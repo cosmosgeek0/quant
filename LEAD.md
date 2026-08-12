@@ -57,6 +57,18 @@ RULES OF THIS FILE
 - Silent means silent: no boot narration, no re-introductions, no re-litigating
   settled decisions. Pick up the exact next action and keep going.
 
+## UI LAW — owner word 2026-08-12, folded same turn
+- UI WORK listens FIRST: the owner shows examples of how it should look and
+  feel; the seat extracts the design language, plays it back in plain words,
+  and builds ONE small piece at a time, owner-approved before the next.
+  Never build scrap and then iterate on scrap.
+- Real data only: a screen exists only where real data exists (the real runs,
+  live public prices). No fake cards, no placeholders, no pretend content —
+  an honest "nothing yet" beats a fake card.
+- Nothing from the old project's UI — no imports, styles, or components —
+  unless the owner names the specific piece and says take it. Every control
+  hits a real endpoint; no dead buttons.
+
 ## SEATS
 - OWNER: direction, gates, money. Above every file.
 - MILESTONE LEAD: the older standing chat, deep old-context, has seen the real
