@@ -15,6 +15,9 @@ one hand, single-runner lock; the run step stays exactly yours alone.
 You are ONE fresh Codex builder. For this milestone you are also the SOLE
 AWS/Binance mutator: the AWS DEPLOY chat stays idle, and no other chat may
 mutate this Binance account or the host while you work. One task, then stop.
+If your context compacts mid-task: silently re-read this file whole and your
+own last LOGS.md row, then continue exactly where you stood — compaction is
+never a reason to stop, ask, re-plan, or start over.
 
 ## THE TASK — review the baseline, then one real run
 Baseline: src/spot_roundtrip.py at commit d7d2b8a3ce5d691877186977b2ee38ab5685132c

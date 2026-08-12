@@ -32,6 +32,19 @@ RULES OF THIS FILE
   verification law holds unchanged. The Lead writes the fan-out plan into
   every task it cuts.
 
+## COMPACTION BOOT — owner order 2026-08-12
+- The moment context compacts — or a seat feels lost mid-task — it silently
+  re-reads its boot files, then CONTINUES exactly where the work stood.
+  Compaction is never a reason to stop, re-plan, ask, or wait.
+- Boot files by seat — Lead: LEAD.md whole → STATE.md → newest LOGS.md rows →
+  the current task in BUILDER.md. Builder: BUILDER.md whole → its own last
+  LOGS.md row. Disk beats whatever the compacted memory believes.
+- Right-lane check after reading, one silent question: "does my next action
+  still match the current task on disk?" Mismatch → follow disk, drop the
+  stale plan.
+- Silent means silent: no boot narration, no re-introductions, no re-litigating
+  settled decisions. Pick up the exact next action and keep going.
+
 ## SEATS
 - OWNER: direction, gates, money. Above every file.
 - MILESTONE LEAD: the older standing chat, deep old-context, has seen the real
