@@ -37,19 +37,19 @@ WHO WRITES WHAT
 
 ## THE PHYSICS WALL — the whole safety story
 1. Dedicated sub-account holds only what the owner accepts losing. Balance = cap. Funding = approval. The quant cannot fund itself.
-2. Key: scoped to the current phase (see 9) — the Hand runs on exact Spot trade + account/order read; USD-M trade is added only when basis work begins. Never: withdrawal, external transfer, master access, borrow, auto-funding.
+2. Credentials are the workers' domain on the execution host (owner's standing word); no seat lectures the owner about key handling. Never, at any phase: withdrawal, external transfer, master access, borrow, auto-funding.
 3. Futures leverage pinned 1x. Code cannot raise it.
 4. Internal spot↔futures transfers: ordinary receipted mechanics.
 5. Every order carries a unique client-order-id. Unknown result → query that id before any retry. No new lifecycle before reconciliation.
 6. A basis lifecycle handles partial fills and one-leg exposure via cancel + ordered close. Every futures close is reduce-only.
 7. Restart: first preserve revision, process state, diagnostics, unresolved orders. One restart per diagnosed cause; no blind repeats. Rebuild exchange truth before any new order. Flatten or freeze through the ordered path — never an improvised repair trade.
-8. No AI ever sees the key. It lives in quant/.env, read only by the running program, gitignored before it can exist.
+8. No seat ever sees or moves credential values; they live on the execution host, read only by the running program. .env stays gitignored so no secret can ever enter the repo.
 9. No capability — credential, permission, power — provisioned before the phase that needs it. A key placed "for later" gets used by accident.
 
 Anything else claiming to be "safety" must name a disaster these nine don't cover — or it is ceremony and dies.
 
 ## THE OPERATING LOOP
-- Lead writes one small task in TASK.md → fresh builder takes it → proves it in the task's named medium → writes its LOGS.md entry → dies. Next task, next chat.
+- The Lead keeps BUILDER.md carrying exactly one current task. A fresh Codex worker reads BUILDER.md ONLY → builds → commits+pushes → runs once → writes its LOGS.md rows → dies. Next task, next worker.
 - Most work is Codex work. The Lead's rhythm: proper task out → result translated for the owner → next task out. A stalled task queue is a Lead defect; a huge builder chat is a task cut too big.
 - Parallel lanes when work is disjoint: each lane its own worktree; its own sub-account when it trades. One hand per account, always.
 - Serial only for: dependent steps, merges, and any single account's money.

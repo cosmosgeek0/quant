@@ -12,14 +12,14 @@ Also on disk: aws-connect/ — owner-placed WORKERS' tools (ssmrun.sh, xfer.sh:
 run scripts / transfer files on the EC2 execution host over SSM). Rail verified
 2026-08-12 from this Mac (account …7436, instance …63a9, ap-south-1; remote
 user ssm-user). xfer.sh's dead helper path fixed 2026-08-12 — now self-locating.
-No product code. No account. No key. Nothing has traded.
+No product code yet. Nothing has traded in this program. Exchange credentials:
+workers' domain on the execution host — their state there unverified by seats.
 
-WHAT IS OPEN: THE HAND — the first money path, top order in TASK.md (cards
-removed on owner word 2026-08-12): one real Spot round trip, ready for the next
-Codex chat now. Only the run gate remains: owner's sub-account + Spot-trade-only
-key (USD-M added later, at the basis phase) + small funding + key into
-quant/.env, needed only after committed code is ready. The builder owns
-everything else.
+CURRENT WORK: the smallest configurable Spot round-trip program — spec lives in
+BUILDER.md, the worker's ONLY file. Execution runs on the existing EC2
+connection (quant/aws-connect); credentials are the workers' domain on that
+host. Commit+push before the live run, run once, real exchange result into
+LOGS.md. No gates.
 
 WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
 spot↔USD-M gap itself); then one full basis cycle at minimum size, including
