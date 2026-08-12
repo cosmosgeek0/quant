@@ -2,15 +2,22 @@
 
 ## PARALLEL-FIRST — read before the task, re-ask at every stage
 Can parallel CHATS cut the remaining wall-clock to ~1/10th of serial? Yes →
-send those pieces to other fresh chats NOW, one bounded piece each, naming the
-exact files that chat must read for context (every chat is disposable and
-boots from disk, never from your memory). A fan-out is itself a task for ONE
-dispatcher chat: it spawns the parallel chats, watches, never grinds, and
-returns one consolidated result. Keep for yourself only the serial core, the
-main thread, and final assembly. Your own subagents — up to 9 — are a second
-speed layer inside your chat; they never replace chat-level fan-out. The named
-defect: one initial burst of delegation, then grinding solo like a sitting
-duck; re-ask after every milestone. Time outranks compute and usage limits.
+one owner work command gets ONE worker chat and ONE worktree. That worker uses
+up to 9 subagents inside its own chat for every independent piece that can cut
+wall-clock: code reads, AWS reads, checks, tests, evidence, and verification.
+Do not split one task into peer worker chats. Separate worker chats exist only
+for separate owner-named tasks or manifest lanes, each with its own worktree.
+The worker does not fan out once and then grind a long serial tail: before the
+first action and AGAIN after every milestone, it asks what remaining work is
+independent and sends all of it to available subagents immediately. Keep only
+true dependencies and one live position/action lifecycle serial. Time outranks
+compute and usage limits. TASK.md's named blockers are the gates; never invent
+extra gates or substitute readiness ceremony for the ordered work.
+
+Every worker dispatch/work command MUST repeat this operating instruction:
+"One task, one worker chat, one worktree. Use up to 9 subagents throughout;
+fan out every independent piece now and re-fan-out after every milestone. Keep
+only true dependencies/live lifecycle serial. Do not invent gates."
 Live mutation law = DISJOINTNESS: no two workers on the same coin or the same
 wallet action; each worker its own client-ID prefix and its own ceiling;
 collisions are harmless rejections; an open position keeps its coin exclusive
