@@ -53,6 +53,11 @@ until flat.
   auto-archive it. It stays visible until the owner directly says otherwise.
 - Before archiving, record lane, final SHA, verdict, evidence/disposition, and
   confirm no unfinished follow-up remains in that task.
+- Retirement order is mandatory for every app-managed worker: while the task
+  is still unarchived, verify and record the clean worktree, move its exact
+  folder to /Users/cosmosgeek/.Trash/, prune only its stale Git registration,
+  confirm branch/commits remain, and ONLY THEN archive the task. Never archive
+  first: the app may remove its temporary worktree before it reaches Trash.
 
 ## WORKER CONTACT LAW — owner order 2026-08-12
 - Before sending any mid-task message to a worker, read or wait for its newest
@@ -98,6 +103,7 @@ a lane yourself.
 - Only after the folder is safely present in Trash, clean its stale Git
   worktree registration with the standard Git worktree-prune flow and confirm
   the branch and commits remain. Never prune a live or unfinished worktree.
+- Archive the worker task only after that Trash-and-prune proof succeeds.
 - If your context compacts mid-task: silently re-read this file whole, your
   dispatch, TASK.md, the newest LOGS.md rows, worktree tips, and active task
   state, then continue exactly where you stood.
