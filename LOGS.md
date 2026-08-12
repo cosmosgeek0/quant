@@ -1,12 +1,24 @@
 # LOGS.md — builders write what was achieved; the Lead and the owner read it
 
 Contract: newest entry on top, exact shape defined in BUILDER.md, written
-LEAD-CLEAN (defined in LEAD.md): plain rows, no secrets (last-4 only), no raw
+LEAD-CLEAN (defined in LEAD.md): plain rows, no secrets; operational IDs last-4;
+Git SHAs last-8 in entries and exact in finals; no raw
 logs or error dumps — evidence referenced by path. One entry per task. No prose
 beyond the shape. The Lead translates these for the owner in plain words on
 every step.
 
 ---
+
+governance correction 2026-08-12T18:49:16Z | expected owner rules on disk | MEASURED review found 48 issue classes across control files | IN_PROGRESS
+scope | expected lane/model/access rules | found ambiguity at base b3187bd6 | final SHA pending
+parallel | expected runtime-available slots refilled | found shared-pool/child-peer ambiguity | correction in progress
+records | expected mistakes written first | found read-only/precedence/owner-order conflicts | canonical-owner relay correction in progress
+finals | expected every final safe for Fable | found no filter/SHA exception | <=10-row contract correction in progress
+execution | expected platform boundary at dispatch | found late/stale worker-mutation text | executor split correction in progress
+boot | expected TASK + LOGS + worktree state after compaction | found incomplete LEAD/Builder boot | correction in progress
+first failure | expected boundary checked before dispatch | found late disclosure | UNVERIFIED no-mutation claim retained only in earlier measured row
+implementation | expected clean control files | found 4 patch failures plus grammar/shape and stale clauses | recorded and corrected
+verification | expected current four-file diff passes review | found MEASURED diff-check exit 0; bounded review running | commit/push not checked
 
 2026-08-12T18:18:55Z | FUTURES LIVE PROOF PRECHECK | committed executor + GET-only host proof | SHA last-8 b01b8190
 deploy | /home/ssm-user/quant-run/live-proof-ef95946 | wallet/futures source SHA-256 matched | secret fields exact; values never printed
