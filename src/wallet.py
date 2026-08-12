@@ -45,6 +45,8 @@ QUERY_SLEEP = 2.0
 HISTORY_LOOKBACK_MS = 60_000
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGE_LIMIT = 20
+TRANSFER_ASSET = "USDT"
+TRANSFER_HARD_CEILING = Decimal("10")
 
 DIRECTIONS = {
     "spot-to-usdm": "MAIN_UMFUTURE",
@@ -80,6 +82,17 @@ def decimal(raw, label):
 
 def decimal_text(value):
     return format(value, "f")
+
+
+def validated_transfer_amount(asset, raw_amount):
+    if asset != TRANSFER_ASSET:
+        raise ValueError("internal transfers are restricted to USDT")
+    amount = decimal(raw_amount, "amount")
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    if amount > TRANSFER_HARD_CEILING:
+        raise ValueError("amount exceeds the compiled 10 USDT transfer ceiling")
+    return amount
 
 
 def last4(value):
@@ -446,6 +459,11 @@ def finish_transfer(store, path, receipt, state, note, release=False):
 
 
 def reconcile_transfer(store, path, receipt, client, attempts=QUERY_ATTEMPTS):
+    # A durable mutation_attempts=0 receipt was saved before any POST.  It is
+    # therefore known-unsent and must never adopt an unrelated history row.
+    if receipt.get("mutation_attempts") != 1:
+        return path, receipt
+
     state, payload = query_receipt(client, receipt, attempts)
     if state == "found":
         row_status = str(payload.get("status", "UNKNOWN")).upper()
@@ -501,6 +519,7 @@ def reconcile_transfer(store, path, receipt, client, attempts=QUERY_ATTEMPTS):
 
 def execute_transfer(store, client, direction, asset, amount, sha,
                      query_attempts=QUERY_ATTEMPTS):
+    amount = decimal_text(validated_transfer_amount(asset, amount))
     request_id = new_request_id()
     if not store.acquire_lock(request_id):
         return None, {
@@ -711,19 +730,21 @@ def main(argv=None):
         if args.command == "reconcile":
             path, receipt = store.load_transfer(args.request_id)
             if receipt.get("state") not in (
-                "CONFIRMED", "FAILED", "REJECTED", "REJECTED_BEFORE_TRANSFER"
+                "CONFIRMED", "FAILED", "REJECTED", "REJECTED_BEFORE_TRANSFER",
+                "BLOCKED",
             ):
                 path, receipt = reconcile_transfer(store, path, receipt, client)
             print_transfer(receipt)
-            return 0 if receipt["state"] == "CONFIRMED" else \
-                2 if receipt["state"] in ("FAILED", "REJECTED") else 4
+            if receipt["state"] == "CONFIRMED":
+                return 0
+            if receipt["state"] == "BLOCKED":
+                return 3
+            return 2 if receipt["state"] in ("FAILED", "REJECTED") else 4
 
         asset = args.asset.upper()
         if not ASSET_RE.fullmatch(asset):
             raise ValueError("asset must be 1-20 uppercase letters or digits")
-        amount_value = decimal(args.amount, "amount")
-        if amount_value <= 0:
-            raise ValueError("amount must be positive")
+        amount_value = validated_transfer_amount(asset, args.amount)
         if not args.execute_internal_transfer:
             raise ValueError("transfer requires --execute-internal-transfer")
         path, receipt = execute_transfer(

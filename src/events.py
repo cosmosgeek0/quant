@@ -223,15 +223,11 @@ def _base_event(receipt: Mapping[str, Any], kind: str, ts: Any) -> dict[str, Any
     }
 
 
-def _terminal_time(receipt: Mapping[str, Any], side: str, order: Mapping[str, Any]) -> Any:
+def _terminal_time(order: Mapping[str, Any]) -> Any:
     for field in ("terminal_utc", "updated_utc"):
         if order.get(field) is not None:
             return order[field]
-    if side == "buy":
-        sell = _mapping(receipt.get("sell"), "sell")
-        if sell.get("submitted_utc") is not None:
-            return sell["submitted_utc"]
-    return receipt.get("finished_utc", order.get("submitted_utc"))
+    return None
 
 
 def events_from_receipt(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -278,7 +274,10 @@ def events_from_receipt(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
 
         if order.get("status") is None:
             continue
-        terminal = _base_event(receipt, "order_terminal", _terminal_time(receipt, side, order))
+        terminal_time = _terminal_time(order)
+        if terminal_time is None:
+            continue
+        terminal = _base_event(receipt, "order_terminal", terminal_time)
         terminal["side"] = side_upper
         if client_id is not None:
             terminal["client_id_last4"] = _last4(client_id, f"{side}_client_id")

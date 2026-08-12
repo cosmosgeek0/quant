@@ -373,7 +373,12 @@ def main():
     nf = f.get("NOTIONAL") or f.get("MIN_NOTIONAL") or {}
     min_notional = d(nf.get("minNotional", "0"))
     apply_mkt = bool(nf.get("applyMinToMarket", nf.get("applyToMarket", True)))
+    base_precision = sym.get("baseAssetPrecision")
+    if isinstance(base_precision, bool) or not isinstance(base_precision, int) or \
+            not 0 <= base_precision <= 30:
+        refuse("base asset precision is unavailable or invalid")
     qprec = int(sym.get("quoteAssetPrecision", sym.get("quotePrecision", 8)))
+    base_balance_tolerance = Decimal(1).scaleb(-base_precision)
     quote_spend = max_quote.quantize(Decimal(1).scaleb(-qprec), rounding=ROUND_DOWN)
 
     kind, acct = get_retry("/api/v3/account", signed=True)
@@ -411,7 +416,8 @@ def main():
         "filters": {"step": fmt(step), "min_qty": fmt(min_qty),
                     "market_min_qty": fmt(mkt_min),
                     "min_notional": fmt(min_notional),
-                    "apply_min_to_market": apply_mkt},
+                    "apply_min_to_market": apply_mkt,
+                    "base_balance_tolerance": fmt(base_balance_tolerance)},
         "planned_spend": fmt(quote_spend)}
     save()
 
@@ -550,7 +556,9 @@ def main():
                 "nothing resent", 4)
     final = balances_of(acct2, base, quote)
     fees = fees_by_asset(buy_trades, sell_trades)
-    base_delta_ok = ((final[base] - start[base]) - residual).copy_abs() < step
+    base_delta_ok = (
+        (final[base] - start[base]) - residual
+    ).copy_abs() <= base_balance_tolerance
     q_tol = Decimal(1).scaleb(-qprec) * 2
     exp_quote = quote_recv - quote_spent - fee_in(fees, quote)
     quote_delta_ok = ((final[quote] - start[quote]) - exp_quote).copy_abs() <= q_tol

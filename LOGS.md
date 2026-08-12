@@ -8,6 +8,53 @@ every step.
 
 ---
 
+2026-08-12T17:42:17Z | L10 INTEGRATOR | integrated L1-L4 + repaired L5 findings | source commit last-8 cd50ecf8
+source provenance | L1 17a8b4a1 -> adbb26f7 | L2 a5b270f1 -> d45b25c1 | L3 3f7649ae -> 756c47b3 | L4 44fc7357 -> ca83675b | stable patch IDs match
+history | exact L1-L5 rows retained newest-on-top | L5 tip 652e48b9 findings repaired
+repairs | wallet unsent guard + compiled USDT <=10 ceiling | terminal ts provenance | base-precision CLOSED reconciliation
+evidence | py_compile 5/5 | no-network regressions + controls | real CLOSED v1 7/7 | L1-L3 GET-only | exact scope/diff clean
+first failure | integrated static-audit harness TypeError from name collision; corrected rerun exit 0
+blocker preserved | L2 signed account truth canTrade=false | Futures not enabled | no order was sent
+disposition | L6 tip 79d54885 | SPEC_READY | NON_MERGED | blocked on owner-only borrow power
+disposition | L7 tip 08a6ff4c | paper-only look-ahead | NON_MERGED | UNPROVEN
+disposition | L8 tip eb23244d | 7 import candidates | NON_MERGED | owner per-item permit required | L9 absent | verdict PASS; candidate SHA in handoff
+
+2026-08-12T17:28:26Z | L5 CORRECTNESS | adversarial git-object review; no live calls | base last-8 338a6e8
+reviewed tips | L1 82dbb705 | L2 2b419400 | L3 c0128194 | L4 1fe5ba73
+evidence | LOGS.md | git show + AST/compile + deterministic in-memory harnesses
+validations | positive controls exit 0 | L3 blocked-reconcile 1 | L3 ceiling 1 | L4 terminal-ts 1 | Spot CLOSED tolerance 1
+findings | HIGH src/wallet.py:713 false-confirms unsent BLOCKED receipt | HIGH src/wallet.py:724 has no transfer ceiling
+findings | MEDIUM src/events.py:226 substitutes non-terminal timestamps | MEDIUM src/spot_roundtrip.py:553 masks dust mismatch
+first failure | docs lookup wrapper SyntaxError, corrected | first code failure: L3 BLOCKED -> CONFIRMED
+clean lanes | L1 no findings | L2 no findings; capability honestly BLOCKED with canTrade=false
+verdict | FAIL — material correctness defects found; L5 made no fixes and never ran spot_roundtrip.py
+
+2026-08-12T17:23:42Z | L3 WALLET | signed GET-only Spot + USD-M balance snapshot
+code commit last-8 | b3c9ad2e
+files | src/wallet.py | LOGS.md
+evidence | host /home/ssm-user/quant_receipts/wallet/balance-*e209.json | mode 600 | SHA 3f7649ae | READ_OK
+balances asset/free | spot BTC 0.00000985 | spot USDT 94.98056920
+balances asset/free | usd_m BTC 0.00000000 | usd_m USDT 1.00000000
+transfer mechanics | coded + deterministic 4-scenario proof | live transfer not executed
+first failure | xfer.sh emitted head: illegal line count -- 0; remote SHA + bytes later matched
+verdict | PASS
+
+2026-08-12T17:22:15Z | L2 FUTURES-HAND | local + execution-host read-only validation; no live/test order
+commit hash last-8 | edb437c0
+evidence | src/futures_hand.py | remote /home/ssm-user/quant-run/l2-futures-hand-precommit/futures_hand.py (matching sha256)
+checks | py_compile 0 | safety simulation 0 | SOLUSDT plan 9.844900 <= 10 | signed validator exit 3
+first failure | xfer warned head line-count 0 (final SHA matched); ETHUSDT validation exit 3 below MIN_NOTIONAL
+blocker | signed GET /fapi/v3/account succeeded and returned canTrade=false; later signed GETs not reached
+verdict | BLOCKED — code complete; Futures trading capability absent; no permission requested/added
+
+L4 EVENT-EMITTER | read-only SSM-sanitized CLOSED receipt -> python3 src/events.py + independent v1 validator | 27bc507b | /tmp/l4-events.jsonl: 7 lines, sha256 last-8 37a71f12 | failures none | PASS
+
+2026-08-12T17:10:09Z–17:10:10Z | L1 MARKET-READS | PYTHONDONTWRITEBYTECODE=1 python3 src/market_reads.py BTCUSDT ETHUSDT | code e6677647
+evidence | live unsigned public GET stdout exit 0 | BTC gap -21.40500000 / -3.37139680 bps | ETH gap -0.97354264 / -5.15125093 bps
+reads | Spot bid/ask/mid + USD-M mark/index/funding/next-funding | basis = mark - Spot mid
+first failure | source-audit harness exit 1 compared AST nodes, not values; corrected audit exit 0
+verdict | PASS — factual Decimal-safe rows printed; no credentials, signed mutation, or orders
+
 2026-08-12T16:01:11Z–16:01:13Z | run 6a7c98c70019a8 | receipt /home/ssm-user/quant_receipts/roundtrip-6a7c98c70019a8.json
 full commit SHA | d1b204bc4c82c5ffc8e495b7d4faa9085c71f0f9
 symbol + approved ceiling | BTCUSDT | 10 USDT
