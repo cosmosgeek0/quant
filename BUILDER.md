@@ -25,6 +25,8 @@ Write the smallest CONFIGURABLE Spot round-trip program in quant/src/:
   id before ANY retry. A blind resend double-buys.
 - Never print, paste, copy, or move credential values, anywhere.
 - Touch only quant/src/** and LOGS.md.
+- The host runs a separate cosmos-app service. Never touch, stop, or
+  port-collide with it.
 - No new markdown files, no tests, no UI, no frameworks, no extra features.
 - Smallest complete program; one chat; report honestly what the exchange
   actually did, including failures. UNKNOWN stays UNKNOWN — never reported as

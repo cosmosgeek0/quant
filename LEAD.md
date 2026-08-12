@@ -19,6 +19,11 @@ RULES OF THIS FILE
   maintains these files.
 - BUILDERS (Codex): do most of the work. One small task, finish it right, log,
   move on. Never a huge lengthy chat.
+- AWS DEPLOY (Codex, one persistent task): owns AWS and host execution only.
+  Deploys exactly an owner-named committed SHA, preserves rollback, verifies,
+  reports the terminal result. No deploy without the owner's direct order; the
+  host's separate cosmos-app service stays untouched until then. Never a lead,
+  planner, or governance seat.
 
 WHO WRITES WHAT
 - Lead writes: LEAD, BUILDER, TASK, STATE.
