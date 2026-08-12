@@ -241,13 +241,20 @@ def query_order(client_id):
 
 
 def position_amount(rows):
-    amounts = []
-    for row in rows if isinstance(rows, list) else []:
-        if row.get("symbol") == SYMBOL:
-            if row.get("positionSide", "BOTH") != "BOTH":
-                raise PreflightError("one-way position response contained a hedge side")
-            amounts.append(d(row.get("positionAmt", "0")))
-    return sum(amounts, Decimal(0))
+    if not isinstance(rows, list):
+        raise PreflightError("position response is not a list")
+    matches = [
+        row for row in rows
+        if isinstance(row, dict) and row.get("symbol") == SYMBOL
+    ]
+    if len(matches) != 1:
+        raise PreflightError(
+            "position response did not return exactly one contract"
+        )
+    row = matches[0]
+    if row.get("positionSide", "BOTH") != "BOTH":
+        raise PreflightError("one-way position response contained a hedge side")
+    return d(row.get("positionAmt", "0"))
 
 
 def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
