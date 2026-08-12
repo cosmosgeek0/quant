@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """One Binance USD-M Futures long open and reduce-only close, then exit.
 
-Default/no-argument mode is read-only validation. Only ``--execute`` reaches
-``POST /fapi/v1/order``. The opening order is BUY LIMIT IOC so its price and
-quantity can be bounded by the compiled 10 USDT lane ceiling; the closing
-order is SELL MARKET with ``reduceOnly=true`` for exactly the opened quantity.
+Default/no-argument mode is read-only validation. Only ``--execute`` can
+change leverage or reach ``POST /fapi/v1/order``. Before an order, the executor
+reads the symbol configuration and sets initial leverage to the compiled 1x
+target once when needed, then re-reads it. The opening order is BUY LIMIT IOC
+so its price and quantity can be bounded by the compiled 10 USDT lane ceiling;
+the closing order is SELL MARKET with ``reduceOnly=true`` for exactly the
+opened quantity.
 
 Required environment (values are read but never printed): BINANCE_API_KEY,
 BINANCE_API_SECRET, SYMBOL, MAX_NOTIONAL, and QUANT_SHA. Optional:
@@ -45,6 +48,8 @@ LOCK_PATH = os.path.join(RECEIPT_DIR, "futures-hand.lock")
 
 LANE_PREFIX = "l2fh-"
 LANE_HARD_CEILING = Decimal("10")  # USDT; never configurable upward
+TARGET_LEVERAGE = 1
+MAX_ALLOWED_LEVERAGE = 2  # Owner law: anything above 2x needs a new order.
 CLOSE_PRICE_FLOOR = Decimal("0.99")  # require 1% room above close MIN_NOTIONAL
 RECV_WINDOW = "5000"
 HTTP_TIMEOUT = 15
@@ -321,6 +326,33 @@ def signed_read(path, params, label):
     return payload
 
 
+def parse_symbol_configuration(payload):
+    if not isinstance(payload, list):
+        raise PreflightError("symbol configuration response is not a list")
+    if any(not isinstance(row, dict) for row in payload):
+        raise PreflightError("symbol configuration contains a non-object row")
+    matches = [row for row in payload if row.get("symbol") == SYMBOL]
+    if len(matches) != 1:
+        raise PreflightError(
+            "symbol configuration did not return exactly one contract"
+        )
+    try:
+        leverage = int(str(matches[0]["leverage"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise PreflightError("symbol leverage is missing or invalid") from error
+    if leverage < 1:
+        raise PreflightError("symbol leverage must be positive")
+    return matches[0], leverage
+
+
+def read_symbol_configuration():
+    payload = signed_read(
+        "/fapi/v1/symbolConfig", {"symbol": SYMBOL},
+        "symbol configuration read",
+    )
+    return parse_symbol_configuration(payload)
+
+
 def preflight(max_notional, slippage_bps):
     global _time_offset_ms
     kind, server = get_retry("/fapi/v1/time")
@@ -370,6 +402,7 @@ def preflight(max_notional, slippage_bps):
     account_amount = position_amount(account.get("positions", []))
     if risk_amount != 0 or account_amount != 0:
         raise PreflightError("existing position on symbol makes attribution unsafe")
+    symbol_configuration, current_leverage = read_symbol_configuration()
     available = d(account.get("availableBalance", "0"))
     if available < plan["max_fill_notional"]:
         raise PreflightError("available Futures balance is below the capped notional")
@@ -379,6 +412,10 @@ def preflight(max_notional, slippage_bps):
         "position_mode": "ONE_WAY",
         "open_orders": 0,
         "position_amount": Decimal(0),
+        "current_leverage": current_leverage,
+        "target_leverage": TARGET_LEVERAGE,
+        "leverage_change_required": current_leverage != TARGET_LEVERAGE,
+        "margin_type": symbol_configuration.get("marginType", "UNKNOWN"),
     })
     return plan
 
@@ -398,10 +435,18 @@ def final_state():
         return None
     try:
         amount = position_amount(risks)
+        _, leverage = read_symbol_configuration()
     except PreflightError as error:
         first_fail("final_position_parse", error)
         return None
-    return {"position_amount": amount, "open_orders": len(orders)}
+    except CapabilityBlocked as error:
+        first_fail("final_leverage_read", error)
+        return None
+    return {
+        "position_amount": amount,
+        "open_orders": len(orders),
+        "leverage": leverage,
+    }
 
 
 def wrap_up(verdict, note, code):
@@ -418,7 +463,72 @@ def wrap_up(verdict, note, code):
             note = "planned pair ended with position %s and %s open order(s); no repair" % (
                 fmt(state["position_amount"]), state["open_orders"]
             )
+        elif state["leverage"] != TARGET_LEVERAGE:
+            verdict, code = "UNKNOWN", 4
+            note = "orders are flat but final leverage is not the compiled 1x target"
     finish(verdict, note, code, release_lock=(verdict == "CLOSED"))
+
+
+def enforce_target_leverage(plan):
+    """Set 1x at most once, then prove the factual symbol configuration."""
+    before = plan["current_leverage"]
+    receipt["leverage"] = {
+        "before": before,
+        "target": TARGET_LEVERAGE,
+        "mutation_attempts": 0,
+    }
+    save()
+    if TARGET_LEVERAGE > MAX_ALLOWED_LEVERAGE:
+        first_fail("leverage", "compiled target exceeds owner hard cap")
+        refuse("compiled leverage target exceeds the owner hard cap")
+    if before == TARGET_LEVERAGE:
+        receipt["leverage"].update({
+            "after": before,
+            "verified_utc": utc(),
+            "note": "already at compiled target; no leverage mutation sent",
+        })
+        save()
+        return
+
+    receipt["leverage"]["submitted_utc"] = utc()
+    receipt["leverage"]["mutation_attempts"] = 1
+    save()
+    kind, response = http(
+        "POST", "/fapi/v1/leverage",
+        {"symbol": SYMBOL, "leverage": str(TARGET_LEVERAGE)},
+        signed=True,
+    )
+    ctx["mutated"] = True
+    receipt["leverage"]["submission_kind"] = kind
+    if kind == "ok" and isinstance(response, dict):
+        receipt["leverage"]["reported_leverage"] = response.get("leverage")
+    elif kind == "api_error":
+        first_fail("leverage_submit", api_reason(response))
+        refuse("1x leverage request was rejected: %s" % api_reason(response))
+    else:
+        first_fail("leverage_submit", "submission result was unclear")
+    save()
+
+    try:
+        _, after = read_symbol_configuration()
+    except (CapabilityBlocked, PreflightError) as error:
+        first_fail("leverage_verify", error)
+        finish(
+            "UNKNOWN",
+            "1x leverage result is unreadable; no order was sent and nothing retried",
+            4,
+        )
+    receipt["leverage"].update({"after": after, "verified_utc": utc()})
+    save()
+    if after != TARGET_LEVERAGE:
+        first_fail("leverage_verify", "symbol remains at %sx" % after)
+        finish(
+            "REJECTED_BEFORE_OPEN",
+            "symbol leverage is %sx, not the compiled 1x target; "
+            "no order sent" % after,
+            3,
+            release_lock=True,
+        )
 
 
 def submit_once(stage, params, exposure):
@@ -569,6 +679,11 @@ def main():
         print("open_orders: 0")
         print("position_amount: 0")
         print("account_can_trade: true")
+        print("current_leverage:", plan["current_leverage"])
+        print("target_leverage:", TARGET_LEVERAGE)
+        print("leverage_change_required:", str(
+            plan["leverage_change_required"]
+        ).lower())
         print("key_trade_permission: UNVERIFIED_READ_ONLY_ONLY")
         print("VERDICT: READ_ONLY_VALIDATED")
         print("NOTE: signed USER_DATA reads passed; no order/test endpoint was called")
@@ -579,6 +694,7 @@ def main():
         for key, value in plan.items()
     }
     save()
+    enforce_target_leverage(plan)
     open_params = {
         "symbol": SYMBOL,
         "side": "BUY",
