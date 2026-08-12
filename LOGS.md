@@ -8,7 +8,7 @@ every step.
 
 ---
 
-2026-08-12T17:42:17Z | L10 INTEGRATOR | integrated L1-L4 + repaired L5 findings | source commit last-8 cd50ecf8
+2026-08-12T17:42:17Z | L10 INTEGRATOR | integrated L1-L4 + repaired L5 findings | source commit last-8 cd50ecf8 | final candidate last-8 cb14dfa1
 source provenance | L1 17a8b4a1 -> adbb26f7 | L2 a5b270f1 -> d45b25c1 | L3 3f7649ae -> 756c47b3 | L4 44fc7357 -> ca83675b | stable patch IDs match
 history | exact L1-L5 rows retained newest-on-top | L5 tip 652e48b9 findings repaired
 repairs | wallet unsent guard + compiled USDT <=10 ceiling | terminal ts provenance | base-precision CLOSED reconciliation
@@ -17,7 +17,7 @@ first failure | integrated static-audit harness TypeError from name collision; c
 blocker preserved | L2 signed account truth canTrade=false | Futures not enabled | no order was sent
 disposition | L6 tip 79d54885 | SPEC_READY | NON_MERGED | blocked on owner-only borrow power
 disposition | L7 tip 08a6ff4c | paper-only look-ahead | NON_MERGED | UNPROVEN
-disposition | L8 tip eb23244d | 7 import candidates | NON_MERGED | owner per-item permit required | L9 absent | verdict PASS; candidate SHA in handoff
+disposition | L8 tip eb23244d | 7 import candidates | NON_MERGED | owner per-item permit required | L9 absent | verdict PASS
 
 2026-08-12T17:28:26Z | L5 CORRECTNESS | adversarial git-object review; no live calls | base last-8 338a6e8
 reviewed tips | L1 82dbb705 | L2 2b419400 | L3 c0128194 | L4 1fe5ba73
