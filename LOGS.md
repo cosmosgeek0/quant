@@ -8,6 +8,16 @@ every step.
 
 ---
 
+2026-08-12T18:18:55Z | FUTURES LIVE PROOF PRECHECK | committed executor + GET-only host proof | SHA last-8 b01b8190
+deploy | /home/ssm-user/quant-run/live-proof-ef95946 | wallet/futures source SHA-256 matched | secret fields exact; values never printed
+exchange truth | SOLUSDT | canTrade=false | ONE_WAY | position 0 | open orders 0 | configured leverage 5x CROSSED
+funds | Spot free 94.98056920 USDT | USD-M available/wallet 1.00000000 USDT | no transfer sent
+plan | 0.13 SOL | capped fill 9.878700 USDT | transfer-to-total-10 would be 9.00000000 USDT
+safety fix | ef959463 | committed 1x one-shot set + factual re-read; deterministic no-network cases PASS
+first failure | unsupported futures_hand.py --help exit 2; first audit used v3 flat position row for leverage and blocked; corrected to symbolConfig
+AWS discovery | host ListSecrets explicit-deny; local operator ListSecrets denied | no secret guessed or changed
+verdict | BLOCKED_BEFORE_TRANSFER — execution secret still reports canTrade=false; no leverage/order/test-order mutation; exposure 0
+
 2026-08-12T17:42:17Z | L10 INTEGRATOR | integrated L1-L4 + repaired L5 findings | source commit last-8 cd50ecf8 | final candidate last-8 cb14dfa1
 source provenance | L1 17a8b4a1 -> adbb26f7 | L2 a5b270f1 -> d45b25c1 | L3 3f7649ae -> 756c47b3 | L4 44fc7357 -> ca83675b | stable patch IDs match
 history | exact L1-L5 rows retained newest-on-top | L5 tip 652e48b9 findings repaired
