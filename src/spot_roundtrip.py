@@ -44,7 +44,7 @@ RECV_WINDOW = "5000"
 HTTP_TIMEOUT = 15
 POLL_SECONDS = 180           # wall-clock budget per order confirmation
 POLL_SLEEP = 2.0
-FEE_CUSHION = Decimal("0.002")  # taker fee + slippage headroom, estimate only
+SLIPPAGE_CUSHION = Decimal("0.001")  # added to Binance's exact BUY taker fees
 TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}
 
 _time_offset_ms = 0
@@ -265,10 +265,15 @@ def wrap_up(verdict, note, code):
     print("residual base from this run:", res["residual_base_from_this_run"])
     print("open orders after:", res["open_orders_after"])
     # Verdict truth: CLOSED only on observed exchange state, never on a model.
-    if verdict == "CLOSED" and (final is None or open_after is None):
-        verdict, code = "UNKNOWN", 4
-        note = "orders terminal but final account/open-orders state could " \
-               "not be read; nothing resent; reconcile from the receipt ids"
+    if verdict == "CLOSED":
+        if final is None or open_after is None:
+            verdict, code = "UNKNOWN", 4
+            note = "orders terminal but final account/open-orders state could " \
+                   "not be read; nothing resent; reconcile from the receipt ids"
+        elif open_after:
+            verdict, code = "OPEN_EXPOSURE", 3
+            note = "%s open order(s) remain on %s; account is not closed; " \
+                   "no repair trade" % (len(open_after), SYMBOL)
     ctx["final"], ctx["open_after"] = final, open_after
     finish(verdict, note, code)
 
@@ -394,22 +399,11 @@ def main():
         refuse("average price read failed")
     price = d(avg["price"])
 
-    # Feasibility at the approved ceiling, modeling the REAL two-floor path:
-    # the BUY returns a step-multiple, the base fee is subtracted, then the
-    # SELL floors again - so a whole step can be lost to the fee. Never raise
-    # the amount; report the sufficient minimum instead.
+    # A BUY below the exchange minimum cannot start under any fee schedule.
     if apply_mkt and quote_spend < min_notional:
         refuse("MAX_QUOTE %s below minimum BUY notional %s %s" %
                (fmt(quote_spend), fmt(min_notional), quote))
-    bought_est = floor_step(quote_spend / price, step)
-    est_sell = floor_step(bought_est * (1 - FEE_CUSHION), step)
     need_qty = max(min_qty, mkt_min)
-    if est_sell < need_qty or (apply_mkt and est_sell * price < min_notional):
-        req_sell = max(need_qty,
-                       (min_notional / price) if apply_mkt else Decimal(0))
-        req_quote = (req_sell + 2 * step) * price / (1 - FEE_CUSHION)
-        refuse("approved amount too small to sell back after fees and step "
-               "rounding; sufficient minimum ~ %s %s" % (fmt(req_quote), quote))
 
     receipt["starting_state"] = {
         "base_free": fmt(start[base]), "quote_free": fmt(start[quote]),
@@ -425,14 +419,47 @@ def main():
     buy_params = {"symbol": SYMBOL, "side": "BUY", "type": "MARKET",
                   "quoteOrderQty": fmt(quote_spend), "newClientOrderId": buy_id,
                   "newOrderRespType": "FULL"}
-    kind, resp = http("POST", "/api/v3/order/test", buy_params, signed=True)
+    test_params = dict(buy_params)
+    test_params["computeCommissionRates"] = "true"
+    kind, resp = http("POST", "/api/v3/order/test", test_params, signed=True)
     if kind == "unclear":
         first_fail("order_test", resp)
-        kind, resp = http("POST", "/api/v3/order/test", buy_params, signed=True)
+        kind, resp = http("POST", "/api/v3/order/test", test_params, signed=True)
     if kind == "api_error":
         refuse("test order rejected: %s %s" % (resp.get("code"), resp.get("msg")))
     if kind == "unclear":
         refuse("connectivity unclear on non-mutating test order; not starting")
+
+    # Binance's test-order response contains the taker rate for this exact BUY,
+    # including account-specific standard, tax, and special commissions. Assume
+    # all can be deducted from received base; BNB payment can only improve this.
+    try:
+        buy_fee_rate = sum((d(resp[k]["taker"]) for k in (
+            "standardCommissionForOrder", "taxCommissionForOrder",
+            "specialCommissionForOrder")), Decimal(0))
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        refuse("test order returned no usable commission rates; not starting")
+    sellability_cushion = buy_fee_rate + SLIPPAGE_CUSHION
+    if not buy_fee_rate.is_finite() or buy_fee_rate < 0 or \
+            sellability_cushion >= 1:
+        refuse("test order returned an invalid commission rate; not starting")
+    receipt["starting_state"].update({
+        "buy_taker_commission_rate": fmt(buy_fee_rate),
+        "sellability_cushion": fmt(sellability_cushion)})
+    save()
+
+    # Feasibility at the approved ceiling, modeling the REAL two-floor path:
+    # the BUY returns a step-multiple, its worst-case base fee is subtracted,
+    # then the SELL floors again. Never raise the amount; report the sufficient
+    # minimum instead.
+    bought_est = floor_step(quote_spend / price, step)
+    est_sell = floor_step(bought_est * (1 - sellability_cushion), step)
+    if est_sell < need_qty or (apply_mkt and est_sell * price < min_notional):
+        req_sell = max(need_qty,
+                       (min_notional / price) if apply_mkt else Decimal(0))
+        req_quote = (req_sell + 2 * step) * price / (1 - sellability_cushion)
+        refuse("approved amount too small to sell back after fees and step "
+               "rounding; sufficient minimum ~ %s %s" % (fmt(req_quote), quote))
 
     # The BUY. One submission; truth established only by its client id.
     receipt["buy"] = {"submitted_utc": utc()}
