@@ -10,6 +10,28 @@ RULES OF THIS FILE
   context and private memory are cache. A brand-new Lead must understand everything
   from these files alone.
 
+## PARALLEL-FIRST — owner order 2026-08-12; read before anything else below
+- Before ANY task, and AGAIN at every stage inside it, the seat asks: can
+  parallel CHATS cut the remaining wall-clock to ~1/10th of serial? Yes → fan
+  out NOW. Time outranks compute and usage limits, always.
+- Parallel chats means OTHER CHATS, not your own subagents: the dispatcher
+  sends each parallel piece to a separate fresh chat (inter-chat message or a
+  new Codex chat) and keeps ONLY the serial core, the main thread, and final
+  assembly for itself. Subagents — up to 9 per worker — are a second speed
+  layer INSIDE each chat, never a substitute for chat-level fan-out.
+- Every spawned worker is disposable and boots from disk: its dispatch names
+  the exact files it must read for context. No worker leans on the
+  dispatcher's memory.
+- The named defect: one initial burst of delegation, then sitting like a duck
+  grinding solo. After every milestone the seat re-asks: "what am I grinding
+  right now that another chat could already be grinding?"
+- What NEVER parallelizes: any single account's money and any live mutation —
+  one mutator, one hand, single-runner lock, always. Dependent steps and
+  merges stay serial; disjoint files and worktrees only.
+- Fan-out changes speed, not standards: LEAD-CLEAN digests back; every
+  verification law holds unchanged. The Lead writes the fan-out plan into
+  every task it cuts.
+
 ## SEATS
 - OWNER: direction, gates, money. Above every file.
 - MILESTONE LEAD: the older standing chat, deep old-context, has seen the real
@@ -67,22 +89,6 @@ Anything else claiming to be "safety" must name a disaster these nine don't cove
 - READY = the complete chain proven callable end to end. Code existing ≠ capability existing (a money handoff was once reported READY with no executor built).
 - Lanes start from the current accepted quant. Verify base before first commit and before landing; a stale base never lands.
 - One proven ability merges at a time. The running quant is never edited while it holds a position.
-
-## PARALLEL-FIRST — owner order 2026-08-12: time outranks compute
-- Before ANY task starts, the seat holding it asks once: can parallel chats or
-  subagents cut the wall-clock to ~1/10th of serial? If yes, fan out NOW —
-  spawn the parallel workers, let them grind concurrently, collect and merge
-  their results. Never grind serially what could have been split.
-- Each worker may run up to 9 subagents of its own to go faster.
-- Compute and usage limits are spent freely to buy time. A seat serially
-  grinding parallelizable work is a defect, not diligence.
-- What NEVER parallelizes: any single account's money and any live mutation —
-  one mutator, one hand, single-runner lock, always. Disjoint files and
-  worktrees only; dependent steps and merges stay serial.
-- Fan-out changes speed, not standards: results come back as LEAD-CLEAN
-  digests and every verification law holds unchanged.
-- The Lead writes the fan-out plan into each task it cuts; workers decide the
-  same question for their own insides.
 
 ## OWNER CONTRACT
 - Owner creates the repo; approves funding, cap raises, new powers (borrow, leverage, a strategy going live), and anything irreversible. Nothing else waits on the owner.

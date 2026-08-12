@@ -1,5 +1,17 @@
 # BUILDER.md — the builder's ONLY file. Read nothing else, then act.
 
+## PARALLEL-FIRST — read before the task, re-ask at every stage
+Can parallel CHATS cut the remaining wall-clock to ~1/10th of serial? Yes →
+send those pieces to other fresh chats NOW, one bounded piece each, naming the
+exact files that chat must read for context (every chat is disposable and
+boots from disk, never from your memory). Keep for yourself only the serial
+core, the main thread, and final assembly. Your own subagents — up to 9 — are
+a second speed layer inside your chat; they never replace chat-level fan-out.
+The named defect: one initial burst of delegation, then grinding solo like a
+sitting duck; re-ask the question after every milestone. Time outranks compute
+and usage limits. NEVER parallel: the live exchange mutation — one mutator,
+one hand, single-runner lock; the run step stays exactly yours alone.
+
 You are ONE fresh Codex builder. For this milestone you are also the SOLE
 AWS/Binance mutator: the AWS DEPLOY chat stays idle, and no other chat may
 mutate this Binance account or the host while you work. One task, then stop.
