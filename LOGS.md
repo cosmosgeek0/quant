@@ -9,6 +9,16 @@ every step.
 
 ---
 
+UI LANE 2026-08-13 | read-only screen, code commit 5407d77a on lane/ui, base 1aa1e018 | evidence ui/verify.py | BUILT
+render | expected every fixture event on screen | found 9/9 rows via page's own render fn headless (CLOSED run 7 + rejected run 2) | PASS
+live price | expected unsigned public BTCUSDT GET usable from page | found HTTP 200 + allow-origin * + valid price | PASS
+controls | expected one refresh control, no dead buttons | found exactly 1 button, wired to price endpoint | PASS
+empty states | expected honest nothing-yet for futures/volume | found 2 plain empty states, no fake cards | PASS
+serve | expected local HTTP 200 on all 4 assets then stop | found 200 x4 on 127.0.0.1:8901, server stopped | PASS
+first failure | none | verify passed on first run | PASS
+note | dispatch said 7 fixture events | file holds 9; 7 belong to the CLOSED run; all 9 rendered | RECORDED
+verdict | DONE, not pushed, not merged | screenshot/pixel look not checked (headless only) | DONE
+
 FIRST SPARSE-V3 FIX 2026-08-13 | expected code repair only | found base 53fd337e | IN_PROGRESS
 scope | expected src/futures_hand.py + LOGS.md only | found no live or external action | PASS
 first failure | expected repository test-manifest scan | found unmatched README glob stopped scan | CORRECTED
