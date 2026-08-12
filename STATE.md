@@ -1,75 +1,61 @@
 # STATE.md — current truth, one page, overwritten in place
 
-PROJECT: quant — the owner's money system. Strategies: basis first, volume second.
-BORN: 2026-08-10. Folder: Desktop/quant. Git: LIVE since 2026-08-12 — first commit
-5fa5fea "Initial quant project" on main, pushed to github.com/cosmosgeek0/quant,
-working tree clean, .gitignore excludes .env from birth (verified: .env ignored
-before any key exists; no secret has ever entered a commit or the remote). The
-one-device open risk is CLOSED — unique work now has history and a remote.
+PROJECT: quant — the owner's money system. Strategies: basis first, volume
+second. BORN: 2026-08-10. Folder: Desktop/quant. Git LIVE since 2026-08-12:
+first commit 5fa5fea on main, remote github.com/cosmosgeek0/quant. .gitignore
+has excluded .env from birth; no secret has ever entered a commit or the
+remote; no credential exists on this Mac.
 
-WHAT EXISTS: the five governance files (LEAD, BUILDER, TASK, LOGS, STATE).
-Also on disk: aws-connect/ — owner-placed WORKERS' tools (ssmrun.sh, xfer.sh:
-run scripts / transfer files on the EC2 execution host over SSM). Rail verified
-2026-08-12 from this Mac (account …7436, instance …63a9, ap-south-1; remote
-user ssm-user). xfer.sh's dead helper path fixed 2026-08-12 — now self-locating.
-HOST (measured by the AWS DEPLOY seat 2026-08-12, owner-relayed): t3a.large
-…63a9 running, health OK; restricted IAM operator (StartSession only, cannot
-see wider account); zero inbound rules, Cloudflare Tunnel active; CloudWatch +
-SSM agents on; 200-GiB encrypted volume ~13 GiB used. A separate cosmos-app
-Node service (the old project) runs on 127.0.0.1:8080 there — never confused
-with quant, untouched until the owner directly orders. Quant itself: NOT
-deployed. AWS DEPLOY (persistent Codex task) owns all AWS/host execution and
-deploys only an owner-named committed SHA, keeping rollback.
-Product code: src/spot_roundtrip.py — PROVEN LIVE 2026-08-12 (one CLOSED round
-trip, one correct pre-BUY refusal). Exchange credentials: workers' domain on
-the execution host, working there as of the run.
+RESET 2026-08-13 (direct owner order, in-channel): TASK B cancelled;
+OWNER_ORDER_PARALLEL_WAVE_2 cancelled. Owner-fixed facts: main =
+72d88b565d67b038c9979facb6845d3e9e188c48 at reset; NO bot deployed; NO
+Futures trade has ever completed. The old Task-A/Task-B worker is stopped and
+was never the lead; a fresh operational Lead holds the seat. Process truth
+(measured 2026-08-13): no Task-B process on the Mac; no quant unit, timer,
+unit file, process, or cron entry on the host.
 
-FIRST MONEY MOVED — 2026-08-12T16:01Z, verdict CLOSED (LOGS.md top entry;
-receipt on the execution host). One real BTCUSDT round trip at commit d1b204b
-under a 10 USDT ceiling: bought 0.00015 BTC (9.51796950 USDT), sold 0.00014
-back (8.88343680 USDT), residual 0.00000985 BTC dust below the sell step, no
-open orders, no failures. Quote-side cost 0.64341614 USDT, of which ~0.62 is
-the retained dust's value — true round-trip friction ≈ 0.02 USDT. An earlier
-5 USDT attempt was correctly REFUSED before the BUY (sufficient minimum
-~6.28 USDT reported) — the guard works live. The hand is PROVEN: receipt +
-exchange states + balances + LOGS entry agree.
-NOW (2026-08-12T17:42Z): LANES INTEGRATED — main @ 19deb1b, local = GitHub,
-worktree registry clean. The quant can now: read live spot+futures basis gaps
-(market_reads), snapshot both wallets (wallet — real snapshot taken), emit
-contract-v1 events from real receipts (events — 7/7 valid), and holds a
-complete capped futures hand (futures_hand) that has never traded. L5 found 4
-real defects (2 HIGH in wallet, 2 MEDIUM); the integrator repaired all before
-merge and added a compiled USDT<=10 transfer ceiling. No live orders,
-transfers, or permission changes happened.
-THE ONE BLOCKER (measured): the account's Futures capability is DISABLED —
-signed futures read returned canTrade=false. Owner act (~2 min): enable
-Futures on the sub-account + futures permission on the key. Then, on standing
-permission: minimum futures open/close, then one minimum-size basis cycle.
-PARKED, non-merged, awaiting owner words someday: L6 reverse-basis spec
-(needs borrow power), L7 volume map (paper-only, unproven), L8's seven
-old-project import candidates (per-item permits).
+QUARANTINE: the Task-B draft — src/host_once.py, deploy/ unit templates,
+tests/, edits to wallet.py, futures_hand.py, events.py, plus 10 LOGS rows —
+sits uncommitted in Desktop/quant, held unchanged: no merge, delete, deploy,
+run, or repair. All wave work runs in clean worktrees from the reset SHA. One
+un-retired worktree remains: ~/.codex/worktrees/2ae9/quant @ dd474b2 (blocked
+futures task; its branch is pushed to origin); retirement awaits a later word.
 
-WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
-spot↔USD-M gap itself); then one full basis cycle at minimum size, including
-partial-fill and one-leg cancel/close handling and a reduce-only futures close.
-Volume stays paper until basis proves the hand; go-live or scale also needs an
-untouched, parameter-frozen holdout with multiplicity accounted for.
+WHAT EXISTS: five governance files; aws-connect/ SSM tools (rail verified
+2026-08-12; account …7436, instance …63a9, ap-south-1). EC2 host healthy,
+zero inbound, tunnel active; the old project's separate cosmos-app service
+runs there untouched; quant itself NOT deployed. Committed product code:
+src/spot_roundtrip.py (PROVEN LIVE), market_reads.py, wallet.py,
+futures_hand.py, events.py; ui/fixtures/events.jsonl (contract v1).
+Credentials live only on the host, read only by the running program.
 
-THE OLD PROJECT: preserved at github.com/cosmosgeek0/arbitrage-cosmos (owner
-word 2026-08-12) — ~a million lines; most of it does not work right; its tests,
-proofs, and receipts are inside. That repo is the donor shelf: WORKERS pull
-single donor pieces from it when their task needs one (donor law, LEAD.md wall
-17). The Lead does not touch the old repo for now. Locally it is gone — off the
-Desktop, Mac ports quiet (measured 2026-08-12) — but its cosmos-app service
-still RUNS on the EC2 host (127.0.0.1:8080, Cloudflare Tunnel): AWS DEPLOY's
-domain, untouched. Standing
-owner prohibition survives in every location: _TRASH and the two forbidden
-files (FINAL_M0_MEGA_BURST_CONTROL_ORDER.md, M0_PRODUCT_LOCK_MAP.md) are never
+FIRST MONEY MOVED — 2026-08-12T16:01Z, verdict CLOSED (LOGS.md; receipt on
+the host). One real BTCUSDT round trip at d1b204b under a 10 USDT ceiling;
+true round-trip friction ≈ 0.02 USDT plus ~0.62 retained dust value; an
+earlier 5 USDT attempt was correctly REFUSED before the BUY. The spot hand is
+PROVEN by the four-way match.
+
+FUTURES: capability last measured 2026-08-12 canTrade=false; the owner has
+since reported enabling it — UNVERIFIED, no fresh preflight run. No futures
+order, live or test, has ever been sent. USD-M wallet held 1.00000000 USDT at
+the last snapshot; its origin was a 2026-07-20 internal transfer (LOGS).
+
+NOW RUNNING — PRODUCT WAVE (orders in TASK.md): four lanes in clean worktrees
+from the reset SHA — BASIS-READ, FUTURES-SHORT (offline), VOLUME (paper), UI
+(read-only). No host runner, no live action this wave. The Lead integrates
+the smallest src/basis_cycle.py after BASIS-READ and FUTURES-SHORT land.
+
+PARKED, awaiting owner words someday: L6 reverse-basis spec (needs borrow
+power); L8's seven old-project import candidates (per-item permits); the
+Codex worktree retirement above.
+
+THE OLD PROJECT: preserved at github.com/cosmosgeek0/arbitrage-cosmos — the
+donor shelf (LEAD.md wall 17); the Lead does not touch it. Its cosmos-app
+service still runs on the EC2 host: AWS DEPLOY's domain, untouched. Standing
+prohibition survives everywhere: _TRASH and the two forbidden files are never
 listed, opened, or quoted by any seat.
 
-OWNER'S STANDING WORDS: money first; owner approves funding, cap raises, and new
-powers; owner gets plain-word updates at every step; no ceremony anywhere. Most
-work runs through Codex builders on proper small tasks; the operational Lead
-(replaced constantly) keeps that stream moving and translates; a standing
-milestone lead moves bigger milestones; the Lead seat stays grounded — self-check
-before every dispatch, write, and DONE (LEAD.md wall 19).
+OWNER'S STANDING WORDS: money first; owner approves funding, cap raises, and
+new powers; plain-word updates at every step; no ceremony; workers build the
+pieces while the Lead — this wave — is also the integrator; the Lead stays
+grounded: self-check before every dispatch, write, and DONE (LEAD.md wall 19).
