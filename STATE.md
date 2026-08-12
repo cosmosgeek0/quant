@@ -20,14 +20,18 @@ Node service (the old project) runs on 127.0.0.1:8080 there — never confused
 with quant, untouched until the owner directly orders. Quant itself: NOT
 deployed. AWS DEPLOY (persistent Codex task) owns all AWS/host execution and
 deploys only an owner-named committed SHA, keeping rollback.
-No product code yet. Nothing has traded in this program. Exchange credentials:
-workers' domain on the execution host — their state there unverified by seats.
+Product code: src/spot_roundtrip.py (baseline, never run live). Nothing has
+traded in this program. Exchange credentials: workers' domain on the execution
+host — their state there unverified by seats.
 
-CURRENT WORK: the smallest configurable Spot round-trip program — spec lives in
-BUILDER.md, the worker's ONLY file. Execution runs on the existing EC2
-connection (quant/aws-connect); credentials are the workers' domain on that
-host. Commit+push before the live run, run once, real exchange result into
-LOGS.md. No gates.
+CURRENT WORK (owner instruction FABLE_FIRST_MONEY_LOOP, consumed 2026-08-12):
+src/spot_roundtrip.py — the complete one-file first money loop, written by the
+Lead as a baseline and adversarially verified. BUILDER.md is now the bounded
+review-and-run task for ONE fresh Codex builder: review the baseline against
+the Binance docs, fix only loop-blocking defects, commit+push, then stop and
+ask the owner for SYMBOL and MAX_QUOTE plus one execute-question naming the
+exact SHA. That builder is the SOLE AWS/Binance mutator for this milestone;
+AWS DEPLOY stays idle. Receipt goes outside git. Nothing has run live.
 
 WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
 spot↔USD-M gap itself); then one full basis cycle at minimum size, including

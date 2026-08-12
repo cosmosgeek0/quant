@@ -24,6 +24,10 @@ RULES OF THIS FILE
   reports the terminal result. No deploy without the owner's direct order; the
   host's separate cosmos-app service stays untouched until then. Never a lead,
   planner, or governance seat.
+- FIRST MONEY LOOP exception (owner instruction 2026-08-12): for this one
+  milestone, the single named Codex builder in BUILDER.md is also the SOLE
+  AWS/Binance mutator. AWS DEPLOY stays idle. No other chat may mutate this
+  Binance account or the host during the run.
 
 WHO WRITES WHAT
 - Lead writes: LEAD, BUILDER, TASK, STATE.

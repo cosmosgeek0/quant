@@ -1,38 +1,67 @@
-# BUILDER.md — the worker's ONLY file. Read nothing else.
+# BUILDER.md — the builder's ONLY file. Read nothing else, then act.
 
-You are a fresh Codex worker. This file is your whole world: the task and the
-rules are below; when your LOGS.md rows are written, you stop. Do not read other
-chats, other markdown files, the old repo, or anything not named here.
+You are ONE fresh Codex builder. For this milestone you are also the SOLE
+AWS/Binance mutator: the AWS DEPLOY chat stays idle, and no other chat may
+mutate this Binance account or the host while you work. One task, then stop.
 
-## THE TASK
-Repo: github.com/cosmosgeek0/quant (local checkout: Desktop/quant).
-Write the smallest CONFIGURABLE Spot round-trip program in quant/src/:
-- Config (env vars or one small config file in quant/src/): symbol and quote
-  amount. Nothing hardcoded.
-- Flow, run once end to end: buy the smallest exchange-valid amount of the
-  configured symbol → confirm the fill by querying your own unique
-  client-order-id → sell back to flat → verify flat via balances → report the
-  real exchange result: orders, fills, fees, final balances.
-- The execution connection already exists: quant/aws-connect/ssmrun.sh runs a
-  script on the execution host; xfer.sh transfers files to it. Use it.
-  Credentials are handled on the execution host side — if none work there,
-  report exactly that as your result and stop; never ask for keys in chat.
-- Commit and push your code on main BEFORE the live run. Run once. Write your
-  LOGS.md rows. Stop.
+## THE TASK — review the baseline, then one real run
+Baseline: src/spot_roundtrip.py at commit d7d2b8a3ce5d691877186977b2ee38ab5685132c
+(github.com/cosmosgeek0/quant, local checkout Desktop/quant). It is a complete
+one-file program: one Binance Spot market BUY capped by MAX_QUOTE, confirmed by
+its own client order id; one market SELL of only what that BUY acquired; one
+JSON receipt outside git; truth-gated verdict CLOSED / OPEN_EXPOSURE /
+REJECTED_BEFORE_BUY / UNKNOWN. It exceeds the 350-line target because an
+adversarial review's 11 blocker fixes went in (reason recorded in its
+docstring); do not trim it back at the cost of any of those behaviors.
 
-## RULES — each one is a paid scar, not ceremony
-- Every order carries a unique client-order-id. Unclear response → query that
-  id before ANY retry. A blind resend double-buys.
-- Never print, paste, copy, or move credential values, anywhere.
-- Touch only quant/src/** and LOGS.md.
-- The host runs a separate cosmos-app service. Never touch, stop, or
-  port-collide with it.
-- No new markdown files, no tests, no UI, no frameworks, no extra features.
-- Smallest complete program; one chat; report honestly what the exchange
-  actually did, including failures. UNKNOWN stays UNKNOWN — never reported as
-  success.
-- A passing rerun never erases a first failure: name the first red in your rows.
+1. REVIEW the baseline against the real Binance Spot REST docs:
+   https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/trade
+   https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/account
+   https://developers.binance.com/en/docs/products/spot/filters
+   https://developers.binance.com/en/docs/products/spot/faqs/commission_faq
+   Fix ONLY defects that block the real loop: wrong endpoint/param/signing,
+   filter misreads, Decimal errors, lifecycle holes. No refactors, no renames,
+   no features, no new files, no tests, no classes. A Binance test-order call
+   is already inline; it is never a milestone — the same run continues to the
+   real order.
+2. COMMIT and PUSH on main.
+3. STOP and ask the owner for exactly two values:
+   SYMBOL=<exact Spot symbol>   MAX_QUOTE=<max quote the BUY may spend>
+   Then show the exact committed SHA and ask one question, verbatim:
+   "Execute this SHA once on SYMBOL with a BUY ceiling of MAX_QUOTE?"
+   Read-only inspection is allowed before the answer. No real order is.
+4. On the owner's yes: run the committed version ONCE on the execution host
+   through the existing helpers (quant/aws-connect/ssmrun.sh runs a script on
+   the host; xfer.sh transfers files). Export SYMBOL, MAX_QUOTE, and
+   QUANT_SHA=<the full committed SHA> for the process; credentials already
+   live on the host side — never open, print, copy, or relay them. MAX_QUOTE
+   is a hard ceiling: if filters make it invalid or too small to sell back,
+   the program stops before the BUY and reports the sufficient minimum —
+   relay that to the owner and STOP. Never raise the amount yourself.
+5. Write the real result into LOGS.md (shape below). Stop. After the first
+   live attempt — success, rejection, exposure, or unknown — no refactor, no
+   retry, no second run. The owner picks the next task from what the exchange
+   actually taught.
 
-## YOUR LOGS.md ROWS — newest on top, ≤ 10 lines, plain rows, no secrets
-what ran | commit hash last-8 | order ids last-4 | fills + fees | final
-balances | failures named (or none)
+## UNKNOWN-RESULT RULE — binding
+A timeout or error response does not prove Binance rejected an order. Never
+blindly resend a mutating request; query the same client order id — it is a
+reconciliation key, not permission to resend. If Binance truth cannot be
+established: report UNKNOWN, submit nothing else, state the possible remaining
+exposure, stop. A failed SELL or unresolved BUY never justifies an invented
+repair trade — report the exact exposure and wait for the owner.
+
+## HANDS OFF
+- The host's separate cosmos-app service: never touch, stop, or port-collide.
+- Touch only src/spot_roundtrip.py and LOGS.md. No transfers, Futures, Margin,
+  strategies, repetition, or infrastructure of any kind.
+- The program refuses to run over an unreconciled prior receipt or a standing
+  run.lock in RECEIPT_DIR — that refusal is law, not an error to code around.
+
+## YOUR LOGS.md ROWS — newest on top, ≤ 20 lines, plain rows, no secrets
+full commit SHA | symbol + approved ceiling | BUY and SELL client + order ids
+(last-4) | terminal order states | executed quantities + quote totals |
+commissions grouped by asset | starting and final base/quote balances | base
+introduced by this run remaining after the SELL | remaining open orders |
+first failure, if any | verdict: CLOSED / OPEN_EXPOSURE /
+REJECTED_BEFORE_BUY / UNKNOWN
