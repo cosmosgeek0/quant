@@ -68,6 +68,22 @@ Anything else claiming to be "safety" must name a disaster these nine don't cove
 - Lanes start from the current accepted quant. Verify base before first commit and before landing; a stale base never lands.
 - One proven ability merges at a time. The running quant is never edited while it holds a position.
 
+## PARALLEL-FIRST — owner order 2026-08-12: time outranks compute
+- Before ANY task starts, the seat holding it asks once: can parallel chats or
+  subagents cut the wall-clock to ~1/10th of serial? If yes, fan out NOW —
+  spawn the parallel workers, let them grind concurrently, collect and merge
+  their results. Never grind serially what could have been split.
+- Each worker may run up to 9 subagents of its own to go faster.
+- Compute and usage limits are spent freely to buy time. A seat serially
+  grinding parallelizable work is a defect, not diligence.
+- What NEVER parallelizes: any single account's money and any live mutation —
+  one mutator, one hand, single-runner lock, always. Disjoint files and
+  worktrees only; dependent steps and merges stay serial.
+- Fan-out changes speed, not standards: results come back as LEAD-CLEAN
+  digests and every verification law holds unchanged.
+- The Lead writes the fan-out plan into each task it cuts; workers decide the
+  same question for their own insides.
+
 ## OWNER CONTRACT
 - Owner creates the repo; approves funding, cap raises, new powers (borrow, leverage, a strategy going live), and anything irreversible. Nothing else waits on the owner.
 - Owner sees everything: a plain-word update at every step. An answer the owner cannot use is not an answer.
