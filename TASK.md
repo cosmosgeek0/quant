@@ -1,5 +1,21 @@
 # TASK.md — current work orders
 
+NOW — LIVE PROOF: FUTURES MINIMUM OPEN/CLOSE (futures enabled by owner act
+2026-08-12; standing permission covers the run). ONE Codex worker, committed
+tree only (record exact main SHA as QUANT_SHA):
+1. src/wallet.py internal transfer Spot→USD-M, receipted, inside its compiled
+   10-USDT ceiling — just enough margin for the minimum plan, nothing more.
+2. src/futures_hand.py: ONE minimum open + reduce-only close on its validated
+   plan symbol; own client-ID prefix; notional <= 10 USDT; leverage 1x; its
+   own preflight re-measures canTrade before anything.
+3. One receipt per act on the host + LOGS.md rows (LEAD-CLEAN). STOP after one
+   open/close. No repeat, no basis cycle in this task.
+Disjointness: this worker owns its plan coin and the wallet-transfer action
+until flat and receipted. The UNKNOWN rule binds: never resend blind, report
+exposure, no repair trades.
+NEXT BUILD after this proof lands: the coordinated basis cycle (spot leg +
+futures leg), cut as a fresh task.
+
 DONE 2026-08-12: first money loop CLOSED at d1b204b (numbers in LOGS.md).
 Never re-run src/spot_roundtrip.py live without a direct owner order naming a
 SHA — a repeat spends real money.
@@ -54,7 +70,6 @@ L9 UI GROUNDWORK  | the UI WORK chat, designing WITH the owner | fixture =
 L10 INTEGRATOR    | merges lane branches to ONE candidate SHA after L5
    reports | evidence: candidate SHA + clean build
 
-LIVE PROOF ORDER after integration — standing permission, no owner word per
-run: minimum futures open/close (blocked only on the owner's futures-permission
-act on the key — a new power; Old Lead calls its timing), then one complete
-minimum-size basis cycle.
+LIVE PROOF ORDER — step one is the NOW order at the top of this file (futures
+unblocked 2026-08-12); step two, the minimum-size basis cycle, is cut as a
+fresh task after step one's receipt lands.
