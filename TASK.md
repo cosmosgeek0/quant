@@ -6,24 +6,24 @@ timer/service running committed code under standing permission. No human
 run-steps, no per-trade judgment by any chat. Human-executor structures are
 the old disease: kill on sight.
 
-NOW — ONE Codex worker, code + host setup, no ceremony:
-1. Fix src/futures_hand.py flat-truth: a sparse/zero-row V3 position response
-   IS flat (documented shape); change nothing else; keep every other guard;
-   commit+push.
-2. Build the machine trigger: one small host-side runner (systemd unit or
-   timer on the EC2 host) that executes the committed sequence ONCE —
-   signed GET preflight (stop + record BLOCKED if canTrade is not true) →
-   src/wallet.py one receipted Spot→USD-M transfer inside its 10-USDT
-   ceiling → src/futures_hand.py ONE minimum open + reduce-only close,
-   validated plan symbol, own client-ID prefix, notional <= 10 USDT,
-   leverage 1x — receipts + events.jsonl on the host. Arm it. The HOST
-   executes; no chat and no human presses the trigger.
-3. Reconcile the receipts into LOGS.md rows (LEAD-CLEAN). Stop. No repeat,
-   no basis cycle in this task.
-Committed tree only (QUANT_SHA = main HEAD at arm time). UNKNOWN rule binds:
-never resend blind, report exposure, no repair trades. Disjointness binds:
-this lifecycle owns its plan coin and the wallet action until flat and
-receipted.
+NOW — TASK A, one fresh worker, this and NOTHING else: change ONLY
+src/futures_hand.py — a sparse/zero-row V3 position response IS flat
+(documented shape); keep every other guard — plus one focused existing test.
+Commit, push, one LOGS row, STOP. No scheduler, no AWS, no Binance calls, no
+governance edits, no audit campaign. A prior worker audited instead of fixing;
+do not repeat that: the diff is the deliverable.
+
+THEN — TASK B, a separate worker, cut only after A's commit lands: the machine
+trigger. One small host-side runner (timer/service on the EC2 host) that
+executes the committed sequence ONCE — signed GET preflight (stop + record
+BLOCKED if canTrade is not true) → src/wallet.py one receipted Spot→USD-M
+transfer inside its 10-USDT ceiling → src/futures_hand.py ONE minimum open +
+reduce-only close, validated plan symbol, own client-ID prefix, notional <=
+10 USDT, leverage 1x — receipts + events.jsonl on the host. Arm it; the HOST
+executes; no chat and no human presses the trigger. Then reconcile receipts
+into LOGS rows. Committed tree only (QUANT_SHA = main HEAD at arm time).
+UNKNOWN rule binds; disjointness binds: this lifecycle owns its plan coin and
+the wallet action until flat and receipted.
 
 ## EVENT CONTRACT v1 — frozen 2026-08-12; grows only on owner word; 1 page max
 One JSON object per line, appended to events.jsonl on the execution host; the
