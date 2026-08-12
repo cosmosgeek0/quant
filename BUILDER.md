@@ -35,6 +35,18 @@ until flat.
 - Continue from the exact unfinished milestone. Never redispatch completed
   work, rerun money code, or invent a new plan because context compacted.
 
+## TASK ARCHIVE LAW — owner order 2026-08-12
+- A worker task stays visible while unfinished, blocked, under review, or not
+  yet incorporated into the accepted candidate/consolidated record.
+- After its work is done AND incorporated (or its deliberate non-merge result
+  is captured in the consolidated record), archive that worker task promptly.
+- Never archive merely because a worker stopped; proof of incorporation or
+  recorded disposition comes first.
+- The active main dispatcher/owner-facing worker is the exception: never
+  auto-archive it. It stays visible until the owner directly says otherwise.
+- Before archiving, record lane, final SHA, verdict, evidence/disposition, and
+  confirm no unfinished follow-up remains in that task.
+
 ## YOUR TASK — YOU ARE THE DISPATCHER
 Standing warning first: the first money loop is COMPLETE (CLOSED, d1b204b,
 LOGS.md). src/spot_roundtrip.py is NEVER run live again without a direct owner
@@ -51,8 +63,9 @@ a lane yourself.
 3. L9 belongs to the UI WORK chat — do not spawn it. Spawn L10 (integrator)
    only after L5 reports.
 4. Watch, collect each lane's LOGS.md row, chase honest completion — then
-   report ONE consolidated result and stop. If a lane stalls, respawn it
-   fresh rather than grinding its work yourself.
+   archive each completed incorporated worker task, report ONE consolidated
+   result, and stop. If a lane stalls, respawn it fresh rather than grinding
+   its work yourself; keep stalled/unincorporated tasks visible.
 
 ## RULES — each one is a paid scar, not ceremony
 - Touch only the files your dispatch names, inside your own worktree.
