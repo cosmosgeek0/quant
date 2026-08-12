@@ -33,12 +33,17 @@ the retained dust's value — true round-trip friction ≈ 0.02 USDT. An earlier
 5 USDT attempt was correctly REFUSED before the BUY (sufficient minimum
 ~6.28 USDT reported) — the guard works live. The hand is PROVEN: receipt +
 exchange states + balances + LOGS entry agree.
-NOW: per the owner instruction, everyone stops — no refactor, no second run
-unordered. The next task is chosen from what the exchange taught. Banked
-lessons: at tiny size, step-flooring dominates cost (one step ≈ 0.63 USDT
-held back as dust); the refusal + minimum-reporting machinery is proven.
-Next candidates (unchanged): basis read → one full basis cycle at minimum
-size.
+NOW: the commander's parallel plan is ADOPTED (Old Lead verdict + owner word,
+2026-08-12). The repeat-trade trap is DEFUSED: TASK.md and BUILDER.md no
+longer order the completed trade; a fresh chat reading them stops. Structure:
+~12 disjoint lanes as parallel Codex chats from Desktop worktrees; ONE
+dispatcher spawns/watches and returns one result; ONE integrator merges to
+one candidate SHA; ONE owner-ordered live money-toucher. Live proof order:
+minimum futures open/close, then one complete minimum-size basis cycle.
+PENDING: event contract + lane manifest frozen from the commander's plan
+text; owner's word on UI WORK; later owner act — futures permission on the
+key (Old Lead calls the timing). Banked lessons stand: step-flooring
+dominates cost at tiny size; refusal machinery proven.
 
 WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
 spot↔USD-M gap itself); then one full basis cycle at minimum size, including

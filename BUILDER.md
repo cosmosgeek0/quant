@@ -4,79 +4,43 @@
 Can parallel CHATS cut the remaining wall-clock to ~1/10th of serial? Yes →
 send those pieces to other fresh chats NOW, one bounded piece each, naming the
 exact files that chat must read for context (every chat is disposable and
-boots from disk, never from your memory). Keep for yourself only the serial
-core, the main thread, and final assembly. Your own subagents — up to 9 — are
-a second speed layer inside your chat; they never replace chat-level fan-out.
-The named defect: one initial burst of delegation, then grinding solo like a
-sitting duck; re-ask the question after every milestone. Time outranks compute
-and usage limits. NEVER parallel: the live exchange mutation — one mutator,
-one hand, single-runner lock; the run step stays exactly yours alone.
+boots from disk, never from your memory). A fan-out is itself a task for ONE
+dispatcher chat: it spawns the parallel chats, watches, never grinds, and
+returns one consolidated result. Keep for yourself only the serial core, the
+main thread, and final assembly. Your own subagents — up to 9 — are a second
+speed layer inside your chat; they never replace chat-level fan-out. The named
+defect: one initial burst of delegation, then grinding solo like a sitting
+duck; re-ask after every milestone. Time outranks compute and usage limits.
+NEVER parallel: any live exchange mutation — one mutator, one hand, always.
 
-You are ONE fresh Codex builder. For this milestone you are also the SOLE
-AWS/Binance mutator: the AWS DEPLOY chat stays idle, and no other chat may
-mutate this Binance account or the host while you work. One task, then stop.
-If your context compacts mid-task: silently re-read this file whole and your
-own last LOGS.md row, then continue exactly where you stood — compaction is
-never a reason to stop, ask, re-plan, or start over.
+## STATUS — NO OPEN TASK IN THIS FILE
+The first money loop is COMPLETE: verdict CLOSED, 2026-08-12, commit d1b204b,
+top entry in LOGS.md. src/spot_roundtrip.py is NEVER run against the live
+exchange again without a direct owner order naming a SHA — a repeat spends
+real money. If you are a fresh chat reading this without a dispatch message
+naming your lane: STOP. Do nothing. Reply that no task is open here.
 
-## THE TASK — review the baseline, then one real run
-Baseline: src/spot_roundtrip.py at commit d7d2b8a3ce5d691877186977b2ee38ab5685132c
-(github.com/cosmosgeek0/quant, local checkout Desktop/quant). It is a complete
-one-file program: one Binance Spot market BUY capped by MAX_QUOTE, confirmed by
-its own client order id; one market SELL of only what that BUY acquired; one
-JSON receipt outside git; truth-gated verdict CLOSED / OPEN_EXPOSURE /
-REJECTED_BEFORE_BUY / UNKNOWN. It exceeds the 350-line target because an
-adversarial review's 11 blocker fixes went in (reason recorded in its
-docstring); do not trim it back at the cost of any of those behaviors.
+Next-phase lane tasks arrive as DISPATCH MESSAGES naming: your lane, your base
+SHA, your worktree, your exact files, and the evidence you must return. Your
+dispatch is your task; this file is your law.
 
-1. REVIEW the baseline against the real Binance Spot REST docs:
-   https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/trade
-   https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/account
-   https://developers.binance.com/en/docs/products/spot/filters
-   https://developers.binance.com/en/docs/products/spot/faqs/commission_faq
-   Fix ONLY defects that block the real loop: wrong endpoint/param/signing,
-   filter misreads, Decimal errors, lifecycle holes. No refactors, no renames,
-   no features, no new files, no tests, no classes. A Binance test-order call
-   is already inline; it is never a milestone — the same run continues to the
-   real order.
-2. COMMIT and PUSH on main.
-3. STOP and ask the owner for exactly two values:
-   SYMBOL=<exact Spot symbol>   MAX_QUOTE=<max quote the BUY may spend>
-   Then show the exact committed SHA and ask one question, verbatim:
-   "Execute this SHA once on SYMBOL with a BUY ceiling of MAX_QUOTE?"
-   Read-only inspection is allowed before the answer. No real order is.
-4. On the owner's yes: run the committed version ONCE on the execution host
-   through the existing helpers (quant/aws-connect/ssmrun.sh runs a script on
-   the host; xfer.sh transfers files). Export SYMBOL, MAX_QUOTE, and
-   QUANT_SHA=<the full committed SHA> for the process; credentials already
-   live on the host side — never open, print, copy, or relay them. MAX_QUOTE
-   is a hard ceiling: if filters make it invalid or too small to sell back,
-   the program stops before the BUY and reports the sufficient minimum —
-   relay that to the owner and STOP. Never raise the amount yourself.
-5. Write the real result into LOGS.md (shape below). Stop. After the first
-   live attempt — success, rejection, exposure, or unknown — no refactor, no
-   retry, no second run. The owner picks the next task from what the exchange
-   actually taught.
-
-## UNKNOWN-RESULT RULE — binding
-A timeout or error response does not prove Binance rejected an order. Never
-blindly resend a mutating request; query the same client order id — it is a
-reconciliation key, not permission to resend. If Binance truth cannot be
-established: report UNKNOWN, submit nothing else, state the possible remaining
-exposure, stop. A failed SELL or unresolved BUY never justifies an invented
-repair trade — report the exact exposure and wait for the owner.
-
-## HANDS OFF
+## RULES — each one is a paid scar, not ceremony
+- Touch only the files your dispatch names, inside your own worktree.
+- Read-only / look-ahead lanes create NO repo markdown files — notes live in
+  your branch for the integrator. Documents breeding is how the old disease
+  started.
+- A finished worktree retires via git worktree remove, THEN the folder goes
+  to trash. Dragging the folder alone leaves rot in git's registry.
+- If your context compacts mid-task: silently re-read this file whole, your
+  dispatch, and your last LOGS.md row, then continue exactly where you stood.
 - The host's separate cosmos-app service: never touch, stop, or port-collide.
-- Touch only src/spot_roundtrip.py and LOGS.md. No transfers, Futures, Margin,
-  strategies, repetition, or infrastructure of any kind.
-- The program refuses to run over an unreconciled prior receipt or a standing
-  run.lock in RECEIPT_DIR — that refusal is law, not an error to code around.
+- Never print, paste, copy, or move credential values, anywhere.
+- Any future money task: unique client-order-id, query that id before ANY
+  retry (a blind resend double-buys), UNKNOWN stays UNKNOWN, no repair trades,
+  report exposure and stop. One mutator, one hand, single-runner lock.
+- Report honestly what actually happened, including failures. A passing rerun
+  never erases a first failure.
 
-## YOUR LOGS.md ROWS — newest on top, ≤ 20 lines, plain rows, no secrets
-full commit SHA | symbol + approved ceiling | BUY and SELL client + order ids
-(last-4) | terminal order states | executed quantities + quote totals |
-commissions grouped by asset | starting and final base/quote balances | base
-introduced by this run remaining after the SELL | remaining open orders |
-first failure, if any | verdict: CLOSED / OPEN_EXPOSURE /
-REJECTED_BEFORE_BUY / UNKNOWN
+## YOUR LOGS.md ROWS — newest on top, ≤ 10 lines, plain rows, no secrets
+lane + what ran | commit hash last-8 | evidence produced (paths) | failures
+named (or none) | verdict

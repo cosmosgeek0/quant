@@ -19,6 +19,14 @@ RULES OF THIS FILE
   new Codex chat) and keeps ONLY the serial core, the main thread, and final
   assembly for itself. Subagents — up to 9 per worker — are a second speed
   layer INSIDE each chat, never a substitute for chat-level fan-out.
+- A fan-out is itself a task for ONE dispatcher chat (owner order 2026-08-12):
+  told "run 50 chats," the Lead hands the whole fan-out to a single dispatcher
+  that spawns the chats, watches, never grinds, and returns one consolidated
+  result. The Lead babysits one dispatcher, never N workers.
+- Read-only / look-ahead lanes create NO repo markdown — notes live in their
+  branches for the integrator. A finished worktree retires via git worktree
+  remove, THEN its folder goes to trash (dragging alone leaves rot in git's
+  registry).
 - Every spawned worker is disposable and boots from disk: its dispatch names
   the exact files it must read for context. No worker leans on the
   dispatcher's memory.
