@@ -16,6 +16,25 @@ wallet action; each worker its own client-ID prefix and its own ceiling;
 collisions are harmless rejections; an open position keeps its coin exclusive
 until flat.
 
+## WORKER MODEL + ACCESS — owner order 2026-08-12
+- From the next newly created lane, respawn, or integrator onward: use
+  gpt-5.6-sol with ultra reasoning, standard speed; never fast mode.
+- Give each worker the full local-access environment available to the QUANT
+  project, while its dispatch and worktree remain the hard scope boundary.
+- Workers already running when this law landed continue; do not restart them
+  merely to change model settings.
+
+## COMPACTION BOOT — owner order 2026-08-12
+- After every context compaction, before another action, silently re-read this
+  BUILDER.md whole, then TASK.md's current manifest/contract, then the newest
+  LOGS.md rows, then measure git worktree/branch tips and active lane status.
+- Reconstruct the current dispatcher table from disk and task state: lane,
+  worktree, branch, base SHA, thread, latest evidence, blocker, next action.
+- Ask: "Am I on the right lane, and what current fact would make this plan
+  stale?" Disk and measured task state beat remembered context or bias.
+- Continue from the exact unfinished milestone. Never redispatch completed
+  work, rerun money code, or invent a new plan because context compacted.
+
 ## YOUR TASK — YOU ARE THE DISPATCHER
 Standing warning first: the first money loop is COMPLETE (CLOSED, d1b204b,
 LOGS.md). src/spot_roundtrip.py is NEVER run live again without a direct owner
@@ -43,7 +62,8 @@ a lane yourself.
 - A finished worktree retires via git worktree remove, THEN the folder goes
   to trash. Dragging the folder alone leaves rot in git's registry.
 - If your context compacts mid-task: silently re-read this file whole, your
-  dispatch, and your last LOGS.md row, then continue exactly where you stood.
+  dispatch, TASK.md, the newest LOGS.md rows, worktree tips, and active task
+  state, then continue exactly where you stood.
 - The host's separate cosmos-app service: never touch, stop, or port-collide.
 - Never print, paste, copy, or move credential values, anywhere.
 - Any money task: unique client-order-id, query that id before ANY retry (a
