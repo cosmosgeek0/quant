@@ -15,8 +15,8 @@ local access where settings exist. Record any new mistake before continuing:
 write only within named scope, or if strict read-only/no ownership, first relay
 one FABLE-CLEAN correction to the canonical owner. Final report must be
 FABLE-CLEAN."
-Execution boundary: the authorized human-controlled executor owns steps 1-2 below. The
-Codex worker owns preparation, non-mutating tests/audits, and step 3 receipt
+Execution boundary: the authorized human-controlled executor owns steps 1-3 below. The
+Codex worker owns preparation, non-mutating tests/audits, and step 4 receipt
 reconciliation; it says this boundary before accepting work and never initiates
 or mutates that live lifecycle.
 1. HUMAN EXECUTOR: run the committed signed GET-only capability preflight. If

@@ -164,9 +164,10 @@ Anything else claiming to be "safety" must name a disaster these nine don't cove
 - TASK.md carries the current task set; BUILDER.md carries worker law. Each owner-named atomic task or
   manifest lane gets one worker chat/worktree; disjoint named lanes run
   concurrently. Each write-enabled builder completes the full boot above, then
-  builds → commits+pushes → writes its LOGS.md row → retires under archive law.
-  Strict read-only workers relay one FABLE-CLEAN final; the dispatcher records
-  their disposition and retires them.
+  builds → commits+pushes → writes its LOGS.md row. The dispatch-designated
+  retirement owner then retires it under archive law. Strict read-only workers
+  relay one FABLE-CLEAN final; the dispatcher records their disposition, and
+  the dispatch-designated retirement owner retires them.
 - Most work is Codex work. The Lead keeps all disjoint named lanes fed and
   translates their results for the owner. A stalled lane queue is a Lead defect;
   a huge builder chat is a task cut too big.

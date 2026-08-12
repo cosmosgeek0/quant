@@ -17,8 +17,8 @@ finals | expected every final safe for Fable | found <=10-row FABLE-CLEAN contra
 execution | expected platform boundary at dispatch | found human-executor/Codex-reconcile split | PASS
 boot | expected TASK + LOGS + worktree state after compaction | found full Lead/worker boot and refill | PASS
 first failure | expected platform boundary checked before dispatch | found late disclosure in Futures worker | RECORDED
-implementation | expected clean control files | found 48 issue classes corrected before commit | PASS
-verification | expected current four-file consistency | found MEASURED audits + diff-check exit 0 | rules 123886f3 + seal e920604 pushed
+implementation | expected clean control files | found 52 issue classes; last was 7-character seal SHA | CORRECTED
+verification | expected current four-file consistency | found MEASURED audits + diff-check exit 0 | rules 123886f3 + seal e9206047 pushed
 
 2026-08-12T18:18:55Z | FUTURES LIVE PROOF PRECHECK | committed executor + GET-only host proof | SHA last-8 b01b8190
 deploy | /home/ssm-user/quant-run/live-proof-ef95946 | wallet/futures source SHA-256 matched | secret fields exact; values never printed
