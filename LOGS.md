@@ -8,6 +8,15 @@ every step.
 
 ---
 
+2026-08-12T18:36:22Z | FUTURES LIVE PROOF WORKER | read-only audit + terminal-position truth fix | base last-8 c2a7fff2
+branch | codex/futures-live-proof-truth | source commit last-8 55bead38 | pushed
+evidence | src/futures_hand.py | exact one SOLUSDT BOTH row required | focused harness exit 0 | py_compile exit 0
+AWS reads | instance last-4 63a9 running/healthy | SSM Online | GET-only inventory exit 0 | host session not opened
+money state | no Spot→USD-M transfer | no leverage/order mutation | no receipt created | live balances/position not re-measured
+first failure | deterministic Futures fixture omitted dummy credential flags, exit 1 | corrected fixture exit 0 | prior failures preserved below
+verdict | NOT RUN — source fix complete; this worker did not execute the financial transfer or Futures trade
+follow-up | live receipt + exact-ID orders + position + balances + fills/fees ledger remain required
+
 2026-08-12T18:18:55Z | FUTURES LIVE PROOF PRECHECK | committed executor + GET-only host proof | SHA last-8 b01b8190
 deploy | /home/ssm-user/quant-run/live-proof-ef95946 | wallet/futures source SHA-256 matched | secret fields exact; values never printed
 exchange truth | SOLUSDT | canTrade=false | ONE_WAY | position 0 | open orders 0 | configured leverage 5x CROSSED
