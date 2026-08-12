@@ -47,6 +47,18 @@ until flat.
 - Before archiving, record lane, final SHA, verdict, evidence/disposition, and
   confirm no unfinished follow-up remains in that task.
 
+## WORKER CONTACT LAW — owner order 2026-08-12
+- Before sending any mid-task message to a worker, read or wait for its newest
+  state and check the last message already sent to it.
+- Do not interrupt a running worker with repeated instructions, status nudges,
+  encouragement, or facts it already has. Let it reach its next milestone.
+- If a genuinely new correction, safety boundary, or blocker cannot wait, send
+  one concise consolidated message containing all of it; never drip-feed or
+  "slam-dunk" spam a worker with multiple follow-ups.
+- Prefer one dispatch, quiet observation, and one requested correction. A
+  worker asking for owner input may be surfaced, but it must not be answered by
+  another worker pretending to be the owner.
+
 ## YOUR TASK — YOU ARE THE DISPATCHER
 Standing warning first: the first money loop is COMPLETE (CLOSED, d1b204b,
 LOGS.md). src/spot_roundtrip.py is NEVER run live again without a direct owner
@@ -72,8 +84,13 @@ a lane yourself.
 - Read-only / look-ahead lanes create NO repo markdown files — notes live in
   your branch for the integrator. Documents breeding is how the old disease
   started.
-- A finished worktree retires via git worktree remove, THEN the folder goes
-  to trash. Dragging the folder alone leaves rot in git's registry.
+- After its task is done and incorporated/recorded, verify the worktree is
+  clean and its branch, final SHA, and disposition are recorded. Move that
+  exact worktree folder to a unique path inside /Users/cosmosgeek/.Trash/;
+  never use rm and never permanently delete the folder.
+- Only after the folder is safely present in Trash, clean its stale Git
+  worktree registration with the standard Git worktree-prune flow and confirm
+  the branch and commits remain. Never prune a live or unfinished worktree.
 - If your context compacts mid-task: silently re-read this file whole, your
   dispatch, TASK.md, the newest LOGS.md rows, worktree tips, and active task
   state, then continue exactly where you stood.
