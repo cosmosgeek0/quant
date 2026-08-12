@@ -9,6 +9,13 @@ every step.
 
 ---
 
+VOLUME 2026-08-13 | observer + paper lifecycle built | base 1aa1e018 branch lane/volume | DONE
+files | src/volume_observer.py + tests/test_volume_observer.py | new, stdlib only, Decimal money, PAPER ONLY | PASS
+live read | expected fixed-list 24h public rows | found 4 rows exit 0 in evidence/observe_run_20260813.txt | PASS
+paper run | expected entry + trail-stop exit receipts | found 2 records all paper:true in paper_receipts.jsonl | PASS
+tests | expected deterministic offline green | found 30 pass first run, module urlopen patched shut | PASS
+failures | none on first test run and first live read | no real order path anywhere in module | MEASURED
+
 BASIS-READ 2026-08-13 | expected executable-gap reader lane | found base 1aa1e018 clean, code commit 5ef2875e | DONE
 code | expected entry=usdm_bid-spot_ask, exit=usdm_ask-spot_bid, funding, Decimal-only | found src/basis_read.py stdlib-only, bps bases named in printed rows | PASS
 tests | expected deterministic no-network proof | found tests/test_basis_read.py 21 tests green offline, direct + discover modes | PASS
