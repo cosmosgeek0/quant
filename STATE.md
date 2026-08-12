@@ -25,13 +25,15 @@ traded in this program. Exchange credentials: workers' domain on the execution
 host — their state there unverified by seats.
 
 CURRENT WORK (owner instruction FABLE_FIRST_MONEY_LOOP, consumed 2026-08-12):
-src/spot_roundtrip.py — the complete one-file first money loop, written by the
-Lead as a baseline and adversarially verified. BUILDER.md is now the bounded
-review-and-run task for ONE fresh Codex builder: review the baseline against
-the Binance docs, fix only loop-blocking defects, commit+push, then stop and
-ask the owner for SYMBOL and MAX_QUOTE plus one execute-question naming the
-exact SHA. That builder is the SOLE AWS/Binance mutator for this milestone;
-AWS DEPLOY stays idle. Receipt goes outside git. Nothing has run live.
+src/spot_roundtrip.py — the one-file first money loop. Lead baseline d7d2b8a
+(4-lens adversarial panel: 32 findings, 11 blockers fixed pre-commit); Codex
+review pass DONE at d1b204b "Harden Spot round-trip gates" (exact per-order
+fee rates from the test call replace the estimated cushion; a leftover open
+order can no longer be called CLOSED), pushed, local = GitHub. WAITING ON THE
+OWNER in the builder chat: SYMBOL, MAX_QUOTE, and the one execute-question
+naming d1b204b. That builder is the SOLE AWS/Binance mutator this milestone;
+AWS DEPLOY idle. Receipt outside git. Nothing has run live; LOGS.md still
+empty — its first entry comes from the run.
 
 WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
 spot↔USD-M gap itself); then one full basis cycle at minimum size, including
