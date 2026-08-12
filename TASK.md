@@ -1,5 +1,15 @@
 # TASK.md — current work orders
 
+FIRST — FIX THE BLOCKER (found 2026-08-13, LOGS.md): src/futures_hand.py's
+flat-truth check demands exactly one position row, but Binance USD-M V3
+position responses are documented SPARSE — a flat position may legitimately
+return zero rows, so the code cannot prove flat and honestly blocks. ONE
+Codex worker, code work only, no live act: repair on main — treat an
+absent/zero-row response as flat-compatible truth per the documented V3
+shape; change nothing else; keep every other guard; commit+push; LOGS row.
+The idle task branch dd474b26 stays unmerged. THEN the NOW order below
+proceeds.
+
 NOW — LIVE PROOF: FUTURES MINIMUM OPEN/CLOSE (owner reported Futures enabled
 2026-08-12; exchange capability remains UNVERIFIED until fresh human-executor
 preflight). ONE Codex worker chat, ONE
