@@ -9,6 +9,13 @@ every step.
 
 ---
 
+BASIS-READ 2026-08-13 | expected executable-gap reader lane | found base 1aa1e018 clean, code commit 5ef2875e | DONE
+code | expected entry=usdm_bid-spot_ask, exit=usdm_ask-spot_bid, funding, Decimal-only | found src/basis_read.py stdlib-only, bps bases named in printed rows | PASS
+tests | expected deterministic no-network proof | found tests/test_basis_read.py 21 tests green offline, direct + discover modes | PASS
+live | expected one public read printed | found BTCUSDT+ETHUSDT rows exit 0, evidence/basis-read-live-run.txt | PASS
+first failure | expected unittest discover to load | found tests dir not importable; tests/__init__.py added; rerun green | CORRECTED
+verdict | expected commit to lane/basis-read, no push, no merge | found committed, unpushed, unmerged | DONE
+
 FIRST SPARSE-V3 FIX 2026-08-13 | expected code repair only | found base 53fd337e | IN_PROGRESS
 scope | expected src/futures_hand.py + LOGS.md only | found no live or external action | PASS
 first failure | expected repository test-manifest scan | found unmatched README glob stopped scan | CORRECTED
