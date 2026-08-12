@@ -9,6 +9,24 @@ every step.
 
 ---
 
+USD-M 1-USDT PROVENANCE 2026-08-13 | expected receipted origin | found confirmed prior internal transfer | PASS
+first failure | expected safe remote-query encoding | found local encoder unavailable before SSM | CORRECTED
+second failure | expected one encoded SSM line | found shell line truncated before query | CORRECTED
+third failure | expected chunked query input | found newline escaping caused SSM EOF before query | CORRECTED
+history read | expected rows key on empty history | found valid total-only zero-row shape | CORRECTED
+exchange history | expected exact 1-USDT event | found Spot-to-USD-M 2026-07-20T15:47:00Z ID last-4 0981 | CONFIRMED
+actor | expected identify initiator | found transfer history has no actor field | UNKNOWN
+verdict | expected this Futures task sent it | found transfer predates task by weeks | DID NOT SEND
+
+FUTURES TASK CONTACT CHECK 2026-08-13 | expected actual Futures task read before answer | found repo and audit workers checked instead | RECORDED
+named Futures task | branch final dd474b26 | direct task and four child records read | CHECKED
+first failure | expected task list limit <=50 | found 80 rejected before read | CORRECTED
+second failure | expected task read limit <=10 | found 20 rejected before read | CORRECTED
+result | expected transfer + open/close proof | found no live act, receipt, or fresh exchange state | NOT DONE
+source | expected flat-compatible position truth | found exact-one-row rule conflicts with documented sparse V3 response | BLOCK
+parallel | expected continuous runtime refill | found 4 child starts; available capacity not measured | UNVERIFIED
+verdict | expected usable Futures result | found idle task and unmergeable branch | BLOCKED
+
 governance correction 2026-08-12T18:49:16Z | expected owner rules on disk | found rules commit 123886f3 | CORRECTED
 scope | expected separate named lanes + internal children + model/access | found explicit in BUILDER.md, LEAD.md, TASK.md | PASS
 parallel | expected runtime-available slots refilled throughout | found start/finish/milestone/compaction refill law | PASS
