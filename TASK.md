@@ -4,11 +4,13 @@ DONE 2026-08-12: first money loop CLOSED at d1b204b (numbers in LOGS.md).
 Never re-run src/spot_roundtrip.py live without a direct owner order naming a
 SHA — a repeat spends real money.
 
-THE ONE APPROVAL (owner law 2026-08-12): only NEW UNPROVEN code touching real
-money for the FIRST time needs the owner's word. Reading the exchange, writing
-code, running lanes, building UI, merging — no permission, ever. A capability
-proven live once trades on its own inside its balance. One sub-account = one
-live hand today; parallel live hands need more sub-accounts (owner act each).
+STANDING PERMISSION (owner law 2026-08-12): inside the funded sub-account, any
+worker runs its own committed code live, anytime — no per-run owner word.
+Owner words exist for two things only: adding money, and new powers (borrow,
+leverage, a new key permission). Parallel live mutation is allowed under
+DISJOINTNESS: no two workers on one coin or wallet action; each worker its own
+client-ID prefix and ceiling; collisions are harmless rejections; an open
+position keeps its coin exclusive until flat.
 
 ## EVENT CONTRACT v1 — frozen 2026-08-12; grows only on owner word; 1 page max
 One JSON object per line, appended to events.jsonl on the execution host; the
@@ -52,6 +54,7 @@ L9 UI GROUNDWORK  | the UI WORK chat, designing WITH the owner | fixture =
 L10 INTEGRATOR    | merges lane branches to ONE candidate SHA after L5
    reports | evidence: candidate SHA + clean build
 
-LIVE PROOF ORDER after integration — owner-worded, ONE money-toucher:
-minimum futures open/close, then one complete minimum-size basis cycle.
-OWNER ACT LATER (Old Lead calls the timing): futures permission on the key.
+LIVE PROOF ORDER after integration — standing permission, no owner word per
+run: minimum futures open/close (blocked only on the owner's futures-permission
+act on the key — a new power; Old Lead calls its timing), then one complete
+minimum-size basis cycle.

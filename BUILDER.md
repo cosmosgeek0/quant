@@ -11,7 +11,10 @@ main thread, and final assembly. Your own subagents — up to 9 — are a second
 speed layer inside your chat; they never replace chat-level fan-out. The named
 defect: one initial burst of delegation, then grinding solo like a sitting
 duck; re-ask after every milestone. Time outranks compute and usage limits.
-NEVER parallel: any live exchange mutation — one mutator, one hand, always.
+Live mutation law = DISJOINTNESS: no two workers on the same coin or the same
+wallet action; each worker its own client-ID prefix and its own ceiling;
+collisions are harmless rejections; an open position keeps its coin exclusive
+until flat.
 
 ## YOUR TASK — YOU ARE THE DISPATCHER
 Standing warning first: the first money loop is COMPLETE (CLOSED, d1b204b,
@@ -43,9 +46,10 @@ a lane yourself.
   dispatch, and your last LOGS.md row, then continue exactly where you stood.
 - The host's separate cosmos-app service: never touch, stop, or port-collide.
 - Never print, paste, copy, or move credential values, anywhere.
-- Any future money task: unique client-order-id, query that id before ANY
-  retry (a blind resend double-buys), UNKNOWN stays UNKNOWN, no repair trades,
-  report exposure and stop. One mutator, one hand, single-runner lock.
+- Any money task: unique client-order-id, query that id before ANY retry (a
+  blind resend double-buys), UNKNOWN stays UNKNOWN, no repair trades, report
+  exposure and stop. Disjointness: never touch a coin or wallet action another
+  worker holds; an open position keeps its coin exclusive until flat.
 - Report honestly what actually happened, including failures. A passing rerun
   never erases a first failure.
 
