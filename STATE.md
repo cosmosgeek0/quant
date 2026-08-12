@@ -20,20 +20,25 @@ Node service (the old project) runs on 127.0.0.1:8080 there — never confused
 with quant, untouched until the owner directly orders. Quant itself: NOT
 deployed. AWS DEPLOY (persistent Codex task) owns all AWS/host execution and
 deploys only an owner-named committed SHA, keeping rollback.
-Product code: src/spot_roundtrip.py (baseline, never run live). Nothing has
-traded in this program. Exchange credentials: workers' domain on the execution
-host — their state there unverified by seats.
+Product code: src/spot_roundtrip.py — PROVEN LIVE 2026-08-12 (one CLOSED round
+trip, one correct pre-BUY refusal). Exchange credentials: workers' domain on
+the execution host, working there as of the run.
 
-CURRENT WORK (owner instruction FABLE_FIRST_MONEY_LOOP, consumed 2026-08-12):
-src/spot_roundtrip.py — the one-file first money loop. Lead baseline d7d2b8a
-(4-lens adversarial panel: 32 findings, 11 blockers fixed pre-commit); Codex
-review pass DONE at d1b204b "Harden Spot round-trip gates" (exact per-order
-fee rates from the test call replace the estimated cushion; a leftover open
-order can no longer be called CLOSED), pushed, local = GitHub. WAITING ON THE
-OWNER in the builder chat: SYMBOL, MAX_QUOTE, and the one execute-question
-naming d1b204b. That builder is the SOLE AWS/Binance mutator this milestone;
-AWS DEPLOY idle. Receipt outside git. Nothing has run live; LOGS.md still
-empty — its first entry comes from the run.
+FIRST MONEY MOVED — 2026-08-12T16:01Z, verdict CLOSED (LOGS.md top entry;
+receipt on the execution host). One real BTCUSDT round trip at commit d1b204b
+under a 10 USDT ceiling: bought 0.00015 BTC (9.51796950 USDT), sold 0.00014
+back (8.88343680 USDT), residual 0.00000985 BTC dust below the sell step, no
+open orders, no failures. Quote-side cost 0.64341614 USDT, of which ~0.62 is
+the retained dust's value — true round-trip friction ≈ 0.02 USDT. An earlier
+5 USDT attempt was correctly REFUSED before the BUY (sufficient minimum
+~6.28 USDT reported) — the guard works live. The hand is PROVEN: receipt +
+exchange states + balances + LOGS entry agree.
+NOW: per the owner instruction, everyone stops — no refactor, no second run
+unordered. The next task is chosen from what the exchange taught. Banked
+lessons: at tiny size, step-flooring dominates cost (one step ≈ 0.63 USDT
+held back as dust); the refusal + minimum-reporting machinery is proven.
+Next candidates (unchanged): basis read → one full basis cycle at minimum
+size.
 
 WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
 spot↔USD-M gap itself); then one full basis cycle at minimum size, including
