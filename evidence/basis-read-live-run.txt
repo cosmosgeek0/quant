@@ -1,0 +1,7 @@
+entry_gap_quote_formula=usdm_bid-spot_ask
+exit_gap_quote_formula=usdm_ask-spot_bid
+entry_gap_bps_formula=entry_gap_quote/spot_ask*10000;bps_base=spot_ask
+exit_gap_bps_formula=exit_gap_quote/spot_bid*10000;bps_base=spot_bid
+completed_utc	usdm_book_time_utc	symbol	spot_bid	spot_ask	usdm_bid	usdm_ask	entry_gap_quote	entry_gap_bps_vs_spot_ask	exit_gap_quote	exit_gap_bps_vs_spot_bid	funding_rate	next_funding_utc
+2026-08-12T23:44:39.448Z	2026-08-12T23:44:38.379Z	BTCUSDT	63389.99000000	63390.00000000	63379.90	63380.00	-10.10000000	-1.59331125	-9.99000000	-1.57595860	0.00006421	2026-08-13T00:00:00.000Z
+2026-08-12T23:44:40.473Z	2026-08-12T23:44:39.840Z	ETHUSDT	1878.20000000	1878.21000000	1877.39	1877.40	-0.82000000	-4.36585898	-0.80000000	-4.25939730	0.00005433	2026-08-13T00:00:00.000Z

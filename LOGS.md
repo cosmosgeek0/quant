@@ -9,6 +9,13 @@ every step.
 
 ---
 
+BASIS-READ 2026-08-13 | expected executable-gap reader lane | found base 1aa1e018 clean, code commit 5ef2875e | DONE
+code | expected entry=usdm_bid-spot_ask, exit=usdm_ask-spot_bid, funding, Decimal-only | found src/basis_read.py stdlib-only, bps bases named in printed rows | PASS
+tests | expected deterministic no-network proof | found tests/test_basis_read.py 21 tests green offline, direct + discover modes | PASS
+live | expected one public read printed | found BTCUSDT+ETHUSDT rows exit 0, evidence/basis-read-live-run.txt | PASS
+first failure | expected unittest discover to load | found tests dir not importable; tests/__init__.py added; rerun green | CORRECTED
+verdict | expected commit to lane/basis-read, no push, no merge | found committed, unpushed, unmerged | DONE
+
 UI LANE 2026-08-13 | read-only screen, code commit 5407d77a on lane/ui, base 1aa1e018 | evidence ui/verify.py | BUILT
 render | expected every fixture event on screen | found 9/9 rows via page's own render fn headless (CLOSED run 7 + rejected run 2) | PASS
 live price | expected unsigned public BTCUSDT GET usable from page | found HTTP 200 + allow-origin * + valid price | PASS
