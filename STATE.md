@@ -33,17 +33,21 @@ the retained dust's value — true round-trip friction ≈ 0.02 USDT. An earlier
 5 USDT attempt was correctly REFUSED before the BUY (sufficient minimum
 ~6.28 USDT reported) — the guard works live. The hand is PROVEN: receipt +
 exchange states + balances + LOGS entry agree.
-NOW: the commander's parallel plan is ADOPTED (Old Lead verdict + owner word,
-2026-08-12). The repeat-trade trap is DEFUSED: TASK.md and BUILDER.md no
-longer order the completed trade; a fresh chat reading them stops. Structure:
-~12 disjoint lanes as parallel Codex chats from Desktop worktrees; ONE
-dispatcher spawns/watches and returns one result; ONE integrator merges to
-one candidate SHA; ONE owner-ordered live money-toucher. Live proof order:
-minimum futures open/close, then one complete minimum-size basis cycle.
-PENDING: event contract + lane manifest frozen from the commander's plan
-text; owner's word on UI WORK; later owner act — futures permission on the
-key (Old Lead calls the timing). Banked lessons stand: step-flooring
-dominates cost at tiny size; refusal machinery proven.
+NOW (2026-08-12T17:42Z): LANES INTEGRATED — main @ 19deb1b, local = GitHub,
+worktree registry clean. The quant can now: read live spot+futures basis gaps
+(market_reads), snapshot both wallets (wallet — real snapshot taken), emit
+contract-v1 events from real receipts (events — 7/7 valid), and holds a
+complete capped futures hand (futures_hand) that has never traded. L5 found 4
+real defects (2 HIGH in wallet, 2 MEDIUM); the integrator repaired all before
+merge and added a compiled USDT<=10 transfer ceiling. No live orders,
+transfers, or permission changes happened.
+THE ONE BLOCKER (measured): the account's Futures capability is DISABLED —
+signed futures read returned canTrade=false. Owner act (~2 min): enable
+Futures on the sub-account + futures permission on the key. Then, on standing
+permission: minimum futures open/close, then one minimum-size basis cycle.
+PARKED, non-merged, awaiting owner words someday: L6 reverse-basis spec
+(needs borrow power), L7 volume map (paper-only, unproven), L8's seven
+old-project import candidates (per-item permits).
 
 WHAT IS NEXT AFTER THE HAND: basis read (the quant computes one live
 spot↔USD-M gap itself); then one full basis cycle at minimum size, including
