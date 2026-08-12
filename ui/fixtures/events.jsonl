@@ -1,0 +1,9 @@
+{"ts":"2026-08-12T15:52:45Z","sha8":"d1b204bc","kind":"run_start","run_id":"6a7c96cdb1754b","symbol":"BTCUSDT","balances":{"BTC":"0.00000000","USDT":"95.62398534"},"note":"ceiling 5 USDT"}
+{"ts":"2026-08-12T15:52:46Z","sha8":"d1b204bc","kind":"run_verdict","run_id":"6a7c96cdb1754b","symbol":"BTCUSDT","verdict":"REJECTED_BEFORE_BUY","note":"approved 5 USDT too small to sell back after fees and step rounding; sufficient minimum ~6.28 USDT; no order submitted"}
+{"ts":"2026-08-12T16:01:11Z","sha8":"d1b204bc","kind":"run_start","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","balances":{"BTC":"0.00000000","USDT":"95.62398534"},"note":"ceiling 10 USDT"}
+{"ts":"2026-08-12T16:01:11Z","sha8":"d1b204bc","kind":"order_submitted","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","side":"BUY","client_id_last4":"9a8b"}
+{"ts":"2026-08-12T16:01:12Z","sha8":"d1b204bc","kind":"order_terminal","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","side":"BUY","client_id_last4":"9a8b","order_id_last4":"8130","executed":"0.00015000","quote":"9.51796950","fees":{"BTC":"0.00000015"},"note":"FILLED"}
+{"ts":"2026-08-12T16:01:12Z","sha8":"d1b204bc","kind":"order_submitted","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","side":"SELL","client_id_last4":"9a8s"}
+{"ts":"2026-08-12T16:01:13Z","sha8":"d1b204bc","kind":"order_terminal","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","side":"SELL","client_id_last4":"9a8s","order_id_last4":"8167","executed":"0.00014000","quote":"8.88343680","fees":{"USDT":"0.00888344"},"note":"FILLED"}
+{"ts":"2026-08-12T16:01:13Z","sha8":"d1b204bc","kind":"balance_snapshot","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","balances":{"BTC":"0.00000985","USDT":"94.98056920"}}
+{"ts":"2026-08-12T16:01:13Z","sha8":"d1b204bc","kind":"run_verdict","run_id":"6a7c98c70019a8","symbol":"BTCUSDT","verdict":"CLOSED","residual":"0.00000985","note":"net quote cost incl fees 0.64341614 USDT; residual is dust below sell step"}
