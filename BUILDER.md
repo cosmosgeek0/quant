@@ -1,23 +1,30 @@
 # BUILDER.md — the builder's ONLY file. Read nothing else, then act.
 
-## PARALLEL-FIRST — read before the task, re-ask at every stage
-Can parallel CHATS cut the remaining wall-clock to ~1/10th of serial? Yes →
-one owner work command gets ONE worker chat and ONE worktree. That worker uses
-up to 9 subagents inside its own chat for every independent piece that can cut
-wall-clock: code reads, AWS reads, checks, tests, evidence, and verification.
-Do not split one task into peer worker chats. Separate worker chats exist only
-for separate owner-named tasks or manifest lanes, each with its own worktree.
-The worker does not fan out once and then grind a long serial tail: before the
-first action and AGAIN after every milestone, it asks what remaining work is
-independent and sends all of it to available subagents immediately. Keep only
-true dependencies and one live position/action lifecycle serial. Time outranks
-compute and usage limits. TASK.md's named blockers are the gates; never invent
-extra gates or substitute readiness ceremony for the ordered work.
-
-Every worker dispatch/work command MUST repeat this operating instruction:
-"One task, one worker chat, one worktree. Use up to 9 subagents throughout;
-fan out every independent piece now and re-fan-out after every milestone. Keep
-only true dependencies/live lifecycle serial. Do not invent gates."
+## PRIORITY 0 — CONTINUOUS FULL SUBAGENT SATURATION; HIGHEST LAW
+These rules are ordered. A new worker and a compacted worker read them first.
+1. Fill EVERY child-subagent slot actually available before the first
+   substantive action. In this nine-slot environment the worker occupies one,
+   so the normal target is 8 concurrent children. "Use up to" is too soft:
+   every safe, useful, independent code read, AWS read, check, test, evidence
+   pass, and verification pass is assigned immediately while a slot is free.
+2. Keep the slots full THROUGHOUT the task. The opening fan-out is not
+   compliance. Whenever a child finishes, after EVERY milestone, and
+   immediately after EVERY context compaction, re-decompose the remaining work
+   and refill every available slot before taking another substantive serial
+   action. Never enter an indefinite serial tail while independent work exists.
+3. One owner work command = ONE worker chat = ONE worktree. Its children are
+   subagents inside that worker. Never split one task into peer worker chats;
+   another chat/worktree is only for another owner-named task or manifest lane.
+4. A child slot may stay idle only when no safe, useful, independent work
+   remains because of a true dependency, a TASK.md named blocker, or the live
+   disjointness law. Keep only one live position/action lifecycle serial.
+5. TASK.md's named blockers are the gates. Never invent extra gates or replace
+   ordered work with readiness, review, or verification ceremony.
+6. No worker is expected to remember this by magic. EVERY worker dispatch/work
+   command MUST include this exact instruction: "One task, one worker chat, one
+   worktree. Saturate every available child-subagent slot now; refill every
+   freed slot, after every milestone, and after compaction. Serial only for
+   true dependencies or one live lifecycle. Do not invent gates."
 Live mutation law = DISJOINTNESS: no two workers on the same coin or the same
 wallet action; each worker its own client-ID prefix and its own ceiling;
 collisions are harmless rejections; an open position keeps its coin exclusive
@@ -28,6 +35,8 @@ until flat.
   gpt-5.6-sol with ultra reasoning, standard speed; never fast mode.
 - Give each worker the full local-access environment available to the QUANT
   project, while its dispatch and worktree remain the hard scope boundary.
+- Apply the same gpt-5.6-sol, ultra, standard-speed, full-local-access order to
+  every child subagent wherever the platform exposes those settings.
 - Workers already running when this law landed continue; do not restart them
   merely to change model settings.
 
@@ -37,6 +46,8 @@ until flat.
   LOGS.md rows, then measure git worktree/branch tips and active lane status.
 - Reconstruct the current dispatcher table from disk and task state: lane,
   worktree, branch, base SHA, thread, latest evidence, blocker, next action.
+- Then, before another substantive action, perform PRIORITY 0 again: split all
+  remaining independent work and refill every available child-subagent slot.
 - Ask: "Am I on the right lane, and what current fact would make this plan
   stale?" Disk and measured task state beat remembered context or bias.
 - Continue from the exact unfinished milestone. Never redispatch completed
@@ -83,7 +94,8 @@ a lane yourself.
 2. Create Desktop/worktrees/ and spawn lanes L1-L8 NOW as fresh parallel
    Codex chats, one per lane, each in its own worktree (git worktree add),
    each dispatch naming: lane, base SHA (record main HEAD at spawn), exact
-   files, expected evidence, and this file as its law.
+   files, expected evidence, this file as its law, and the exact mandatory
+   PRIORITY 0 instruction above. Every later worker command repeats it too.
 3. L9 belongs to the UI WORK chat — do not spawn it. Spawn L10 (integrator)
    only after L5 reports.
 4. Watch, collect each lane's LOGS.md row, chase honest completion — then
