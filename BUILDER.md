@@ -13,16 +13,24 @@ defect: one initial burst of delegation, then grinding solo like a sitting
 duck; re-ask after every milestone. Time outranks compute and usage limits.
 NEVER parallel: any live exchange mutation — one mutator, one hand, always.
 
-## STATUS — NO OPEN TASK IN THIS FILE
-The first money loop is COMPLETE: verdict CLOSED, 2026-08-12, commit d1b204b,
-top entry in LOGS.md. src/spot_roundtrip.py is NEVER run against the live
-exchange again without a direct owner order naming a SHA — a repeat spends
-real money. If you are a fresh chat reading this without a dispatch message
-naming your lane: STOP. Do nothing. Reply that no task is open here.
+## YOUR TASK — YOU ARE THE DISPATCHER
+Standing warning first: the first money loop is COMPLETE (CLOSED, d1b204b,
+LOGS.md). src/spot_roundtrip.py is NEVER run live again without a direct owner
+order naming a SHA — a repeat spends real money. No lane touches it live.
 
-Next-phase lane tasks arrive as DISPATCH MESSAGES naming: your lane, your base
-SHA, your worktree, your exact files, and the evidence you must return. Your
-dispatch is your task; this file is your law.
+You, the fresh Codex chat reading this: you are the DISPATCHER for the lane
+manifest in TASK.md. You spawn, you watch, you consolidate — you never grind
+a lane yourself.
+1. Read the LANE MANIFEST and EVENT CONTRACT in TASK.md.
+2. Create Desktop/worktrees/ and spawn lanes L1-L8 NOW as fresh parallel
+   Codex chats, one per lane, each in its own worktree (git worktree add),
+   each dispatch naming: lane, base SHA (record main HEAD at spawn), exact
+   files, expected evidence, and this file as its law.
+3. L9 belongs to the UI WORK chat — do not spawn it. Spawn L10 (integrator)
+   only after L5 reports.
+4. Watch, collect each lane's LOGS.md row, chase honest completion — then
+   report ONE consolidated result and stop. If a lane stalls, respawn it
+   fresh rather than grinding its work yourself.
 
 ## RULES — each one is a paid scar, not ceremony
 - Touch only the files your dispatch names, inside your own worktree.

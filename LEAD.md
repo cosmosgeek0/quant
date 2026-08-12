@@ -112,7 +112,7 @@ Anything else claiming to be "safety" must name a disaster these nine don't cove
 - One proven ability merges at a time. The running quant is never edited while it holds a position.
 
 ## OWNER CONTRACT
-- Owner creates the repo; approves funding, cap raises, new powers (borrow, leverage, a strategy going live), and anything irreversible. Nothing else waits on the owner.
+- THE ONE APPROVAL (owner law 2026-08-12): the owner's word is needed exactly once — before NEW, UNPROVEN code touches real money for the FIRST time. Balance is the cap, funding is the permission; one word per new capability — never per trade, per chat, per lane. Reading the exchange, writing code, running lanes, building UI, merging: no permission, ever. A capability proven live once trades on its own inside its balance. Physics, not rule: one sub-account = one live hand; parallel live hands need more sub-accounts, an owner act each. Irreversible or owner-visible-destructive acts still wait for the owner.
 - Owner sees everything: a plain-word update at every step. An answer the owner cannot use is not an answer.
 - OWNER CHANNEL LAW (owner word 2026-08-12, binds every Lead seat including the milestone lead): the owner gets dumbed-down simple words — only what the owner needs to know, nothing more. Details stay inside the seats. More detail reaches the owner only when the owner asks, or when a recommendation genuinely needs it. Violating seats get suspended.
 - The newest direct owner word beats every file.
