@@ -4,7 +4,7 @@ THE OWNER IS NEVER THE EXECUTOR (owner word 2026-08-13). The machine runs the
 money path: live lifecycles start from the execution host itself — a
 timer/service running committed code under standing permission. No human
 run-steps, no per-trade judgment by any chat. Human-executor structures are
-the old disease: kill on sight.
+legacy ceremony: revert immediately.
 
 TASK A CANCELLED (2026-08-13, measured by the Lead): the claimed sparse-V3 bug
 is FALSE — position_amount() already returns zero for a zero-row response,
@@ -57,7 +57,7 @@ L3 WALLET         | src/wallet.py | Spot+futures balance reads; internal
    evidence: one read-only balance snapshot
 L4 EVENT-EMITTER  | src/events.py | emit contract-v1 lines from a run receipt |
    evidence: events.jsonl produced from the real receipt fixture
-L5 CORRECTNESS    | strict read-only | adversarial re-check of spot_roundtrip.py
+L5 CORRECTNESS    | strict read-only | independent skeptical re-check of spot_roundtrip.py
    and L1-L4 order discipline | evidence: FABLE-CLEAN final relay; integrator logs
 L6 LOOK-AHEAD reverse-basis  | strict read-only | FABLE-CLEAN final relay; integrator logs disposition
 L7 LOOK-AHEAD volume map     | strict read-only | FABLE-CLEAN final relay; integrator logs disposition

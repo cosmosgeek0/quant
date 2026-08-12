@@ -50,7 +50,7 @@ word, dispatch scope, WRITE-FIRST order, and TASK.md blockers still control.
    names a blocker. A write-enabled owner records before any other message/action.
 8. FABLE-CLEAN FINAL LAW: EVERY final report from every seat, and every relay
    meant for Fable, is short, plain, neutral, secret-free, and safe to read. Never paste raw
-   logs, stack traces, credential-shaped text, exploit-shaped text, or dense
+   logs, stack traces, secret-format text, risky-format text, or dense
    trigger-risk material. Report the minimum plain result, correction, blocker,
    and next action. Cite evidence only by paths, counts, exact Git SHAs,
    owner-requested content digests, allowed
