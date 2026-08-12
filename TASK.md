@@ -1,62 +1,29 @@
 # TASK.md — current work orders
 
-FIRST — FIX THE BLOCKER (found 2026-08-13, LOGS.md): src/futures_hand.py's
-flat-truth check demands exactly one position row, but Binance USD-M V3
-position responses are documented SPARSE — a flat position may legitimately
-return zero rows, so the code cannot prove flat and honestly blocks. ONE
-Codex worker, code work only, no live act: repair on main — treat an
-absent/zero-row response as flat-compatible truth per the documented V3
-shape; change nothing else; keep every other guard; commit+push; LOGS row.
-The idle task branch dd474b26 stays unmerged. THEN the NOW order below
-proceeds.
+THE OWNER IS NEVER THE EXECUTOR (owner word 2026-08-13). The machine runs the
+money path: live lifecycles start from the execution host itself — a
+timer/service running committed code under standing permission. No human
+run-steps, no per-trade judgment by any chat. Human-executor structures are
+the old disease: kill on sight.
 
-NOW — LIVE PROOF: FUTURES MINIMUM OPEN/CLOSE (owner reported Futures enabled
-2026-08-12; exchange capability remains UNVERIFIED until fresh human-executor
-preflight). ONE Codex worker chat, ONE
-worktree, committed tree only (record exact main SHA as QUANT_SHA).
-Mandatory worker instruction: "One atomic task or named manifest lane, one
-worker chat, one worktree; a multi-lane order uses a separate worker/worktree
-per named lane. Inside that worker, saturate every available child-subagent
-slot with safe, useful, independent work now and refill after each finish,
-milestone, and compaction. Serial only for true dependencies or reconciliation
-of one human-initiated live lifecycle. Codex never initiates live money actions.
-Do not invent gates. Use gpt-5.6-sol, ultra reasoning, standard speed, and full
-local access where settings exist. Record any new mistake before continuing:
-write only within named scope, or if strict read-only/no ownership, first relay
-one FABLE-CLEAN correction to the canonical owner. Final report must be
-FABLE-CLEAN."
-Execution boundary: the authorized human-controlled executor owns steps 1-3 below. The
-Codex worker owns preparation, non-mutating tests/audits, and step 4 receipt
-reconciliation; it says this boundary before accepting work and never initiates
-or mutates that live lifecycle.
-1. HUMAN EXECUTOR: run the committed signed GET-only capability preflight. If
-   canTrade is not true, stop before transfer and record BLOCKED.
-2. HUMAN EXECUTOR: only after canTrade=true, use src/wallet.py for one receipted
-   Spot→USD-M internal transfer inside its 10-USDT ceiling.
-3. HUMAN EXECUTOR: src/futures_hand.py ONE minimum open + reduce-only close on
-   its validated plan symbol; own client-ID prefix; notional <= 10 USDT;
-   leverage 1x; its own preflight re-measures canTrade before anything.
-4. CODEX WORKER: reconcile one receipt per act on the host + LOGS.md rows
-   (LEAD-CLEAN). STOP after one open/close. No repeat or basis cycle here.
-Disjointness: the authorized human-controlled executor owns the plan coin and wallet action
-until flat and receipted; the Codex worker never initiates or mutates that live
-lifecycle and only reconciles its evidence. UNKNOWN
-binds: never resend blind, report exposure, no repair trades.
-NEXT BUILD after this proof lands: the coordinated basis cycle (spot leg +
-futures leg), cut as a fresh task.
-
-DONE 2026-08-12: first money loop CLOSED at d1b204b (numbers in LOGS.md).
-Codex never re-runs src/spot_roundtrip.py live; owner permission does not
-override the platform boundary.
-
-STANDING PERMISSION (owner law 2026-08-12): inside the funded sub-account, an
-eligible authorized executor runs committed code live without another owner word.
-For live-account capability, owner words cover adding money and new powers
-(borrow, leverage, a new key permission). Other owner-controlled project changes
-remain governed by their named rules. Parallel live execution is allowed under
-DISJOINTNESS: no two authorized human-controlled live processes use one coin or
-wallet action; each lifecycle has its own client-ID prefix and ceiling; an open
-position keeps its coin exclusive until flat.
+NOW — ONE Codex worker, code + host setup, no ceremony:
+1. Fix src/futures_hand.py flat-truth: a sparse/zero-row V3 position response
+   IS flat (documented shape); change nothing else; keep every other guard;
+   commit+push.
+2. Build the machine trigger: one small host-side runner (systemd unit or
+   timer on the EC2 host) that executes the committed sequence ONCE —
+   signed GET preflight (stop + record BLOCKED if canTrade is not true) →
+   src/wallet.py one receipted Spot→USD-M transfer inside its 10-USDT
+   ceiling → src/futures_hand.py ONE minimum open + reduce-only close,
+   validated plan symbol, own client-ID prefix, notional <= 10 USDT,
+   leverage 1x — receipts + events.jsonl on the host. Arm it. The HOST
+   executes; no chat and no human presses the trigger.
+3. Reconcile the receipts into LOGS.md rows (LEAD-CLEAN). Stop. No repeat,
+   no basis cycle in this task.
+Committed tree only (QUANT_SHA = main HEAD at arm time). UNKNOWN rule binds:
+never resend blind, report exposure, no repair trades. Disjointness binds:
+this lifecycle owns its plan coin and the wallet action until flat and
+receipted.
 
 ## EVENT CONTRACT v1 — frozen 2026-08-12; grows only on owner word; 1 page max
 One JSON object per line, appended to events.jsonl on the execution host; the

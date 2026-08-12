@@ -9,6 +9,10 @@ every step.
 
 ---
 
+FIRST SPARSE-V3 FIX 2026-08-13 | expected code repair only | found base 53fd337e | IN_PROGRESS
+scope | expected src/futures_hand.py + LOGS.md only | found no live or external action | PASS
+first failure | expected repository test-manifest scan | found unmatched README glob stopped scan | CORRECTED
+
 USD-M 1-USDT PROVENANCE 2026-08-13 | expected receipted origin | found confirmed prior internal transfer | PASS
 first failure | expected safe remote-query encoding | found local encoder unavailable before SSM | CORRECTED
 second failure | expected one encoded SSM line | found shell line truncated before query | CORRECTED
