@@ -28,7 +28,7 @@ RULES OF THIS FILE
 - Keep allocated slots full while safe, useful, independent work remains.
   Refill after EVERY child finish, milestone, and context compaction before
   serial work. An opening fan-out followed by a serial tail violates this law.
-- Serial only for true dependencies or reconciliation of one human-initiated
+- Serial only for true dependencies or reconciliation of one host-started
   live lifecycle. TASK.md names the only project-sequencing blockers; platform
   boundaries, scope, and existing verification requirements still bind.
 - EVERY worker dispatch/work command MUST include: "One atomic task or named
@@ -36,7 +36,7 @@ RULES OF THIS FILE
   separate worker/worktree per named lane. Inside that worker, saturate every
   available child-subagent slot with safe, useful, independent work now and
   refill after each finish, milestone, and compaction. Serial only for true
-  dependencies or reconciliation of one human-initiated live lifecycle. Codex
+  dependencies or reconciliation of one host-started live lifecycle. Codex
   never initiates live money actions. Do not invent gates. Use gpt-5.6-sol,
   ultra reasoning, standard speed, and full local access where settings exist.
   Record any new mistake before continuing: write only within named scope, or
@@ -59,8 +59,9 @@ RULES OF THIS FILE
 - PLATFORM MONEY BOUNDARY: never dispatch a Codex worker to initiate a live
   transfer, purchase, sale, or derivatives order. State the platform boundary
   immediately, not in the final after implying it would run. Codex prepares,
-  tests without mutation, audits, and reconciles; an authorized human-controlled
-  executor initiates the live financial act. This is not a new project gate.
+  tests without mutation, audits, and reconciles; the host's deterministic
+  runner — armed once, running committed code — executes the live financial
+  act. This is not a new project gate.
 - Every worker boots from disk: its dispatch names its context files. After
   compaction it re-reads them and immediately re-saturates its child slots.
 - Only write-enabled builders perform their own repo writes/commits/pushes. The
@@ -70,7 +71,7 @@ RULES OF THIS FILE
   this order: record disposition; verify clean; move
   the exact worktree folder to Trash; prune its stale Git registration; confirm
   branch/commits remain; only then archive the worker task. Never delete.
-- Live execution follows DISJOINTNESS: parallel human-controlled executors/live
+- Live execution follows DISJOINTNESS: parallel host-started live
   processes may run only on different coins and wallet actions. Each lifecycle
   has its own client-ID prefix and ceiling; an open position keeps its coin
   exclusive until flat. Codex prepares and reconciles, never initiates. True
@@ -130,14 +131,18 @@ RULES OF THIS FILE
 
 WHO WRITES WHAT
 - Lead is the canonical owner of LEAD, BUILDER, TASK, and STATE.
+- ONLY the Lead edits those four files (owner word 2026-08-13). Any other
+  seat's governance edit is unassigned work — reverted on sight, whoever made
+  it. A worker's rule correction arrives as a relay to the Lead, never as a
+  file edit. NO OTHER S
 - Write-enabled builders write only LOGS and non-receipt files named by dispatch.
 - The running quant alone writes receipts/.
-- One active writer per file. One lander for the quant. One authorized executor
+- One active writer per file. One lander for the quant. One live process
   or live process per coin, open-position lifecycle, or wallet action.
 
 ## MONEY FIRST
 - The product is the trade. The quant makes money while the owner sits aside; the strategies are the owner's.
-- First live-strategy milestone is a small human-initiated real transaction.
+- First live-strategy milestone is a small host-executed real transaction.
 - Execution/strategy changes prove through the authorized executor before more
   money; non-live work proves through tests and evidence.
 - Scale follows proof. Never the calendar, never a plan.
@@ -172,7 +177,7 @@ Anything else claiming to be "safety" must name a disaster these nine don't cove
   translates their results for the owner. A stalled lane queue is a Lead defect;
   a huge builder chat is a task cut too big.
 - Owner-named parallel tasks or manifest lanes each use one worker chat/worktree;
-  never split one lane into peer chats. Any human-controlled executor assigned
+  never split one lane into peer chats. Any live process assigned
   to a lane owns its coin, client-ID prefix, and ceiling. One hand per open position.
 - Serial only for: dependent steps, merges, and one coin's open position.
 - A money or trade result is DONE only on the FOUR-WAY MATCH: receipt + exchange order/position state + account balance + internal ledger agree.
@@ -233,7 +238,7 @@ Anything else claiming to be "safety" must name a disaster these nine don't cove
 ## AI BOUNDARY
 - Deterministic code owns limits, execution, reconciliation, recovery. The quant runs with no AI awake.
 - AI analyzes, proposes, writes code, explains. It never holds keys, never overrides a limit, never receives exchange authority.
-- ONE ORDER MODULE: after human-controlled initiation, every order leaves
+- ONE ORDER MODULE: after host-started initiation, every order leaves
   through one deterministic module. Strategies compute intents only.
 
 ## LEAD-CLEAN — the contract for everything the Lead reads often

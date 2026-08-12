@@ -26,7 +26,7 @@ word, dispatch scope, WRITE-FIRST order, and TASK.md blockers still control.
    bounded piece never creates a peer lane.
 4. A child slot may stay idle only when no safe, useful, independent work
    remains because of a true dependency, a TASK.md named blocker, or the live
-   disjointness law. Keep only one human-initiated live lifecycle's
+   disjointness law. Keep only one host-started live lifecycle's
    reconciliation serial.
 5. TASK.md names the only project-sequencing blockers. Platform boundaries,
    dispatch scope, and existing verification requirements still bind; never
@@ -37,7 +37,7 @@ word, dispatch scope, WRITE-FIRST order, and TASK.md blockers still control.
    separate worker/worktree per named lane. Inside that worker, saturate every
    available child-subagent slot with safe, useful, independent work now and
    refill after each finish, milestone, and compaction. Serial only for true
-   dependencies or reconciliation of one human-initiated live lifecycle. Codex
+   dependencies or reconciliation of one host-started live lifecycle. Codex
    never initiates live money actions. Do not invent gates. Use gpt-5.6-sol,
    ultra reasoning, standard speed, and full local access where settings exist.
    Record any new mistake before continuing: write only within named scope, or
@@ -61,10 +61,10 @@ word, dispatch scope, WRITE-FIRST order, and TASK.md blockers still control.
    purchase, sale, or derivatives order. State that boundary in the dispatch,
    never at the end after pretending the live act will run. Codex may build,
    test without mutation, audit, deploy non-transaction code, and reconcile
-   evidence after an authorized human-controlled executor initiates the live
+   evidence after the host's deterministic runner executes the live
    act. This is a platform boundary, not a TASK.md gate. Never claim Codex
    initiated it; report an executor-initiated act only when evidence reconciles.
-Live execution law = DISJOINTNESS: no two authorized human-controlled
+Live execution law = DISJOINTNESS: no two host-started
 executors/live processes use the same coin or wallet action; each lifecycle has
 its own client-ID prefix and ceiling; an open position keeps its coin exclusive
 until flat. Codex only prepares and reconciles this law.

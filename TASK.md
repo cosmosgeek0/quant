@@ -6,14 +6,11 @@ timer/service running committed code under standing permission. No human
 run-steps, no per-trade judgment by any chat. Human-executor structures are
 the old disease: kill on sight.
 
-NOW — TASK A, one fresh worker, this and NOTHING else: change ONLY
-src/futures_hand.py — a sparse/zero-row V3 position response IS flat
-(documented shape); keep every other guard — plus one focused existing test.
-Commit, push, one LOGS row, STOP. No scheduler, no AWS, no Binance calls, no
-governance edits, no audit campaign. A prior worker audited instead of fixing;
-do not repeat that: the diff is the deliverable.
+TASK A CANCELLED (2026-08-13, measured by the Lead): the claimed sparse-V3 bug
+is FALSE — position_amount() already returns zero for a zero-row response,
+which is flat. No code fix exists to make. The prior BLOCK verdict was wrong.
 
-THEN — TASK B, a separate worker, cut only after A's commit lands: the machine
+NOW — TASK B, one worker: the machine
 trigger. One small host-side runner (timer/service on the EC2 host) that
 executes the committed sequence ONCE — signed GET preflight (stop + record
 BLOCKED if canTrade is not true) → src/wallet.py one receipted Spot→USD-M
@@ -52,7 +49,7 @@ L1 MARKET-READS   | src/market_reads.py | live Spot + USD-M mark/funding reads,
    computed basis-gap rows | evidence: one read-only run's printed output
 L2 FUTURES-HAND   | src/futures_hand.py | minimum USD-M open + reduce-only
    close pair, client-id + query-before-retry discipline; NO live order
-   in-lane (live proof belongs to the authorized human-controlled executor) |
+   in-lane (live proof belongs to the host runner) |
    evidence: code + validation as far as the key allows; honest BLOCKED row
    if futures permission is not yet on the key
 L3 WALLET         | src/wallet.py | Spot+futures balance reads; internal
