@@ -104,7 +104,7 @@ WHO WRITES WHAT
 ## THE PHYSICS WALL — the whole safety story
 1. Dedicated sub-account holds only what the owner accepts losing. Balance = cap. Funding = approval. The quant cannot fund itself.
 2. Credentials are the workers' domain on the execution host (owner's standing word); no seat lectures the owner about key handling. Never, at any phase: withdrawal, external transfer, master access, borrow, auto-funding.
-3. Futures leverage pinned 1x. Code cannot raise it.
+3. Futures leverage: HARD CAP 2x anywhere (owner word 2026-08-12). Code cannot exceed it; anything above 2x is a new power needing a fresh owner word. The current futures proof still runs at 1x.
 4. Internal spot↔futures transfers: ordinary receipted mechanics.
 5. Every order carries a unique client-order-id. Unknown result → query that id before any retry. No new lifecycle before reconciliation.
 6. A basis lifecycle handles partial fills and one-leg exposure via cancel + ordered close. Every futures close is reduce-only.
