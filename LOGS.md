@@ -9,6 +9,12 @@ every step.
 
 ---
 
+FUTURES-SHORT 2026-08-13 | offline short-hand build | base 1aa1e018 | code commit b6019754
+deliverable | src/futures_hand.py --short hand: SELL LIMIT IOC open + reduce-only BUY MARKET close, own l2fs- prefix, 10 USDT cap and 1x preserved
+evidence | py_compile clean on src/futures_hand.py + tests/test_futures_short.py | tests/test_futures_short.py 29 cases green offline, injected transport, no network
+failures | none
+verdict | DONE_LOCAL — committed to lane/futures-short; not pushed, not merged
+
 FIRST SPARSE-V3 FIX 2026-08-13 | expected code repair only | found base 53fd337e | IN_PROGRESS
 scope | expected src/futures_hand.py + LOGS.md only | found no live or external action | PASS
 first failure | expected repository test-manifest scan | found unmatched README glob stopped scan | CORRECTED
