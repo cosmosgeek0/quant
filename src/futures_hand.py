@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""One Binance USD-M Futures long open and reduce-only close, then exit.
+"""One Binance USD-M Futures open and reduce-only close, then exit.
 
 Default/no-argument mode is read-only validation. Only ``--execute`` can
 change leverage or reach ``POST /fapi/v1/order``. Before an order, the executor
 reads the symbol configuration and sets initial leverage to the compiled 1x
-target once when needed, then re-reads it. The opening order is BUY LIMIT IOC
-so its price and quantity can be bounded by the compiled 10 USDT lane ceiling;
-the closing order is SELL MARKET with ``reduceOnly=true`` for exactly the
-opened quantity.
+target once when needed, then re-reads it. The default hand is long: the
+opening order is BUY LIMIT IOC so its price and quantity can be bounded by the
+compiled 10 USDT lane ceiling; the closing order is SELL MARKET with
+``reduceOnly=true`` for exactly the opened quantity.
+
+``--short`` runs the mirrored short hand: the opening order is SELL LIMIT IOC,
+floored below the bid but sized against the same slippage-padded ask so the
+worst-case entry notional stays under the same ceiling; the closing order is
+BUY MARKET with ``reduceOnly=true`` for exactly the opened quantity. Short
+client order ids use their own ``l2fs-`` prefix.
 
 Required environment (values are read but never printed): BINANCE_API_KEY,
 BINANCE_API_SECRET, SYMBOL, MAX_NOTIONAL, and QUANT_SHA. Optional:
@@ -47,6 +53,12 @@ RECEIPT_DIR = os.path.expanduser(
 LOCK_PATH = os.path.join(RECEIPT_DIR, "futures-hand.lock")
 
 LANE_PREFIX = "l2fh-"
+SHORT_LANE_PREFIX = "l2fs-"
+HANDS = {
+    "long": {"prefix": LANE_PREFIX, "open_side": "BUY", "close_side": "SELL"},
+    "short": {"prefix": SHORT_LANE_PREFIX, "open_side": "SELL",
+              "close_side": "BUY"},
+}
 LANE_HARD_CEILING = Decimal("10")  # USDT; never configurable upward
 TARGET_LEVERAGE = 1
 MAX_ALLOWED_LEVERAGE = 2  # Owner law: anything above 2x needs a new order.
@@ -192,6 +204,7 @@ def finish(verdict, note, code, release_lock=False):
     receipt["finished_utc"] = utc()
     save()
     print("lane: L2 FUTURES-HAND")
+    print("hand:", receipt.get("hand", ""))
     print("run_id:", receipt.get("run_id", ""))
     print("sha8:", receipt.get("sha", "")[:8])
     print("symbol:", receipt.get("symbol", ""))
@@ -250,8 +263,17 @@ def position_amount(rows):
     return sum(amounts, Decimal(0))
 
 
-def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
-    """Build a BUY LIMIT IOC whose worst fill notional is at the hard cap."""
+def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps,
+              open_side="BUY"):
+    """Build an opening LIMIT IOC whose worst fill notional is at the hard cap.
+
+    BUY caps its limit above the ask, which the exchange enforces as the worst
+    fill price. SELL floors its limit below the bid as the worst sale price and
+    still sizes quantity against the same slippage-padded ask so the short's
+    worst-case entry notional stays at or under the cap.
+    """
+    if open_side not in ("BUY", "SELL"):
+        raise PreflightError("open side must be BUY or SELL")
     if symbol_info.get("status") != "TRADING":
         raise PreflightError("symbol is not TRADING")
     if symbol_info.get("contractType") != "PERPETUAL":
@@ -274,30 +296,46 @@ def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
         min_qty = max(d(lot["minQty"]), d(market_lot["minQty"]))
         max_qty = min(d(lot["maxQty"]), d(market_lot["maxQty"]))
         ask = d(book["askPrice"])
+        bid = d(book["bidPrice"])
         mark = d(mark_payload["markPrice"])
     except (KeyError, TypeError, ValueError, ArithmeticError) as error:
         raise PreflightError("symbol filters or market prices are unusable") from error
-    if tick <= 0 or ask <= 0 or mark <= 0 or min_qty <= 0 or max_qty < min_qty:
+    if tick <= 0 or ask <= 0 or bid <= 0 or mark <= 0 or min_qty <= 0 or \
+            max_qty < min_qty:
         raise PreflightError("symbol filters or market prices are non-positive")
 
-    limit_price = ceil_step(
+    cap_price = ceil_step(
         ask * (Decimal(1) + slippage_bps / Decimal(10000)), tick
     )
+    if open_side == "BUY":
+        limit_price = cap_price
+    else:
+        limit_price = floor_step(
+            bid * (Decimal(1) - slippage_bps / Decimal(10000)), tick
+        )
+        if limit_price <= 0:
+            raise PreflightError("floored SELL limit price is not positive")
     min_price = d(price_filter.get("minPrice", "0"))
     max_price = d(price_filter.get("maxPrice", "0"))
     if limit_price < min_price or (max_price > 0 and limit_price > max_price):
         raise PreflightError("capped IOC price is outside PRICE_FILTER")
     percent = filters.get("PERCENT_PRICE", {})
-    multiplier_up = d(percent.get("multiplierUp", "0"))
-    if multiplier_up > 0 and limit_price > mark * multiplier_up:
-        raise PreflightError("capped IOC price is outside PERCENT_PRICE")
+    if open_side == "BUY":
+        multiplier_up = d(percent.get("multiplierUp", "0"))
+        if multiplier_up > 0 and limit_price > mark * multiplier_up:
+            raise PreflightError("capped IOC price is outside PERCENT_PRICE")
+    else:
+        multiplier_down = d(percent.get("multiplierDown", "0"))
+        if multiplier_down > 0 and limit_price < mark * multiplier_down:
+            raise PreflightError("floored IOC price is outside PERCENT_PRICE")
 
-    quantity = floor_step(min(max_notional / limit_price, max_qty), step)
-    notional = quantity * limit_price
+    quantity = floor_step(min(max_notional / cap_price, max_qty), step)
+    notional = quantity * cap_price
+    entry_floor = quantity * limit_price
     min_notional = d(filters.get("MIN_NOTIONAL", {}).get("notional", "0"))
     if quantity < min_qty:
         raise PreflightError("hard ceiling is below the common minimum quantity")
-    if min_notional > 0 and notional < min_notional:
+    if min_notional > 0 and entry_floor < min_notional:
         raise PreflightError("hard ceiling is below MIN_NOTIONAL")
     close_notional_floor = quantity * mark * CLOSE_PRICE_FLOOR
     if min_notional > 0 and close_notional_floor < min_notional:
@@ -307,6 +345,7 @@ def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
     if quantity % d(lot["stepSize"]) or quantity % d(market_lot["stepSize"]):
         raise PreflightError("planned quantity is not valid for both order legs")
     return {
+        "open_side": open_side,
         "quantity": quantity,
         "limit_price": limit_price,
         "max_fill_notional": notional,
@@ -314,8 +353,63 @@ def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
         "close_notional_floor": close_notional_floor,
         "step": step,
         "ask": ask,
+        "bid": bid,
         "mark": mark,
     }
+
+
+def plan_short_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
+    """Build the short hand's SELL LIMIT IOC plan under the same hard cap."""
+    return plan_open(
+        symbol_info, book, mark_payload, max_notional, slippage_bps,
+        open_side="SELL",
+    )
+
+
+def open_intent(open_side, plan, client_id):
+    """Order parameters for one hand's opening LIMIT IOC; never reduce-only."""
+    if open_side not in ("BUY", "SELL"):
+        raise PreflightError("open side must be BUY or SELL")
+    return {
+        "symbol": SYMBOL,
+        "side": open_side,
+        "positionSide": "BOTH",
+        "type": "LIMIT",
+        "timeInForce": "IOC",
+        "quantity": fmt(plan["quantity"]),
+        "price": fmt(plan["limit_price"]),
+        "reduceOnly": "false",
+        "newClientOrderId": client_id,
+        "newOrderRespType": "RESULT",
+    }
+
+
+def close_intent(close_side, quantity, client_id):
+    """Reduce-only MARKET close for exactly the opened quantity."""
+    if close_side not in ("BUY", "SELL"):
+        raise PreflightError("close side must be BUY or SELL")
+    if quantity <= 0:
+        raise PreflightError("close quantity must be positive")
+    return {
+        "symbol": SYMBOL,
+        "side": close_side,
+        "positionSide": "BOTH",
+        "type": "MARKET",
+        "quantity": fmt(quantity),
+        "reduceOnly": "true",
+        "newClientOrderId": client_id,
+        "newOrderRespType": "RESULT",
+    }
+
+
+def short_open_intent(plan, client_id):
+    """SELL-to-open intent for the short hand."""
+    return open_intent(HANDS["short"]["open_side"], plan, client_id)
+
+
+def short_close_intent(quantity, client_id):
+    """Reduce-only BUY-to-close intent for the short hand."""
+    return close_intent(HANDS["short"]["close_side"], quantity, client_id)
 
 
 def signed_read(path, params, label):
@@ -353,7 +447,7 @@ def read_symbol_configuration():
     return parse_symbol_configuration(payload)
 
 
-def preflight(max_notional, slippage_bps):
+def preflight(max_notional, slippage_bps, open_side="BUY"):
     global _time_offset_ms
     kind, server = get_retry("/fapi/v1/time")
     if kind != "ok":
@@ -373,7 +467,8 @@ def preflight(max_notional, slippage_bps):
     kind, mark = get_retry("/fapi/v1/premiumIndex", {"symbol": SYMBOL})
     if kind != "ok":
         raise PreflightError("Futures mark-price read failed")
-    plan = plan_open(matches[0], book, mark, max_notional, slippage_bps)
+    plan = plan_open(matches[0], book, mark, max_notional, slippage_bps,
+                     open_side)
     print("public_symbol_plan: ok")
     print("public_max_fill_notional:", fmt(plan["max_fill_notional"]))
     print("public_plan_under_hard_ceiling: true")
@@ -623,12 +718,16 @@ def config():
 
 
 def main():
-    if sys.argv[1:] in ([], ["--validate-only"]):
+    args = sys.argv[1:]
+    hand = "long"
+    if args[:1] == ["--short"]:
+        hand, args = "short", args[1:]
+    if args in ([], ["--validate-only"]):
         execute = False
-    elif sys.argv[1:] == ["--execute"]:
+    elif args == ["--execute"]:
         execute = True
     else:
-        print("usage: futures_hand.py [--validate-only | --execute]")
+        print("usage: futures_hand.py [--short] [--validate-only | --execute]")
         raise SystemExit(2)
     try:
         max_notional, slippage_bps = config()
@@ -637,9 +736,11 @@ def main():
         print("NOTE:", clean(error, 300))
         raise SystemExit(3)
 
+    sides = HANDS[hand]
     run_id = format(int(time.time()), "x") + secrets.token_hex(3)
-    open_id = LANE_PREFIX + run_id + "-o"
-    close_id = LANE_PREFIX + run_id + "-c"
+    open_id = sides["prefix"] + run_id + "-o"
+    close_id = sides["prefix"] + run_id + "-c"
+    receipt["hand"] = hand
     if execute:
         try:
             acquire_run(run_id, open_id, close_id, max_notional)
@@ -648,11 +749,12 @@ def main():
             print("NOTE:", clean(error, 300))
             raise SystemExit(3)
     try:
-        plan = preflight(max_notional, slippage_bps)
+        plan = preflight(max_notional, slippage_bps, sides["open_side"])
     except CapabilityBlocked as error:
         if execute:
             refuse(str(error))
         print("lane: L2 FUTURES-HAND")
+        print("hand:", hand)
         print("symbol:", SYMBOL)
         print("hard_ceiling_usdt:", fmt(LANE_HARD_CEILING))
         print("VERDICT: BLOCKED")
@@ -662,6 +764,7 @@ def main():
         if execute:
             refuse(str(error))
         print("lane: L2 FUTURES-HAND")
+        print("hand:", hand)
         print("symbol:", SYMBOL)
         print("hard_ceiling_usdt:", fmt(LANE_HARD_CEILING))
         print("VERDICT: BLOCKED")
@@ -670,7 +773,9 @@ def main():
 
     if not execute:
         print("lane: L2 FUTURES-HAND")
+        print("hand:", hand)
         print("symbol:", SYMBOL)
+        print("open_side:", sides["open_side"])
         print("planned_quantity:", fmt(plan["quantity"]))
         print("limit_price:", fmt(plan["limit_price"]))
         print("max_fill_notional:", fmt(plan["max_fill_notional"]))
@@ -695,18 +800,7 @@ def main():
     }
     save()
     enforce_target_leverage(plan)
-    open_params = {
-        "symbol": SYMBOL,
-        "side": "BUY",
-        "positionSide": "BOTH",
-        "type": "LIMIT",
-        "timeInForce": "IOC",
-        "quantity": fmt(plan["quantity"]),
-        "price": fmt(plan["limit_price"]),
-        "reduceOnly": "false",
-        "newClientOrderId": open_id,
-        "newOrderRespType": "RESULT",
-    }
+    open_params = open_intent(sides["open_side"], plan, open_id)
     receipt["open"] = {"submitted_utc": utc(), "params": {
         key: value for key, value in open_params.items()
         if key != "newClientOrderId"
@@ -736,16 +830,7 @@ def main():
     if opened_qty > plan["quantity"] or open_quote > max_notional:
         first_fail("hard_ceiling", "exchange-reported open exceeded the planned cap")
 
-    close_params = {
-        "symbol": SYMBOL,
-        "side": "SELL",
-        "positionSide": "BOTH",
-        "type": "MARKET",
-        "quantity": fmt(opened_qty),
-        "reduceOnly": "true",
-        "newClientOrderId": close_id,
-        "newOrderRespType": "RESULT",
-    }
+    close_params = close_intent(sides["close_side"], opened_qty, close_id)
     receipt["close"] = {"submitted_utc": utc(), "params": {
         key: value for key, value in close_params.items()
         if key != "newClientOrderId"
@@ -778,7 +863,8 @@ def main():
         wrap_up("UNKNOWN", "planned pair ended but a safety invariant failed", 4)
     wrap_up(
         "CLOSED",
-        "capped IOC long open and same-quantity reduce-only market close are terminal",
+        "capped IOC %s open and same-quantity reduce-only market close "
+        "are terminal" % hand,
         0,
     )
 

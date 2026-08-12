@@ -9,6 +9,12 @@ every step.
 
 ---
 
+FUTURES-SHORT 2026-08-13 | offline short-hand build | base 1aa1e018 | code commit b6019754
+deliverable | src/futures_hand.py --short hand: SELL LIMIT IOC open + reduce-only BUY MARKET close, own l2fs- prefix, 10 USDT cap and 1x preserved
+evidence | py_compile clean on src/futures_hand.py + tests/test_futures_short.py | tests/test_futures_short.py 29 cases green offline, injected transport, no network
+failures | none
+verdict | DONE_LOCAL — committed to lane/futures-short; not pushed, not merged
+
 VOLUME 2026-08-13 | observer + paper lifecycle built | base 1aa1e018 branch lane/volume | DONE
 files | src/volume_observer.py + tests/test_volume_observer.py | new, stdlib only, Decimal money, PAPER ONLY | PASS
 live read | expected fixed-list 24h public rows | found 4 rows exit 0 in evidence/observe_run_20260813.txt | PASS
