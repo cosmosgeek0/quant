@@ -9,16 +9,16 @@ every step.
 
 ---
 
-governance correction 2026-08-12T18:49:16Z | expected owner rules on disk | MEASURED review found 48 issue classes across control files | IN_PROGRESS
-scope | expected lane/model/access rules | found ambiguity at base b3187bd6 | final SHA pending
-parallel | expected runtime-available slots refilled | found shared-pool/child-peer ambiguity | correction in progress
-records | expected mistakes written first | found read-only/precedence/owner-order conflicts | canonical-owner relay correction in progress
-finals | expected every final safe for Fable | found no filter/SHA exception | <=10-row contract correction in progress
-execution | expected platform boundary at dispatch | found late/stale worker-mutation text | executor split correction in progress
-boot | expected TASK + LOGS + worktree state after compaction | found incomplete LEAD/Builder boot | correction in progress
-first failure | expected boundary checked before dispatch | found late disclosure | UNVERIFIED no-mutation claim retained only in earlier measured row
-implementation | expected clean control files | found 4 patch failures plus grammar/shape and stale clauses | recorded and corrected
-verification | expected current four-file diff passes review | found MEASURED diff-check exit 0; bounded review running | commit/push not checked
+governance correction 2026-08-12T18:49:16Z | expected owner rules on disk | found rules commit 123886f3 | CORRECTED
+scope | expected separate named lanes + internal children + model/access | found explicit in BUILDER.md, LEAD.md, TASK.md | PASS
+parallel | expected runtime-available slots refilled throughout | found start/finish/milestone/compaction refill law | PASS
+records | expected each mistake recorded first | found scoped write or strict-read-only canonical-owner relay | PASS
+finals | expected every final safe for Fable | found <=10-row FABLE-CLEAN contract | PASS
+execution | expected platform boundary at dispatch | found human-executor/Codex-reconcile split | PASS
+boot | expected TASK + LOGS + worktree state after compaction | found full Lead/worker boot and refill | PASS
+first failure | expected platform boundary checked before dispatch | found late disclosure in Futures worker | RECORDED
+implementation | expected clean control files | found 48 issue classes corrected before commit | PASS
+verification | expected current four-file consistency | found MEASURED audits + diff-check exit 0 | commit 123886f3; push pending
 
 2026-08-12T18:18:55Z | FUTURES LIVE PROOF PRECHECK | committed executor + GET-only host proof | SHA last-8 b01b8190
 deploy | /home/ssm-user/quant-run/live-proof-ef95946 | wallet/futures source SHA-256 matched | secret fields exact; values never printed
