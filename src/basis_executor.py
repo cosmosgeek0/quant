@@ -1092,11 +1092,14 @@ def validate_only(cfg: ExecutorConfig, request,
                   sleep: Callable[[float], None] = time.sleep) -> int:
     """The COMPLETE signed read-only preflight with zero POSTs.
 
-    Public reads produce the plan, then every signed preflight proof runs,
-    including the plan symbol's actual configured leverage. The transport is
-    wrapped so any non-GET attempt dies before leaving the process; the trade
-    lock is never taken and no receipt file is written. Exit 0 = every proof
-    held; exit 5 = preflight refused; exit 2 = the plan itself refused.
+    Public reads attempt the plan, then every signed preflight proof runs
+    REGARDLESS of the plan outcome (owner order 2026-08-13): a refused plan
+    only swaps in a conservative full-ceiling margin requirement, so account
+    readiness is always measured. The transport is wrapped so any non-GET
+    attempt dies before leaving the process; the trade lock is never taken
+    and no receipt file is written. Exit 0 = plan and every proof held;
+    exit 5 = preflight refused; exit 2 = account proofs held but the plan
+    itself refused.
     """
     def get_only(method, base_url, path, params=None, signed=False):
         if method != "GET":
@@ -1104,12 +1107,24 @@ def validate_only(cfg: ExecutorConfig, request,
         return request(method, base_url, path, params, signed)
 
     state = make_state(cfg, get_only, sleep, receipted=False)
+    plan = None
+    plan_note = ""
     try:
         _row, plan, _market = read_and_plan(state)
     except Refusal as refusal:
-        print("VALIDATE | %s | PLAN_REFUSED | %s" % (cfg.symbol,
-                                                     clean(refusal, 300)))
-        return 2
+        plan_note = clean(refusal, 300)
+        print("VALIDATE | %s | PLAN_REFUSED | %s" % (cfg.symbol, plan_note))
+        print("VALIDATE | %s | signed preflight continues with conservative "
+              "margin requirement %s USDT" % (cfg.symbol,
+                                              fmt(MAX_CYCLE_QUOTE)))
+    if plan is None:
+        plan = CyclePlan(
+            symbol=cfg.symbol, entry_gap_bps=Decimal(0),
+            exit_gap_bps=Decimal(0), funding_rate=Decimal(0),
+            spot_quantity=Decimal(0), short_quantity=Decimal(0),
+            spot_quote_cap=MAX_CYCLE_QUOTE, short_notional=MAX_CYCLE_QUOTE,
+            leverage=1,
+            reason="validate-only fallback after plan refusal")
     try:
         signed_preflight(state, plan)
     except PreflightRefusal as refusal:
@@ -1122,7 +1137,7 @@ def validate_only(cfg: ExecutorConfig, request,
               cfg.symbol, proofs.get("symbol_leverage"),
               proofs.get("available_balance"),
               proofs.get("required_short_margin_1x")))
-    return 0
+    return 2 if plan_note else 0
 
 
 def live_request_factory(api_key: str, api_secret: str,

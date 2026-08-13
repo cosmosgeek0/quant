@@ -1360,15 +1360,28 @@ class ValidateOnlyTests(ExecutorCase):
         self.assertIn("5x, not exactly 1x", out)
         self.assertEqual(os.listdir(self.dir), [])
 
-    def test_plan_refusal_exits_2_before_any_signed_read(self):
+    def test_plan_refusal_still_runs_full_signed_preflight(self):
         cfg = ExecutorConfig(symbol=SYMBOL, sha=SHA, receipt_dir=self.dir,
                              run_id=RID, min_entry_bps=Decimal("1000000"))
         code, transport, out = self.validate(happy_spec(), cfg=cfg)
         self.assertEqual(code, 2)
         self.assertIn("PLAN_REFUSED", out)
-        self.assertFalse(any(signed for *_rest, signed in transport.calls))
+        self.assertIn("PREFLIGHT_OK", out)
+        seen = {path for _m, _b, path, _p, signed in transport.calls if signed}
+        self.assertEqual(seen, set(PREFLIGHT_PATHS))
         self.assertEqual(transport.posts, [])
         self.assertEqual(os.listdir(self.dir), [])
+
+    def test_plan_refusal_with_wrong_leverage_still_refuses_exit_5(self):
+        cfg = ExecutorConfig(symbol=SYMBOL, sha=SHA, receipt_dir=self.dir,
+                             run_id=RID, min_entry_bps=Decimal("1000000"))
+        spec = happy_spec()
+        spec["symbol_config"] = [{"symbol": SYMBOL, "leverage": "10"}]
+        code, transport, out = self.validate(spec, cfg=cfg)
+        self.assertEqual(code, 5)
+        self.assertIn("PLAN_REFUSED", out)
+        self.assertIn("10x, not exactly 1x", out)
+        self.assertEqual(transport.posts, [])
 
 
 if __name__ == "__main__":
