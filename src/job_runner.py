@@ -3,7 +3,7 @@
 
 Jobs are immutable-by-convention JSON files in ``RECEIPT_DIR/jobs``.  A
 persistent O_EXCL claim makes every job id single-use.  The runner never
-transfers funds and exposes only the two compiled round-trip operations.
+transfers funds and exposes only the three compiled round-trip operations.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ JOB_FIELDS = {
 RESULT_FIELDS = {
     "job_id", "op", "symbol", "verdict", "exit_code", "receipt_path", "utc"
 }
-OPS = {"FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP"}
+OPS = {"FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP"}
 HARD_MAX_NOTIONAL = Decimal("8")
 MAX_JOB_AGE = timedelta(minutes=15)
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
@@ -204,6 +204,7 @@ def _paths(receipt_dir: str) -> Dict[str, str]:
         "receipts": os.path.join(jobs_dir, "receipts"),
         "results": os.path.join(jobs_dir, "results.jsonl"),
         "proof": os.path.join(jobs_dir, "futures_proof_passed"),
+        "basis_proof": os.path.join(jobs_dir, "basis_proof_passed"),
         "stop": os.path.join(receipt_dir, "STOP-JOBS"),
         "tick_lock": os.path.join(jobs_dir, ".job-runner-active"),
     }
@@ -385,6 +386,45 @@ def _append_result(paths: Dict[str, str], job_id: str, op: str, symbol: str,
     os.close(descriptor)
 
 
+def _write_proof_marker(path: str, job_id: str, utc: str) -> bool:
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        os.write(descriptor, (job_id + " " + utc + "\n").encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _basis_proof_passed(paths: Dict[str, str]) -> bool:
+    if os.path.isfile(paths["basis_proof"]):
+        return True
+    try:
+        with open(paths["results"], encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return False
+                if row.get("op") == "BASIS_ROUNDTRIP" \
+                        and row.get("verdict") == "CLOSED" \
+                        and type(row.get("job_id")) is str \
+                        and type(row.get("utc")) is str:
+                    created = _write_proof_marker(
+                        paths["basis_proof"], row["job_id"], row["utc"]
+                    )
+                    if created:
+                        print("JOB-RUNNER | BASIS_PROOF_BACKFILLED | %s" % (
+                            row["job_id"]
+                        ))
+                    return created or os.path.isfile(paths["basis_proof"])
+    except (OSError, ValueError, UnicodeError):
+        return False
+    return False
+
+
 @contextmanager
 def _environment(values: Dict[str, str]):
     previous = {key: os.environ.get(key) for key in values}
@@ -436,7 +476,8 @@ def _verdict_from_receipt(path: str) -> str:
 
 
 def _run_futures(receipt_dir: str,
-                 entry: Optional[Callable[[], Any]] = None) -> Outcome:
+                 entry: Optional[Callable[[], Any]] = None,
+                 short: bool = True) -> Outcome:
     entry = entry or futures_hand.main
     before = set(glob.glob(os.path.join(receipt_dir, "futures-hand-*.json")))
     futures_hand.API_KEY = os.environ.get("BINANCE_API_KEY", "")
@@ -451,7 +492,10 @@ def _run_futures(receipt_dir: str,
     futures_hand.receipt_path = ""
     futures_hand.ctx = {"lock": False, "mutated": False}
     previous_argv = sys.argv
-    sys.argv = ["futures_hand.py", "--short", "--execute"]
+    sys.argv = ["futures_hand.py"]
+    if short:
+        sys.argv.append("--short")
+    sys.argv.append("--execute")
     returned = None
     code = 0
     try:
@@ -524,6 +568,10 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
         return Outcome("REFUSED", 2, "", "MISSING_CREDENTIALS")
     if job.op == "BASIS_ROUNDTRIP" and not os.path.isfile(paths["proof"]):
         return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
+    if job.op == "MOMENTUM_ROUNDTRIP":
+        basis_proof = _basis_proof_passed(paths)
+        if not os.path.isfile(paths["proof"]) or not basis_proof:
+            return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
 
     values = {
         "SYMBOL": job.symbol,
@@ -536,6 +584,8 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
             return Outcome("UNKNOWN", 4, "", "LEVERAGE_UNPROVEN")
         if job.op == "FUTURES_ROUNDTRIP":
             return _run_futures(receipt_dir, futures_entry)
+        if job.op == "MOMENTUM_ROUNDTRIP":
+            return _run_futures(receipt_dir, futures_entry, short=False)
         return _run_basis(receipt_dir, job.effective_notional, basis_entry)
 
 
@@ -548,15 +598,13 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
             outcome.receipt_path,
         )
         outcome = Outcome(outcome.verdict, outcome.exit_code, receipt_path)
-    if op == "FUTURES_ROUNDTRIP" and outcome.verdict == "CLOSED":
-        try:
-            descriptor = os.open(paths["proof"],
-                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(descriptor, (job_id + " " + _utc_text(now) + "\n").encode())
-            os.fsync(descriptor)
-            os.close(descriptor)
-        except FileExistsError:
-            pass
+    if outcome.verdict == "CLOSED":
+        proof_path = {
+            "FUTURES_ROUNDTRIP": paths["proof"],
+            "BASIS_ROUNDTRIP": paths["basis_proof"],
+        }.get(op)
+        if proof_path:
+            _write_proof_marker(proof_path, job_id, _utc_text(now))
     if outcome.verdict in FREEZE_VERDICTS:
         _touch_stop(paths["stop"])
     _append_result(paths, job_id, op, symbol, outcome, now)

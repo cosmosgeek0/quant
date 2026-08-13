@@ -28,15 +28,23 @@ def utc(value):
 
 
 class LeverageTransport:
-    def __init__(self):
+    def __init__(self, events):
         self.calls = []
+        self.events = events
+        self.current = 1
 
     def __call__(self, method, base_url, path, params=None, signed=False):
-        self.calls.append((method, path, dict(params or {}), signed))
-        if method != "GET" or path != "/fapi/v1/symbolConfig":
-            raise AssertionError("unexpected leverage transport call")
-        symbol = (params or {}).get("symbol", "")
-        return "ok", [{"symbol": symbol, "leverage": "1"}]
+        call = (method, path, dict(params or {}), signed)
+        self.calls.append(call)
+        self.events.append(("leverage", call))
+        if method == "GET" and path == "/fapi/v1/symbolConfig":
+            symbol = (params or {}).get("symbol", "")
+            return "ok", [{"symbol": symbol, "leverage": str(self.current)}]
+        if method == "POST" and path == "/fapi/v1/leverage" \
+                and (params or {}).get("leverage") == "1":
+            self.current = 1
+            return "ok", {"leverage": 1}
+        raise AssertionError("unexpected leverage transport call")
 
 
 class JobRunnerTests(unittest.TestCase):
@@ -48,9 +56,10 @@ class JobRunnerTests(unittest.TestCase):
         os.makedirs(self.jobs_dir)
         self.hand_calls = []
         self.basis_calls = []
+        self.events = []
         self.hand_verdict = "CLOSED"
         self.hand_exit = 0
-        self.leverage = LeverageTransport()
+        self.leverage = LeverageTransport(self.events)
 
         env = mock.patch.dict(os.environ, {
             "RECEIPT_DIR": self.receipt_dir,
@@ -103,6 +112,7 @@ class JobRunnerTests(unittest.TestCase):
 
     def fake_futures(self):
         index = len(self.hand_calls) + 1
+        self.events.append(("futures", list(sys.argv)))
         self.hand_calls.append({
             "argv": list(sys.argv),
             "symbol": os.environ.get("SYMBOL"),
@@ -285,6 +295,98 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.basis_calls[0]["argv"], ["--execute"])
         self.assertEqual(self.basis_calls[0]["executor_cap"], "8")
         self.assertEqual(self.basis_calls[0]["cycle_cap"], "8")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.jobs_dir, "basis_proof_passed"
+        )))
+
+    def test_momentum_is_sequence_locked_before_both_markers(self):
+        self.job("momentum-locked", op="MOMENTUM_ROUNDTRIP")
+        self.assertEqual(self.tick(), 2)
+        row = self.results()[0]
+        self.assertEqual(row["verdict"], "REFUSED")
+        self.assertEqual(self.reason(row), "SEQUENCE_LOCKED")
+        self.assertEqual(self.hand_calls, [])
+
+    def test_closed_basis_result_backfills_marker_and_unlocks_momentum(self):
+        Path(os.path.join(self.jobs_dir, "futures_proof_passed")).touch()
+        proof_utc = utc(NOW - timedelta(minutes=2))
+        receipt = os.path.join(
+            self.receipt_dir, "basis-executor-prior.json"
+        )
+        with open(receipt, "w", encoding="utf-8") as handle:
+            json.dump({"verdict": "CLOSED"}, handle)
+        prior = {
+            "job_id": "basis-live",
+            "op": "BASIS_ROUNDTRIP",
+            "symbol": "TSTUSDT",
+            "verdict": "CLOSED",
+            "exit_code": 0,
+            "receipt_path": receipt,
+            "utc": proof_utc,
+        }
+        with open(os.path.join(self.jobs_dir, "results.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(json.dumps(prior) + "\n")
+        self.job("momentum-backfill", op="MOMENTUM_ROUNDTRIP")
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(self.tick(), 0)
+
+        marker = os.path.join(self.jobs_dir, "basis_proof_passed")
+        with open(marker, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "basis-live %s\n" % proof_utc)
+        self.assertTrue(any(
+            call.args and "BASIS_PROOF_BACKFILLED" in call.args[0]
+            for call in output.call_args_list
+        ))
+        self.assertEqual(self.hand_calls[0]["argv"], [
+            "futures_hand.py", "--execute"
+        ])
+
+    def test_momentum_uses_long_path_clamped_cap_after_forcing_one_x(self):
+        Path(os.path.join(self.jobs_dir, "futures_proof_passed")).touch()
+        Path(os.path.join(self.jobs_dir, "basis_proof_passed")).touch()
+        self.leverage.current = 5
+        self.job(
+            "momentum-clamped", op="MOMENTUM_ROUNDTRIP", max_notional=800
+        )
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(self.hand_calls[0]["argv"], [
+            "futures_hand.py", "--execute"
+        ])
+        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
+        self.assertEqual(self.leverage.calls[1], (
+            "POST", "/fapi/v1/leverage",
+            {"symbol": "TSTUSDT", "leverage": "1"}, True,
+        ))
+        self.assertEqual(self.leverage.current, 1)
+        self.assertEqual(
+            [event[0] for event in self.events],
+            ["leverage", "leverage", "leverage", "leverage", "futures"],
+        )
+
+    def test_unknown_momentum_touches_stop_and_blocks_next_job(self):
+        Path(os.path.join(self.jobs_dir, "futures_proof_passed")).touch()
+        Path(os.path.join(self.jobs_dir, "basis_proof_passed")).touch()
+        self.job("momentum-a", op="MOMENTUM_ROUNDTRIP")
+        self.job("momentum-b", op="MOMENTUM_ROUNDTRIP")
+        self.hand_verdict = "UNKNOWN"
+        self.hand_exit = 4
+
+        self.assertEqual(self.tick(), 4)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.hand_verdict = "CLOSED"
+        self.hand_exit = 0
+        self.assertEqual(self.tick(), 0)
+        self.assertEqual(len(self.hand_calls), 1)
+        self.assertEqual(
+            [row["job_id"] for row in self.results()], ["momentum-a"]
+        )
 
     def test_closed_futures_writes_proof_marker(self):
         self.job("proof")
