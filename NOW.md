@@ -40,7 +40,7 @@
   MOMENTUM PROVEN 2026-08-13T23:21Z (receipt three).
 - Money history: one CLOSED spot round trip (d1b204b); one honest
   OPEN_EXPOSURE freeze whose residual was later sold by the ordered
-  reconcile; futures fills: four (short proof + basis cycle, 2026-08-13);
+  reconcile; futures fills: six (short proof + basis cycle + momentum, 2026-08-13);
   completed basis cycles: one (mechanics-only); profit proven: none. Not
   guaranteed money — the machine refuses when the full equation is
   negative, which today it is.
