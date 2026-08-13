@@ -9,6 +9,14 @@ every step.
 
 ---
 
+WAVE-3 FULL BASIS 2026-08-13 | commander order complete | release 382b8b96204ab9e4f501bfb11cc8a5487bd1db03
+built | basis_kernel (99 spec rules, 17-step guard order) | basis_watch (continuous observer, hysteresis, restart-safe) | basis_position (resumable open/hold/close/resume) | 618 tests green
+extraction proof | 125 differential fixtures from the old engine: 116 reproduced, 9 waived with written reasons | spec + fixtures committed in tests/fixtures/
+review | 31-agent panel: 12 confirmed findings (2 HIGH watch, 1 HIGH position) | all 12 repaired — 1 Fable-direct, 11 via narrow codex-cli tasks, every one verified by the Lead's own diffs and test runs
+production scan | live universe passes 1-6, HARD KILL, restart resumed at pass 7 from persisted watermark, 8 symbols tracked, STOP honored | all decisions honest refusals
+signed truth | commission measured: spot 0.10% + usdm 0.05% taker = 0.30% round trip, recorded on host | full preflight ran for 3 finalists regardless of market: TST banded-margin refuse, FF/EDU leverage refuse
+verdict | READY_WAITING_FOR_NET_EDGE — best raw entry gap ~0.21% vs 0.30% measured fees before slippage/funding; the machine correctly wants no trade | live entry stays owner-activated | trading loop stays PAUSED
+
 FIRST BASIS CYCLE ATTEMPT + MACHINE TRIGGER 2026-08-13 | owner pressed; machine built | code 81e999ad
 live result | leverage BNBUSDT 5x->1x proven | transfer 9 USDT spot-to-usdm CONFIRMED | cycle bought ~10 USDT BNB then froze OPEN_EXPOSURE
 live defect | net base after 0.1% fee floors below the 0.01 futures lot | lock held, no repair trade | ~0.00999 BNB spot unhedged, awaiting reconcile

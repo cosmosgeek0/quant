@@ -44,20 +44,15 @@ exchange-side symbolConfig BTCUSDT 10x, ETH/SOL 5x CROSSED (the hand sets 1x
 one-shot before any order). No futures order, live or test, has ever been
 sent; trade capability stays unproven until a real order.
 
-WAVE-1 LANDED at 3046dd97 (basis_cycle + four lanes, 4-lens panel, 9 repaired
-findings, 113 tests). WAVE-2 LANDED (2026-08-13, measured): capability fix
-(canTrade from accountConfig), one-shot src/basis_executor.py composing the
-proven pieces (signed read-only preflight before any order, exchange-truth
-fee-aware sizing, spot-step shortfall honesty, cross-lane receipt gate,
-PREFLIGHT_REFUSED exit 5), closed-candle restart-safe paper volume, and the
-served read-only UI — merged at ec9cff37558863f8d7c91e7eb27da8a24587b767
-after a 3-lens panel confirmed 9 findings (1 HIGH), all repaired pre-merge;
-285 offline tests green. Live executor code exists but is deliberately
-UNVERIFIED live. THE EXACT REMAINING BLOCKER: USD-M available balance is
-1.00000000 USDT — below the ~10 USDT margin the minimum basis cycle needs at
-1x, so the executor's own preflight would refuse; one receipted Spot->USD-M
-transfer (wallet.py mechanics, <=10 ceiling) unlocks it, and that is a live
-action waiting on the owner's word, as is the first live executor run.
+WAVE-3 LANDED (2026-08-13, measured): the full normal-basis strategy is
+built, panel-hardened (12/12 findings repaired), extraction-proven against
+the old engine (116/125 differential fixtures), and production-validated —
+continuous live observer with restart recovery, measured commission truth
+(0.30% round trip), complete signed preflight for finalists. Release
+382b8b96204ab9e4f501bfb11cc8a5487bd1db03; modules sha-verified on the host.
+STATE: READY_WAITING_FOR_NET_EDGE — no economically positive candidate
+exists; the observer and the paused loop await the owner's activation word.
+Wave-1/2 history preserved in LOGS.
 
 PARKED, awaiting owner words someday: L6 reverse-basis spec (needs borrow
 power); L8's seven old-project import candidates (per-item permits); the
