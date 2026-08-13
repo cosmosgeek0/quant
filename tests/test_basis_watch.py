@@ -42,6 +42,7 @@ import basis_scan  # noqa: E402
 import basis_position  # noqa: E402
 import basis_watch  # noqa: E402
 from basis_watch import (  # noqa: E402
+    StreamStateReads,
     SymbolState,
     Watch,
     WatchError,
@@ -331,6 +332,21 @@ def funding_history_rows(period_ms: int, count: int = 3,
     return [{"fundingTime": 1 + period_ms * index,
              "fundingRate": values[index]}
             for index in range(count)]
+
+
+def stream_record(gap_pct: Optional[str], freshness_ms: str = "0",
+                  venues: str = "both") -> Dict[str, Any]:
+    return {
+        "utc": "2026-08-13T00:00:00.000Z",
+        "venues": venues,
+        "spot_bid": "100", "spot_ask": "100.02",
+        "perp_bid": "100.8", "perp_ask": "100.82",
+        "mark": "100.81", "vol_1m_quote": "1000",
+        "vol_med_1m": "500", "surge_ratio": "2",
+        "oi": "10000", "oi_change_pct": "0.1",
+        "funding_rate": "0.0001", "next_funding_ms": "14400000",
+        "basis_gap_pct": gap_pct, "freshness_ms": freshness_ms,
+    }
 
 
 def scenario_bundle(now_ms: int, gap_pct: str = "0.78", qty: str = "500",
@@ -1315,15 +1331,41 @@ class CliTests(PipelineCase):
     def base_args(self) -> List[str]:
         return ["--receipt-dir", self.tmp.name, "--state-file", self.state_path]
 
+    def write_stream(self, payload: Dict[str, Any]) -> str:
+        path = os.path.join(self.tmp.name, "stream_state.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
     def test_once_prints_factual_rows_and_persists_state(self):
         reads = FakeReads([universe_row("TESTUSDT")],
                           {"TESTUSDT": scenario_bundle(T0 + 2000)})
         code, output = self.run_main(["--once"] + self.base_args(), reads)
         self.assertEqual(code, 0)
         self.assertIn("WATCH | pass 1", output)
+        self.assertIn("mode DIRECT-FETCH", output)
         self.assertIn("TESTUSDT", output)
         self.assertIn("ESTIMATED", output)  # no commission receipt present
+        self.assertEqual(reads.universe_calls, 1)
         self.assertTrue(os.path.exists(self.state_path))
+
+    def test_stream_flag_replaces_only_universe_read_and_reports_mode(self):
+        path = self.write_stream({
+            "STREAMUSDT": stream_record("0.78"),
+            "SPOTONLYUSDT": stream_record("9", venues="spot"),
+            "NULLUSDT": stream_record(None),
+            "STALEUSDT": stream_record("8", freshness_ms="5001"),
+        })
+        reads = FakeReads(
+            [universe_row("DIRECTUSDT", entry_bps="999")],
+            {"STREAMUSDT": scenario_bundle(T0 + 2000)})
+        code, output = self.run_main(
+            ["--once", "--stream-state", path] + self.base_args(), reads)
+        self.assertEqual(code, 0)
+        self.assertEqual(reads.universe_calls, 0)
+        self.assertIn("mode STREAM-FED", output)
+        self.assertIn("STREAMUSDT", output)
+        self.assertNotIn("DIRECTUSDT", output)
 
     def test_default_state_is_nested_outside_shared_receipt_glob(self):
         reads = FakeReads([universe_row("TESTUSDT")],
@@ -1536,6 +1578,59 @@ class KernelIntegrationTests(PipelineCase):
 
 
 class FinalistSelectionTests(PipelineCase):
+    def write_stream(self, payload: Dict[str, Any], name: str) -> str:
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def test_stream_pass_uses_only_fresh_both_venue_non_null_gaps(self):
+        path = self.write_stream({
+            "LOWUSDT": stream_record("0.40"),
+            "SPOTONLYUSDT": stream_record("7", venues="spot"),
+            "PERPONLYUSDT": stream_record("6", venues="perp"),
+            "NULLUSDT": stream_record(None),
+            "STALEUSDT": stream_record("9", freshness_ms="5001"),
+            "ZEROGAPUSDT": stream_record("0"),
+            "NEGATIVEUSDT": stream_record("-0.25"),
+            "HIGHUSDT": stream_record("0.90", freshness_ms="5000"),
+        }, "stream-filter.json")
+        deep = FakeReads([], {
+            "HIGHUSDT": scenario_bundle(T0 + 2000, gap_pct="0.90"),
+            "LOWUSDT": scenario_bundle(T0 + 2000, gap_pct="0.40"),
+        })
+        reads = StreamStateReads(path, deep, watch_config()["stale_ms"])
+        out = self.make_watch().run_pass(reads, T0 + 2000)
+        self.assertEqual([row["symbol"] for row in out],
+                         ["HIGHUSDT", "LOWUSDT"])
+        self.assertEqual(deep.universe_calls, 0)
+
+    def test_stream_and_equivalent_direct_fixture_rank_identically(self):
+        path = self.write_stream({
+            "LOWUSDT": stream_record("0.20"),
+            "HIGHUSDT": stream_record("0.90"),
+            "MIDUSDT": stream_record("0.55"),
+        }, "stream-rank.json")
+        bundles = {
+            symbol: scenario_bundle(T0 + 2000, gap_pct=gap)
+            for symbol, gap in (("LOWUSDT", "0.20"),
+                                ("HIGHUSDT", "0.90"),
+                                ("MIDUSDT", "0.55"))
+        }
+        cfg = watch_config({"finalist_cap": 2})
+        direct = FakeReads([
+            universe_row("HIGHUSDT", entry_bps="90"),
+            universe_row("MIDUSDT", entry_bps="55"),
+            universe_row("LOWUSDT", entry_bps="20"),
+        ], bundles)
+        stream = StreamStateReads(path, FakeReads([], bundles), cfg["stale_ms"])
+        direct_watch = Watch(self.state_path + ".direct", self.tmp.name, cfg)
+        stream_watch = Watch(self.state_path + ".stream", self.tmp.name, cfg)
+        direct_out = direct_watch.run_pass(direct, T0 + 2000)
+        stream_out = stream_watch.run_pass(stream, T0 + 2000)
+        self.assertEqual([row["symbol"] for row in stream_out],
+                         [row["symbol"] for row in direct_out])
+
     def test_non_conforming_symbol_never_becomes_finalist(self):
         watch = self.make_watch()
         rows = [universe_row("币安人生USDT", entry_bps="99"),

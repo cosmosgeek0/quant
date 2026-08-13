@@ -3,45 +3,52 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>quant — read-only</title>
+<title>quant runtime truth — read-only</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
-  <h1>quant</h1>
-  <p class="sub">read-only screen &middot; event contract v1 &middot; served by ui/serve.py read-only GET endpoints</p>
+  <h1>quant runtime truth</h1>
+  <p class="sub">read-only &middot; local runtime files &middot; automatic refresh every 2 seconds</p>
+  <button id="refresh-runtime" type="button">refresh runtime files</button>
 </header>
 
-<section id="live" aria-labelledby="live-h">
-  <h2 id="live-h">Live &mdash; BTCUSDT spot</h2>
-  <p class="price-line"><span id="price" class="num">&mdash;</span> <span class="unit" id="price-unit"></span></p>
-  <p class="meta" id="price-meta">not fetched yet</p>
-  <p class="meta">endpoint: api.binance.com/api/v3/ticker/price?symbol=BTCUSDT (unsigned public GET)</p>
-  <button id="refresh" type="button">refresh</button>
+<section id="live-tokens" aria-labelledby="stream-h">
+  <h2 id="stream-h">Live tokens &mdash; surge + both-venue basis gaps</h2>
+  <div id="stream"><p class="meta">loading /api/stream&hellip;</p></div>
 </section>
 
-<section id="spot-runs" aria-labelledby="spot-h">
-  <h2 id="spot-h">Spot runs &mdash; recorded events</h2>
-  <div id="runs"><p class="meta">loading /api/events&hellip;</p></div>
+<section id="candidate-list" aria-labelledby="candidates-h">
+  <h2 id="candidates-h">Candidates &mdash; valid unexpired proposals</h2>
+  <div id="candidates"><p class="meta">loading /api/candidates&hellip;</p></div>
 </section>
 
-<section id="basis-reads" aria-labelledby="basis-h">
-  <h2 id="basis-h">Basis reads</h2>
-  <div id="basis"><p class="meta">loading /api/basis&hellip;</p></div>
+<section id="positions" aria-labelledby="positions-h">
+  <h2 id="positions-h">Positions</h2>
+  <p class="run-head">basis position + supervision</p>
+  <div id="position"><p class="meta">loading /api/position&hellip;</p></div>
+  <p class="run-head">momentum paper positions</p>
+  <div id="momentum"><p class="meta">loading /api/momentum&hellip;</p></div>
 </section>
 
-<section id="futures-runs" aria-labelledby="fut-h">
-  <h2 id="fut-h">Futures runs</h2>
-  <div id="futures"><p class="meta">loading /api/futures&hellip;</p></div>
+<section id="commission-fees" aria-labelledby="fees-h">
+  <h2 id="fees-h">Fees &mdash; commission rates</h2>
+  <div id="fees"><p class="meta">loading /api/fees&hellip;</p></div>
 </section>
 
-<section id="volume-runs" aria-labelledby="vol-h">
-  <h2 id="vol-h">Volume paper runs</h2>
-  <div id="volume"><p class="meta">loading /api/volume&hellip;</p></div>
+<section id="realized-pnl" aria-labelledby="pnl-h">
+  <h2 id="pnl-h">Realized P&amp;L</h2>
+  <div id="pnl"><p class="meta">loading /api/pnl&hellip;</p></div>
+</section>
+
+<section id="spot-history" aria-labelledby="history-h">
+  <h2 id="history-h">History &mdash; recorded spot runs</h2>
+  <p class="meta">The events fixture is archived historical evidence. It is not a live market, candidate, order, position, fee, or P&amp;L source.</p>
+  <div id="runs"><p class="meta">loading historical /api/events&hellip;</p></div>
 </section>
 
 <footer>
-  <p class="meta">Events and receipts are shown as recorded, unaltered, from the local read-only server (GET and HEAD only; no mutating endpoint). Timestamps are UTC as written in each record. Absent sources are reported as absent, never invented. The only control on this page is the refresh button above; it re-reads the live price endpoint.</p>
+  <p class="meta">All live sections are rendered from the resolved local runtime paths shown beside them. Every source supplies its own timestamp, with file modification time used only as the fallback as-of fact. Missing or unreadable sources stay visibly empty. The server accepts GET and HEAD only and exposes no mutation route.</p>
 </footer>
 
 <script src="app.js"></script>

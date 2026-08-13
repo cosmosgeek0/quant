@@ -1,146 +1,103 @@
 "use strict";
 
-/* quant read-only screen, served runtime.
-   Every section is fetched over HTTP from ui/serve.py's read-only GET
-   endpoints — no file:// path, no fixture-only assumption. Absent sources
-   are shown as honest "nothing yet" states, exactly as the server reports
-   them. Pure functions first (also loadable in Node for headless
-   verification), DOM wiring at the bottom. */
+/* Read-only runtime screen. Every market, fee, position, and P&L value comes
+   from ui/serve.py's local file-backed GET endpoints. The events endpoint is
+   deliberately separate and rendered only as historical spot-run evidence. */
 
-var PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT";
+var STREAM_URL = "/api/stream";
+var CANDIDATES_URL = "/api/candidates";
+var POSITION_URL = "/api/position";
+var MOMENTUM_URL = "/api/momentum";
+var FEES_URL = "/api/fees";
+var PNL_URL = "/api/pnl";
 var EVENTS_URL = "/api/events";
-var BASIS_URL = "/api/basis";
-var FUTURES_URL = "/api/futures";
-var VOLUME_URL = "/api/volume";
+var REFRESH_MS = 2000;
 
-/* ---------- pure: contract-v1 rendering ---------- */
+function valueText(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function receiptPairs(obj) {
+  if (!obj || typeof obj !== "object") return [];
+  return Object.keys(obj).sort().map(function (key) {
+    return [key, valueText(obj[key])];
+  });
+}
 
 function fmtPairs(obj) {
   if (!obj) return "";
-  return Object.keys(obj).map(function (k) { return k + " " + obj[k]; }).join(", ");
+  return Object.keys(obj).map(function (key) {
+    return key + " " + valueText(obj[key]);
+  }).join(", ");
 }
 
-/* One contract-v1 event -> one factual display row. No derived opinions:
-   every value shown is a field of the event, verbatim. */
-function eventRow(ev) {
-  var d = [];
-  switch (ev.kind) {
+function eventRow(event) {
+  var details = [];
+  switch (event.kind) {
     case "run_start":
-      if (ev.balances) d.push("balances: " + fmtPairs(ev.balances));
+      if (event.balances) details.push("balances: " + fmtPairs(event.balances));
       break;
     case "order_submitted":
-      if (ev.side) d.push(ev.side);
-      if (ev.client_id_last4) d.push("client id …" + ev.client_id_last4);
+      if (event.side) details.push(event.side);
+      if (event.client_id_last4) details.push("client id …" + event.client_id_last4);
       break;
     case "order_terminal":
-      if (ev.side) d.push(ev.side);
-      if (ev.executed) d.push("executed " + ev.executed);
-      if (ev.quote) d.push("quote " + ev.quote);
-      if (ev.fees) d.push("fees: " + fmtPairs(ev.fees));
-      if (ev.client_id_last4) d.push("client id …" + ev.client_id_last4);
-      if (ev.order_id_last4) d.push("order id …" + ev.order_id_last4);
+      if (event.side) details.push(event.side);
+      if (event.executed) details.push("executed " + event.executed);
+      if (event.quote) details.push("quote " + event.quote);
+      if (event.fees) details.push("fees: " + fmtPairs(event.fees));
+      if (event.client_id_last4) details.push("client id …" + event.client_id_last4);
+      if (event.order_id_last4) details.push("order id …" + event.order_id_last4);
       break;
     case "balance_snapshot":
-      if (ev.balances) d.push("balances: " + fmtPairs(ev.balances));
+      if (event.balances) details.push("balances: " + fmtPairs(event.balances));
       break;
     case "run_verdict":
-      if (ev.verdict) d.push(ev.verdict);
-      if (ev.residual) d.push("residual " + ev.residual);
+      if (event.verdict) details.push(event.verdict);
+      if (event.residual) details.push("residual " + event.residual);
       break;
     case "gap_read":
-      if (ev.symbol) d.push(ev.symbol);
+      if (event.symbol) details.push(event.symbol);
       break;
     default:
-      /* unknown kind: still factual — show the raw record */
-      d.push(JSON.stringify(ev));
+      details.push(JSON.stringify(event));
   }
-  if (ev.note) d.push(ev.note);
-  return { ts: ev.ts, kind: ev.kind, detail: d.join(" · "), run_id: ev.run_id };
+  if (event.note) details.push(event.note);
+  return {
+    ts: event.ts,
+    kind: event.kind,
+    detail: details.join(" · "),
+    run_id: event.run_id
+  };
 }
 
-/* JSONL text -> array of event objects, line order preserved. */
-function parseJsonl(text) {
-  return text.split("\n")
-    .map(function (l) { return l.trim(); })
-    .filter(function (l) { return l.length > 0; })
-    .map(function (l) { return JSON.parse(l); });
-}
-
-/* Group events by run_id, preserving first-appearance order. */
 function groupRuns(events) {
   var order = [];
   var byId = {};
-  events.forEach(function (ev) {
-    var id = ev.run_id || "(no run_id)";
-    if (!byId[id]) { byId[id] = { run_id: id, sha8: ev.sha8, symbol: ev.symbol, events: [] }; order.push(id); }
-    byId[id].events.push(ev);
+  events.forEach(function (event) {
+    var id = event.run_id || "(no run_id)";
+    if (!byId[id]) {
+      byId[id] = {
+        run_id: id,
+        sha8: event.sha8,
+        symbol: event.symbol,
+        events: []
+      };
+      order.push(id);
+    }
+    byId[id].events.push(event);
   });
   return order.map(function (id) { return byId[id]; });
 }
 
-/* One volume paper receipt record -> one factual display row, verbatim fields. */
-function paperReceiptRow(rec) {
-  var d = [];
-  if (rec.side) d.push(rec.side);
-  if (rec.qty) d.push("qty " + rec.qty);
-  if (rec.price) d.push("price " + rec.price);
-  if (rec.paper_cost) d.push("paper cost " + rec.paper_cost);
-  if (rec.paper_proceeds) d.push("paper proceeds " + rec.paper_proceeds);
-  if (rec.paper_pnl_quote) d.push("paper pnl " + rec.paper_pnl_quote);
-  if (rec.exit_reason) d.push("exit " + rec.exit_reason);
-  if (rec.trail_pct) d.push("trail " + rec.trail_pct);
-  if (rec.trail_stop_price) d.push("trail stop " + rec.trail_stop_price);
-  if (rec.peak_price) d.push("peak " + rec.peak_price);
-  if (rec.paper === true) d.push("paper: true");
-  if (rec.note) d.push(rec.note);
-  return { ts: rec.ts, kind: rec.kind, detail: d.join(" · "), run_id: rec.run_id };
-}
-
-/* Any receipt/state object -> [key, value-as-string] pairs, key-sorted,
-   values verbatim (nested objects shown as their JSON). */
-function receiptPairs(obj) {
-  if (!obj || typeof obj !== "object") return [];
-  return Object.keys(obj).sort().map(function (k) {
-    var v = obj[k];
-    var s = (v !== null && typeof v === "object") ? JSON.stringify(v) : String(v);
-    return [k, s];
-  });
-}
-
-/* ---------- DOM wiring (browser only) ---------- */
-
 if (typeof document !== "undefined") {
-
   function el(tag, cls, text) {
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text !== undefined) n.textContent = text;
-    return n;
-  }
-
-  function table(headers) {
-    var t = el("table");
-    var thead = el("thead");
-    var hr = el("tr");
-    headers.forEach(function (h) { hr.appendChild(el("th", null, h)); });
-    thead.appendChild(hr);
-    t.appendChild(thead);
-    var tbody = el("tbody");
-    t.appendChild(tbody);
-    return { table: t, tbody: tbody };
-  }
-
-  function rowTr(row) {
-    var tr = el("tr");
-    tr.setAttribute("data-kind", row.kind);
-    [["ts", row.ts], ["kind", row.kind], ["detail", row.detail]].forEach(function (p) {
-      tr.appendChild(el("td", p[0], p[1]));
-    });
-    return tr;
-  }
-
-  function sourceMeta(source, present) {
-    return el("p", "meta", "source: " + source + (present ? "" : " (absent)"));
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
   }
 
   function clearTo(id) {
@@ -149,164 +106,271 @@ if (typeof document !== "undefined") {
     return root;
   }
 
-  function couldNotLoad(id, url, err) {
+  function table(headers) {
+    var result = el("table");
+    var head = el("thead");
+    var headRow = el("tr");
+    headers.forEach(function (header) {
+      headRow.appendChild(el("th", null, header));
+    });
+    head.appendChild(headRow);
+    result.appendChild(head);
+    var body = el("tbody");
+    result.appendChild(body);
+    return { table: result, tbody: body };
+  }
+
+  function objectTable(obj) {
+    var result = table(["field", "value"]);
+    receiptPairs(obj).forEach(function (pair) {
+      var row = el("tr");
+      row.appendChild(el("td", "kind", pair[0]));
+      row.appendChild(el("td", "detail", pair[1]));
+      result.tbody.appendChild(row);
+    });
+    return result.table;
+  }
+
+  function sourceMeta(source, present, asOf) {
+    var status = present ? "present" : "absent";
+    return el("p", "meta", "source: " + source + " · " + status +
+      " · as of: " + (asOf || "nothing yet"));
+  }
+
+  function parseErrorMeta(root, count) {
+    if (count) root.appendChild(el("p", "meta", "parse errors: " + count));
+  }
+
+  function empty(root, text) {
+    root.appendChild(el("p", "empty", "nothing yet — " + text));
+  }
+
+  function couldNotLoad(id, url, error) {
     var root = clearTo(id);
     root.appendChild(el("p", "empty",
-      "could not load " + url + " (" + err.message + ")"));
+      "could not load " + url + " (" + error.message + ")"));
   }
 
   function getJson(url, render, targetId) {
     fetch(url)
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
+      .then(function (response) {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.json();
       })
       .then(render)
-      .catch(function (err) { couldNotLoad(targetId, url, err); });
+      .catch(function (error) { couldNotLoad(targetId, url, error); });
   }
 
-  /* -- spot: contract-v1 events ------------------------------------- */
-  function renderEvents(payload) {
-    var root = clearTo("runs");
-    root.appendChild(sourceMeta(payload.source, payload.present));
-    if (!payload.present || payload.count === 0) {
-      root.appendChild(el("p", "empty", "nothing yet — no events recorded"));
+  function renderStream(payload) {
+    var root = clearTo("stream");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    root.appendChild(el("p", "meta", "append log: " + payload.log_source +
+      (payload.log_present ? " · present" : " · absent")));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || payload.tokens.length === 0) {
+      empty(root, "no live token state");
       return;
     }
-    groupRuns(payload.events).forEach(function (run) {
+    var columns = [
+      ["symbol", function (entry) { return entry.symbol; }],
+      ["selected", function (entry) { return entry.selection.join(" + "); }],
+      ["venues", function (entry) { return valueText(entry.data.venues); }],
+      ["spot bid", function (entry) { return valueText(entry.data.spot_bid); }],
+      ["spot ask", function (entry) { return valueText(entry.data.spot_ask); }],
+      ["perp bid", function (entry) { return valueText(entry.data.perp_bid); }],
+      ["perp ask", function (entry) { return valueText(entry.data.perp_ask); }],
+      ["mark", function (entry) { return valueText(entry.data.mark); }],
+      ["vol 1m quote", function (entry) { return valueText(entry.data.vol_1m_quote); }],
+      ["vol median 1m", function (entry) { return valueText(entry.data.vol_med_1m); }],
+      ["surge ratio", function (entry) { return valueText(entry.data.surge_ratio); }],
+      ["OI", function (entry) { return valueText(entry.data.oi); }],
+      ["OI change %", function (entry) { return valueText(entry.data.oi_change_pct); }],
+      ["funding rate", function (entry) { return valueText(entry.data.funding_rate); }],
+      ["next funding ms", function (entry) { return valueText(entry.data.next_funding_ms); }],
+      ["basis gap %", function (entry) { return valueText(entry.data.basis_gap_pct); }],
+      ["freshness ms", function (entry) { return valueText(entry.data.freshness_ms); }],
+      ["as of", function (entry) { return valueText(entry.as_of); }]
+    ];
+    var result = table(columns.map(function (column) { return column[0]; }));
+    payload.tokens.forEach(function (entry) {
+      var row = el("tr");
+      columns.forEach(function (column) {
+        row.appendChild(el("td", "detail", column[1](entry)));
+      });
+      result.tbody.appendChild(row);
+    });
+    root.appendChild(result.table);
+  }
+
+  function renderCandidates(payload) {
+    var root = clearTo("candidates");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || payload.candidates.length === 0) {
+      empty(root, "no valid unexpired proposals");
+      return;
+    }
+    payload.candidates.forEach(function (entry) {
       var box = el("div", "run");
-      var head = el("p", "run-head");
-      head.appendChild(el("span", null, "run " + run.run_id));
-      head.appendChild(el("span", "muted",
-        "  · " + (run.symbol || "") + " · sha8 " + (run.sha8 || "")));
-      box.appendChild(head);
-      var t = table(["ts (UTC)", "kind", "detail"]);
-      run.events.forEach(function (ev) { t.tbody.appendChild(rowTr(eventRow(ev))); });
-      box.appendChild(t.table);
+      box.appendChild(el("p", "run-head",
+        entry.proposal.symbol + " · proposal " + entry.proposal.proposal_id));
+      box.appendChild(el("p", "meta", entry.file + " · as of: " +
+        valueText(entry.as_of)));
+      box.appendChild(objectTable(entry.proposal));
       root.appendChild(box);
     });
   }
 
-  /* -- basis: recorded basis_read output ------------------------------ */
-  function renderBasis(payload) {
-    var root = clearTo("basis");
-    root.appendChild(sourceMeta(payload.source, payload.present));
-    if (!payload.present || payload.rows.length === 0) {
-      root.appendChild(el("p", "empty", "nothing yet — no basis read recorded"));
+  function renderPosition(payload) {
+    var root = clearTo("position");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || !payload.position) {
+      empty(root, "no basis position state");
       return;
     }
-    payload.formulas.forEach(function (f) { root.appendChild(el("p", "meta", f)); });
-    var t = table(payload.columns);
-    payload.rows.forEach(function (row) {
-      var tr = el("tr");
-      payload.columns.forEach(function (c) {
-        tr.appendChild(el("td", "detail", row[c]));
-      });
-      t.tbody.appendChild(tr);
-    });
-    root.appendChild(t.table);
+    root.appendChild(objectTable(payload.position));
+    root.appendChild(el("p", "run-head", "supervision"));
+    if (payload.supervision) {
+      root.appendChild(objectTable(payload.supervision));
+    } else {
+      empty(root, "no basis supervision record");
+    }
   }
 
-  /* -- futures: receipts from the receipt dir ------------------------- */
-  function renderFutures(payload) {
-    var root = clearTo("futures");
-    root.appendChild(sourceMeta(payload.source, payload.present));
-    if (!payload.present || payload.count === 0) {
-      root.appendChild(el("p", "empty", "nothing yet — no futures receipts recorded"));
+  function collectionEmpty(value) {
+    if (Array.isArray(value)) return value.length === 0;
+    return !value || Object.keys(value).length === 0;
+  }
+
+  function renderMomentum(payload) {
+    var root = clearTo("momentum");
+    var state = payload.state;
+    root.appendChild(sourceMeta(state.source, state.present, state.as_of));
+    parseErrorMeta(root, state.parse_errors);
+    if (!state.present || collectionEmpty(state.positions)) {
+      empty(root, "no momentum paper positions");
+    } else if (Array.isArray(state.positions)) {
+      state.positions.forEach(function (position, index) {
+        var box = el("div", "run");
+        box.appendChild(el("p", "run-head",
+          valueText(position.symbol || ("position " + (index + 1)))));
+        box.appendChild(objectTable(position));
+        root.appendChild(box);
+      });
+    } else {
+      Object.keys(state.positions).sort().forEach(function (symbol) {
+        var box = el("div", "run");
+        box.appendChild(el("p", "run-head", symbol));
+        box.appendChild(objectTable(state.positions[symbol]));
+        root.appendChild(box);
+      });
+    }
+
+    var receipts = payload.receipts;
+    root.appendChild(el("p", "run-head", "recent momentum paper receipts"));
+    root.appendChild(sourceMeta(receipts.source, receipts.present, receipts.as_of));
+    parseErrorMeta(root, receipts.parse_errors);
+    if (!receipts.present || receipts.records.length === 0) {
+      empty(root, "no momentum paper receipts");
+    } else {
+      receipts.records.forEach(function (record) {
+        var box = el("div", "run");
+        box.appendChild(el("p", "run-head",
+          valueText(record.ts) + " · " + valueText(record.kind) + " · " +
+          valueText(record.symbol)));
+        box.appendChild(objectTable(record));
+        root.appendChild(box);
+      });
+    }
+  }
+
+  function renderFees(payload) {
+    var root = clearTo("fees");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || !payload.rates) {
+      empty(root, "no commission rates recorded");
       return;
     }
-    payload.receipts.forEach(function (entry) {
+    root.appendChild(objectTable(payload.rates));
+  }
+
+  function renderPnl(payload) {
+    var root = clearTo("pnl");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || payload.records.length === 0) {
+      empty(root, "no realized P&L block in a CLOSED or reconcile receipt");
+      return;
+    }
+    payload.records.forEach(function (record) {
       var box = el("div", "run");
-      box.appendChild(el("p", "run-head", entry.file));
-      if (!entry.receipt) {
-        box.appendChild(el("p", "empty",
-          "unreadable receipt (" + (entry.error || "unknown") + ")"));
-      } else {
-        var t = table(["field", "value"]);
-        receiptPairs(entry.receipt).forEach(function (pair) {
-          var tr = el("tr");
-          tr.appendChild(el("td", "kind", pair[0]));
-          tr.appendChild(el("td", "detail", pair[1]));
-          t.tbody.appendChild(tr);
-        });
-        box.appendChild(t.table);
+      box.appendChild(el("p", "run-head",
+        valueText(record.symbol) + " · " + valueText(record.verdict) +
+        " · run " + valueText(record.run_id)));
+      box.appendChild(el("p", "meta", record.file + " · as of: " +
+        valueText(record.as_of) + " · partial fees: " +
+        valueText(record.partial_fees)));
+      box.appendChild(objectTable(record.pnl));
+      if (Object.keys(record.partial_fee_flags).length) {
+        box.appendChild(el("p", "meta", "fee flags: " +
+          JSON.stringify(record.partial_fee_flags)));
       }
       root.appendChild(box);
     });
   }
 
-  /* -- volume: paper receipts + state --------------------------------- */
-  function renderVolume(payload) {
-    var root = clearTo("volume");
-    var receipts = payload.receipts;
-    root.appendChild(sourceMeta(receipts.source, receipts.present));
-    if (!receipts.present || receipts.count === 0) {
-      root.appendChild(el("p", "empty", "nothing yet — no volume paper receipts"));
-    } else {
-      var t = table(["ts (UTC)", "kind", "detail"]);
-      receipts.records.forEach(function (rec) {
-        t.tbody.appendChild(rowTr(paperReceiptRow(rec)));
-      });
-      root.appendChild(t.table);
+  function renderEvents(payload) {
+    var root = clearTo("runs");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || payload.events.length === 0) {
+      empty(root, "no historical spot events recorded");
+      return;
     }
-    var state = payload.state;
-    if (state.present && state.state) {
-      root.appendChild(el("p", "run-head", "volume state"));
-      var st = table(["field", "value"]);
-      receiptPairs(state.state).forEach(function (pair) {
-        var tr = el("tr");
-        tr.appendChild(el("td", "kind", pair[0]));
-        tr.appendChild(el("td", "detail", pair[1]));
-        st.tbody.appendChild(tr);
+    groupRuns(payload.events).forEach(function (run) {
+      var box = el("div", "run");
+      var heading = el("p", "run-head");
+      heading.appendChild(el("span", null, "run " + run.run_id));
+      heading.appendChild(el("span", "muted",
+        " · " + (run.symbol || "") + " · sha8 " + (run.sha8 || "")));
+      box.appendChild(heading);
+      var result = table(["ts (UTC)", "kind", "detail"]);
+      run.events.forEach(function (event) {
+        var display = eventRow(event);
+        var row = el("tr");
+        row.appendChild(el("td", "ts", valueText(display.ts)));
+        row.appendChild(el("td", "kind", valueText(display.kind)));
+        row.appendChild(el("td", "detail", display.detail));
+        result.tbody.appendChild(row);
       });
-      root.appendChild(st.table);
-    } else {
-      root.appendChild(el("p", "meta",
-        "no volume state file (" + state.source + " absent)"));
-    }
+      box.appendChild(result.table);
+      root.appendChild(box);
+    });
   }
 
-  /* -- live price: the one control, unchanged public endpoint --------- */
-  function fetchPrice() {
-    var btn = document.getElementById("refresh");
-    var priceEl = document.getElementById("price");
-    var unitEl = document.getElementById("price-unit");
-    var metaEl = document.getElementById("price-meta");
-    btn.disabled = true;
-    fetch(PRICE_URL)
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
-      .then(function (data) {
-        priceEl.textContent = data.price;
-        unitEl.textContent = "USDT · " + data.symbol;
-        metaEl.textContent = "fetched at " + new Date().toISOString();
-      })
-      .catch(function (err) {
-        priceEl.textContent = "—";
-        unitEl.textContent = "";
-        metaEl.textContent = "fetch failed at " + new Date().toISOString() +
-          " (" + err.message + ")";
-      })
-      .then(function () { btn.disabled = false; });
+  function refreshRuntime() {
+    getJson(STREAM_URL, renderStream, "stream");
+    getJson(CANDIDATES_URL, renderCandidates, "candidates");
+    getJson(POSITION_URL, renderPosition, "position");
+    getJson(MOMENTUM_URL, renderMomentum, "momentum");
+    getJson(FEES_URL, renderFees, "fees");
+    getJson(PNL_URL, renderPnl, "pnl");
   }
 
-  document.getElementById("refresh").addEventListener("click", fetchPrice);
+  document.getElementById("refresh-runtime").addEventListener(
+    "click", refreshRuntime);
+  refreshRuntime();
   getJson(EVENTS_URL, renderEvents, "runs");
-  getJson(BASIS_URL, renderBasis, "basis");
-  getJson(FUTURES_URL, renderFutures, "futures");
-  getJson(VOLUME_URL, renderVolume, "volume");
-  fetchPrice();
+  window.setInterval(refreshRuntime, REFRESH_MS);
 }
 
-/* ---------- Node export for headless verification ---------- */
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    valueText: valueText,
+    receiptPairs: receiptPairs,
     eventRow: eventRow,
-    parseJsonl: parseJsonl,
-    groupRuns: groupRuns,
-    paperReceiptRow: paperReceiptRow,
-    receiptPairs: receiptPairs
+    groupRuns: groupRuns
   };
 }

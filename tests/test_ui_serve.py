@@ -1,11 +1,4 @@
-"""Deterministic offline tests for ui/serve.py — the read-only UI runtime.
-
-Every test binds 127.0.0.1 on an OS-assigned port, drives the real server
-over loopback HTTP, and never touches the network beyond loopback. Present
-and absent source cases are both proven per endpoint, plus the read-only
-guarantees: GET/HEAD only, no path traversal, and the server never creates
-a missing source file or directory.
-"""
+"""Loopback HTTP evidence for ui/serve.py's read-only runtime truth view."""
 
 import http.client
 import json
@@ -16,73 +9,78 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(UI_DIR))
-sys.path.insert(0, str(SRC_DIR))
 
 import serve  # noqa: E402
-import volume_observer as vo  # noqa: E402
 
-# Real-shaped sample rows (field shapes match the recorded live data).
+
 EVENT_LINES = [
     '{"ts":"2026-08-12T15:52:45Z","sha8":"d1b204bc","kind":"run_start",'
     '"run_id":"6a7c96cdb1754b","symbol":"BTCUSDT",'
-    '"balances":{"BTC":"0.00000000","USDT":"95.62398534"},"note":"ceiling 5 USDT"}',
+    '"balances":{"BTC":"0.00000000","USDT":"95.62398534"}}',
     '{"ts":"2026-08-12T15:52:46Z","sha8":"d1b204bc","kind":"run_verdict",'
-    '"run_id":"6a7c96cdb1754b","symbol":"BTCUSDT","verdict":"REJECTED_BEFORE_BUY",'
-    '"note":"approved 5 USDT too small"}',
+    '"run_id":"6a7c96cdb1754b","symbol":"BTCUSDT",'
+    '"verdict":"REJECTED_BEFORE_BUY"}',
 ]
 
-BASIS_TEXT = (
-    "entry_gap_quote_formula=usdm_bid-spot_ask\n"
-    "exit_gap_quote_formula=usdm_ask-spot_bid\n"
-    "entry_gap_bps_formula=entry_gap_quote/spot_ask*10000;bps_base=spot_ask\n"
-    "exit_gap_bps_formula=exit_gap_quote/spot_bid*10000;bps_base=spot_bid\n"
-    "completed_utc\tusdm_book_time_utc\tsymbol\tspot_bid\tspot_ask\tusdm_bid\t"
-    "usdm_ask\tentry_gap_quote\tentry_gap_bps_vs_spot_ask\texit_gap_quote\t"
-    "exit_gap_bps_vs_spot_bid\tfunding_rate\tnext_funding_utc\n"
-    "2026-08-12T23:44:39.448Z\t2026-08-12T23:44:38.379Z\tBTCUSDT\t63389.99000000\t"
-    "63390.00000000\t63379.90\t63380.00\t-10.10000000\t-1.59331125\t-9.99000000\t"
-    "-1.57595860\t0.00006421\t2026-08-13T00:00:00.000Z\n"
-    "2026-08-12T23:44:40.473Z\t2026-08-12T23:44:39.840Z\tETHUSDT\t1878.20000000\t"
-    "1878.21000000\t1877.39\t1877.40\t-0.82000000\t-4.36585898\t-0.80000000\t"
-    "-4.25939730\t0.00005433\t2026-08-13T00:00:00.000Z\n"
-)
 
-FUTURES_RECEIPT = {
-    "run_id": "20260813-abcd",
-    "open_client_id": "l2fs-20260813-abcd-o",
-    "close_client_id": "l2fs-20260813-abcd-c",
-    "sha": "0cffc896",
-    "symbol": "BTCUSDT",
-    "requested_max_notional": "10",
-    "hard_ceiling_usdt": "10",
-    "started_utc": "2026-08-13T00:00:00Z",
-    "verdict": "REJECTED",
-}
+def stream_row(venues, surge, gap, spot=True):
+    return {
+        "venues": venues,
+        "spot_bid": "100.00" if spot else None,
+        "spot_ask": "100.01" if spot else None,
+        "perp_bid": "100.40",
+        "perp_ask": "100.41",
+        "mark": "100.405",
+        "vol_1m_quote": "125000.50",
+        "vol_med_1m": "25000.10",
+        "surge_ratio": surge,
+        "oi": "450000.75",
+        "oi_change_pct": "3.20",
+        "funding_rate": "0.000125",
+        "next_funding_ms": 1786608000000,
+        "basis_gap_pct": gap,
+        "freshness_ms": 184,
+    }
 
-PAPER_LINES = [
-    '{"kind": "paper_entry", "note": "paper only; no real order path", '
-    '"paper": true, "paper_cost": "10.00000000", "price": "100", '
-    '"qty": "0.10000000", "run_id": "paperdemo20260813", "seq": 0, '
-    '"side": "BUY", "symbol": "BTCUSDT", "trail_pct": "0.05", '
-    '"ts": "2026-08-12T23:46:04.453Z"}',
-    '{"exit_reason": "trail_stop", "kind": "paper_exit", '
-    '"note": "paper only; no real order path", "paper": true, '
-    '"paper_pnl_quote": "0.40000000", "paper_proceeds": "10.40000000", '
-    '"peak_price": "110", "price": "104", "qty": "0.10000000", '
-    '"run_id": "paperdemo20260813", "seq": 4, "side": "SELL", '
-    '"symbol": "BTCUSDT", "trail_stop_price": "104.50", '
-    '"ts": "2026-08-12T23:46:04.453Z"}',
-]
+
+def proposal(proposal_id="live01", expires="2099-08-13T00:02:00.000Z"):
+    return {
+        "proposal_id": proposal_id,
+        "created_utc": "2026-08-13T00:00:00.000Z",
+        "expires_utc": expires,
+        "quant_sha": "a" * 40,
+        "config_digest": "b" * 64,
+        "symbol": "APRUSDT",
+        "direction": "long_spot_short_perp",
+        "spot_ask": "0.04510000",
+        "perp_bid": "0.04533000",
+        "entry_gap_pct": "0.50997783",
+        "spot_bid": "0.04509000",
+        "perp_ask": "0.04534000",
+        "exit_gap_pct": "0.55444666",
+        "spot_maker_commission_pct": "0.0800",
+        "spot_taker_commission_pct": "0.0750",
+        "perp_maker_commission_pct": "0.0200",
+        "perp_taker_commission_pct": "0.0400",
+        "commission_source": "measured",
+        "entry_slippage_pct": "0.0100",
+        "exit_slippage_pct": "0.0120",
+        "funding_rate": "0.000125",
+        "funding_period_ms": 28800000,
+        "carry_pct": "0.0125",
+        "safety_buffer_pct": "0.2500",
+        "net_edge_pct": "0.02503117",
+        "quantity": "220.00000000",
+    }
 
 
 class ServerHarness(unittest.TestCase):
-    """Starts the real server on 127.0.0.1:0 with per-test sources."""
+    """Start the real server on 127.0.0.1:0 with isolated source paths."""
 
     def start(self, sources):
         server = serve.make_server(sources, port=0)
@@ -116,49 +114,64 @@ class ServerHarness(unittest.TestCase):
         return json.loads(body)
 
     def request(self, method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=10)
         try:
-            conn.request(method, path, body=body)
-            response = conn.getresponse()
+            connection.request(method, path, body=body)
+            response = connection.getresponse()
             return response.status, response.read()
         finally:
-            conn.close()
+            connection.close()
 
     def empty_sources(self, missing_root):
-        """Sources that all point below one nonexistent directory."""
         return {
             "events": missing_root / "events.jsonl",
-            "basis": missing_root / "basis.txt",
-            "futures_dir": missing_root / "receipts",
-            "volume_receipts": missing_root / "paper_receipts.jsonl",
-            "volume_state": missing_root / "volume_state.json",
+            "stream_state": missing_root / "stream_state.json",
+            "stream_log": missing_root / "stream_log.jsonl",
+            "proposals_dir": missing_root / "proposals",
+            "basis_position": missing_root / "basis-position.json",
+            "basis_receipts_dir": missing_root,
+            "fees": missing_root / "commission-rates.json",
+            "momentum_state": missing_root / "momentum-paper-state.json",
+            "momentum_receipts": (
+                missing_root / "momentum-paper-receipts.jsonl"),
         }
 
 
 class TestStaticServing(ServerHarness):
 
-    def test_root_and_assets_serve(self):
+    def test_runtime_page_and_assets_serve_over_http(self):
         base = self.start({})
-        for path, kind, marker in (
-                ("/", "text/html", b"quant"),
-                ("/index.html", "text/html", b'<button id="refresh"'),
-                ("/app.js", "text/javascript", b"/api/events"),
-                ("/style.css", "text/css", b"read-only"),
-                ("/fixtures/events.jsonl", "text/plain", b'"run_id"')):
+        for path, kind, markers in (
+                ("/", "text/html", (b"Live tokens", b"Realized P&amp;L",
+                                      b"History &mdash; recorded spot runs")),
+                ("/index.html", "text/html",
+                 (b'id="refresh-runtime"', b"momentum paper positions")),
+                ("/app.js", "text/javascript",
+                 (b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"')),
+                ("/style.css", "text/css", (b"read-only",)),
+                ("/fixtures/events.jsonl", "text/plain", (b'"run_id"',))):
             status, headers, body = self.get(base, path)
             self.assertEqual(status, 200, path)
             self.assertIn(kind, headers.get("Content-Type", ""), path)
-            self.assertIn(marker, body, path)
+            for marker in markers:
+                self.assertIn(marker, body, path)
 
-    def test_unknown_path_is_json_404(self):
+    def test_page_has_no_browser_exchange_fetch_or_legacy_live_sections(self):
         base = self.start({})
-        status, _, body = self.get(base, "/api/nope")
-        self.assertEqual(status, 404)
-        self.assertEqual(json.loads(body)["error"], "not found")
+        _, _, html = self.get(base, "/index.html")
+        _, _, javascript = self.get(base, "/app.js")
+        joined = html + javascript
+        self.assertNotIn(b"api.binance.com", joined)
+        self.assertNotIn(b"PRICE_URL", joined)
+        for legacy in ("/api/basis", "/api/futures", "/api/volume"):
+            payload = self.get_json(base, legacy, expect_status=404)
+            self.assertEqual(payload["error"], "not found")
 
-    def test_traversal_refused_raw_and_encoded(self):
+    def test_unknown_path_and_traversal_are_refused(self):
         self.start({})
-        for path in ("/../TASK.md", "/%2e%2e/TASK.md", "/fixtures/../../TASK.md"):
+        for path in ("/api/nope", "/../TASK.md", "/%2e%2e/TASK.md",
+                     "/fixtures/../../TASK.md"):
             status, body = self.request("GET", path)
             self.assertEqual(status, 404, path)
             self.assertIn(b"not found", body, path)
@@ -168,306 +181,448 @@ class TestStaticServing(ServerHarness):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
 
 
-class TestEventsEndpoint(ServerHarness):
+class TestEventsHistoryEndpoint(ServerHarness):
 
-    def test_present_serves_real_rows_verbatim(self):
+    def test_present_is_verbatim_and_explicitly_historical(self):
         root = self.tempdir()
         events = root / "events.jsonl"
         events.write_text("\n".join(EVENT_LINES) + "\n", encoding="utf-8")
-        base = self.start({"events": events})
-        payload = self.get_json(base, "/api/events")
+        sources = self.empty_sources(root / "missing")
+        sources["events"] = events
+        payload = self.get_json(self.start(sources), "/api/events")
         self.assertTrue(payload["present"])
+        self.assertIs(payload["historical"], True)
         self.assertEqual(payload["count"], 2)
-        self.assertEqual(payload["parse_errors"], 0)
-        self.assertEqual(payload["source"], str(events))
-        self.assertEqual(payload["events"][0]["kind"], "run_start")
-        self.assertEqual(payload["events"][0]["balances"]["USDT"], "95.62398534")
-        self.assertEqual(payload["events"][1]["verdict"], "REJECTED_BEFORE_BUY")
+        self.assertEqual(payload["events"][0]["balances"]["USDT"],
+                         "95.62398534")
+        self.assertEqual(payload["events"][1]["verdict"],
+                         "REJECTED_BEFORE_BUY")
+        self.assertIsNotNone(payload["as_of"])
 
-    def test_garbage_line_counted_never_invented(self):
+    def test_absent_is_honest_empty(self):
         root = self.tempdir()
-        events = root / "events.jsonl"
-        events.write_text(EVENT_LINES[0] + "\nnot json at all\n"
-                          + EVENT_LINES[1] + "\n", encoding="utf-8")
-        base = self.start({"events": events})
-        payload = self.get_json(base, "/api/events")
-        self.assertEqual(payload["count"], 2)
-        self.assertEqual(payload["parse_errors"], 1)
-        kinds = [e["kind"] for e in payload["events"]]
-        self.assertEqual(kinds, ["run_start", "run_verdict"])
-
-    def test_absent_file_answers_honest_empty(self):
-        root = self.tempdir()
-        base = self.start(self.empty_sources(root / "missing"))
-        payload = self.get_json(base, "/api/events")
+        payload = self.get_json(
+            self.start(self.empty_sources(root / "missing")), "/api/events")
         self.assertFalse(payload["present"])
-        self.assertEqual(payload["count"], 0)
         self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertIsNone(payload["as_of"])
+
+
+class TestStreamEndpoint(ServerHarness):
+
+    def test_top_surge_union_all_both_venue_gaps_and_as_of(self):
+        root = self.tempdir()
+        state_path = root / "stream_state.json"
+        state_path.write_text(json.dumps({
+            "BTCUSDT": stream_row(["spot", "perp"], "9.25", "0.40"),
+            "ETHUSDT": stream_row(["perp"], "7.50", None, spot=False),
+            "APRUSDT": stream_row(["spot", "perp"], "1.10", "0.62"),
+        }), encoding="utf-8")
+        log_path = root / "stream_log.jsonl"
+        log_path.write_text(
+            '{"ts":"2026-08-13T10:00:01.250Z","kind":"stream_tick",'
+            '"symbol":"APRUSDT"}\n', encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources.update({"stream_state": state_path, "stream_log": log_path})
+        base = self.start(sources)
+        with mock.patch.object(serve, "STREAM_TOP_N", 1):
+            payload = self.get_json(base, "/api/stream")
+
+        self.assertTrue(payload["present"])
+        self.assertTrue(payload["log_present"])
+        self.assertEqual(payload["as_of"], "2026-08-13T10:00:01.250Z")
+        self.assertEqual(payload["top_surge_count"], 1)
+        self.assertEqual(payload["basis_gap_count"], 2)
+        self.assertEqual([row["symbol"] for row in payload["tokens"]],
+                         ["BTCUSDT", "APRUSDT"])
+        btc, apr = payload["tokens"]
+        self.assertEqual(btc["selection"], ["top_surge", "basis_gap"])
+        self.assertEqual(apr["selection"], ["basis_gap"])
+        self.assertEqual(btc["data"]["surge_ratio"], "9.25")
+        self.assertEqual(apr["data"]["basis_gap_pct"], "0.62")
+        self.assertEqual(apr["data"]["next_funding_ms"], 1786608000000)
         self.assertEqual(payload["parse_errors"], 0)
 
-
-class TestBasisEndpoint(ServerHarness):
-
-    def test_present_parses_recorded_output(self):
+    def test_absent_state_and_log_are_honest_empty_and_not_created(self):
         root = self.tempdir()
-        basis = root / "basis.txt"
-        basis.write_text(BASIS_TEXT, encoding="utf-8")
-        base = self.start({"basis": basis})
-        payload = self.get_json(base, "/api/basis")
-        self.assertTrue(payload["present"])
-        self.assertEqual(len(payload["formulas"]), 4)
-        self.assertEqual(len(payload["columns"]), 13)
-        self.assertEqual(len(payload["rows"]), 2)
-        self.assertEqual(payload["parse_errors"], 0)
-        self.assertEqual(payload["rows"][0]["symbol"], "BTCUSDT")
-        self.assertEqual(payload["rows"][1]["symbol"], "ETHUSDT")
-        self.assertEqual(payload["rows"][0]["entry_gap_quote"], "-10.10000000")
-        self.assertTrue(payload["text"].startswith("entry_gap_quote_formula"))
-
-    def test_absent_file_answers_honest_empty(self):
-        root = self.tempdir()
-        base = self.start(self.empty_sources(root / "missing"))
-        payload = self.get_json(base, "/api/basis")
+        missing = root / "missing"
+        payload = self.get_json(
+            self.start(self.empty_sources(missing)), "/api/stream")
         self.assertFalse(payload["present"])
-        self.assertIsNone(payload["text"])
-        self.assertEqual(payload["rows"], [])
-        self.assertEqual(payload["columns"], [])
-
-
-class TestFuturesEndpoint(ServerHarness):
-
-    def test_present_receipts_and_bad_file_counted(self):
-        root = self.tempdir()
-        receipts = root / "receipts"
-        receipts.mkdir()
-        (receipts / "futures-hand-20260813-abcd.json").write_text(
-            json.dumps(FUTURES_RECEIPT), encoding="utf-8")
-        (receipts / "futures-hand-bad.json").write_text(
-            "{broken", encoding="utf-8")
-        (receipts / "futures-hand.lock").write_text("x", encoding="utf-8")
-        (receipts / "unrelated.json").write_text("{}", encoding="utf-8")
-        base = self.start({"futures_dir": receipts})
-        payload = self.get_json(base, "/api/futures")
-        self.assertTrue(payload["present"])
-        self.assertEqual(payload["count"], 2)  # lock + unrelated ignored
-        self.assertEqual(payload["parse_errors"], 1)
-        by_file = {r["file"]: r for r in payload["receipts"]}
-        good = by_file["futures-hand-20260813-abcd.json"]
-        self.assertEqual(good["receipt"]["verdict"], "REJECTED")
-        self.assertEqual(good["receipt"]["hard_ceiling_usdt"], "10")
-        bad = by_file["futures-hand-bad.json"]
-        self.assertIsNone(bad["receipt"])
-        self.assertEqual(bad["error"], "JSONDecodeError")
-
-    def test_absent_dir_honest_and_never_created(self):
-        root = self.tempdir()
-        missing = root / "receipts-not-there"
-        base = self.start({"futures_dir": missing})
-        payload = self.get_json(base, "/api/futures")
-        self.assertFalse(payload["present"])
+        self.assertFalse(payload["log_present"])
+        self.assertEqual(payload["tokens"], [])
         self.assertEqual(payload["count"], 0)
-        self.assertEqual(payload["receipts"], [])
-        self.assertFalse(missing.exists(),
-                         "read-only server must never create the receipt dir")
+        self.assertIsNone(payload["as_of"])
+        self.assertFalse(missing.exists())
 
-    def test_empty_dir_is_present_with_zero(self):
+    def test_malformed_state_is_present_but_never_invented(self):
         root = self.tempdir()
-        receipts = root / "receipts"
-        receipts.mkdir()
-        base = self.start({"futures_dir": receipts})
-        payload = self.get_json(base, "/api/futures")
+        state_path = root / "stream_state.json"
+        state_path.write_text("{torn", encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["stream_state"] = state_path
+        payload = self.get_json(self.start(sources), "/api/stream")
         self.assertTrue(payload["present"])
-        self.assertEqual(payload["count"], 0)
-        self.assertEqual(payload["receipts"], [])
+        self.assertEqual(payload["tokens"], [])
+        self.assertEqual(payload["state_parse_errors"], 1)
 
 
-class TestVolumeEndpoint(ServerHarness):
+class TestCandidatesEndpoint(ServerHarness):
 
-    def test_receipts_present_state_absent(self):
+    def test_only_complete_positive_unexpired_proposals_are_served(self):
         root = self.tempdir()
-        paper = root / "paper_receipts.jsonl"
-        paper.write_text("\n".join(PAPER_LINES) + "\n", encoding="utf-8")
-        base = self.start({"volume_receipts": paper,
-                           "volume_state": root / "volume_state.json"})
-        payload = self.get_json(base, "/api/volume")
-        receipts = payload["receipts"]
-        self.assertTrue(receipts["present"])
-        self.assertEqual(receipts["count"], 2)
-        self.assertTrue(all(r["paper"] is True for r in receipts["records"]))
-        self.assertEqual(receipts["records"][1]["exit_reason"], "trail_stop")
-        state = payload["state"]
-        self.assertFalse(state["present"])
-        self.assertIsNone(state["state"])
-
-    def test_state_present_served_verbatim(self):
-        root = self.tempdir()
-        paper = root / "paper_receipts.jsonl"
-        paper.write_text(PAPER_LINES[0] + "\n", encoding="utf-8")
-        state_file = root / "volume_state.json"
-        state_file.write_text(
-            '{"symbol": "BTCUSDT", "phase": "holding", "qty": "0.10000000"}',
+        directory = root / "proposals"
+        directory.mkdir()
+        live = proposal()
+        (directory / "proposal-live01.json").write_text(
+            json.dumps(live), encoding="utf-8")
+        (directory / "proposal-expired.json").write_text(
+            json.dumps(proposal("expired", "2000-01-01T00:00:00Z")),
             encoding="utf-8")
-        base = self.start({"volume_receipts": paper,
-                           "volume_state": state_file})
-        payload = self.get_json(base, "/api/volume")
-        self.assertTrue(payload["state"]["present"])
-        self.assertEqual(payload["state"]["state"]["phase"], "holding")
-        self.assertEqual(payload["state"]["state"]["qty"], "0.10000000")
+        invalid = proposal("invalid")
+        del invalid["funding_rate"]
+        (directory / "proposal-invalid.json").write_text(
+            json.dumps(invalid), encoding="utf-8")
+        (directory / "proposal-torn.json").write_text(
+            "{torn", encoding="utf-8")
+        (directory / "proposal-live01.claim").write_text(
+            "not a proposal", encoding="utf-8")
 
-    def test_absent_receipts_answer_honest_empty(self):
+        sources = self.empty_sources(root / "missing")
+        sources["proposals_dir"] = directory
+        payload = self.get_json(self.start(sources), "/api/candidates")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["scanned_count"], 4)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["expired_count"], 1)
+        self.assertEqual(payload["invalid_count"], 2)
+        self.assertEqual(payload["parse_errors"], 1)
+        served = payload["candidates"][0]
+        self.assertEqual(served["file"], "proposal-live01.json")
+        self.assertEqual(served["proposal"], live)
+        self.assertEqual(served["proposal"]["net_edge_pct"], "0.02503117")
+        self.assertEqual(set(served["proposal"]),
+                         set(serve.PROPOSAL_REQUIRED_FIELDS))
+
+    def test_absent_directory_is_honest_empty(self):
         root = self.tempdir()
-        base = self.start(self.empty_sources(root / "missing"))
-        payload = self.get_json(base, "/api/volume")
-        self.assertFalse(payload["receipts"]["present"])
-        self.assertEqual(payload["receipts"]["count"], 0)
-        self.assertEqual(payload["receipts"]["records"], [])
+        missing = root / "missing"
+        payload = self.get_json(
+            self.start(self.empty_sources(missing)), "/api/candidates")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["candidates"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertFalse(missing.exists())
+
+
+class TestPositionEndpoint(ServerHarness):
+
+    def test_current_state_and_supervision_are_served_verbatim(self):
+        root = self.tempdir()
+        path = root / "basis-position.json"
+        position = {
+            "version": 1,
+            "updated_utc": "2026-08-13T10:01:00.000Z",
+            "state": "OPEN",
+            "verdict": "OPEN",
+            "symbol": "APRUSDT",
+            "entry": {"quantity": "220.00000000", "gap_pct": "0.51"},
+            "last_check": {
+                "checked_utc": "2026-08-13T10:00:59.900Z",
+                "directive": "HOLD",
+                "current_gap_pct": "0.43",
+                "freshness_ms": 210,
+            },
+            "reconcile": {"status": "PASS", "recommendations": []},
+        }
+        path.write_text(json.dumps(position), encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["basis_position"] = path
+        payload = self.get_json(self.start(sources), "/api/position")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["position"], position)
+        self.assertEqual(payload["as_of"], position["updated_utc"])
+        self.assertEqual(payload["supervision"]["last_check"]["directive"],
+                         "HOLD")
+        self.assertEqual(payload["supervision"]["reconcile"]["status"],
+                         "PASS")
+
+    def test_absent_position_is_honest_empty(self):
+        root = self.tempdir()
+        payload = self.get_json(
+            self.start(self.empty_sources(root / "missing")), "/api/position")
+        self.assertFalse(payload["present"])
+        self.assertIsNone(payload["position"])
+        self.assertIsNone(payload["supervision"])
+        self.assertIsNone(payload["as_of"])
+
+
+class TestMomentumEndpoint(ServerHarness):
+
+    def test_paper_positions_and_recent_receipts_are_real_file_rows(self):
+        root = self.tempdir()
+        state_path = root / "momentum-paper-state.json"
+        state = {
+            "version": 1,
+            "paper": True,
+            "updated_utc": "2026-08-13T10:02:00.000Z",
+            "positions": {
+                "APRUSDT": {
+                    "paper": True, "phase": "HOLDING",
+                    "qty": "110.00000000", "entry_price": "0.04510",
+                    "peak_price": "0.04620", "adds": 1,
+                }
+            },
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        receipts_path = root / "momentum-paper-receipts.jsonl"
+        receipts = [
+            {"ts": "2026-08-13T10:01:10.000Z", "kind": "paper_entry",
+             "paper": True, "symbol": "APRUSDT", "qty": "55.00000000",
+             "price": "0.04510"},
+            {"ts": "2026-08-13T10:01:40.000Z", "kind": "paper_add",
+             "paper": True, "symbol": "APRUSDT", "qty": "55.00000000",
+             "price": "0.04550", "surge_ratio": "6.20"},
+        ]
+        receipts_path.write_text(
+            "\n".join(json.dumps(row) for row in receipts) + "\nnot json\n",
+            encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources.update({"momentum_state": state_path,
+                        "momentum_receipts": receipts_path})
+        payload = self.get_json(self.start(sources), "/api/momentum")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["state"]["state"], state)
+        self.assertEqual(
+            payload["state"]["positions"]["APRUSDT"]["phase"], "HOLDING")
+        self.assertEqual(payload["receipts"]["count"], 2)
+        self.assertEqual(payload["receipts"]["records"], receipts)
+        self.assertEqual(payload["receipts"]["parse_errors"], 1)
+        self.assertEqual(payload["as_of"], state["updated_utc"])
+
+    def test_absent_momentum_sources_are_honest_empty(self):
+        root = self.tempdir()
+        payload = self.get_json(
+            self.start(self.empty_sources(root / "missing")), "/api/momentum")
+        self.assertFalse(payload["present"])
         self.assertFalse(payload["state"]["present"])
+        self.assertEqual(payload["state"]["positions"], {})
+        self.assertFalse(payload["receipts"]["present"])
+        self.assertEqual(payload["receipts"]["records"], [])
+        self.assertIsNone(payload["as_of"])
 
 
-class TestVolumeWriteReadRoundtrip(ServerHarness):
-    """The defect this guards: /api/volume once read volume_state.json while
-    the volume lane wrote paper_state.json, so the dashboard showed no open
-    paper positions while positions existed.  Here the state is written by
-    volume_observer's OWN entry + save path (default file names) and must
-    come back through the endpoint."""
+class TestFeesEndpoint(ServerHarness):
 
-    FIXED_TS = "2026-08-13T00:00:00.000Z"
-
-    def scan_candles(self):
-        """Four closed candles; the last one surges (volumes 10,20,30,90)."""
-        base_open_ms = 1_600_000_000_000
-        minute_ms = 60_000
-        candles = []
-        for index, volume in enumerate(("10", "20", "30", "90")):
-            open_ms = base_open_ms + index * minute_ms
-            candles.append(vo.Candle(
-                open_time_ms=open_ms,
-                close_time_ms=open_ms + minute_ms - 1,
-                open_price=Decimal("100"),
-                high_price=Decimal("120"),
-                low_price=Decimal("90"),
-                close_price=Decimal("100"),
-                base_volume=Decimal("1"),
-                quote_volume=Decimal(volume),
-                trade_count=5,
-            ))
-        return candles
-
-    def test_endpoint_serves_positions_volume_observer_wrote(self):
+    def test_commission_rates_are_served_verbatim(self):
         root = self.tempdir()
-        receipts_path = root / vo.DEFAULT_RECEIPT_PATH.name
-        state_path = root / vo.DEFAULT_STATE_PATH.name
+        path = root / "commission-rates.json"
+        rates = {
+            "symbol": "APRUSDT",
+            "updated_utc": "2026-08-13T10:03:00.000Z",
+            "spot": {"maker": "0.0008", "taker": "0.00075"},
+            "usdm": {"maker": "0.0002", "taker": "0.0004"},
+        }
+        path.write_text(json.dumps(rates), encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["fees"] = path
+        payload = self.get_json(self.start(sources), "/api/fees")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["rates"], rates)
+        self.assertEqual(payload["as_of"], rates["updated_utc"])
+        self.assertEqual(payload["rates"]["spot"]["taker"], "0.00075")
 
-        closed = self.scan_candles()
-        check = vo.evaluate_surge(
-            "AAAUSDT", "1m", closed, 3, Decimal("3"), self.FIXED_TS)
-        self.assertTrue(check.surged)
-        state = vo.PaperState()
-        action = vo.apply_paper_candle(
-            state, check, closed[-1], Decimal("10"), Decimal("0.05"),
-            receipts_path, "uiwire01", lambda: self.FIXED_TS)
-        self.assertEqual(action, "paper_entry")
-        vo.save_paper_state(state_path, state, lambda: self.FIXED_TS)
+    def test_absent_fees_are_honest_empty(self):
+        root = self.tempdir()
+        payload = self.get_json(
+            self.start(self.empty_sources(root / "missing")), "/api/fees")
+        self.assertFalse(payload["present"])
+        self.assertIsNone(payload["rates"])
+        self.assertIsNone(payload["as_of"])
 
-        base = self.start({"volume_receipts": receipts_path,
-                           "volume_state": state_path})
-        payload = self.get_json(base, "/api/volume")
 
-        receipts = payload["receipts"]
-        self.assertTrue(receipts["present"])
-        self.assertEqual(receipts["count"], 1)
-        self.assertEqual(receipts["parse_errors"], 0)
-        self.assertEqual(receipts["records"][0]["kind"], "paper_entry")
-        self.assertIs(receipts["records"][0]["paper"], True)
+class TestPnlEndpoint(ServerHarness):
 
-        served = payload["state"]
-        self.assertTrue(served["present"])
-        self.assertEqual(served["parse_errors"], 0)
-        self.assertEqual(served["state"]["version"], 1)
-        self.assertIs(served["state"]["paper"], True)
-        position = served["state"]["positions"]["AAAUSDT"]
-        self.assertIs(position["paper"], True)
-        self.assertEqual(position["entry_price"], "100")
-        self.assertEqual(position["qty"], "0.10000000")
-        self.assertEqual(served["state"]["candle_marks"]["AAAUSDT"],
-                         closed[-1].close_time_ms)
+    def test_closed_and_reconcile_pnl_blocks_include_partial_fee_truth(self):
+        root = self.tempdir()
+        receipts_dir = root / "receipts"
+        receipts_dir.mkdir()
+        partial_pnl = {
+            "spot_quote_pnl_usdt": "0.12000000",
+            "short_quote_pnl_usdt": "-0.03000000",
+            "spot_fees_usdt": "0.01000000",
+            "usdm_commission_usdt": "-0.00400000",
+            "funding_usdt": "0.00200000",
+            "total_usdt": "0.07800000",
+            "total_usdt_status": "PARTIAL_FEES_EXCLUDED",
+            "excluded_spot_fees_by_asset": {"BNB": "0.00000120"},
+        }
+        complete_pnl = {
+            "total_usdt": "-0.01400000", "fees_complete": True,
+        }
+        receipts = {
+            "basis-executor-closed.json": {
+                "kind": "basis_cycle", "verdict": "CLOSED",
+                "run_id": "closed01", "symbol": "APRUSDT",
+                "finished_utc": "2026-08-13T10:04:00.000Z",
+                "pnl": partial_pnl,
+            },
+            "basis-executor-reconcile.json": {
+                "kind": "reconcile", "verdict": "RECONCILED",
+                "run_id": "recon01", "symbol": "BTCUSDT",
+                "finished_utc": "2026-08-13T10:05:00.000Z",
+                "result": {"pnl": complete_pnl},
+            },
+            "basis-executor-open.json": {
+                "kind": "basis_cycle", "verdict": "OPEN_EXPOSURE",
+                "run_id": "open01", "pnl": {"total_usdt": "999"},
+            },
+            "basis-position-no-pnl.json": {
+                "kind": "position-close", "verdict": "CLOSED",
+                "run_id": "nopnl01",
+            },
+        }
+        for name, value in receipts.items():
+            (receipts_dir / name).write_text(
+                json.dumps(value), encoding="utf-8")
+        (receipts_dir / "basis-executor-torn.json").write_text(
+            "{torn", encoding="utf-8")
+        (receipts_dir / "unrelated.json").write_text(
+            json.dumps({"pnl": {"total_usdt": "500"}}), encoding="utf-8")
+
+        sources = self.empty_sources(root / "missing")
+        sources["basis_receipts_dir"] = receipts_dir
+        payload = self.get_json(self.start(sources), "/api/pnl")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["scanned_receipts"], 5)
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["parse_errors"], 1)
+        by_run = {row["run_id"]: row for row in payload["records"]}
+        self.assertEqual(by_run["closed01"]["pnl"], partial_pnl)
+        self.assertTrue(by_run["closed01"]["partial_fees"])
+        self.assertEqual(
+            by_run["closed01"]["partial_fee_flags"]
+            ["excluded_spot_fees_by_asset"]["BNB"], "0.00000120")
+        self.assertEqual(by_run["recon01"]["pnl"], complete_pnl)
+        self.assertFalse(by_run["recon01"]["partial_fees"])
+        self.assertNotIn("open01", by_run)
+
+    def test_closed_position_state_explicit_pnl_is_also_visible(self):
+        root = self.tempdir()
+        position_path = root / "basis-position.json"
+        pnl = {
+            "total_usdt": "-0.02757000",
+            "total_usdt_status": "PARTIAL_FEES_EXCLUDED",
+            "excluded_spot_fees_by_asset": {"BNB": "0.00042000"},
+        }
+        position_path.write_text(json.dumps({
+            "state": "CLOSED", "verdict": "CLOSED", "run_id": "pos01",
+            "symbol": "BTCUSDT", "updated_utc": "2026-08-13T10:06:00Z",
+            "close": {"closed_utc": "2026-08-13T10:06:00Z", "pnl": pnl},
+        }), encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["basis_position"] = position_path
+        payload = self.get_json(self.start(sources), "/api/pnl")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["records"][0]["pnl"], pnl)
+        self.assertTrue(payload["records"][0]["partial_fees"])
+
+    def test_absent_pnl_sources_are_honest_empty(self):
+        root = self.tempdir()
+        missing = root / "missing"
+        payload = self.get_json(
+            self.start(self.empty_sources(missing)), "/api/pnl")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["records"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertIsNone(payload["as_of"])
+        self.assertFalse(missing.exists())
 
 
 class TestReadOnlyGuarantees(ServerHarness):
 
-    def test_mutating_methods_all_answer_405(self):
+    def test_mutating_methods_all_answer_405_on_runtime_routes(self):
         self.start({})
         for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
-            for path in ("/api/events", "/api/futures", "/index.html"):
+            for path in ("/api/stream", "/api/candidates", "/api/position",
+                         "/api/momentum", "/api/fees", "/api/pnl"):
                 status, body = self.request(method, path, body=b"{}")
                 self.assertEqual(status, 405, "%s %s" % (method, path))
                 self.assertIn(b"read-only", body)
 
-    def test_health_reports_read_only_and_sources(self):
+    def test_health_reports_exact_read_only_sources(self):
         base = self.start({})
         payload = self.get_json(base, "/api/health")
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["read_only"])
         self.assertEqual(payload["bind"], "127.0.0.1")
         self.assertEqual(payload["methods"], ["GET", "HEAD"])
-        self.assertEqual(
-            sorted(payload["sources"]),
-            ["basis", "events", "futures_dir", "volume_receipts",
-             "volume_state"])
+        self.assertEqual(sorted(payload["sources"]), [
+            "basis_position", "basis_receipts_dir", "events", "fees",
+            "momentum_receipts", "momentum_state", "proposals_dir",
+            "stream_log", "stream_state",
+        ])
 
-    def test_head_matches_get_with_empty_body(self):
-        base = self.start({})
-        get_status, _, get_body = self.get(base, "/api/events")
+    def test_head_matches_status_and_has_empty_body(self):
+        root = self.tempdir()
+        base = self.start(self.empty_sources(root / "missing"))
+        get_status, _, get_body = self.get(base, "/api/stream")
         self.assertEqual(get_status, 200)
-        status, head_body = self.request("HEAD", "/api/events")
+        self.assertTrue(get_body)
+        status, head_body = self.request("HEAD", "/api/stream")
         self.assertEqual(status, 200)
         self.assertEqual(head_body, b"")
 
-    def test_get_endpoints_write_nothing_anywhere(self):
+    def test_get_endpoints_write_nothing(self):
         root = self.tempdir()
         missing = root / "nothing-here"
         base = self.start(self.empty_sources(missing))
-        for path in ("/api/events", "/api/basis", "/api/futures",
-                     "/api/volume", "/api/health"):
+        for path in ("/api/events", "/api/stream", "/api/candidates",
+                     "/api/position", "/api/momentum", "/api/fees",
+                     "/api/pnl", "/api/health"):
             self.get_json(base, path)
         self.assertEqual(list(root.iterdir()), [],
-                         "no source may be created by reads")
+                         "GETs must never create a runtime source")
 
 
 class TestDefaultSources(unittest.TestCase):
 
-    def test_defaults_point_where_the_quant_writes(self):
-        sources = serve.default_sources()
-        repo = Path(__file__).resolve().parent.parent
-        self.assertEqual(sources["events"],
-                         repo / "ui" / "fixtures" / "events.jsonl")
-        self.assertEqual(sources["basis"],
-                         repo / "evidence" / "basis-read-live-run.txt")
-        self.assertEqual(sources["volume_receipts"],
-                         repo / "paper_receipts.jsonl")
-        self.assertEqual(sources["volume_state"], repo / "paper_state.json")
-
-    def test_volume_defaults_are_the_writer_modules_own_constants(self):
-        """One shared definition: the server serves the paths the volume
-        lane actually writes, imported from volume_observer itself."""
-        sources = serve.default_sources()
-        self.assertEqual(sources["volume_receipts"], vo.DEFAULT_RECEIPT_PATH)
-        self.assertEqual(sources["volume_state"], vo.DEFAULT_STATE_PATH)
-
-    def test_futures_dir_honors_receipt_dir_env(self):
+    def test_defaults_use_receipt_dir_path_conventions_only(self):
         old = os.environ.get("RECEIPT_DIR")
         try:
-            os.environ["RECEIPT_DIR"] = "/tmp-example/receipts"
-            self.assertEqual(serve.default_sources()["futures_dir"],
-                             Path("/tmp-example/receipts"))
-            del os.environ["RECEIPT_DIR"]
-            self.assertEqual(serve.default_sources()["futures_dir"],
-                             Path(os.path.expanduser("~/quant_receipts")))
+            os.environ["RECEIPT_DIR"] = "/tmp-example/quant-receipts"
+            sources = serve.default_sources()
+            receipt_dir = Path("/tmp-example/quant-receipts")
+            self.assertEqual(sources["stream_state"],
+                             receipt_dir / "stream_state.json")
+            self.assertEqual(sources["stream_log"],
+                             receipt_dir / "stream_log.jsonl")
+            self.assertEqual(sources["proposals_dir"],
+                             receipt_dir / "proposals")
+            self.assertEqual(sources["basis_position"],
+                             receipt_dir / "basis-position.json")
+            self.assertEqual(sources["basis_receipts_dir"], receipt_dir)
+            self.assertEqual(sources["fees"],
+                             receipt_dir / "commission-rates.json")
+            self.assertEqual(sources["momentum_state"],
+                             receipt_dir / "momentum-paper-state.json")
+            self.assertEqual(sources["momentum_receipts"],
+                             receipt_dir / "momentum-paper-receipts.jsonl")
+            self.assertEqual(sources["events"],
+                             UI_DIR / "fixtures" / "events.jsonl")
         finally:
-            if old is not None:
-                os.environ["RECEIPT_DIR"] = old
-            else:
+            if old is None:
                 os.environ.pop("RECEIPT_DIR", None)
+            else:
+                os.environ["RECEIPT_DIR"] = old
+
+    def test_events_is_the_only_fixture_source(self):
+        sources = serve.default_sources()
+        fixture_sources = [name for name, path in sources.items()
+                           if "fixtures" in path.parts]
+        self.assertEqual(fixture_sources, ["events"])
 
 
 if __name__ == "__main__":

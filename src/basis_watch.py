@@ -4,9 +4,12 @@ One pass = one engine tick of the old scanner, ported per
 tests/fixtures/old_engine_spec.json (scanner area, plus the math-area unit
 conventions).  Per pass:
 
-1. Cheap all-universe public pass reusing basis_scan's machinery (five
-   unsigned GETs: two exchangeInfo, two all-symbol bookTickers, one
-   all-symbol premiumIndex).
+1. Cheap all-universe pass.  By default it reuses basis_scan's machinery
+   (five unsigned GETs: two exchangeInfo, two all-symbol bookTickers, one
+   all-symbol premiumIndex).  With --stream-state it instead reads the shared
+   stream_state.json snapshot and admits fresh, both-venue, positive NORMAL
+   basis gaps.  A missing, malformed, stale, or null stream value never
+   becomes a finalist.
 2. Finalists: cap-fitting rows with the best raw entry gaps (bounded by
    --finalists), plus every symbol already WATCHING/FOCUS/PROPOSED so
    demotion stays honest.  COOLDOWN symbols are wholly skipped (spec rule
@@ -132,6 +135,8 @@ FUNDING_HISTORY_LIMIT = 32            # spec funding_ingestion_and_history keep 
 FUNDING_PERIOD_MIN_ROWS = 3           # two consecutive spacings are the minimum
 FUNDING_PERIOD_JITTER_MS = 60_000     # exchange stamps may drift slightly
 PREC = 50
+DIRECT_FEED_MODE = "DIRECT-FETCH"
+STREAM_FEED_MODE = "STREAM-FED"
 
 STATES = ("IDLE", "WATCHING", "FOCUS", "PROPOSED", "REJECTED", "COOLDOWN")
 ADVANCED_STATES = ("FOCUS", "PROPOSED")
@@ -1055,6 +1060,8 @@ def _state_from_payload(symbol: str, record: Any) -> SymbolState:
 class LiveReads:
     """Unsigned public GETs only, exactly the dispatch's endpoints."""
 
+    feed_mode = DIRECT_FEED_MODE
+
     def __init__(self) -> None:
         self.now_ms = lambda: int(time.time() * 1000)
 
@@ -1101,6 +1108,65 @@ class LiveReads:
                 "funding_history": history, "premium": premium}
 
 
+class StreamStateReads:
+    """Shared-stream cheap pass plus the unchanged per-finalist deep reads.
+
+    The stream intentionally has no venue lot-size metadata.  Compatibility
+    rows therefore carry null steps: finalist discovery remains available,
+    while proposal construction fails closed unless that execution metadata
+    is supplied by a later contract.
+    """
+
+    feed_mode = STREAM_FEED_MODE
+
+    def __init__(self, path: str, deep_reads: Any, stale_ms: int) -> None:
+        self.path = path
+        self.deep_reads = deep_reads
+        self.stale_ms = Decimal(stale_ms)
+
+    def universe_rows(self) -> List[Dict[str, Any]]:
+        with open(self.path, encoding="utf-8") as handle:
+            payload = json.load(handle, parse_float=Decimal)
+        if not isinstance(payload, dict):
+            raise ScanError("stream state root must be a symbol object")
+
+        rows: List[Dict[str, Any]] = []
+        for symbol, record in payload.items():
+            if not isinstance(symbol, str) or not isinstance(record, dict) \
+                    or record.get("venues") != "both":
+                continue
+            freshness = dec(record.get("freshness_ms"))
+            gap_pct = dec(record.get("basis_gap_pct"))
+            if freshness is None or freshness < 0 \
+                    or freshness > self.stale_ms or gap_pct is None:
+                continue
+            funding_rate = dec(record.get("funding_rate"))
+            spot_bid = dec(record.get("spot_bid"))
+            perp_ask = dec(record.get("perp_ask"))
+            exit_gap = return_pct(perp_ask, spot_bid)
+            rows.append({
+                "symbol": symbol,
+                "entry_gap_bps": gap_pct * Decimal(100),
+                "exit_gap_bps": None if exit_gap is None
+                else exit_gap * Decimal(100),
+                "funding_bps": None if funding_rate is None
+                else funding_rate * Decimal(10_000),
+                "min_valid_notional": None,
+                # Keep valid non-positive rows in the universe so an already
+                # tracked symbol can be evaluated and demoted honestly.  Only
+                # positive NORMAL gaps enter the new-finalist ranking.
+                "finalist_eligible": gap_pct > 0,
+                "fits_10_cap": False,
+                "spot_step": None,
+                "perp_step": None,
+            })
+        rows.sort(key=lambda row: (-row["entry_gap_bps"], row["symbol"]))
+        return rows
+
+    def finalist(self, symbol: str) -> Dict[str, Any]:
+        return self.deep_reads.finalist(symbol)
+
+
 # ---------------------------------------------------------------------------
 # The observer engine.
 
@@ -1115,6 +1181,7 @@ class Watch:
         self.symbols: Dict[str, SymbolState] = {}
         self.pass_count = 0
         self.last_pass_ms: Optional[int] = None
+        self.last_feed_mode = DIRECT_FEED_MODE
         self.load_state()
 
     # -- state file ---------------------------------------------------------
@@ -1552,7 +1619,9 @@ class Watch:
                 break
             # universe_filter (KEEP): symbol regex is engine meta validation;
             # a non-conforming symbol is ineligible, never a finalist.
-            if row["fits_10_cap"] and SYMBOL_RE.fullmatch(row["symbol"]):
+            eligible = row["finalist_eligible"] \
+                if "finalist_eligible" in row else row["fits_10_cap"]
+            if eligible and SYMBOL_RE.fullmatch(row["symbol"]):
                 finalists.append(row["symbol"])
         tracked = sorted(symbol for symbol, state in self.symbols.items()
                          if state.state in ("WATCHING", "FOCUS", "PROPOSED")
@@ -1576,6 +1645,7 @@ class Watch:
             else (lambda: int(time.time() * 1000))
         pass_now = clock()
         rows = reads.universe_rows()
+        self.last_feed_mode = getattr(reads, "feed_mode", DIRECT_FEED_MODE)
         market_rows = {row["symbol"]: row for row in rows}
         finalists = self._pick_finalists(rows, pass_now)
         out: List[Dict[str, Any]] = []
@@ -1677,8 +1747,8 @@ ROW_FIELDS = ("symbol", "state", "kind", "reject_code", "gap_pct",
 
 
 def print_pass(watch: Watch, rows: List[Dict[str, Any]]) -> None:
-    print("WATCH | pass %d | finalists %d | kernel %s | state %s"
-          % (watch.pass_count, len(rows),
+    print("WATCH | pass %d | mode %s | finalists %d | kernel %s | state %s"
+          % (watch.pass_count, watch.last_feed_mode, len(rows),
              "present" if basis_kernel is not None else "absent",
              watch.state_path))
     print(" | ".join(ROW_FIELDS))
@@ -1701,6 +1771,9 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
     parser.add_argument("--stop-file", default=None,
                         help="loop exits cleanly when this path exists "
                              "(default RECEIPT_DIR/STOP)")
+    parser.add_argument("--stream-state", default=None, metavar="PATH",
+                        help="read the cheap universe pass from stream_state "
+                             "instead of direct all-universe GETs")
     parser.add_argument("--finalists", type=int, default=DEFAULTS["finalist_cap"],
                         help="cap-fitting best-gap finalist bound")
     parser.add_argument("--notional-usd", default=None,
@@ -1723,12 +1796,16 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
             parser.error("--notional-usd must be a positive decimal")
         overrides["notional_usd"] = notional
     try:
-        watch = Watch(state_path, receipt_dir, watch_config(overrides))
+        config = watch_config(overrides)
+        watch = Watch(state_path, receipt_dir, config)
     except WatchError as exc:
         print("ERROR: %s" % exc)
         return 4
     if reads is None:
         reads = LiveReads()
+    if args.stream_state is not None:
+        reads = StreamStateReads(os.path.expanduser(args.stream_state), reads,
+                                 config["stale_ms"])
 
     if args.once:
         try:
