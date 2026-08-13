@@ -1,23 +1,27 @@
 # TASK.md — current work orders
 
-ARMED, OWNER'S TRIGGER (2026-08-13): the one capped BNBUSDT plumbing
-sequence sits deployed and verified on the host (leverage 1x one-shot ->
-receipted 9 USDT transfer -> full signed validate -> ONE capped cycle;
-stops honestly at any step). No seat presses it; the owner runs
-`bash aws-connect/ssmrun.sh scripts/run_plumbing_on_host.sh 240` from
-Desktop/quant. Code 4971faad; sequence commit fca93576.
-
-COMPLETED same day (owner GO, Fable-direct):
-- basis_executor.py signed-reads the plan symbol's ACTUAL leverage
-  (/fapi/v1/symbolConfig) and refuses before every order unless it is
-  exactly 1x. The module never changes leverage.
-- --validate-only runs the COMPLETE signed preflight, including actual
-  symbol leverage, with zero POSTs and zero account changes.
-- --plan-only stays unsigned/public.
-- Focused offline tests; commit, push; run plan-only for BTCUSDT, ETHUSDT,
-  SOLUSDT and validate-only for any symbol whose plan passes; report the SHA
-  and measured results; then STOP.
-- No orders, no leverage changes, no UI, Volume, panel, or lane work.
+WAVE 3 — FULL NORMAL-BASIS STRATEGY (owner GO 2026-08-13, adopting the
+commander's FABLE_FULL_BASIS_ORDER with Lead corrections: base = current
+main, old-engine files digested by workers as behavioral specs per donor
+law, Task-B references moot — already Trash-disposed):
+- Build the complete vertical: continuous universe observer -> economically
+  valid candidate (entry - exit + expected funding - four MEASURED
+  commissions - slippage - buffer, all in bps) -> Spot long + USD-M short ->
+  persistent restart-safe HOLD -> measured exit (convergence, max-hold,
+  edge-inversion, emergency) -> reconciliation and P&L.
+- Preserve the proven execution mechanics (basis_executor discipline,
+  basis_scan first pass, wallet/futures/spot hands). No wholesale old-code
+  copy; behaviors ported one at a time with reasons; differential fixtures
+  prove extraction.
+- Commission truth from signed GET /api/v3/account/commission and
+  /fapi/v1/commissionRate for finalists only. Leverage: set-and-verify 1x on
+  the selected symbol only.
+- End states: CLOSED (genuine qualifying cycle, owner-activated) |
+  READY_WAITING_FOR_NET_EDGE | EXECUTION_MECHANICS_ONLY (only if the owner
+  separately orders a paid mechanics proof) | UNKNOWN.
+- The cron loop's TRADING is PAUSED (STOP file) until the new gate replaces
+  its crude bar; live entry only on owner activation. Checkpoint commits
+  throughout; no UI, no Volume, no new laws.
 
 (Event contract v1 unchanged; its frozen text is preserved in TASK.md at
 commit 5a53ddbb and stays binding.)
