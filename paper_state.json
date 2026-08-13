@@ -1,0 +1,43 @@
+{
+ "candle_marks": {
+  "0GUSDT": 1786582199999,
+  "1000CATUSDT": 1786582199999,
+  "1000CHEEMSUSDT": 1786582199999,
+  "1000SATSUSDT": 1786582199999,
+  "1INCHUSDT": 1786582199999,
+  "1MBABYDOGEUSDT": 1786582199999
+ },
+ "paper": true,
+ "positions": {
+  "1000SATSUSDT": {
+   "entry_candle_close_ms": 1786582199999,
+   "entry_price": "0.00001012",
+   "entry_ts": "2026-08-13T00:54:47.219Z",
+   "note": "paper only; no real order path",
+   "paper": true,
+   "paper_cost": "9.9999999999999132",
+   "paper_notional_requested": "10",
+   "peak_price": "0.00001012",
+   "qty": "988142.29249011",
+   "run_id": "livescan05",
+   "symbol": "1000SATSUSDT",
+   "trail_pct": "0.01"
+  },
+  "1INCHUSDT": {
+   "entry_candle_close_ms": 1786582199999,
+   "entry_price": "0.08310000",
+   "entry_ts": "2026-08-13T00:54:47.824Z",
+   "note": "paper only; no real order path",
+   "paper": true,
+   "paper_cost": "9.9999999998640000",
+   "paper_notional_requested": "10",
+   "peak_price": "0.08310000",
+   "qty": "120.33694344",
+   "run_id": "livescan05",
+   "symbol": "1INCHUSDT",
+   "trail_pct": "0.01"
+  }
+ },
+ "updated_utc": "2026-08-13T00:54:48.439Z",
+ "version": 1
+}
