@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Stateless tick driver for the persistent basis-position machine.
+
+The supervisor owns ordering, not trading mechanics.  Every lifecycle action
+is delegated to ``basis_position`` and every tick reloads its durable state.
+The only durable artifact created here is an exclusive proposal claim.
+
+Exit codes: 0 acted, 1 held, 2 frozen, 3 idle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, List, Optional
+
+from basis_position import (
+    EMERGENCY_FILE,
+    EXIT_CODE as POSITION_EXIT_CODE,
+    FREEZE_NEW_ACTIONS,
+    LOCK_FILE,
+    PROPOSAL_DIR,
+    PROPOSAL_ID_RE,
+    REQUEST_EMERGENCY_UNWIND,
+    REQUEST_EXIT,
+    STATE_FILE,
+    STOP_FILE,
+    ST_CLOSED,
+    ST_CLOSING,
+    ST_NONE,
+    ST_ONE_LEG,
+    ST_OPEN,
+    ST_OPENING,
+    ST_UNKNOWN,
+    PositionConfig,
+    PositionError,
+    cmd_check,
+    cmd_close,
+    cmd_open,
+    cmd_resume,
+    config_from_env,
+    default_now_ms,
+    live_request_factory,
+    load_entry_proposal,
+    load_position,
+    supervise,
+)
+
+
+EXIT_ACTED = 0
+EXIT_HELD = 1
+EXIT_FROZEN = 2
+EXIT_IDLE = 3
+
+FREEZE_STATES = frozenset((ST_UNKNOWN, ST_ONE_LEG, ST_OPENING, ST_CLOSING))
+CLOSE_DECISIONS = frozenset((REQUEST_EXIT, REQUEST_EMERGENCY_UNWIND))
+PROPOSAL_NAME_RE = re.compile(r"proposal-(.+)\.json")
+
+# Public identity for callers which need the complete pure ladder.  Runtime
+# market checks stay in cmd_check: the supervisor must not reproduce its
+# executable-price/funding reads or its decision rules.
+supervision_ladder = supervise
+
+
+@dataclass(frozen=True)
+class ProposalCandidate:
+    proposal_id: str
+    created_ms: int
+
+
+def _text(value: Any, limit: int = 300) -> str:
+    """One safe factual row, without multiline transport/error text."""
+    return " ".join(str(value).split())[:limit]
+
+
+def _row(action: str, outcome: str, note: Any) -> None:
+    print("SUPERVISOR | %s | %s | %s"
+          % (_text(action, 40), _text(outcome, 40), _text(note)))
+
+
+def _utc_from_ms(value: int) -> str:
+    return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _created_ms(payload: dict) -> int:
+    text = payload["created_utc"]
+    parsed = datetime.fromisoformat(
+        text[:-1] + "+00:00" if text.endswith("Z") else text)
+    return int(parsed.timestamp() * 1000)
+
+
+def _scan_newest_valid(cfg: PositionConfig, tick_ms: int
+                       ) -> Optional[ProposalCandidate]:
+    """Validate every immutable proposal; return the newest valid one."""
+    directory = os.path.join(cfg.receipt_dir, PROPOSAL_DIR)
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        _row("SCAN", "FROZEN", "proposal directory unreadable: %s"
+             % type(error).__name__)
+        raise
+
+    valid: List[ProposalCandidate] = []
+    for name in names:
+        match = PROPOSAL_NAME_RE.fullmatch(name)
+        if match is None:
+            continue
+        proposal_id = match.group(1)
+        if PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
+            _row("PROPOSAL", "SKIPPED", "%s has an invalid id" % name)
+            continue
+        try:
+            accepted = load_entry_proposal(
+                cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha, tick_ms)
+            valid.append(ProposalCandidate(
+                proposal_id=proposal_id,
+                created_ms=_created_ms(accepted.payload)))
+        except (KeyError, TypeError, ValueError, PositionError) as error:
+            _row("PROPOSAL", "SKIPPED", "%s: %s"
+                 % (proposal_id, _text(error, 220)))
+    if not valid:
+        return None
+    return max(valid, key=lambda item: (item.created_ms, item.proposal_id))
+
+
+def _claim(candidate: ProposalCandidate, cfg: PositionConfig, claimant: str,
+           claimed_ms: int) -> bool:
+    """Create the proposal claim exactly once; an existing inode owns it."""
+    path = os.path.join(cfg.receipt_dir, PROPOSAL_DIR,
+                        "proposal-%s.claim" % candidate.proposal_id)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    payload = (json.dumps({
+        "claimant": _text(claimant, 160),
+        "utc": _utc_from_ms(claimed_ms),
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        _row("CLAIM", "SKIPPED", "proposal %s already owned"
+             % candidate.proposal_id)
+        return False
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("claim write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    _row("CLAIM", "CREATED", "proposal %s claimant %s"
+         % (candidate.proposal_id, _text(claimant, 80)))
+    return True
+
+
+def _load_after(action: str, cfg: PositionConfig) -> Optional[dict]:
+    try:
+        return load_position(cfg.receipt_dir)
+    except PositionError as error:
+        _row(action, "FROZEN", error)
+        return None
+
+
+def _position_file_exists(cfg: PositionConfig) -> bool:
+    return os.path.exists(os.path.join(cfg.receipt_dir, STATE_FILE))
+
+
+def _reconcile(cfg: PositionConfig, request, sleep, now_ms,
+               label: str = "RECONCILE") -> tuple[int, Optional[dict]]:
+    code = cmd_resume(cfg, request, sleep=sleep, now_ms=now_ms)
+    position = _load_after(label, cfg)
+    state = position.get("state") if position else ST_NONE
+    _row(label, "DONE" if code == 0 else "HELD",
+         "position command exit %s state %s" % (code, state))
+    return code, position
+
+
+def _fresh_check_decision(before: dict, after: dict,
+                          check_code: int) -> Optional[str]:
+    if check_code != POSITION_EXIT_CODE["DECIDED"]:
+        return None
+    old_revision = before.get("revision")
+    new_revision = after.get("revision")
+    changed = isinstance(old_revision, int) and isinstance(new_revision, int) \
+        and new_revision > old_revision
+    if not changed and after.get("last_check") == before.get("last_check"):
+        return None
+    last_check = after.get("last_check")
+    if not isinstance(last_check, dict):
+        return None
+    decision = last_check.get("decision")
+    return decision if isinstance(decision, str) else None
+
+
+def _default_claimant() -> str:
+    return "pid-%s" % os.getpid()
+
+
+def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.sleep,
+         now_ms: Callable[[], int] = default_now_ms,
+         claimant: Optional[str] = None) -> int:
+    """Run exactly one restart-safe supervisor cycle."""
+    claimant = claimant or _default_claimant()
+
+    # Reconcile before every decision whenever position state (or its shared
+    # ownership lock) exists.  A corrupt state also goes through cmd_resume so
+    # the position machinery, not this driver, owns the refusal.
+    position: Optional[dict]
+    try:
+        position = load_position(cfg.receipt_dir)
+    except PositionError:
+        position = None
+    has_recovery_artifact = _position_file_exists(cfg) or os.path.exists(
+        os.path.join(cfg.receipt_dir, LOCK_FILE))
+    if has_recovery_artifact:
+        resume_code, position = _reconcile(
+            cfg, request, sleep, now_ms)
+        state = position.get("state") if position else None
+        lock_stands = os.path.exists(os.path.join(cfg.receipt_dir, LOCK_FILE))
+        ownership_inconsistent = (state == ST_OPEN and not lock_stands) \
+            or (state in (ST_NONE, ST_CLOSED) and lock_stands)
+        if resume_code != 0 or state in FREEZE_STATES or position is None:
+            _row("TICK", "FROZEN",
+                 "reconciliation is the only action; state %s"
+                 % (state or "UNREADABLE"))
+            return EXIT_FROZEN
+        if ownership_inconsistent:
+            _row("TICK", "FROZEN",
+                 "reconciliation is the only action; state/lock ownership "
+                 "is inconsistent")
+            return EXIT_FROZEN
+
+    if position is not None and position.get("state") == ST_OPEN:
+        before = position
+        prior_check = before.get("last_check")
+        prior_decision = prior_check.get("decision") \
+            if isinstance(prior_check, dict) else None
+        emergency_before = os.path.exists(os.path.join(
+            cfg.receipt_dir, EMERGENCY_FILE))
+        check_code = cmd_check(cfg, request, sleep=sleep, now_ms=now_ms)
+        after = _load_after("CHECK", cfg)
+        if after is None:
+            return EXIT_FROZEN
+        decision = _fresh_check_decision(before, after, check_code)
+        emergency = emergency_before or os.path.exists(os.path.join(
+            cfg.receipt_dir, EMERGENCY_FILE))
+        _row("CHECK", "DONE" if check_code == 0 else "FROZEN",
+             "position command exit %s decision %s"
+             % (check_code, decision or
+                (REQUEST_EMERGENCY_UNWIND if emergency else "UNPROVEN")))
+        close_reason = REQUEST_EMERGENCY_UNWIND if emergency else (
+            decision if decision in CLOSE_DECISIONS else
+            prior_decision if prior_decision in CLOSE_DECISIONS else None)
+        if check_code != POSITION_EXIT_CODE["DECIDED"] \
+                and close_reason is None:
+            return EXIT_FROZEN
+        if after.get("state") != ST_OPEN:
+            return EXIT_FROZEN
+        if close_reason is not None:
+            close_code = cmd_close(
+                cfg, request, sleep=sleep, now_ms=now_ms)
+            _row("CLOSE", "AUTOMATIC",
+                 "%s; position command exit %s"
+                 % (close_reason, close_code))
+            resume_code, final_position = _reconcile(
+                cfg, request, sleep, now_ms, label="CLOSE-RECONCILE")
+            final_state = final_position.get("state") \
+                if final_position else None
+            if resume_code != 0 or final_state in FREEZE_STATES \
+                    or final_position is None:
+                return EXIT_FROZEN
+            return EXIT_ACTED
+        if decision == FREEZE_NEW_ACTIONS:
+            return EXIT_FROZEN
+        if decision is None:
+            _row("TICK", "FROZEN", "check decision was not persisted")
+            return EXIT_FROZEN
+        _row("TICK", "HELD", "OPEN position remains within policy")
+        return EXIT_HELD
+
+    # CLOSED/NONE state does not stand.  STOP gates only entry; reconciliation,
+    # checks, and exits above never consult it.
+    if os.path.exists(os.path.join(cfg.receipt_dir, STOP_FILE)):
+        _row("ENTRY", "SKIPPED", "STOP file present")
+        return EXIT_IDLE
+
+    tick_ms = now_ms()
+    try:
+        candidate = _scan_newest_valid(cfg, tick_ms)
+    except OSError:
+        return EXIT_FROZEN
+    if candidate is None:
+        _row("ENTRY", "IDLE", "no valid proposal")
+        return EXIT_IDLE
+    try:
+        claimed = _claim(candidate, cfg, claimant, tick_ms)
+    except OSError as error:
+        _row("CLAIM", "FROZEN", "%s: %s"
+             % (candidate.proposal_id, type(error).__name__))
+        return EXIT_FROZEN
+    if not claimed:
+        return EXIT_IDLE
+
+    open_code = cmd_open(
+        cfg, request, sleep=sleep, now_ms=now_ms,
+        proposal_id=candidate.proposal_id)
+    opened = _load_after("OPEN", cfg)
+    opened_state = opened.get("state") if opened else ST_NONE
+    _row("OPEN", "DONE" if open_code == 0 else "HELD",
+         "proposal %s position command exit %s state %s"
+         % (candidate.proposal_id, open_code, opened_state))
+    if opened is not None and opened_state in FREEZE_STATES:
+        return EXIT_FROZEN
+    return EXIT_ACTED
+
+
+def run(cfg: PositionConfig, request, seconds: float, halt_file: str, *,
+        sleep: Callable[[float], None] = time.sleep,
+        now_ms: Callable[[], int] = default_now_ms,
+        claimant: Optional[str] = None) -> int:
+    """Run ticks until the independent halt file appears."""
+    if seconds <= 0:
+        raise ValueError("SECONDS must be positive")
+    last_code = EXIT_IDLE
+    while not os.path.exists(halt_file):
+        last_code = tick(cfg, request, sleep=sleep, now_ms=now_ms,
+                         claimant=claimant)
+        if os.path.exists(halt_file):
+            break
+        sleep(seconds)
+    _row("LOOP", "HALTED", halt_file)
+    return last_code
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("SECONDS must be numeric") from None
+    if not parsed > 0:
+        raise argparse.ArgumentTypeError("SECONDS must be positive")
+    return parsed
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="restart-safe one-position basis supervisor")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--tick", action="store_true",
+                      help="run one supervisor cycle")
+    mode.add_argument("--run", metavar="SECONDS", type=_positive_seconds,
+                      help="run ticks at this interval until the halt file")
+    parser.add_argument("--symbol", default="",
+                        help="basis symbol (default: SYMBOL environment)")
+    parser.add_argument("--halt-file",
+                        help="loop halt path (default: RECEIPT_DIR/HALT)")
+    args = parser.parse_args(argv)
+
+    try:
+        cfg = config_from_env(os.environ, args.symbol)
+    except PositionError as error:
+        _row("CONFIG", "FROZEN", error)
+        return EXIT_FROZEN
+    api_key = os.environ.get("BINANCE_API_KEY", "")
+    api_secret = os.environ.get("BINANCE_API_SECRET", "")
+    if not api_key or not api_secret:
+        _row("CONFIG", "FROZEN",
+             "missing BINANCE_API_KEY / BINANCE_API_SECRET")
+        return EXIT_FROZEN
+    request = live_request_factory(api_key, api_secret)
+    if args.tick:
+        return tick(cfg, request)
+    halt_file = os.path.expanduser(
+        args.halt_file or os.path.join(cfg.receipt_dir, "HALT"))
+    try:
+        return run(cfg, request, args.run, halt_file)
+    except KeyboardInterrupt:
+        _row("LOOP", "HALTED", "keyboard interrupt")
+        return EXIT_IDLE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
