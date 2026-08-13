@@ -114,8 +114,11 @@ for row in matches[0]["filters"]:
                    Decimal(str(row.get("bidMultiplierUp", "0"))))
 if band <= 1:
     band = Decimal("1.5")
-need = (Decimal("10") * band * Decimal("1.05")).quantize(Decimal("0.01"),
-                                                         ROUND_UP)
+# Owner word 2026-08-13: keep real headroom. Target at least double the
+# 10-USDT leg cap, more when the band demands it; trades stay capped at 10.
+need = max(Decimal("20"),
+           (Decimal("10") * band * Decimal("1.2"))).quantize(Decimal("0.01"),
+                                                             ROUND_UP)
 gap = need - available
 if gap <= 0:
     print("0")
