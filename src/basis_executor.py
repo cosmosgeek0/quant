@@ -1,0 +1,1004 @@
+"""basis_executor.py — one-shot command-line executor for the smallest basis cycle.
+
+Connects the proven pieces and adds only the missing plumbing:
+- basis_read supplies the live executable-gap read (build_basis_read_row and
+  the public Spot/USD-M endpoints);
+- basis_cycle supplies the lifecycle: plan_cycle refuses or proceeds, leg_intent
+  and client_id shape every order with unique bc- ids, run_cycle is the verdict
+  oracle over the confirmed leg outcomes and the acquired-base seam;
+- futures_hand lends the short discipline (query the exact client id after the
+  one submission; TERMINAL states; common_step; one mutating call, no retry);
+- spot_roundtrip lends the spot discipline (quoteOrderQty-bounded BUY, fills
+  and commissions from exchange truth via fees_by_asset, receipt + lock shape);
+- events emits EVENT CONTRACT v1 JSONL locally.
+
+Flow when it one day runs live (this wave is OFFLINE ONLY — every test injects
+transport; nothing here was run against the network in-lane):
+one basis read -> refuse or proceed per plan_cycle -> Spot BUY bounded by
+quoteOrderQty -> confirm ACTUAL net base = exchange-reported fills minus
+base-asset fees, floored to the shared step -> Futures SELL short exactly that
+quantity -> confirm the actual short fill -> reduce-only BUY close of the EXACT
+short fill -> Spot SELL of the actual remaining base.
+
+Discipline (each rule is a paid scar):
+- one submission per leg; order truth is established ONLY by querying that
+  leg's client order id; a blind resend double-buys, so nothing is ever resent;
+- partial fills are handled from exchange-reported executed quantities;
+- UNKNOWN stays UNKNOWN: freeze, report exposure with the exact client id to
+  reconcile, exit nonzero; no repair trades ever;
+- a JSON receipt is saved before and after every mutation; contract-v1 events
+  are appended to a local events.jsonl at the end of the run.
+
+Exit codes: 0 CLOSED | 2 REJECTED_BEFORE_ENTRY or config refusal |
+3 OPEN_EXPOSURE / BLOCKED / BLOCKED_UNRESOLVED | 4 UNKNOWN.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import events
+from basis_cycle import (
+    ENTER_SHORT,
+    ENTER_SPOT,
+    EXIT_SHORT,
+    EXIT_SPOT,
+    MAX_CYCLE_QUOTE,
+    UNWIND_SPOT,
+    CyclePlan,
+    client_id,
+    leg_intent,
+    plan_cycle,
+    quantize_down,
+    run_cycle,
+)
+from basis_read import (
+    SPOT_BASE_URL,
+    SPOT_BOOK_PATH,
+    USDM_BASE_URL,
+    USDM_BOOK_PATH,
+    USDM_PREMIUM_PATH,
+    BasisReadError,
+    build_basis_read_row,
+    now_utc,
+)
+from futures_hand import TERMINAL, api_reason, clean, common_step, d, fmt
+from spot_roundtrip import fees_by_asset
+
+ALL_STAGES = (ENTER_SPOT, ENTER_SHORT, EXIT_SHORT, EXIT_SPOT, UNWIND_SPOT)
+RECV_WINDOW = "5000"
+HTTP_TIMEOUT = 15
+QUERY_TRIES = 45          # x QUERY_SLEEP = the live per-order confirmation budget
+QUERY_SLEEP = 2.0
+MISSING_LIMIT = 8         # consecutive -2013 answers = the order never existed
+TRADE_TRIES = 5
+SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+EXIT_CODE = {
+    "CLOSED": 0,
+    "REJECTED_BEFORE_ENTRY": 2,
+    "OPEN_EXPOSURE": 3,
+    "BLOCKED_UNRESOLVED": 3,
+    "UNKNOWN": 4,
+}
+USDM_POSITION_PATH = "/fapi/v3/positionRisk"
+
+
+@dataclass(frozen=True)
+class Venue:
+    name: str
+    base_url: str
+    exchange_info_path: str
+    order_path: str
+    trades_path: str
+    quote_field: str
+    resp_type: str
+
+
+SPOT = Venue("spot", SPOT_BASE_URL, "/api/v3/exchangeInfo", "/api/v3/order",
+             "/api/v3/myTrades", "cummulativeQuoteQty", "FULL")
+USDM = Venue("usdm", USDM_BASE_URL, "/fapi/v1/exchangeInfo", "/fapi/v1/order",
+             "", "cumQuote", "RESULT")
+VENUES = {"spot": SPOT, "usdm": USDM}
+
+
+class ExecutorExit(Exception):
+    """Carries the process exit code out of the one finish() call."""
+
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
+
+
+class Blocked(Exception):
+    """A local precondition (config, lock) refuses the run before any receipt."""
+
+
+class Refusal(Exception):
+    """A pre-order refusal inside a receipted run; nothing was submitted."""
+
+
+@dataclass(frozen=True)
+class ExecutorConfig:
+    symbol: str
+    sha: str
+    receipt_dir: str
+    min_entry_bps: Decimal = Decimal("1")
+    events_path: str = ""     # default: <receipt_dir>/events.jsonl
+    run_id: str = ""          # default: generated per run
+
+
+@dataclass
+class RunState:
+    cfg: ExecutorConfig
+    request: Callable[..., Tuple[str, Any]]
+    sleep: Callable[[float], None]
+    run_id: str
+    receipt_path: str
+    lock_path: str
+    events_path: str
+    client_ids: Tuple[str, ...] = ()
+    receipt: Dict[str, Any] = field(default_factory=dict)
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    outcomes: Dict[str, str] = field(default_factory=dict)
+    locked: bool = False
+    partial_short: Optional[Decimal] = None
+
+
+def utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def new_run_id() -> str:
+    return format(int(time.time()), "x") + secrets.token_hex(3)
+
+
+def save(state: RunState) -> None:
+    if not state.receipt_path:
+        return
+    tmp = state.receipt_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state.receipt, handle, indent=2, default=str)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, state.receipt_path)
+
+
+def first_fail(state: RunState, where: str, detail: Any) -> None:
+    if "first_failure" not in state.receipt:
+        state.receipt["first_failure"] = {
+            "utc": utc(), "where": clean(where, 60), "detail": clean(detail, 200),
+        }
+        save(state)
+
+
+def contract_note(text: Any, identifiers: Tuple[str, ...]) -> str:
+    """Normalize free text into an EVENT CONTRACT v1 note (a _safe_note fixed
+    point): known ids to last-4, then the contract's own token reductions."""
+    note = " ".join(str(text).split())
+    for identifier in sorted({i for i in identifiers if len(i) > 4},
+                             key=len, reverse=True):
+        note = note.replace(identifier, identifier[-4:])
+    note = events.LONG_ID_RE.sub(lambda match: match.group(0)[-4:], note)
+    note = events.OPAQUE_TOKEN_RE.sub(lambda match: match.group(0)[-4:], note)
+    return note[:480]
+
+
+def base_event(state: RunState, kind: str) -> Dict[str, Any]:
+    return {"ts": utc(), "sha8": state.cfg.sha[:8].lower(), "kind": kind,
+            "run_id": state.run_id, "symbol": state.cfg.symbol}
+
+
+def write_events(state: RunState) -> None:
+    if not state.events:
+        return
+    try:
+        events.write_jsonl(state.events, state.events_path, append=True)
+    except (events.ReceiptError, OSError) as exc:
+        first_fail(state, "events_contract", exc)
+        state.receipt["events_error"] = clean(exc, 200)
+        save(state)
+
+
+def finish(state: RunState, verdict: str, exposure: str, note: str) -> None:
+    state.receipt.update({
+        "outcomes": dict(state.outcomes),
+        "verdict": verdict,
+        "exposure": clean(exposure, 300),
+        "verdict_note": clean(note, 300),
+        "finished_utc": utc(),
+    })
+    save(state)
+    verdict_event = base_event(state, "run_verdict")
+    verdict_event["verdict"] = verdict
+    residual = state.receipt.get("result", {}).get("residual_base_from_this_run")
+    if residual not in (None, "UNKNOWN"):
+        verdict_event["residual"] = residual
+    text = exposure if exposure and exposure != "none" else note
+    if text:
+        verdict_event["note"] = contract_note(text, state.client_ids)
+    state.events.append(verdict_event)
+    write_events(state)
+    if state.locked and verdict in ("CLOSED", "REJECTED_BEFORE_ENTRY"):
+        os.unlink(state.lock_path)
+        state.locked = False
+    print("lane: BASIS-EXECUTOR")
+    print("run_id:", state.run_id)
+    print("sha8:", state.cfg.sha[:8])
+    print("symbol:", state.cfg.symbol)
+    for leg in state.receipt.get("legs", []):
+        print("leg: %s %s executed=%s client_last4=%s" % (
+            leg.get("stage"), leg.get("status", "-"),
+            leg.get("executed_qty", "-"), leg.get("client_id", "")[-4:]))
+    if "first_failure" in state.receipt:
+        print("first_failure:", json.dumps(state.receipt["first_failure"]))
+    print("VERDICT:", verdict)
+    print("EXPOSURE:", clean(exposure, 300))
+    print("NOTE:", clean(note, 300))
+    print("RECEIPT:", state.receipt_path)
+    print("EVENTS:", state.events_path)
+    raise ExecutorExit(EXIT_CODE[verdict])
+
+
+def get_retry(state: RunState, base_url: str, path: str,
+              params: Optional[Dict[str, str]] = None, signed: bool = False,
+              tries: int = 3) -> Tuple[str, Any]:
+    """Reads may retry; mutations NEVER go through here."""
+    kind, payload = "unclear", {}
+    for attempt in range(tries):
+        kind, payload = state.request("GET", base_url, path, params, signed)
+        if kind != "unclear":
+            return kind, payload
+        if attempt + 1 < tries:
+            state.sleep(1 + attempt)
+    return kind, payload
+
+
+def public_read(state: RunState, base_url: str, path: str, label: str) -> Any:
+    kind, payload = get_retry(state, base_url, path,
+                              {"symbol": state.cfg.symbol}, signed=False)
+    if kind != "ok":
+        raise Refusal(f"{label} read failed")
+    return payload
+
+
+def one_symbol(payload: Any, symbol: str, label: str) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise Refusal(f"{label} returned a non-object response")
+    matches = [row for row in payload.get("symbols", [])
+               if isinstance(row, dict) and row.get("symbol") == symbol]
+    if len(matches) != 1:
+        raise Refusal(f"{label} did not return exactly one symbol")
+    return matches[0]
+
+
+def market_context(state: RunState) -> Dict[str, Any]:
+    """Read both venues' filters; derive the shared step and minimums."""
+    symbol = state.cfg.symbol
+    spot_info = one_symbol(
+        public_read(state, SPOT.base_url, SPOT.exchange_info_path,
+                    "Spot exchangeInfo"), symbol, "Spot exchangeInfo")
+    usdm_info = one_symbol(
+        public_read(state, USDM.base_url, USDM.exchange_info_path,
+                    "USD-M exchangeInfo"), symbol, "USD-M exchangeInfo")
+
+    if spot_info.get("status") != "TRADING" or \
+            not spot_info.get("isSpotTradingAllowed", False):
+        raise Refusal("symbol is not live for Spot trading")
+    if "MARKET" not in spot_info.get("orderTypes", []) or \
+            not spot_info.get("quoteOrderQtyMarketAllowed", False):
+        raise Refusal("MARKET quoteOrderQty orders not enabled for symbol")
+    if spot_info.get("quoteAsset") != "USDT":
+        raise Refusal("cycle accepts only USDT-quoted Spot symbols")
+    if usdm_info.get("status") != "TRADING":
+        raise Refusal("USD-M symbol is not TRADING")
+    if usdm_info.get("contractType") != "PERPETUAL":
+        raise Refusal("USD-M symbol is not a PERPETUAL contract")
+    if usdm_info.get("quoteAsset") != "USDT" or \
+            usdm_info.get("marginAsset") != "USDT":
+        raise Refusal("cycle accepts only USDT-quoted, USDT-margined contracts")
+    if "MARKET" not in usdm_info.get("orderTypes", []):
+        raise Refusal("USD-M symbol does not support MARKET orders")
+
+    try:
+        spot_filters = {row["filterType"]: row
+                        for row in spot_info.get("filters", [])}
+        usdm_filters = {row["filterType"]: row
+                        for row in usdm_info.get("filters", [])}
+        steps = [d(spot_filters["LOT_SIZE"]["stepSize"]),
+                 d(usdm_filters["LOT_SIZE"]["stepSize"])]
+        min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"]),
+                    d(usdm_filters["LOT_SIZE"]["minQty"])]
+        for filters in (spot_filters, usdm_filters):
+            market_lot = filters.get("MARKET_LOT_SIZE", {})
+            market_step = d(market_lot.get("stepSize", "0"))
+            if market_step > 0:
+                steps.append(market_step)
+            min_qtys.append(d(market_lot.get("minQty", "0")))
+        spot_notional = spot_filters.get("NOTIONAL") or \
+            spot_filters.get("MIN_NOTIONAL") or {}
+        usdm_notional = usdm_filters.get("MIN_NOTIONAL", {})
+        min_notional = max(d(spot_notional.get("minNotional", "0")),
+                           d(usdm_notional.get("notional", "0")))
+        shared_step = steps[0]
+        for step in steps[1:]:
+            shared_step = common_step(shared_step, step)
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        raise Refusal("symbol filters are unusable on one venue") from None
+    if shared_step <= 0:
+        raise Refusal("shared quantity step is not positive")
+    return {
+        "base": spot_info.get("baseAsset", ""),
+        "shared_step": shared_step,
+        "min_notional": min_notional,
+        "min_qty": max(min_qtys),
+    }
+
+
+def gap_row(state: RunState):
+    """One basis read through the injected transport; contract of basis_read."""
+    symbol = state.cfg.symbol
+    spot_book = public_read(state, SPOT.base_url, SPOT_BOOK_PATH, "Spot book")
+    usdm_book = public_read(state, USDM.base_url, USDM_BOOK_PATH, "USD-M book")
+    premium = public_read(state, USDM.base_url, USDM_PREMIUM_PATH,
+                          "USD-M premium")
+    try:
+        row = build_basis_read_row(symbol, spot_book, usdm_book, premium,
+                                   completed_utc=now_utc())
+    except BasisReadError as exc:
+        raise Refusal(f"basis read refused: {exc}") from None
+    state.receipt["gap"] = {
+        name: fmt(value) if isinstance(value, Decimal) else value
+        for name, value in dataclasses.asdict(row).items()}
+    save(state)
+    gap_event = base_event(state, "gap_read")
+    gap_event["note"] = contract_note(
+        "entry %s bps exit %s bps funding %s" % (
+            fmt(row.entry_gap_bps_vs_spot_ask),
+            fmt(row.exit_gap_bps_vs_spot_bid), fmt(row.funding_rate)),
+        state.client_ids)
+    state.events.append(gap_event)
+    return row
+
+
+def query_client_order(state: RunState, venue: Venue,
+                       order_client_id: str) -> Tuple[str, Any]:
+    """Poll one exact client id until terminal, definitely absent, or unknown.
+
+    Mirrors futures_hand.query_order over the injected transport: a definite
+    non -2013 query error stops the polling because order truth is NOT
+    established; nothing is ever resent from here.
+    """
+    last, missing = None, 0
+    for _ in range(QUERY_TRIES):
+        kind, order = state.request(
+            "GET", venue.base_url, venue.order_path,
+            {"symbol": state.cfg.symbol, "origClientOrderId": order_client_id},
+            True)
+        if kind == "ok" and isinstance(order, dict):
+            last, missing = order, 0
+            if order.get("status") in TERMINAL:
+                return "terminal", order
+        elif kind == "api_error":
+            if isinstance(order, dict) and order.get("code") == -2013:
+                missing += 1
+                if missing >= MISSING_LIMIT:
+                    return "not_found", None
+            else:
+                first_fail(state, "query_order", api_reason(order))
+                return "error", order
+        state.sleep(QUERY_SLEEP)
+    return "pending", last
+
+
+def settle_leg(state: RunState, stage: str, plan: CyclePlan,
+               quantity: Optional[Decimal] = None):
+    """Submit ONE order for a stage, then establish its truth by client id.
+
+    Returns ("terminal", order, response_fills) | ("rejected", payload, []) |
+    ("unknown", last_seen, []). The caller decides; nothing is resent here.
+    """
+    intent = leg_intent(stage, plan, state.run_id, quantity)
+    venue = VENUES[intent.pop("market")]
+    wire = dict(intent)
+    wire["newOrderRespType"] = venue.resp_type
+    order_client_id = wire["newClientOrderId"]
+    leg: Dict[str, Any] = {
+        "stage": stage, "market": venue.name, "side": wire["side"],
+        "client_id": order_client_id, "submitted_utc": utc(),
+    }
+    if "quantity" in wire:
+        leg["quantity"] = wire["quantity"]
+    if "quoteOrderQty" in wire:
+        leg["quote_order_qty"] = wire["quoteOrderQty"]
+    state.receipt["legs"].append(leg)
+    save(state)
+    submitted = base_event(state, "order_submitted")
+    submitted["side"] = wire["side"]
+    submitted["client_id_last4"] = order_client_id[-4:]
+    state.events.append(submitted)
+
+    kind, response = state.request("POST", venue.base_url, venue.order_path,
+                                   dict(wire), True)
+    query_state, order = query_client_order(state, venue, order_client_id)
+
+    if query_state == "terminal":
+        if order.get("clientOrderId") != order_client_id:
+            first_fail(state, "query_order", "returned client id did not match")
+            leg.update({"status": "UNKNOWN", "detail": "order identity mismatch"})
+            save(state)
+            return "unknown", order, []
+        executed = d(order.get("executedQty", "0"))
+        quote = d(order.get(venue.quote_field, "0"))
+        order_id = str(order.get("orderId", ""))
+        leg.update({"status": str(order.get("status")), "order_id": order_id,
+                    "executed_qty": fmt(executed), "quote": fmt(quote),
+                    "terminal_utc": utc()})
+        save(state)
+        terminal = base_event(state, "order_terminal")
+        terminal["side"] = wire["side"]
+        terminal["client_id_last4"] = order_client_id[-4:]
+        if order_id:
+            terminal["order_id_last4"] = order_id[-4:]
+        terminal["executed"] = fmt(executed)
+        terminal["quote"] = fmt(quote)
+        terminal["note"] = contract_note(
+            "%s %s" % (stage, order.get("status")), state.client_ids)
+        state.events.append(terminal)
+        fills = response.get("fills") if (
+            kind == "ok" and isinstance(response, dict)) else None
+        return "terminal", order, list(fills or [])
+
+    if query_state == "not_found" and kind == "api_error":
+        reason = api_reason(response)
+        leg.update({"status": "REJECTED", "reason": clean(reason, 200),
+                    "terminal_utc": utc()})
+        save(state)
+        terminal = base_event(state, "order_terminal")
+        terminal["side"] = wire["side"]
+        terminal["client_id_last4"] = order_client_id[-4:]
+        terminal["executed"] = "0"
+        terminal["note"] = contract_note("%s REJECTED %s" % (stage, reason),
+                                         state.client_ids)
+        state.events.append(terminal)
+        return "rejected", response, []
+
+    first_fail(state, stage.lower(),
+               "submission %s; query %s" % (kind, query_state))
+    leg.update({"status": "UNKNOWN", "submission_kind": kind,
+                "query_state": query_state})
+    save(state)
+    return "unknown", order, []
+
+
+def spot_trades(state: RunState, order_id: str, executed: Decimal,
+                response_fills: List[Dict[str, Any]]):
+    """Real fills for one spot order: FULL-response fills first, then myTrades
+    until they cover the executed quantity (spot_roundtrip.order_trades)."""
+    trades = list(response_fills or [])
+    covered = sum((d(t.get("qty", "0")) for t in trades), Decimal(0))
+    for _ in range(TRADE_TRIES):
+        if covered >= executed:
+            break
+        state.sleep(1)
+        kind, payload = get_retry(
+            state, SPOT.base_url, SPOT.trades_path,
+            {"symbol": state.cfg.symbol, "orderId": order_id}, signed=True)
+        if kind == "ok" and isinstance(payload, list) and payload:
+            trades = payload
+            covered = sum((d(t.get("qty", "0")) for t in trades), Decimal(0))
+    if covered < executed:
+        first_fail(state, "order_trades",
+                   "trades cover %s of %s" % (fmt(covered), fmt(executed)))
+    return trades, covered
+
+
+def base_fee_of(trades: List[Dict[str, Any]], base_asset: str) -> Decimal:
+    return sum((d(t.get("commission", "0")) for t in trades
+                if t.get("commissionAsset") == base_asset), Decimal(0))
+
+
+def attach_fees(state: RunState, leg_index: int, trades) -> None:
+    fee_map = fees_by_asset(trades)
+    state.receipt["legs"][leg_index]["fee_by_asset"] = fee_map
+    save(state)
+    if fee_map and state.events and state.events[-1]["kind"] == "order_terminal":
+        state.events[-1]["fees"] = fee_map
+
+
+def futures_position(rows: Any, symbol: str) -> Optional[Decimal]:
+    """Net one-way position, or None when the read cannot prove flatness.
+
+    A hedge-side row (positionSide LONG/SHORT) makes attribution unsafe —
+    offsetting dual-side positions would sum to zero — so it is treated as
+    unreadable, exactly like futures_hand's one-way discipline."""
+    if not isinstance(rows, list):
+        return None
+    total = Decimal(0)
+    for row in rows:
+        if isinstance(row, dict) and row.get("symbol") == symbol:
+            if row.get("positionSide", "BOTH") != "BOTH":
+                return None
+            try:
+                total += d(row.get("positionAmt", "0"))
+            except ArithmeticError:
+                return None
+    return total
+
+
+def conclude(state: RunState, plan: CyclePlan,
+             hedge: Optional[Decimal]) -> None:
+    """Feed the confirmed outcomes to the proven lifecycle for the verdict."""
+    result = run_cycle(plan, state.run_id, state.outcomes, acquired_base=hedge)
+    exposure = result.exposure
+    if state.partial_short is not None and exposure != "none":
+        exposure += "; short leg actual fill %s" % fmt(state.partial_short)
+    finish(state, result.verdict, exposure, result.note)
+
+
+def sold_leg_result(state: RunState, stage: str, order, fills,
+                    net_base: Decimal, hedge: Decimal, base_asset: str,
+                    shared_step: Decimal) -> Decimal:
+    """Confirm a spot sale from exchange truth; freeze on uncoverable fees.
+
+    Returns the residual base from this run once it is exactly computable.
+    """
+    sold = d(order.get("executedQty", "0"))
+    quote_received = d(order.get(SPOT.quote_field, "0"))
+    trades, covered = spot_trades(
+        state, state.receipt["legs"][-1].get("order_id", ""), sold, fills)
+    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
+    if covered < sold:
+        state.receipt["result"] = {"residual_base_from_this_run": "UNKNOWN"}
+        save(state)
+        finish(state, "UNKNOWN",
+               "%s executed but its trade and fee data never loaded; residual "
+               "unknowable" % stage,
+               "reconcile the %s client id before trusting balances" % stage)
+    sell_base_fee = base_fee_of(trades, base_asset)
+    residual = net_base - sold - sell_base_fee
+    state.receipt["result"] = {
+        "stage": stage,
+        "sold_qty": fmt(sold),
+        "quote_received": fmt(quote_received),
+        "sell_base_fee": fmt(sell_base_fee),
+        "residual_base_from_this_run": fmt(residual),
+    }
+    save(state)
+    if residual < 0:
+        finish(state, "OPEN_EXPOSURE",
+               "sale consumed %s %s beyond this run's acquisition; "
+               "pre-existing balance was touched" % (fmt(-residual), base_asset),
+               "report to owner; no repair trade")
+    if residual >= shared_step:
+        finish(state, "OPEN_EXPOSURE",
+               "%s sold %s of %s; residual %s %s at or above the shared step"
+               % (stage, fmt(sold), fmt(hedge), fmt(residual), base_asset),
+               "partial spot sale left a sellable remainder; executor reports "
+               "and stops; no repair trade")
+    return residual
+
+
+def execute_legs(state: RunState, plan: CyclePlan,
+                 market: Dict[str, Any]) -> None:
+    """Drive the four-leg cycle; every path ends in finish()/conclude()."""
+    base_asset = market["base"]
+    shared_step = market["shared_step"]
+
+    # Leg 1 — Spot BUY bounded by quoteOrderQty.
+    res, order, fills = settle_leg(state, ENTER_SPOT, plan)
+    if res == "rejected":
+        state.outcomes[ENTER_SPOT] = "REJECTED"
+        conclude(state, plan, None)
+    if res == "unknown":
+        state.outcomes[ENTER_SPOT] = "UNKNOWN"
+        conclude(state, plan, None)
+    executed = d(order.get("executedQty", "0"))
+    quote_spent = d(order.get(SPOT.quote_field, "0"))
+    if executed <= 0:
+        state.receipt["legs"][-1]["note"] = "terminal zero fill; nothing acquired"
+        save(state)
+        state.outcomes[ENTER_SPOT] = "REJECTED"
+        conclude(state, plan, None)
+    state.outcomes[ENTER_SPOT] = "FILLED"
+
+    # Acquired exchange truth: fills minus base-asset fees, floored to step.
+    trades, covered = spot_trades(
+        state, state.receipt["legs"][-1].get("order_id", ""), executed, fills)
+    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
+    if covered < executed:
+        state.receipt["acquired"] = {"executed_qty": fmt(executed),
+                                     "held_worst_case": fmt(executed)}
+        save(state)
+        finish(state, "OPEN_EXPOSURE",
+               "holding up to %s %s from the spot BUY" % (fmt(executed),
+                                                          base_asset),
+               "trade and fee data never covered the spot fill; sizing a later "
+               "leg on an assumed fee is forbidden; no repair trade")
+    buy_base_fee = base_fee_of(trades, base_asset)
+    net_base = executed - buy_base_fee
+    hedge = quantize_down(net_base, shared_step)
+    state.receipt["acquired"] = {
+        "executed_qty": fmt(executed), "quote_spent": fmt(quote_spent),
+        "base_fee": fmt(buy_base_fee), "net_base": fmt(net_base),
+        "shared_step": fmt(shared_step), "hedge_quantity": fmt(hedge),
+    }
+    save(state)
+    if hedge <= 0:
+        finish(state, "OPEN_EXPOSURE",
+               "holding %s %s dust below the shared step; cannot hedge or "
+               "sell it back" % (fmt(net_base), base_asset),
+               "net base after fees floors to zero at the shared step; "
+               "executor reports and stops; no repair trade")
+
+    # Leg 2 — Futures SELL short exactly the acquired quantity.
+    short_filled: Optional[Decimal] = None
+    if hedge < market["min_qty"]:
+        state.outcomes[ENTER_SHORT] = "REJECTED"
+        state.receipt["legs"].append({
+            "stage": ENTER_SHORT, "market": "usdm", "side": "SELL",
+            "client_id": client_id(ENTER_SHORT, state.run_id),
+            "status": "NOT_SUBMITTED",
+            "reason": "net quantity below venue minimum quantity",
+        })
+        save(state)
+        first_fail(state, "enter_short",
+                   "net quantity below venue minimum; short not submitted")
+    else:
+        res, order, _ = settle_leg(state, ENTER_SHORT, plan, hedge)
+        if res == "unknown":
+            state.outcomes[ENTER_SHORT] = "UNKNOWN"
+            conclude(state, plan, hedge)
+        if res == "rejected":
+            state.outcomes[ENTER_SHORT] = "REJECTED"
+        else:
+            short_filled = d(order.get("executedQty", "0"))
+            if short_filled <= 0:
+                state.receipt["legs"][-1]["note"] = "terminal zero fill"
+                save(state)
+                state.outcomes[ENTER_SHORT] = "REJECTED"
+                short_filled = None
+            else:
+                state.outcomes[ENTER_SHORT] = "FILLED"
+                if short_filled != hedge:
+                    state.partial_short = short_filled
+                    first_fail(state, "enter_short", "short filled %s of %s" % (
+                        fmt(short_filled), fmt(hedge)))
+
+    if state.outcomes[ENTER_SHORT] == "REJECTED":
+        # Unwind: Spot SELL of the actual remaining base through the ordered path.
+        res, order, fills = settle_leg(state, UNWIND_SPOT, plan, hedge)
+        if res == "unknown":
+            state.outcomes[UNWIND_SPOT] = "UNKNOWN"
+            conclude(state, plan, hedge)
+        if res == "rejected":
+            state.outcomes[UNWIND_SPOT] = "REJECTED"
+            conclude(state, plan, hedge)
+        sold = d(order.get("executedQty", "0"))
+        if sold <= 0:
+            state.receipt["legs"][-1]["note"] = "terminal zero fill"
+            save(state)
+            state.outcomes[UNWIND_SPOT] = "REJECTED"
+            conclude(state, plan, hedge)
+        sold_leg_result(state, UNWIND_SPOT, order, fills, net_base, hedge,
+                        base_asset, shared_step)
+        state.outcomes[UNWIND_SPOT] = "FILLED"
+        conclude(state, plan, hedge)
+
+    # Leg 3 — reduce-only BUY close of the EXACT short fill.
+    res, order, _ = settle_leg(state, EXIT_SHORT, plan, short_filled)
+    if res == "unknown":
+        state.outcomes[EXIT_SHORT] = "UNKNOWN"
+        conclude(state, plan, hedge)
+    if res == "rejected":
+        state.outcomes[EXIT_SHORT] = "REJECTED"
+        conclude(state, plan, hedge)
+    closed = d(order.get("executedQty", "0"))
+    if closed <= 0:
+        state.receipt["legs"][-1]["note"] = "terminal zero fill"
+        save(state)
+        state.outcomes[EXIT_SHORT] = "REJECTED"
+        conclude(state, plan, hedge)
+    if closed < short_filled:
+        first_fail(state, "exit_short", "closed %s of short %s" % (
+            fmt(closed), fmt(short_filled)))
+        finish(state, "OPEN_EXPOSURE",
+               "reduce-only close executed %s of short %s; short remains open "
+               "with spot %s %s held" % (fmt(closed), fmt(short_filled),
+                                         fmt(hedge), base_asset),
+               "partial reduce-only close; executor reports and stops; "
+               "no repair trade")
+    state.outcomes[EXIT_SHORT] = "FILLED"
+
+    # Leg 4 — Spot SELL of the actual remaining base.
+    res, order, fills = settle_leg(state, EXIT_SPOT, plan, hedge)
+    if res == "unknown":
+        state.outcomes[EXIT_SPOT] = "UNKNOWN"
+        conclude(state, plan, hedge)
+    if res == "rejected":
+        state.outcomes[EXIT_SPOT] = "REJECTED"
+        conclude(state, plan, hedge)
+    sold = d(order.get("executedQty", "0"))
+    if sold <= 0:
+        state.receipt["legs"][-1]["note"] = "terminal zero fill"
+        save(state)
+        state.outcomes[EXIT_SPOT] = "REJECTED"
+        conclude(state, plan, hedge)
+    sold_leg_result(state, EXIT_SPOT, order, fills, net_base, hedge,
+                    base_asset, shared_step)
+    state.outcomes[EXIT_SPOT] = "FILLED"
+
+    # CLOSED only on observed exchange state: the short must really be flat.
+    kind, rows = get_retry(state, USDM.base_url, USDM_POSITION_PATH,
+                           {"symbol": state.cfg.symbol}, signed=True)
+    amount = futures_position(rows, state.cfg.symbol) if kind == "ok" else None
+    state.receipt["final_futures_position"] = (
+        fmt(amount) if amount is not None else "UNKNOWN")
+    save(state)
+    if amount is None:
+        first_fail(state, "final_position_read", "position read failed")
+        finish(state, "UNKNOWN",
+               "all legs terminal but the final Futures position is unreadable",
+               "nothing resent; reconcile from the receipt client ids")
+    if amount != 0:
+        finish(state, "OPEN_EXPOSURE",
+               "Futures position %s remains after the reduce-only close"
+               % fmt(amount),
+               "executor reports and stops; no repair trade")
+    conclude(state, plan, hedge)
+
+
+def acquire(state: RunState) -> None:
+    """Single-runner lock + prior-receipt gate, then the receipt skeleton."""
+    receipt_dir = os.path.dirname(state.receipt_path)
+    os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
+    try:
+        descriptor = os.open(state.lock_path,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(descriptor, state.run_id.encode())
+        os.close(descriptor)
+        state.locked = True
+    except FileExistsError:
+        raise Blocked("basis-executor lock exists; another or unreconciled run "
+                      "owns the lane") from None
+    state.receipt.update({
+        "run_id": state.run_id,
+        "sha": state.cfg.sha,
+        "symbol": state.cfg.symbol,
+        "client_ids": {stage: client_id(stage, state.run_id)
+                       for stage in ALL_STAGES},
+        "hard_ceiling_usdt": fmt(MAX_CYCLE_QUOTE),
+        "started_utc": utc(),
+        "legs": [],
+    })
+    save(state)
+    start = base_event(state, "run_start")
+    start["note"] = contract_note("ceiling %s USDT per leg"
+                                  % fmt(MAX_CYCLE_QUOTE), state.client_ids)
+    state.events.append(start)
+    own_name = os.path.basename(state.receipt_path)
+    for name in sorted(os.listdir(receipt_dir)):
+        if not name.startswith("basis-executor-") or not name.endswith(".json"):
+            continue
+        if name == own_name:
+            continue
+        try:
+            with open(os.path.join(receipt_dir, name), encoding="utf-8") as f:
+                prior = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            first_fail(state, "prior_receipt", type(exc).__name__)
+            finish(state, "BLOCKED_UNRESOLVED",
+                   "a prior basis-executor receipt is unreadable",
+                   "reconcile the prior run before any new trade")
+        if "verdict" not in prior:
+            finish(state, "BLOCKED_UNRESOLVED",
+                   "a prior basis-executor run has no verdict",
+                   "reconcile its client ids before any new trade")
+
+
+def read_and_plan(state: RunState):
+    """Reads + plan; raises Refusal when the gap, size, or filters refuse."""
+    market = market_context(state)
+    row = gap_row(state)
+    plan = plan_cycle(row, state.cfg.min_entry_bps, market["shared_step"],
+                      market["min_notional"])
+    if plan is None:
+        raise Refusal(
+            "plan refused: entry gap %s bps below min %s bps or size below "
+            "minimum notional" % (fmt(row.entry_gap_bps_vs_spot_ask),
+                                  fmt(state.cfg.min_entry_bps)))
+    if plan.spot_quantity < market["min_qty"]:
+        raise Refusal("planned quantity %s below venue minimum quantity %s"
+                      % (fmt(plan.spot_quantity), fmt(market["min_qty"])))
+    return row, plan, market
+
+
+def make_state(cfg: ExecutorConfig, request, sleep,
+               receipted: bool = True) -> RunState:
+    run_id = cfg.run_id or new_run_id()
+    receipt_path = os.path.join(cfg.receipt_dir,
+                                "basis-executor-%s.json" % run_id)
+    return RunState(
+        cfg=cfg, request=request, sleep=sleep, run_id=run_id,
+        receipt_path=receipt_path if receipted else "",
+        lock_path=os.path.join(cfg.receipt_dir, "basis-executor.lock"),
+        events_path=cfg.events_path or os.path.join(cfg.receipt_dir,
+                                                    "events.jsonl"),
+        client_ids=tuple(client_id(stage, run_id) for stage in ALL_STAGES),
+    )
+
+
+def run_once(cfg: ExecutorConfig, request,
+             sleep: Callable[[float], None] = time.sleep) -> int:
+    """The one-shot cycle: lock, read, plan, four legs, receipt, events, exit."""
+    state = make_state(cfg, request, sleep)
+    try:
+        acquire(state)
+        try:
+            _row, plan, market = read_and_plan(state)
+            state.receipt["plan"] = {
+                "entry_gap_bps": fmt(plan.entry_gap_bps),
+                "exit_gap_bps": fmt(plan.exit_gap_bps),
+                "funding_rate": fmt(plan.funding_rate),
+                "estimated_quantity": fmt(plan.spot_quantity),
+                "spot_quote_cap": fmt(plan.spot_quote_cap),
+                "estimated_short_notional": fmt(plan.short_notional),
+                "leverage": plan.leverage,
+                "shared_step": fmt(market["shared_step"]),
+                "min_notional": fmt(market["min_notional"]),
+                "min_quantity": fmt(market["min_qty"]),
+                "reason": plan.reason,
+            }
+            save(state)
+        except Refusal as refusal:
+            finish(state, "REJECTED_BEFORE_ENTRY", "none", str(refusal))
+        execute_legs(state, plan, market)
+        raise AssertionError("execute_legs must conclude every path")
+    except Blocked as blocked:
+        print("lane: BASIS-EXECUTOR")
+        print("VERDICT: BLOCKED")
+        print("NOTE:", clean(blocked, 300))
+        return 3
+    except ExecutorExit as done:
+        return done.code
+
+
+def plan_only(cfg: ExecutorConfig, request,
+              sleep: Callable[[float], None] = time.sleep) -> int:
+    """Unsigned public reads and the plan decision only; no receipt, no orders."""
+    state = make_state(cfg, request, sleep, receipted=False)
+    try:
+        _row, plan, market = read_and_plan(state)
+    except Refusal as refusal:
+        print("REFUSED | %s | %s" % (cfg.symbol, clean(refusal, 300)))
+        return 2
+    print("PLAN | %s | est qty %s | spot spend cap %s USDT (quoteOrderQty) | "
+          "est short notional %s USDT | shared step %s | leverage %sx | %s" % (
+              plan.symbol, fmt(plan.spot_quantity), fmt(plan.spot_quote_cap),
+              fmt(plan.short_notional), fmt(market["shared_step"]),
+              plan.leverage, plan.reason))
+    return 0
+
+
+def live_request_factory(api_key: str, api_secret: str,
+                         timeout: float = HTTP_TIMEOUT):
+    """One transport for both venues, in the futures_hand style: 'ok' = 2xx
+    JSON; 'api_error' = a real Binance {code,msg}; 'unclear' proves NOTHING.
+    Mutations are submitted exactly once by the caller and never retried."""
+    offsets: Dict[str, int] = {}
+
+    def sync(base_url: str) -> None:
+        path = "/api/v3/time" if base_url == SPOT_BASE_URL else "/fapi/v1/time"
+        kind, payload = request("GET", base_url, path, None, False)
+        if kind == "ok" and isinstance(payload, dict) and \
+                isinstance(payload.get("serverTime"), int):
+            offsets[base_url] = payload["serverTime"] - int(time.time() * 1000)
+        else:
+            offsets[base_url] = 0
+
+    def request(method: str, base_url: str, path: str,
+                params: Optional[Dict[str, str]] = None,
+                signed: bool = False) -> Tuple[str, Any]:
+        params = dict(params or {})
+        if signed:
+            if base_url not in offsets:
+                sync(base_url)
+            params["timestamp"] = str(int(time.time() * 1000)
+                                      + offsets.get(base_url, 0))
+            params["recvWindow"] = RECV_WINDOW
+            query = urllib.parse.urlencode(params)
+            signature = hmac.new(api_secret.encode(), query.encode(),
+                                 hashlib.sha256).hexdigest()
+            query += "&signature=" + signature
+        else:
+            query = urllib.parse.urlencode(params)
+        http_request = urllib.request.Request(
+            base_url + path + ("?" + query if query else ""), method=method)
+        if api_key:
+            http_request.add_header("X-MBX-APIKEY", api_key)
+        try:
+            with urllib.request.urlopen(http_request,
+                                        timeout=timeout) as response:
+                return "ok", json.loads(response.read().decode())
+        except urllib.error.HTTPError as error:
+            body = error.read().decode(errors="replace")
+            if error.code >= 500 or error.code in (408, 409):
+                return "unclear", {"http": error.code}
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and "code" in parsed:
+                    return "api_error", {"code": parsed.get("code"),
+                                         "msg": clean(parsed.get("msg", ""))}
+            except ValueError:
+                pass
+            return "unclear", {"http": error.code}
+        except Exception as error:  # never stringify an exception with the URL
+            return "unclear", {"error": type(error).__name__}
+
+    return request
+
+
+def config_from_env(env) -> ExecutorConfig:
+    symbol = env.get("SYMBOL", "").upper()
+    sha = env.get("QUANT_SHA", "").lower()
+    if not SYMBOL_RE.fullmatch(symbol):
+        raise Blocked("SYMBOL must be 5-20 uppercase letters/digits")
+    if not SHA_RE.fullmatch(sha):
+        raise Blocked("QUANT_SHA must be a full 40-character git SHA")
+    raw_bps = env.get("MIN_ENTRY_BPS", "1")
+    try:
+        min_entry_bps = Decimal(raw_bps)
+    except ArithmeticError:
+        raise Blocked("MIN_ENTRY_BPS is invalid") from None
+    if not min_entry_bps.is_finite() or min_entry_bps < 0:
+        raise Blocked("MIN_ENTRY_BPS must be finite and non-negative")
+    return ExecutorConfig(
+        symbol=symbol, sha=sha,
+        receipt_dir=os.path.expanduser(env.get("RECEIPT_DIR",
+                                               "~/quant_receipts")),
+        min_entry_bps=min_entry_bps)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="one-shot basis-cycle executor (no timer, no loop)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--plan-only", action="store_true",
+                      help="unsigned public reads and the plan decision only")
+    mode.add_argument("--execute", action="store_true",
+                      help="run the full four-leg cycle once (needs keys)")
+    args = parser.parse_args(argv)
+    try:
+        cfg = config_from_env(os.environ)
+    except Blocked as blocked:
+        print("lane: BASIS-EXECUTOR")
+        print("VERDICT: BLOCKED")
+        print("NOTE:", clean(blocked, 300))
+        return 2
+    if not args.execute:
+        return plan_only(cfg, live_request_factory("", ""))
+    api_key = os.environ.get("BINANCE_API_KEY", "")
+    api_secret = os.environ.get("BINANCE_API_SECRET", "")
+    if not api_key or not api_secret:
+        print("lane: BASIS-EXECUTOR")
+        print("VERDICT: BLOCKED")
+        print("NOTE: missing BINANCE_API_KEY / BINANCE_API_SECRET in environment")
+        return 2
+    return run_once(cfg, live_request_factory(api_key, api_secret))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
