@@ -50,14 +50,18 @@ gap-sample window, session timestamps — plus a pass watermark.  Written
 with temp file + fsync + os.replace after every pass and reloaded on
 start, so a kill at any moment loses at most the in-flight pass.
 
+PROPOSALS: a positive-net kernel proposal is published once under
+RECEIPT_DIR/proposals/proposal-<id>.json.  Each file is a complete, atomic,
+120-second-by-default market authority, chmod 0400 after publication, and is
+never updated or removed by this observer.  A live proposal for the same
+symbol suppresses duplicates.
+
 COMMISSION: RECEIPT_DIR/commission-rates.json (written by the lifecycle
-tool from the signed commission endpoints) is read when present; rates are
-accepted in the lifecycle writer's top-level FRACTION shape ({"symbol": ...,
-"spot": {"maker": ..., "taker": ...}, "usdm": {"maker": ..., "taker":
-...}}), or as the legacy percent-per-leg and Binance-native shapes.  Fraction
-rates are converted x100 to percent.  When the file is absent or unusable the
-spec defaults (spot 0.10% / perp 0.05% taker per leg) are used and labeled
-ESTIMATED in every output row.
+tool from the signed commission endpoints) is read when present; maker and
+taker rates are accepted in the lifecycle writer's top-level FRACTION shape
+({"symbol": ..., "spot": {...}, "usdm": {...}}), or as legacy percent-per-leg
+and Binance-native shapes.  Fraction rates are converted x100 to percent.
+When the file is absent or unusable, explicit ESTIMATED defaults are used.
 
 NOT ENFORCED HERE: the universe 24h-volume floor (universe_filter,
 minQuoteVolume24hUsd 3,000,000) — the dispatch's cheap pass reuses
@@ -76,18 +80,22 @@ STOP file: the loop exits cleanly when the stop path exists).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
-from datetime import datetime, timezone
-from decimal import Decimal, localcontext
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN, localcontext
+from math import gcd
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from basis_scan import (
     CAP_USDT,
+    FEE_BUFFER,
     SPOT_BASE,
     USDM_BASE,
     ScanError,
@@ -109,6 +117,7 @@ RECEIPT_DIR = os.path.expanduser(os.environ.get("RECEIPT_DIR", "~/quant_receipts
 WATCH_STATE_DIR_NAME = "watch"
 STATE_FILE_NAME = "basis_watch_state.json"
 COMMISSION_FILE_NAME = "commission-rates.json"
+PROPOSAL_DIR_NAME = "proposals"
 STATE_VERSION = 1
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,32}$")  # spec universe_filter symbol regex
 MAX_MARKET_NUMBER = Decimal("1e15")   # spec ingest_book_validity max_market_number
@@ -122,6 +131,16 @@ PREC = 50
 STATES = ("IDLE", "WATCHING", "FOCUS", "PROPOSED", "REJECTED", "COOLDOWN")
 ADVANCED_STATES = ("FOCUS", "PROPOSED")
 DECISION_KINDS = ("ignore", "watch", "focus", "proposal", "reject")
+PROPOSAL_FIELDS = frozenset({
+    "proposal_id", "created_utc", "expires_utc", "quant_sha",
+    "config_digest", "symbol", "direction", "spot_ask", "perp_bid",
+    "entry_gap_pct", "spot_bid", "perp_ask", "exit_gap_pct",
+    "spot_maker_commission_pct", "spot_taker_commission_pct",
+    "perp_maker_commission_pct", "perp_taker_commission_pct",
+    "commission_source", "entry_slippage_pct", "exit_slippage_pct",
+    "funding_rate", "funding_period_ms", "carry_pct",
+    "safety_buffer_pct", "net_edge_pct", "quantity",
+})
 
 # Scanner-area defaults, spelled exactly as the spec's defaults (KEEP/ADAPT
 # rules).  Percent values are PERCENT, spreads BPS, funding FRACTIONS.
@@ -151,7 +170,10 @@ DEFAULTS: Dict[str, Any] = {
     # spec REJECTs the old toy suggestedNotionalUsd; the intended notional is
     # an input, defaulting to this program's real compiled 10 USDT per-leg cap.
     "notional_usd": CAP_USDT,
+    "proposal_ttl_seconds": 120,
+    "spot_maker_fee_pct": Decimal("0.1"),
     "spot_taker_fee_pct": Decimal("0.1"),
+    "perp_maker_fee_pct": Decimal("0.02"),
     "perp_taker_fee_pct": Decimal("0.05"),
     "finalist_cap": 5,
 }
@@ -182,6 +204,14 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     for key in ("min_net_basis_pct", "max_funding_drag_pct", "notional_usd"):
         if cfg[key] <= 0:
             raise WatchError("config: %s must be > 0" % key)
+    ttl = dec(cfg.get("proposal_ttl_seconds"))
+    if ttl is None or ttl <= 0:
+        raise WatchError("config: proposal_ttl_seconds must be > 0")
+    for key in ("spot_maker_fee_pct", "spot_taker_fee_pct",
+                "perp_maker_fee_pct", "perp_taker_fee_pct"):
+        rate = dec(cfg.get(key))
+        if rate is None or rate < 0:
+            raise WatchError("config: %s must be >= 0" % key)
     for key in ("stale_ms", "funding_stale_ms", "max_leg_skew_ms",
                 "max_future_skew_ms", "cooldown_ms", "candidate_ttl_ms",
                 "focus_max_age_ms", "tick_ms"):
@@ -547,31 +577,42 @@ def _pct_field(record: Dict[str, Any], *keys: str) -> Optional[Decimal]:
     return None
 
 
-def _fraction_taker_pct(record: Any) -> Optional[Decimal]:
+def _fraction_fee_pct(record: Any, side: str) -> Optional[Decimal]:
     if not isinstance(record, dict):
         return None
-    fraction = dec(record.get("takerCommissionRate"))
+    fraction = dec(record.get(side + "CommissionRate"))
     if fraction is None and isinstance(record.get("standardCommission"), dict):
-        fraction = dec(record["standardCommission"].get("taker"))
+        fraction = dec(record["standardCommission"].get(side))
     if fraction is None:
-        fraction = dec(record.get("taker"))
+        fraction = dec(record.get(side))
     if fraction is None or fraction < 0:
         return None
     return fraction * 100
 
 
-def _commission_from(record: Any) -> Optional[Dict[str, Decimal]]:
+def _commission_from(record: Any) -> Optional[Dict[str, Optional[Decimal]]]:
     if not isinstance(record, dict):
         return None
-    spot = _pct_field(record, "spot_taker_fee_pct", "spotTakerFeePct")
-    perp = _pct_field(record, "perp_taker_fee_pct", "perpTakerFeePct")
-    if spot is None:
-        spot = _fraction_taker_pct(record.get("spot"))
-    if perp is None:
-        perp = _fraction_taker_pct(record.get("usdm"))
-    if spot is None or perp is None:
+    spot_taker = _pct_field(record, "spot_taker_fee_pct", "spotTakerFeePct")
+    perp_taker = _pct_field(record, "perp_taker_fee_pct", "perpTakerFeePct")
+    spot_maker = _pct_field(record, "spot_maker_fee_pct", "spotMakerFeePct")
+    perp_maker = _pct_field(record, "perp_maker_fee_pct", "perpMakerFeePct")
+    if spot_taker is None:
+        spot_taker = _fraction_fee_pct(record.get("spot"), "taker")
+    if perp_taker is None:
+        perp_taker = _fraction_fee_pct(record.get("usdm"), "taker")
+    if spot_maker is None:
+        spot_maker = _fraction_fee_pct(record.get("spot"), "maker")
+    if perp_maker is None:
+        perp_maker = _fraction_fee_pct(record.get("usdm"), "maker")
+    if spot_taker is None or perp_taker is None:
         return None
-    return {"spot_taker_fee_pct": spot, "perp_taker_fee_pct": perp}
+    return {
+        "spot_maker_fee_pct": spot_maker,
+        "spot_taker_fee_pct": spot_taker,
+        "perp_maker_fee_pct": perp_maker,
+        "perp_taker_fee_pct": perp_taker,
+    }
 
 
 def read_commission_rates(receipt_dir: str, symbol: str,
@@ -579,9 +620,12 @@ def read_commission_rates(receipt_dir: str, symbol: str,
     """RECEIPT_DIR/commission-rates.json when present, else spec defaults
     labeled ESTIMATED.  Any unusable file or record falls back to ESTIMATED
     — measured-looking numbers never come from a broken receipt."""
-    estimated = {"spot_taker_fee_pct": cfg["spot_taker_fee_pct"],
+    estimated = {"spot_maker_fee_pct": cfg["spot_maker_fee_pct"],
+                 "spot_taker_fee_pct": cfg["spot_taker_fee_pct"],
+                 "perp_maker_fee_pct": cfg["perp_maker_fee_pct"],
                  "perp_taker_fee_pct": cfg["perp_taker_fee_pct"],
-                 "source": "ESTIMATED"}
+                 "source": "ESTIMATED",
+                 "proposal_source": "ESTIMATED"}
     path = os.path.join(receipt_dir, COMMISSION_FILE_NAME)
     try:
         with open(path, encoding="utf-8") as handle:
@@ -598,7 +642,21 @@ def read_commission_rates(receipt_dir: str, symbol: str,
     for candidate in candidates:
         rates = _commission_from(candidate)
         if rates is not None:
-            return {**rates, "source": "receipt"}
+            all_measured = rates["spot_maker_fee_pct"] is not None \
+                and rates["perp_maker_fee_pct"] is not None
+            return {
+                "spot_maker_fee_pct": rates["spot_maker_fee_pct"]
+                if rates["spot_maker_fee_pct"] is not None
+                else cfg["spot_maker_fee_pct"],
+                "spot_taker_fee_pct": rates["spot_taker_fee_pct"],
+                "perp_maker_fee_pct": rates["perp_maker_fee_pct"]
+                if rates["perp_maker_fee_pct"] is not None
+                else cfg["perp_maker_fee_pct"],
+                "perp_taker_fee_pct": rates["perp_taker_fee_pct"],
+                "source": "receipt",
+                "proposal_source": "measured" if all_measured
+                else "ESTIMATED",
+            }
     return estimated
 
 
@@ -613,22 +671,49 @@ def read_commission_rates(receipt_dir: str, symbol: str,
 _DECISION_REASONS = ("ignore", "watch", "focus", "proposal")
 
 
-def _kernel_decision(module: Any, observation: Dict[str, Any]) -> Any:
+def _canonical_json_value(value: Any) -> Any:
+    """JSON-safe canonical form for a stable config SHA-256."""
+    if isinstance(value, Decimal):
+        if value == 0:
+            return "0"
+        return format(value.normalize(), "f")
+    if isinstance(value, dict):
+        return {str(key): _canonical_json_value(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    raise WatchError("kernel config contains an unsupported value")
+
+
+def _stable_config_digest(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(_canonical_json_value(payload), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _typed_kernel_config(module: Any, observation: Dict[str, Any]) -> Any:
+    """Build the exact per-symbol KernelConfig passed to the typed kernel."""
     cfg = observation["config"]
     fees = observation["fees"]
     config_kwargs: Dict[str, Any] = {}
     for spec_field in dataclass_fields(module.KernelConfig):
         if spec_field.name in ("spot_taker_fee_pct", "perp_taker_fee_pct",
                               "funding_period_ms"):
-            continue  # commission and funding cadence are per symbol below
+            continue
         if spec_field.name in cfg:
             config_kwargs[spec_field.name] = cfg[spec_field.name]
     funding_period_ms = observation.get("funding_period_ms")
     if funding_period_ms is not None:
         config_kwargs["funding_period_ms"] = funding_period_ms
-    config = module.KernelConfig(
+    return module.KernelConfig(
         spot_taker_fee_pct=fees["spot_taker_fee_pct"],
         perp_taker_fee_pct=fees["perp_taker_fee_pct"], **config_kwargs)
+
+
+def _kernel_decision(module: Any, observation: Dict[str, Any]) -> Any:
+    config = _typed_kernel_config(module, observation)
     now_ms = observation["now_ms"]
 
     def to_book(book: Optional[Dict[str, Any]]) -> Any:
@@ -689,6 +774,10 @@ def _kernel_decision(module: Any, observation: Dict[str, Any]) -> Any:
     elif isinstance(reason, str) and reason:
         decision["kind"] = "reject"
         decision["reject_code"] = reason
+    decision["config_digest"] = _stable_config_digest({
+        spec_field.name: getattr(config, spec_field.name)
+        for spec_field in dataclass_fields(config)
+    })
     return decision
 
 
@@ -705,6 +794,18 @@ def kernel_evaluate(observation: Dict[str, Any]) -> Dict[str, Any]:
             decision = _kernel_decision(module, observation)
         else:
             decision = module.evaluate(observation)
+            if isinstance(decision, dict):
+                decision = dict(decision)
+                effective_cfg = dict(observation.get("config") or {})
+                fees = observation.get("fees") or {}
+                effective_cfg["spot_taker_fee_pct"] = fees.get(
+                    "spot_taker_fee_pct")
+                effective_cfg["perp_taker_fee_pct"] = fees.get(
+                    "perp_taker_fee_pct")
+                effective_cfg["funding_period_ms"] = observation.get(
+                    "funding_period_ms")
+                decision["config_digest"] = _stable_config_digest(
+                    effective_cfg)
     except Exception as exc:  # foreign-code boundary: never kills the observer
         return {"kind": "unknown", "reject_code": None,
                 "note": "kernel_error:" + type(exc).__name__}
@@ -716,6 +817,107 @@ def kernel_evaluate(observation: Dict[str, Any]) -> Dict[str, Any]:
 
 def decision_decimal(decision: Dict[str, Any], key: str) -> Optional[Decimal]:
     return dec(decision.get(key)) if decision.get(key) is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Immutable proposal economics and sizing.
+
+
+def ladder_walk_slippage_pct(
+        levels: Optional[List[Tuple[Decimal, Decimal]]],
+        notional_usd: Decimal) -> Optional[Decimal]:
+    """Average-fill-vs-touch PERCENT using the kernel's ladder-walk law."""
+    if not levels or notional_usd <= 0 or levels[0][0] <= 0:
+        return None
+    with localcontext() as context:
+        context.prec = PREC
+        touch = levels[0][0]
+        remaining = notional_usd
+        cost_usd = Decimal(0)
+        filled_base = Decimal(0)
+        for price, quantity in levels:
+            if remaining <= 0:
+                break
+            take_usd = min(remaining, price * quantity)
+            cost_usd += take_usd
+            filled_base += take_usd / price
+            remaining -= take_usd
+        if remaining > 0 or filled_base <= 0:
+            return None
+        average_price = cost_usd / filled_base
+        return abs(average_price - touch) / touch * 100
+
+
+def _proposal_leg_slippage_pct(
+        levels: Optional[List[Tuple[Decimal, Decimal]]],
+        notional_usd: Decimal, cfg: Dict[str, Any]) -> Optional[Decimal]:
+    """Ladder walk with the same fail-expensive thin-ladder penalty."""
+    estimate = dec(cfg.get("slippage_pct_estimate", Decimal("0.05")))
+    multiple = dec(cfg.get("thin_ladder_penalty_multiple", Decimal(4)))
+    if estimate is None or estimate < 0 or multiple is None or multiple < 0:
+        return None
+    walked = ladder_walk_slippage_pct(levels, notional_usd)
+    return walked if walked is not None else estimate * multiple
+
+
+def exit_slippage_pct(observation: Dict[str, Any]) -> Optional[Decimal]:
+    """NORMAL exit hits Spot bids and USD-M asks, never the entry sides."""
+    spot_ladder = observation.get("spot_ladder")
+    perp_ladder = observation.get("perp_ladder")
+    notional = dec(observation.get("notional_usd"))
+    if not isinstance(spot_ladder, dict) or not isinstance(perp_ladder, dict) \
+            or notional is None or notional <= 0:
+        return None
+    spot = _proposal_leg_slippage_pct(
+        spot_ladder.get("bids"), notional, observation["config"])
+    perp = _proposal_leg_slippage_pct(
+        perp_ladder.get("asks"), notional, observation["config"])
+    if spot is None or perp is None:
+        return None
+    return spot + perp
+
+
+def common_quantity_step(spot_step: Any, perp_step: Any) -> Optional[Decimal]:
+    """Smallest positive decimal step aligned to both venue LOT_SIZE steps."""
+    spot, perp = dec(spot_step), dec(perp_step)
+    if spot is None or perp is None or spot <= 0 or perp <= 0:
+        return None
+    exponent = min(spot.as_tuple().exponent, perp.as_tuple().exponent)
+    quantum = Decimal(1).scaleb(exponent)
+    spot_units = int(spot / quantum)
+    perp_units = int(perp / quantum)
+    if spot_units <= 0 or perp_units <= 0:
+        return None
+    shared_units = spot_units // gcd(spot_units, perp_units) * perp_units
+    return Decimal(shared_units) * quantum
+
+
+def proposal_quantity(notional_usd: Any, spot_ask: Any, perp_bid: Any,
+                      spot_step: Any, perp_step: Any) -> Optional[Decimal]:
+    """Fee-aware equal-leg quantity, floored to both venues' lot rules."""
+    notional = dec(notional_usd)
+    spot_price, perp_price = dec(spot_ask), dec(perp_bid)
+    step = common_quantity_step(spot_step, perp_step)
+    if notional is None or spot_price is None or perp_price is None \
+            or step is None or notional <= 0 or spot_price <= 0 \
+            or perp_price <= 0:
+        return None
+    with localcontext() as context:
+        context.prec = PREC
+        spot_capacity = notional / (1 + FEE_BUFFER) / spot_price
+        perp_capacity = notional / perp_price
+        quantity = (min(spot_capacity, perp_capacity) / step).to_integral_value(
+            rounding=ROUND_DOWN) * step
+    return quantity if quantity > 0 else None
+
+
+def _proposal_utc(now_ms: int) -> str:
+    return datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _proposal_decimal(value: Optional[Decimal]) -> Optional[str]:
+    return format(value, "f") if value is not None and value.is_finite() else None
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +1049,15 @@ class LiveReads:
         spot_books = book_map(fetch_json(SPOT_BASE + "/api/v3/ticker/bookTicker"))
         fut_books = book_map(fetch_json(USDM_BASE + "/fapi/v1/ticker/bookTicker"))
         funding = funding_map(fetch_json(USDM_BASE + "/fapi/v1/premiumIndex"))
-        return build_rows(spot_meta, fut_meta, spot_books, fut_books, funding)
+        rows = build_rows(spot_meta, fut_meta, spot_books, fut_books, funding)
+        # build_rows deliberately emits display economics only.  Proposals
+        # additionally need both venue LOT_SIZE rules so one shared quantity
+        # can be floored to a size accepted by each venue.
+        for row in rows:
+            symbol = row["symbol"]
+            row["spot_step"] = spot_meta[symbol]["step"]
+            row["perp_step"] = fut_meta[symbol]["step"]
+        return rows
 
     def _get(self, url: str) -> Any:
         try:
@@ -946,6 +1156,188 @@ class Watch:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, self.state_path)
+
+    # -- immutable proposal files -----------------------------------------
+
+    @property
+    def proposal_dir(self) -> str:
+        return os.path.join(self.receipt_dir, PROPOSAL_DIR_NAME)
+
+    def _unexpired_proposal_id(self, symbol: str,
+                               now_ms: int) -> Optional[str]:
+        """Return an existing live proposal id without modifying any file."""
+        try:
+            names = sorted(os.listdir(self.proposal_dir))
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise WatchError("proposal directory unreadable: %s"
+                             % self.proposal_dir) from exc
+        now = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
+        for name in names:
+            if not name.startswith("proposal-") or not name.endswith(".json"):
+                continue
+            path = os.path.join(self.proposal_dir, name)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                expires_text = payload.get("expires_utc") \
+                    if isinstance(payload, dict) else None
+                expires = datetime.fromisoformat(
+                    expires_text.replace("Z", "+00:00")) \
+                    if isinstance(expires_text, str) else None
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if payload.get("symbol") == symbol and expires is not None \
+                    and expires > now:
+                proposal_id = payload.get("proposal_id")
+                return proposal_id if isinstance(proposal_id, str) else name[9:-5]
+        return None
+
+    def _proposal_payload(self, proposal_id: str, symbol: str, now_ms: int,
+                          market_row: Dict[str, Any],
+                          observation: Dict[str, Any],
+                          decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        spot = observation.get("spot_book")
+        perp = observation.get("perp_book")
+        mark = observation.get("mark")
+        if not isinstance(spot, dict) or not isinstance(perp, dict) \
+                or not isinstance(mark, dict):
+            return None
+        entry_gap = entry_gap_pct(spot.get("ask"), perp.get("bid"))
+        exit_gap = return_pct(perp.get("ask"), spot.get("bid"))
+        entry_slippage = decision_decimal(decision, "slippage_pct")
+        exit_slippage = exit_slippage_pct(observation)
+        carry = decision_decimal(decision, "carry_pct")
+        net_edge = decision_decimal(decision, "net_pct")
+        quantity = proposal_quantity(
+            observation.get("notional_usd"), spot.get("ask"), perp.get("bid"),
+            market_row.get("spot_step"), market_row.get("perp_step"))
+        digest = decision.get("config_digest")
+        fees = observation.get("fees") or {}
+        required_decimals = (
+            spot.get("ask"), perp.get("bid"), entry_gap,
+            spot.get("bid"), perp.get("ask"), exit_gap,
+            fees.get("spot_maker_fee_pct"), fees.get("spot_taker_fee_pct"),
+            fees.get("perp_maker_fee_pct"), fees.get("perp_taker_fee_pct"),
+            entry_slippage, exit_slippage, mark.get("funding_rate"), carry,
+            dec(self.cfg.get("min_net_basis_pct")), net_edge, quantity,
+        )
+        parsed = [dec(value) for value in required_decimals]
+        if any(value is None for value in parsed) \
+                or not isinstance(observation.get("funding_period_ms"), int) \
+                or not isinstance(digest, str) \
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return None
+        ttl = dec(self.cfg["proposal_ttl_seconds"])
+        if ttl is None:
+            return None
+        created = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
+        expires = created + timedelta(milliseconds=int(ttl * 1000))
+        values = iter(parsed)
+        payload = {
+            "proposal_id": proposal_id,
+            "created_utc": _proposal_utc(now_ms),
+            "expires_utc": expires.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"),
+            "quant_sha": os.environ.get("QUANT_SHA") or "UNCOMMITTED",
+            "config_digest": digest,
+            "symbol": symbol,
+            "direction": observation.get("direction"),
+            "spot_ask": _proposal_decimal(next(values)),
+            "perp_bid": _proposal_decimal(next(values)),
+            "entry_gap_pct": _proposal_decimal(next(values)),
+            "spot_bid": _proposal_decimal(next(values)),
+            "perp_ask": _proposal_decimal(next(values)),
+            "exit_gap_pct": _proposal_decimal(next(values)),
+            "spot_maker_commission_pct": _proposal_decimal(next(values)),
+            "spot_taker_commission_pct": _proposal_decimal(next(values)),
+            "perp_maker_commission_pct": _proposal_decimal(next(values)),
+            "perp_taker_commission_pct": _proposal_decimal(next(values)),
+            "commission_source": fees.get("proposal_source"),
+            "entry_slippage_pct": _proposal_decimal(next(values)),
+            "exit_slippage_pct": _proposal_decimal(next(values)),
+            "funding_rate": _proposal_decimal(next(values)),
+            "funding_period_ms": observation["funding_period_ms"],
+            "carry_pct": _proposal_decimal(next(values)),
+            # min_net_basis_pct is the kernel's configured positive safety
+            # threshold: net edge had to clear this buffer to become proposal.
+            "safety_buffer_pct": _proposal_decimal(next(values)),
+            "net_edge_pct": _proposal_decimal(next(values)),
+            "quantity": _proposal_decimal(next(values)),
+        }
+        if payload["direction"] != "long_spot_short_perp" \
+                or payload["commission_source"] not in ("measured", "ESTIMATED") \
+                or set(payload) != PROPOSAL_FIELDS:
+            return None
+        return payload
+
+    def _write_proposal(self, payload: Dict[str, Any]) -> str:
+        """Atomically publish one new file and make it owner-read-only."""
+        net_edge = dec(payload.get("net_edge_pct"))
+        if set(payload) != PROPOSAL_FIELDS or net_edge is None or net_edge <= 0:
+            raise WatchError("proposal refuses incomplete or non-positive net")
+        os.makedirs(self.proposal_dir, mode=0o700, exist_ok=True)
+        proposal_id = payload["proposal_id"]
+        path = os.path.join(self.proposal_dir,
+                            "proposal-%s.json" % proposal_id)
+        if os.path.exists(path):
+            raise WatchError("proposal id collision: %s" % proposal_id)
+        temp_path = "%s.tmp-%s-%s" % (
+            path, os.getpid(), secrets.token_hex(2))
+        try:
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, indent=1)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            # The mode travels with the inode through rename; the second chmod
+            # makes the post-publish invariant explicit and independently true.
+            os.chmod(temp_path, 0o400)
+            os.replace(temp_path, path)
+            os.chmod(path, 0o400)
+            directory_fd = os.open(self.proposal_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise WatchError("proposal write failed: %s" % type(exc).__name__) \
+                from exc
+        return path
+
+    def maybe_write_proposal(self, symbol: str, now_ms: int,
+                             market_row: Dict[str, Any],
+                             observation: Dict[str, Any],
+                             decision: Dict[str, Any]
+                             ) -> Tuple[Optional[str], str]:
+        if decision.get("kind") != "proposal":
+            return None, "not_applicable"
+        net_edge = decision_decimal(decision, "net_pct")
+        if net_edge is None or net_edge <= 0:
+            return None, "refused_non_positive_net_edge"
+        if self._unexpired_proposal_id(symbol, now_ms) is not None:
+            return None, "duplicate_unexpired"
+        for _attempt in range(8):
+            proposal_id = format(now_ms // 1000, "x") + secrets.token_hex(3)
+            path = os.path.join(self.proposal_dir,
+                                "proposal-%s.json" % proposal_id)
+            if not os.path.exists(path):
+                break
+        else:
+            raise WatchError("could not allocate a unique proposal id")
+        payload = self._proposal_payload(
+            proposal_id, symbol, now_ms, market_row, observation, decision)
+        if payload is None:
+            return None, "refused_incomplete_proposal"
+        self._write_proposal(payload)
+        return proposal_id, "written"
 
     # -- focus capacity hysteresis (spec focus_capacity_hysteresis) ---------
 
@@ -1167,6 +1559,7 @@ class Watch:
             else (lambda: int(time.time() * 1000))
         pass_now = clock()
         rows = reads.universe_rows()
+        market_rows = {row["symbol"]: row for row in rows}
         finalists = self._pick_finalists(rows, pass_now)
         out: List[Dict[str, Any]] = []
         for symbol in finalists:
@@ -1194,7 +1587,13 @@ class Watch:
                 decision_decimal(decision, "capture_factor"),
                 decision_decimal(decision, "dq_score"),
                 observation["slope_pct_per_min"], self.cfg)
-            self.apply_decision(symbol, decision["kind"],
+            proposal_id, proposal_status = self.maybe_write_proposal(
+                symbol, sym_now, market_rows[symbol], observation, decision)
+            lifecycle_kind = decision["kind"]
+            if lifecycle_kind == "proposal" and proposal_status.startswith(
+                    "refused_"):
+                lifecycle_kind = "unknown"  # no PROPOSED state without artifact
+            self.apply_decision(symbol, lifecycle_kind,
                                 decision.get("reject_code"), score, sym_now)
             spot_leg = leg_depth_score(
                 observation["spot_ladder"]["asks"] if observation["spot_ladder"]
@@ -1230,6 +1629,8 @@ class Watch:
                 "stability_cv": observation["stability_cv"],
                 "score": score,
                 "fees_source": fees["source"],
+                "proposal_id": proposal_id,
+                "proposal_status": proposal_status,
             })
         end_now = clock()
         self.maintain(end_now)
@@ -1254,7 +1655,8 @@ def format_value(value: Any) -> str:
 ROW_FIELDS = ("symbol", "state", "kind", "reject_code", "gap_pct",
               "spot_spread_bps", "perp_spread_bps", "depth_score",
               "funding_rate", "carry_pct", "net_pct", "persist_ticks",
-              "stability_cv", "fees_source")
+              "stability_cv", "fees_source", "proposal_id",
+              "proposal_status")
 
 
 def print_pass(watch: Watch, rows: List[Dict[str, Any]]) -> None:

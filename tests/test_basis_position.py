@@ -11,6 +11,7 @@ explicitly per the spec's math-area unit hazard note.
 """
 
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -39,6 +40,7 @@ LIFECYCLE_FIXTURES = {f["name"] for f in SPEC["lifecycle"]["fixtures"]}
 SYMBOL = "BTCUSDT"
 SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 RID = "cafe01"
+PROPOSAL_ID = "abc123"
 NOW = 1800000000000            # supervision fixtures' NOW
 T_OPEN = 1755000000000
 SPOT_URL = bp.SPOT.base_url
@@ -593,6 +595,38 @@ def term_usdm(status, executed, quote, order_id):
 NEW_ORDER = ("ok", {"status": "NEW"})
 MISSING = ("api_error", {"code": -2013, "msg": "Order does not exist."})
 FLAT_POSITION = [{"symbol": SYMBOL, "positionAmt": "0.000"}]
+_AUTO_PROPOSAL = object()
+
+
+def proposal_payload(proposal_id=PROPOSAL_ID):
+    return {
+        "proposal_id": proposal_id,
+        "created_utc": "2025-08-12T00:00:00Z",
+        "expires_utc": "2099-01-01T00:00:00Z",
+        "quant_sha": SHA,
+        "config_digest": "c" * 64,
+        "symbol": SYMBOL,
+        "direction": "long_spot_short_perp",
+        "spot_ask": "100.0",
+        "perp_bid": "100.2",
+        "entry_gap_pct": "0.2",
+        "spot_bid": "99.9",
+        "perp_ask": "100.3",
+        "exit_gap_pct": "0.4004004004",
+        "spot_maker_commission_pct": "0.08",
+        "spot_taker_commission_pct": "0.075",
+        "perp_maker_commission_pct": "0.02",
+        "perp_taker_commission_pct": "0.04",
+        "commission_source": "measured",
+        "entry_slippage_pct": "0.01",
+        "exit_slippage_pct": "0.01",
+        "funding_rate": "0.0001",
+        "funding_period_ms": 28800000,
+        "carry_pct": "0.01",
+        "safety_buffer_pct": "0.01",
+        "net_edge_pct": "0.05",
+        "quantity": "0.099",
+    }
 
 
 def working_usdm(params):
@@ -812,16 +846,32 @@ class MachineCase(unittest.TestCase):
             max_hold_ms=86400000,
             min_remaining_edge_pct=Decimal("0.01"),
             max_adverse_move_pct=Decimal("0.5"))
+        self.write_proposal()
 
-    def run_cmd(self, handler, spec_or_transport, run_id=RID, now=T_OPEN):
+    def write_proposal(self, payload=None, proposal_id=PROPOSAL_ID):
+        proposal_dir = os.path.join(self.dir, bp.PROPOSAL_DIR)
+        os.makedirs(proposal_dir, exist_ok=True)
+        path = os.path.join(proposal_dir,
+                            "proposal-%s.json" % proposal_id)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload or proposal_payload(proposal_id), handle,
+                      sort_keys=True)
+        return path
+
+    def run_cmd(self, handler, spec_or_transport, run_id=RID, now=T_OPEN,
+                proposal_id=_AUTO_PROPOSAL):
         transport = spec_or_transport \
             if callable(spec_or_transport) \
             else ScriptedTransport(spec_or_transport)
         cfg = dataclasses.replace(self.cfg, run_id=run_id)
         buffer = io.StringIO()
+        kwargs = {"sleep": lambda seconds: None,
+                  "now_ms": lambda: now}
+        if handler is bp.cmd_open:
+            kwargs["proposal_id"] = PROPOSAL_ID \
+                if proposal_id is _AUTO_PROPOSAL else proposal_id
         with redirect_stdout(buffer):
-            code = handler(cfg, transport, sleep=lambda seconds: None,
-                           now_ms=lambda: now)
+            code = handler(cfg, transport, **kwargs)
         return code, transport, buffer.getvalue()
 
     def position(self):
@@ -880,6 +930,72 @@ class RatesTests(MachineCase):
 
 
 class OpenTests(MachineCase):
+    def test_open_without_proposal_refuses_before_any_transport(self):
+        transport = ScriptedTransport(happy_spec())
+        code, transport, out = self.run_cmd(
+            bp.cmd_open, transport, proposal_id=None)
+        self.assertEqual(code, 2)
+        self.assertIn("requires --proposal", out)
+        self.assertEqual(transport.calls, [])
+
+    def test_open_expired_proposal_refuses_before_any_transport(self):
+        proposal = proposal_payload()
+        proposal["expires_utc"] = "2025-08-12T01:00:00Z"
+        self.write_proposal(proposal)
+        transport = ScriptedTransport(happy_spec())
+        code, transport, out = self.run_cmd(bp.cmd_open, transport)
+        self.assertEqual(code, 2)
+        self.assertIn("expired", out)
+        self.assertEqual(transport.calls, [])
+
+    def test_open_sha_mismatch_refuses_before_any_transport(self):
+        proposal = proposal_payload()
+        proposal["quant_sha"] = "feedfacefeedfacefeedfacefeedfacefeedface"
+        self.write_proposal(proposal)
+        transport = ScriptedTransport(happy_spec())
+        code, transport, out = self.run_cmd(bp.cmd_open, transport)
+        self.assertEqual(code, 2)
+        self.assertIn("does not match QUANT_SHA", out)
+        self.assertEqual(transport.calls, [])
+
+    def test_open_negative_net_proposal_refuses_before_any_transport(self):
+        proposal = proposal_payload()
+        proposal["net_edge_pct"] = "-0.01"
+        self.write_proposal(proposal)
+        transport = ScriptedTransport(happy_spec())
+        code, transport, out = self.run_cmd(bp.cmd_open, transport)
+        self.assertEqual(code, 2)
+        self.assertIn("net_edge_pct must be positive", out)
+        self.assertEqual(transport.calls, [])
+
+    def test_stop_blocks_open_first_but_resume_and_close_still_run(self):
+        stop_path = os.path.join(self.dir, bp.STOP_FILE)
+        with open(stop_path, "w", encoding="utf-8") as handle:
+            handle.write("owner stop\n")
+        blocked = ScriptedTransport(happy_spec())
+        code, blocked, out = self.run_cmd(
+            bp.cmd_open, blocked, proposal_id=None)
+        self.assertEqual(code, 3)
+        self.assertIn("STOP file present", out)
+        self.assertNotIn("requires --proposal", out)
+        self.assertEqual(blocked.calls, [])
+
+        os.unlink(stop_path)
+        self.open_position()
+        with open(stop_path, "w", encoding="utf-8") as handle:
+            handle.write("owner stop\n")
+        resume_spec = happy_spec()
+        resume_spec["position"] = [
+            {"symbol": SYMBOL, "positionAmt": "-0.098"}]
+        code, resumed, out = self.run_cmd(
+            bp.cmd_resume, resume_spec, run_id="cafe02")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(resumed.calls)
+        code, closed, out = self.run_cmd(
+            bp.cmd_close, happy_spec(), run_id="cafe03")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(post_stages(closed), ["exit_short", "exit_spot"])
+
     def test_open_applies_cross_lane_prior_receipt_gate_before_transport(self):
         prior_path = os.path.join(self.dir, "roundtrip-cafe00.json")
         with open(prior_path, "w", encoding="utf-8") as handle:
@@ -926,11 +1042,24 @@ class OpenTests(MachineCase):
                          Decimal("0.098"))
         self.assertEqual(position["thesis"]["opened_at_ms"], T_OPEN)
         self.assertEqual(position["thesis"]["max_hold_ms"], 86400000)
+        proposal_path = os.path.join(
+            self.dir, bp.PROPOSAL_DIR,
+            "proposal-%s.json" % PROPOSAL_ID)
+        with open(proposal_path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        self.assertEqual(position["proposal_id"], PROPOSAL_ID)
+        self.assertEqual(position["proposal_digest"], digest)
+        receipt_path = os.path.join(
+            self.dir, "basis-position-%s.json" % RID)
+        with open(receipt_path, encoding="utf-8") as handle:
+            receipt = json.load(handle)
+        self.assertEqual(receipt["proposal_id"], PROPOSAL_ID)
+        self.assertEqual(receipt["proposal_digest"], digest)
         self.assertIsNone(position["pending_intent"])
         self.assertEqual(len(position["client_ids"]), 2)
         self.assertTrue(self.lock_exists())    # lane held while standing
         kinds = [event["kind"] for event in self.events_list()]
-        self.assertEqual(kinds, ["run_start", "gap_read", "order_submitted",
+        self.assertEqual(kinds, ["run_start", "order_submitted",
                                  "order_terminal", "order_submitted",
                                  "order_terminal", "run_verdict"])
 
@@ -959,24 +1088,42 @@ class OpenTests(MachineCase):
         spec = happy_spec()
         spec["symbol_config_seq"] = [
             [{"symbol": SYMBOL, "leverage": "10"}],
+            [{"symbol": SYMBOL, "leverage": "10"}],
             [{"symbol": SYMBOL, "leverage": "1"}],
         ]
         code, transport, out = self.run_cmd(bp.cmd_open, spec)
         self.assertEqual(code, 0, out)
         self.assertEqual(len(transport.leverage_posts), 1)
         self.assertEqual(transport.leverage_posts[0]["leverage"], "1")
-        # The leverage change happened before any order POST.
+        # Every read-only proof completed before the leverage mutation.
         leverage_index = next(index for index, call
                               in enumerate(transport.calls)
                               if call[2] == "/fapi/v1/leverage")
+        required_reads = {
+            (USDM_URL, "/fapi/v1/accountConfig"),
+            (SPOT_URL, "/api/v3/account"),
+            (USDM_URL, "/fapi/v1/positionSide/dual"),
+            (SPOT_URL, "/api/v3/openOrders"),
+            (USDM_URL, "/fapi/v1/openOrders"),
+            (USDM_URL, "/fapi/v3/positionRisk"),
+            (USDM_URL, "/fapi/v3/account"),
+        }
+        before_leverage = {(call[1], call[2])
+                           for call in transport.calls[:leverage_index]
+                           if call[0] == "GET"}
+        self.assertTrue(required_reads <= before_leverage)
         first_order = next(index for index, call
                            in enumerate(transport.calls)
                            if call[0] == "POST" and call[2].endswith("/order"))
         self.assertLess(leverage_index, first_order)
+        between = transport.calls[leverage_index + 1:first_order]
+        self.assertEqual([(call[0], call[2]) for call in between],
+                         [("GET", "/fapi/v1/symbolConfig")])
 
     def test_open_refuses_unproven_leverage_before_any_order(self):
         spec = happy_spec()
         spec["symbol_config_seq"] = [
+            [{"symbol": SYMBOL, "leverage": "10"}],
             [{"symbol": SYMBOL, "leverage": "10"}],
             [{"symbol": SYMBOL, "leverage": "10"}],   # re-read disproves
         ]
@@ -994,22 +1141,25 @@ class OpenTests(MachineCase):
             with redirect_stdout(buffer):
                 code = bp.cmd_open(cfg, transport,
                                    sleep=lambda seconds: None,
-                                   now_ms=lambda: T_OPEN)
+                                   now_ms=lambda: T_OPEN,
+                                   proposal_id=PROPOSAL_ID)
             self.assertEqual(code, 2)
             self.assertIn("owner decision required", buffer.getvalue())
             self.assertEqual(transport.posts, [])
 
-    def test_open_gap_below_min_refuses_before_any_order(self):
+    def test_open_uses_proposal_not_a_fresh_raw_gap(self):
         spec = happy_spec()
         spec["usdm_book"] = {"symbol": SYMBOL, "bidPrice": "100.001",
                              "askPrice": "100.05", "time": 1755000000000}
         code, transport, out = self.run_cmd(bp.cmd_open, spec)
-        self.assertEqual(code, 2)
-        self.assertEqual(transport.posts, [])
-        self.assertIn("REJECTED_BEFORE_ENTRY", out)
-        self.assertFalse(self.lock_exists())
-        self.assertFalse(os.path.exists(os.path.join(self.dir,
-                                                     bp.STATE_FILE)))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+        raw_gap_paths = {"/api/v3/ticker/bookTicker",
+                         "/fapi/v1/ticker/bookTicker",
+                         "/fapi/v1/premiumIndex"}
+        self.assertFalse([call for call in transport.calls
+                          if call[2] in raw_gap_paths])
 
     def test_open_wallet_shortfall_refuses(self):
         spec = happy_spec()

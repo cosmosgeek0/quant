@@ -28,9 +28,11 @@ import contextlib
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from decimal import Decimal
 from glob import glob
 from pathlib import Path
@@ -302,10 +304,12 @@ class StubKernel:
 
 
 def universe_row(symbol: str, entry_bps: str = "78",
-                 fits: bool = True) -> Dict[str, Any]:
+                 fits: bool = True, spot_step: str = "0.001",
+                 perp_step: str = "0.001") -> Dict[str, Any]:
     return {"symbol": symbol, "entry_gap_bps": D(entry_bps),
             "exit_gap_bps": D("0"), "funding_bps": D("1"),
-            "min_valid_notional": D("5"), "fits_10_cap": fits}
+            "min_valid_notional": D("5"), "fits_10_cap": fits,
+            "spot_step": D(spot_step), "perp_step": D(perp_step)}
 
 
 def funding_history_rows(period_ms: int, count: int = 3,
@@ -1074,6 +1078,147 @@ class StateFileTests(PipelineCase):
         watch = self.make_watch()
         self.assertEqual(watch.symbols, {})
         self.assertEqual(watch.pass_count, 0)
+
+
+# ---------------------------------------------------------------------------
+# Immutable proposal files.
+
+
+class ProposalFileTests(PipelineCase):
+    def paths(self) -> List[str]:
+        return glob(os.path.join(self.tmp.name, "proposals", "proposal-*.json"))
+
+    def proposal_tick(self, watch: Watch, now_ms: int = T0 + 2000,
+                      symbol: str = "TESTUSDT") -> Dict[str, Any]:
+        return self.tick(watch, now_ms, symbol=symbol)
+
+    def test_proposal_file_is_complete_atomic_and_immutable(self):
+        rates_path = os.path.join(self.tmp.name, "commission-rates.json")
+        with open(rates_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "symbol": "TESTUSDT",
+                "spot": {"maker": "0.0008", "taker": "0.00075"},
+                "usdm": {"maker": "0.0002", "taker": "0.0004"},
+            }, handle)
+        old_sha = os.environ.get("QUANT_SHA")
+        os.environ["QUANT_SHA"] = "a" * 40
+        self.addCleanup(
+            lambda: os.environ.__setitem__("QUANT_SHA", old_sha)
+            if old_sha is not None else os.environ.pop("QUANT_SHA", None))
+
+        row = self.proposal_tick(self.make_watch(persist_ticks=1))
+        self.assertEqual((row["kind"], row["proposal_status"]),
+                         ("proposal", "written"))
+        self.assertEqual(len(self.paths()), 1)
+        path = self.paths()[0]
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o400)
+        self.assertFalse(glob(path + ".tmp-*"))
+        with open(path, encoding="utf-8") as handle:
+            proposal = json.load(handle)
+
+        self.assertEqual(set(proposal), basis_watch.PROPOSAL_FIELDS)
+        self.assertTrue(all(value is not None for value in proposal.values()))
+        self.assertEqual(proposal["proposal_id"], row["proposal_id"])
+        self.assertTrue(path.endswith(
+            "proposal-%s.json" % proposal["proposal_id"]))
+        self.assertRegex(proposal["proposal_id"], r"^[0-9a-f]+$")
+        self.assertRegex(proposal["config_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(proposal["quant_sha"], "a" * 40)
+        self.assertEqual(proposal["direction"], "long_spot_short_perp")
+        self.assertEqual(proposal["commission_source"], "measured")
+        self.assertEqual(proposal["spot_maker_commission_pct"], "0.0800")
+        self.assertEqual(proposal["spot_taker_commission_pct"], "0.07500")
+        self.assertEqual(proposal["perp_maker_commission_pct"], "0.0200")
+        self.assertEqual(proposal["perp_taker_commission_pct"], "0.0400")
+        self.assertEqual(D(proposal["quantity"]) % D("0.001"), D(0))
+        self.assertGreater(D(proposal["quantity"]), D(0))
+        self.assertGreater(D(proposal["net_edge_pct"]), D(0))
+        created = datetime.fromisoformat(
+            proposal["created_utc"].replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(
+            proposal["expires_utc"].replace("Z", "+00:00"))
+        self.assertEqual((expires - created).total_seconds(), 120)
+
+    def test_ttl_is_configured_seconds_from_market_read(self):
+        watch = self.make_watch(persist_ticks=1, proposal_ttl_seconds=37)
+        self.proposal_tick(watch)
+        with open(self.paths()[0], encoding="utf-8") as handle:
+            proposal = json.load(handle)
+        created = datetime.fromisoformat(
+            proposal["created_utc"].replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(
+            proposal["expires_utc"].replace("Z", "+00:00"))
+        self.assertEqual((expires - created).total_seconds(), 37)
+
+    def test_only_proposal_decisions_write_files(self):
+        cases = (
+            ("ignore", "0.10", {"persist_ticks": 2}),
+            ("watch", "0.20", {"persist_ticks": 2,
+                                "spot_taker_fee_pct": D("0.01"),
+                                "perp_taker_fee_pct": D("0.01"),
+                                "min_net_basis_pct": D("0.01")}),
+            ("focus", "0.78", {"persist_ticks": 2}),
+            ("reject", "0.25", {"persist_ticks": 2}),
+        )
+        for index, (expected, gap, overrides) in enumerate(cases):
+            with self.subTest(kind=expected):
+                watch = Watch(self.state_path + ".%d" % index, self.tmp.name,
+                              watch_config(overrides))
+                row = self.tick(watch, T0 + 2000, gap_pct=gap)
+                self.assertEqual(row["kind"], expected)
+                self.assertEqual(row["proposal_status"], "not_applicable")
+        self.assertEqual(self.paths(), [])
+
+    def test_unexpired_symbol_does_not_get_duplicate(self):
+        watch = self.make_watch(persist_ticks=1)
+        first = self.proposal_tick(watch, T0 + 2000)
+        second = self.proposal_tick(watch, T0 + 4000)
+        self.assertEqual(first["proposal_status"], "written")
+        self.assertEqual(second["proposal_status"], "duplicate_unexpired")
+        self.assertIsNone(second["proposal_id"])
+        self.assertEqual(len(self.paths()), 1)
+
+    def test_exit_slippage_uses_bid_ask_sides_and_quantity_uses_both_steps(self):
+        now = T0 + 2000
+        bundle = scenario_bundle(now)
+        bundle["spot_depth"]["bids"] = [["100", "0.05"], ["99", "1"]]
+        perp_touch = D(bundle["perp_depth"]["asks"][0][0])
+        bundle["perp_depth"]["asks"] = [
+            [str(perp_touch), "0.05"], [str(perp_touch + 1), "1"]]
+        reads = FakeReads(
+            [universe_row("TESTUSDT", spot_step="0.003", perp_step="0.002")],
+            {"TESTUSDT": bundle})
+        row = self.make_watch(persist_ticks=1).run_pass(reads, now)[0]
+        self.assertEqual(row["proposal_status"], "written")
+        with open(self.paths()[0], encoding="utf-8") as handle:
+            proposal = json.load(handle)
+        expected = _walk_slippage_pct(
+            [(D("100"), D("0.05")), (D("99"), D(1))], D(10)) \
+            + _walk_slippage_pct(
+                [(perp_touch, D("0.05")), (perp_touch + 1, D(1))], D(10))
+        self.assertClose(D(proposal["exit_slippage_pct"]), expected)
+        self.assertEqual(D(proposal["entry_slippage_pct"]), D(0))
+        quantity = D(proposal["quantity"])
+        self.assertEqual(quantity % D("0.003"), D(0))
+        self.assertEqual(quantity % D("0.002"), D(0))
+
+    def test_negative_net_kernel_proposal_is_refused(self):
+        class NegativeProposalKernel:
+            @staticmethod
+            def evaluate(observation):
+                decision = stub_evaluate(observation)
+                decision["kind"] = "proposal"
+                decision["reject_code"] = None
+                decision["net_pct"] = D("-0.0001")
+                return decision
+
+        basis_watch.basis_kernel = NegativeProposalKernel()
+        row = self.proposal_tick(self.make_watch(persist_ticks=1))
+        self.assertEqual(row["kind"], "proposal")
+        self.assertEqual(row["proposal_status"],
+                         "refused_non_positive_net_edge")
+        self.assertEqual(row["state"], "IDLE")
+        self.assertEqual(self.paths(), [])
 
 
 # ---------------------------------------------------------------------------

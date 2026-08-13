@@ -5,8 +5,8 @@ restart-safe position machine on top of the PROVEN executor mechanics. This
 module composes; it does not duplicate: transport, order settlement, signed
 reads, market filters, and the receipts/events discipline all come from
 basis_executor (settle_leg, signed_read, market_context, query_client_order,
-signed_preflight, spot_trades, save), and the one leverage mutation comes
-from set_leverage_1x.run (set-and-verify exactly 1x).
+spot_trades, save), and the one leverage mutation comes from
+set_leverage_1x.run (set-and-verify exactly 1x).
 
 Spec mapping (python_target_mapping collapse):
 - candidate layer (signal machine IDLE..COOLDOWN) is NOT here — that stage
@@ -65,6 +65,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -75,17 +76,24 @@ from basis_cycle import (
     ENTER_SPOT,
     EXIT_SHORT,
     EXIT_SPOT,
+    FEE_BUFFER,
+    MAX_CYCLE_QUOTE,
     UNWIND_SPOT,
     CyclePlan,
     leg_intent,
-    plan_cycle,
     quantize_down,
 )
 from basis_executor import (
     SPOT,
     SPOT_ACCOUNT_PATH,
+    SPOT_OPEN_ORDERS_PATH,
     USDM,
+    USDM_ACCOUNT_CONFIG_PATH,
+    USDM_ACCOUNT_PATH,
+    USDM_OPEN_ORDERS_PATH,
     USDM_POSITION_PATH,
+    USDM_POSITION_MODE_PATH,
+    USDM_SYMBOL_CONFIG_PATH,
     VENUES,
     ExecutorConfig,
     PreflightRefusal,
@@ -102,21 +110,25 @@ from basis_executor import (
     live_request_factory,
     market_context,
     new_run_id,
+    parse_trade_capability,
     query_client_order,
     save,
     settle_leg,
-    signed_preflight,
     signed_read,
     spot_trades,
+    symbol_leverage,
     utc,
     write_events,
 )
+from futures_hand import PreflightError as FuturesPreflightError
 from futures_hand import clean, d, fmt
 
 STATE_FILE = "basis-position.json"
 STATE_WRITE_GUARD_FILE = "basis-position.write.lock"
 RATES_FILE = "commission-rates.json"
 EMERGENCY_FILE = "EMERGENCY"
+STOP_FILE = "STOP"
+PROPOSAL_DIR = "proposals"
 LOCK_FILE = "basis-executor.lock"          # shared lane lock with the executor
 SPOT_COMMISSION_PATH = "/api/v3/account/commission"
 USDM_COMMISSION_PATH = "/fapi/v1/commissionRate"
@@ -124,6 +136,18 @@ USDM_INCOME_PATH = "/fapi/v1/income"
 SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 MS_SAFE_MAX = 2 ** 53 - 1
+PROPOSAL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+MARGIN_QUANTUM = Decimal("0.00000001")
+PROPOSAL_REQUIRED_FIELDS = frozenset({
+    "proposal_id", "created_utc", "expires_utc", "quant_sha",
+    "config_digest", "symbol", "direction", "spot_ask", "perp_bid",
+    "entry_gap_pct", "spot_bid", "perp_ask", "exit_gap_pct",
+    "spot_maker_commission_pct", "spot_taker_commission_pct",
+    "perp_maker_commission_pct", "perp_taker_commission_pct",
+    "commission_source", "entry_slippage_pct", "exit_slippage_pct",
+    "funding_rate", "funding_period_ms", "carry_pct",
+    "safety_buffer_pct", "net_edge_pct", "quantity",
+})
 
 # Spec defaults that exist (everything without a spec default is an owner
 # decision required in the environment — never invented here).
@@ -1077,8 +1101,417 @@ def _spot_free(account: Any, asset: str) -> Optional[Decimal]:
     return Decimal(0)
 
 
+@dataclass(frozen=True)
+class AcceptedProposal:
+    proposal_id: str
+    digest: str
+    payload: Dict[str, Any]
+    quantity: Decimal
+    net_edge_pct: Decimal
+
+
+def _proposal_value(payload: Dict[str, Any],
+                    paths: Tuple[Tuple[str, ...], ...]) -> Any:
+    for path in paths:
+        value: Any = payload
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                break
+            value = value[key]
+        else:
+            return value
+    return None
+
+
+def _proposal_decimal(payload: Dict[str, Any], label: str,
+                      paths: Tuple[Tuple[str, ...], ...],
+                      required: bool = True) -> Optional[Decimal]:
+    raw = _proposal_value(payload, paths)
+    if raw is None:
+        if required:
+            raise PositionError("proposal required field %s is missing" % label)
+        return None
+    if isinstance(raw, bool):
+        raise PositionError("proposal field %s is not a finite decimal" % label)
+    try:
+        value = d(raw)
+    except (ArithmeticError, TypeError, ValueError):
+        raise PositionError(
+            "proposal field %s is not a finite decimal" % label) from None
+    if not value.is_finite():
+        raise PositionError("proposal field %s is not a finite decimal" % label)
+    return value
+
+
+def _proposal_utc_ms(value: Any, label: str) -> int:
+    if not isinstance(value, str) or not value:
+        raise PositionError("proposal required field %s is missing" % label)
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
+        return int(parsed.timestamp() * 1000)
+    except (OverflowError, OSError, ValueError):
+        raise PositionError(
+            "proposal %s is not a timezone-aware timestamp" % label) from None
+
+
+def load_entry_proposal(receipt_dir: str, proposal_id: Optional[str],
+                        symbol: str, quant_sha: str,
+                        now_ms: int) -> AcceptedProposal:
+    """Load and validate the immutable entry authority before any transport.
+
+    The digest is over the exact bytes read, so the position and run receipt
+    identify precisely which proposal authorized the entry.
+    """
+    if not isinstance(proposal_id, str) or not PROPOSAL_ID_RE.fullmatch(
+            proposal_id):
+        raise PositionError("--open requires --proposal <id>")
+    path = os.path.join(receipt_dir, PROPOSAL_DIR,
+                        "proposal-%s.json" % proposal_id)
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        payload = json.loads(raw.decode("utf-8"), parse_float=Decimal)
+    except FileNotFoundError:
+        raise PositionError("proposal %s is missing" % proposal_id) from None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise PositionError("proposal %s is unreadable" % proposal_id) from None
+    if not isinstance(payload, dict):
+        raise PositionError("proposal %s is unreadable: JSON object required"
+                            % proposal_id)
+
+    missing_fields = sorted(PROPOSAL_REQUIRED_FIELDS - set(payload))
+    if missing_fields:
+        raise PositionError("proposal required field(s) missing: %s"
+                            % ", ".join(missing_fields))
+
+    stored_id = payload.get("proposal_id")
+    if not isinstance(stored_id, str):
+        raise PositionError("proposal required field id is missing")
+    if stored_id != proposal_id:
+        raise PositionError("proposal id %s does not match requested id %s"
+                            % (stored_id, proposal_id))
+    if "id" in payload and payload["id"] != payload["proposal_id"]:
+        raise PositionError("proposal id fields disagree")
+    proposal_symbol = payload.get("symbol")
+    if not isinstance(proposal_symbol, str):
+        raise PositionError("proposal required field symbol is missing")
+    if proposal_symbol != symbol:
+        raise PositionError("proposal symbol %s does not match SYMBOL %s"
+                            % (proposal_symbol, symbol))
+    proposal_sha = payload.get("quant_sha")
+    if not isinstance(proposal_sha, str):
+        raise PositionError("proposal required field quant_sha is missing")
+    if proposal_sha != quant_sha:
+        raise PositionError("proposal quant_sha %s does not match QUANT_SHA %s"
+                            % (proposal_sha, quant_sha))
+    created_ms = _proposal_utc_ms(payload.get("created_utc"), "created_utc")
+    expires_ms = _proposal_utc_ms(payload.get("expires_utc"), "expires_utc")
+    if expires_ms <= created_ms:
+        raise PositionError("proposal expires_utc must be after created_utc")
+    if now_ms >= expires_ms:
+        raise PositionError("proposal %s expired at %s"
+                            % (proposal_id, payload.get("expires_utc")))
+
+    digest = payload.get("config_digest")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) \
+            is None:
+        raise PositionError("proposal config_digest is missing or invalid")
+    if payload.get("direction") != "long_spot_short_perp":
+        raise PositionError("proposal direction is not long_spot_short_perp")
+    source = payload.get("commission_source")
+    if not isinstance(source, str) or not source:
+        raise PositionError("proposal commission_source is missing")
+    funding_period = payload.get("funding_period_ms")
+    if isinstance(funding_period, bool) or not isinstance(funding_period, int) \
+            or funding_period <= 0:
+        raise PositionError("proposal funding_period_ms must be positive")
+
+    positive_fields = ("spot_ask", "perp_bid", "spot_bid", "perp_ask",
+                       "entry_gap_pct", "safety_buffer_pct")
+    nonnegative_fields = (
+        "spot_maker_commission_pct", "spot_taker_commission_pct",
+        "perp_maker_commission_pct", "perp_taker_commission_pct",
+        "entry_slippage_pct", "exit_slippage_pct")
+    for field in positive_fields:
+        value = _proposal_decimal(payload, field, ((field,),))
+        if value is None or value <= 0:
+            raise PositionError("proposal %s must be positive" % field)
+    for field in nonnegative_fields:
+        value = _proposal_decimal(payload, field, ((field,),))
+        if value is None or value < 0:
+            raise PositionError("proposal %s must be non-negative" % field)
+    for field in ("exit_gap_pct", "funding_rate", "carry_pct"):
+        _proposal_decimal(payload, field, ((field,),))
+
+    net_edge = _proposal_decimal(
+        payload, "net_edge_pct",
+        (("net_edge_pct",), ("final_net_edge_pct",),
+         ("economics", "net_edge_pct"),
+         ("economics", "final_net_edge_pct")))
+    if net_edge is None or net_edge <= 0:
+        raise PositionError("proposal net_edge_pct must be positive")
+    quantity = _proposal_decimal(
+        payload, "quantity",
+        (("quantity",), ("base_quantity",), ("quantity_base",),
+         ("execution", "quantity")))
+    if quantity is None or quantity <= 0:
+        raise PositionError("proposal quantity must be positive")
+    return AcceptedProposal(
+        proposal_id=proposal_id,
+        digest=hashlib.sha256(raw).hexdigest(),
+        payload=payload,
+        quantity=quantity,
+        net_edge_pct=net_edge,
+    )
+
+
+def _proposal_plan(accepted: AcceptedProposal,
+                   market: Dict[str, Any]) -> CyclePlan:
+    """Build the entry plan only from proposal facts plus venue filters."""
+    payload = accepted.payload
+    quantity = accepted.quantity
+    if quantize_down(quantity, market["shared_step"]) != quantity:
+        raise PositionError("proposal quantity is not on the shared venue step")
+    if quantity < market["min_qty"]:
+        raise PositionError("proposal quantity is below a venue minimum")
+
+    entry_bps = _proposal_decimal(
+        payload, "entry_gap_bps",
+        (("entry_gap_bps",), ("economics", "entry_gap_bps")),
+        required=False)
+    entry_pct = _proposal_decimal(
+        payload, "entry_gap_pct",
+        (("entry_gap_pct",), ("gross_edge_pct",),
+         ("entry", "gap_pct"), ("executable_entry", "gap_pct"),
+         ("economics", "entry_gap_pct"),
+         ("economics", "entry", "gap_pct")),
+        required=False)
+    spot_ask = _proposal_decimal(
+        payload, "entry spot ask",
+        (("entry_spot_ask",), ("spot_ask",),
+         ("entry", "spot_ask"), ("executable_entry", "spot_ask"),
+         ("economics", "entry", "spot_ask")),
+        required=False)
+    usdm_bid = _proposal_decimal(
+        payload, "entry perp bid",
+        (("entry_usdm_bid",), ("entry_perp_bid",), ("usdm_bid",),
+         ("perp_bid",), ("entry", "usdm_bid"),
+         ("entry", "perp_bid"), ("executable_entry", "perp_bid"),
+         ("economics", "entry", "perp_bid")),
+        required=False)
+    if entry_bps is None:
+        if entry_pct is not None:
+            entry_bps = entry_pct * Decimal(100)
+        elif spot_ask is not None and usdm_bid is not None and spot_ask > 0:
+            entry_bps = (usdm_bid - spot_ask) / spot_ask * Decimal(10000)
+        else:
+            raise PositionError(
+                "proposal executable entry economics are missing")
+    if entry_bps <= 0:
+        raise PositionError("proposal executable entry gap must be positive")
+
+    exit_bps = _proposal_decimal(
+        payload, "exit_gap_bps",
+        (("exit_gap_bps",), ("economics", "exit_gap_bps")),
+        required=False)
+    exit_pct = _proposal_decimal(
+        payload, "exit_gap_pct",
+        (("exit_gap_pct",), ("intended_exit_gap_pct",),
+         ("exit", "gap_pct"), ("intended_exit", "gap_pct"),
+         ("economics", "exit_gap_pct"),
+         ("economics", "exit", "gap_pct")),
+        required=False)
+    exit_spot_bid = _proposal_decimal(
+        payload, "exit spot bid",
+        (("exit_spot_bid",), ("exit", "spot_bid"),
+         ("intended_exit", "spot_bid"),
+         ("economics", "exit", "spot_bid")),
+        required=False)
+    exit_usdm_ask = _proposal_decimal(
+        payload, "exit perp ask",
+        (("exit_usdm_ask",), ("exit_perp_ask",),
+         ("exit", "usdm_ask"), ("exit", "perp_ask"),
+         ("intended_exit", "perp_ask"),
+         ("economics", "exit", "perp_ask")),
+        required=False)
+    if exit_bps is None:
+        if exit_pct is not None:
+            exit_bps = exit_pct * Decimal(100)
+        elif exit_spot_bid is not None and exit_usdm_ask is not None \
+                and exit_spot_bid > 0:
+            exit_bps = ((exit_usdm_ask - exit_spot_bid) / exit_spot_bid
+                        * Decimal(10000))
+        else:
+            raise PositionError(
+                "proposal intended-exit economics are missing")
+
+    funding_rate = _proposal_decimal(
+        payload, "funding_rate",
+        (("funding_rate",), ("funding", "rate"),
+         ("economics", "funding_rate"),
+         ("economics", "funding", "rate")))
+    spot_quote_cap = _proposal_decimal(
+        payload, "spot_quote_cap",
+        (("spot_quote_cap",), ("notional_usd",),
+         ("suggested_notional_usd",),
+         ("execution", "spot_quote_cap"),
+         ("economics", "notional_usd")),
+        required=False)
+    if spot_quote_cap is None and spot_ask is not None:
+        spot_quote_cap = (quantity * spot_ask * (Decimal(1) + FEE_BUFFER)
+                          ).quantize(MARGIN_QUANTUM)
+    if spot_quote_cap is None:
+        raise PositionError("proposal execution notional is missing")
+    short_notional = _proposal_decimal(
+        payload, "short_notional",
+        (("short_notional",), ("notional_usd",),
+         ("suggested_notional_usd",),
+         ("execution", "short_notional"),
+         ("economics", "notional_usd")),
+        required=False)
+    if short_notional is None and usdm_bid is not None:
+        short_notional = (quantity * usdm_bid).quantize(MARGIN_QUANTUM)
+    if short_notional is None:
+        raise PositionError("proposal short notional is missing")
+    if spot_quote_cap <= 0 or short_notional <= 0:
+        raise PositionError("proposal execution notionals must be positive")
+    if spot_quote_cap > MAX_CYCLE_QUOTE or short_notional > MAX_CYCLE_QUOTE:
+        raise PositionError("proposal execution notional exceeds the compiled "
+                            "%s USDT cap" % fmt(MAX_CYCLE_QUOTE))
+    if spot_quote_cap < market["min_notional"] \
+            or short_notional < market["min_notional"]:
+        raise PositionError("proposal execution notional is below a venue minimum")
+    return CyclePlan(
+        symbol=payload["symbol"],
+        entry_gap_bps=entry_bps,
+        exit_gap_bps=exit_bps,
+        funding_rate=funding_rate,
+        spot_quantity=quantity,
+        short_quantity=quantity,
+        spot_quote_cap=spot_quote_cap,
+        short_notional=short_notional,
+        leverage=1,
+        reason="accepted proposal %s digest %s" % (
+            accepted.proposal_id, accepted.digest),
+    )
+
+
+def _read_only_entry_preflight(state: RunState, plan: CyclePlan,
+                               market: Dict[str, Any]) -> int:
+    """Complete every account proof while leverage is still unchanged."""
+    symbol = state.cfg.symbol
+    capability = signed_read(state, USDM.base_url,
+                             USDM_ACCOUNT_CONFIG_PATH, None,
+                             "Futures account-configuration read")
+    try:
+        parse_trade_capability(capability)
+    except FuturesPreflightError as exc:
+        raise PreflightRefusal(str(exc)) from None
+
+    spot_account = signed_read(state, SPOT.base_url, SPOT_ACCOUNT_PATH, None,
+                               "Spot account and balance read")
+    can_trade = spot_account.get("canTrade") \
+        if isinstance(spot_account, dict) else None
+    if not (can_trade is True or str(can_trade).strip().lower() == "true"):
+        raise PreflightRefusal("Spot account canTrade is not true")
+    free_quote = _spot_free(spot_account, "USDT")
+    if free_quote is None or free_quote < plan.spot_quote_cap:
+        raise PreflightRefusal(
+            "spot USDT free balance %s does not cover the quote cap %s"
+            % ("UNKNOWN" if free_quote is None else fmt(free_quote),
+               fmt(plan.spot_quote_cap)))
+
+    mode = signed_read(state, USDM.base_url, USDM_POSITION_MODE_PATH, None,
+                       "Futures position-mode read")
+    dual = mode.get("dualSidePosition") if isinstance(mode, dict) else None
+    if not (dual is False or str(dual).strip().lower() == "false"):
+        raise PreflightRefusal("Futures position mode is not proven ONE_WAY; "
+                               "cycle intents send no positionSide")
+
+    config_rows = signed_read(state, USDM.base_url,
+                              USDM_SYMBOL_CONFIG_PATH, {"symbol": symbol},
+                              "Futures symbol-configuration read")
+    leverage_before = symbol_leverage(config_rows, symbol)
+    if leverage_before < 1:
+        raise PreflightRefusal("actual symbol leverage is not positive")
+
+    for venue, orders_path in ((SPOT, SPOT_OPEN_ORDERS_PATH),
+                               (USDM, USDM_OPEN_ORDERS_PATH)):
+        orders = signed_read(state, venue.base_url, orders_path,
+                             {"symbol": symbol},
+                             "%s open-orders read" % venue.name)
+        if not isinstance(orders, list):
+            raise PreflightRefusal(
+                "%s open-orders response is not a list" % venue.name)
+        if orders:
+            raise PreflightRefusal(
+                "%s open order(s) already standing on %s for the plan "
+                "symbol; attribution unsafe" % (len(orders), venue.name))
+
+    rows = signed_read(state, USDM.base_url, USDM_POSITION_PATH,
+                       {"symbol": symbol}, "Futures position read")
+    amount = futures_position(rows, symbol)
+    if amount is None:
+        raise PreflightRefusal("Futures position read cannot prove flatness "
+                               "on the plan symbol")
+    if amount != 0:
+        raise PreflightRefusal("existing Futures position %s on the plan "
+                               "symbol; attribution unsafe" % fmt(amount))
+
+    account = signed_read(state, USDM.base_url, USDM_ACCOUNT_PATH, None,
+                          "Futures balance read")
+    try:
+        available = d(account.get("availableBalance", "0")) \
+            if isinstance(account, dict) else Decimal(0)
+    except ArithmeticError:
+        raise PreflightRefusal(
+            "Futures available balance is unreadable") from None
+    required = (plan.short_notional * market["band_up"]).quantize(
+        MARGIN_QUANTUM)
+    if available < required:
+        raise PreflightRefusal(
+            "available Futures balance %s is below the banded short margin "
+            "%s USDT (notional %s x band %s at 1x)" % (
+                fmt(available), fmt(required), fmt(plan.short_notional),
+                fmt(market["band_up"])))
+    state.receipt["preflight"] = {
+        "futures_can_trade": True,
+        "spot_can_trade": True,
+        "position_mode": "ONE_WAY",
+        "symbol_leverage_before": leverage_before,
+        "open_orders": 0,
+        "position_amount": "0",
+        "spot_available_balance": fmt(free_quote),
+        "futures_available_balance": fmt(available),
+        "required_short_margin_1x": fmt(required),
+        "margin_band_up": fmt(market["band_up"]),
+        "verified_utc": utc(),
+    }
+    save(state)
+    return leverage_before
+
+
 def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
-             now_ms: Callable[[], int] = default_now_ms) -> int:
+             now_ms: Callable[[], int] = default_now_ms,
+             proposal_id: Optional[str] = None) -> int:
+    # STOP is the global ENTRY interlock.  This must remain the first command
+    # check: do not inspect a proposal, receipt, state file, or transport first.
+    if os.path.exists(os.path.join(cfg.receipt_dir, STOP_FILE)):
+        print("OPEN | %s | BLOCKED | STOP file present; entry is disabled"
+              % cfg.symbol)
+        return EXIT_CODE["BLOCKED"]
+    proposal_now_ms = now_ms()
+    try:
+        accepted = load_entry_proposal(
+            cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha,
+            proposal_now_ms)
+    except PositionError as error:
+        print("OPEN | %s | REFUSED | %s" % (cfg.symbol, clean(error, 300)))
+        return EXIT_CODE["REFUSED"]
+
     # Owner-decision thesis fields are required BEFORE anything happens:
     # the spec forbids inventing max-hold / edge / divergence defaults.
     missing = [name for name, value in (
@@ -1106,49 +1539,40 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
         return EXIT_CODE["BLOCKED"]
 
     state = make_state(cfg, request, sleep, "open")
+    state.receipt.update({
+        "proposal_id": accepted.proposal_id,
+        "proposal_digest": accepted.digest,
+    })
+    save(state)
     if not take_lock(state):
         return conclude(state, "BLOCKED", "none",
                         "lane lock exists; another or unreconciled run owns "
                         "the lane")
     try:
         market = market_context(state)
-        row = gap_row(state)
     except Refusal as refusal:
         release_lock(state)
         return conclude(state, "REJECTED_BEFORE_ENTRY", "none", str(refusal))
-    from basis_cycle import plan_cycle
-    plan = plan_cycle(row, cfg.min_entry_bps, market["shared_step"],
-                      market["min_notional"])
-    if plan is None or plan.spot_quantity < market["min_qty"]:
+    try:
+        plan = _proposal_plan(accepted, market)
+    except PositionError as error:
         release_lock(state)
         return conclude(state, "REJECTED_BEFORE_ENTRY", "none",
-                        "plan refused: entry gap %s bps below min %s bps or "
-                        "size below venue minimums"
-                        % (fmt(row.entry_gap_bps_vs_spot_ask),
-                           fmt(cfg.min_entry_bps)))
+                        str(error))
 
-    # Leverage SET-AND-VERIFY exactly 1x (the one owner-approved account
-    # mutation, delegated whole to set_leverage_1x.run — no duplication).
-    if set_leverage_1x.run(cfg.symbol, request) != 0:
-        release_lock(state)
-        return conclude(state, "PREFLIGHT_REFUSED", "none",
-                        "leverage could not be proven exactly 1x; nothing "
-                        "submitted")
+    # Every account/order/position/balance/margin proof completes while the
+    # account is unchanged.  The current leverage only has to be readable
+    # here; set-and-verify to exactly 1x is deliberately the final pre-order
+    # account action below.
     try:
-        signed_preflight(state, plan, market)
-        spot_account = signed_read(state, SPOT.base_url, SPOT_ACCOUNT_PATH,
-                                   None, "Spot balance read")
-        free_quote = _spot_free(spot_account, "USDT")
-        if free_quote is None or free_quote < plan.spot_quote_cap:
-            raise PreflightRefusal(
-                "spot USDT free balance %s does not cover the quote cap %s"
-                % ("UNKNOWN" if free_quote is None else fmt(free_quote),
-                   fmt(plan.spot_quote_cap)))
+        _read_only_entry_preflight(state, plan, market)
     except PreflightRefusal as refusal:
         release_lock(state)
-        return conclude(state, "PREFLIGHT_REFUSED", "none", str(refusal))
+        return conclude(state, "PREFLIGHT_REFUSED", "none",
+                        str(refusal))
 
-    # The position record exists BEFORE the first mutation.
+    # Persist the accepted authority and opening state before the sole
+    # pre-entry account mutation.
     opened_at = now_ms()
     position = {
         "version": 1,
@@ -1156,6 +1580,8 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
         "sha": cfg.sha,
         "state": ST_OPENING,
         "open_run_id": state.run_id,
+        "proposal_id": accepted.proposal_id,
+        "proposal_digest": accepted.digest,
         "thesis": {
             "opened_at_ms": None,
             "max_hold_ms": cfg.max_hold_ms,
@@ -1169,6 +1595,19 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
         "pending_intent": None,
     }
     save_position(cfg.receipt_dir, position)
+
+    # Leverage SET-AND-VERIFY exactly 1x (the one owner-approved account
+    # mutation), last after every read-only proof and directly before entry.
+    if set_leverage_1x.run(cfg.symbol, request) != 0:
+        position["state"] = ST_NONE
+        save_position(cfg.receipt_dir, position)
+        release_lock(state)
+        return conclude(state, "PREFLIGHT_REFUSED", "none",
+                        "leverage could not be proven exactly 1x; nothing "
+                        "submitted")
+    state.receipt["preflight"]["symbol_leverage_after"] = 1
+    state.receipt["preflight"]["leverage_verified_utc"] = utc()
+    save(state)
 
     # Leg 1 — spot BUY, quote-bounded; intent persisted before the POST.
     client = persist_intent(cfg.receipt_dir, position, ENTER_SPOT, plan,
@@ -1211,9 +1650,10 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
     hedge = quantize_down(net_base, market["shared_step"])
     entry = {
         "opened_utc": utc(),
-        "entry_gap_bps": fmt(row.entry_gap_bps_vs_spot_ask),
-        "entry_gap_pct": fmt(row.entry_gap_bps_vs_spot_ask / Decimal(100)),
-        "funding_rate": fmt(row.funding_rate),   # per-period FRACTION
+        "entry_gap_bps": fmt(plan.entry_gap_bps),
+        "entry_gap_pct": fmt(plan.entry_gap_bps / Decimal(100)),
+        "funding_rate": fmt(plan.funding_rate),   # per-period FRACTION
+        "proposal_net_edge_pct": fmt(accepted.net_edge_pct),
         "spot": {"executed_qty": fmt(executed),
                  "quote_spent": fmt(quote_spent),
                  "base_fee": fmt(buy_base_fee),
@@ -1265,8 +1705,7 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
                     % (fmt(net_base), market["base"], fmt(short_filled)),
                     "entry gap %s bps; funding %s per period; lane lock held "
                     "while the position stands"
-                    % (fmt(row.entry_gap_bps_vs_spot_ask),
-                       fmt(row.funding_rate)))
+                    % (fmt(plan.entry_gap_bps), fmt(plan.funding_rate)))
 
 
 def _unwind_spot(cfg: PositionConfig, state: RunState,
@@ -1949,10 +2388,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             ("--resume", "restart recovery: query-first by client id")):
         mode.add_argument(flag, metavar="SYMBOL", nargs="?", const="",
                           default=None, help=text)
+    parser.add_argument("--proposal", metavar="ID",
+                        help="immutable proposal id required by --open")
     args = parser.parse_args(argv)
     command, symbol = next(
-        (name, value) for name, value in vars(args).items()
-        if value is not None)
+        (name, getattr(args, name))
+        for name in ("rates", "open", "check", "close", "resume")
+        if getattr(args, name) is not None)
+    if args.proposal is not None and command != "open":
+        parser.error("--proposal is valid only with --open")
+    if command == "open":
+        receipt_dir = os.path.expanduser(
+            os.environ.get("RECEIPT_DIR", "~/quant_receipts"))
+        if os.path.exists(os.path.join(receipt_dir, STOP_FILE)):
+            display_symbol = (symbol or os.environ.get("SYMBOL", "")).upper()
+            print("OPEN | %s | BLOCKED | STOP file present; entry is disabled"
+                  % display_symbol)
+            return EXIT_CODE["BLOCKED"]
     try:
         cfg = config_from_env(os.environ, symbol)
     except PositionError as error:
@@ -1960,6 +2412,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("VERDICT: BLOCKED")
         print("NOTE:", clean(error, 300))
         return 2
+    if command == "open" and args.proposal is None:
+        print("OPEN | %s | REFUSED | --open requires --proposal <id>"
+              % cfg.symbol)
+        return EXIT_CODE["REFUSED"]
     if command == "check":
         return cmd_check(cfg, live_request_factory("", ""))
     api_key = os.environ.get("BINANCE_API_KEY", "")
@@ -1973,6 +2429,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     factory = live_request_factory(api_key, api_secret)
     handler = {"rates": cmd_rates, "open": cmd_open, "close": cmd_close,
                "resume": cmd_resume}[command]
+    if command == "open":
+        return handler(cfg, factory, proposal_id=args.proposal)
     return handler(cfg, factory)
 
 
