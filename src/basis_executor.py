@@ -111,6 +111,7 @@ EXIT_CODE = {
     "PREFLIGHT_REFUSED": 5,
 }
 USDM_POSITION_PATH = "/fapi/v3/positionRisk"
+USDM_SYMBOL_CONFIG_PATH = "/fapi/v1/symbolConfig"
 USDM_ACCOUNT_CONFIG_PATH = "/fapi/v1/accountConfig"
 USDM_POSITION_MODE_PATH = "/fapi/v1/positionSide/dual"
 USDM_OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
@@ -583,6 +584,22 @@ def signed_read(state: RunState, base_url: str, path: str,
     return payload
 
 
+def symbol_leverage(rows: Any, symbol: str) -> int:
+    """The plan symbol's ACTUAL configured leverage from one symbolConfig row."""
+    if not isinstance(rows, list) or \
+            any(not isinstance(row, dict) for row in rows):
+        raise PreflightRefusal("symbol-configuration response is malformed")
+    matches = [row for row in rows if row.get("symbol") == symbol]
+    if len(matches) != 1:
+        raise PreflightRefusal("symbol configuration did not return exactly "
+                               "one row for the plan symbol")
+    try:
+        return int(str(matches[0].get("leverage")))
+    except (TypeError, ValueError):
+        raise PreflightRefusal(
+            "symbol leverage is missing or unreadable") from None
+
+
 def signed_preflight(state: RunState, plan: CyclePlan) -> None:
     """Signed READ-ONLY account proofs before ANY order is submitted.
 
@@ -590,7 +607,9 @@ def signed_preflight(state: RunState, plan: CyclePlan) -> None:
     /fapi/v1/accountConfig alone (the /fapi/v3/account snapshot once returned
     a false negative and is never consulted for capability), spot account
     canTrade, position mode explicitly ONE_WAY (cycle intents send no
-    positionSide), no open orders on the plan symbol on either venue, no
+    positionSide), the plan symbol's ACTUAL configured leverage exactly 1x
+    (owner order 2026-08-13: measured, never assumed; this module never
+    changes leverage), no open orders on the plan symbol on either venue, no
     existing futures position on the plan symbol, and futures available
     balance covering the planned short margin at 1x. Any unproven fact raises
     PreflightRefusal; nothing is ever submitted from here.
@@ -616,6 +635,16 @@ def signed_preflight(state: RunState, plan: CyclePlan) -> None:
     if not (dual is False or str(dual).strip().lower() == "false"):
         raise PreflightRefusal("Futures position mode is not proven ONE_WAY; "
                                "cycle intents send no positionSide")
+
+    config_rows = signed_read(state, USDM.base_url, USDM_SYMBOL_CONFIG_PATH,
+                              {"symbol": symbol},
+                              "Futures symbol-configuration read")
+    leverage = symbol_leverage(config_rows, symbol)
+    if leverage != plan.leverage:
+        raise PreflightRefusal(
+            "actual symbol leverage is %sx, not exactly %sx; refusing before "
+            "any order (this module never changes leverage)" % (
+                leverage, plan.leverage))
 
     for venue, orders_path in ((SPOT, SPOT_OPEN_ORDERS_PATH),
                                (USDM, USDM_OPEN_ORDERS_PATH)):
@@ -657,6 +686,7 @@ def signed_preflight(state: RunState, plan: CyclePlan) -> None:
         "futures_can_trade": True,
         "spot_can_trade": True,
         "position_mode": "ONE_WAY",
+        "symbol_leverage": leverage,
         "open_orders": 0,
         "position_amount": "0",
         "available_balance": fmt(available),
@@ -1058,6 +1088,43 @@ def plan_only(cfg: ExecutorConfig, request,
     return 0
 
 
+def validate_only(cfg: ExecutorConfig, request,
+                  sleep: Callable[[float], None] = time.sleep) -> int:
+    """The COMPLETE signed read-only preflight with zero POSTs.
+
+    Public reads produce the plan, then every signed preflight proof runs,
+    including the plan symbol's actual configured leverage. The transport is
+    wrapped so any non-GET attempt dies before leaving the process; the trade
+    lock is never taken and no receipt file is written. Exit 0 = every proof
+    held; exit 5 = preflight refused; exit 2 = the plan itself refused.
+    """
+    def get_only(method, base_url, path, params=None, signed=False):
+        if method != "GET":
+            raise AssertionError("validate-only attempted a non-GET call")
+        return request(method, base_url, path, params, signed)
+
+    state = make_state(cfg, get_only, sleep, receipted=False)
+    try:
+        _row, plan, _market = read_and_plan(state)
+    except Refusal as refusal:
+        print("VALIDATE | %s | PLAN_REFUSED | %s" % (cfg.symbol,
+                                                     clean(refusal, 300)))
+        return 2
+    try:
+        signed_preflight(state, plan)
+    except PreflightRefusal as refusal:
+        print("VALIDATE | %s | PREFLIGHT_REFUSED | %s" % (cfg.symbol,
+                                                          clean(refusal, 300)))
+        return 5
+    proofs = state.receipt.get("preflight", {})
+    print("VALIDATE | %s | PREFLIGHT_OK | leverage %sx | mode ONE_WAY | "
+          "available %s USDT | required %s USDT | no orders, no position" % (
+              cfg.symbol, proofs.get("symbol_leverage"),
+              proofs.get("available_balance"),
+              proofs.get("required_short_margin_1x")))
+    return 0
+
+
 def live_request_factory(api_key: str, api_secret: str,
                          timeout: float = HTTP_TIMEOUT):
     """One transport for both venues, in the futures_hand style: 'ok' = 2xx
@@ -1143,6 +1210,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan-only", action="store_true",
                       help="unsigned public reads and the plan decision only")
+    mode.add_argument("--validate-only", action="store_true",
+                      help="complete signed read-only preflight incl. actual "
+                           "symbol leverage; zero POSTs, no account change "
+                           "(needs keys)")
     mode.add_argument("--execute", action="store_true",
                       help="run the full four-leg cycle once (needs keys)")
     args = parser.parse_args(argv)
@@ -1153,7 +1224,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("VERDICT: BLOCKED")
         print("NOTE:", clean(blocked, 300))
         return 2
-    if not args.execute:
+    if not (args.execute or args.validate_only):
         return plan_only(cfg, live_request_factory("", ""))
     api_key = os.environ.get("BINANCE_API_KEY", "")
     api_secret = os.environ.get("BINANCE_API_SECRET", "")
@@ -1162,7 +1233,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("VERDICT: BLOCKED")
         print("NOTE: missing BINANCE_API_KEY / BINANCE_API_SECRET in environment")
         return 2
-    return run_once(cfg, live_request_factory(api_key, api_secret))
+    factory = live_request_factory(api_key, api_secret)
+    if args.validate_only:
+        return validate_only(cfg, factory)
+    return run_once(cfg, factory)
 
 
 if __name__ == "__main__":

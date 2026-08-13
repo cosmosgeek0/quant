@@ -9,6 +9,13 @@ every step.
 
 ---
 
+LEVERAGE GATE + VALIDATE-ONLY 2026-08-13 | Fable-direct single pass on owner GO | base 5a53ddbb
+code | signed_preflight reads /fapi/v1/symbolConfig and refuses before any order unless actual leverage is exactly 1x | the module never changes leverage
+code | --validate-only added: complete signed preflight with zero POSTs enforced by a GET-only transport wrapper, no lock taken, no receipt written | --plan-only stays unsigned/public
+tests | +10 focused: leverage 10x/2x refusals, 1x pass recorded, malformed/missing/unavailable config, validate-only zero-POST + wrong-leverage exit 5 + plan-refusal exit 2 | executor file 80 green | full suite 295 green
+first failure | none
+verdict | COMMITTED this commit | measured plan-only + validate-only results reported to the owner
+
 WAVE-2 INTEGRATION 2026-08-13 | four lanes merged + panel repairs | base 0b04ff62 | integrator = the Lead
 lanes | capability-fix 4f7a06be | basis-executor 4a1755ab | volume-v2 7ab78306 | ui-runtime 6b45fc37 | all DONE, LOGS stacked, no history lost
 review | 3-lens adversarial panel, 2 refuters per finding | 9 confirmed, 0 refuted | worst: HIGH spot-sell dust threshold at the wrong venue step

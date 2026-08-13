@@ -138,7 +138,8 @@ class ScriptedTransport:
 
     Signed preflight reads are served from optional spec keys with tradable
     defaults: usdm_account_config, spot_account, position_mode,
-    spot_open_orders, usdm_open_orders, usdm_account, preflight_position (the
+    symbol_config (actual leverage; default exactly 1x), spot_open_orders,
+    usdm_open_orders, usdm_account, preflight_position (the
     FIRST positionRisk read); "position" stays the final flatness read. Any
     of them may be a (kind, payload) tuple to script a non-ok transport kind.
     """
@@ -182,6 +183,9 @@ class ScriptedTransport:
             return self.scripted("usdm_account", {"availableBalance": "1000"})
         if path == "/fapi/v1/positionSide/dual":
             return self.scripted("position_mode", {"dualSidePosition": False})
+        if path == "/fapi/v1/symbolConfig":
+            return self.scripted("symbol_config",
+                                 [{"symbol": SYMBOL, "leverage": "1"}])
         if path.endswith("openOrders"):
             key = "spot_open_orders" if base_url == SPOT_URL \
                 else "usdm_open_orders"
@@ -888,6 +892,7 @@ PREFLIGHT_PATHS = (
     "/fapi/v1/accountConfig",
     "/api/v3/account",
     "/fapi/v1/positionSide/dual",
+    "/fapi/v1/symbolConfig",
     "/api/v3/openOrders",
     "/fapi/v1/openOrders",
     "/fapi/v3/positionRisk",
@@ -1270,6 +1275,100 @@ class LiveTransportOfflineTests(unittest.TestCase):
             kind, payload = live("GET", SPOT_URL, "/api/v3/time")
         self.assertEqual(kind, "unclear")
         self.assertEqual(payload, {"error": "URLError"})
+
+
+class LeverageGateTests(ExecutorCase):
+    """The plan symbol's ACTUAL leverage is measured and must be exactly 1x."""
+
+    def refuse(self, spec, fragment):
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 5)
+        self.assertEqual(transport.posts, [])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "PREFLIGHT_REFUSED")
+        self.assertIn(fragment, receipt["verdict_note"])
+        self.assertFalse(self.lock_exists())
+        return receipt
+
+    def test_leverage_10x_refuses_before_any_order(self):
+        spec = happy_spec()
+        spec["symbol_config"] = [{"symbol": SYMBOL, "leverage": "10"}]
+        self.refuse(spec, "10x, not exactly 1x")
+
+    def test_leverage_2x_refuses_even_inside_the_wall_cap(self):
+        spec = happy_spec()
+        spec["symbol_config"] = [{"symbol": SYMBOL, "leverage": "2"}]
+        self.refuse(spec, "2x, not exactly 1x")
+
+    def test_leverage_exactly_1x_passes_and_is_recorded(self):
+        code, _, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.receipt()["preflight"]["symbol_leverage"], 1)
+
+    def test_missing_symbol_row_refuses(self):
+        spec = happy_spec()
+        spec["symbol_config"] = [{"symbol": "OTHERUSDT", "leverage": "1"}]
+        self.refuse(spec, "exactly one row")
+
+    def test_unreadable_leverage_refuses(self):
+        spec = happy_spec()
+        spec["symbol_config"] = [{"symbol": SYMBOL, "leverage": None}]
+        self.refuse(spec, "missing or unreadable")
+
+    def test_unavailable_symbol_config_read_refuses(self):
+        spec = happy_spec()
+        spec["symbol_config"] = ("unclear", {"error": "TimeoutError"})
+        self.refuse(spec, "symbol-configuration read unavailable")
+
+
+class ValidateOnlyTests(ExecutorCase):
+    """--validate-only: the complete signed preflight, zero POSTs, zero
+    account changes, no lock taken, no receipt file written."""
+
+    def validate(self, spec, cfg=None):
+        transport = ScriptedTransport(spec)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = basis_executor.validate_only(cfg or self.cfg, transport,
+                                                sleep=lambda seconds: None)
+        return code, transport, buffer.getvalue()
+
+    def test_all_proofs_pass_with_zero_posts_and_no_files(self):
+        code, transport, out = self.validate(happy_spec())
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.posts, [])
+        self.assertTrue(all(call[0] == "GET" for call in transport.calls))
+        self.assertIn("PREFLIGHT_OK", out)
+        self.assertIn("leverage 1x", out)
+        self.assertFalse(self.lock_exists())
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_signed_preflight_paths_all_run_signed(self):
+        _, transport, _ = self.validate(happy_spec())
+        seen = {path: signed for _m, _b, path, _p, signed in transport.calls
+                if path in PREFLIGHT_PATHS}
+        self.assertEqual(set(seen), set(PREFLIGHT_PATHS))
+        self.assertTrue(all(seen.values()))
+
+    def test_wrong_leverage_refuses_with_exit_5(self):
+        spec = happy_spec()
+        spec["symbol_config"] = [{"symbol": SYMBOL, "leverage": "5"}]
+        code, transport, out = self.validate(spec)
+        self.assertEqual(code, 5)
+        self.assertEqual(transport.posts, [])
+        self.assertIn("PREFLIGHT_REFUSED", out)
+        self.assertIn("5x, not exactly 1x", out)
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_plan_refusal_exits_2_before_any_signed_read(self):
+        cfg = ExecutorConfig(symbol=SYMBOL, sha=SHA, receipt_dir=self.dir,
+                             run_id=RID, min_entry_bps=Decimal("1000000"))
+        code, transport, out = self.validate(happy_spec(), cfg=cfg)
+        self.assertEqual(code, 2)
+        self.assertIn("PLAN_REFUSED", out)
+        self.assertFalse(any(signed for *_rest, signed in transport.calls))
+        self.assertEqual(transport.posts, [])
+        self.assertEqual(os.listdir(self.dir), [])
 
 
 if __name__ == "__main__":
