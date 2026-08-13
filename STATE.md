@@ -14,10 +14,11 @@ was never the lead; a fresh operational Lead holds the seat. Process truth
 (measured 2026-08-13): no Task-B process on the Mac; no quant unit, timer,
 unit file, process, or cron entry on the host.
 
-QUARANTINE: the Task-B draft — src/host_once.py, deploy/ unit templates,
-tests/, edits to wallet.py, futures_hand.py, events.py, plus 10 LOGS rows —
-sits uncommitted in Desktop/quant, held unchanged: no merge, delete, deploy,
-run, or repair. All wave work runs in clean worktrees from the reset SHA. One
+TASK-B DISPOSITION (owner word 2026-08-13): the cancelled draft was first
+stashed as CANCELLED-TASK-B-DO-NOT-APPLY, then on the owner's removal order
+preserved whole to ~/.Trash/task-b-cancelled-*/ (tracked patch + untracked
+files) and dropped from the repo. It exists nowhere in the live tree, index,
+or stash (verified). The old worker chat must never press Undo. One
 un-retired worktree remains: ~/.codex/worktrees/2ae9/quant @ dd474b2 (blocked
 futures task; its branch is pushed to origin); retirement awaits a later word.
 
