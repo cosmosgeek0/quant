@@ -40,10 +40,15 @@ since reported enabling it — UNVERIFIED, no fresh preflight run. No futures
 order, live or test, has ever been sent. USD-M wallet held 1.00000000 USDT at
 the last snapshot; its origin was a 2026-07-20 internal transfer (LOGS).
 
-NOW RUNNING — PRODUCT WAVE (orders in TASK.md): four lanes in clean worktrees
-from the reset SHA — BASIS-READ, FUTURES-SHORT (offline), VOLUME (paper), UI
-(read-only). No host runner, no live action this wave. The Lead integrates
-the smallest src/basis_cycle.py after BASIS-READ and FUTURES-SHORT land.
+WAVE-1 LANDED (2026-08-13, measured): all four lanes DONE and merged with the
+Lead's src/basis_cycle.py (spot-long + USD-M-short lifecycle, offline only,
+exchange-truth fee-aware sizing, quoteOrderQty-bounded entry, short-leg-first
+exit) at candidate 3046dd975bf10f67f0e0da3f78b0b02e33433027 on main. An
+adversarial 4-lens panel confirmed 9 findings (1 HIGH); all repaired before
+the merge; 113 offline tests green. Nothing deployed, nothing live, no host
+action; quarantine unchanged. NEXT, on owner word only: the executor wave —
+arming the cycle on the host — plus the futures-capability preflight, still
+UNVERIFIED since 2026-08-12.
 
 PARKED, awaiting owner words someday: L6 reverse-basis spec (needs borrow
 power); L8's seven old-project import candidates (per-item permits); the
