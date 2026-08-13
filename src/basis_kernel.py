@@ -243,7 +243,7 @@ class KernelConfig:
             raise ValueError(
                 "config requires min_hold_ms <= default_hold_ms <= max_hold_ms"
             )
-        if self.max_hold_ms // self.funding_period_ms > 1000:
+        if self.max_hold_ms > 1000 * self.funding_period_ms:
             raise ValueError("config max_hold_ms/funding_period_ms must be <= 1000")
         if self.gap_window_size < 3 or self.funding_history_keep < 3:
             raise ValueError("config rolling windows must be >= 3")
@@ -906,6 +906,7 @@ def funding_carry_pct(
     period_ms: Any,
     known_rates: Sequence[Any],
     direction: str,
+    rate_sanity_abs_max: Any = DEFAULT_CONFIG.rate_sanity_abs_max,
 ) -> Optional[Decimal]:
     """Funding carry over the hold in PERCENT via DISCRETE settlements (KEEP).
 
@@ -914,23 +915,31 @@ def funding_carry_pct(
     crossings = 1 + floor((hold - ms_to_next)/period); a crossing whose
     settlement rate is not in known_rates makes the whole carry None (an
     unknown settlement stays unknown).  Used rates must be finite fractions
-    with abs <= 0.1.  sign = +1 for long_spot_short_perp (the short perp
-    leg RECEIVES positive funding), -1 for short_spot_long_perp.
+    with abs <= rate_sanity_abs_max (0.1 by default).  sign = +1 for
+    long_spot_short_perp (the short perp leg RECEIVES positive funding), -1
+    for short_spot_long_perp.
     carry_pct = sum(rate_i) * 100 * sign.
     """
     sign = _DIRECTION_SIGN.get(direction)
     hold = _dec(hold_ms)
     ms_to_next = _dec(ms_to_next_ms)
     period = _dec(period_ms)
-    if sign is None or hold is None or ms_to_next is None or period is None:
+    sanity_cap = _dec(rate_sanity_abs_max)
+    if (
+        sign is None or hold is None or ms_to_next is None or period is None
+        or sanity_cap is None
+    ):
         return None
-    if hold < 0 or ms_to_next <= 0 or period <= 0:
+    if hold < 0 or ms_to_next <= 0 or period <= 0 or sanity_cap <= 0:
         return None
     if ms_to_next > hold:
         return Decimal(0)
     with localcontext() as context:
         context.prec = PRECISION
-        crossings_dec = Decimal(1) + (hold - ms_to_next) // period
+        try:
+            crossings_dec = Decimal(1) + (hold - ms_to_next) // period
+        except InvalidOperation:
+            return None
         if crossings_dec > MAX_SAFE_INTEGER:
             return None
         crossings = int(crossings_dec)
@@ -939,7 +948,7 @@ def funding_carry_pct(
         total = Decimal(0)
         for raw in list(known_rates)[:crossings]:
             rate = _dec(raw)
-            if rate is None or abs(rate) > DEFAULT_CONFIG.rate_sanity_abs_max:
+            if rate is None or abs(rate) > sanity_cap:
                 return None
             total += rate
         return total * Decimal(100) * sign
@@ -1039,14 +1048,15 @@ def funding_context(
 ) -> FundingContext:
     """Fresh-or-all-null funding view (KEEP: fail closed, never prorated).
 
-    Fresh only if ALL hold: mark exists; rate finite with abs <= 0.1;
-    mark_price finite > 0; mark.ts a positive safe integer; staleness known
-    and within [-max_future_skew_ms, funding_stale_ms]; next_funding_ts a
-    safe integer STRICTLY > now (a past schedule cannot manufacture a
-    settlement).  Not fresh -> rate/carry/flip all None, capture 0,
-    expected hold still computed, reported staleness floored at 0.  The
-    engine knows only the CURRENT rate, so any hold crossing >= 2
-    settlements yields carry None by construction.
+    Fresh only if ALL hold: mark exists; rate finite with abs within the
+    configured sanity cap; mark_price finite > 0; mark.ts a positive safe
+    integer; staleness known and within
+    [-max_future_skew_ms, funding_stale_ms]; next_funding_ts a safe integer
+    STRICTLY > now (a past schedule cannot manufacture a settlement).  Not
+    fresh -> rate/carry/flip all None, capture 0, expected hold still
+    computed, reported staleness floored at 0.  The engine knows only the
+    CURRENT rate, so any hold crossing >= 2 settlements yields carry None
+    by construction.
     """
     cfg = config if config is not None else DEFAULT_CONFIG
     hold = expected_hold_ms(gap_pct, slope, cfg)
@@ -1090,7 +1100,8 @@ def funding_context(
         context.prec = PRECISION
         ms_to_funding = Decimal(next_ts - now_ms)
     raw_carry = funding_carry_pct(
-        hold, ms_to_funding, cfg.funding_period_ms, [rate], direction
+        hold, ms_to_funding, cfg.funding_period_ms, [rate], direction,
+        rate_sanity_abs_max=cfg.rate_sanity_abs_max,
     )
     risk = flip_risk(history_rates, rate, cfg)
     carry = discounted_carry_pct(raw_carry, risk)

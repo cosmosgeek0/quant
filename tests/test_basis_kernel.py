@@ -624,6 +624,15 @@ class FundingContextFixtures(KernelAssertions):
         self.assertClose(ctx.carry_pct, expected["carryPctOverHold"])
         self.assertClose(ctx.capture_factor, expected["captureFactor"])
 
+    def test_ctx_uses_configured_rate_sanity_cap(self):
+        cfg = bk.KernelConfig(rate_sanity_abs_max=D("0.2"))
+        mark = bk.FundingMark(D(100), D("0.15"), NOW + 60_000, NOW)
+        ctx = bk.funding_context(
+            mark, 0, (), bk.DIRECTION_NORMAL, D(1), D(0), NOW, cfg
+        )
+        self.assertTrue(ctx.fresh)
+        self.assertEqual(ctx.carry_raw_pct, D(15))
+
     def test_ctx_stale_mark_all_null(self):
         inputs, expected = fixture("funding", "ctx_stale_mark_all_null")
         self.assertEqual(inputs["cfg"]["fundingStaleMs"], CFG.funding_stale_ms)
@@ -1099,6 +1108,11 @@ class NullGuardTests(KernelAssertions):
         self.assertIsNone(bk.funding_carry_pct(D("NaN"), 60_000, 28_800_000,
                                                rates, bk.DIRECTION_NORMAL))
 
+    def test_carry_extreme_crossing_count_returns_none(self):
+        self.assertIsNone(bk.funding_carry_pct(
+            D("1e100"), 1, 1, (), bk.DIRECTION_NORMAL
+        ))
+
     def test_flip_risk_null_guards_and_finite_filter(self):
         self.assertIsNone(bk.flip_risk(None))
         self.assertIsNone(bk.flip_risk([D("0.0001")] * 2))
@@ -1358,6 +1372,10 @@ class ConfigValidationTests(KernelAssertions):
     def test_hold_to_period_ratio_capped_at_1000(self):
         with self.assertRaises(ValueError):
             bk.KernelConfig(funding_period_ms=60_000)  # 86400000/60000 > 1000
+
+    def test_hold_to_period_ratio_rejects_fraction_above_1000(self):
+        with self.assertRaises(ValueError):
+            bk.KernelConfig(funding_period_ms=86_399)
 
     def test_zero_funding_period_throws(self):
         # Old suite: updateConfig({fundingPeriodMs: 0}) throws.
