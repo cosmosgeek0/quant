@@ -1,11 +1,17 @@
 "use strict";
 
-/* quant read-only screen.
-   Pure functions first (also loadable in Node for headless verification),
-   DOM wiring at the bottom, guarded so this file needs no build step. */
+/* quant read-only screen, served runtime.
+   Every section is fetched over HTTP from ui/serve.py's read-only GET
+   endpoints — no file:// path, no fixture-only assumption. Absent sources
+   are shown as honest "nothing yet" states, exactly as the server reports
+   them. Pure functions first (also loadable in Node for headless
+   verification), DOM wiring at the bottom. */
 
 var PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT";
-var FIXTURE_PATH = "fixtures/events.jsonl";
+var EVENTS_URL = "/api/events";
+var BASIS_URL = "/api/basis";
+var FUTURES_URL = "/api/futures";
+var VOLUME_URL = "/api/volume";
 
 /* ---------- pure: contract-v1 rendering ---------- */
 
@@ -72,6 +78,35 @@ function groupRuns(events) {
   return order.map(function (id) { return byId[id]; });
 }
 
+/* One volume paper receipt record -> one factual display row, verbatim fields. */
+function paperReceiptRow(rec) {
+  var d = [];
+  if (rec.side) d.push(rec.side);
+  if (rec.qty) d.push("qty " + rec.qty);
+  if (rec.price) d.push("price " + rec.price);
+  if (rec.paper_cost) d.push("paper cost " + rec.paper_cost);
+  if (rec.paper_proceeds) d.push("paper proceeds " + rec.paper_proceeds);
+  if (rec.paper_pnl_quote) d.push("paper pnl " + rec.paper_pnl_quote);
+  if (rec.exit_reason) d.push("exit " + rec.exit_reason);
+  if (rec.trail_pct) d.push("trail " + rec.trail_pct);
+  if (rec.trail_stop_price) d.push("trail stop " + rec.trail_stop_price);
+  if (rec.peak_price) d.push("peak " + rec.peak_price);
+  if (rec.paper === true) d.push("paper: true");
+  if (rec.note) d.push(rec.note);
+  return { ts: rec.ts, kind: rec.kind, detail: d.join(" · "), run_id: rec.run_id };
+}
+
+/* Any receipt/state object -> [key, value-as-string] pairs, key-sorted,
+   values verbatim (nested objects shown as their JSON). */
+function receiptPairs(obj) {
+  if (!obj || typeof obj !== "object") return [];
+  return Object.keys(obj).sort().map(function (k) {
+    var v = obj[k];
+    var s = (v !== null && typeof v === "object") ? JSON.stringify(v) : String(v);
+    return [k, s];
+  });
+}
+
 /* ---------- DOM wiring (browser only) ---------- */
 
 if (typeof document !== "undefined") {
@@ -83,58 +118,155 @@ if (typeof document !== "undefined") {
     return n;
   }
 
-  function renderRuns(events) {
-    var root = document.getElementById("runs");
+  function table(headers) {
+    var t = el("table");
+    var thead = el("thead");
+    var hr = el("tr");
+    headers.forEach(function (h) { hr.appendChild(el("th", null, h)); });
+    thead.appendChild(hr);
+    t.appendChild(thead);
+    var tbody = el("tbody");
+    t.appendChild(tbody);
+    return { table: t, tbody: tbody };
+  }
+
+  function rowTr(row) {
+    var tr = el("tr");
+    tr.setAttribute("data-kind", row.kind);
+    [["ts", row.ts], ["kind", row.kind], ["detail", row.detail]].forEach(function (p) {
+      tr.appendChild(el("td", p[0], p[1]));
+    });
+    return tr;
+  }
+
+  function sourceMeta(source, present) {
+    return el("p", "meta", "source: " + source + (present ? "" : " (absent)"));
+  }
+
+  function clearTo(id) {
+    var root = document.getElementById(id);
     root.textContent = "";
-    if (events.length === 0) {
+    return root;
+  }
+
+  function couldNotLoad(id, url, err) {
+    var root = clearTo(id);
+    root.appendChild(el("p", "empty",
+      "could not load " + url + " (" + err.message + ")"));
+  }
+
+  function getJson(url, render, targetId) {
+    fetch(url)
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(render)
+      .catch(function (err) { couldNotLoad(targetId, url, err); });
+  }
+
+  /* -- spot: contract-v1 events ------------------------------------- */
+  function renderEvents(payload) {
+    var root = clearTo("runs");
+    root.appendChild(sourceMeta(payload.source, payload.present));
+    if (!payload.present || payload.count === 0) {
       root.appendChild(el("p", "empty", "nothing yet — no events recorded"));
       return;
     }
-    groupRuns(events).forEach(function (run) {
+    groupRuns(payload.events).forEach(function (run) {
       var box = el("div", "run");
       var head = el("p", "run-head");
       head.appendChild(el("span", null, "run " + run.run_id));
       head.appendChild(el("span", "muted",
         "  · " + (run.symbol || "") + " · sha8 " + (run.sha8 || "")));
       box.appendChild(head);
-
-      var table = el("table");
-      var thead = el("thead");
-      var hr = el("tr");
-      ["ts (UTC)", "kind", "detail"].forEach(function (h) { hr.appendChild(el("th", null, h)); });
-      thead.appendChild(hr);
-      table.appendChild(thead);
-
-      var tbody = el("tbody");
-      run.events.forEach(function (ev) {
-        var row = eventRow(ev);
-        var tr = el("tr");
-        tr.setAttribute("data-kind", row.kind);
-        var tds = [["ts", row.ts], ["kind", row.kind], ["detail", row.detail]];
-        tds.forEach(function (p) { tr.appendChild(el("td", p[0], p[1])); });
-        tbody.appendChild(tr);
-      });
-      table.appendChild(tbody);
-      box.appendChild(table);
+      var t = table(["ts (UTC)", "kind", "detail"]);
+      run.events.forEach(function (ev) { t.tbody.appendChild(rowTr(eventRow(ev))); });
+      box.appendChild(t.table);
       root.appendChild(box);
     });
   }
 
-  function loadFixture() {
-    fetch(FIXTURE_PATH)
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.text();
-      })
-      .then(function (text) { renderRuns(parseJsonl(text)); })
-      .catch(function (err) {
-        var root = document.getElementById("runs");
-        root.textContent = "";
-        root.appendChild(el("p", "empty",
-          "could not load " + FIXTURE_PATH + " (" + err.message + ")"));
+  /* -- basis: recorded basis_read output ------------------------------ */
+  function renderBasis(payload) {
+    var root = clearTo("basis");
+    root.appendChild(sourceMeta(payload.source, payload.present));
+    if (!payload.present || payload.rows.length === 0) {
+      root.appendChild(el("p", "empty", "nothing yet — no basis read recorded"));
+      return;
+    }
+    payload.formulas.forEach(function (f) { root.appendChild(el("p", "meta", f)); });
+    var t = table(payload.columns);
+    payload.rows.forEach(function (row) {
+      var tr = el("tr");
+      payload.columns.forEach(function (c) {
+        tr.appendChild(el("td", "detail", row[c]));
       });
+      t.tbody.appendChild(tr);
+    });
+    root.appendChild(t.table);
   }
 
+  /* -- futures: receipts from the receipt dir ------------------------- */
+  function renderFutures(payload) {
+    var root = clearTo("futures");
+    root.appendChild(sourceMeta(payload.source, payload.present));
+    if (!payload.present || payload.count === 0) {
+      root.appendChild(el("p", "empty", "nothing yet — no futures receipts recorded"));
+      return;
+    }
+    payload.receipts.forEach(function (entry) {
+      var box = el("div", "run");
+      box.appendChild(el("p", "run-head", entry.file));
+      if (!entry.receipt) {
+        box.appendChild(el("p", "empty",
+          "unreadable receipt (" + (entry.error || "unknown") + ")"));
+      } else {
+        var t = table(["field", "value"]);
+        receiptPairs(entry.receipt).forEach(function (pair) {
+          var tr = el("tr");
+          tr.appendChild(el("td", "kind", pair[0]));
+          tr.appendChild(el("td", "detail", pair[1]));
+          t.tbody.appendChild(tr);
+        });
+        box.appendChild(t.table);
+      }
+      root.appendChild(box);
+    });
+  }
+
+  /* -- volume: paper receipts + state --------------------------------- */
+  function renderVolume(payload) {
+    var root = clearTo("volume");
+    var receipts = payload.receipts;
+    root.appendChild(sourceMeta(receipts.source, receipts.present));
+    if (!receipts.present || receipts.count === 0) {
+      root.appendChild(el("p", "empty", "nothing yet — no volume paper receipts"));
+    } else {
+      var t = table(["ts (UTC)", "kind", "detail"]);
+      receipts.records.forEach(function (rec) {
+        t.tbody.appendChild(rowTr(paperReceiptRow(rec)));
+      });
+      root.appendChild(t.table);
+    }
+    var state = payload.state;
+    if (state.present && state.state) {
+      root.appendChild(el("p", "run-head", "volume state"));
+      var st = table(["field", "value"]);
+      receiptPairs(state.state).forEach(function (pair) {
+        var tr = el("tr");
+        tr.appendChild(el("td", "kind", pair[0]));
+        tr.appendChild(el("td", "detail", pair[1]));
+        st.tbody.appendChild(tr);
+      });
+      root.appendChild(st.table);
+    } else {
+      root.appendChild(el("p", "meta",
+        "no volume state file (" + state.source + " absent)"));
+    }
+  }
+
+  /* -- live price: the one control, unchanged public endpoint --------- */
   function fetchPrice() {
     var btn = document.getElementById("refresh");
     var priceEl = document.getElementById("price");
@@ -161,11 +293,20 @@ if (typeof document !== "undefined") {
   }
 
   document.getElementById("refresh").addEventListener("click", fetchPrice);
-  loadFixture();
+  getJson(EVENTS_URL, renderEvents, "runs");
+  getJson(BASIS_URL, renderBasis, "basis");
+  getJson(FUTURES_URL, renderFutures, "futures");
+  getJson(VOLUME_URL, renderVolume, "volume");
   fetchPrice();
 }
 
 /* ---------- Node export for headless verification ---------- */
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { eventRow: eventRow, parseJsonl: parseJsonl, groupRuns: groupRuns };
+  module.exports = {
+    eventRow: eventRow,
+    parseJsonl: parseJsonl,
+    groupRuns: groupRuns,
+    paperReceiptRow: paperReceiptRow,
+    receiptPairs: receiptPairs
+  };
 }

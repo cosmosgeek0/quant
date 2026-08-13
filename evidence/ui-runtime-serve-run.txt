@@ -1,0 +1,348 @@
+UI-RUNTIME headless evidence run — 2026-08-13T00:52:05Z
+worktree: /Users/cosmosgeek/Desktop/worktrees/ui-runtime @ 0cffc89636743a32838d0163aee2ad3e26bd9bd0 branch lane/ui-runtime
+note: ports 8907/8908 must be free before the run
+
+== start server A (real sources) on 127.0.0.1:8907 ==
+== start server B (every source pointed at a nonexistent path) on 127.0.0.1:8908 ==
+both servers up: serving quant ui (read-only, GET/HEAD only) on http://127.0.0.1:8907/ / serving quant ui (read-only, GET/HEAD only) on http://127.0.0.1:8908/
+
+==== verify.py against server A (present mode: real recorded data) ====
+OK  HTTP 200 / (1939 bytes)
+OK  HTTP 200 /index.html (1939 bytes)
+OK  HTTP 200 /app.js (11054 bytes)
+OK  HTTP 200 /style.css (2178 bytes)
+OK  static: 1 refresh control; app.js wired to all 4 /api/ endpoints + price endpoint; no direct fixture fetch
+OK  /api/health: read_only, bind 127.0.0.1, sources:
+      basis = /Users/cosmosgeek/Desktop/worktrees/ui-runtime/evidence/basis-read-live-run.txt
+      events = /Users/cosmosgeek/Desktop/worktrees/ui-runtime/ui/fixtures/events.jsonl
+      futures_dir = /Users/cosmosgeek/quant_receipts
+      volume_receipts = /Users/cosmosgeek/Desktop/worktrees/ui-runtime/paper_receipts.jsonl
+      volume_state = /Users/cosmosgeek/Desktop/worktrees/ui-runtime/volume_state.json
+OK  /api/events: 9 real events, 2 runs, CLOSED run 6a7c98c70019a8 (7 events); 9 rendered rows, 0 empty
+OK  /api/basis: 2 recorded rows ['BTCUSDT', 'ETHUSDT'], 13 columns, 4 formula lines
+OK  /api/futures: dir absent (/Users/cosmosgeek/quant_receipts), honest 0 receipts, none invented
+OK  /api/volume: 2 paper receipts (all paper:true) rendered; state honestly absent
+OK  POST /api/events -> 405 (read-only server, no mutating endpoint)
+VERDICT: PASS
+
+==== verify.py against server B (absent mode: honest empties) ====
+OK  /api/events absent -> present:false, 0 events, none invented
+OK  /api/basis absent -> present:false, 0 rows, text null
+OK  /api/futures absent -> present:false, 0 receipts, none invented
+OK  /api/volume absent -> receipts present:false 0 rows, state null
+OK  POST /api/events -> 405 (read-only server, no mutating endpoint)
+VERDICT: PASS (absent sources answered honestly)
+
+==== raw endpoint transcript — server A (real sources) ====
+--- GET /api/health ---
+{
+ "ok": true,
+ "read_only": true,
+ "bind": "127.0.0.1",
+ "methods": [
+  "GET",
+  "HEAD"
+ ],
+ "sources": {
+  "events": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/ui/fixtures/events.jsonl",
+  "basis": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/evidence/basis-read-live-run.txt",
+  "futures_dir": "/Users/cosmosgeek/quant_receipts",
+  "volume_receipts": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/paper_receipts.jsonl",
+  "volume_state": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/volume_state.json"
+ }
+}
+--- GET /api/events ---
+{
+ "source": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/ui/fixtures/events.jsonl",
+ "present": true,
+ "count": 9,
+ "events": [
+  {
+   "ts": "2026-08-12T15:52:45Z",
+   "sha8": "d1b204bc",
+   "kind": "run_start",
+   "run_id": "6a7c96cdb1754b",
+   "symbol": "BTCUSDT",
+   "balances": {
+    "BTC": "0.00000000",
+    "USDT": "95.62398534"
+   },
+   "note": "ceiling 5 USDT"
+  },
+  {
+   "ts": "2026-08-12T15:52:46Z",
+   "sha8": "d1b204bc",
+   "kind": "run_verdict",
+   "run_id": "6a7c96cdb1754b",
+   "symbol": "BTCUSDT",
+   "verdict": "REJECTED_BEFORE_BUY",
+   "note": "approved 5 USDT too small to sell back after fees and step rounding; sufficient minimum ~6.28 USDT; no order submitted"
+  },
+  {
+   "ts": "2026-08-12T16:01:11Z",
+   "sha8": "d1b204bc",
+   "kind": "run_start",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "balances": {
+    "BTC": "0.00000000",
+    "USDT": "95.62398534"
+   },
+   "note": "ceiling 10 USDT"
+  },
+  {
+   "ts": "2026-08-12T16:01:11Z",
+   "sha8": "d1b204bc",
+   "kind": "order_submitted",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "side": "BUY",
+   "client_id_last4": "9a8b"
+  },
+  {
+   "ts": "2026-08-12T16:01:12Z",
+   "sha8": "d1b204bc",
+   "kind": "order_terminal",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "side": "BUY",
+   "client_id_last4": "9a8b",
+   "order_id_last4": "8130",
+   "executed": "0.00015000",
+   "quote": "9.51796950",
+   "fees": {
+    "BTC": "0.00000015"
+   },
+   "note": "FILLED"
+  },
+  {
+   "ts": "2026-08-12T16:01:12Z",
+   "sha8": "d1b204bc",
+   "kind": "order_submitted",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "side": "SELL",
+   "client_id_last4": "9a8s"
+  },
+  {
+   "ts": "2026-08-12T16:01:13Z",
+   "sha8": "d1b204bc",
+   "kind": "order_terminal",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "side": "SELL",
+   "client_id_last4": "9a8s",
+   "order_id_last4": "8167",
+   "executed": "0.00014000",
+   "quote": "8.88343680",
+   "fees": {
+    "USDT": "0.00888344"
+   },
+   "note": "FILLED"
+  },
+  {
+   "ts": "2026-08-12T16:01:13Z",
+   "sha8": "d1b204bc",
+   "kind": "balance_snapshot",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "balances": {
+    "BTC": "0.00000985",
+    "USDT": "94.98056920"
+   }
+  },
+  {
+   "ts": "2026-08-12T16:01:13Z",
+   "sha8": "d1b204bc",
+   "kind": "run_verdict",
+   "run_id": "6a7c98c70019a8",
+   "symbol": "BTCUSDT",
+   "verdict": "CLOSED",
+   "residual": "0.00000985",
+   "note": "net quote cost incl fees 0.64341614 USDT; residual is dust below sell step"
+  }
+ ],
+ "parse_errors": 0
+}
+--- GET /api/basis ---
+{
+ "source": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/evidence/basis-read-live-run.txt",
+ "present": true,
+ "text": "entry_gap_quote_formula=usdm_bid-spot_ask\nexit_gap_quote_formula=usdm_ask-spot_bid\nentry_gap_bps_formula=entry_gap_quote/spot_ask*10000;bps_base=spot_ask\nexit_gap_bps_formula=exit_gap_quote/spot_bid*10000;bps_base=spot_bid\ncompleted_utc\tusdm_book_time_utc\tsymbol\tspot_bid\tspot_ask\tusdm_bid\tusdm_ask\tentry_gap_quote\tentry_gap_bps_vs_spot_ask\texit_gap_quote\texit_gap_bps_vs_spot_bid\tfunding_rate\tnext_funding_utc\n2026-08-12T23:44:39.448Z\t2026-08-12T23:44:38.379Z\tBTCUSDT\t63389.99000000\t63390.00000000\t63379.90\t63380.00\t-10.10000000\t-1.59331125\t-9.99000000\t-1.57595860\t0.00006421\t2026-08-13T00:00:00.000Z\n2026-08-12T23:44:40.473Z\t2026-08-12T23:44:39.840Z\tETHUSDT\t1878.20000000\t1878.21000000\t1877.39\t1877.40\t-0.82000000\t-4.36585898\t-0.80000000\t-4.25939730\t0.00005433\t2026-08-13T00:00:00.000Z\n",
+ "formulas": [
+  "entry_gap_quote_formula=usdm_bid-spot_ask",
+  "exit_gap_quote_formula=usdm_ask-spot_bid",
+  "entry_gap_bps_formula=entry_gap_quote/spot_ask*10000;bps_base=spot_ask",
+  "exit_gap_bps_formula=exit_gap_quote/spot_bid*10000;bps_base=spot_bid"
+ ],
+ "columns": [
+  "completed_utc",
+  "usdm_book_time_utc",
+  "symbol",
+  "spot_bid",
+  "spot_ask",
+  "usdm_bid",
+  "usdm_ask",
+  "entry_gap_quote",
+  "entry_gap_bps_vs_spot_ask",
+  "exit_gap_quote",
+  "exit_gap_bps_vs_spot_bid",
+  "funding_rate",
+  "next_funding_utc"
+ ],
+ "rows": [
+  {
+   "completed_utc": "2026-08-12T23:44:39.448Z",
+   "usdm_book_time_utc": "2026-08-12T23:44:38.379Z",
+   "symbol": "BTCUSDT",
+   "spot_bid": "63389.99000000",
+   "spot_ask": "63390.00000000",
+   "usdm_bid": "63379.90",
+   "usdm_ask": "63380.00",
+   "entry_gap_quote": "-10.10000000",
+   "entry_gap_bps_vs_spot_ask": "-1.59331125",
+   "exit_gap_quote": "-9.99000000",
+   "exit_gap_bps_vs_spot_bid": "-1.57595860",
+   "funding_rate": "0.00006421",
+   "next_funding_utc": "2026-08-13T00:00:00.000Z"
+  },
+  {
+   "completed_utc": "2026-08-12T23:44:40.473Z",
+   "usdm_book_time_utc": "2026-08-12T23:44:39.840Z",
+   "symbol": "ETHUSDT",
+   "spot_bid": "1878.20000000",
+   "spot_ask": "1878.21000000",
+   "usdm_bid": "1877.39",
+   "usdm_ask": "1877.40",
+   "entry_gap_quote": "-0.82000000",
+   "entry_gap_bps_vs_spot_ask": "-4.36585898",
+   "exit_gap_quote": "-0.80000000",
+   "exit_gap_bps_vs_spot_bid": "-4.25939730",
+   "funding_rate": "0.00005433",
+   "next_funding_utc": "2026-08-13T00:00:00.000Z"
+  }
+ ],
+ "parse_errors": 0
+}
+--- GET /api/futures ---
+{
+ "source": "/Users/cosmosgeek/quant_receipts",
+ "present": false,
+ "count": 0,
+ "receipts": [],
+ "parse_errors": 0
+}
+--- GET /api/volume ---
+{
+ "receipts": {
+  "source": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/paper_receipts.jsonl",
+  "present": true,
+  "count": 2,
+  "records": [
+   {
+    "kind": "paper_entry",
+    "note": "paper only; no real order path",
+    "paper": true,
+    "paper_cost": "10.00000000",
+    "paper_notional_requested": "10",
+    "price": "100",
+    "qty": "0.10000000",
+    "run_id": "paperdemo20260813",
+    "seq": 0,
+    "side": "BUY",
+    "symbol": "BTCUSDT",
+    "trail_pct": "0.05",
+    "ts": "2026-08-12T23:46:04.453Z"
+   },
+   {
+    "exit_reason": "trail_stop",
+    "kind": "paper_exit",
+    "note": "paper only; no real order path",
+    "paper": true,
+    "paper_pnl_quote": "0.40000000",
+    "paper_proceeds": "10.40000000",
+    "peak_price": "110",
+    "price": "104",
+    "qty": "0.10000000",
+    "run_id": "paperdemo20260813",
+    "seq": 4,
+    "side": "SELL",
+    "symbol": "BTCUSDT",
+    "trail_stop_price": "104.50",
+    "ts": "2026-08-12T23:46:04.453Z"
+   }
+  ],
+  "parse_errors": 0
+ },
+ "state": {
+  "source": "/Users/cosmosgeek/Desktop/worktrees/ui-runtime/volume_state.json",
+  "present": false,
+  "state": null,
+  "parse_errors": 0
+ }
+}
+--- GET / (page, first 3 lines + button/count checks) ---
+<!doctype html>
+<html lang="en">
+<head>
+button-count=1
+--- POST /api/events (must be refused) ---
+{
+ "error": "read-only server: GET and HEAD only; no mutating endpoint exists",
+ "method": "POST"
+}
+http_code=405
+
+==== raw endpoint transcript — server B (absent sources) ====
+--- GET /api/events ---
+{
+ "source": "/private/tmp/claude-501/-Users-cosmosgeek-Desktop/6caf918f-adcf-4a75-b869-ea289e79a5ab/scratchpad/ui-evidence/nowhere/events.jsonl",
+ "present": false,
+ "count": 0,
+ "events": [],
+ "parse_errors": 0
+}
+--- GET /api/basis ---
+{
+ "source": "/private/tmp/claude-501/-Users-cosmosgeek-Desktop/6caf918f-adcf-4a75-b869-ea289e79a5ab/scratchpad/ui-evidence/nowhere/basis.txt",
+ "present": false,
+ "text": null,
+ "formulas": [],
+ "columns": [],
+ "rows": [],
+ "parse_errors": 0
+}
+--- GET /api/futures ---
+{
+ "source": "/private/tmp/claude-501/-Users-cosmosgeek-Desktop/6caf918f-adcf-4a75-b869-ea289e79a5ab/scratchpad/ui-evidence/nowhere/receipts",
+ "present": false,
+ "count": 0,
+ "receipts": [],
+ "parse_errors": 0
+}
+--- GET /api/volume ---
+{
+ "receipts": {
+  "source": "/private/tmp/claude-501/-Users-cosmosgeek-Desktop/6caf918f-adcf-4a75-b869-ea289e79a5ab/scratchpad/ui-evidence/nowhere/paper_receipts.jsonl",
+  "present": false,
+  "count": 0,
+  "records": [],
+  "parse_errors": 0
+ },
+ "state": {
+  "source": "/private/tmp/claude-501/-Users-cosmosgeek-Desktop/6caf918f-adcf-4a75-b869-ea289e79a5ab/scratchpad/ui-evidence/nowhere/volume_state.json",
+  "present": false,
+  "state": null,
+  "parse_errors": 0
+ }
+}
+absent receipts dir still absent after reads: yes — nothing created
+
+== stop both servers ==
+/private/tmp/claude-501/-Users-cosmosgeek-Desktop/6caf918f-adcf-4a75-b869-ea289e79a5ab/scratchpad/ui-evidence-run.sh: line 87: 34268 Terminated: 15          python3 "$W/ui/serve.py" --port 8908 --events-file "$S/nowhere/events.jsonl" --basis-file "$S/nowhere/basis.txt" --futures-dir "$S/nowhere/receipts" --volume-receipts "$S/nowhere/paper_receipts.jsonl" --volume-state "$S/nowhere/volume_state.json" > "$S/serveB.out" 2> "$S/serveB.err"
+both servers stopped; ports 8907/8908 no longer answer
+EVIDENCE-RUN VERDICT: PASS
+
+==== live public price endpoint (the page's one control target; unsigned public GET) ====
+{"symbol":"BTCUSDT","price":"63574.02000000"}
+http_code=200
