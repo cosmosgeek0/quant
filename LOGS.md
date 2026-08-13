@@ -9,6 +9,15 @@ every step.
 
 ---
 
+VALIDATE + UNIVERSE SCAN 2026-08-13 | owner order: results regardless of sign | code 945b7f89
+change | validate-only decoupled from plan outcome (conservative 10-USDT margin fallback) | src/basis_scan.py public sweep added | 303 tests green
+host validate | BTCUSDT: PLAN_REFUSED entry gap -5.09 bps, then PREFLIGHT_REFUSED actual leverage 10x | exit 5 | zero POSTs
+host validate | ETHUSDT: -3.57 bps then leverage 5x refuse | SOLUSDT: -7.92 bps then leverage 5x refuse | both exit 5 | zero POSTs
+scan | 490 spot USDT x 527 USDT perps -> 358 common with books | positive entry gaps 3: TSTUSDT +20.62 bps, FFUSDT +12.37, BNBUSDT +4.42 | all three fit the 10-USDT cap
+scan | BTCUSDT/ETHUSDT min notionals 50/20 exceed the 10 cap | round-trip fees ESTIMATED ~30 bps from default taker rates, account rates unread
+first failure | nested heredoc over the SSM PTY never wrote the host runner; corrected via verified xfer transfer
+verdict | complete signed path proven live end to end — it refuses on leverage exactly as coded; no order, no leverage change, no account change
+
 LEVERAGE GATE + VALIDATE-ONLY 2026-08-13 | Fable-direct single pass on owner GO | base 5a53ddbb
 code | signed_preflight reads /fapi/v1/symbolConfig and refuses before any order unless actual leverage is exactly 1x | the module never changes leverage
 code | --validate-only added: complete signed preflight with zero POSTs enforced by a GET-only transport wrapper, no lock taken, no receipt written | --plan-only stays unsigned/public
