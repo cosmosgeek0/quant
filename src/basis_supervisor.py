@@ -145,6 +145,54 @@ def _claim(candidate: ProposalCandidate, cfg: PositionConfig, claimant: str,
     try:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError:
+        # The claim is durable before cmd_open starts.  A process can die in
+        # that exact gap, leaving no position, lane lock, or position-command
+        # receipt to resume.  The same supervisor identity may adopt only
+        # that provably unstarted claim; every attempted/foreign claim remains
+        # immutable contention and is never replayed.
+        try:
+            with open(path, encoding="utf-8") as handle:
+                prior_claim = json.load(handle)
+        except (OSError, ValueError, UnicodeError):
+            prior_claim = None
+        attempted = False
+        try:
+            names = os.listdir(cfg.receipt_dir)
+        except OSError:
+            names = []
+            attempted = True
+        for name in names:
+            if not (name.startswith("basis-position-")
+                    and name.endswith(".json")):
+                continue
+            try:
+                with open(os.path.join(cfg.receipt_dir, name),
+                          encoding="utf-8") as handle:
+                    receipt = json.load(handle)
+            except (OSError, ValueError, UnicodeError):
+                attempted = True
+                break
+            if isinstance(receipt, dict) and receipt.get("proposal_id") \
+                    == candidate.proposal_id:
+                attempted = True
+                break
+        try:
+            position = load_position(cfg.receipt_dir)
+        except PositionError:
+            position = None
+            attempted = True
+        if isinstance(position, dict) and position.get("proposal_id") \
+                == candidate.proposal_id:
+            attempted = True
+        same_unstarted_owner = isinstance(prior_claim, dict) \
+            and prior_claim.get("claimant") == _text(claimant, 160) \
+            and isinstance(prior_claim.get("utc"), str) \
+            and not attempted \
+            and not os.path.exists(os.path.join(cfg.receipt_dir, LOCK_FILE))
+        if same_unstarted_owner:
+            _row("CLAIM", "RECOVERED", "proposal %s claimant %s"
+                 % (candidate.proposal_id, _text(claimant, 80)))
+            return True
         _row("CLAIM", "SKIPPED", "proposal %s already owned"
              % candidate.proposal_id)
         return False
