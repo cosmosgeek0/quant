@@ -10,7 +10,7 @@ SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --que
 export BINANCE_API_KEY=$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["BINANCE_API_KEY"])')
 export BINANCE_API_SECRET=$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["BINANCE_API_SECRET"])')
 unset SECRET_JSON
-export QUANT_SHA=__RELEASE_SHA__
+export QUANT_SHA=911cbea09d87cb12c961375db857649d131144e9
 cd "$D/src"
 python3 basis_supervisor.py --tick
 echo "tick exit $?"
