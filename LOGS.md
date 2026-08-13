@@ -9,6 +9,16 @@ every step.
 
 ---
 
+UI-RUNTIME 2026-08-13 | served read-only runtime built | base 0cffc896 branch lane/ui-runtime | code commit d3e69a72 | DONE
+files | ui/serve.py new (stdlib, binds 127.0.0.1 only, GET/HEAD only) + ui/app.js + ui/index.html re-pointed to /api endpoints + ui/verify.py present/absent modes + tests/test_ui_serve.py | no new .md
+endpoints | /api/events /api/basis /api/futures /api/volume /api/health over the actual output paths: events fixture stays the spot source until host outputs wired; futures = RECEIPT_DIR (~/quant_receipts); volume = paper_receipts.jsonl + volume_state.json if present | PASS
+honesty | absent source -> present:false + empty rows, never fabricated; garbage lines counted not repaired; absent dirs never created by reads; POST/PUT/DELETE/PATCH/OPTIONS -> 405; no mutating endpoint | PASS
+evidence | evidence/ui-runtime-serve-run.txt | present mode: 9 real events, CLOSED run 6a7c98c70019a8, 2 basis rows, 2 paper receipts all paper:true, live futures dir honestly absent | absent mode: all endpoints honest empties | both servers stopped, ports closed | PASS
+tests | full suite 134 green first run (113 prior + 21 new test_ui_serve) | py_compile + node --check clean | PASS
+live | one unsigned public price GET -> 200, appended to evidence (the page's single control target, unchanged) | PASS
+failures | none on first test run and first evidence run | child-subagent saturation not possible: no spawn tool exists in this environment, built serial | MEASURED
+verdict | DONE_LOCAL — committed to lane/ui-runtime, not pushed, not merged | pixel/visual look not checked (headless only)
+
 VOLUME-V2 2026-08-13 | wave-2 lane: closed-candle surge + live USDT universe + restart-safe paper positions | base 0cffc896 | branch lane/volume-v2
 built | src/volume_observer.py scan+state commands | klines closed-candle surge, rule+parameters printed | exchangeInfo universe reduced payload 1 GET, cap+spacing stated | paper_state.json atomic writes + candle-watermark idempotency, every record paper:true
 tests | tests/test_volume_observer_v2.py 60 offline deterministic tests (synthetic candles, write-kill-reload, fixture exchangeInfo, offline CLI) | full suite 173 green (was 113) | MEASURED

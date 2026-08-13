@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>quant</h1>
-  <p class="sub">read-only screen &middot; event contract v1 &middot; source: fixtures/events.jsonl</p>
+  <p class="sub">read-only screen &middot; event contract v1 &middot; served by ui/serve.py read-only GET endpoints</p>
 </header>
 
 <section id="live" aria-labelledby="live-h">
@@ -22,21 +22,26 @@
 
 <section id="spot-runs" aria-labelledby="spot-h">
   <h2 id="spot-h">Spot runs &mdash; recorded events</h2>
-  <div id="runs"><p class="meta">loading fixtures/events.jsonl&hellip;</p></div>
+  <div id="runs"><p class="meta">loading /api/events&hellip;</p></div>
+</section>
+
+<section id="basis-reads" aria-labelledby="basis-h">
+  <h2 id="basis-h">Basis reads</h2>
+  <div id="basis"><p class="meta">loading /api/basis&hellip;</p></div>
 </section>
 
 <section id="futures-runs" aria-labelledby="fut-h">
   <h2 id="fut-h">Futures runs</h2>
-  <p class="empty">nothing yet &mdash; no events recorded</p>
+  <div id="futures"><p class="meta">loading /api/futures&hellip;</p></div>
 </section>
 
 <section id="volume-runs" aria-labelledby="vol-h">
-  <h2 id="vol-h">Volume runs</h2>
-  <p class="empty">nothing yet &mdash; no events recorded</p>
+  <h2 id="vol-h">Volume paper runs</h2>
+  <div id="volume"><p class="meta">loading /api/volume&hellip;</p></div>
 </section>
 
 <footer>
-  <p class="meta">Events are shown as recorded, unaltered. Timestamps are UTC as written in the record. The only control on this page is the refresh button above; it re-reads the live price endpoint.</p>
+  <p class="meta">Events and receipts are shown as recorded, unaltered, from the local read-only server (GET and HEAD only; no mutating endpoint). Timestamps are UTC as written in each record. Absent sources are reported as absent, never invented. The only control on this page is the refresh button above; it re-reads the live price endpoint.</p>
 </footer>
 
 <script src="app.js"></script>
