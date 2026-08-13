@@ -13,8 +13,11 @@ read-only GET endpoints over the ACTUAL output files the quant writes:
                 capture of the live public read)
   /api/futures  futures-hand-*.json receipts from RECEIPT_DIR
                 (default ~/quant_receipts, same as src/futures_hand.py)
-  /api/volume   volume paper receipts (paper_receipts.jsonl, same default as
-                src/volume_observer.py) and the volume state file if present
+  /api/volume   volume paper receipts and the paper position state file,
+                both read from src/volume_observer.py's OWN default write
+                paths (DEFAULT_RECEIPT_PATH / DEFAULT_STATE_PATH, imported
+                below) — one shared definition, so the dashboard reads
+                exactly where the volume lane writes
 
 Honesty rules: a missing source answers {"present": false} with empty rows —
 never fabricated data, never an invented placeholder row. Unparseable lines
@@ -33,6 +36,18 @@ from urllib.parse import unquote, urlsplit
 
 UI_DIR = Path(__file__).resolve().parent
 REPO_DIR = UI_DIR.parent
+SRC_DIR = REPO_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# One shared definition for the volume lane's files: the writer module's own
+# constants.  A path hardcoded here once drifted from where the lane actually
+# writes (volume_state.json vs paper_state.json) and the dashboard showed no
+# open paper positions while two existed; importing the writer's constants
+# makes that drift impossible.
+from volume_observer import DEFAULT_RECEIPT_PATH  # noqa: E402
+from volume_observer import DEFAULT_STATE_PATH  # noqa: E402
+
 BIND_HOST = "127.0.0.1"  # localhost only; deliberately not configurable
 DEFAULT_PORT = 8899
 
@@ -58,8 +73,8 @@ def default_sources():
         "events": UI_DIR / "fixtures" / "events.jsonl",
         "basis": REPO_DIR / "evidence" / "basis-read-live-run.txt",
         "futures_dir": futures_dir,
-        "volume_receipts": REPO_DIR / "paper_receipts.jsonl",
-        "volume_state": REPO_DIR / "volume_state.json",
+        "volume_receipts": DEFAULT_RECEIPT_PATH,
+        "volume_state": DEFAULT_STATE_PATH,
     }
 
 
@@ -307,9 +322,11 @@ def main(argv=None):
                         help="futures receipts dir (default RECEIPT_DIR "
                              "or ~/quant_receipts)")
     parser.add_argument("--volume-receipts", type=Path, default=None,
-                        help="volume paper receipts jsonl")
+                        help="volume paper receipts jsonl (default: "
+                             "volume_observer.DEFAULT_RECEIPT_PATH)")
     parser.add_argument("--volume-state", type=Path, default=None,
-                        help="volume state json (served if present)")
+                        help="volume paper state json, served if present "
+                             "(default: volume_observer.DEFAULT_STATE_PATH)")
     args = parser.parse_args(argv)
 
     overrides = {}

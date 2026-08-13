@@ -130,14 +130,29 @@ def happy_spec():
     }
 
 
+FLAT_POSITION = [{"symbol": SYMBOL, "positionAmt": "0.000"}]
+
+
 class ScriptedTransport:
-    """Injected transport with the (kind, payload) contract of the live one."""
+    """Injected transport with the (kind, payload) contract of the live one.
+
+    Signed preflight reads are served from optional spec keys with tradable
+    defaults: usdm_account_config, spot_account, position_mode,
+    spot_open_orders, usdm_open_orders, usdm_account, preflight_position (the
+    FIRST positionRisk read); "position" stays the final flatness read. Any
+    of them may be a (kind, payload) tuple to script a non-ok transport kind.
+    """
 
     def __init__(self, spec):
         self.spec = spec
         self.calls = []
         self.posts = []
         self.query_counts = {}
+        self.position_reads = 0
+
+    def scripted(self, key, default):
+        entry = self.spec.get(key, default)
+        return entry if isinstance(entry, tuple) else ("ok", entry)
 
     def __call__(self, method, base_url, path, params=None, signed=False):
         params = dict(params or {})
@@ -159,10 +174,23 @@ class ScriptedTransport:
             trades = self.spec.get("my_trades", {}).get(
                 str(params.get("orderId")), [])
             return ("ok", trades)
+        if path == "/fapi/v1/accountConfig":
+            return self.scripted("usdm_account_config", {"canTrade": True})
+        if path == "/api/v3/account":
+            return self.scripted("spot_account", {"canTrade": True})
+        if path == "/fapi/v3/account":
+            return self.scripted("usdm_account", {"availableBalance": "1000"})
+        if path == "/fapi/v1/positionSide/dual":
+            return self.scripted("position_mode", {"dualSidePosition": False})
+        if path.endswith("openOrders"):
+            key = "spot_open_orders" if base_url == SPOT_URL \
+                else "usdm_open_orders"
+            return self.scripted(key, [])
         if path.endswith("positionRisk"):
-            position = self.spec.get(
-                "position", [{"symbol": SYMBOL, "positionAmt": "0.000"}])
-            return position if isinstance(position, tuple) else ("ok", position)
+            self.position_reads += 1
+            if self.position_reads == 1:
+                return self.scripted("preflight_position", FLAT_POSITION)
+            return self.scripted("position", FLAT_POSITION)
         if path.endswith("/order"):
             cid = params["origClientOrderId"]
             stage = cid.split("-", 2)[2]
@@ -444,6 +472,126 @@ class PartialFillTests(ExecutorCase):
             Decimal("0.048901"))
         verdict = self.events_list()[-1]
         self.assertEqual(Decimal(verdict["residual"]), Decimal("0.048901"))
+
+
+def coarse_step_spec():
+    """Spot step 0.01 vs futures step 1, so the shared (LCM) step is 1.
+    Buy 1.10 base for ~5 USDT, hedge 1; a spot SELL of 1 that fills only
+    0.20 strands residual 0.90 — sellable at the spot step 0.01 although
+    far below the shared step."""
+    spec = happy_spec()
+    spec["spot_info"]["symbols"][0]["filters"] = [
+        {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"},
+        {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.01",
+         "minQty": "0.01"},
+        {"filterType": "NOTIONAL", "minNotional": "5.00000000"},
+    ]
+    spec["usdm_info"]["symbols"][0]["filters"] = [
+        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+        {"filterType": "MARKET_LOT_SIZE", "stepSize": "1", "minQty": "1"},
+        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+    ]
+    spec["spot_book"] = {"symbol": SYMBOL, "bidPrice": "4.99",
+                         "askPrice": "5.00"}
+    spec["usdm_book"] = {"symbol": SYMBOL, "bidPrice": "5.01",
+                         "askPrice": "5.02", "time": 1755000000000}
+    spec["legs"] = {
+        "enter_spot": {
+            "submit": ("ok", {"fills": [
+                {"qty": "1.10", "commission": "0.0055",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("FILLED", "1.10", "5.00", 211222)],
+        },
+        "enter_short": {
+            "submit": ("ok", {}),
+            "query": [term_usdm("FILLED", "1", "5.01", 544555)],
+        },
+        "exit_short": {
+            "submit": ("ok", {}),
+            "query": [term_usdm("FILLED", "1", "5.02", 544556)],
+        },
+        "exit_spot": {
+            "submit": ("ok", {"fills": [
+                {"qty": "0.20", "commission": "0.001",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("EXPIRED", "0.20", "1.00", 211223)],
+        },
+        "unwind_spot": {
+            "submit": ("ok", {"fills": [
+                {"qty": "0.20", "commission": "0.001",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("EXPIRED", "0.20", "1.00", 211224)],
+        },
+    }
+    return spec
+
+
+class SpotStepResidualTests(ExecutorCase):
+    """A spot-sell shortfall is judged at the SPOT step, never the shared
+    (LCM) step: residual 0.90 under a shared step of 1 is sellable, not
+    dust. Panel repro: sell of 1.00 fills 0.20, residual 0.90 stranded."""
+
+    def test_exit_spot_shortfall_at_spot_step_is_open_exposure(self):
+        code, transport, _ = self.run_once(coarse_step_spec())
+        self.assertEqual(code, 3)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short", "exit_short",
+                          "exit_spot"])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "OPEN_EXPOSURE")
+        self.assertEqual(
+            Decimal(receipt["result"]["residual_base_from_this_run"]),
+            Decimal("0.90"))
+        self.assertIn("0.20", receipt["exposure"])
+        self.assertIn("0.90", receipt["exposure"])
+        self.assertIn("spot step", receipt["exposure"])
+        self.assertTrue(self.lock_exists())
+        verdict = self.events_list()[-1]
+        self.assertEqual(verdict["verdict"], "OPEN_EXPOSURE")
+        self.assertEqual(Decimal(verdict["residual"]), Decimal("0.90"))
+
+    def test_unwind_spot_shortfall_at_spot_step_is_open_exposure(self):
+        spec = coarse_step_spec()
+        spec["legs"]["enter_short"] = {
+            "submit": ("api_error", {"code": -2019,
+                                     "msg": "Margin is insufficient."}),
+            "query": [MISSING],
+        }
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 3)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short", "unwind_spot"])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "OPEN_EXPOSURE")
+        self.assertEqual(
+            Decimal(receipt["result"]["residual_base_from_this_run"]),
+            Decimal("0.90"))
+        self.assertIn("0.20", receipt["exposure"])
+        self.assertIn("0.90", receipt["exposure"])
+        self.assertTrue(self.lock_exists())
+
+    def test_full_fill_residual_below_spot_step_is_recorded_dust(self):
+        spec = coarse_step_spec()
+        spec["legs"]["enter_spot"] = {
+            "submit": ("ok", {"fills": [
+                {"qty": "1.005", "commission": "0.005",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("FILLED", "1.005", "5.00", 211222)],
+        }
+        spec["legs"]["exit_spot"] = {
+            "submit": ("ok", {"fills": [
+                {"qty": "1.00", "commission": "0.005",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("FILLED", "1.00", "5.00", 211223)],
+        }
+        code, _, _ = self.run_once(spec)
+        self.assertEqual(code, 0)
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "CLOSED")
+        self.assertEqual(
+            Decimal(receipt["result"]["residual_base_from_this_run"]),
+            Decimal("0.005"))
+        self.assertFalse(self.lock_exists())
 
 
 class ShortRejectionTests(ExecutorCase):
@@ -736,6 +884,150 @@ class SpotBuyEdgeTests(ExecutorCase):
         self.assertEqual(legs[1]["status"], "NOT_SUBMITTED")
 
 
+PREFLIGHT_PATHS = (
+    "/fapi/v1/accountConfig",
+    "/api/v3/account",
+    "/fapi/v1/positionSide/dual",
+    "/api/v3/openOrders",
+    "/fapi/v1/openOrders",
+    "/fapi/v3/positionRisk",
+    "/fapi/v3/account",
+)
+
+
+class SignedPreflightTests(ExecutorCase):
+    """run_once must prove account facts with signed read-only GETs BEFORE
+    any order; every unproven fact refuses with the distinct
+    PREFLIGHT_REFUSED verdict and exit 5, no order sent, lock released."""
+
+    def assert_preflight_refused(self, spec, note_fragment):
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 5)
+        self.assertEqual(transport.posts, [])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "PREFLIGHT_REFUSED")
+        self.assertIn(note_fragment, receipt["verdict_note"])
+        self.assertIn("plan", receipt)  # refused after planning, before orders
+        self.assertFalse(self.lock_exists())
+        return receipt
+
+    def test_signed_preflight_reads_precede_the_first_order(self):
+        code, transport, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 0)
+        first_post = next(index for index, call in enumerate(transport.calls)
+                          if call[0] == "POST")
+        seen = {}
+        for method, _base, path, _params, signed in transport.calls[:first_post]:
+            if method == "GET" and path in PREFLIGHT_PATHS:
+                seen.setdefault(path, signed)
+        self.assertEqual(set(seen), set(PREFLIGHT_PATHS))
+        self.assertTrue(all(seen.values()), "preflight reads must be signed")
+        preflight = self.receipt()["preflight"]
+        self.assertEqual(preflight["position_mode"], "ONE_WAY")
+        self.assertTrue(preflight["futures_can_trade"])
+        self.assertTrue(preflight["spot_can_trade"])
+
+    def test_hedge_mode_refuses_before_any_order(self):
+        spec = happy_spec()
+        spec["position_mode"] = {"dualSidePosition": True}
+        self.assert_preflight_refused(spec, "ONE_WAY")
+
+    def test_unproven_position_mode_refuses(self):
+        spec = happy_spec()
+        spec["position_mode"] = {}
+        self.assert_preflight_refused(spec, "ONE_WAY")
+
+    def test_futures_can_trade_false_refuses(self):
+        spec = happy_spec()
+        spec["usdm_account_config"] = {"canTrade": False}
+        receipt = self.assert_preflight_refused(spec, "canTrade")
+        kinds = [event["kind"] for event in self.events_list()]
+        self.assertEqual(kinds, ["run_start", "gap_read", "run_verdict"])
+        self.assertEqual(self.events_list()[-1]["verdict"],
+                         "PREFLIGHT_REFUSED")
+        self.assertEqual(receipt["legs"], [])
+
+    def test_spot_can_trade_false_refuses(self):
+        spec = happy_spec()
+        spec["spot_account"] = {"canTrade": False}
+        self.assert_preflight_refused(spec, "Spot account canTrade")
+
+    def test_margin_short_refuses(self):
+        # plan short notional is 0.099 * 100.2 = 9.9198 USDT at 1x
+        spec = happy_spec()
+        spec["usdm_account"] = {"availableBalance": "5"}
+        receipt = self.assert_preflight_refused(spec, "short margin")
+        self.assertIn("9.9198", receipt["verdict_note"])
+
+    def test_existing_position_refuses(self):
+        spec = happy_spec()
+        spec["preflight_position"] = [
+            {"symbol": SYMBOL, "positionAmt": "0.010"}]
+        self.assert_preflight_refused(spec, "existing Futures position 0.010")
+
+    def test_hedge_side_position_rows_refuse(self):
+        spec = happy_spec()
+        spec["preflight_position"] = [
+            {"symbol": SYMBOL, "positionAmt": "0.010",
+             "positionSide": "LONG"},
+            {"symbol": SYMBOL, "positionAmt": "-0.010",
+             "positionSide": "SHORT"},
+        ]
+        self.assert_preflight_refused(spec, "cannot prove flatness")
+
+    def test_open_futures_order_refuses(self):
+        spec = happy_spec()
+        spec["usdm_open_orders"] = [{"orderId": 9, "symbol": SYMBOL}]
+        self.assert_preflight_refused(spec, "open order")
+
+    def test_open_spot_order_refuses(self):
+        spec = happy_spec()
+        spec["spot_open_orders"] = [{"orderId": 8, "symbol": SYMBOL}]
+        self.assert_preflight_refused(spec, "open order")
+
+    def test_unreadable_capability_read_refuses(self):
+        spec = happy_spec()
+        spec["usdm_account_config"] = ("unclear", {})
+        self.assert_preflight_refused(spec, "unavailable")
+
+
+class ShortCeilingTests(ExecutorCase):
+    """The short entry's exchange-reported cumQuote is measured against
+    MAX_CYCLE_QUOTE post-fill; a breach is recorded in the receipt and the
+    first-failure mechanism while the ordered reduce-only close contains it."""
+
+    def test_cum_quote_breach_is_recorded_and_contained(self):
+        spec = happy_spec()
+        spec["legs"]["enter_short"]["query"] = [
+            term_usdm("FILLED", "0.098", "10.50000000", 444555)]
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 0)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short", "exit_short",
+                          "exit_spot"])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "CLOSED")
+        short_leg = [leg for leg in receipt["legs"]
+                     if leg["stage"] == "ENTER_SHORT"][0]
+        self.assertEqual(Decimal(short_leg["ceiling_breach"]["cum_quote"]),
+                         Decimal("10.5"))
+        self.assertEqual(
+            Decimal(short_leg["ceiling_breach"]["hard_ceiling_usdt"]),
+            Decimal("10"))
+        self.assertEqual(receipt["first_failure"]["where"],
+                         "enter_short_ceiling")
+        self.assertIn("10.50000000", receipt["first_failure"]["detail"])
+
+    def test_no_breach_records_nothing(self):
+        code, _, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 0)
+        receipt = self.receipt()
+        short_leg = [leg for leg in receipt["legs"]
+                     if leg["stage"] == "ENTER_SHORT"][0]
+        self.assertNotIn("ceiling_breach", short_leg)
+        self.assertNotIn("first_failure", receipt)
+
+
 class FinalStateTests(ExecutorCase):
     def test_nonzero_final_position_downgrades_to_exposure(self):
         spec = happy_spec()
@@ -788,6 +1080,51 @@ class LockAndGateTests(ExecutorCase):
         self.assertEqual(transport.posts, [])
         self.assertEqual(self.receipt()["verdict"], "BLOCKED_UNRESOLVED")
         self.assertTrue(self.lock_exists())
+
+    def test_cross_lane_verdictless_receipt_blocks(self):
+        # A spot_roundtrip-lane receipt with no verdict must block this lane.
+        with open(os.path.join(self.dir, "roundtrip-old.json"), "w") as f:
+            json.dump({"run_id": "old", "buy_client_id": "fmloldb"}, f)
+        code, transport, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 3)
+        self.assertEqual(transport.posts, [])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "BLOCKED_UNRESOLVED")
+        self.assertIn("any lane", receipt["exposure"])
+        self.assertTrue(self.lock_exists())
+
+    def test_cross_lane_receipt_with_verdict_does_not_block(self):
+        with open(os.path.join(self.dir, "futures-hand-x.json"), "w") as f:
+            json.dump({"run_id": "x", "verdict": "CLOSED"}, f)
+        code, transport, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.receipt()["verdict"], "CLOSED")
+        self.assertEqual(len(transport.posts), 4)
+
+    def test_unreadable_cross_lane_json_blocks(self):
+        with open(os.path.join(self.dir, "mystery.json"), "w") as f:
+            f.write("{not json")
+        code, transport, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 3)
+        self.assertEqual(transport.posts, [])
+        self.assertEqual(self.receipt()["verdict"], "BLOCKED_UNRESOLVED")
+        self.assertEqual(self.receipt()["first_failure"]["where"],
+                         "prior_receipt")
+
+    def test_non_object_json_blocks_instead_of_crashing(self):
+        with open(os.path.join(self.dir, "scalar.json"), "w") as f:
+            f.write("5")
+        code, transport, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 3)
+        self.assertEqual(transport.posts, [])
+        self.assertEqual(self.receipt()["verdict"], "BLOCKED_UNRESOLVED")
+
+    def test_non_json_names_do_not_block(self):
+        # .jsonl event streams and lock files are not receipts.
+        with open(os.path.join(self.dir, "events.jsonl"), "w") as f:
+            f.write("")
+        code, _, _ = self.run_once(happy_spec())
+        self.assertEqual(code, 0)
 
 
 class PlanOnlyAndMainTests(ExecutorCase):

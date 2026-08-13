@@ -9,6 +9,23 @@ every step.
 
 ---
 
+WAVE-2 INTEGRATION 2026-08-13 | four lanes merged + panel repairs | base 0b04ff62 | integrator = the Lead
+lanes | capability-fix 4f7a06be | basis-executor 4a1755ab | volume-v2 7ab78306 | ui-runtime 6b45fc37 | all DONE, LOGS stacked, no history lost
+review | 3-lens adversarial panel, 2 refuters per finding | 9 confirmed, 0 refuted | worst: HIGH spot-sell dust threshold at the wrong venue step
+repairs | executor: spot-step shortfall -> OPEN_EXPOSURE with lock held; signed read-only preflight before any order (new PREFLIGHT_REFUSED, exit 5); short cumQuote ceiling breach recorded; receipt gate blocks any verdict-less receipt, any lane
+repairs | volume/UI: /api/volume serves the real paper_state path from one shared constant; runtime state untracked (byte-exact sample kept in evidence/); crash-window closed by receipt replay on load
+evidence | 285 offline tests green (was 255 at merge) | py_compile clean | no POST anywhere, nothing live, stash intact
+first failure | executor lane's first test run had 4 assertion-literal mismatches, fixed in tests, module unchanged
+verdict | CANDIDATE merged to main this commit | live executor deliberately UNVERIFIED until the owner's word
+
+HOST CHECK 2026-08-13 | signed GET-only host read | deploy /home/ssm-user/quant-run/wave2-check-20260813-h1 | no mutation of any kind
+capability | GET /fapi/v1/accountConfig | canTrade=true | CHANGED from 2026-08-12 canTrade=false — that reading was a /fapi/v3/account false-negative | MEASURED
+funds | USD-M USDT wallet 1.00000000 available 1.00000000 | Spot USDT free 94.98056920 | MEASURED
+positions | nonzero positions 0 | positionRisk nonzero rows 0 | open orders 0 | MEASURED
+mode+config | position mode ONE_WAY | symbolConfig BTCUSDT 10x CROSSED, ETHUSDT 5x CROSSED, SOLUSDT 5x CROSSED | exchange-side config; the hand sets 1x one-shot before any order
+first failure | none | seven signed reads first-pass exit 0 | clock offset -68ms | known cosmetic xfer head warning only
+verdict | DONE — the standing capability blocker no longer reports; trade capability stays unproven until a real order
+
 UI-RUNTIME 2026-08-13 | served read-only runtime built | base 0cffc896 branch lane/ui-runtime | code commit d3e69a72 | DONE
 files | ui/serve.py new (stdlib, binds 127.0.0.1 only, GET/HEAD only) + ui/app.js + ui/index.html re-pointed to /api endpoints + ui/verify.py present/absent modes + tests/test_ui_serve.py | no new .md
 endpoints | /api/events /api/basis /api/futures /api/volume /api/health over the actual output paths: events fixture stays the spot source until host outputs wired; futures = RECEIPT_DIR (~/quant_receipts); volume = paper_receipts.jsonl + volume_state.json if present | PASS

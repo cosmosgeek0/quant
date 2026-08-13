@@ -35,8 +35,11 @@ positions persist in ONE JSON state file inside the worktree, are reloaded on
 start, and survive kill/restart without duplication or loss: the state file is
 written atomically (temp file + os.replace), a per-symbol closed-candle
 watermark makes every action idempotent (re-scanning an already-processed
-candle performs no action), and an existing open position blocks a second
-entry for the same symbol.  Every stored record carries "paper": true.
+candle performs no action), an existing open position blocks a second entry
+for the same symbol, and on load the state is reconciled against the receipt
+ledger, replaying any candle receipt a kill stranded between its append and
+the state save — so even a crash inside that window cannot duplicate a
+receipt on restart.  Every stored record carries "paper": true.
 
 There is no real order path anywhere in this module: no credentials, no
 signing, no POST, no order endpoint; the only network calls are unsigned
@@ -913,6 +916,98 @@ def save_paper_state(
     os.replace(temp_path, path)
 
 
+def reconcile_receipts(state: PaperState, receipt_path: Path) -> int:
+    """Roll the loaded state forward over receipts beyond its candle marks.
+
+    Closes the one crash window in the scan paper step: the paper receipt is
+    appended to the ledger BEFORE the state file persists, so a kill between
+    the two leaves the receipt on disk with a stale state, and a naive
+    restart would re-process the candle and append the receipt again.  On
+    load, a candle-bearing receipt (paper_entry/paper_exit carrying
+    candle_close_ms — only the scan step writes those) whose candle is past
+    its symbol's watermark is evidence of exactly that window; replaying it
+    into the state (entry -> reopen the recorded position with its receipt
+    fields, exit -> close the open position, both advancing the watermark)
+    makes the restarted scan skip the already-receipted candle instead of
+    duplicating it.
+
+    Honesty rules: price-series lifecycle receipts (no candle_close_ms)
+    never touched state and are ignored; an unparseable line — the torn tail
+    of a killed append — is skipped, never repaired; a receipt at or below
+    the watermark is already reflected in the state and is skipped; a
+    replayable receipt that contradicts the state (re-entry over an open
+    position, exit without one, exit not matching the open position's entry)
+    raises DataReadError — reconcile repairs the crash window, it never
+    invents or discards positions silently.  Returns the number of receipts
+    replayed; the caller persists the state when that is non-zero.
+    """
+    if not receipt_path.exists():
+        return 0
+    try:
+        with open(receipt_path, encoding="utf-8") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        raise DataReadError(f"paper receipts unreadable: {receipt_path}") from None
+    replayed = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn tail of a killed append; never a completed receipt
+        if not isinstance(record, dict):
+            continue
+        if record.get("kind") not in (ACTION_ENTRY, ACTION_EXIT):
+            continue
+        candle_close_ms = record.get("candle_close_ms")
+        if isinstance(candle_close_ms, bool) or not isinstance(candle_close_ms, int):
+            continue  # price-series lifecycle receipt: no candle, no state
+        symbol = record.get("symbol")
+        if not isinstance(symbol, str) or not SYMBOL_PATTERN.fullmatch(symbol):
+            raise DataReadError("candle receipt has invalid symbol")
+        if candle_close_ms < 0:
+            raise DataReadError(f"candle receipt has invalid candle for {symbol}")
+        if candle_close_ms <= state.candle_marks.get(symbol, -1):
+            continue  # already reflected in the persisted state
+        position = state.positions.get(symbol)
+        if record["kind"] == ACTION_EXIT:
+            if position is None:
+                raise DataReadError(
+                    f"receipt ledger exits {symbol} with no open position in state"
+                )
+            if record.get("entry_run_id") != position.get("run_id"):
+                raise DataReadError(
+                    f"receipt ledger exit for {symbol} does not match "
+                    "the open position"
+                )
+            del state.positions[symbol]
+        else:
+            if position is not None:
+                raise DataReadError(
+                    f"receipt ledger re-enters {symbol} over an open position"
+                )
+            rebuilt = {
+                "paper": True,
+                "run_id": record.get("run_id"),
+                "symbol": record.get("symbol"),
+                "entry_ts": record.get("ts"),
+                "entry_candle_close_ms": candle_close_ms,
+                "entry_price": record.get("price"),
+                "qty": record.get("qty"),
+                "paper_notional_requested": record.get("paper_notional_requested"),
+                "paper_cost": record.get("paper_cost"),
+                "trail_pct": record.get("trail_pct"),
+                "peak_price": record.get("price"),
+                "note": PAPER_NOTE,
+            }
+            state.positions[symbol] = _validate_position_record(symbol, rebuilt)
+        state.candle_marks[symbol] = candle_close_ms
+        replayed += 1
+    return replayed
+
+
 def apply_paper_candle(
     state: PaperState,
     check: SurgeCheck,
@@ -1143,8 +1238,10 @@ def run_scan(
 ) -> List[Tuple[SurgeCheck, str]]:
     """One bounded scan pass: capped klines GETs, factual rows, paper step.
 
-    State is loaded before any action and saved after every mutating paper
-    action, so a kill at any point restarts cleanly without duplication.
+    State is loaded before any action, reconciled against the receipt ledger
+    (closing the crash window between a receipt append and the state save),
+    and saved after every mutating paper action, so a kill at any point
+    restarts cleanly without duplication.
     """
     if not 1 <= max_symbols <= MAX_SCAN_SYMBOLS:
         raise PaperInputError(
@@ -1172,6 +1269,11 @@ def run_scan(
         scan_symbols = seen[:max_symbols]
 
     state = load_paper_state(state_path) if paper_enabled else PaperState()
+    replayed = reconcile_receipts(state, receipt_path) if paper_enabled else 0
+    if replayed:
+        # Persist the repair at once: the ledger receipt(s) a kill stranded
+        # ahead of the state file are now reflected in the state on disk.
+        save_paper_state(state_path, state, now_fn)
     print_scan_header(
         universe_size,
         scan_symbols,
@@ -1182,6 +1284,8 @@ def run_scan(
         paper_enabled,
         state_path if paper_enabled else None,
     )
+    if replayed:
+        print(f"paper_reconcile_replayed_receipts={replayed}")
 
     results: List[Tuple[SurgeCheck, str]] = []
     for index, symbol in enumerate(scan_symbols):

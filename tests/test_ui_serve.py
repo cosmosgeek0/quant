@@ -16,12 +16,16 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from decimal import Decimal
 from pathlib import Path
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(UI_DIR))
+sys.path.insert(0, str(SRC_DIR))
 
 import serve  # noqa: E402
+import volume_observer as vo  # noqa: E402
 
 # Real-shaped sample rows (field shapes match the recorded live data).
 EVENT_LINES = [
@@ -320,6 +324,75 @@ class TestVolumeEndpoint(ServerHarness):
         self.assertFalse(payload["state"]["present"])
 
 
+class TestVolumeWriteReadRoundtrip(ServerHarness):
+    """The defect this guards: /api/volume once read volume_state.json while
+    the volume lane wrote paper_state.json, so the dashboard showed no open
+    paper positions while positions existed.  Here the state is written by
+    volume_observer's OWN entry + save path (default file names) and must
+    come back through the endpoint."""
+
+    FIXED_TS = "2026-08-13T00:00:00.000Z"
+
+    def scan_candles(self):
+        """Four closed candles; the last one surges (volumes 10,20,30,90)."""
+        base_open_ms = 1_600_000_000_000
+        minute_ms = 60_000
+        candles = []
+        for index, volume in enumerate(("10", "20", "30", "90")):
+            open_ms = base_open_ms + index * minute_ms
+            candles.append(vo.Candle(
+                open_time_ms=open_ms,
+                close_time_ms=open_ms + minute_ms - 1,
+                open_price=Decimal("100"),
+                high_price=Decimal("120"),
+                low_price=Decimal("90"),
+                close_price=Decimal("100"),
+                base_volume=Decimal("1"),
+                quote_volume=Decimal(volume),
+                trade_count=5,
+            ))
+        return candles
+
+    def test_endpoint_serves_positions_volume_observer_wrote(self):
+        root = self.tempdir()
+        receipts_path = root / vo.DEFAULT_RECEIPT_PATH.name
+        state_path = root / vo.DEFAULT_STATE_PATH.name
+
+        closed = self.scan_candles()
+        check = vo.evaluate_surge(
+            "AAAUSDT", "1m", closed, 3, Decimal("3"), self.FIXED_TS)
+        self.assertTrue(check.surged)
+        state = vo.PaperState()
+        action = vo.apply_paper_candle(
+            state, check, closed[-1], Decimal("10"), Decimal("0.05"),
+            receipts_path, "uiwire01", lambda: self.FIXED_TS)
+        self.assertEqual(action, "paper_entry")
+        vo.save_paper_state(state_path, state, lambda: self.FIXED_TS)
+
+        base = self.start({"volume_receipts": receipts_path,
+                           "volume_state": state_path})
+        payload = self.get_json(base, "/api/volume")
+
+        receipts = payload["receipts"]
+        self.assertTrue(receipts["present"])
+        self.assertEqual(receipts["count"], 1)
+        self.assertEqual(receipts["parse_errors"], 0)
+        self.assertEqual(receipts["records"][0]["kind"], "paper_entry")
+        self.assertIs(receipts["records"][0]["paper"], True)
+
+        served = payload["state"]
+        self.assertTrue(served["present"])
+        self.assertEqual(served["parse_errors"], 0)
+        self.assertEqual(served["state"]["version"], 1)
+        self.assertIs(served["state"]["paper"], True)
+        position = served["state"]["positions"]["AAAUSDT"]
+        self.assertIs(position["paper"], True)
+        self.assertEqual(position["entry_price"], "100")
+        self.assertEqual(position["qty"], "0.10000000")
+        self.assertEqual(served["state"]["candle_marks"]["AAAUSDT"],
+                         closed[-1].close_time_ms)
+
+
 class TestReadOnlyGuarantees(ServerHarness):
 
     def test_mutating_methods_all_answer_405(self):
@@ -372,7 +445,14 @@ class TestDefaultSources(unittest.TestCase):
                          repo / "evidence" / "basis-read-live-run.txt")
         self.assertEqual(sources["volume_receipts"],
                          repo / "paper_receipts.jsonl")
-        self.assertEqual(sources["volume_state"], repo / "volume_state.json")
+        self.assertEqual(sources["volume_state"], repo / "paper_state.json")
+
+    def test_volume_defaults_are_the_writer_modules_own_constants(self):
+        """One shared definition: the server serves the paths the volume
+        lane actually writes, imported from volume_observer itself."""
+        sources = serve.default_sources()
+        self.assertEqual(sources["volume_receipts"], vo.DEFAULT_RECEIPT_PATH)
+        self.assertEqual(sources["volume_state"], vo.DEFAULT_STATE_PATH)
 
     def test_futures_dir_honors_receipt_dir_env(self):
         old = os.environ.get("RECEIPT_DIR")

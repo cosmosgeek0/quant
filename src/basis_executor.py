@@ -14,11 +14,15 @@ Connects the proven pieces and adds only the missing plumbing:
 
 Flow when it one day runs live (this wave is OFFLINE ONLY — every test injects
 transport; nothing here was run against the network in-lane):
-one basis read -> refuse or proceed per plan_cycle -> Spot BUY bounded by
-quoteOrderQty -> confirm ACTUAL net base = exchange-reported fills minus
-base-asset fees, floored to the shared step -> Futures SELL short exactly that
-quantity -> confirm the actual short fill -> reduce-only BUY close of the EXACT
-short fill -> Spot SELL of the actual remaining base.
+one basis read -> refuse or proceed per plan_cycle -> signed READ-ONLY account
+preflight (futures accountConfig canTrade, spot account canTrade, position
+mode proven ONE_WAY, no position and no open orders on the plan symbol on
+either venue, futures available balance covering the planned short margin at
+1x) -> Spot BUY bounded by quoteOrderQty -> confirm ACTUAL net base =
+exchange-reported fills minus base-asset fees, floored to the shared step ->
+Futures SELL short exactly that quantity -> confirm the actual short fill ->
+reduce-only BUY close of the EXACT short fill -> Spot SELL of the actual
+remaining base.
 
 Discipline (each rule is a paid scar):
 - one submission per leg; order truth is established ONLY by querying that
@@ -30,7 +34,8 @@ Discipline (each rule is a paid scar):
   are appended to a local events.jsonl at the end of the run.
 
 Exit codes: 0 CLOSED | 2 REJECTED_BEFORE_ENTRY or config refusal |
-3 OPEN_EXPOSURE / BLOCKED / BLOCKED_UNRESOLVED | 4 UNKNOWN.
+3 OPEN_EXPOSURE / BLOCKED / BLOCKED_UNRESOLVED | 4 UNKNOWN |
+5 PREFLIGHT_REFUSED (a signed read-only account proof failed; nothing sent).
 """
 
 from __future__ import annotations
@@ -76,7 +81,16 @@ from basis_read import (
     build_basis_read_row,
     now_utc,
 )
-from futures_hand import TERMINAL, api_reason, clean, common_step, d, fmt
+from futures_hand import (
+    TERMINAL,
+    PreflightError as FuturesPreflightError,
+    api_reason,
+    clean,
+    common_step,
+    d,
+    fmt,
+    parse_trade_capability,
+)
 from spot_roundtrip import fees_by_asset
 
 ALL_STAGES = (ENTER_SPOT, ENTER_SHORT, EXIT_SHORT, EXIT_SPOT, UNWIND_SPOT)
@@ -94,8 +108,15 @@ EXIT_CODE = {
     "OPEN_EXPOSURE": 3,
     "BLOCKED_UNRESOLVED": 3,
     "UNKNOWN": 4,
+    "PREFLIGHT_REFUSED": 5,
 }
 USDM_POSITION_PATH = "/fapi/v3/positionRisk"
+USDM_ACCOUNT_CONFIG_PATH = "/fapi/v1/accountConfig"
+USDM_POSITION_MODE_PATH = "/fapi/v1/positionSide/dual"
+USDM_OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
+USDM_ACCOUNT_PATH = "/fapi/v3/account"
+SPOT_ACCOUNT_PATH = "/api/v3/account"
+SPOT_OPEN_ORDERS_PATH = "/api/v3/openOrders"
 
 
 @dataclass(frozen=True)
@@ -130,6 +151,10 @@ class Blocked(Exception):
 
 class Refusal(Exception):
     """A pre-order refusal inside a receipted run; nothing was submitted."""
+
+
+class PreflightRefusal(Exception):
+    """A signed read-only account proof failed before any order was sent."""
 
 
 @dataclass(frozen=True)
@@ -232,7 +257,8 @@ def finish(state: RunState, verdict: str, exposure: str, note: str) -> None:
         verdict_event["note"] = contract_note(text, state.client_ids)
     state.events.append(verdict_event)
     write_events(state)
-    if state.locked and verdict in ("CLOSED", "REJECTED_BEFORE_ENTRY"):
+    if state.locked and verdict in ("CLOSED", "REJECTED_BEFORE_ENTRY",
+                                    "PREFLIGHT_REFUSED"):
         os.unlink(state.lock_path)
         state.locked = False
     print("lane: BASIS-EXECUTOR")
@@ -336,13 +362,21 @@ def market_context(state: RunState) -> Dict[str, Any]:
         shared_step = steps[0]
         for step in steps[1:]:
             shared_step = common_step(shared_step, step)
+        # The SPOT venue's own sellability step: a spot-sale residual at or
+        # above this is a sellable remainder, whatever the shared (LCM) step.
+        spot_step = d(spot_filters["LOT_SIZE"]["stepSize"])
+        spot_market_step = d(spot_filters.get("MARKET_LOT_SIZE",
+                                              {}).get("stepSize", "0"))
+        if spot_market_step > 0:
+            spot_step = common_step(spot_step, spot_market_step)
     except (KeyError, TypeError, ValueError, ArithmeticError):
         raise Refusal("symbol filters are unusable on one venue") from None
-    if shared_step <= 0:
+    if shared_step <= 0 or spot_step <= 0:
         raise Refusal("shared quantity step is not positive")
     return {
         "base": spot_info.get("baseAsset", ""),
         "shared_step": shared_step,
+        "spot_step": spot_step,
         "min_notional": min_notional,
         "min_qty": max(min_qtys),
     }
@@ -539,6 +573,99 @@ def futures_position(rows: Any, symbol: str) -> Optional[Decimal]:
     return total
 
 
+def signed_read(state: RunState, base_url: str, path: str,
+                params: Optional[Dict[str, str]], label: str) -> Any:
+    """One signed read-only GET; anything but 'ok' refuses the preflight."""
+    kind, payload = get_retry(state, base_url, path, params, signed=True)
+    if kind != "ok":
+        reason = api_reason(payload) if kind == "api_error" else kind
+        raise PreflightRefusal("%s unavailable: %s" % (label, reason))
+    return payload
+
+
+def signed_preflight(state: RunState, plan: CyclePlan) -> None:
+    """Signed READ-ONLY account proofs before ANY order is submitted.
+
+    Must prove, in the futures_hand discipline: futures canTrade=true from
+    /fapi/v1/accountConfig alone (the /fapi/v3/account snapshot once returned
+    a false negative and is never consulted for capability), spot account
+    canTrade, position mode explicitly ONE_WAY (cycle intents send no
+    positionSide), no open orders on the plan symbol on either venue, no
+    existing futures position on the plan symbol, and futures available
+    balance covering the planned short margin at 1x. Any unproven fact raises
+    PreflightRefusal; nothing is ever submitted from here.
+    """
+    symbol = state.cfg.symbol
+    capability = signed_read(state, USDM.base_url, USDM_ACCOUNT_CONFIG_PATH,
+                             None, "Futures account-configuration read")
+    try:
+        parse_trade_capability(capability)
+    except FuturesPreflightError as exc:
+        raise PreflightRefusal(str(exc)) from None
+
+    spot_account = signed_read(state, SPOT.base_url, SPOT_ACCOUNT_PATH, None,
+                               "Spot account read")
+    can_trade = spot_account.get("canTrade") \
+        if isinstance(spot_account, dict) else None
+    if not (can_trade is True or str(can_trade).strip().lower() == "true"):
+        raise PreflightRefusal("Spot account canTrade is not true")
+
+    mode = signed_read(state, USDM.base_url, USDM_POSITION_MODE_PATH, None,
+                       "Futures position-mode read")
+    dual = mode.get("dualSidePosition") if isinstance(mode, dict) else None
+    if not (dual is False or str(dual).strip().lower() == "false"):
+        raise PreflightRefusal("Futures position mode is not proven ONE_WAY; "
+                               "cycle intents send no positionSide")
+
+    for venue, orders_path in ((SPOT, SPOT_OPEN_ORDERS_PATH),
+                               (USDM, USDM_OPEN_ORDERS_PATH)):
+        orders = signed_read(state, venue.base_url, orders_path,
+                             {"symbol": symbol},
+                             "%s open-orders read" % venue.name)
+        if not isinstance(orders, list):
+            raise PreflightRefusal(
+                "%s open-orders response is not a list" % venue.name)
+        if orders:
+            raise PreflightRefusal(
+                "%s open order(s) already standing on %s for the plan "
+                "symbol; attribution unsafe" % (len(orders), venue.name))
+
+    rows = signed_read(state, USDM.base_url, USDM_POSITION_PATH,
+                       {"symbol": symbol}, "Futures position read")
+    amount = futures_position(rows, symbol)
+    if amount is None:
+        raise PreflightRefusal("Futures position read cannot prove flatness "
+                               "on the plan symbol")
+    if amount != 0:
+        raise PreflightRefusal("existing Futures position %s on the plan "
+                               "symbol; attribution unsafe" % fmt(amount))
+
+    account = signed_read(state, USDM.base_url, USDM_ACCOUNT_PATH, None,
+                          "Futures balance read")
+    try:
+        available = d(account.get("availableBalance", "0")) \
+            if isinstance(account, dict) else Decimal(0)
+    except ArithmeticError:
+        raise PreflightRefusal(
+            "Futures available balance is unreadable") from None
+    if available < plan.short_notional:
+        raise PreflightRefusal(
+            "available Futures balance %s is below the planned short margin "
+            "%s USDT at %sx" % (fmt(available), fmt(plan.short_notional),
+                                plan.leverage))
+    state.receipt["preflight"] = {
+        "futures_can_trade": True,
+        "spot_can_trade": True,
+        "position_mode": "ONE_WAY",
+        "open_orders": 0,
+        "position_amount": "0",
+        "available_balance": fmt(available),
+        "required_short_margin_1x": fmt(plan.short_notional),
+        "verified_utc": utc(),
+    }
+    save(state)
+
+
 def conclude(state: RunState, plan: CyclePlan,
              hedge: Optional[Decimal]) -> None:
     """Feed the confirmed outcomes to the proven lifecycle for the verdict."""
@@ -550,12 +677,20 @@ def conclude(state: RunState, plan: CyclePlan,
 
 
 def sold_leg_result(state: RunState, stage: str, order, fills,
-                    net_base: Decimal, hedge: Decimal, base_asset: str,
-                    shared_step: Decimal) -> Decimal:
+                    net_base: Decimal, hedge: Decimal,
+                    market: Dict[str, Any]) -> Decimal:
     """Confirm a spot sale from exchange truth; freeze on uncoverable fees.
 
-    Returns the residual base from this run once it is exactly computable.
+    Dust is judged at the SPOT venue's own step, never the shared (LCM) step:
+    a shortfall (executed < submitted) whose residual is at or above the spot
+    step is a sellable remainder and freezes as OPEN_EXPOSURE with the exact
+    quantities. Only a residual below the spot step is dust, and it is still
+    recorded in the receipt. Returns the residual base from this run once it
+    is exactly computable.
     """
+    base_asset = market["base"]
+    shared_step = market["shared_step"]
+    spot_step = market["spot_step"]
     sold = d(order.get("executedQty", "0"))
     quote_received = d(order.get(SPOT.quote_field, "0"))
     trades, covered = spot_trades(
@@ -583,12 +718,20 @@ def sold_leg_result(state: RunState, stage: str, order, fills,
                "sale consumed %s %s beyond this run's acquisition; "
                "pre-existing balance was touched" % (fmt(-residual), base_asset),
                "report to owner; no repair trade")
+    if sold < hedge and residual >= spot_step:
+        finish(state, "OPEN_EXPOSURE",
+               "%s sold %s of the submitted %s; residual %s %s at or above "
+               "the spot step %s is sellable"
+               % (stage, fmt(sold), fmt(hedge), fmt(residual), base_asset,
+                  fmt(spot_step)),
+               "partial spot sale left a sellable remainder; executor reports "
+               "and stops; no repair trade")
     if residual >= shared_step:
         finish(state, "OPEN_EXPOSURE",
                "%s sold %s of %s; residual %s %s at or above the shared step"
                % (stage, fmt(sold), fmt(hedge), fmt(residual), base_asset),
-               "partial spot sale left a sellable remainder; executor reports "
-               "and stops; no repair trade")
+               "spot sale left a remainder at or above the shared step; "
+               "executor reports and stops; no repair trade")
     return residual
 
 
@@ -673,6 +816,21 @@ def execute_legs(state: RunState, plan: CyclePlan,
                 short_filled = None
             else:
                 state.outcomes[ENTER_SHORT] = "FILLED"
+                # Exchange-reported entry notional vs the compiled ceiling,
+                # measured post-fill. A breach is recorded loudly (receipt +
+                # first-failure); the flow's own reduce-only close remains
+                # the containment — never silent, never a repair trade.
+                short_quote = d(order.get(USDM.quote_field, "0"))
+                if short_quote > MAX_CYCLE_QUOTE:
+                    state.receipt["legs"][-1]["ceiling_breach"] = {
+                        "cum_quote": fmt(short_quote),
+                        "hard_ceiling_usdt": fmt(MAX_CYCLE_QUOTE),
+                    }
+                    save(state)
+                    first_fail(state, "enter_short_ceiling",
+                               "short entry filled %s USDT above the %s USDT "
+                               "ceiling; ordered reduce-only close contains "
+                               "it" % (fmt(short_quote), fmt(MAX_CYCLE_QUOTE)))
                 if short_filled != hedge:
                     state.partial_short = short_filled
                     first_fail(state, "enter_short", "short filled %s of %s" % (
@@ -694,7 +852,7 @@ def execute_legs(state: RunState, plan: CyclePlan,
             state.outcomes[UNWIND_SPOT] = "REJECTED"
             conclude(state, plan, hedge)
         sold_leg_result(state, UNWIND_SPOT, order, fills, net_base, hedge,
-                        base_asset, shared_step)
+                        market)
         state.outcomes[UNWIND_SPOT] = "FILLED"
         conclude(state, plan, hedge)
 
@@ -737,8 +895,7 @@ def execute_legs(state: RunState, plan: CyclePlan,
         save(state)
         state.outcomes[EXIT_SPOT] = "REJECTED"
         conclude(state, plan, hedge)
-    sold_leg_result(state, EXIT_SPOT, order, fills, net_base, hedge,
-                    base_asset, shared_step)
+    sold_leg_result(state, EXIT_SPOT, order, fills, net_base, hedge, market)
     state.outcomes[EXIT_SPOT] = "FILLED"
 
     # CLOSED only on observed exchange state: the short must really be flat.
@@ -790,10 +947,11 @@ def acquire(state: RunState) -> None:
                                   % fmt(MAX_CYCLE_QUOTE), state.client_ids)
     state.events.append(start)
     own_name = os.path.basename(state.receipt_path)
+    # Any verdict-less *.json in the receipt directory blocks, whatever lane
+    # wrote it (spot_roundtrip's own discipline): an unresolved run in any
+    # lane means unreconciled ids may exist against the same account.
     for name in sorted(os.listdir(receipt_dir)):
-        if not name.startswith("basis-executor-") or not name.endswith(".json"):
-            continue
-        if name == own_name:
+        if not name.endswith(".json") or name == own_name:
             continue
         try:
             with open(os.path.join(receipt_dir, name), encoding="utf-8") as f:
@@ -801,11 +959,12 @@ def acquire(state: RunState) -> None:
         except (OSError, json.JSONDecodeError) as exc:
             first_fail(state, "prior_receipt", type(exc).__name__)
             finish(state, "BLOCKED_UNRESOLVED",
-                   "a prior basis-executor receipt is unreadable",
+                   "a prior receipt in the receipt directory is unreadable",
                    "reconcile the prior run before any new trade")
-        if "verdict" not in prior:
+        if not isinstance(prior, dict) or "verdict" not in prior:
             finish(state, "BLOCKED_UNRESOLVED",
-                   "a prior basis-executor run has no verdict",
+                   "a prior run in the receipt directory has no verdict; "
+                   "any lane blocks",
                    "reconcile its client ids before any new trade")
 
 
@@ -843,7 +1002,8 @@ def make_state(cfg: ExecutorConfig, request, sleep,
 
 def run_once(cfg: ExecutorConfig, request,
              sleep: Callable[[float], None] = time.sleep) -> int:
-    """The one-shot cycle: lock, read, plan, four legs, receipt, events, exit."""
+    """The one-shot cycle: lock, read, plan, signed read-only preflight,
+    four legs, receipt, events, exit."""
     state = make_state(cfg, request, sleep)
     try:
         acquire(state)
@@ -858,6 +1018,7 @@ def run_once(cfg: ExecutorConfig, request,
                 "estimated_short_notional": fmt(plan.short_notional),
                 "leverage": plan.leverage,
                 "shared_step": fmt(market["shared_step"]),
+                "spot_step": fmt(market["spot_step"]),
                 "min_notional": fmt(market["min_notional"]),
                 "min_quantity": fmt(market["min_qty"]),
                 "reason": plan.reason,
@@ -865,6 +1026,10 @@ def run_once(cfg: ExecutorConfig, request,
             save(state)
         except Refusal as refusal:
             finish(state, "REJECTED_BEFORE_ENTRY", "none", str(refusal))
+        try:
+            signed_preflight(state, plan)
+        except PreflightRefusal as refusal:
+            finish(state, "PREFLIGHT_REFUSED", "none", str(refusal))
         execute_legs(state, plan, market)
         raise AssertionError("execute_legs must conclude every path")
     except Blocked as blocked:

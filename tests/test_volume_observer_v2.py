@@ -615,6 +615,135 @@ class PaperStatePersistenceTests(NoNetworkTestCase):
         )
 
 
+class ReceiptReconcileTests(NoNetworkTestCase):
+    """The crash window between a receipt append and the atomic state save:
+    reconcile_receipts rolls a reloaded state forward over the stranded
+    receipt, so a restart skips the already-receipted candle instead of
+    appending it again."""
+
+    def surged_check_and_closed(self):
+        closed = closed_fixture_candles(surge_kline_fixture())
+        check = vo.evaluate_surge(
+            "AAAUSDT", "1m", closed, 3, Decimal("3"), FIXED_TS
+        )
+        return check, closed
+
+    def test_crash_between_append_and_save_recovers_exact_state(self):
+        # An earlier action persisted normally (a mark for another symbol).
+        persisted = vo.PaperState(candle_marks={"BBBUSDT": 123})
+        vo.save_paper_state(self.state_path, persisted, fixed_now)
+        # The next action appends its entry receipt ...
+        check, closed = self.surged_check_and_closed()
+        crashed = vo.load_paper_state(self.state_path)
+        action = vo.apply_paper_candle(
+            crashed,
+            check,
+            closed[-1],
+            Decimal("10"),
+            Decimal("0.05"),
+            self.receipts,
+            "recontest01",
+            fixed_now,
+        )
+        self.assertEqual(action, "paper_entry")
+        # ... and the process dies HERE: save_paper_state never runs, so the
+        # disk holds the receipt next to the stale pre-entry state.
+        reloaded = vo.load_paper_state(self.state_path)
+        self.assertEqual(reloaded.positions, {})
+        replayed = vo.reconcile_receipts(reloaded, self.receipts)
+        self.assertEqual(replayed, 1)
+        self.assertEqual(reloaded.positions, crashed.positions)
+        self.assertEqual(reloaded.candle_marks, crashed.candle_marks)
+        # Re-scanning the receipted candle after recovery is a no-op ...
+        action = vo.apply_paper_candle(
+            reloaded,
+            check,
+            closed[-1],
+            Decimal("10"),
+            Decimal("0.05"),
+            self.receipts,
+            "recontest02",
+            fixed_now,
+        )
+        self.assertEqual(action, "skipped_candle_already_processed")
+        # ... and the ledger still holds exactly one receipt.
+        self.assertEqual(len(self.read_receipts()), 1)
+
+    def test_missing_receipts_file_reconciles_to_zero(self):
+        state = vo.PaperState()
+        self.assertEqual(vo.reconcile_receipts(state, self.receipts), 0)
+        self.assertEqual(state.positions, {})
+        self.assertEqual(state.candle_marks, {})
+
+    def test_lifecycle_receipts_and_torn_tail_ignored(self):
+        # A real price-series lifecycle writes candle-less receipts ...
+        vo.run_paper_lifecycle(
+            "BTCUSDT",
+            [Decimal("100"), Decimal("90")],
+            receipt_path=self.receipts,
+            run_id="lifecycle01",
+            now_fn=fixed_now,
+        )
+        # ... then a scan entry appends its candle receipt ...
+        check, closed = self.surged_check_and_closed()
+        crashed = vo.PaperState()
+        vo.apply_paper_candle(
+            crashed,
+            check,
+            closed[-1],
+            Decimal("10"),
+            Decimal("0.05"),
+            self.receipts,
+            "recontest01",
+            fixed_now,
+        )
+        # ... and the kill tears the NEXT append mid-line.
+        with open(self.receipts, "a", encoding="utf-8") as handle:
+            handle.write('{"kind": "paper_entry", "candle_close_ms": 9')
+        reloaded = vo.PaperState()
+        replayed = vo.reconcile_receipts(reloaded, self.receipts)
+        self.assertEqual(replayed, 1)  # only the scan entry touches state
+        self.assertEqual(reloaded.positions, crashed.positions)
+        self.assertEqual(reloaded.candle_marks, crashed.candle_marks)
+
+    def test_replay_contradicting_state_raises_never_repairs_silently(self):
+        check, closed = self.surged_check_and_closed()
+        opened = vo.PaperState()
+        vo.apply_paper_candle(
+            opened,
+            check,
+            closed[-1],
+            Decimal("10"),
+            Decimal("0.05"),
+            self.receipts,
+            "recontest01",
+            fixed_now,
+        )
+        # A ledger claiming a SECOND entry beyond the mark while the state
+        # holds an open position is corruption, not a crash window.
+        first_line = self.receipts.read_text(encoding="utf-8").splitlines()[0]
+        forged = json.loads(first_line)
+        forged["candle_close_ms"] = closed[-1].close_time_ms + MINUTE_MS
+        with open(self.receipts, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(forged, sort_keys=True) + "\n")
+        with self.assertRaises(vo.DataReadError):
+            vo.reconcile_receipts(opened, self.receipts)
+
+    def test_exit_replay_without_open_position_raises(self):
+        exit_record = {
+            "paper": True,
+            "kind": "paper_exit",
+            "symbol": "AAAUSDT",
+            "candle_close_ms": MINUTE_MS,
+            "entry_run_id": "ghost01",
+        }
+        self.receipts.write_text(
+            json.dumps(exit_record, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with self.assertRaises(vo.DataReadError):
+            vo.reconcile_receipts(vo.PaperState(), self.receipts)
+
+
 class ScanFlowTests(NoNetworkTestCase):
     """run_scan and the scan CLI, entirely offline via patched fetchers."""
 
@@ -754,6 +883,98 @@ class ScanFlowTests(NoNetworkTestCase):
             self.run_scan_universe(
                 self.default_klines(), [], max_symbols=vo.MAX_SCAN_SYMBOLS + 1
             )
+
+    def test_scan_killed_between_append_and_save_restarts_without_duplicate(self):
+        """Simulated kill EXACTLY between the receipt append and the state
+        save: the entry receipt reaches disk, the state file does not.  The
+        restarted scan reconciles the receipt into the state and appends
+        nothing new."""
+        sleeps = []
+        with patch.object(
+            vo,
+            "save_paper_state",
+            side_effect=OSError("killed before state persisted"),
+        ):
+            with self.assertRaises(OSError):
+                self.run_scan_universe(self.default_klines(), sleeps)
+        # The exact crash picture: one receipt on disk, no state file.
+        self.assertEqual(
+            [r["kind"] for r in self.read_receipts()], ["paper_entry"]
+        )
+        self.assertFalse(self.state_path.exists())
+        # Restart over the same candles.
+        results, printed = self.run_scan_universe(
+            self.default_klines(), sleeps, run_id="scantest02"
+        )
+        self.assertIn("paper_reconcile_replayed_receipts=1", printed)
+        self.assertEqual(
+            [action for _, action in results],
+            ["skipped_candle_already_processed", "no_action"],
+        )
+        receipts = self.read_receipts()
+        self.assertEqual([r["kind"] for r in receipts], ["paper_entry"])
+        state = vo.load_paper_state(self.state_path)
+        self.assertEqual(list(state.positions), ["AAAUSDT"])
+        position = state.positions["AAAUSDT"]
+        self.assertEqual(position["run_id"], "scantest01")  # the crashed run's
+        self.assertEqual(position["entry_price"], "100")
+        self.assertEqual(position["qty"], "0.10000000")
+        self.assertEqual(position["peak_price"], "100")
+        self.assertEqual(
+            position["entry_candle_close_ms"], state.candle_marks["AAAUSDT"]
+        )
+
+    def exit_klines(self):
+        """The surge fixture then one closed candle at 94 — below the 95
+        trail stop (peak 100, trail 0.05) of the held position."""
+        return {
+            "AAAUSDT": surge_kline_fixture()[:4]
+            + [kline_row(4, quote_volume="10", close_price="94")],
+            "BBBUSDT": quiet_kline_fixture(),
+        }
+
+    def test_scan_killed_between_exit_append_and_save_no_duplicate_exit(self):
+        sleeps = []
+        # First scan completes and persists the entry.
+        self.run_scan_universe(self.default_klines(), sleeps)
+        # The next candle exits; the kill lands between append and save.
+        with patch.object(
+            vo,
+            "save_paper_state",
+            side_effect=OSError("killed before state persisted"),
+        ):
+            with self.assertRaises(OSError):
+                self.run_scan_universe(
+                    self.exit_klines(), sleeps, run_id="scantest02"
+                )
+        self.assertEqual(
+            [r["kind"] for r in self.read_receipts()],
+            ["paper_entry", "paper_exit"],
+        )
+        stale = vo.load_paper_state(self.state_path)
+        self.assertIn("AAAUSDT", stale.positions)  # state missed the exit
+        # Restart with the same candles: reconcile closes the position and
+        # the scan appends nothing new.
+        results, printed = self.run_scan_universe(
+            self.exit_klines(), sleeps, run_id="scantest03"
+        )
+        self.assertIn("paper_reconcile_replayed_receipts=1", printed)
+        self.assertEqual(
+            [action for _, action in results],
+            [
+                "skipped_candle_already_processed",
+                "skipped_candle_already_processed",
+            ],
+        )
+        self.assertEqual(
+            [r["kind"] for r in self.read_receipts()],
+            ["paper_entry", "paper_exit"],
+        )
+        state = vo.load_paper_state(self.state_path)
+        self.assertEqual(state.positions, {})
+        self.assertEqual(
+            state.candle_marks["AAAUSDT"], BASE_OPEN_MS + 5 * MINUTE_MS - 1
+        )
 
     def test_cli_scan_kill_restart_no_duplicates(self):
         """CLI-level write-kill-reload: a rerun of the same scan duplicates nothing."""
