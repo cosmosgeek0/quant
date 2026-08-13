@@ -1,6 +1,13 @@
 # TASK.md — current work orders
 
-SINGLE TASK (owner GO 2026-08-13, Fable-direct, no workers or subagents):
+ARMED, OWNER'S TRIGGER (2026-08-13): the one capped BNBUSDT plumbing
+sequence sits deployed and verified on the host (leverage 1x one-shot ->
+receipted 9 USDT transfer -> full signed validate -> ONE capped cycle;
+stops honestly at any step). No seat presses it; the owner runs
+`bash aws-connect/ssmrun.sh scripts/run_plumbing_on_host.sh 240` from
+Desktop/quant. Code 4971faad; sequence commit fca93576.
+
+COMPLETED same day (owner GO, Fable-direct):
 - basis_executor.py signed-reads the plan symbol's ACTUAL leverage
   (/fapi/v1/symbolConfig) and refuses before every order unless it is
   exactly 1x. The module never changes leverage.
