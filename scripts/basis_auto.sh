@@ -17,36 +17,25 @@ unset SECRET_JSON
 export QUANT_SHA=b08a18d956698072c8ead5102a6deb2c57c66c55
 cd "$D/src"
 
-# A held lock means an unreconciled run owns the lane: reconcile it first.
-if [ -f "$R/basis-executor.lock" ]; then
-  SYMBOL=$(python3 - <<'PY'
-import glob, json, os
-for path in sorted(glob.glob("/home/ssm-user/quant_receipts/basis-executor-*.json"), reverse=True):
-    try:
-        receipt = json.load(open(path))
-    except Exception:
-        continue
-    if isinstance(receipt, dict) and receipt.get("kind") != "reconcile" \
-            and receipt.get("verdict") == "OPEN_EXPOSURE" \
-            and not receipt.get("reconciled_by"):
-        rid = os.path.basename(path)[len("basis-executor-"):-len(".json")]
-        for line in open("/home/ssm-user/quant_receipts/events.jsonl"):
-            try:
-                event = json.loads(line)
-            except Exception:
-                continue
-            if event.get("run_id") == rid and event.get("symbol"):
-                print(event["symbol"])
-                raise SystemExit
-        break
+# Reconcile first whenever the executor itself sees a pending or reopenable
+# exposure — lock or no lock. The executor's own rules decide, one source
+# of truth. A lock with nothing reconcilable halts the loop for a human.
+RECON_SYMBOL=$(cd "$D/src" && python3 - <<'PY'
+import os
+import sys
+sys.path.insert(0, ".")
+from basis_executor import pending_exposure, source_symbol_from_events
+path, receipt = pending_exposure("/home/ssm-user/quant_receipts")
+if path:
+    rid = os.path.basename(path)[len("basis-executor-"):-len(".json")]
+    symbol = source_symbol_from_events(
+        "/home/ssm-user/quant_receipts/events.jsonl", rid)
+    if symbol:
+        print(symbol)
 PY
 )
-  if [ -z "$SYMBOL" ]; then
-    echo "lock held with no reconcilable source — halting auto for a human"
-    touch "$D/STOP"
-    exit 3
-  fi
-  export SYMBOL
+if [ -n "$RECON_SYMBOL" ]; then
+  export SYMBOL=$RECON_SYMBOL
   python3 basis_executor.py --reconcile
   RC=$?
   echo "reconcile $SYMBOL exit $RC"
@@ -55,6 +44,11 @@ PY
     touch "$D/STOP"
   fi
   exit $RC
+fi
+if [ -f "$R/basis-executor.lock" ]; then
+  echo "lock held with no reconcilable source — halting auto for a human"
+  touch "$D/STOP"
+  exit 3
 fi
 
 # Plumbing bar 5 bps until the first CLOSED cycle exists; economic 35 after.
@@ -103,10 +97,16 @@ if kind != "ok" or not isinstance(account, dict):
     raise SystemExit
 available = Decimal(str(account.get("availableBalance", "0")))
 info = json.load(urllib.request.urlopen(
-    "https://fapi.binance.com/fapi/v1/exchangeInfo?symbol=" + symbol,
-    timeout=20))
+    "https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=20))
+# The futures exchangeInfo ignores a symbol parameter — match explicitly
+# (reading symbols[0] once billed a BTC band against a TST trade).
+matches = [row for row in info.get("symbols", [])
+           if row.get("symbol") == symbol]
+if len(matches) != 1:
+    print("READ_FAILED")
+    raise SystemExit
 band = Decimal("0")
-for row in info["symbols"][0]["filters"]:
+for row in matches[0]["filters"]:
     if row["filterType"] == "PERCENT_PRICE":
         band = max(band, Decimal(str(row.get("multiplierUp", "0"))))
     if row["filterType"] == "PERCENT_PRICE_BY_SIDE":
