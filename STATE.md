@@ -50,8 +50,11 @@ the old engine (116/125 differential fixtures), and production-validated —
 continuous live observer with restart recovery, measured commission truth
 (0.30% round trip), complete signed preflight for finalists. Release
 382b8b96204ab9e4f501bfb11cc8a5487bd1db03; modules sha-verified on the host.
-STATE: READY_WAITING_FOR_NET_EDGE — no economically positive candidate
-exists; the observer and the paused loop await the owner's activation word.
+STATE: WAVE3_COMPONENTS_BUILT__RUNTIME_NOT_READY (commander verdict): the
+components are built and hardened, but the restart-safe runtime vertical —
+immutable proposals, proposal-only entry, STOP interlock, one supervisor
+with crash-resume, e2e crash tests, paused GET-only deploy evidence — is
+NOT built. No live mutation; basis_auto stays unarmed.
 Wave-1/2 history preserved in LOGS.
 
 PARKED, awaiting owner words someday: L6 reverse-basis spec (needs borrow

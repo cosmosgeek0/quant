@@ -9,6 +9,10 @@ every step.
 
 ---
 
+VERDICT CORRECTION 2026-08-13 | commander rejected wave-3 completion | recorded state is now WAVE3_COMPONENTS_BUILT__RUNTIME_NOT_READY
+missing | immutable persisted proposals | proposal-only entry | STOP as global entry interlock | reads-before-leverage ordering | ONE supervisor (claim->open->reconcile->auto-close->crash-resume) | e2e crash-boundary tests | paused GET-only deploy evidence
+standing | READY_WAITING_FOR_NET_EDGE and production-validated are RETIRED from the record until the runtime vertical passes | no live mutation, basis_auto stays unarmed
+
 WAVE-3 FULL BASIS 2026-08-13 | commander order complete | release 382b8b96204ab9e4f501bfb11cc8a5487bd1db03
 built | basis_kernel (99 spec rules, 17-step guard order) | basis_watch (continuous observer, hysteresis, restart-safe) | basis_position (resumable open/hold/close/resume) | 618 tests green
 extraction proof | 125 differential fixtures from the old engine: 116 reproduced, 9 waived with written reasons | spec + fixtures committed in tests/fixtures/
