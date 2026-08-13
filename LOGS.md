@@ -9,6 +9,17 @@ every step.
 
 ---
 
+BASIS-EXECUTOR 2026-08-13 | one-shot cycle executor built offline | base 0cffc896 branch lane/basis-executor | code commit 6e3e694f
+deliverable | src/basis_executor.py | connects basis_read + basis_cycle + futures_hand + spot_roundtrip + events; one-shot CLI, no loop/timer/daemon
+discipline | quoteOrderQty-bounded BUY -> net base = fills minus base fees floored to shared step -> short exactly that -> reduce-only close of exact short fill -> spot sell of remaining base | unique bc- ids, query before any decision, UNKNOWN freezes nonzero, no repair trades
+tests | tests/test_basis_executor.py 49 cases green offline via injected transport + socket guard | full suite 113 -> 162 green | py_compile clean both files
+coverage | happy cycle, partial spot/short/close/sell fills, short rejection -> spot unwind, UNKNOWN resolve-vs-freeze on all five legs, fee-aware net-base math, dust guard, lock + prior-receipt gates, live transport offline via patched urlopen
+first failure | 4 test-literal scale mismatches on first test run (0.098 vs 0.09800000 wire strings); assertions corrected to Decimal compare; module unchanged
+repair | self-review: hedge-mode positionRisk rows no longer prove flatness (UNKNOWN, never CLOSED) | +1 test
+offline law | nothing live run in-lane: no network call executed, no credentials present, no order anywhere | MEASURED (injected transport only; live path UNVERIFIED by design this wave)
+note | TASK.md at base SHA has no wave-2 section; dispatch text carried the lane row
+verdict | DONE_LOCAL — committed to lane/basis-executor; not pushed, not merged
+
 WAVE-1 INTEGRATION 2026-08-13 | four lanes merged + basis_cycle built | base 1aa1e018 | integrator = the Lead
 merged | lane/ui fde677ed | lane/basis-read 07f2af1d | lane/volume 47d02a0f | lane/futures-short e240074a | LOGS stacked, no history lost
 built | src/basis_cycle.py + tests/test_basis_cycle.py | spot-long + USD-M-short lifecycle, offline only, 11/11 terminal paths tested
