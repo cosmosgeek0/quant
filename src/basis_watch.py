@@ -13,7 +13,8 @@ conventions).  Per pass:
    cooldown_and_candidate_ttl: no decisions at all while cooling).
 3. Per finalist, four more public GETs: Spot depth /api/v3/depth and USD-M
    depth /fapi/v1/depth (limit 50), funding history /fapi/v1/fundingRate
-   (flip-risk input), and the per-symbol premiumIndex.  Ingestion applies
+   (flip-risk and per-symbol settlement-period input), and the per-symbol
+   premiumIndex.  Ingestion applies
    the spec's book/ladder validity and future-timestamp-skew guards
    (ingest_book_validity, depth_ladder_ingestion, future_timestamp_guard):
    invalid or future-skewed data CLEARS the leg to None — it is never
@@ -43,7 +44,7 @@ slippage, carry and net edge are PERCENT (0.78 means 0.78%); spreads and
 mark divergence are BPS (x10000); funding rates are per-period FRACTIONS
 (0.0001 = 1 bp per settlement, converted to percent only inside carry).
 
-STATE: ONE atomic JSON file (default RECEIPT_DIR/basis_watch_state.json)
+STATE: ONE atomic JSON file (default RECEIPT_DIR/watch/basis_watch_state.json)
 holding per-symbol candidate state — lifecycle state, persistence counter,
 gap-sample window, session timestamps — plus a pass watermark.  Written
 with temp file + fsync + os.replace after every pass and reloaded on
@@ -51,13 +52,12 @@ start, so a kill at any moment loses at most the in-flight pass.
 
 COMMISSION: RECEIPT_DIR/commission-rates.json (written by the lifecycle
 tool from the signed commission endpoints) is read when present; rates are
-accepted either as percent-per-leg fields (spot_taker_fee_pct /
-perp_taker_fee_pct, or spotTakerFeePct / perpTakerFeePct) per symbol under
-"symbols" (or at the top level, or under "default"), or as Binance-native
-FRACTION shapes ({"spot": {"standardCommission": {"taker": ...}}, "usdm":
-{"takerCommissionRate": ...}}) which are converted x100 to percent.  When
-the file is absent or unusable the spec defaults (spot 0.10% / perp 0.05%
-taker per leg) are used and labeled ESTIMATED in every output row.
+accepted in the lifecycle writer's top-level FRACTION shape ({"symbol": ...,
+"spot": {"maker": ..., "taker": ...}, "usdm": {"maker": ..., "taker":
+...}}), or as the legacy percent-per-leg and Binance-native shapes.  Fraction
+rates are converted x100 to percent.  When the file is absent or unusable the
+spec defaults (spot 0.10% / perp 0.05% taker per leg) are used and labeled
+ESTIMATED in every output row.
 
 NOT ENFORCED HERE: the universe 24h-volume floor (universe_filter,
 minQuoteVolume24hUsd 3,000,000) — the dispatch's cheap pass reuses
@@ -106,6 +106,7 @@ except ImportError:  # B1 not landed yet — observer stays honest, nothing prom
     basis_kernel = None  # type: ignore[assignment]
 
 RECEIPT_DIR = os.path.expanduser(os.environ.get("RECEIPT_DIR", "~/quant_receipts"))
+WATCH_STATE_DIR_NAME = "watch"
 STATE_FILE_NAME = "basis_watch_state.json"
 COMMISSION_FILE_NAME = "commission-rates.json"
 STATE_VERSION = 1
@@ -114,6 +115,8 @@ MAX_MARKET_NUMBER = Decimal("1e15")   # spec ingest_book_validity max_market_num
 MAX_DEPTH_LEVELS = 5000               # spec depth_ladder_ingestion
 DEPTH_LIMIT = 50                      # dispatch: /api/v3/depth, /fapi/v1/depth limit 50
 FUNDING_HISTORY_LIMIT = 32            # spec funding_ingestion_and_history keep bound
+FUNDING_PERIOD_MIN_ROWS = 3           # two consecutive spacings are the minimum
+FUNDING_PERIOD_JITTER_MS = 60_000     # exchange stamps may drift slightly
 PREC = 50
 
 STATES = ("IDLE", "WATCHING", "FOCUS", "PROPOSED", "REJECTED", "COOLDOWN")
@@ -143,7 +146,6 @@ DEFAULTS: Dict[str, Any] = {
     "focus_max_age_ms": 900000,
     "focus_soft_cap": 10,
     "focus_hard_cap": 25,
-    "funding_period_ms": 28800000,
     "priority_momentum_weight": Decimal("0.25"),
     "min_quote_volume_24h_usd": Decimal("3000000"),
     # spec REJECTs the old toy suggestedNotionalUsd; the intended notional is
@@ -494,16 +496,42 @@ def parse_mark(payload: Any) -> Optional[Dict[str, Any]]:
             "next_funding_ts_ms": next_funding_ts, "ts_ms": ts_ms}
 
 
-def parse_funding_history(payload: Any) -> List[Decimal]:
-    """fundingRate history payload -> per-period FRACTION rates, given order,
-    non-finite rows dropped, bounded to the newest FUNDING_HISTORY_LIMIT."""
-    rates: List[Decimal] = []
+def parse_funding_history(payload: Any) -> List[Dict[str, Any]]:
+    """fundingRate history -> timestamped per-period FRACTION observations.
+
+    Timestamped rows stay in exchange order and are bounded to the newest
+    FUNDING_HISTORY_LIMIT.  A malformed rate is retained as None because its
+    valid fundingTime still carries schedule evidence; it is omitted from the
+    rate sequence passed to the kernel.
+    """
+    points: List[Dict[str, Any]] = []
     for row in payload if isinstance(payload, list) else []:
         if isinstance(row, dict):
-            rate = dec(row.get("fundingRate"))
-            if rate is not None:
-                rates.append(rate)
-    return rates[-FUNDING_HISTORY_LIMIT:]
+            funding_time_ms = pos_int(row.get("fundingTime"))
+            if funding_time_ms is not None:
+                points.append({"funding_time_ms": funding_time_ms,
+                               "funding_rate": dec(row.get("fundingRate"))})
+    return points[-FUNDING_HISTORY_LIMIT:]
+
+
+def infer_funding_period_ms(history: List[Dict[str, Any]]) -> Optional[int]:
+    """Median consecutive fundingTime spacing, or None when not trustworthy."""
+    if len(history) < FUNDING_PERIOD_MIN_ROWS:
+        return None
+    spacings = [current["funding_time_ms"] - previous["funding_time_ms"]
+                for previous, current in zip(history, history[1:])]
+    if any(spacing <= 0 for spacing in spacings):
+        return None
+    ordered = sorted(spacings)
+    middle = len(ordered) // 2
+    period_ms = ordered[middle] if len(ordered) % 2 else \
+        (ordered[middle - 1] + ordered[middle]) // 2
+    if period_ms <= FUNDING_PERIOD_JITTER_MS:
+        return None
+    if any(abs(spacing - period_ms) > FUNDING_PERIOD_JITTER_MS
+           for spacing in spacings):
+        return None
+    return period_ms
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +553,8 @@ def _fraction_taker_pct(record: Any) -> Optional[Decimal]:
     fraction = dec(record.get("takerCommissionRate"))
     if fraction is None and isinstance(record.get("standardCommission"), dict):
         fraction = dec(record["standardCommission"].get("taker"))
+    if fraction is None:
+        fraction = dec(record.get("taker"))
     if fraction is None or fraction < 0:
         return None
     return fraction * 100
@@ -562,7 +592,9 @@ def read_commission_rates(receipt_dir: str, symbol: str,
         return estimated
     symbols = payload.get("symbols")
     candidates = [symbols.get(symbol) if isinstance(symbols, dict) else None,
-                  payload.get(symbol), payload.get("default")]
+                  payload.get(symbol),
+                  payload if payload.get("symbol") in (None, symbol) else None,
+                  payload.get("default")]
     for candidate in candidates:
         rates = _commission_from(candidate)
         if rates is not None:
@@ -586,10 +618,14 @@ def _kernel_decision(module: Any, observation: Dict[str, Any]) -> Any:
     fees = observation["fees"]
     config_kwargs: Dict[str, Any] = {}
     for spec_field in dataclass_fields(module.KernelConfig):
-        if spec_field.name in ("spot_taker_fee_pct", "perp_taker_fee_pct"):
-            continue  # commission truth is per symbol, folded in below
+        if spec_field.name in ("spot_taker_fee_pct", "perp_taker_fee_pct",
+                              "funding_period_ms"):
+            continue  # commission and funding cadence are per symbol below
         if spec_field.name in cfg:
             config_kwargs[spec_field.name] = cfg[spec_field.name]
+    funding_period_ms = observation.get("funding_period_ms")
+    if funding_period_ms is not None:
+        config_kwargs["funding_period_ms"] = funding_period_ms
     config = module.KernelConfig(
         spot_taker_fee_pct=fees["spot_taker_fee_pct"],
         perp_taker_fee_pct=fees["perp_taker_fee_pct"], **config_kwargs)
@@ -1069,6 +1105,13 @@ class Watch:
         if mark is not None \
                 and not accept_timestamp(premium_receipt, mark["ts_ms"], skew):
             mark = None
+        funding_points = parse_funding_history(bundle.get("funding_history"))
+        funding_period_ms = infer_funding_period_ms(funding_points)
+        if funding_period_ms is None:
+            # KernelConfig requires a positive period, so express an unknown
+            # cadence by clearing the funding mark.  The kernel then applies
+            # its normal data_stale refusal; no global 8h value prices it.
+            mark = None
         return {
             "symbol": symbol,
             "direction": "long_spot_short_perp",
@@ -1079,9 +1122,11 @@ class Watch:
             "spot_ladder": spot_ladder,
             "perp_ladder": perp_ladder,
             "mark": mark,
-            "funding_history": parse_funding_history(
-                bundle.get("funding_history")),
-            "funding_period_ms": cfg["funding_period_ms"],
+            "funding_history": [point["funding_rate"]
+                                for point in funding_points
+                                if point["funding_rate"] is not None],
+            "funding_history_points": funding_points,
+            "funding_period_ms": funding_period_ms,
             "fees": fees,
             "config": cfg,
         }
@@ -1232,8 +1277,8 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
     parser.add_argument("--receipt-dir", default=RECEIPT_DIR,
                         help="commission receipts + default state/stop dir")
     parser.add_argument("--state-file", default=None,
-                        help="state path (default RECEIPT_DIR/%s)"
-                             % STATE_FILE_NAME)
+                        help="state path (default RECEIPT_DIR/%s/%s)"
+                             % (WATCH_STATE_DIR_NAME, STATE_FILE_NAME))
     parser.add_argument("--stop-file", default=None,
                         help="loop exits cleanly when this path exists "
                              "(default RECEIPT_DIR/STOP)")
@@ -1249,7 +1294,8 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
         parser.error("--finalists must be >= 1")
 
     receipt_dir = os.path.expanduser(args.receipt_dir)
-    state_path = args.state_file or os.path.join(receipt_dir, STATE_FILE_NAME)
+    state_path = args.state_file or os.path.join(
+        receipt_dir, WATCH_STATE_DIR_NAME, STATE_FILE_NAME)
     stop_path = args.stop_file or os.path.join(receipt_dir, "STOP")
     overrides: Dict[str, Any] = {"finalist_cap": args.finalists}
     if args.notional_usd is not None:

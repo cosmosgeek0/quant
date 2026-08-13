@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 from decimal import Decimal
+from glob import glob
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import basis_scan  # noqa: E402
+import basis_position  # noqa: E402
 import basis_watch  # noqa: E402
 from basis_watch import (  # noqa: E402
     SymbolState,
@@ -48,6 +50,7 @@ from basis_watch import (  # noqa: E402
     accept_timestamp,
     depth_coverage_score,
     entry_gap_pct,
+    infer_funding_period_ms,
     leg_depth_score,
     observe_gap,
     pair_depth_score,
@@ -305,12 +308,23 @@ def universe_row(symbol: str, entry_bps: str = "78",
             "min_valid_notional": D("5"), "fits_10_cap": fits}
 
 
+def funding_history_rows(period_ms: int, count: int = 3,
+                         rates: Optional[List[str]] = None
+                         ) -> List[Dict[str, Any]]:
+    values = rates if rates is not None else ["0.0001"] * count
+    return [{"fundingTime": 1 + period_ms * index,
+             "fundingRate": values[index]}
+            for index in range(count)]
+
+
 def scenario_bundle(now_ms: int, gap_pct: str = "0.78", qty: str = "500",
                     rate: str = "0.0001", next_funding_ms: Optional[int] = None,
                     book_ts: Optional[int] = None,
                     perp_ts: Optional[int] = None,
                     mark_ts: Optional[int] = None,
-                    default_book: bool = False) -> Dict[str, Any]:
+                    default_book: bool = False,
+                    funding_history: Optional[List[Dict[str, Any]]] = None
+                    ) -> Dict[str, Any]:
     """One finalist bundle built with the old suite's generator:
     perp_bid = spot_ask * (1 + g/100) makes the entry gap exactly g.
     default_book=True uses the spec's default book instead (spot 100/100.02,
@@ -325,13 +339,18 @@ def scenario_bundle(now_ms: int, gap_pct: str = "0.78", qty: str = "500",
     next_funding = next_funding_ms if next_funding_ms is not None \
         else now_ms + 14_400_000
     mid = (perp_bid + perp_ask) / 2
+    if funding_history is None:
+        # Existing scanner fixtures intentionally leave flip risk unknown;
+        # three valid timestamps still supply the now-required 8h cadence.
+        funding_history = funding_history_rows(
+            28_800_000, rates=["0.0001", "0.0001", "nan"])
     return {
         "spot_depth": {"bids": [["100", qty]], "asks": [[str(spot_ask), qty]]},
         "spot_receipt_ms": book_ts,
         "perp_depth": {"T": perp_ts, "bids": [[str(perp_bid), qty]],
                        "asks": [[str(perp_ask), qty]]},
         "perp_receipt_ms": now_ms,
-        "funding_history": [],
+        "funding_history": funding_history,
         "premium": {"markPrice": str(mid), "lastFundingRate": rate,
                     "nextFundingTime": next_funding, "time": mark_ts},
     }
@@ -817,11 +836,34 @@ class IngestionTests(PipelineCase):
         self.assertIsNone(parse_mark(zero_mark))
 
     def test_parse_funding_history_keeps_order_and_bounds(self):
-        payload = [{"fundingRate": "0.0001"}, {"fundingRate": "-0.0002"},
-                   {"fundingRate": "nan"}, {"fundingRate": "0.0003"}]
+        payload = [{"fundingTime": 1, "fundingRate": "0.0001"},
+                   {"fundingTime": 2, "fundingRate": "-0.0002"},
+                   {"fundingTime": 3, "fundingRate": "nan"},
+                   {"fundingRate": "0.0003"}]
         self.assertEqual(parse_funding_history(payload),
-                         [D("0.0001"), D("-0.0002"), D("0.0003")])
+                         [{"funding_time_ms": 1,
+                           "funding_rate": D("0.0001")},
+                          {"funding_time_ms": 2,
+                           "funding_rate": D("-0.0002")},
+                          {"funding_time_ms": 3,
+                           "funding_rate": None}])
         self.assertEqual(parse_funding_history(None), [])
+
+    def test_funding_period_inference_one_and_eight_hours(self):
+        one_hour = parse_funding_history(funding_history_rows(3_600_000))
+        eight_hours = parse_funding_history(funding_history_rows(28_800_000))
+        self.assertEqual(infer_funding_period_ms(one_hour), 3_600_000)
+        self.assertEqual(infer_funding_period_ms(eight_hours), 28_800_000)
+
+    def test_funding_period_inference_refuses_irregular_or_two_rows(self):
+        irregular = parse_funding_history([
+            {"fundingTime": 1, "fundingRate": "0.0001"},
+            {"fundingTime": 3_600_001, "fundingRate": "0.0001"},
+            {"fundingTime": 10_800_001, "fundingRate": "0.0001"},
+        ])
+        two_rows = parse_funding_history(funding_history_rows(3_600_000, 2))
+        self.assertIsNone(infer_funding_period_ms(irregular))
+        self.assertIsNone(infer_funding_period_ms(two_rows))
 
     def test_universe_eligible_predicate(self):
         floor = watch_config()["min_quote_volume_24h_usd"]
@@ -870,6 +912,46 @@ class CommissionTests(unittest.TestCase):
         rates = read_commission_rates(self.tmp.name, "TESTUSDT", self.cfg)
         self.assertEqual(rates["source"], "receipt")
         self.assertEqual(rates["spot_taker_fee_pct"], D("0.1"))
+        self.assertEqual(rates["perp_taker_fee_pct"], D("0.04"))
+
+    def test_actual_cmd_rates_writer_shape_converts_to_kernel_percent(self):
+        def request(method, _base_url, path, params, signed):
+            self.assertEqual((method, params, signed),
+                             ("GET", {"symbol": "TESTUSDT"}, True))
+            if path == basis_position.SPOT_COMMISSION_PATH:
+                return "ok", {
+                    "symbol": "TESTUSDT",
+                    "standardCommission": {
+                        "maker": "0.0008", "taker": "0.00075"},
+                }
+            if path == basis_position.USDM_COMMISSION_PATH:
+                return "ok", {
+                    "symbol": "TESTUSDT",
+                    "makerCommissionRate": "0.0002",
+                    "takerCommissionRate": "0.0004",
+                }
+            self.fail("unexpected commission path")
+
+        cfg = basis_position.PositionConfig(
+            symbol="TESTUSDT", sha="0" * 40, receipt_dir=self.tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = basis_position.cmd_rates(
+                cfg, request, sleep=lambda _seconds: None, now_ms=lambda: T0)
+        self.assertEqual(code, basis_position.EXIT_CODE["RATES_RECORDED"])
+
+        path = os.path.join(self.tmp.name, "commission-rates.json")
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["symbol"], "TESTUSDT")
+        self.assertEqual(payload["spot"],
+                         {"maker": "0.0008", "taker": "0.00075"})
+        self.assertEqual(payload["usdm"],
+                         {"maker": "0.0002", "taker": "0.0004"})
+        self.assertNotIn("symbols", payload)
+
+        rates = read_commission_rates(self.tmp.name, "TESTUSDT", self.cfg)
+        self.assertEqual(rates["source"], "receipt")
+        self.assertEqual(rates["spot_taker_fee_pct"], D("0.075"))
         self.assertEqual(rates["perp_taker_fee_pct"], D("0.04"))
 
     def test_default_block_used_when_symbol_absent(self):
@@ -1057,6 +1139,18 @@ class CliTests(PipelineCase):
         self.assertIn("ESTIMATED", output)  # no commission receipt present
         self.assertTrue(os.path.exists(self.state_path))
 
+    def test_default_state_is_nested_outside_shared_receipt_glob(self):
+        reads = FakeReads([universe_row("TESTUSDT")],
+                          {"TESTUSDT": scenario_bundle(T0 + 2000)})
+        code, _output = self.run_main(
+            ["--once", "--receipt-dir", self.tmp.name], reads)
+        state_path = os.path.join(
+            self.tmp.name, basis_watch.WATCH_STATE_DIR_NAME,
+            basis_watch.STATE_FILE_NAME)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(state_path))
+        self.assertNotIn(state_path, glob(os.path.join(self.tmp.name, "*.json")))
+
     def test_loop_honors_preexisting_stop_file(self):
         stop = os.path.join(self.tmp.name, "STOP")
         with open(stop, "w", encoding="utf-8") as handle:
@@ -1108,6 +1202,75 @@ class KernelIntegrationTests(PipelineCase):
     def setUp(self) -> None:
         super().setUp()
         basis_watch.basis_kernel = _REAL_KERNEL  # undo the stub: real B1
+
+    def tick_recording_kernel(self, watch: Watch, now_ms: int,
+                              **bundle_kwargs: Any) -> tuple:
+        calls = []
+
+        class RecordingKernel:
+            BasisSnapshot = _REAL_KERNEL.BasisSnapshot
+            KernelConfig = _REAL_KERNEL.KernelConfig
+            Book = _REAL_KERNEL.Book
+            FundingMark = _REAL_KERNEL.FundingMark
+
+            @staticmethod
+            def evaluate(snapshot, config):
+                result = _REAL_KERNEL.evaluate(snapshot, config)
+                calls.append((snapshot, config, result))
+                return result
+
+        basis_watch.basis_kernel = RecordingKernel()
+        try:
+            row = self.tick(watch, now_ms, **bundle_kwargs)
+        finally:
+            basis_watch.basis_kernel = _REAL_KERNEL
+        self.assertEqual(len(calls), 1)
+        return (row,) + calls[0]
+
+    def test_one_hour_period_reaches_config_and_counts_all_crossings(self):
+        now = T0 + 2000
+        history = funding_history_rows(3_600_000)
+        row, _, config, result = self.tick_recording_kernel(
+            self.make_watch(), now, funding_history=history,
+            next_funding_ms=now + 60_000)
+        self.assertEqual(config.funding_period_ms, 3_600_000)
+        hold = result["components"]["expected_hold_ms"]
+        crossings = 1 + (hold - 60_000) // config.funding_period_ms
+        self.assertEqual(crossings, 4)
+        self.assertIsNone(result["components"]["carry_raw_pct"])
+        self.assertEqual((row["kind"], row["reject_code"]),
+                         ("reject", "data_stale"))
+
+    def test_eight_hour_period_reaches_config(self):
+        row, _, config, result = self.tick_recording_kernel(
+            self.make_watch(), T0 + 2000,
+            funding_history=funding_history_rows(28_800_000))
+        self.assertEqual(config.funding_period_ms, 28_800_000)
+        self.assertIsNotNone(result["components"]["carry_raw_pct"])
+        self.assertNotEqual((row["kind"], row["reject_code"]),
+                            ("reject", "data_stale"))
+
+    def test_unknown_period_clears_funding_and_refuses(self):
+        histories = {
+            "irregular": [
+                {"fundingTime": 1, "fundingRate": "0.0001"},
+                {"fundingTime": 3_600_001, "fundingRate": "0.0001"},
+                {"fundingTime": 10_800_001, "fundingRate": "0.0001"},
+            ],
+            "two_rows": funding_history_rows(3_600_000, 2),
+        }
+        for index, (name, history) in enumerate(histories.items()):
+            with self.subTest(name=name):
+                watch = Watch(self.state_path + ".period%d" % index,
+                              self.tmp.name, watch_config())
+                row, snapshot, _, result = self.tick_recording_kernel(
+                    watch, T0 + 2000, funding_history=history)
+                self.assertIsNone(snapshot.mark)
+                self.assertFalse(result["components"]["funding_fresh"])
+                self.assertIsNone(result["components"]["carry_pct"])
+                self.assertFalse(result["accept"])
+                self.assertEqual((row["kind"], row["reject_code"]),
+                                 ("reject", "data_stale"))
 
     def test_decision_sequence_persist3_through_real_kernel(self):
         fixture = scanner_fixture("decision_sequence_persist3")

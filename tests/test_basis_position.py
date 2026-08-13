@@ -680,6 +680,37 @@ def happy_spec():
     }
 
 
+def one_unit_spec():
+    """A valid 10 USDT fixture whose measured net entry is exactly 1.0."""
+    spec = happy_spec()
+    spec["spot_book"] = {"symbol": SYMBOL, "bidPrice": "9.89",
+                         "askPrice": "9.9"}
+    spec["usdm_book"] = {"symbol": SYMBOL, "bidPrice": "10.0",
+                         "askPrice": "10.01", "time": 1755000000000}
+    spec["spot_account"]["balances"][1]["free"] = "1.0"
+    spec["legs"]["enter_spot"] = {
+        "submit": ("ok", {"fills": [
+            {"qty": "1.001", "commission": "0.001",
+             "commissionAsset": "BTC"}]}),
+        "query": [term_spot("FILLED", "1.001", "9.9099", 211222)],
+    }
+    spec["legs"]["enter_short"] = {
+        "submit": ("ok", {}),
+        "query": [term_usdm("FILLED", "1.0", "10.0", 544555)],
+    }
+    spec["legs"]["exit_short"] = {
+        "submit": ("ok", {}),
+        "query": [term_usdm("FILLED", "1.0", "9.99", 544556)],
+    }
+    spec["legs"]["exit_spot"] = {
+        "submit": ("ok", {"fills": [
+            {"qty": "1.0", "commission": "0.00989",
+             "commissionAsset": "USDT"}]}),
+        "query": [term_spot("FILLED", "1.0", "9.89", 211223)],
+    }
+    return spec
+
+
 class ScriptedTransport:
     """(kind, payload) contract of the live transport. Differs from the
     executor harness in one place: ALL positionRisk reads serve the single
@@ -849,6 +880,34 @@ class RatesTests(MachineCase):
 
 
 class OpenTests(MachineCase):
+    def test_open_applies_cross_lane_prior_receipt_gate_before_transport(self):
+        prior_path = os.path.join(self.dir, "roundtrip-cafe00.json")
+        with open(prior_path, "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "cafe00", "legs": []}, handle)
+
+        blocked = ScriptedTransport(happy_spec())
+        code, blocked, out = self.run_cmd(bp.cmd_open, blocked)
+        self.assertEqual(code, 3)
+        self.assertIn("no verdict", out)
+        self.assertEqual(blocked.calls, [])
+        self.assertEqual(blocked.posts, [])
+
+        with open(prior_path, "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "cafe00", "verdict": "CLOSED"}, handle)
+        code, allowed, out = self.run_cmd(bp.cmd_open, happy_spec())
+        self.assertEqual(code, 0, out)
+        self.assertEqual(post_stages(allowed), ["enter_spot", "enter_short"])
+
+    def test_open_blocks_unreadable_prior_json_before_transport(self):
+        with open(os.path.join(self.dir, "roundtrip-damaged.json"),
+                  "w", encoding="utf-8") as handle:
+            handle.write("{")
+        transport = ScriptedTransport(happy_spec())
+        code, transport, out = self.run_cmd(bp.cmd_open, transport)
+        self.assertEqual(code, 3)
+        self.assertIn("unreadable", out)
+        self.assertEqual(transport.calls, [])
+
     def test_open_persists_open_with_entry_snapshot(self):
         transport = self.open_position()
         self.assertEqual(post_stages(transport),
@@ -1020,6 +1079,33 @@ class CheckTests(MachineCase):
         self.assertEqual(Decimal(position["last_check"]["current_gap_pct"]),
                          Decimal("0.2"))
 
+    def test_check_refuses_to_clobber_concurrent_state_mutation(self):
+        self.open_position()
+        transport = ScriptedTransport(happy_spec())
+        mutated = False
+
+        def mutate_during_public_reads(method, base_url, path, params=None,
+                                       signed=False):
+            nonlocal mutated
+            if not mutated and path.endswith("ticker/bookTicker"):
+                concurrent = bp.load_position(self.dir)
+                concurrent["state"] = bp.ST_CLOSING
+                concurrent["race_marker"] = "concurrent-close"
+                bp.save_position(self.dir, concurrent)
+                mutated = True
+            return transport(method, base_url, path, params, signed)
+
+        code, _request, out = self.check(
+            transport=mutate_during_public_reads)
+        self.assertTrue(mutated)
+        self.assertEqual(code, 3)
+        self.assertIn("changed while --check was reading", out)
+        persisted = self.position()
+        self.assertEqual(persisted["state"], bp.ST_CLOSING)
+        self.assertEqual(persisted["race_marker"], "concurrent-close")
+        self.assertNotIn("last_check", persisted)
+        self.assertEqual(transport.posts, [])
+
     def test_check_gap_below_watch_is_target_reached(self):
         self.open_position()
         spec = happy_spec()
@@ -1099,6 +1185,13 @@ class CheckTests(MachineCase):
 
 
 class CloseTests(MachineCase):
+    def replace_entry_spot_fees(self, fees):
+        position = self.position()
+        entry_spot = next(leg for leg in position["legs"]
+                          if leg["stage"] == bp.ENTER_SPOT)
+        entry_spot["fee_by_asset"] = dict(fees)
+        bp.save_position(self.dir, position)
+
     def test_close_happy_reconciles_and_reports_pnl(self):
         self.open_position()
         code, transport, out = self.run_cmd(bp.cmd_close, happy_spec(),
@@ -1127,6 +1220,40 @@ class CloseTests(MachineCase):
         self.assertEqual(Decimal(pnl["total_usdt"]), Decimal("-0.02757"))
         self.assertFalse(self.lock_exists())      # lane freed on CLOSED
         self.assertIn("VERDICT: CLOSED", out)
+
+    def test_close_all_usdt_fees_keeps_complete_pnl(self):
+        self.open_position()
+        self.replace_entry_spot_fees({"USDT": "0.001"})
+        code, _transport, out = self.run_cmd(
+            bp.cmd_close, happy_spec(), run_id="cafe02")
+        self.assertEqual(code, 0, out)
+        pnl = self.position()["close"]["pnl"]
+        self.assertEqual(Decimal(pnl["spot_fees_usdt"]),
+                         Decimal("0.01088"))
+        self.assertEqual(Decimal(pnl["total_usdt"]), Decimal("-0.02857"))
+        self.assertNotIn("total_usdt_status", pnl)
+        self.assertNotIn("excluded_spot_fees_by_asset", pnl)
+
+    def test_close_mixed_usdt_bnb_fees_marks_partial_pnl(self):
+        self.open_position()
+        self.replace_entry_spot_fees({"USDT": "0.001",
+                                      "BNB": "0.00042"})
+        code, _transport, out = self.run_cmd(
+            bp.cmd_close, happy_spec(), run_id="cafe02")
+        self.assertEqual(code, 0, out)
+        pnl = self.position()["close"]["pnl"]
+        self.assertEqual(pnl["total_usdt_status"],
+                         "PARTIAL_FEES_EXCLUDED")
+        self.assertEqual(set(pnl["spot_fees_by_asset"]), {"USDT", "BNB"})
+        self.assertEqual(Decimal(pnl["spot_fees_by_asset"]["USDT"]),
+                         Decimal("0.01088"))
+        self.assertEqual(Decimal(pnl["spot_fees_by_asset"]["BNB"]),
+                         Decimal("0.00042"))
+        self.assertEqual(pnl["excluded_spot_fees_by_asset"],
+                         {"BNB": "0.00042"})
+        self.assertEqual(Decimal(pnl["spot_fees_usdt"]),
+                         Decimal("0.01088"))
+        self.assertEqual(Decimal(pnl["total_usdt"]), Decimal("-0.02857"))
 
     def test_close_persists_intent_before_each_post(self):
         self.open_position()
@@ -1206,6 +1333,51 @@ class CloseTests(MachineCase):
         self.assertEqual(transport.posts, [])
         self.assertIn("no OPEN position", out)
 
+    def test_close_refuses_without_any_proven_short_quantity(self):
+        self.open_position()
+        position = bp.load_position(self.dir)
+        del position["entry"]["short"]
+        bp.save_position(self.dir, position)
+        code, transport, out = self.run_cmd(bp.cmd_close, happy_spec(),
+                                            run_id="cafe02")
+        self.assertEqual(code, 2)
+        self.assertEqual(transport.posts, [])
+        self.assertEqual(self.position()["state"], "OPEN")
+        self.assertIn("no proven short quantity", out)
+
+    def test_close_after_partial_resume_uses_remaining_short(self):
+        self.open_position(one_unit_spec())
+        self.assertEqual(
+            Decimal(self.position()["entry"]["short"]["filled_qty"]),
+            Decimal("1.0"))
+
+        partial_spec = one_unit_spec()
+        partial_spec["legs"]["exit_short"]["query"] = [
+            term_usdm("FILLED", "0.4", "4.0", 544557)]
+        code, transport, out = self.run_cmd(bp.cmd_close, partial_spec,
+                                            run_id="cafe02")
+        self.assertEqual(code, 3, out)
+        self.assertEqual(transport.posts[0][1]["quantity"], "1.0")
+        self.assertEqual(self.position()["state"], "CLOSING")
+
+        resume_spec = one_unit_spec()
+        resume_spec["legs"]["exit_short"]["query"] = [
+            term_usdm("FILLED", "0.4", "4.0", 544557)]
+        resume_spec["position"] = [
+            {"symbol": SYMBOL, "positionAmt": "-0.6"}]
+        code, _transport, out = self.run_cmd(bp.cmd_resume, resume_spec,
+                                             run_id="cafe03")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.position()["state"], "OPEN")
+
+        second_spec = one_unit_spec()
+        second_spec["legs"]["exit_short"]["query"] = [
+            term_usdm("FILLED", "0.6", "5.99", 544558)]
+        code, transport, out = self.run_cmd(bp.cmd_close, second_spec,
+                                            run_id="cafe04")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(transport.posts[0][1]["quantity"], "0.6")
+
 
 class ResumeTests(MachineCase):
     def test_resume_open_position_intact(self):
@@ -1244,9 +1416,24 @@ class ResumeTests(MachineCase):
         self.assertEqual(transport.posts, [])          # proven, not resent
         position = self.position()
         self.assertEqual(position["state"], "OPEN")
-        # Entry snapshot was never persisted; the hold clock latches at the
-        # proven-resume moment.
+        self.assertNotIn("short", position["entry"])
+        self.assertEqual(position["resume_proven"], {
+            "run_id": "cafe02",
+            "short_qty": "0.098",
+            "source": "positionRisk",
+        })
+        # The short sub-snapshot was never persisted; the hold clock latches
+        # at the proven-resume moment.
         self.assertEqual(position["thesis"]["opened_at_ms"], T_OPEN + 5000)
+
+        code, close_transport, out = self.run_cmd(
+            bp.cmd_close, happy_spec(), run_id="cafe03")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(close_transport.posts[0][1]["quantity"], "0.098")
+        position = self.position()
+        self.assertEqual(position["state"], "CLOSED")
+        self.assertEqual(position["close"]["pnl"]
+                         ["short_quote_pnl_usdt"], "UNKNOWN")
 
     def test_resume_short_never_existed_names_one_leg(self):
         spec = happy_spec()

@@ -114,6 +114,7 @@ from basis_executor import (
 from futures_hand import clean, d, fmt
 
 STATE_FILE = "basis-position.json"
+STATE_WRITE_GUARD_FILE = "basis-position.write.lock"
 RATES_FILE = "commission-rates.json"
 EMERGENCY_FILE = "EMERGENCY"
 LOCK_FILE = "basis-executor.lock"          # shared lane lock with the executor
@@ -712,15 +713,83 @@ def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
     return loaded
 
 
-def save_position(receipt_dir: str, position: Dict[str, Any]) -> None:
-    position["verdict"] = STATE_VERDICT[position["state"]]
-    position["updated_utc"] = utc()
-    path = position_path(receipt_dir)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(position, handle, indent=2, default=str)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+def _position_revision(position: Optional[Dict[str, Any]]) -> int:
+    if position is None:
+        return 0
+    revision = position.get("revision", 0)
+    if isinstance(revision, bool) or not isinstance(revision, int) \
+            or revision < 0:
+        raise PositionError("basis-position.json revision is invalid")
+    return revision
+
+
+_NO_REVISION_CHECK = object()
+
+
+def save_position(receipt_dir: str, position: Dict[str, Any],
+                  expected_revision: Any = _NO_REVISION_CHECK) -> None:
+    """Atomically save one revision; optionally refuse a stale writer.
+
+    The short O_EXCL guard makes the revision comparison and os.replace one
+    operation with respect to every writer in this module.  --check uses the
+    expected revision captured before its public reads, so it cannot restore
+    a snapshot changed by --close/--resume while those reads were running.
+    """
+    os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
+    guard_path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
+    try:
+        descriptor = os.open(guard_path,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+    except FileExistsError:
+        raise PositionError("basis-position write already in progress; "
+                            "refusing concurrent state update") from None
+    try:
+        current = load_position(receipt_dir)
+        current_revision = _position_revision(current)
+        if expected_revision is not _NO_REVISION_CHECK \
+                and current_revision != expected_revision:
+            raise PositionError("basis-position.json changed while --check "
+                                "was reading; stale check not saved")
+        position["revision"] = max(_position_revision(position),
+                                   current_revision) + 1
+        position["verdict"] = STATE_VERDICT[position["state"]]
+        position["updated_utc"] = utc()
+        path = position_path(receipt_dir)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(position, handle, indent=2, default=str)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(guard_path)
+        except FileNotFoundError:
+            pass
+
+
+def _prior_receipt_blocker(receipt_dir: str) -> Optional[str]:
+    """Mirror basis_executor.acquire's cross-lane prior-receipt rule."""
+    try:
+        names = sorted(os.listdir(receipt_dir))
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "the shared receipt directory is unreadable"
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(receipt_dir, name),
+                      encoding="utf-8") as handle:
+                prior = json.load(handle)
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return ("a prior receipt in the receipt directory is unreadable; "
+                    "reconcile it before any new trade")
+        if not isinstance(prior, dict) or "verdict" not in prior:
+            return ("a prior run in the receipt directory has no verdict; "
+                    "any lane blocks until its client ids are reconciled")
+    return None
 
 
 def persist_intent(receipt_dir: str, position: Dict[str, Any], stage: str,
@@ -1021,6 +1090,10 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
               "spec default and must be set in the environment"
               % (cfg.symbol, ", ".join(missing)))
         return EXIT_CODE["REFUSED"]
+    receipt_blocker = _prior_receipt_blocker(cfg.receipt_dir)
+    if receipt_blocker:
+        print("OPEN | %s | BLOCKED | %s" % (cfg.symbol, receipt_blocker))
+        return EXIT_CODE["BLOCKED"]
     try:
         position = load_position(cfg.receipt_dir)
     except PositionError as error:
@@ -1332,6 +1405,7 @@ def cmd_check(cfg: PositionConfig, request, sleep=time.sleep,
               now_ms: Callable[[], int] = default_now_ms) -> int:
     try:
         position = load_position(cfg.receipt_dir)
+        loaded_revision = _position_revision(position)
     except PositionError as error:
         print("CHECK | %s | BLOCKED | %s" % (cfg.symbol, clean(error, 300)))
         return EXIT_CODE["BLOCKED"]
@@ -1379,7 +1453,13 @@ def cmd_check(cfg: PositionConfig, request, sleep=time.sleep,
         "exit_fees_pct": fmt(fees), "fees_source": fees_source,
         "decision": decision["kind"], "why": decision["why"][0],
     }
-    save_position(cfg.receipt_dir, position)
+    try:
+        save_position(cfg.receipt_dir, position,
+                      expected_revision=loaded_revision)
+    except PositionError as error:
+        print("CHECK | %s | BLOCKED | %s"
+              % (cfg.symbol, clean(error, 300)))
+        return EXIT_CODE["BLOCKED"]
     return _print_decision(cfg, position, decision, current_gap_pct,
                            "exit fees %s%% (%s)" % (fmt(fees), fees_source))
 
@@ -1431,6 +1511,37 @@ def _spot_usdt_fees(position: Dict[str, Any]) -> Decimal:
     return total
 
 
+def _spot_fees_by_asset(position: Dict[str, Any]) -> Dict[str, Decimal]:
+    """Aggregate the persisted spot commission map without conversion."""
+    totals: Dict[str, Decimal] = {}
+    for leg in position.get("legs", []):
+        for asset, amount in (leg.get("fee_by_asset") or {}).items():
+            try:
+                totals[asset] = totals.get(asset, Decimal(0)) + d(amount)
+            except ArithmeticError:
+                pass
+    return totals
+
+
+def _close_short_quantity(position: Dict[str, Any]) -> Optional[Decimal]:
+    """Newest proven short size, with the entry fill as the initial proof."""
+    resume_proven = position.get("resume_proven")
+    if resume_proven is not None:
+        raw = resume_proven.get("short_qty") \
+            if isinstance(resume_proven, dict) else None
+    else:
+        entry = position.get("entry")
+        short = entry.get("short") if isinstance(entry, dict) else None
+        raw = short.get("filled_qty") if isinstance(short, dict) else None
+    try:
+        quantity = d(raw)
+    except (ArithmeticError, TypeError):
+        return None
+    if not quantity.is_finite() or quantity <= 0:
+        return None
+    return quantity
+
+
 def cmd_close(cfg: PositionConfig, request, sleep=time.sleep,
               now_ms: Callable[[], int] = default_now_ms) -> int:
     try:
@@ -1447,8 +1558,12 @@ def cmd_close(cfg: PositionConfig, request, sleep=time.sleep,
         print("CLOSE | position holds %s, command names %s | refusing "
               "mismatch" % (position.get("symbol"), cfg.symbol))
         return EXIT_CODE["REFUSED"]
+    short_qty = _close_short_quantity(position)
+    if short_qty is None:
+        print("CLOSE | %s | REFUSED | no proven short quantity in the "
+              "persisted entry or latest resume measurement" % cfg.symbol)
+        return EXIT_CODE["REFUSED"]
     entry = position["entry"]
-    short_qty = d(entry["short"]["filled_qty"])
     net_base = d(entry["spot"]["net_base"])
     spot_step = d(entry["spot_step"])
     base_asset = entry["base_asset"]
@@ -1567,10 +1682,15 @@ def cmd_close(cfg: PositionConfig, request, sleep=time.sleep,
     # P&L from fills + commissions + funding (income is exchange truth;
     # an unreadable income read leaves funding UNKNOWN, never assumed zero).
     entry_quote_spent = d(entry["spot"]["quote_spent"])
-    entry_short_quote = d(entry["short"]["cum_quote"])
+    try:
+        entry_short_quote = d(entry.get("short", {}).get("cum_quote"))
+    except (ArithmeticError, TypeError):
+        entry_short_quote = None
     spot_pnl = quote_received - entry_quote_spent
-    short_pnl = entry_short_quote - exit_short_quote
+    short_pnl = entry_short_quote - exit_short_quote \
+        if entry_short_quote is not None else None
     spot_fees_usdt = _spot_usdt_fees(position)
+    spot_fees_by_asset = _spot_fees_by_asset(position)
     opened_at = position["thesis"].get("opened_at_ms") or 0
     kind, income = get_retry(state, USDM.base_url, USDM_INCOME_PATH,
                              {"symbol": cfg.symbol,
@@ -1597,7 +1717,8 @@ def cmd_close(cfg: PositionConfig, request, sleep=time.sleep,
             funding_total, usdm_commission = funding_sum, commission_sum
     pnl: Dict[str, Any] = {
         "spot_quote_pnl_usdt": fmt(spot_pnl),
-        "short_quote_pnl_usdt": fmt(short_pnl),
+        "short_quote_pnl_usdt": fmt(short_pnl)
+        if isinstance(short_pnl, Decimal) else "UNKNOWN",
         "spot_fees_usdt": fmt(spot_fees_usdt),
         "usdm_commission_usdt": fmt(usdm_commission)
         if isinstance(usdm_commission, Decimal) else "UNKNOWN",
@@ -1605,12 +1726,24 @@ def cmd_close(cfg: PositionConfig, request, sleep=time.sleep,
         if isinstance(funding_total, Decimal) else "UNKNOWN",
         "residual_base": fmt(residual),
     }
-    if isinstance(funding_total, Decimal) \
+    if isinstance(short_pnl, Decimal) \
+            and isinstance(funding_total, Decimal) \
             and isinstance(usdm_commission, Decimal):
         pnl["total_usdt"] = fmt(spot_pnl + short_pnl - spot_fees_usdt
                                 + funding_total + usdm_commission)
     else:
         pnl["total_usdt"] = "UNKNOWN"    # funding never assumed zero
+    excluded_spot_fees = {
+        asset: fmt(amount) for asset, amount in spot_fees_by_asset.items()
+        if asset != "USDT"
+    }
+    if excluded_spot_fees:
+        pnl["spot_fees_by_asset"] = {
+            asset: fmt(amount) for asset, amount
+            in spot_fees_by_asset.items()
+        }
+        pnl["total_usdt_status"] = "PARTIAL_FEES_EXCLUDED"
+        pnl["excluded_spot_fees_by_asset"] = excluded_spot_fees
     position["close"] = {
         "closed_utc": utc(), "short_closed_qty": fmt(closed),
         "exit_short_quote": fmt(exit_short_quote),
@@ -1781,6 +1914,12 @@ def cmd_resume(cfg: PositionConfig, request, sleep=time.sleep,
         "base_free": fmt(base_free) if base_free is not None else "UNKNOWN",
         "recommendations": judgment["recommendations"],
     }
+    if short_amount is not None:
+        position["resume_proven"] = {
+            "run_id": state.run_id,
+            "short_qty": fmt(abs(short_amount)),
+            "source": "positionRisk",
+        }
     if judgment["state"] == ST_OPEN \
             and position["thesis"].get("opened_at_ms") is None:
         position["thesis"]["opened_at_ms"] = now_ms()   # proven late; latch
