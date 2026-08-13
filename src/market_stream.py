@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """One restart-safe Binance Spot + USD-M perpetual market truth stream.
 
-The per-pass universe comes only from the two bulk book-ticker endpoints.  It
-therefore has no alphabetical cap or fixed symbol list: every symbol ending in
-USDT from either venue is represented, including Spot-only, perpetual-only,
-and shared markets.  Mark price and funding are joined from one additional
-bulk USD-M premium-index read.
+The per-pass universe comes from the two bulk book-ticker endpoints, filtered
+by the venues' exchange metadata.  It therefore has no alphabetical cap or
+fixed symbol list: every TRADING Spot symbol and every TRADING USD-M PERPETUAL
+ending in USDT is represented, including Spot-only, perpetual-only, and shared
+markets.  Mark price and funding are joined from one additional bulk USD-M
+premium-index read.
 
 Expensive per-symbol reads are bounded by ``focus_cap``.  Half of the focus
 slots (rounded down) revisit the largest absolute price moves measurable from
@@ -45,6 +46,8 @@ from urllib.request import Request, urlopen
 
 SPOT_BASE_URL = "https://api.binance.com"
 FAPI_BASE_URL = "https://fapi.binance.com"
+SPOT_EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
+FAPI_EXCHANGE_INFO_PATH = "/fapi/v1/exchangeInfo"
 SPOT_BOOK_PATH = "/api/v3/ticker/bookTicker"
 FAPI_BOOK_PATH = "/fapi/v1/ticker/bookTicker"
 FAPI_PREMIUM_PATH = "/fapi/v1/premiumIndex"
@@ -413,6 +416,26 @@ def book_map(payload: Any, source: str) -> Dict[str, Dict[str, Any]]:
             raise DataReadError(f"{source} bulk response repeats {symbol}")
         result[symbol] = dict(raw)
     return result
+
+
+def trading_symbols(
+    payload: Any, source: str, *, perpetual_only: bool = False
+) -> frozenset[str]:
+    if not isinstance(payload, dict):
+        raise DataReadError(f"{source} exchange info is not an object")
+    rows = payload.get("symbols")
+    if not isinstance(rows, list):
+        raise DataReadError(f"{source} exchange info symbols is not a list")
+    result = set()
+    for raw in rows:
+        if not isinstance(raw, dict) or raw.get("status") != "TRADING":
+            continue
+        if perpetual_only and raw.get("contractType") != "PERPETUAL":
+            continue
+        symbol = _valid_symbol(raw.get("symbol"))
+        if symbol is not None:
+            result.add(symbol)
+    return frozenset(result)
 
 
 def premium_map(payload: Any) -> Dict[str, Dict[str, Any]]:
@@ -804,11 +827,29 @@ class MarketStream:
         self._last_request_monotonic = None
         pass_start_ms = self.ms_fn()
 
+        spot_info_payload = self._read(
+            "bulk", SPOT_BASE_URL, SPOT_EXCHANGE_INFO_PATH, {}
+        )
+        perp_info_payload = self._read(
+            "bulk", FAPI_BASE_URL, FAPI_EXCHANGE_INFO_PATH, {}
+        )
         spot_payload = self._read("bulk", SPOT_BASE_URL, SPOT_BOOK_PATH, {})
         perp_payload = self._read("bulk", FAPI_BASE_URL, FAPI_BOOK_PATH, {})
         premium_payload = self._read("bulk", FAPI_BASE_URL, FAPI_PREMIUM_PATH, {})
-        spot = book_map(spot_payload, "Spot book ticker")
-        perp = book_map(perp_payload, "USD-M book ticker")
+        spot_universe = trading_symbols(spot_info_payload, "Spot")
+        perp_universe = trading_symbols(
+            perp_info_payload, "USD-M", perpetual_only=True
+        )
+        spot = {
+            symbol: row
+            for symbol, row in book_map(spot_payload, "Spot book ticker").items()
+            if symbol in spot_universe
+        }
+        perp = {
+            symbol: row
+            for symbol, row in book_map(perp_payload, "USD-M book ticker").items()
+            if symbol in perp_universe
+        }
         premium = premium_map(premium_payload)
         universe = sorted(set(spot) | set(perp))
         if not universe:
@@ -915,7 +956,7 @@ class MarketStream:
             perp_only=counts["perp"],
             both=counts["both"],
             request_count=self._request_count,
-            request_budget=3 + (2 * selected_cap),
+            request_budget=5 + (2 * selected_cap),
             bulk_requests=self._request_kinds["bulk"],
             kline_requests=self._request_kinds["kline"],
             oi_requests=self._request_kinds["oi"],

@@ -41,6 +41,18 @@ def premium(symbol, mark, funding="0.0001", next_ms="2000001000"):
     }
 
 
+def spot_info(symbol, status="TRADING"):
+    return {"symbol": symbol, "status": status}
+
+
+def perp_info(symbol, status="TRADING", contract_type="PERPETUAL"):
+    return {
+        "symbol": symbol,
+        "status": status,
+        "contractType": contract_type,
+    }
+
+
 def klines(volumes, first_close=1_000_000):
     rows = []
     for index, volume in enumerate(volumes):
@@ -72,12 +84,16 @@ class FixtureReader:
         *,
         spot=None,
         perp=None,
+        spot_symbols=None,
+        perp_symbols=None,
         premiums=None,
         kline_batches=None,
         oi=None,
     ):
         self.spot = list(spot or [])
         self.perp = list(perp or [])
+        self.spot_symbols = None if spot_symbols is None else list(spot_symbols)
+        self.perp_symbols = None if perp_symbols is None else list(perp_symbols)
         self.premiums = list(premiums or [])
         self.kline_batches = {
             symbol: list(batches) for symbol, batches in (kline_batches or {}).items()
@@ -87,6 +103,16 @@ class FixtureReader:
 
     def __call__(self, base_url, path, params):
         self.calls.append((base_url, path, dict(params)))
+        if path == ms.SPOT_EXCHANGE_INFO_PATH:
+            symbols = self.spot_symbols
+            if symbols is None:
+                symbols = [spot_info(row["symbol"]) for row in self.spot]
+            return {"symbols": symbols}
+        if path == ms.FAPI_EXCHANGE_INFO_PATH:
+            symbols = self.perp_symbols
+            if symbols is None:
+                symbols = [perp_info(row["symbol"]) for row in self.perp]
+            return {"symbols": symbols}
         if path == ms.SPOT_BOOK_PATH:
             return self.spot
         if path == ms.FAPI_BOOK_PATH:
@@ -153,9 +179,34 @@ class OfflineCase(unittest.TestCase):
 class SchemaCompletenessTests(OfflineCase):
     def test_every_venue_class_has_exact_frozen_schema(self):
         reader = FixtureReader(
-            spot=[book("AAAUSDT", "1", "1.1"), book("BBBUSDT", "10", "11")],
-            perp=[book("BBBUSDT", "12", "13"), book("CCCUSDT", "20", "21")],
-            premiums=[premium("BBBUSDT", "12.5"), premium("CCCUSDT", "20.5")],
+            spot=[
+                book("AAAUSDT", "1", "1.1"),
+                book("BBBUSDT", "10", "11"),
+                book("DEADUSDT", "0", "0"),
+            ],
+            perp=[
+                book("BBBUSDT", "12", "13"),
+                book("CCCUSDT", "20", "21"),
+                book("HALTUSDT", "30", "31"),
+                book("QUARTERUSDT", "40", "41"),
+            ],
+            spot_symbols=[
+                spot_info("AAAUSDT"),
+                spot_info("BBBUSDT"),
+                spot_info("DEADUSDT", "BREAK"),
+            ],
+            perp_symbols=[
+                perp_info("BBBUSDT"),
+                perp_info("CCCUSDT"),
+                perp_info("HALTUSDT", "SETTLING"),
+                perp_info("QUARTERUSDT", contract_type="CURRENT_QUARTER"),
+            ],
+            premiums=[
+                premium("BBBUSDT", "12.5"),
+                premium("CCCUSDT", "20.5"),
+                premium("HALTUSDT", "30.5"),
+                premium("QUARTERUSDT", "40.5"),
+            ],
             kline_batches={
                 "AAAUSDT": [klines(("1", "2", "3"))],
                 "BBBUSDT": [klines(("2", "2", "4"))],
@@ -195,11 +246,12 @@ class SchemaCompletenessTests(OfflineCase):
         self.assertEqual(shared["basis_gap_pct"], "9.0909090909090909090909090909090909090909090909091")
         self.assertEqual(stats.total, 3)
         self.assertEqual((stats.spot_only, stats.perp_only, stats.both), (1, 1, 1))
-        self.assertEqual(stats.request_count, 8)
-        self.assertEqual(stats.request_budget, 9)
-        self.assertEqual(stats.bulk_requests, 3)
+        self.assertEqual(stats.request_count, 10)
+        self.assertEqual(stats.request_budget, 11)
+        self.assertEqual(stats.bulk_requests, 5)
         self.assertEqual(stats.kline_requests, 3)
         self.assertEqual(stats.oi_requests, 2)
+        self.assertEqual(stats.coverage_passes, 2)
 
     def test_nonpositive_or_crossed_books_fail_closed_to_null(self):
         reader = FixtureReader(
