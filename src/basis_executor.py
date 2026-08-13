@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import hashlib
 import hmac
 import json
@@ -1088,6 +1089,170 @@ def plan_only(cfg: ExecutorConfig, request,
     return 0
 
 
+def pending_exposure(receipt_dir: str):
+    """Newest own OPEN_EXPOSURE receipt not yet reconciled: (path, receipt)."""
+    pattern = os.path.join(receipt_dir, "basis-executor-*.json")
+    for path in sorted(glob.glob(pattern), reverse=True):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(receipt, dict) and receipt.get("kind") != "reconcile" \
+                and receipt.get("verdict") == "OPEN_EXPOSURE" \
+                and not receipt.get("reconciled_by"):
+            return path, receipt
+    return None, None
+
+
+def source_symbol_from_events(events_path: str, run_id: str) -> str:
+    """The symbol a recorded run traded, from its own event lines."""
+    try:
+        with open(events_path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("run_id") == run_id \
+                        and event.get("symbol"):
+                    return str(event["symbol"])
+    except OSError:
+        pass
+    return ""
+
+
+def mark_source(path: str, receipt: Dict[str, Any], run_id: str,
+                how: str, amount: str) -> None:
+    receipt = dict(receipt)
+    receipt["reconciled_by"] = run_id
+    receipt["reconciled_note"] = "%s %s at %s" % (how, amount, utc())
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=2, default=str)
+    os.replace(tmp, path)
+
+
+def reconcile_once(cfg: ExecutorConfig, request,
+                   sleep: Callable[[float], None] = time.sleep) -> int:
+    """Flatten ONE recorded OPEN_EXPOSURE through the ordered path.
+
+    Sells exactly the source receipt's recorded net acquired base, floored to
+    the SPOT step, with one order proven by client id — never a repair trade,
+    never a retry, never futures. A residual below the sellable minimum is
+    recorded as accepted dust. The lane lock is released only when the
+    exposure is sold or proven dust; anything unproven keeps the lock and
+    exits nonzero for a human. Exit 0 done/none, 3 human check, 4 UNKNOWN.
+    """
+    state = make_state(cfg, request, sleep)
+    state.receipt["kind"] = "reconcile"
+    state.receipt["legs"] = []
+    source_path, source = pending_exposure(cfg.receipt_dir)
+    lock_exists = os.path.exists(state.lock_path)
+    if source is None:
+        if lock_exists:
+            print("RECONCILE | lock held but no pending exposure receipt | "
+                  "human check required")
+            return 3
+        print("RECONCILE | nothing pending")
+        return 0
+    source_run = os.path.basename(source_path)[len("basis-executor-"):
+                                               -len(".json")]
+    symbol = source_symbol_from_events(state.events_path, source_run)
+    if not symbol or symbol != cfg.symbol:
+        print("RECONCILE | source run %s traded %s, SYMBOL env is %s | "
+              "refusing mismatch" % (source_run, symbol or "UNKNOWN",
+                                     cfg.symbol))
+        return 3
+    acquired = source.get("acquired") or {}
+    try:
+        net_base = d(acquired.get("net_base", "not-a-number"))
+    except ArithmeticError:
+        net_base = None
+    if net_base is None or not net_base.is_finite() or net_base <= 0:
+        print("RECONCILE | %s | source receipt has no usable net_base | "
+              "human check required" % source_run)
+        return 3
+    state.receipt["source_run"] = source_run
+    save(state)
+    try:
+        market = market_context(state)
+    except Refusal as refusal:
+        print("RECONCILE | market context refused: %s" % clean(refusal, 200))
+        return 3
+    kind, book = state.request("GET", SPOT.base_url,
+                               "/api/v3/ticker/bookTicker",
+                               {"symbol": symbol}, False)
+    bid = d(book.get("bidPrice", "0")) \
+        if kind == "ok" and isinstance(book, dict) else Decimal(0)
+    if bid <= 0:
+        print("RECONCILE | no usable spot bid | try again later")
+        return 3
+    sell_qty = quantize_down(net_base, market["spot_step"])
+    if sell_qty <= 0 or sell_qty < market["min_qty"] \
+            or sell_qty * bid < market["min_notional"]:
+        mark_source(source_path, source, state.run_id, "dust_accepted",
+                    fmt(net_base))
+        state.receipt.update({"verdict": "RECONCILED_DUST",
+                              "residual": fmt(net_base),
+                              "finished_utc": utc()})
+        save(state)
+        if lock_exists:
+            os.unlink(state.lock_path)
+        print("RECONCILE | %s | residual %s %s below the sellable minimum | "
+              "dust accepted | lane freed" % (symbol, fmt(net_base),
+                                              market["base"]))
+        return 0
+    plan_stub = CyclePlan(
+        symbol=symbol, entry_gap_bps=Decimal(0), exit_gap_bps=Decimal(0),
+        funding_rate=Decimal(0), spot_quantity=sell_qty,
+        short_quantity=sell_qty, spot_quote_cap=Decimal(0),
+        short_notional=Decimal(0), leverage=1,
+        reason="reconcile: ordered sale of recorded exposure")
+    outcome, order, _fills = settle_leg(state, EXIT_SPOT, plan_stub, sell_qty)
+    if outcome == "terminal":
+        executed = d(order.get("executedQty", "0"))
+        residual = net_base - executed
+        if executed > 0 and residual < market["spot_step"]:
+            mark_source(source_path, source, state.run_id, "sold",
+                        fmt(executed))
+            state.receipt.update({"verdict": "RECONCILED_SOLD",
+                                  "sold": fmt(executed),
+                                  "residual": fmt(residual),
+                                  "finished_utc": utc()})
+            save(state)
+            write_events(state)
+            if lock_exists:
+                os.unlink(state.lock_path)
+            print("RECONCILE | %s | sold %s %s | residual %s | lane freed" % (
+                symbol, fmt(executed), market["base"], fmt(residual)))
+            return 0
+        state.receipt.update({"verdict": "RECONCILE_PARTIAL",
+                              "sold": fmt(executed),
+                              "residual": fmt(residual),
+                              "finished_utc": utc()})
+        save(state)
+        write_events(state)
+        print("RECONCILE | %s | partial sale %s of %s | residual %s still "
+              "sellable | lock kept" % (symbol, fmt(executed), fmt(sell_qty),
+                                        fmt(residual)))
+        return 3
+    if outcome == "rejected":
+        state.receipt.update({"verdict": "RECONCILE_REJECTED",
+                              "finished_utc": utc()})
+        save(state)
+        write_events(state)
+        print("RECONCILE | %s | sale rejected | lock kept | human check "
+              "required" % symbol)
+        return 3
+    state.receipt.update({"verdict": "UNKNOWN", "finished_utc": utc()})
+    save(state)
+    write_events(state)
+    print("RECONCILE | %s | sale UNKNOWN | query %s before anything | lock "
+          "kept" % (symbol, client_id(EXIT_SPOT, state.run_id)))
+    return 4
+
+
 def validate_only(cfg: ExecutorConfig, request,
                   sleep: Callable[[float], None] = time.sleep) -> int:
     """The COMPLETE signed read-only preflight with zero POSTs.
@@ -1231,6 +1396,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                            "(needs keys)")
     mode.add_argument("--execute", action="store_true",
                       help="run the full four-leg cycle once (needs keys)")
+    mode.add_argument("--reconcile", action="store_true",
+                      help="flatten one recorded OPEN_EXPOSURE through the "
+                           "ordered path, then free the lane (needs keys)")
     args = parser.parse_args(argv)
     try:
         cfg = config_from_env(os.environ)
@@ -1239,7 +1407,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("VERDICT: BLOCKED")
         print("NOTE:", clean(blocked, 300))
         return 2
-    if not (args.execute or args.validate_only):
+    if not (args.execute or args.validate_only or args.reconcile):
         return plan_only(cfg, live_request_factory("", ""))
     api_key = os.environ.get("BINANCE_API_KEY", "")
     api_secret = os.environ.get("BINANCE_API_SECRET", "")
@@ -1251,6 +1419,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     factory = live_request_factory(api_key, api_secret)
     if args.validate_only:
         return validate_only(cfg, factory)
+    if args.reconcile:
+        return reconcile_once(cfg, factory)
     return run_once(cfg, factory)
 
 

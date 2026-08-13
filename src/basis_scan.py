@@ -26,6 +26,7 @@ USDM_BASE = "https://fapi.binance.com"
 MAX_BYTES = 8_000_000
 TIMEOUT = 30.0
 CAP_USDT = Decimal("10")
+FEE_BUFFER = Decimal("0.002")   # mirrors basis_cycle: spot fee headroom
 BPS_Q = Decimal("0.0001")
 EST_SPOT_TAKER_BPS = Decimal("10")   # ESTIMATED default, per side
 EST_USDM_TAKER_BPS = Decimal("5")    # ESTIMATED default, per side
@@ -121,9 +122,15 @@ def funding_map(payload: Any) -> Dict[str, Decimal]:
 def cap_feasible(spot_ask: Decimal, fut_bid: Decimal,
                  spot_meta: Dict[str, Decimal],
                  fut_meta: Dict[str, Decimal]) -> bool:
-    """Could one hedged pair fit under the 10 USDT per-leg cap right now?"""
+    """Could one hedged pair fit under the 10 USDT per-leg cap right now?
+
+    Fee-aware, mirroring basis_cycle: the cap must also cover the spot
+    base-fee headroom, or the net acquired floors below one futures lot
+    (the exact live failure of 2026-08-13 on BNBUSDT).
+    """
     step = max(spot_meta["step"], fut_meta["step"])
-    quantity = (CAP_USDT / spot_ask / step).to_integral_value(
+    usable = CAP_USDT / (Decimal(1) + FEE_BUFFER)
+    quantity = (usable / spot_ask / step).to_integral_value(
         rounding=ROUND_DOWN) * step
     if quantity <= 0:
         return False
@@ -167,6 +174,10 @@ def build_rows(spot_meta: Dict[str, Dict[str, Decimal]],
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--top", type=int, default=20)
+    parser.add_argument("--best-min-bps", default="",
+                        help="print one machine line — BEST|SYMBOL|bps for "
+                             "the top cap-fitting symbol at or above this "
+                             "entry gap, else BEST|NONE — and exit")
     args = parser.parse_args(argv)
 
     spot_meta = spot_universe(fetch_json(
@@ -178,6 +189,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     funding = funding_map(fetch_json(USDM_BASE + "/fapi/v1/premiumIndex"))
 
     rows = build_rows(spot_meta, fut_meta, spot_books, fut_books, funding)
+    if args.best_min_bps:
+        floor = Decimal(args.best_min_bps)
+        for row in rows:
+            if row["fits_10_cap"] and row["entry_gap_bps"] >= floor:
+                print("BEST|%s|%s" % (row["symbol"], row["entry_gap_bps"]))
+                return 0
+        print("BEST|NONE")
+        return 0
     positive = [row for row in rows if row["entry_gap_bps"] > 0]
     qualifying = [row for row in positive if row["fits_10_cap"]]
     print("SCAN | spot USDT symbols %d | USDT perpetuals %d | common with "

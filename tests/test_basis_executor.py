@@ -331,7 +331,8 @@ class HappyPathTests(ExecutorCase):
                     for _, params in transport.posts}
         buy = by_stage["enter_spot"]
         self.assertEqual(buy["side"], "BUY")
-        self.assertEqual(buy["quoteOrderQty"], "9.90000000")
+        # fee-aware: the cap now carries the 0.2% base-fee headroom
+        self.assertEqual(buy["quoteOrderQty"], "9.91980000")
         self.assertNotIn("quantity", buy)
         self.assertEqual(buy["newOrderRespType"], "FULL")
         self.assertNotIn("market", buy)

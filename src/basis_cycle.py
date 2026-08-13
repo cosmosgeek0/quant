@@ -34,6 +34,7 @@ from basis_read import BasisReadRow, build_basis_read_row
 
 CYCLE_PREFIX = "bc-"          # disjoint from spot (…b/…s) and l2fs- lanes
 MAX_CYCLE_QUOTE = Decimal("10")   # per-leg ceiling, USDT; compiled, not config
+FEE_BUFFER = Decimal("0.002")     # spot base-fee headroom; net must cover qty
 TARGET_LEVERAGE = 1               # owner law caps at 2x; the cycle runs 1x
 QTY_QUANTUM = Decimal("0.00000001")
 
@@ -95,12 +96,18 @@ def plan_cycle(
         return None
     if row.spot_ask <= 0 or row.usdm_bid <= 0:
         raise BasisCycleError("prices must be positive to plan")
-    spot_cap_qty = MAX_CYCLE_QUOTE / row.spot_ask
+    # Fee-aware: the quote cap must buy the planned quantity PLUS the spot
+    # base-asset fee, or the net acquired floors below one futures lot (this
+    # exact failure stranded spot BNB live on 2026-08-13). A symbol whose one
+    # lot plus fee headroom exceeds the cap is refused outright.
+    usable_spot_quote = MAX_CYCLE_QUOTE / (Decimal(1) + FEE_BUFFER)
+    spot_cap_qty = usable_spot_quote / row.spot_ask
     short_cap_qty = MAX_CYCLE_QUOTE / row.usdm_bid
     quantity = quantize_down(min(spot_cap_qty, short_cap_qty), quantity_step)
     if quantity <= 0:
         return None
-    spot_quote = (quantity * row.spot_ask).quantize(QTY_QUANTUM)
+    spot_quote = (quantity * row.spot_ask
+                  * (Decimal(1) + FEE_BUFFER)).quantize(QTY_QUANTUM)
     short_notional = (quantity * row.usdm_bid).quantize(QTY_QUANTUM)
     if spot_quote < min_notional or short_notional < min_notional:
         return None
