@@ -31,8 +31,11 @@
   zero positions; zero open orders. Commissions measured: 0.30% round trip.
 - FUTURES PROVEN 2026-08-13T22:13Z: first real futures fills — 565 TST short
   opened and reduce-only closed, both FILLED, flat, receipted, ~1.4 cents,
-  via the armed job runner with zero owner presses. Basis mechanics job
-  queued next in sequence.
+  via the armed job runner with zero owner presses.
+- BASIS CYCLE PROVEN 2026-08-13T22:20Z: four real fills (spot 568.1 in/568
+  out, short 568 open/reduce-only close), verdict CLOSED, exposure none —
+  the complete mechanics chain is live. Remaining receipt: momentum's first
+  real entry + exit (adapter next; money needs it).
 - Money history: one CLOSED spot round trip (d1b204b); one honest
   OPEN_EXPOSURE freeze whose residual was later sold by the ordered
   reconcile; futures fills: two (the 2026-08-13T22:13Z proof); zero completed basis cycles; profit
