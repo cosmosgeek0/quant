@@ -1,0 +1,9 @@
+WAVE-3R RUNTIME WIRED (PAUSED) — 2026-08-13, sanitized, measured over SSM
+release: 911cbea09d87cb12c961375db857649d131144e9
+deployed sha256 (first16), host == local verified 4/4:
+  basis_kernel 6db13ddf84fa49d6 | basis_watch 504c341ca47a8e83
+  basis_position 56b249635774a434 | basis_supervisor 3d597e965e185a71
+cron: */2 basis_tick.sh (supervisor tick) — obsolete basis_auto line REMOVED
+STOP: present — entry sealed; exits/reconcile always run
+first live tick (2026-08-13T10:20:20Z): SUPERVISOR | ENTRY | IDLE | no valid proposal — exit 3 (held)
+repairs in this release: full-equation net edge (entry - intended exit - both slippages - 4 commissions + funding - buffer, one number everywhere); symbol routed from the claimed proposal (env = whitelist only); entry-time fresh-book revalidation before the leverage mutation; e2e suite updated with assertions strengthened — 666/666 green
