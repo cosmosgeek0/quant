@@ -466,6 +466,29 @@ def read_symbol_configuration():
     return parse_symbol_configuration(payload)
 
 
+def parse_trade_capability(payload):
+    """canTrade truth comes from GET /fapi/v1/accountConfig alone.
+
+    The /fapi/v3/account snapshot returned canTrade=false for a
+    Futures-enabled account (false negative recorded 2026-08-12), so that
+    endpoint is never consulted for capability again; it stays the source
+    for balances and positions only. Anything but an explicit true blocks.
+    """
+    if not isinstance(payload, dict):
+        raise PreflightError("account configuration response is not an object")
+    value = payload.get("canTrade")
+    if value is True or str(value).strip().lower() == "true":
+        return True
+    raise CapabilityBlocked("Futures accountConfig canTrade is not true")
+
+
+def read_trade_capability():
+    payload = signed_read(
+        "/fapi/v1/accountConfig", None, "Futures account-configuration read"
+    )
+    return parse_trade_capability(payload)
+
+
 def preflight(max_notional, slippage_bps, open_side="BUY"):
     global _time_offset_ms
     kind, server = get_retry("/fapi/v1/time")
@@ -494,9 +517,10 @@ def preflight(max_notional, slippage_bps, open_side="BUY"):
 
     if not API_KEY or not API_SECRET:
         raise CapabilityBlocked("host session has no Binance credential environment")
-    account = signed_read("/fapi/v3/account", None, "Futures account read")
-    if not account.get("canTrade", False):
-        raise CapabilityBlocked("Futures account canTrade is false")
+    read_trade_capability()
+    account = signed_read(
+        "/fapi/v3/account", None, "Futures balances/positions read"
+    )
 
     mode = signed_read("/fapi/v1/positionSide/dual", None, "position-mode read")
     if mode.get("dualSidePosition") is True or \

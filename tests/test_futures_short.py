@@ -417,8 +417,11 @@ class ShortExecuteTransport:
             "/fapi/v1/exchangeInfo": ("ok", {"symbols": [symbol_info()]}),
             "/fapi/v1/ticker/bookTicker": ("ok", dict(BOOK)),
             "/fapi/v1/premiumIndex": ("ok", dict(MARK)),
-            "/fapi/v3/account": ("ok", {"canTrade": True,
-                                        "availableBalance": "100",
+            "/fapi/v1/accountConfig": ("ok", {"canTrade": True,
+                                              "dualSidePosition": False}),
+            # Balances/positions truth only: canTrade is deliberately absent
+            # so any regression back to v3-account capability sourcing fails.
+            "/fapi/v3/account": ("ok", {"availableBalance": "100",
                                         "positions": []}),
             "/fapi/v1/positionSide/dual": ("ok", {"dualSidePosition": False}),
             "/fapi/v1/openOrders": ("ok", []),
