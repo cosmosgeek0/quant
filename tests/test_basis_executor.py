@@ -1278,6 +1278,43 @@ class LiveTransportOfflineTests(unittest.TestCase):
         self.assertEqual(payload, {"error": "URLError"})
 
 
+class MarginBandTests(ExecutorCase):
+    """The margin proof must cover notional x the futures price band —
+    the exchange reserves worst-case market-order margin (live -2019,
+    2026-08-13: 9.92 notional refused against 10.00 available, band 1.15)."""
+
+    def with_band(self, spec, multiplier_up, available):
+        spec["usdm_info"]["symbols"][0]["filters"].append(
+            {"filterType": "PERCENT_PRICE", "multiplierUp": multiplier_up,
+             "multiplierDown": "0.85", "multiplierDecimal": "4"})
+        spec["usdm_account"] = {"availableBalance": available}
+        return spec
+
+    def test_banded_margin_refuses_the_exact_live_case(self):
+        spec = self.with_band(happy_spec(), "1.15", "10")
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 5)
+        self.assertEqual(transport.posts, [])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "PREFLIGHT_REFUSED")
+        self.assertIn("banded short margin", receipt["verdict_note"])
+
+    def test_banded_margin_passes_with_headroom(self):
+        spec = self.with_band(happy_spec(), "1.15", "12")
+        code, _, _ = self.run_once(spec)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.receipt()["preflight"]["margin_band_up"],
+                         "1.15")
+
+    def test_missing_band_uses_conservative_default(self):
+        spec = happy_spec()
+        spec["usdm_account"] = {"availableBalance": "12"}
+        code, transport, _ = self.run_once(spec)   # 9.9 x 1.5 = 14.85 > 12
+        self.assertEqual(code, 5)
+        self.assertEqual(transport.posts, [])
+        self.assertIn("1.5", self.receipt()["verdict_note"])
+
+
 class LeverageGateTests(ExecutorCase):
     """The plan symbol's ACTUAL leverage is measured and must be exactly 1x."""
 

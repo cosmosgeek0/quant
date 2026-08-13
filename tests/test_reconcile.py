@@ -36,11 +36,12 @@ class ReconcileCase(unittest.TestCase):
                                   receipt_dir=self.dir, run_id=RID)
 
     def seed_exposure(self, net_base="0.09970000", symbol=SYMBOL,
-                      with_lock=True):
+                      with_lock=True, **extra):
         source = {
             "verdict": "OPEN_EXPOSURE",
             "acquired": {"executed_qty": "0.01000000", "base_fee": "0.00001",
                          "net_base": net_base, "hedge_quantity": "0"},
+            **extra,
         }
         self.source_path = os.path.join(
             self.dir, "basis-executor-%s.json" % SOURCE_RID)
@@ -123,6 +124,25 @@ class ReconcileTests(ReconcileCase):
         self.assertEqual(code, 3)
         self.assertEqual(transport.posts, [])
         self.assertTrue(self.lock_exists())
+
+    def test_legacy_cross_venue_dust_mark_is_reopened_and_sold(self):
+        # The 2026-08-13 BNB write-off: an old "dust_accepted" mark judged by
+        # cross-venue minimums must be re-evaluated with SPOT minimums.
+        self.seed_exposure(reconciled_by="oldrun",
+                           reconciled_note="dust_accepted 0.09970000 at old")
+        code, transport, out = self.reconcile(sell_spec())
+        self.assertEqual(code, 0)
+        self.assertEqual(len(transport.posts), 1)
+        self.assertIn("lane freed", out)
+        self.assertEqual(self.source()["reconciled_by"], RID)
+
+    def test_spot_dust_mark_is_terminal(self):
+        self.seed_exposure(with_lock=False, reconciled_by="oldrun",
+                           reconciled_note="spot_dust_accepted 0.0001 at old")
+        code, transport, out = self.reconcile(happy_spec())
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.posts, [])
+        self.assertIn("nothing pending", out)
 
     def test_unknown_sale_keeps_the_lock(self):
         self.seed_exposure()

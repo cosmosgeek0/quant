@@ -119,6 +119,7 @@ USDM_OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
 USDM_ACCOUNT_PATH = "/fapi/v3/account"
 SPOT_ACCOUNT_PATH = "/api/v3/account"
 SPOT_OPEN_ORDERS_PATH = "/api/v3/openOrders"
+QTY_QUANTUM_MARGIN = Decimal("0.00000001")
 
 
 @dataclass(frozen=True)
@@ -375,12 +376,36 @@ def market_context(state: RunState) -> Dict[str, Any]:
         raise Refusal("symbol filters are unusable on one venue") from None
     if shared_step <= 0 or spot_step <= 0:
         raise Refusal("shared quantity step is not positive")
+    # Worst-case futures price band for a market order: the exchange reserves
+    # margin at roughly notional x the up-multiplier (measured live 2026-08-13:
+    # -2019 at 9.92 notional vs 10.00 available with band 1.15). Missing band
+    # data falls back to a conservative 1.5.
+    band = usdm_filters.get("PERCENT_PRICE", {})
+    band_by_side = usdm_filters.get("PERCENT_PRICE_BY_SIDE", {})
+    ups = []
+    for source, key in ((band, "multiplierUp"),
+                        (band_by_side, "askMultiplierUp"),
+                        (band_by_side, "bidMultiplierUp")):
+        try:
+            value = d(source.get(key, "0"))
+        except ArithmeticError:
+            continue
+        if value > 1:
+            ups.append(value)
+    band_up = max(ups) if ups else Decimal("1.5")
+    spot_min_notional = d((spot_notional or {}).get("minNotional", "0"))
+    spot_min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"]),
+                     d(spot_filters.get("MARKET_LOT_SIZE",
+                                        {}).get("minQty", "0"))]
     return {
         "base": spot_info.get("baseAsset", ""),
         "shared_step": shared_step,
         "spot_step": spot_step,
         "min_notional": min_notional,
         "min_qty": max(min_qtys),
+        "band_up": band_up,
+        "spot_min_notional": spot_min_notional,
+        "spot_min_qty": max(spot_min_qtys),
     }
 
 
@@ -601,7 +626,8 @@ def symbol_leverage(rows: Any, symbol: str) -> int:
             "symbol leverage is missing or unreadable") from None
 
 
-def signed_preflight(state: RunState, plan: CyclePlan) -> None:
+def signed_preflight(state: RunState, plan: CyclePlan,
+                     market: Optional[Dict[str, Any]] = None) -> None:
     """Signed READ-ONLY account proofs before ANY order is submitted.
 
     Must prove, in the futures_hand discipline: futures canTrade=true from
@@ -678,11 +704,15 @@ def signed_preflight(state: RunState, plan: CyclePlan) -> None:
     except ArithmeticError:
         raise PreflightRefusal(
             "Futures available balance is unreadable") from None
-    if available < plan.short_notional:
+    band_up = market["band_up"] if market else Decimal(1)
+    required = (plan.short_notional * band_up).quantize(QTY_QUANTUM_MARGIN)
+    if available < required:
         raise PreflightRefusal(
-            "available Futures balance %s is below the planned short margin "
-            "%s USDT at %sx" % (fmt(available), fmt(plan.short_notional),
-                                plan.leverage))
+            "available Futures balance %s is below the banded short margin "
+            "%s USDT (notional %s x band %s at %sx) — the exchange reserves "
+            "worst-case market-order margin" % (
+                fmt(available), fmt(required), fmt(plan.short_notional),
+                fmt(band_up), plan.leverage))
     state.receipt["preflight"] = {
         "futures_can_trade": True,
         "spot_can_trade": True,
@@ -691,7 +721,8 @@ def signed_preflight(state: RunState, plan: CyclePlan) -> None:
         "open_orders": 0,
         "position_amount": "0",
         "available_balance": fmt(available),
-        "required_short_margin_1x": fmt(plan.short_notional),
+        "required_short_margin_1x": fmt(required),
+        "margin_band_up": fmt(band_up),
         "verified_utc": utc(),
     }
     save(state)
@@ -1058,7 +1089,7 @@ def run_once(cfg: ExecutorConfig, request,
         except Refusal as refusal:
             finish(state, "REJECTED_BEFORE_ENTRY", "none", str(refusal))
         try:
-            signed_preflight(state, plan)
+            signed_preflight(state, plan, market)
         except PreflightRefusal as refusal:
             finish(state, "PREFLIGHT_REFUSED", "none", str(refusal))
         execute_legs(state, plan, market)
@@ -1099,9 +1130,14 @@ def pending_exposure(receipt_dir: str):
         except (OSError, ValueError):
             continue
         if isinstance(receipt, dict) and receipt.get("kind") != "reconcile" \
-                and receipt.get("verdict") == "OPEN_EXPOSURE" \
-                and not receipt.get("reconciled_by"):
-            return path, receipt
+                and receipt.get("verdict") == "OPEN_EXPOSURE":
+            note = str(receipt.get("reconciled_note", ""))
+            # Legacy "dust_accepted" marks used cross-venue minimums and may
+            # have written off spot-sellable coins; reopen those once. The
+            # corrected mark, "spot_dust_accepted", is terminal.
+            if not receipt.get("reconciled_by") \
+                    or note.startswith("dust_accepted"):
+                return path, receipt
     return None, None
 
 
@@ -1189,9 +1225,9 @@ def reconcile_once(cfg: ExecutorConfig, request,
         print("RECONCILE | no usable spot bid | try again later")
         return 3
     sell_qty = quantize_down(net_base, market["spot_step"])
-    if sell_qty <= 0 or sell_qty < market["min_qty"] \
-            or sell_qty * bid < market["min_notional"]:
-        mark_source(source_path, source, state.run_id, "dust_accepted",
+    if sell_qty <= 0 or sell_qty < market["spot_min_qty"] \
+            or sell_qty * bid < market["spot_min_notional"]:
+        mark_source(source_path, source, state.run_id, "spot_dust_accepted",
                     fmt(net_base))
         state.receipt.update({"verdict": "RECONCILED_DUST",
                               "residual": fmt(net_base),
@@ -1273,9 +1309,10 @@ def validate_only(cfg: ExecutorConfig, request,
 
     state = make_state(cfg, get_only, sleep, receipted=False)
     plan = None
+    market = None
     plan_note = ""
     try:
-        _row, plan, _market = read_and_plan(state)
+        _row, plan, market = read_and_plan(state)
     except Refusal as refusal:
         plan_note = clean(refusal, 300)
         print("VALIDATE | %s | PLAN_REFUSED | %s" % (cfg.symbol, plan_note))
@@ -1291,7 +1328,7 @@ def validate_only(cfg: ExecutorConfig, request,
             leverage=1,
             reason="validate-only fallback after plan refusal")
     try:
-        signed_preflight(state, plan)
+        signed_preflight(state, plan, market)
     except PreflightRefusal as refusal:
         print("VALIDATE | %s | PREFLIGHT_REFUSED | %s" % (cfg.symbol,
                                                           clean(refusal, 300)))
