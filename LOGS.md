@@ -9,6 +9,15 @@ every step.
 
 ---
 
+FIRST BASIS CYCLE ATTEMPT + MACHINE TRIGGER 2026-08-13 | owner pressed; machine built | code 81e999ad
+live result | leverage BNBUSDT 5x->1x proven | transfer 9 USDT spot-to-usdm CONFIRMED | cycle bought ~10 USDT BNB then froze OPEN_EXPOSURE
+live defect | net base after 0.1% fee floors below the 0.01 futures lot | lock held, no repair trade | ~0.00999 BNB spot unhedged, awaiting reconcile
+repairs | plan sizing now fee-aware (a symbol whose one lot + fee headroom exceeds the 10 cap refuses — BNB now refuses honestly) | scan feasibility matched
+repairs | --reconcile added: sells exactly the recorded net acquired through the ordered path, dust accepted below sellable minimum, lane freed only on proof
+machine | scripts/basis_auto.sh: cron 5-min fire — reconcile first if lane locked; then scan picks the best cap-fitting symbol over the bar (5 bps until first CLOSED, 35 after); one-shot 1x set; execute | STOP file + stop script halt everything
+tests | 319 green | first failure this pass: reconcile receipt lacked its legs list; fixed before commit
+verdict | armed on disk, NOT running | one owner press installs cron and fires once (reconciles the BNB); zero presses per run after
+
 VALIDATE + UNIVERSE SCAN 2026-08-13 | owner order: results regardless of sign | code 945b7f89
 change | validate-only decoupled from plan outcome (conservative 10-USDT margin fallback) | src/basis_scan.py public sweep added | 303 tests green
 host validate | BTCUSDT: PLAN_REFUSED entry gap -5.09 bps, then PREFLIGHT_REFUSED actual leverage 10x | exit 5 | zero POSTs
