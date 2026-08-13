@@ -399,6 +399,120 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
         self.assertEqual(len(transport.posts()), 1)
 
 
+class ShortExecuteTransport:
+    """Serves one full offline ``--short --execute`` run deterministically.
+
+    ``/fapi/v1/order`` GETs echo back the queried client order id so the
+    run ids generated inside ``main`` always match; the open and close fills
+    are injected per test. Leverage is already 1x so the only POSTs a run
+    may make are the open and close orders.
+    """
+
+    def __init__(self, open_fill, close_fill):
+        self.calls = []
+        self.open_fill = dict(open_fill)
+        self.close_fill = dict(close_fill)
+        self.reads = {
+            "/fapi/v1/time": ("ok", {"serverTime": 1755000000000}),
+            "/fapi/v1/exchangeInfo": ("ok", {"symbols": [symbol_info()]}),
+            "/fapi/v1/ticker/bookTicker": ("ok", dict(BOOK)),
+            "/fapi/v1/premiumIndex": ("ok", dict(MARK)),
+            "/fapi/v3/account": ("ok", {"canTrade": True,
+                                        "availableBalance": "100",
+                                        "positions": []}),
+            "/fapi/v1/positionSide/dual": ("ok", {"dualSidePosition": False}),
+            "/fapi/v1/openOrders": ("ok", []),
+            "/fapi/v3/positionRisk": ("ok", []),
+            "/fapi/v1/symbolConfig": ("ok", [{"symbol": "BTCUSDT",
+                                              "leverage": "1"}]),
+        }
+
+    def __call__(self, method, path, params=None, signed=False):
+        params = dict(params or {})
+        self.calls.append((method, path, params, signed))
+        if method == "POST":
+            if path != "/fapi/v1/order":
+                raise AssertionError("unexpected offline POST to " + path)
+            return "ok", {}
+        if path == "/fapi/v1/order":
+            client_id = params.get("origClientOrderId", "")
+            fill = self.open_fill if client_id.endswith("-o") \
+                else self.close_fill
+            return "ok", dict(fill, clientOrderId=client_id)
+        if path in self.reads:
+            return self.reads[path]
+        raise AssertionError("unexpected offline request: %s %s" % (method,
+                                                                    path))
+
+    def order_posts(self):
+        return [call for call in self.calls if call[0] == "POST"]
+
+
+OPEN_FILL_BREACH = {"status": "FILLED", "orderId": 111,
+                    "executedQty": "0.099", "cumQuote": "10.098"}
+OPEN_FILL_UNDER_CAP = {"status": "FILLED", "orderId": 111,
+                       "executedQty": "0.099", "cumQuote": "9.88"}
+CLOSE_FILL = {"status": "FILLED", "orderId": 222, "executedQty": "0.099",
+              "cumQuote": "10.10", "reduceOnly": True}
+
+
+class TestShortNotionalBreachContainment(OfflineCase):
+    """A sell fill above the cap must be flattened and named, never UNKNOWN."""
+
+    def run_short_execute(self, open_fill, close_fill=CLOSE_FILL):
+        transport = ShortExecuteTransport(open_fill, close_fill)
+        out = io.StringIO()
+        argv = ["futures_hand.py", "--short", "--execute"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(fh, "API_KEY", "offline-test-key"), \
+                mock.patch.object(fh, "API_SECRET", "offline-test-secret"), \
+                mock.patch.object(fh, "http", transport), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as caught:
+                fh.main()
+        return transport, out.getvalue(), caught.exception.code
+
+    def test_breach_is_detected_flattened_and_honestly_named(self):
+        transport, text, code = self.run_short_execute(OPEN_FILL_BREACH)
+        self.assertEqual(code, 3)
+        self.assertEqual(fh.receipt["verdict"], "CEILING_BREACH_CONTAINED")
+        self.assertEqual(fh.receipt["first_failure"]["where"], "hard_ceiling")
+        self.assertIn("flattened", fh.receipt["verdict_note"])
+        self.assertIn("10.098", fh.receipt["verdict_note"])
+        posts = transport.order_posts()
+        self.assertEqual(len(posts), 2)
+        open_post, close_post = posts[0][2], posts[1][2]
+        self.assertEqual(open_post["side"], "SELL")
+        self.assertEqual(open_post["reduceOnly"], "false")
+        self.assertEqual(close_post["side"], "BUY")
+        self.assertEqual(close_post["type"], "MARKET")
+        self.assertEqual(close_post["reduceOnly"], "true")
+        self.assertEqual(close_post["quantity"], "0.099")
+        self.assertTrue(close_post["newClientOrderId"].startswith("l2fs-"))
+        self.assertIn("VERDICT: CEILING_BREACH_CONTAINED", text)
+        self.assertEqual(fh.receipt["final_state"]["position_amount"],
+                         Decimal("0"))
+        self.assertTrue(os.path.exists(fh.LOCK_PATH))
+
+    def test_no_breach_short_run_still_ends_closed(self):
+        transport, text, code = self.run_short_execute(OPEN_FILL_UNDER_CAP)
+        self.assertEqual(code, 0)
+        self.assertEqual(fh.receipt["verdict"], "CLOSED")
+        self.assertNotIn("first_failure", fh.receipt)
+        self.assertEqual(len(transport.order_posts()), 2)
+        self.assertIn("VERDICT: CLOSED", text)
+        self.assertFalse(os.path.exists(fh.LOCK_PATH))
+
+    def test_breach_with_partial_close_reports_exposure_not_containment(self):
+        partial_close = dict(CLOSE_FILL, executedQty="0.050")
+        transport, text, code = self.run_short_execute(OPEN_FILL_BREACH,
+                                                       partial_close)
+        self.assertEqual(code, 3)
+        self.assertEqual(fh.receipt["verdict"], "OPEN_EXPOSURE")
+        self.assertNotIn("CEILING_BREACH_CONTAINED", text)
+        self.assertEqual(len(transport.order_posts()), 2)
+
+
 class TestConfigRefusals(OfflineCase):
     def test_config_accepts_capped_notional(self):
         self.assertEqual(fh.config(), (Decimal("10"), Decimal("10")))

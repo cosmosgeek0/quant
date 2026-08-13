@@ -10,10 +10,16 @@ compiled 10 USDT lane ceiling; the closing order is SELL MARKET with
 ``reduceOnly=true`` for exactly the opened quantity.
 
 ``--short`` runs the mirrored short hand: the opening order is SELL LIMIT IOC,
-floored below the bid but sized against the same slippage-padded ask so the
-worst-case entry notional stays under the same ceiling; the closing order is
-BUY MARKET with ``reduceOnly=true`` for exactly the opened quantity. Short
-client order ids use their own ``l2fs-`` prefix.
+floored below the bid and sized against the same slippage-padded ask so the
+PLANNED entry notional stays under the same ceiling. That cap binds sizing
+only, not the fill: a sell's limit price is a floor, so fills execute at or
+above it, and on an up-move between the sizing read and submission the filled
+notional can exceed the cap. Containment is post-fill: the breach is measured
+from the exchange-reported fill notional, recorded as the first failure, and
+the full filled quantity is flattened through the ordered reduce-only BUY
+MARKET close, ending in CEILING_BREACH_CONTAINED rather than a bare UNKNOWN.
+The closing order is BUY MARKET with ``reduceOnly=true`` for exactly the
+opened quantity. Short client order ids use their own ``l2fs-`` prefix.
 
 Required environment (values are read but never printed): BINANCE_API_KEY,
 BINANCE_API_SECRET, SYMBOL, MAX_NOTIONAL, and QUANT_SHA. Optional:
@@ -265,12 +271,16 @@ def position_amount(rows):
 
 def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps,
               open_side="BUY"):
-    """Build an opening LIMIT IOC whose worst fill notional is at the hard cap.
+    """Build an opening LIMIT IOC sized so the planned notional is at the cap.
 
     BUY caps its limit above the ask, which the exchange enforces as the worst
-    fill price. SELL floors its limit below the bid as the worst sale price and
-    still sizes quantity against the same slippage-padded ask so the short's
-    worst-case entry notional stays at or under the cap.
+    fill price, so a BUY fill notional cannot exceed the cap. SELL floors its
+    limit below the bid; that floor bounds the sale price from BELOW, not
+    above, so for a short the cap binds only SIZING (quantity times the
+    slippage-padded ask). On an up-move between this sizing read and
+    submission a SELL fill notional can exceed the cap; that breach is
+    detected post-fill from the exchange-reported fill notional and contained
+    through the ordered reduce-only close (see main).
     """
     if open_side not in ("BUY", "SELL"):
         raise PreflightError("open side must be BUY or SELL")
@@ -329,6 +339,10 @@ def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps,
         if multiplier_down > 0 and limit_price < mark * multiplier_down:
             raise PreflightError("floored IOC price is outside PERCENT_PRICE")
 
+    # Sizing bind: quantity * cap_price <= max_notional. For BUY the exchange
+    # also enforces cap_price as the worst fill price; for SELL it does not
+    # (the limit is a floor), so a SELL fill can land above this at
+    # submission time and is re-checked post-fill against cumQuote.
     quantity = floor_step(min(max_notional / cap_price, max_qty), step)
     notional = quantity * cap_price
     entry_floor = quantity * limit_price
@@ -359,7 +373,12 @@ def plan_open(symbol_info, book, mark_payload, max_notional, slippage_bps,
 
 
 def plan_short_open(symbol_info, book, mark_payload, max_notional, slippage_bps):
-    """Build the short hand's SELL LIMIT IOC plan under the same hard cap."""
+    """Build the short hand's SELL LIMIT IOC plan sized against the hard cap.
+
+    The cap binds sizing at the slippage-padded ask, not the fill: a SELL
+    limit price is a floor, so an up-move before submission can fill above
+    the planned notional. Containment of that breach is post-fill (see main).
+    """
     return plan_open(
         symbol_info, book, mark_payload, max_notional, slippage_bps,
         open_side="SELL",
@@ -549,7 +568,7 @@ def wrap_up(verdict, note, code):
     receipt["final_state"] = state or {
         "position_amount": "UNKNOWN", "open_orders": "UNKNOWN"
     }
-    if verdict == "CLOSED":
+    if verdict in ("CLOSED", "CEILING_BREACH_CONTAINED"):
         if state is None:
             verdict, code = "UNKNOWN", 4
             note = "orders terminal but final position/open-orders state is unreadable"
@@ -827,7 +846,8 @@ def main():
             2,
             release_lock=True,
         )
-    if opened_qty > plan["quantity"] or open_quote > max_notional:
+    notional_breach = open_quote > max_notional
+    if opened_qty > plan["quantity"] or notional_breach:
         first_fail("hard_ceiling", "exchange-reported open exceeded the planned cap")
 
     close_params = close_intent(sides["close_side"], opened_qty, close_id)
@@ -859,6 +879,15 @@ def main():
             fmt(closed_qty), fmt(opened_qty)
         ))
         wrap_up("OPEN_EXPOSURE", "reduce-only close did not execute the full open quantity", 3)
+    if notional_breach:
+        wrap_up(
+            "CEILING_BREACH_CONTAINED",
+            "%s open filled %s USDT, above the %s USDT cap; the full filled "
+            "quantity was flattened by the ordered reduce-only close" % (
+                hand, fmt(open_quote), fmt(max_notional)
+            ),
+            3,
+        )
     if "first_failure" in receipt:
         wrap_up("UNKNOWN", "planned pair ended but a safety invariant failed", 4)
     wrap_up(

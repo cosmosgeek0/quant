@@ -9,6 +9,16 @@ every step.
 
 ---
 
+WAVE-1 INTEGRATION 2026-08-13 | four lanes merged + basis_cycle built | base 1aa1e018 | integrator = the Lead
+merged | lane/ui fde677ed | lane/basis-read 07f2af1d | lane/volume 47d02a0f | lane/futures-short e240074a | LOGS stacked, no history lost
+built | src/basis_cycle.py + tests/test_basis_cycle.py | spot-long + USD-M-short lifecycle, offline only, 11/11 terminal paths tested
+review | adversarial 4-lens panel with 2-refuter votes per finding | 13 raw | 9 confirmed | 4 refuted
+repairs | basis_cycle: exchange-truth fee-aware sizing, quoteOrderQty spend bound, short-leg-first exit, truthful UNKNOWN strings
+repairs | futures_hand: cap honesty in docstrings + post-fill breach check -> ordered reduce-only flatten -> CEILING_BREACH_CONTAINED | 29 -> 32 tests
+evidence | full offline suite 113 tests green | py_compile clean | no live action, no host access, quarantine untouched
+first failure | panel HIGH: cycle sold full planned quantity ignoring base-asset fees | repaired before any merge to main
+verdict | CANDIDATE — merged to main this commit; nothing deployed, nothing live
+
 FUTURES-SHORT 2026-08-13 | offline short-hand build | base 1aa1e018 | code commit b6019754
 deliverable | src/futures_hand.py --short hand: SELL LIMIT IOC open + reduce-only BUY MARKET close, own l2fs- prefix, 10 USDT cap and 1x preserved
 evidence | py_compile clean on src/futures_hand.py + tests/test_futures_short.py | tests/test_futures_short.py 29 cases green offline, injected transport, no network
