@@ -1,42 +1,42 @@
 # TASK.md — current work orders
 
-OWNER ORDER 2026-08-13 (direct, in-channel; supersedes TASK B,
-OWNER_ORDER_PARALLEL_WAVE_2, and the screenshotted reset note):
-- TASK B (host machine-trigger) CANCELLED. OWNER_ORDER_PARALLEL_WAVE_2
-  CANCELLED — its L11-L30 plan never governs.
-- Owner-fixed facts at reset: main = 72d88b565d67b038c9979facb6845d3e9e188c48;
-  no bot deployed; no Futures trade has ever completed.
-- The Task-B draft sits uncommitted in Desktop/quant and is QUARANTINED
-  unchanged: no merge, delete, deploy, run, or repair of its modified files.
-  All wave work runs in clean worktrees from the reset SHA.
-- No host runner and no live action anywhere in this wave.
-- Process truth at reset (measured 2026-08-13): no Task-B process on the Mac;
-  no quant unit, timer, unit file, process, or cron entry on the host.
+OWNER ORDER 2026-08-13, WAVE 2 (direct, in-channel; supersedes the wave-1
+lane manifest; the 2026-08-13 reset facts and cancellations still stand):
+- DO NOT arm or deploy the Basis cycle: it has no live executor yet.
+  Nothing executes live until the owner's next word.
+- The seven cancelled Task-B edits are STASHED in Desktop/quant as
+  "CANCELLED-TASK-B-DO-NOT-APPLY" — never apply, never drop. Desktop/quant is
+  clean and current again; wave work still runs in separate worktrees.
+- Base for every wave-2 lane: main 0cffc89636743a32838d0163aee2ad3e26bd9bd0.
 
-NOW — PRODUCT WAVE: four lanes, each one worker in one clean worktree under
-Desktop/worktrees/<lane>, branch lane/<lane>, base = the reset SHA. Read-only
-toward the world: unsigned public GETs only where the lane row names them; no
-credentials, no signed calls, no orders, no transfers. Each worker commits to
-its lane branch, does not push, does not merge, and prepends one standard
-LOGS.md entry inside its own worktree.
+WAVE-2 LANES (one worker, one worktree under Desktop/worktrees/<lane>, branch
+lane/<lane>; offline or public-unsigned only; no credentials on the Mac; no
+POST, transfer, leverage change, or order anywhere; commit to lane branch, no
+push, no merge; one LOGS.md entry each):
+CAPABILITY-FIX | src/futures_hand.py | preflight canTrade must come from
+  GET /fapi/v1/accountConfig; /fapi/v3/account stays for balances+positions;
+  regression tests covering the prior false-negative | offline tests only
+BASIS-EXECUTOR | src/basis_executor.py | ONE-SHOT executor connecting the
+  existing pieces: live basis read -> Spot buy -> confirm actual net base ->
+  Futures short that actual quantity -> confirm actual Futures fill ->
+  reduce-only close exact short fill -> sell actual remaining Spot. Partial
+  fills handled; uncertain orders queried by client ID; no host_once, timer,
+  daemon, or service | offline tests only in this wave
+VOLUME-V2      | src/volume_observer.py | closed-candle volume-surge
+  detection; restart-safe paper positions; live Spot-USDT universe;
+  PAPER ONLY | public unsigned GETs + offline tests
+UI-RUNTIME     | ui/ | serve through localhost HTTP; read ACTUAL Spot, Basis,
+  Futures, and Volume output files; remove fixture-only and file://
+  dependence; read-only | headless evidence
 
-BASIS-READ    | src/basis_read.py | executable prices: entry gap = USD-M bid
-  minus Spot ask; exit gap = USD-M ask minus Spot bid; plus funding;
-  Decimal-safe | evidence: one live public read printed + deterministic
-  no-network test
-FUTURES-SHORT | src/futures_hand.py | SHORT side: SELL open + reduce-only BUY
-  close, capped notional, 1x; OFFLINE proof only — no network at all |
-  evidence: deterministic tests pass offline
-VOLUME        | src/volume_observer.py | public-data observer + paper
-  lifecycle (paper entry, trail out) writing paper receipts inside the
-  worktree | evidence: one public observation run + lifecycle test
-UI            | ui/ | one read-only screen from real receipts
-  (ui/fixtures/events.jsonl, contract v1) + live public prices; real data
-  only; honest empty states; no dead controls | evidence: renders from the
-  real fixture
+HOST CHECK (parallel, one worker): one signed GET-only read on the execution
+host — Futures accountConfig, account+balances, position mode, symbol
+configuration, open orders, position risk, Spot balances. No mutation of any
+kind. Digest returns plain rows only.
 
-INTEGRATION: the Lead builds the smallest src/basis_cycle.py after BASIS-READ
-and FUTURES-SHORT land. Volume stays paper; UI stays read-only.
+INTEGRATION: the Lead merges passing lanes after adversarial review and
+reports: four lane SHAs, merged SHA, canTrade, Spot+Futures USDT, position
+mode, leverage, positions, open orders, and the exact remaining blocker.
 
 ## EVENT CONTRACT v1 — frozen 2026-08-12; grows only on owner word; 1 page max
 One JSON object per line, appended to events.jsonl on the execution host; the
