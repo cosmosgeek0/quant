@@ -9,6 +9,13 @@ every step.
 
 ---
 
+CAPABILITY-FIX 2026-08-13 | canTrade truth moved off v3 account | base 0cffc896 | code commit 304f044f
+fix | src/futures_hand.py preflight: capability gate = GET /fapi/v1/accountConfig canTrade only | /fapi/v3/account kept for balances + positions only | non-true or unreadable config -> honest CapabilityBlocked before any v3 read or order path
+tests | tests/test_capability.py new, 12 offline cases: config-true passes with v3 lacking/contradicting; config-false blocks at preflight, validate, and execute with zero order POSTs; balances/positions still v3-sourced | execute fake in tests/test_futures_short.py now serves accountConfig and its v3 row is canTrade-free
+evidence | full offline suite 125 tests green (baseline 113 re-measured before change) | test_futures_short alone 32 green | py_compile clean on all three touched files | injected transport, no network
+failures | none | first full-suite run after the fix was green | MEASURED
+verdict | DONE_LOCAL — committed to lane/capability-fix, not pushed, not merged | live-key behavior not checked (offline lane)
+
 WAVE-1 INTEGRATION 2026-08-13 | four lanes merged + basis_cycle built | base 1aa1e018 | integrator = the Lead
 merged | lane/ui fde677ed | lane/basis-read 07f2af1d | lane/volume 47d02a0f | lane/futures-short e240074a | LOGS stacked, no history lost
 built | src/basis_cycle.py + tests/test_basis_cycle.py | spot-long + USD-M-short lifecycle, offline only, 11/11 terminal paths tested
