@@ -55,6 +55,9 @@ components are built and hardened, but the restart-safe runtime vertical —
 immutable proposals, proposal-only entry, STOP interlock, one supervisor
 with crash-resume, e2e crash tests, paused GET-only deploy evidence — is
 NOT built. No live mutation; basis_auto stays unarmed.
+UPDATE, same day: order items 1-7 are COMPLETE at release 7ac26aa7 — evidence
+in evidence/wave3R-deploy-evidence.txt — and SUBMITTED for commander
+acceptance; the recorded state stands unchanged until acceptance.
 Wave-1/2 history preserved in LOGS.
 
 PARKED, awaiting owner words someday: L6 reverse-basis spec (needs borrow

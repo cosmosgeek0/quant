@@ -1,0 +1,12 @@
+WAVE-3R PAUSED/GET-ONLY DEPLOY EVIDENCE — 2026-08-13, sanitized, measured over SSM
+release SHA: 7ac26aa771937f802930dac5eb017d6583d968d8
+deployed module sha256 (first16), host == local verified:
+  basis_kernel     bc51acb4c34f63cc
+  basis_watch      89700a5b2d2a311b
+  basis_position   ed00d461d5e8c1f1
+  basis_supervisor 4fe2590678b5cf82
+STOP: present (trading paused; entry interlock armed)   EMERGENCY: absent
+cron: one basis_auto line, STOP-gated at entry; supervisor NOT wired to cron (owner activation pending)
+processes: none beyond the evidence script itself
+signed account truth: spot USDT free 84.31358020 | spot BNB free 0.00096141 (true dust, below step)
+  usdm USDT available/wallet 11.03000000 | futures nonzero positions 0 | futures open orders 0 | spot open orders 0

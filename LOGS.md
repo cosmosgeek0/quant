@@ -9,6 +9,14 @@ every step.
 
 ---
 
+WAVE-3R RUNTIME VERTICAL 2026-08-13 | commander order items 1-7 complete | release 7ac26aa771937f802930dac5eb017d6583d968d8
+built | immutable 0400 proposals (26 fields, TTL, negative-net unwritable) | proposal-only entry, raw-gap path removed | STOP = global entry interlock, exits always run | reads complete before the leverage mutation
+built | ONE supervisor: atomic claim -> open -> reconcile-first ticks -> auto-close on exit/emergency -> crash-resume | UNKNOWN/ONE_LEG freeze entry until reconciled
+proven | e2e injected suite: STOP, negative-net refusal, expiry, all exit routing, emergency, 7 crash boundaries, no client id ever re-POSTs | full suite 651 green
+deployed | paused/GET-only | host module hashes == local (4/4) | STOP present | no EMERGENCY | no quant process | cron STOP-gated, supervisor unwired
+account | spot USDT 84.31358020 | BNB residual 0.00096141 true dust (prior residual sold via the ordered reconcile path) | usdm 11.03 | zero positions, zero open orders anywhere
+verdict | submitted for commander acceptance | recorded state REMAINS WAVE3_COMPONENTS_BUILT__RUNTIME_NOT_READY until accepted | no live mutation, nothing armed
+
 VERDICT CORRECTION 2026-08-13 | commander rejected wave-3 completion | recorded state is now WAVE3_COMPONENTS_BUILT__RUNTIME_NOT_READY
 missing | immutable persisted proposals | proposal-only entry | STOP as global entry interlock | reads-before-leverage ordering | ONE supervisor (claim->open->reconcile->auto-close->crash-resume) | e2e crash-boundary tests | paused GET-only deploy evidence
 standing | READY_WAITING_FOR_NET_EDGE and production-validated are RETIRED from the record until the runtime vertical passes | no live mutation, basis_auto stays unarmed
