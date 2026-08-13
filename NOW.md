@@ -33,11 +33,12 @@
   opened and reduce-only closed, both FILLED, flat, receipted, ~1.4 cents,
   via the armed job runner with zero owner presses.
 - BASIS CYCLE PROVEN 2026-08-13T22:20Z: four real fills (spot 568.1 in/568
-  out, short 568 open/reduce-only close), verdict CLOSED, exposure none —
-  the complete mechanics chain is live. Remaining receipt: momentum's first
-  real entry + exit (adapter next; money needs it).
+  out, short 568 open/reduce-only close), verdict CLOSED, hedged exposure
+  none, 0.1 TST dust recorded — the complete mechanics chain is live.
+  Remaining receipt: momentum's first real entry + exit (money needs it).
 - Money history: one CLOSED spot round trip (d1b204b); one honest
   OPEN_EXPOSURE freeze whose residual was later sold by the ordered
-  reconcile; futures fills: two (the 2026-08-13T22:13Z proof); zero completed basis cycles; profit
-  proven: none. Not guaranteed money — the machine refuses when the full
-  equation is negative, which today it is.
+  reconcile; futures fills: four (short proof + basis cycle, 2026-08-13);
+  completed basis cycles: one (mechanics-only); profit proven: none. Not
+  guaranteed money — the machine refuses when the full equation is
+  negative, which today it is.

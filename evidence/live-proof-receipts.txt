@@ -1,0 +1,219 @@
+WAVE-4 LIVE PROOF RECEIPTS — sanitized raw exports from the execution host, 2026-08-14
+(EXECUTION_MECHANICS_ONLY; ids last-4 by the receipts' own discipline; no secrets present)
+
+=== RECEIPT futures-hand-6a7e416f3c49b8
+{
+ "hand": "short",
+ "run_id": "6a7e416f3c49b8",
+ "open_client_id": "l2fs-6a7e416f3c49b8-o",
+ "close_client_id": "l2fs-6a7e416f3c49b8-c",
+ "sha": "c7739b5198ad07f7ad3f4198ee3027784e4455c8",
+ "symbol": "TSTUSDT",
+ "requested_max_notional": "8",
+ "hard_ceiling_usdt": "10",
+ "started_utc": "2026-08-13T22:13:03Z",
+ "starting_state": {
+  "open_side": "SELL",
+  "quantity": "565",
+  "limit_price": "0.0141000",
+  "max_fill_notional": "7.9947500",
+  "min_notional": "5",
+  "close_notional_floor": "7.9003712700",
+  "step": "1",
+  "ask": "0.0141300",
+  "bid": "0.0141200",
+  "mark": "0.01412420",
+  "available_balance_sufficient": true,
+  "account_can_trade": true,
+  "position_mode": "ONE_WAY",
+  "open_orders": 0,
+  "position_amount": "0",
+  "current_leverage": 1,
+  "target_leverage": 1,
+  "leverage_change_required": false,
+  "margin_type": "CROSSED"
+ },
+ "leverage": {
+  "before": 1,
+  "target": 1,
+  "mutation_attempts": 0,
+  "after": 1,
+  "verified_utc": "2026-08-13T22:13:05Z",
+  "note": "already at compiled target; no leverage mutation sent"
+ },
+ "open": {
+  "submitted_utc": "2026-08-13T22:13:05Z",
+  "params": {
+   "symbol": "TSTUSDT",
+   "side": "SELL",
+   "positionSide": "BOTH",
+   "type": "LIMIT",
+   "timeInForce": "IOC",
+   "quantity": "565",
+   "price": "0.0141000",
+   "reduceOnly": "false",
+   "newOrderRespType": "RESULT"
+  },
+  "client_id_last4": "b8-o",
+  "order_id_last4": "2654",
+  "status": "FILLED",
+  "executed_qty": "565",
+  "cum_quote": "7.9778000"
+ },
+ "close": {
+  "submitted_utc": "2026-08-13T22:13:06Z",
+  "params": {
+   "symbol": "TSTUSDT",
+   "side": "BUY",
+   "positionSide": "BOTH",
+   "type": "MARKET",
+   "quantity": "565",
+   "reduceOnly": "true",
+   "newOrderRespType": "RESULT"
+  },
+  "client_id_last4": "b8-c",
+  "order_id_last4": "2657",
+  "status": "FILLED",
+  "executed_qty": "565",
+  "cum_quote": "7.9834500",
+  "reduce_only": true
+ },
+ "final_state": {
+  "position_amount": "0",
+  "open_orders": 0,
+  "leverage": 1
+ },
+ "verdict": "CLOSED",
+ "verdict_note": "capped IOC short open and same-quantity reduce-only market close are terminal",
+ "finished_utc": "2026-08-13T22:13:06Z"
+}
+=== RECEIPT basis-executor-6a7e43140dc9bf
+{
+ "run_id": "6a7e43140dc9bf",
+ "sha": "c7739b5198ad07f7ad3f4198ee3027784e4455c8",
+ "symbol": "TSTUSDT",
+ "client_ids": {
+  "ENTER_SPOT": "bc-6a7e43140dc9bf-enter_spot",
+  "ENTER_SHORT": "bc-6a7e43140dc9bf-enter_short",
+  "EXIT_SHORT": "bc-6a7e43140dc9bf-exit_short",
+  "EXIT_SPOT": "bc-6a7e43140dc9bf-exit_spot",
+  "UNWIND_SPOT": "bc-6a7e43140dc9bf-unwind_spot"
+ },
+ "hard_ceiling_usdt": "8",
+ "started_utc": "2026-08-13T22:20:04Z",
+ "legs": [
+  {
+   "stage": "ENTER_SPOT",
+   "market": "spot",
+   "side": "BUY",
+   "client_id": "bc-6a7e43140dc9bf-enter_spot",
+   "submitted_utc": "2026-08-13T22:20:07Z",
+   "quote_order_qty": "7.99364538",
+   "status": "FILLED",
+   "order_id": "575532499",
+   "executed_qty": "568.10000000",
+   "quote": "7.99316700",
+   "terminal_utc": "2026-08-13T22:20:07Z",
+   "fee_by_asset": {
+    "BNB": "0.00000976"
+   }
+  },
+  {
+   "stage": "ENTER_SHORT",
+   "market": "usdm",
+   "side": "SELL",
+   "client_id": "bc-6a7e43140dc9bf-enter_short",
+   "submitted_utc": "2026-08-13T22:20:07Z",
+   "quantity": "568.00000000",
+   "status": "FILLED",
+   "order_id": "1965635391",
+   "executed_qty": "568",
+   "quote": "7.9974400",
+   "terminal_utc": "2026-08-13T22:20:08Z"
+  },
+  {
+   "stage": "EXIT_SHORT",
+   "market": "usdm",
+   "side": "BUY",
+   "client_id": "bc-6a7e43140dc9bf-exit_short",
+   "submitted_utc": "2026-08-13T22:20:08Z",
+   "quantity": "568",
+   "status": "FILLED",
+   "order_id": "1965635396",
+   "executed_qty": "568",
+   "quote": "8.0031200",
+   "terminal_utc": "2026-08-13T22:20:09Z"
+  },
+  {
+   "stage": "EXIT_SPOT",
+   "market": "spot",
+   "side": "SELL",
+   "client_id": "bc-6a7e43140dc9bf-exit_spot",
+   "submitted_utc": "2026-08-13T22:20:09Z",
+   "quantity": "568.00000000",
+   "status": "FILLED",
+   "order_id": "575532504",
+   "executed_qty": "568.00000000",
+   "quote": "7.98040000",
+   "terminal_utc": "2026-08-13T22:20:09Z",
+   "fee_by_asset": {
+    "BNB": "0.00000978"
+   }
+  }
+ ],
+ "gap": {
+  "completed_utc": "2026-08-13T22:20:06.187Z",
+  "usdm_book_time_utc": "2026-08-13T22:20:04.698Z",
+  "symbol": "TSTUSDT",
+  "spot_bid": "0.01405000",
+  "spot_ask": "0.01407000",
+  "usdm_bid": "0.0140800",
+  "usdm_ask": "0.0140900",
+  "entry_gap_quote": "0.00001000",
+  "entry_gap_bps_vs_spot_ask": "7.10732054",
+  "exit_gap_quote": "0.00004000",
+  "exit_gap_bps_vs_spot_bid": "28.46975089",
+  "funding_rate": "0.00005000",
+  "next_funding_utc": "2026-08-14T00:00:00.000Z"
+ },
+ "plan": {
+  "entry_gap_bps": "7.10732054",
+  "exit_gap_bps": "28.46975089",
+  "funding_rate": "0.00005000",
+  "estimated_quantity": "567.00000000",
+  "spot_quote_cap": "7.99364538",
+  "estimated_short_notional": "7.98336000",
+  "leverage": 1,
+  "shared_step": "1.00000000",
+  "spot_step": "0.10000000",
+  "min_notional": "5",
+  "min_quantity": "1",
+  "reason": "entry gap 7.10732054 bps >= min 1 bps"
+ },
+ "preflight": {
+  "futures_can_trade": true,
+  "spot_can_trade": true,
+  "position_mode": "ONE_WAY",
+  "symbol_leverage": 1,
+  "open_orders": 0,
+  "position_amount": "0",
+  "available_balance": "11.01636938",
+  "required_short_margin_1x": "9.18086400",
+  "margin_band_up": "1.1500",
+  "verified_utc": "2026-08-13T22:20:07Z"
+ },
+ "acquired": {
+  "executed_qty": "568.10000000",
+  "quote_spent": "7.99316700",
+  "base_fee": "0",
+  "net_base": "568.10000000",
+  "shared_step": "1.00000000",
+  "hedge_quantity": "568.00000000"
+ },
+ "result": {
+  "stage": "EXIT_SPOT",
+  "sold_qty": "568.00000000",
+  "quote_received": "7.98040000",
+  "sell_base_fee": "0",
+  "residual_base_from_
+$ $ 
