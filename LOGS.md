@@ -9,6 +9,12 @@ every step.
 
 ---
 
+GOVERNANCE RESTRUCTURE 2026-08-14 | owner order: industry-standard files | five files -> four
+new | CLAUDE.md (Lead playbook, auto-loads in Claude Code) | AGENTS.md (worker law, read natively by codex) | NOW.md (orders + truth) | LOGS.md unchanged append-only
+retired | LEAD.md, BUILDER.md, TASK.md, STATE.md — content distilled, full text preserved in git history
+standard | AGENTS.md = Linux Foundation open convention read by codex/cursor/copilot; kept hand-written and lean per measured best practice
+verdict | canonical record continues; boot = CLAUDE.md auto -> NOW.md -> newest LOGS rows
+
 WAVE-3R RUNTIME VERTICAL 2026-08-13 | commander order items 1-7 complete | release 7ac26aa771937f802930dac5eb017d6583d968d8
 built | immutable 0400 proposals (26 fields, TTL, negative-net unwritable) | proposal-only entry, raw-gap path removed | STOP = global entry interlock, exits always run | reads complete before the leverage mutation
 built | ONE supervisor: atomic claim -> open -> reconcile-first ticks -> auto-close on exit/emergency -> crash-resume | UNKNOWN/ONE_LEG freeze entry until reconciled
