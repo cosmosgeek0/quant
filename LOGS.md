@@ -9,6 +9,15 @@ every step.
 
 ---
 
+VOLUME-V2 2026-08-13 | wave-2 lane: closed-candle surge + live USDT universe + restart-safe paper positions | base 0cffc896 | branch lane/volume-v2
+built | src/volume_observer.py scan+state commands | klines closed-candle surge, rule+parameters printed | exchangeInfo universe reduced payload 1 GET, cap+spacing stated | paper_state.json atomic writes + candle-watermark idempotency, every record paper:true
+tests | tests/test_volume_observer_v2.py 60 offline deterministic tests (synthetic candles, write-kill-reload, fixture exchangeInfo, offline CLI) | full suite 173 green (was 113) | MEASURED
+evidence | evidence/volume-v2-live-scan.txt | paper_receipts.jsonl 2 live paper entries | paper_state.json 2 open paper positions
+failures | attempt1 live exchangeInfo 17.5MB over 16MB bound, fixed via reduced-payload params | attempt2 live unscannable symbols (CJK/short) fatal under strict charset, fixed to excluded-not-fatal | both preserved in evidence
+live run | universe_size=489 | 1 exchangeInfo GET + 6 klines GETs, 0.25s spacing | 2 surges -> 2 paper entries | immediate rerun all skipped, zero duplication | MEASURED
+boundaries | unsigned public GETs to api.binance.com only | no POST, no credentials, no push, no merge, quarantine untouched
+verdict | CANDIDATE at 20cd3061 (code) | LOGS entry follows in next commit | remaining owner: Lead review + merge decision
+
 BASIS-EXECUTOR 2026-08-13 | one-shot cycle executor built offline | base 0cffc896 branch lane/basis-executor | code commit 6e3e694f
 deliverable | src/basis_executor.py | connects basis_read + basis_cycle + futures_hand + spot_roundtrip + events; one-shot CLI, no loop/timer/daemon
 discipline | quoteOrderQty-bounded BUY -> net base = fills minus base fees floored to shared step -> short exactly that -> reduce-only close of exact short fill -> spot sell of remaining base | unique bc- ids, query before any decision, UNKNOWN freezes nonzero, no repair trades

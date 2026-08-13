@@ -1,0 +1,84 @@
+== volume-v2 live evidence: scan 1 (universe + closed-candle surge + paper step) ==
+Thu Aug 13 00:52:36 UTC 2026
+ERROR: public response too large for exchangeInfo
+
+== scan 2 immediately after (restart-safety on live data: same closed candles => skipped) ==
+ERROR: public response too large for exchangeInfo
+
+== persisted paper state after both scans ==
+paper_state_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_state.json
+rows=factual_paper_state_only; paper only; no real order path
+open_paper_positions=0
+candle_marks=0
+
+==== ATTEMPT 2 (after fix: reduced exchangeInfo payload showPermissionSets=false&symbolStatus=TRADING; attempt 1 above failed: full payload 17.5MB > 16MB bound) ====
+Thu Aug 13 00:53:34 UTC 2026
+
+== scan 1 (universe + closed-candle surge + paper step) ==
+ERROR: exchangeInfo entry has invalid symbol
+
+== scan 2 immediately after (restart-safety on live data: same closed candles => skipped) ==
+ERROR: exchangeInfo entry has invalid symbol
+
+== persisted paper state after both scans ==
+paper_state_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_state.json
+rows=factual_paper_state_only; paper only; no real order path
+open_paper_positions=0
+candle_marks=0
+
+==== ATTEMPT 3 (after fix: unscannable-charset symbols excluded from universe, not fatal; attempt 2 above failed on live CJK/short symbols) ====
+Thu Aug 13 00:54:43 UTC 2026
+
+== scan 1 (universe + closed-candle surge + paper step) ==
+source=https://api.binance.com/api/v3/klines
+universe=https://api.binance.com/api/v3/exchangeInfo
+universe_request_params=showPermissionSets=false&symbolStatus=TRADING
+universe_filter=status_TRADING quote_USDT spot_trading_allowed symbol_charset_A-Z0-9
+universe_size=489
+universe_selection=first_max_symbols_alphabetical
+request_budget=1_exchangeinfo_get+6_klines_gets; max_symbols_cap=6; spacing_seconds=0.25
+rule=surge iff closed_candle_quote_volume >= surge_multiple * median(quote_volume of prior baseline_candles closed candles); open (still-forming) candles are never evaluated
+parameters=interval:5m baseline_candles:20 surge_multiple:3
+rows=factual_observations_only
+paper_actions=enabled; paper only; no real order path
+paper_state_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_state.json
+checked_utc	symbol	interval	status	closed_candle_count	candle_open_utc	candle_close_utc	candle_quote_volume	baseline_median_quote_volume	threshold_quote_volume	surged	paper_action
+2026-08-13T00:54:45.373Z	0GUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	0.00000000	134.21282500	402.63847500	false	no_action
+2026-08-13T00:54:45.981Z	1000CATUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	0.00000000	231.08731950	693.26195850	false	no_action
+2026-08-13T00:54:46.574Z	1000CHEEMSUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	856.32023300	645.50285600	1936.50856800	false	no_action
+2026-08-13T00:54:47.219Z	1000SATSUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	2088.41039968	325.551358705	976.654076115	true	paper_entry
+2026-08-13T00:54:47.824Z	1INCHUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	1133.27625000	75.70703500	227.12110500	true	paper_entry
+2026-08-13T00:54:48.439Z	1MBABYDOGEUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	173.73108530	165.88122320	497.64366960	false	no_action
+open_paper_positions=2
+paper_receipts_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_receipts.jsonl
+
+== scan 2 immediately after (restart-safety on live data: same closed candles => skipped) ==
+source=https://api.binance.com/api/v3/klines
+universe=https://api.binance.com/api/v3/exchangeInfo
+universe_request_params=showPermissionSets=false&symbolStatus=TRADING
+universe_filter=status_TRADING quote_USDT spot_trading_allowed symbol_charset_A-Z0-9
+universe_size=489
+universe_selection=first_max_symbols_alphabetical
+request_budget=1_exchangeinfo_get+6_klines_gets; max_symbols_cap=6; spacing_seconds=0.25
+rule=surge iff closed_candle_quote_volume >= surge_multiple * median(quote_volume of prior baseline_candles closed candles); open (still-forming) candles are never evaluated
+parameters=interval:5m baseline_candles:20 surge_multiple:3
+rows=factual_observations_only
+paper_actions=enabled; paper only; no real order path
+paper_state_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_state.json
+checked_utc	symbol	interval	status	closed_candle_count	candle_open_utc	candle_close_utc	candle_quote_volume	baseline_median_quote_volume	threshold_quote_volume	surged	paper_action
+2026-08-13T00:54:49.618Z	0GUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	0.00000000	134.21282500	402.63847500	false	skipped_candle_already_processed
+2026-08-13T00:54:50.208Z	1000CATUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	0.00000000	231.08731950	693.26195850	false	skipped_candle_already_processed
+2026-08-13T00:54:50.814Z	1000CHEEMSUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	856.32023300	645.50285600	1936.50856800	false	skipped_candle_already_processed
+2026-08-13T00:54:51.430Z	1000SATSUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	2088.41039968	325.551358705	976.654076115	true	skipped_candle_already_processed
+2026-08-13T00:54:52.024Z	1INCHUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	1133.27625000	75.70703500	227.12110500	true	skipped_candle_already_processed
+2026-08-13T00:54:52.614Z	1MBABYDOGEUSDT	5m	evaluated	21	2026-08-13T00:45:00.000Z	2026-08-13T00:49:59.999Z	173.73108530	165.88122320	497.64366960	false	skipped_candle_already_processed
+open_paper_positions=2
+paper_receipts_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_receipts.jsonl
+
+== persisted paper state after both scans ==
+paper_state_path=/Users/cosmosgeek/Desktop/worktrees/volume-v2/paper_state.json
+rows=factual_paper_state_only; paper only; no real order path
+open_paper_positions=2
+1000SATSUSDT	entry_price=0.00001012	qty=988142.29249011	peak_price=0.00001012	trail_pct=0.01	entry_ts=2026-08-13T00:54:47.219Z	paper=true
+1INCHUSDT	entry_price=0.08310000	qty=120.33694344	peak_price=0.08310000	trail_pct=0.01	entry_ts=2026-08-13T00:54:47.824Z	paper=true
+candle_marks=6
