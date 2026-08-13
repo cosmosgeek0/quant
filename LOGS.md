@@ -9,6 +9,15 @@ every step.
 
 ---
 
+VOLUME-V2 2026-08-13 | wave-2 lane: closed-candle surge + live USDT universe + restart-safe paper positions | base 0cffc896 | branch lane/volume-v2
+built | src/volume_observer.py scan+state commands | klines closed-candle surge, rule+parameters printed | exchangeInfo universe reduced payload 1 GET, cap+spacing stated | paper_state.json atomic writes + candle-watermark idempotency, every record paper:true
+tests | tests/test_volume_observer_v2.py 60 offline deterministic tests (synthetic candles, write-kill-reload, fixture exchangeInfo, offline CLI) | full suite 173 green (was 113) | MEASURED
+evidence | evidence/volume-v2-live-scan.txt | paper_receipts.jsonl 2 live paper entries | paper_state.json 2 open paper positions
+failures | attempt1 live exchangeInfo 17.5MB over 16MB bound, fixed via reduced-payload params | attempt2 live unscannable symbols (CJK/short) fatal under strict charset, fixed to excluded-not-fatal | both preserved in evidence
+live run | universe_size=489 | 1 exchangeInfo GET + 6 klines GETs, 0.25s spacing | 2 surges -> 2 paper entries | immediate rerun all skipped, zero duplication | MEASURED
+boundaries | unsigned public GETs to api.binance.com only | no POST, no credentials, no push, no merge, quarantine untouched
+verdict | CANDIDATE at 20cd3061 (code) | LOGS entry follows in next commit | remaining owner: Lead review + merge decision
+
 WAVE-1 INTEGRATION 2026-08-13 | four lanes merged + basis_cycle built | base 1aa1e018 | integrator = the Lead
 merged | lane/ui fde677ed | lane/basis-read 07f2af1d | lane/volume 47d02a0f | lane/futures-short e240074a | LOGS stacked, no history lost
 built | src/basis_cycle.py + tests/test_basis_cycle.py | spot-long + USD-M-short lifecycle, offline only, 11/11 terminal paths tested
