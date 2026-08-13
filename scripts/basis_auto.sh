@@ -14,7 +14,7 @@ SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --que
 export BINANCE_API_KEY=$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["BINANCE_API_KEY"])')
 export BINANCE_API_SECRET=$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["BINANCE_API_SECRET"])')
 unset SECRET_JSON
-export QUANT_SHA=81e999ad8630cd8098376ab57ff05f2ce5be854d
+export QUANT_SHA=b08a18d956698072c8ead5102a6deb2c57c66c55
 cd "$D/src"
 
 # A held lock means an unreconciled run owns the lane: reconcile it first.
@@ -78,6 +78,60 @@ case "$BEST" in
 esac
 export SYMBOL=$(printf '%s' "$BEST" | cut -d'|' -f2)
 export MIN_ENTRY_BPS=$MIN_BPS
+
+# Anti-bleed cooldown: a symbol that failed recently is skipped, not retried.
+if find "$D" -maxdepth 1 -name "cooldown-$SYMBOL" -mmin -45 2>/dev/null | grep -q .; then
+  echo "cooldown active for $SYMBOL — skipping this fire"
+  exit 0
+fi
+
+# Margin headroom: the exchange reserves ~notional x band for a market short
+# (measured -2019 on 2026-08-13). Top up USD-M from Spot inside the funded
+# sub-account — ordinary receipted internal mechanics — before executing.
+TOPUP=$(python3 - <<'PY'
+import json, os, sys, urllib.request
+from decimal import Decimal, ROUND_UP
+sys.path.insert(0, ".")
+from basis_executor import live_request_factory
+symbol = os.environ["SYMBOL"]
+request = live_request_factory(os.environ["BINANCE_API_KEY"],
+                               os.environ["BINANCE_API_SECRET"])
+kind, account = request("GET", "https://fapi.binance.com",
+                        "/fapi/v3/account", None, True)
+if kind != "ok" or not isinstance(account, dict):
+    print("READ_FAILED")
+    raise SystemExit
+available = Decimal(str(account.get("availableBalance", "0")))
+info = json.load(urllib.request.urlopen(
+    "https://fapi.binance.com/fapi/v1/exchangeInfo?symbol=" + symbol,
+    timeout=20))
+band = Decimal("0")
+for row in info["symbols"][0]["filters"]:
+    if row["filterType"] == "PERCENT_PRICE":
+        band = max(band, Decimal(str(row.get("multiplierUp", "0"))))
+    if row["filterType"] == "PERCENT_PRICE_BY_SIDE":
+        band = max(band, Decimal(str(row.get("askMultiplierUp", "0"))),
+                   Decimal(str(row.get("bidMultiplierUp", "0"))))
+if band <= 1:
+    band = Decimal("1.5")
+need = (Decimal("10") * band * Decimal("1.05")).quantize(Decimal("0.01"),
+                                                         ROUND_UP)
+gap = need - available
+if gap <= 0:
+    print("0")
+else:
+    print(min(gap.quantize(Decimal("0.01"), ROUND_UP), Decimal("10")))
+PY
+)
+if [ "$TOPUP" = "READ_FAILED" ]; then echo "margin read failed — skipping"; exit 1; fi
+if [ "$TOPUP" != "0" ]; then
+  echo "margin top-up $TOPUP USDT spot-to-usdm"
+  python3 wallet.py transfer spot-to-usdm --asset USDT --amount "$TOPUP" --execute-internal-transfer || { echo "top-up failed — skipping this fire"; exit 1; }
+fi
+
 python3 set_leverage_1x.py || { echo "leverage set failed for $SYMBOL — skipping this fire"; exit 1; }
 python3 basis_executor.py --execute
-echo "execute $SYMBOL exit $?"
+E=$?
+echo "execute $SYMBOL exit $E"
+[ "$E" -ne 0 ] && touch "$D/cooldown-$SYMBOL"
+exit $E
