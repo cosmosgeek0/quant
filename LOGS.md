@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+FIRST FUTURES FILLS 2026-08-13T22:13Z | EXECUTION_MECHANICS_ONLY | via the owner-armed job runner, zero presses
+job | 6a7e410d7fad FUTURES_ROUNDTRIP TSTUSDT ceiling 8 | queued by the Lead as a job record, executed by the deterministic runner on its minute tick
+fills | short OPEN FILLED 565 TST / 7.9778 USDT | reduce-only CLOSE FILLED 565 / 7.9835 | both terminal, flat verified
+leverage | 1x verified before order, zero mutations needed | receipt futures-hand-6a7e416f3c49b8.json
+cost | ~1.4 cents round trip (0.006 adverse + taker fees) | mechanics proof, not profit — as ordered
+sequence | runner wrote futures_proof_passed | BASIS_ROUNDTRIP unlocked and queued (job 6a7e42b37787)
+verdict | CLOSED — the first futures execution in program history; the live-first loop is running
+
 GOVERNANCE RESTRUCTURE 2026-08-14 | owner order: industry-standard files | five files -> four
 new | CLAUDE.md (Lead playbook, auto-loads in Claude Code) | AGENTS.md (worker law, read natively by codex) | NOW.md (orders + truth) | LOGS.md unchanged append-only
 retired | LEAD.md, BUILDER.md, TASK.md, STATE.md — content distilled, full text preserved in git history
