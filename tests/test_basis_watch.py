@@ -1,19 +1,15 @@
 """Offline tests for src/basis_watch.py — no network, injected reads only.
 
-B1 STUB NOTE (dispatch-required disclosure): src/basis_kernel.py (the B1
-kernel) was ABSENT in this worktree at build time.  Per the dispatch ("if an
-import target is missing at your test time, stub it in the TEST file only
-and say so"), a spec-faithful stand-in kernel lives in THIS file only:
-StubKernel.evaluate implements the spec's frozen entry guard ladder
-(tests/fixtures/old_engine_spec.json, scanner area guard_ladder_order plus
-the math/funding-area formulas it consumes) far enough to reproduce every
-scanner-area DECISION fixture.  Tests patch basis_watch.basis_kernel to the
-stub explicitly, so this suite stays deterministic when the real B1 lands;
-the differential harness then compares stub-driven and kernel-driven runs.
+B1 STUB NOTE: a test-only stand-in remains here to isolate scanner lifecycle
+tests from the typed kernel boundary.  StubKernel.evaluate implements the
+frozen guard ladder and the commander's full round-trip equation.  Separate
+integration tests exercise the real basis_kernel typed surface.
 
 Fixture accounting for the scanner area (23 fixtures):
-- 19 reproduced below (names in ScannerFixtureTests / PipelineFixtureTests /
+- 18 reproduced below (names in ScannerFixtureTests / PipelineFixtureTests /
   HysteresisTests, each test cites its fixture).
+- decision_sequence_persist3 preserves the old entry-only subtotal but has a
+  written commander-equation override at its assertion site.
 - 4 WAIVED: causal_quadrants, causal_growth_then_confirmed_decay,
   causal_flip_resets, causal_expiry_and_source_reversal.  Written reason in
   CausalFixturesWaived below.
@@ -258,7 +254,7 @@ def stub_evaluate(obs: Dict[str, Any]) -> Dict[str, Any]:
     evidence["depth_score"] = depth
     if depth is None or depth < cfg["min_depth_score"]:
         return reject("depth_too_thin")                          # guard 10
-    slippage = _leg_slippage_pct(
+    entry_slippage = _leg_slippage_pct(
         obs["spot_ladder"]["asks"] if obs["spot_ladder"] else None,
         spot["ask"], spot["ask_qty"], notional) + _leg_slippage_pct(
         obs["perp_ladder"]["bids"] if obs["perp_ladder"] else None,
@@ -266,8 +262,9 @@ def stub_evaluate(obs: Dict[str, Any]) -> Dict[str, Any]:
     fees = 2 * obs["fees"]["spot_taker_fee_pct"] \
         + 2 * obs["fees"]["perp_taker_fee_pct"]
     evidence["fees_pct"] = fees
-    evidence["slippage_pct"] = slippage
-    if gap <= fees + slippage:
+    evidence["slippage_pct"] = entry_slippage
+    evidence["entry_slippage_pct"] = entry_slippage
+    if gap <= fees + entry_slippage:
         return reject("edge_below_fees")                         # guard 11
     drag = max(D(0), -carry)
     if drag > cfg["max_funding_drag_pct"]:
@@ -276,9 +273,24 @@ def stub_evaluate(obs: Dict[str, Any]) -> Dict[str, Any]:
     if cv is not None and cv > cfg["max_gap_cv"] \
             and obs["persist_ticks"] < cfg["persist_ticks"]:
         return reject("gap_not_persistent")
-    net = gap - (fees + slippage + drag) + max(D(0), carry)
+    intended_exit_gap = return_pct(perp["ask"], spot["bid"])
+    if intended_exit_gap is not None:
+        intended_exit_gap = max(D(0), intended_exit_gap)
+    exit_slippage = _leg_slippage_pct(
+        obs["spot_ladder"]["bids"] if obs["spot_ladder"] else None,
+        spot["bid"], spot["bid_qty"], notional) + _leg_slippage_pct(
+        obs["perp_ladder"]["asks"] if obs["perp_ladder"] else None,
+        perp["ask"], perp["ask_qty"], notional)
+    safety_buffer = cfg["safety_buffer_pct"]
+    entry_subtotal = gap - fees - entry_slippage + carry
+    net = None if intended_exit_gap is None else (
+        entry_subtotal - intended_exit_gap - exit_slippage - safety_buffer)
+    evidence["intended_exit_gap_pct"] = intended_exit_gap
+    evidence["exit_slippage_pct"] = exit_slippage
+    evidence["safety_buffer_pct"] = safety_buffer
+    evidence["entry_side_subtotal_pct"] = entry_subtotal
     evidence["net_pct"] = net
-    if net < cfg["min_net_basis_pct"]:
+    if net is None or net <= 0:
         return reject("edge_below_threshold")                    # guard 15
     if obs["persist_ticks"] >= cfg["persist_ticks"]:             # guard 16
         kind = "proposal"
@@ -288,7 +300,7 @@ def stub_evaluate(obs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class StubKernel:
-    """TEST-ONLY stand-in for the absent B1 basis_kernel surface."""
+    """TEST-ONLY scanner-isolation stand-in for the B1 kernel surface."""
 
     def __init__(self, log: Optional[List] = None) -> None:
         self.log = log if log is not None else []
@@ -575,8 +587,11 @@ class PipelineFixtureTests(PipelineCase):
         for index in range(3):
             row = self.tick(watch, T0 + 2000 * (index + 1), default_book=True)
             kinds.append(row["kind"])
-        self.assertEqual(kinds, fixture["expected"]["kinds"])
-        self.assertEqual(watch.symbols["TESTUSDT"].state, "PROPOSED")
+        # WAIVER: the old fixture's focus/focus/proposal sequence prices only
+        # entry economics.  The commander's full-equation override makes the
+        # same observations honest edge_below_threshold refusals.
+        self.assertEqual(kinds, ["reject", "reject", "reject"])
+        self.assertEqual(watch.symbols["TESTUSDT"].state, "REJECTED")
         observation, decision = self.kernel_log[-1]
         self.assertEqual(observation["direction"],
                          fixture["expected"]["proposal_direction"])
@@ -584,7 +599,9 @@ class PipelineFixtureTests(PipelineCase):
                          fixture["expected"]["gross_edge_pct"])
         self.assertEqual(decision["fees_pct"], as_dec(fixture["expected"]["fees_pct"]))
         low, high = fixture["expected"]["net_edge_pct_range"]
-        self.assertTrue(as_dec(low) < decision["net_pct"] < as_dec(high))
+        self.assertTrue(as_dec(low) < decision["entry_side_subtotal_pct"]
+                        < as_dec(high))
+        self.assertClose(decision["net_pct"], D("-0.5801559688062376"))
 
     def test_edge_below_fees(self):
         fixture = scanner_fixture("edge_below_fees")
@@ -604,15 +621,20 @@ class PipelineFixtureTests(PipelineCase):
         self.assertEqual(row["reject_code"], fixture["expected"]["reject_code"])
         self.assertEqual(watch.pass_count, fixture["expected"]["fires_on_tick"])
         _, decision = self.kernel_log[-1]
-        self.assertClose(decision["net_pct"], fixture["expected"]["net_edge_pct"])
+        self.assertClose(decision["entry_side_subtotal_pct"],
+                         fixture["expected"]["net_edge_pct"])
+        self.assertClose(decision["net_pct"], D("-0.58009"))
 
     def test_flicker_rejects_not_persistent(self):
         fixture = scanner_fixture("flicker_rejects_not_persistent")
         watch = self.make_watch(persist_ticks=5, min_net_basis_pct=D("0.01"))
         rows = []
         for index, gap in enumerate(fixture["inputs"]["gap_sequence_pct"]):
-            rows.append(self.tick(watch, T0 + 2000 * (index + 1),
-                                  gap_pct=str(gap)))
+            now = T0 + 2000 * (index + 1)
+            rows.append(self.tick(
+                watch, now, gap_pct=str(gap), rate="0.01",
+                next_funding_ms=now + 60_000,
+            ))
         self.assertEqual(rows[-1]["kind"], fixture["expected"]["final_kind"])
         self.assertEqual(rows[-1]["reject_code"],
                          fixture["expected"]["reject_code"])
@@ -626,10 +648,11 @@ class PipelineFixtureTests(PipelineCase):
     def test_stale_books_then_cooldown(self):
         fixture = scanner_fixture("stale_books_then_cooldown")
         watch = self.make_watch()
-        self.tick(watch, T0 + 2000)
-        self.tick(watch, T0 + 4000)
+        self.tick(watch, T0 + 2000, rate="0.01")
+        self.tick(watch, T0 + 4000, rate="0.01")
         self.assertEqual(watch.symbols["TESTUSDT"].state, "FOCUS")
-        stale_row = self.tick(watch, T0 + 12000, book_ts=T0 + 2000)
+        stale_row = self.tick(
+            watch, T0 + 12000, book_ts=T0 + 2000, rate="0.01")
         self.assertEqual(stale_row["kind"], "reject")
         self.assertEqual(stale_row["reject_code"],
                          fixture["expected"]["reject_code"])
@@ -1032,8 +1055,8 @@ class StateFileTests(PipelineCase):
 
     def test_restart_loses_nothing_and_continues_counting(self):
         watch = self.make_watch(persist_ticks=3)
-        self.tick(watch, T0 + 2000)
-        self.tick(watch, T0 + 4000)
+        self.tick(watch, T0 + 2000, rate="0.01")
+        self.tick(watch, T0 + 4000, rate="0.01")
         before = watch.symbols["TESTUSDT"]
         self.assertEqual(before.persist_ticks, 2)
         self.assertEqual(before.state, "FOCUS")
@@ -1046,15 +1069,16 @@ class StateFileTests(PipelineCase):
         self.assertEqual(after.window, before.window)
         self.assertEqual(after.focus_since_ms, before.focus_since_ms)
         self.assertEqual(restarted.pass_count, 2)
-        row = self.tick(restarted, T0 + 6000)
+        row = self.tick(restarted, T0 + 6000, rate="0.01")
         self.assertEqual(row["kind"], "proposal")  # 3rd persisting tick
         self.assertEqual(row["persist_ticks"], 3)
 
     def test_cooldown_survives_restart(self):
         watch = self.make_watch()
-        self.tick(watch, T0 + 2000)
-        self.tick(watch, T0 + 4000)
-        self.tick(watch, T0 + 12000, book_ts=T0 + 2000)  # stale -> COOLDOWN
+        self.tick(watch, T0 + 2000, rate="0.01")
+        self.tick(watch, T0 + 4000, rate="0.01")
+        self.tick(watch, T0 + 12000, book_ts=T0 + 2000,
+                  rate="0.01")  # stale -> COOLDOWN
         until = watch.symbols["TESTUSDT"].cooldown_until_ms
         restarted = Watch(self.state_path, self.tmp.name, watch_config())
         state = restarted.symbols["TESTUSDT"]
@@ -1090,7 +1114,7 @@ class ProposalFileTests(PipelineCase):
 
     def proposal_tick(self, watch: Watch, now_ms: int = T0 + 2000,
                       symbol: str = "TESTUSDT") -> Dict[str, Any]:
-        return self.tick(watch, now_ms, symbol=symbol)
+        return self.tick(watch, now_ms, symbol=symbol, rate="0.01")
 
     def test_proposal_file_is_complete_atomic_and_immutable(self):
         rates_path = os.path.join(self.tmp.name, "commission-rates.json")
@@ -1133,6 +1157,20 @@ class ProposalFileTests(PipelineCase):
         self.assertEqual(D(proposal["quantity"]) % D("0.001"), D(0))
         self.assertGreater(D(proposal["quantity"]), D(0))
         self.assertGreater(D(proposal["net_edge_pct"]), D(0))
+        _observation, decision = self.kernel_log[-1]
+        self.assertEqual(D(proposal["net_edge_pct"]), decision["net_pct"])
+        four_commissions = (
+            D(2) * D(proposal["spot_taker_commission_pct"])
+            + D(2) * D(proposal["perp_taker_commission_pct"])
+        )
+        recomputed = (
+            D(proposal["entry_gap_pct"]) - D(proposal["exit_gap_pct"])
+            + D(proposal["carry_pct"]) - four_commissions
+            - D(proposal["entry_slippage_pct"])
+            - D(proposal["exit_slippage_pct"])
+            - D(proposal["safety_buffer_pct"])
+        )
+        self.assertEqual(D(proposal["net_edge_pct"]), recomputed)
         created = datetime.fromisoformat(
             proposal["created_utc"].replace("Z", "+00:00"))
         expires = datetime.fromisoformat(
@@ -1164,7 +1202,8 @@ class ProposalFileTests(PipelineCase):
             with self.subTest(kind=expected):
                 watch = Watch(self.state_path + ".%d" % index, self.tmp.name,
                               watch_config(overrides))
-                row = self.tick(watch, T0 + 2000, gap_pct=gap)
+                rate = "0.01" if expected in ("watch", "focus") else "0.0001"
+                row = self.tick(watch, T0 + 2000, gap_pct=gap, rate=rate)
                 self.assertEqual(row["kind"], expected)
                 self.assertEqual(row["proposal_status"], "not_applicable")
         self.assertEqual(self.paths(), [])
@@ -1180,7 +1219,7 @@ class ProposalFileTests(PipelineCase):
 
     def test_exit_slippage_uses_bid_ask_sides_and_quantity_uses_both_steps(self):
         now = T0 + 2000
-        bundle = scenario_bundle(now)
+        bundle = scenario_bundle(now, rate="0.02")
         bundle["spot_depth"]["bids"] = [["100", "0.05"], ["99", "1"]]
         perp_touch = D(bundle["perp_depth"]["asks"][0][0])
         bundle["perp_depth"]["asks"] = [
@@ -1246,6 +1285,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["max_spread_bps"], as_dec(thresholds["maxSpreadBps"]))
         self.assertEqual(cfg["min_depth_score"], as_dec(thresholds["minDepthScore"]))
         self.assertEqual(cfg["min_net_basis_pct"],
+                         as_dec(thresholds["minNetBasisPct"]))
+        self.assertEqual(cfg["safety_buffer_pct"],
                          as_dec(thresholds["minNetBasisPct"]))
         self.assertEqual(cfg["max_funding_drag_pct"],
                          as_dec(thresholds["maxFundingDragPct"]))
@@ -1422,16 +1463,22 @@ class KernelIntegrationTests(PipelineCase):
         watch = self.make_watch(persist_ticks=3)
         kinds = []
         rows = []
+        result = None
         for index in range(3):
-            row = self.tick(watch, T0 + 2000 * (index + 1), default_book=True)
+            row, _snapshot, _config, result = self.tick_recording_kernel(
+                watch, T0 + 2000 * (index + 1), default_book=True)
             kinds.append(row["kind"])
             rows.append(row)
-        self.assertEqual(kinds, fixture["expected"]["kinds"])
-        self.assertEqual(watch.symbols["TESTUSDT"].state, "PROPOSED")
+        # WAIVER: commander's full-equation override supersedes the old
+        # entry-only focus/focus/proposal fixture.
+        self.assertEqual(kinds, ["reject", "reject", "reject"])
+        self.assertEqual(watch.symbols["TESTUSDT"].state, "REJECTED")
         self.assertClose(rows[-1]["gap_pct"],
                          fixture["expected"]["gross_edge_pct"])
         low, high = fixture["expected"]["net_edge_pct_range"]
-        self.assertTrue(as_dec(low) < rows[-1]["net_pct"] < as_dec(high))
+        self.assertTrue(as_dec(low) < result["components"][
+            "entry_side_subtotal_pct"] < as_dec(high))
+        self.assertClose(rows[-1]["net_pct"], D("-0.5801559688062376"))
         self.assertClose(rows[-1]["carry_pct"], D("0.01"), D("1e-12"))
 
     def test_edge_rejects_through_real_kernel(self):
@@ -1440,10 +1487,27 @@ class KernelIntegrationTests(PipelineCase):
         self.assertEqual((row["kind"], row["reject_code"]),
                          ("reject", "edge_below_fees"))
         watch2 = Watch(self.state_path + ".2", self.tmp.name, watch_config())
-        row2 = self.tick(watch2, T0 + 2000, gap_pct="0.45")
+        row2, _snapshot, _config, result = self.tick_recording_kernel(
+            watch2, T0 + 2000, gap_pct="0.45")
         self.assertEqual((row2["kind"], row2["reject_code"]),
                          ("reject", "edge_below_threshold"))
-        self.assertClose(row2["net_pct"], D("0.16"), D("1e-12"))
+        self.assertClose(result["components"]["entry_side_subtotal_pct"],
+                         D("0.16"), D("1e-12"))
+        self.assertClose(row2["net_pct"], D("-0.58009"), D("1e-12"))
+
+    def test_proposal_file_net_matches_real_kernel_decision_net(self):
+        row, _snapshot, _config, result = self.tick_recording_kernel(
+            self.make_watch(persist_ticks=1), T0 + 2000, rate="0.01")
+        self.assertEqual((row["kind"], row["proposal_status"]),
+                         ("proposal", "written"))
+        paths = glob(os.path.join(
+            self.tmp.name, "proposals", "proposal-*.json"))
+        self.assertEqual(len(paths), 1)
+        with open(paths[0], encoding="utf-8") as handle:
+            proposal = json.load(handle)
+        decision_net = result["components"]["net_pct"]
+        self.assertEqual(D(proposal["net_edge_pct"]), decision_net)
+        self.assertEqual(row["net_pct"], decision_net)
 
     def test_stale_and_skew_reject_through_real_kernel(self):
         watch = self.make_watch()

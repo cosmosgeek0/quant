@@ -879,6 +879,11 @@ class MachineCase(unittest.TestCase):
                   encoding="utf-8") as handle:
             return json.load(handle)
 
+    def receipt(self, run_id=RID):
+        path = os.path.join(self.dir, "basis-position-%s.json" % run_id)
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
     def lock_exists(self):
         return os.path.exists(os.path.join(self.dir, bp.LOCK_FILE))
 
@@ -1112,6 +1117,16 @@ class OpenTests(MachineCase):
                            for call in transport.calls[:leverage_index]
                            if call[0] == "GET"}
         self.assertTrue(required_reads <= before_leverage)
+        revalidation_reads = [
+            (index, call[2]) for index, call in enumerate(transport.calls)
+            if call[2].endswith("ticker/bookTicker")]
+        self.assertEqual([path for _index, path in revalidation_reads],
+                         ["/api/v3/ticker/bookTicker",
+                          "/fapi/v1/ticker/bookTicker"])
+        self.assertTrue(all(index < leverage_index
+                            for index, _path in revalidation_reads),
+                        "entry revalidation must precede the leverage "
+                        "mutation")
         first_order = next(index for index, call
                            in enumerate(transport.calls)
                            if call[0] == "POST" and call[2].endswith("/order"))
@@ -1147,19 +1162,83 @@ class OpenTests(MachineCase):
             self.assertIn("owner decision required", buffer.getvalue())
             self.assertEqual(transport.posts, [])
 
-    def test_open_uses_proposal_not_a_fresh_raw_gap(self):
+    def test_open_entry_revalidation_equal_gap_proceeds_and_records(self):
+        code, transport, out = self.run_cmd(bp.cmd_open, happy_spec())
+        self.assertEqual(code, 0, out)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+        check = self.receipt()["entry_revalidation"]
+        self.assertEqual(Decimal(check["proposal_entry_gap_pct"]),
+                         Decimal("0.2"))
+        self.assertEqual(Decimal(check["fresh_entry_gap_pct"]),
+                         Decimal("0.2"))
+        self.assertEqual(check["decision"], "PROCEED")
+
+    def test_open_entry_revalidation_better_gap_proceeds(self):
         spec = happy_spec()
-        spec["usdm_book"] = {"symbol": SYMBOL, "bidPrice": "100.001",
-                             "askPrice": "100.05", "time": 1755000000000}
+        spec["usdm_book"]["bidPrice"] = "100.25"
         code, transport, out = self.run_cmd(bp.cmd_open, spec)
         self.assertEqual(code, 0, out)
         self.assertEqual(post_stages(transport),
                          ["enter_spot", "enter_short"])
-        raw_gap_paths = {"/api/v3/ticker/bookTicker",
-                         "/fapi/v1/ticker/bookTicker",
-                         "/fapi/v1/premiumIndex"}
+        self.assertGreater(
+            Decimal(self.receipt()["entry_revalidation"]
+                    ["fresh_entry_gap_pct"]), Decimal("0.2"))
+
+    def test_open_entry_revalidation_decay_refuses_without_posts(self):
+        spec = happy_spec()
+        spec["usdm_book"] = {"symbol": SYMBOL, "bidPrice": "100.18",
+                             "askPrice": "100.28", "time": 1755000000000}
+        code, transport, out = self.run_cmd(bp.cmd_open, spec)
+        self.assertEqual(code, 2, out)
+        self.assertIn("ENTRY_REVALIDATION_FAILED", out)
         self.assertFalse([call for call in transport.calls
-                          if call[2] in raw_gap_paths])
+                          if call[0] == "POST"])
+        check = self.receipt()["entry_revalidation"]
+        self.assertEqual(Decimal(check["proposal_entry_gap_pct"]),
+                         Decimal("0.2"))
+        self.assertEqual(Decimal(check["fresh_entry_gap_pct"]),
+                         Decimal("0.18"))
+        self.assertEqual(check["decision"], "REFUSE")
+        self.assertEqual(check["reason"], "ENTRY_REVALIDATION_FAILED")
+
+    def test_open_entry_revalidation_unreadable_book_refuses(self):
+        spec = happy_spec()
+        spec["spot_book"] = ("unclear", {"http": 503})
+        code, transport, out = self.run_cmd(bp.cmd_open, spec)
+        self.assertEqual(code, 2, out)
+        self.assertIn("ENTRY_REVALIDATION_FAILED", out)
+        self.assertFalse([call for call in transport.calls
+                          if call[0] == "POST"])
+        check = self.receipt()["entry_revalidation"]
+        self.assertEqual(check["decision"], "REFUSE")
+        self.assertEqual(check["fresh_books"]["spot"]["read_status"],
+                         "unclear")
+        book_paths = [call[2] for call in transport.calls
+                      if call[2].endswith("ticker/bookTicker")]
+        self.assertEqual(book_paths, ["/api/v3/ticker/bookTicker",
+                                      "/fapi/v1/ticker/bookTicker"])
+
+    def test_open_entry_revalidation_crossed_book_refuses(self):
+        spec = happy_spec()
+        spec["spot_book"] = {"symbol": SYMBOL, "bidPrice": "100.1",
+                             "askPrice": "100.0"}
+        code, transport, out = self.run_cmd(bp.cmd_open, spec)
+        self.assertEqual(code, 2, out)
+        self.assertIn("ENTRY_REVALIDATION_FAILED", out)
+        self.assertIn("book is crossed", out)
+        self.assertFalse([call for call in transport.calls
+                          if call[0] == "POST"])
+
+    def test_open_entry_revalidation_nonpositive_gap_refuses(self):
+        spec = happy_spec()
+        spec["usdm_book"]["bidPrice"] = "100.0"
+        code, transport, out = self.run_cmd(bp.cmd_open, spec)
+        self.assertEqual(code, 2, out)
+        self.assertIn("ENTRY_REVALIDATION_FAILED", out)
+        self.assertIn("not positive", out)
+        self.assertFalse([call for call in transport.calls
+                          if call[0] == "POST"])
 
     def test_open_wallet_shortfall_refuses(self):
         spec = happy_spec()

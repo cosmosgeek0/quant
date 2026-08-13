@@ -86,10 +86,12 @@ from basis_cycle import (
 from basis_executor import (
     SPOT,
     SPOT_ACCOUNT_PATH,
+    SPOT_BOOK_PATH,
     SPOT_OPEN_ORDERS_PATH,
     USDM,
     USDM_ACCOUNT_CONFIG_PATH,
     USDM_ACCOUNT_PATH,
+    USDM_BOOK_PATH,
     USDM_OPEN_ORDERS_PATH,
     USDM_POSITION_PATH,
     USDM_POSITION_MODE_PATH,
@@ -154,6 +156,8 @@ PROPOSAL_REQUIRED_FIELDS = frozenset({
 WATCH_GAP_PCT_DEFAULT = Decimal("0.15")    # scanner entry_thresholds KEEP
 SPOT_TAKER_FEE_PCT_DEFAULT = Decimal("0.1")   # math four_leg_fees KEEP, per leg
 USDM_TAKER_FEE_PCT_DEFAULT = Decimal("0.05")  # math four_leg_fees KEEP, per leg
+ENTRY_REVALIDATION_FAILED = "ENTRY_REVALIDATION_FAILED"
+ENTRY_REVALIDATION_PASSED = "ENTRY_REVALIDATION_PASSED"
 
 # Persisted machine states (plan-layer collapse).
 ST_OPENING = "OPENING"
@@ -1494,6 +1498,114 @@ def _read_only_entry_preflight(state: RunState, plan: CyclePlan,
     return leverage_before
 
 
+def _book_snapshot(kind: Any, payload: Any) -> Dict[str, Any]:
+    """Receipt-safe public-book fields, including malformed-read evidence."""
+    snapshot = {"read_status": clean(kind, 40),
+                "symbol": None, "bid": None, "ask": None}
+    if not isinstance(payload, dict):
+        return snapshot
+    for receipt_key, payload_key in (("symbol", "symbol"),
+                                     ("bid", "bidPrice"),
+                                     ("ask", "askPrice")):
+        raw = payload.get(payload_key)
+        if isinstance(raw, (str, int, Decimal)) and not isinstance(raw, bool):
+            snapshot[receipt_key] = clean(raw, 80)
+    return snapshot
+
+
+def _validated_book(payload: Any, symbol: str,
+                    label: str) -> Tuple[Decimal, Decimal]:
+    if not isinstance(payload, dict):
+        raise PositionError("%s book returned a non-object response" % label)
+    if payload.get("symbol") != symbol:
+        raise PositionError("%s book symbol does not match %s"
+                            % (label, symbol))
+    prices = []
+    for field in ("bidPrice", "askPrice"):
+        raw = payload.get(field)
+        if raw is None or isinstance(raw, (bool, float)):
+            raise PositionError("%s book has unreadable %s" % (label, field))
+        try:
+            value = d(raw)
+        except (ArithmeticError, TypeError, ValueError):
+            raise PositionError("%s book has unreadable %s"
+                                % (label, field)) from None
+        if not value.is_finite() or value <= 0:
+            raise PositionError("%s book has unreadable %s"
+                                % (label, field))
+        prices.append(value)
+    bid, ask = prices
+    if bid > ask:
+        raise PositionError("%s book is crossed" % label)
+    return bid, ask
+
+
+def _revalidate_entry(state: RunState,
+                      accepted: AcceptedProposal) -> Optional[str]:
+    """Read exactly two public books and persist the entry-time decision.
+
+    Returns a plain refusal detail, or None when the fresh executable gap is
+    still within the proposal's configured safety buffer.
+    """
+    symbol = state.cfg.symbol
+    spot_kind, spot_payload = state.request(
+        "GET", SPOT.base_url, SPOT_BOOK_PATH, {"symbol": symbol}, False)
+    usdm_kind, usdm_payload = state.request(
+        "GET", USDM.base_url, USDM_BOOK_PATH, {"symbol": symbol}, False)
+
+    proposal_gap_pct = _proposal_decimal(
+        accepted.payload, "entry_gap_pct", (("entry_gap_pct",),))
+    tolerance_pct = _proposal_decimal(
+        accepted.payload, "safety_buffer_pct", (("safety_buffer_pct",),))
+    minimum_gap_pct = proposal_gap_pct - tolerance_pct
+    record = {
+        "proposal_entry_gap_pct": fmt(proposal_gap_pct),
+        "tolerance_pct": fmt(tolerance_pct),
+        "minimum_acceptable_gap_pct": fmt(minimum_gap_pct),
+        "fresh_entry_gap_pct": None,
+        "fresh_books": {
+            "spot": _book_snapshot(spot_kind, spot_payload),
+            "perp": _book_snapshot(usdm_kind, usdm_payload),
+        },
+        "decision": "REFUSE",
+        "reason": ENTRY_REVALIDATION_FAILED,
+        "checked_utc": utc(),
+    }
+
+    detail = None
+    if spot_kind != "ok":
+        detail = "fresh Spot book read failed"
+    elif usdm_kind != "ok":
+        detail = "fresh USD-M book read failed"
+    else:
+        try:
+            _spot_bid, spot_ask = _validated_book(
+                spot_payload, symbol, "Spot")
+            usdm_bid, _usdm_ask = _validated_book(
+                usdm_payload, symbol, "USD-M")
+            fresh_gap_pct = ((usdm_bid - spot_ask) / spot_ask
+                             * Decimal(100))
+            record["fresh_entry_gap_pct"] = fmt(fresh_gap_pct)
+            if fresh_gap_pct <= 0:
+                detail = "fresh executable entry gap is not positive"
+            elif fresh_gap_pct < minimum_gap_pct:
+                detail = ("fresh executable entry gap %s%% is below the "
+                          "minimum %s%% (proposal %s%% minus tolerance %s%%)"
+                          % (fmt(fresh_gap_pct), fmt(minimum_gap_pct),
+                             fmt(proposal_gap_pct), fmt(tolerance_pct)))
+        except PositionError as error:
+            detail = str(error)
+
+    if detail is None:
+        record["decision"] = "PROCEED"
+        record["reason"] = ENTRY_REVALIDATION_PASSED
+    else:
+        record["detail"] = clean(detail, 300)
+    state.receipt["entry_revalidation"] = record
+    save(state)
+    return detail
+
+
 def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
              now_ms: Callable[[], int] = default_now_ms,
              proposal_id: Optional[str] = None) -> int:
@@ -1570,6 +1682,15 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
         release_lock(state)
         return conclude(state, "PREFLIGHT_REFUSED", "none",
                         str(refusal))
+
+    # Last read-only gate before leverage or an order can mutate the account:
+    # the immutable proposal cannot authorize entry on stale economics.
+    revalidation_failure = _revalidate_entry(state, accepted)
+    if revalidation_failure is not None:
+        release_lock(state)
+        return conclude(
+            state, "REJECTED_BEFORE_ENTRY", "none",
+            "%s: %s" % (ENTRY_REVALIDATION_FAILED, revalidation_failure))
 
     # Persist the accepted authority and opening state before the sole
     # pre-entry account mutation.

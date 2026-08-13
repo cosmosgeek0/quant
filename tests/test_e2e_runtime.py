@@ -106,6 +106,11 @@ class LedgerTransport:
             "askPrice": str(max(Decimal(perp_bid), Decimal("100.3"))),
             "time": T_OPEN,
         }
+        spec["symbol_config_seq"] = [
+            [{"symbol": SYMBOL, "leverage": "10"}],
+            [{"symbol": SYMBOL, "leverage": "10"}],
+            [{"symbol": SYMBOL, "leverage": "1"}],
+        ]
         self.base = ScriptedTransport(spec)
 
     def _kill(self, label):
@@ -232,7 +237,7 @@ class RuntimeCase(unittest.TestCase):
 
     def config(self, **changes):
         values = {
-            "symbol": SYMBOL,
+            "symbol": "",
             "sha": SHA,
             "receipt_dir": self.receipt_dir,
             "max_hold_ms": 86400000,
@@ -252,17 +257,39 @@ class RuntimeCase(unittest.TestCase):
         watch = basis_watch.Watch(state_path, self.receipt_dir, cfg)
         reads = FakeReads(
             [universe_row(SYMBOL)],
-            {SYMBOL: scenario_bundle(T_OPEN)},
+            {SYMBOL: scenario_bundle(T_OPEN, rate="0.01")},
         )
         with mock.patch.object(basis_watch, "basis_kernel", StubKernel()):
             rows = watch.run_pass(reads, T_OPEN)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["proposal_status"], "written")
+        proposal_path = os.path.join(
+            self.receipt_dir, bp.PROPOSAL_DIR,
+            "proposal-%s.json" % rows[0]["proposal_id"])
+        with open(proposal_path, encoding="utf-8") as handle:
+            self.assert_full_equation_net(json.load(handle))
         return rows[0]["proposal_id"]
+
+    def assert_full_equation_net(self, payload):
+        intended_exit_gap = max(
+            Decimal("0"), Decimal(payload["exit_gap_pct"]))
+        four_commissions = (
+            Decimal("2") * Decimal(payload["spot_taker_commission_pct"])
+            + Decimal("2") * Decimal(payload["perp_taker_commission_pct"])
+        )
+        expected = (
+            Decimal(payload["entry_gap_pct"]) - intended_exit_gap
+            + Decimal(payload["carry_pct"]) - four_commissions
+            - Decimal(payload["entry_slippage_pct"])
+            - Decimal(payload["exit_slippage_pct"])
+            - Decimal(payload["safety_buffer_pct"])
+        )
+        self.assertEqual(Decimal(payload["net_edge_pct"]), expected)
 
     def write_hand_built_proposal(self, proposal_id, **changes):
         payload = proposal_payload(proposal_id)
         payload.update(changes)
+        self.assert_full_equation_net(payload)
         directory = os.path.join(self.receipt_dir, bp.PROPOSAL_DIR)
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, "proposal-%s.json" % proposal_id)
@@ -312,10 +339,36 @@ class RuntimeCase(unittest.TestCase):
             receipted.update(position.get("client_ids", {}))
         self.assertLessEqual(set(self.ledger.posted_client_ids), receipted)
 
+    def opening_transport(self, **changes):
+        return LedgerTransport(
+            self.ledger, spot_ask="100.02", perp_bid="100.800156",
+            **changes)
+
+    def assert_revalidation_precedes_leverage(self, transport):
+        leverage_indexes = [
+            index for index, call in enumerate(transport.calls)
+            if call[0] == "POST" and call[2] == "/fapi/v1/leverage"
+        ]
+        self.assertEqual(len(leverage_indexes), 1)
+        leverage_index = leverage_indexes[0]
+        book_reads = [
+            (index, call[2]) for index, call in enumerate(transport.calls)
+            if call[0] == "GET" and call[2].endswith("ticker/bookTicker")
+        ]
+        self.assertEqual(
+            [path for _index, path in book_reads],
+            ["/api/v3/ticker/bookTicker",
+             "/fapi/v1/ticker/bookTicker"])
+        self.assertTrue(
+            all(index < leverage_index for index, _path in book_reads),
+            "entry revalidation must precede the leverage mutation")
+
     def open_from_watch(self):
         proposal_id = self.publish_watch_proposal()
-        code, output = self.tick(LedgerTransport(self.ledger))
+        transport = self.opening_transport()
+        code, output = self.tick(transport)
         self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assert_revalidation_precedes_leverage(transport)
         self.assertEqual(self.position()["state"], bp.ST_OPEN)
         self.assertEqual(self.position()["proposal_id"], proposal_id)
         self.assertEqual(self.ledger.stages, ["enter_spot", "enter_short"])
@@ -337,9 +390,10 @@ class EntryBoundaryE2ETests(RuntimeCase):
             self.assertFalse(os.path.exists(self.claim_path(proposal_id)))
         os.unlink(stop)
 
-        code, output = self.tick(
-            LedgerTransport(self.ledger), T_OPEN + 30)
+        transport = self.opening_transport()
+        code, output = self.tick(transport, T_OPEN + 30)
         self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assert_revalidation_precedes_leverage(transport)
         self.assertTrue(os.path.exists(self.claim_path(proposal_id)))
         self.assertEqual(self.position()["state"], bp.ST_OPEN)
         self.assertEqual(self.ledger.stages, ["enter_spot", "enter_short"])
@@ -348,7 +402,8 @@ class EntryBoundaryE2ETests(RuntimeCase):
     def test_hand_built_non_positive_net_proposal_is_refused_on_disk(self):
         proposal_id = "negative-net"
         proposal = self.write_hand_built_proposal(
-            proposal_id, net_edge_pct="0")
+            proposal_id, funding_rate="0.004604004004",
+            carry_pct="0.4604004004", net_edge_pct="0")
         self.assertTrue(os.path.exists(proposal))
         for offset in (0, 1000):
             transport = LedgerTransport(self.ledger)
@@ -441,9 +496,11 @@ class CrashBoundaryE2ETests(RuntimeCase):
         self.assertIsNone(self.position())
         self.assertEqual(self.ledger.posted_client_ids, [])
 
+        transport = self.opening_transport()
         code, recovered = self.tick(
-            LedgerTransport(self.ledger), claimant="stable-supervisor")
+            transport, claimant="stable-supervisor")
         self.assertEqual(code, bs.EXIT_ACTED, recovered)
+        self.assert_revalidation_precedes_leverage(transport)
         self.assertIn("SUPERVISOR | CLAIM | RECOVERED", recovered)
         self.assertEqual(self.position()["state"], bp.ST_OPEN)
         self.assertEqual(self.ledger.stages, ["enter_spot", "enter_short"])
@@ -451,9 +508,10 @@ class CrashBoundaryE2ETests(RuntimeCase):
 
     def test_crash_after_spot_intent_before_post_reconciles_definite_absence(self):
         self.publish_watch_proposal()
-        crashing = LedgerTransport(
-            self.ledger, crash="before_post:enter_spot")
+        crashing = self.opening_transport(
+            crash="before_post:enter_spot")
         self.crash_tick(crashing)
+        self.assert_revalidation_precedes_leverage(crashing)
         position = self.position()
         self.assertEqual(position["state"], bp.ST_OPENING)
         self.assertEqual(position["pending_intent"]["stage"],
@@ -471,8 +529,9 @@ class CrashBoundaryE2ETests(RuntimeCase):
 
     def test_crash_after_spot_fill_before_short_intent_freezes_one_leg(self):
         self.publish_watch_proposal()
-        self.crash_tick(
-            LedgerTransport(self.ledger, crash="after_spot_fill"))
+        crashing = self.opening_transport(crash="after_spot_fill")
+        self.crash_tick(crashing)
+        self.assert_revalidation_precedes_leverage(crashing)
         self.assertEqual(self.ledger.stages, ["enter_spot"])
         self.assertEqual(self.position()["state"], bp.ST_OPENING)
         self.assertFalse(any(meta["stage"] == "enter_short"
@@ -488,8 +547,9 @@ class CrashBoundaryE2ETests(RuntimeCase):
 
     def test_crash_after_short_post_freezes_unknown_then_reconcile_resolves(self):
         self.publish_watch_proposal()
-        self.crash_tick(LedgerTransport(
-            self.ledger, crash="after_post:enter_short"))
+        crashing = self.opening_transport(crash="after_post:enter_short")
+        self.crash_tick(crashing)
+        self.assert_revalidation_precedes_leverage(crashing)
         short_client = self.ledger.posted_client_ids[-1]
         self.ledger.hidden_clients.add(short_client)
         self.assertEqual(self.position()["state"], bp.ST_OPENING)

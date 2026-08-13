@@ -40,9 +40,14 @@ conventions).  Per pass:
    FOCUS sessions expire after focusMaxAgeMs back to WATCHING.
 
 UNITS (math-area rule unit_conventions, tested explicitly): gaps, fees,
-slippage, carry and net edge are PERCENT (0.78 means 0.78%); spreads and
-mark divergence are BPS (x10000); funding rates are per-period FRACTIONS
-(0.0001 = 1 bp per settlement, converted to percent only inside carry).
+slippage, carry, safety buffer and net edge are PERCENT (0.78 means 0.78%);
+spreads and mark divergence are BPS (x10000); funding rates are per-period
+FRACTIONS (0.0001 = 1 bp per settlement, converted to percent only inside
+carry).  Decision net is the complete round trip: entry gap minus the
+decision-time intended-exit gap cost, four commissions, entry and exit
+slippage, and safety buffer, plus expected funding carry.  Actual exit is
+later at convergence; the current exit pair models its crossing cost, and a
+favorable pair is floored at zero rather than added as entry profit.
 
 STATE: ONE atomic JSON file (default RECEIPT_DIR/watch/basis_watch_state.json)
 holding per-symbol candidate state — lifecycle state, persistence counter,
@@ -158,6 +163,8 @@ DEFAULTS: Dict[str, Any] = {
     "max_spread_bps": Decimal("25"),
     "min_depth_score": Decimal("0.3"),
     "min_net_basis_pct": Decimal("0.25"),
+    # The commander's explicit buffer uses the frozen spec's min-net default.
+    "safety_buffer_pct": Decimal("0.25"),
     "max_funding_drag_pct": Decimal("0.15"),
     "min_data_quality": Decimal("0.4"),
     "cooldown_ms": 600000,
@@ -187,6 +194,9 @@ def watch_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Spec defaults merged with overrides, then validated (fail-closed)."""
     cfg = dict(DEFAULTS)
     cfg.update(overrides or {})
+    if overrides and "min_net_basis_pct" in overrides \
+            and "safety_buffer_pct" not in overrides:
+        cfg["safety_buffer_pct"] = overrides["min_net_basis_pct"]
     validate_config(cfg)
     return cfg
 
@@ -204,6 +214,9 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     for key in ("min_net_basis_pct", "max_funding_drag_pct", "notional_usd"):
         if cfg[key] <= 0:
             raise WatchError("config: %s must be > 0" % key)
+    safety_buffer = dec(cfg.get("safety_buffer_pct"))
+    if safety_buffer is None or safety_buffer < 0:
+        raise WatchError("config: safety_buffer_pct must be >= 0")
     ttl = dec(cfg.get("proposal_ttl_seconds"))
     if ttl is None or ttl <= 0:
         raise WatchError("config: proposal_ttl_seconds must be > 0")
@@ -760,6 +773,10 @@ def _kernel_decision(module: Any, observation: Dict[str, Any]) -> Any:
         # proposal-grade candidates are recorded here instead of being
         # converted to kill_switch_on rejects (which would cool them down).
         kill_switch_on=False,
+        spot_bid_ladder=observation["spot_ladder"]["bids"]
+        if observation["spot_ladder"] else None,
+        perp_ask_ladder=observation["perp_ladder"]["asks"]
+        if observation["perp_ladder"] else None,
     )
     result = module.evaluate(snapshot, config)
     if not isinstance(result, dict):
@@ -1204,11 +1221,12 @@ class Watch:
         if not isinstance(spot, dict) or not isinstance(perp, dict) \
                 or not isinstance(mark, dict):
             return None
-        entry_gap = entry_gap_pct(spot.get("ask"), perp.get("bid"))
-        exit_gap = return_pct(perp.get("ask"), spot.get("bid"))
-        entry_slippage = decision_decimal(decision, "slippage_pct")
-        exit_slippage = exit_slippage_pct(observation)
+        entry_gap = decision_decimal(decision, "gap_pct")
+        exit_gap = decision_decimal(decision, "intended_exit_gap_pct")
+        entry_slippage = decision_decimal(decision, "entry_slippage_pct")
+        exit_slippage = decision_decimal(decision, "exit_slippage_pct")
         carry = decision_decimal(decision, "carry_pct")
+        safety_buffer = decision_decimal(decision, "safety_buffer_pct")
         net_edge = decision_decimal(decision, "net_pct")
         quantity = proposal_quantity(
             observation.get("notional_usd"), spot.get("ask"), perp.get("bid"),
@@ -1221,7 +1239,7 @@ class Watch:
             fees.get("spot_maker_fee_pct"), fees.get("spot_taker_fee_pct"),
             fees.get("perp_maker_fee_pct"), fees.get("perp_taker_fee_pct"),
             entry_slippage, exit_slippage, mark.get("funding_rate"), carry,
-            dec(self.cfg.get("min_net_basis_pct")), net_edge, quantity,
+            safety_buffer, net_edge, quantity,
         )
         parsed = [dec(value) for value in required_decimals]
         if any(value is None for value in parsed) \
@@ -1260,8 +1278,7 @@ class Watch:
             "funding_rate": _proposal_decimal(next(values)),
             "funding_period_ms": observation["funding_period_ms"],
             "carry_pct": _proposal_decimal(next(values)),
-            # min_net_basis_pct is the kernel's configured positive safety
-            # threshold: net edge had to clear this buffer to become proposal.
+            # This exact kernel component was already subtracted from net.
             "safety_buffer_pct": _proposal_decimal(next(values)),
             "net_edge_pct": _proposal_decimal(next(values)),
             "quantity": _proposal_decimal(next(values)),

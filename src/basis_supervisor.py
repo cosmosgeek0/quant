@@ -11,12 +11,14 @@ Exit codes: 0 acted, 1 held, 2 frozen, 3 idle.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, List, Optional
 
 from basis_position import (
@@ -37,6 +39,7 @@ from basis_position import (
     ST_OPEN,
     ST_OPENING,
     ST_UNKNOWN,
+    SYMBOL_RE,
     PositionConfig,
     PositionError,
     cmd_check,
@@ -70,7 +73,10 @@ supervision_ladder = supervise
 @dataclass(frozen=True)
 class ProposalCandidate:
     proposal_id: str
+    symbol: str
     created_ms: int
+    net_edge_pct: Decimal
+    digest: str
 
 
 def _text(value: Any, limit: int = 300) -> str:
@@ -95,9 +101,38 @@ def _created_ms(payload: dict) -> int:
     return int(parsed.timestamp() * 1000)
 
 
+def _load_candidate(cfg: PositionConfig, proposal_id: str,
+                    tick_ms: int) -> ProposalCandidate:
+    """Validate one proposal using the symbol declared by that proposal."""
+    path = os.path.join(cfg.receipt_dir, PROPOSAL_DIR,
+                        "proposal-%s.json" % proposal_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, ValueError):
+        raise PositionError("proposal %s is unreadable" % proposal_id) \
+            from None
+    if not isinstance(payload, dict):
+        raise PositionError(
+            "proposal %s is unreadable: JSON object required" % proposal_id)
+    symbol = payload.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise PositionError("proposal required field symbol is missing")
+    if SYMBOL_RE.fullmatch(symbol) is None:
+        raise PositionError("proposal symbol is invalid")
+    accepted = load_entry_proposal(
+        cfg.receipt_dir, proposal_id, symbol, cfg.sha, tick_ms)
+    return ProposalCandidate(
+        proposal_id=proposal_id,
+        symbol=accepted.payload["symbol"],
+        created_ms=_created_ms(accepted.payload),
+        net_edge_pct=accepted.net_edge_pct,
+        digest=accepted.digest)
+
+
 def _scan_newest_valid(cfg: PositionConfig, tick_ms: int
                        ) -> Optional[ProposalCandidate]:
-    """Validate every immutable proposal; return the newest valid one."""
+    """Validate all proposals; select best edge, then newest, in whitelist."""
     directory = os.path.join(cfg.receipt_dir, PROPOSAL_DIR)
     try:
         names = sorted(os.listdir(directory))
@@ -118,17 +153,19 @@ def _scan_newest_valid(cfg: PositionConfig, tick_ms: int
             _row("PROPOSAL", "SKIPPED", "%s has an invalid id" % name)
             continue
         try:
-            accepted = load_entry_proposal(
-                cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha, tick_ms)
-            valid.append(ProposalCandidate(
-                proposal_id=proposal_id,
-                created_ms=_created_ms(accepted.payload)))
+            candidate = _load_candidate(cfg, proposal_id, tick_ms)
+            if cfg.symbol and candidate.symbol != cfg.symbol:
+                _row("PROPOSAL", "FILTERED", "%s symbol %s"
+                     % (proposal_id, candidate.symbol))
+                continue
+            valid.append(candidate)
         except (KeyError, TypeError, ValueError, PositionError) as error:
             _row("PROPOSAL", "SKIPPED", "%s: %s"
                  % (proposal_id, _text(error, 220)))
     if not valid:
         return None
-    return max(valid, key=lambda item: (item.created_ms, item.proposal_id))
+    return max(valid, key=lambda item: (
+        item.net_edge_pct, item.created_ms, item.proposal_id))
 
 
 def _claim(candidate: ProposalCandidate, cfg: PositionConfig, claimant: str,
@@ -228,6 +265,17 @@ def _position_file_exists(cfg: PositionConfig) -> bool:
     return os.path.exists(os.path.join(cfg.receipt_dir, STATE_FILE))
 
 
+def _cfg_for_position(cfg: PositionConfig,
+                      position: Optional[dict]) -> PositionConfig:
+    """Bind commands to durable position identity, never the entry filter."""
+    if position is None:
+        return dataclasses.replace(cfg, symbol="")
+    symbol = position.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise PositionError("basis-position.json symbol is missing or invalid")
+    return dataclasses.replace(cfg, symbol=symbol)
+
+
 def _reconcile(cfg: PositionConfig, request, sleep, now_ms,
                label: str = "RECONCILE") -> tuple[int, Optional[dict]]:
     code = cmd_resume(cfg, request, sleep=sleep, now_ms=now_ms)
@@ -271,13 +319,19 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
     position: Optional[dict]
     try:
         position = load_position(cfg.receipt_dir)
-    except PositionError:
-        position = None
+    except PositionError as error:
+        _row("TICK", "FROZEN", error)
+        return EXIT_FROZEN
     has_recovery_artifact = _position_file_exists(cfg) or os.path.exists(
         os.path.join(cfg.receipt_dir, LOCK_FILE))
     if has_recovery_artifact:
+        try:
+            position_cfg = _cfg_for_position(cfg, position)
+        except PositionError as error:
+            _row("TICK", "FROZEN", error)
+            return EXIT_FROZEN
         resume_code, position = _reconcile(
-            cfg, request, sleep, now_ms)
+            position_cfg, request, sleep, now_ms)
         state = position.get("state") if position else None
         lock_stands = os.path.exists(os.path.join(cfg.receipt_dir, LOCK_FILE))
         ownership_inconsistent = (state == ST_OPEN and not lock_stands) \
@@ -294,14 +348,20 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
             return EXIT_FROZEN
 
     if position is not None and position.get("state") == ST_OPEN:
+        try:
+            position_cfg = _cfg_for_position(cfg, position)
+        except PositionError as error:
+            _row("TICK", "FROZEN", error)
+            return EXIT_FROZEN
         before = position
         prior_check = before.get("last_check")
         prior_decision = prior_check.get("decision") \
             if isinstance(prior_check, dict) else None
         emergency_before = os.path.exists(os.path.join(
             cfg.receipt_dir, EMERGENCY_FILE))
-        check_code = cmd_check(cfg, request, sleep=sleep, now_ms=now_ms)
-        after = _load_after("CHECK", cfg)
+        check_code = cmd_check(
+            position_cfg, request, sleep=sleep, now_ms=now_ms)
+        after = _load_after("CHECK", position_cfg)
         if after is None:
             return EXIT_FROZEN
         decision = _fresh_check_decision(before, after, check_code)
@@ -321,12 +381,13 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
             return EXIT_FROZEN
         if close_reason is not None:
             close_code = cmd_close(
-                cfg, request, sleep=sleep, now_ms=now_ms)
+                position_cfg, request, sleep=sleep, now_ms=now_ms)
             _row("CLOSE", "AUTOMATIC",
                  "%s; position command exit %s"
                  % (close_reason, close_code))
             resume_code, final_position = _reconcile(
-                cfg, request, sleep, now_ms, label="CLOSE-RECONCILE")
+                position_cfg, request, sleep, now_ms,
+                label="CLOSE-RECONCILE")
             final_state = final_position.get("state") \
                 if final_position else None
             if resume_code != 0 or final_state in FREEZE_STATES \
@@ -364,10 +425,29 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
     if not claimed:
         return EXIT_IDLE
 
+    # The claim owns the proposal id.  Re-read the immutable proposal after
+    # that atomic boundary and bind the position machine to its symbol.
+    try:
+        claimed_candidate = _load_candidate(
+            cfg, candidate.proposal_id, tick_ms)
+    except (KeyError, TypeError, ValueError, PositionError) as error:
+        _row("CLAIM", "FROZEN", "%s: %s"
+             % (candidate.proposal_id, _text(error, 220)))
+        return EXIT_FROZEN
+    if claimed_candidate.digest != candidate.digest:
+        _row("CLAIM", "FROZEN", "proposal %s changed during claim"
+             % candidate.proposal_id)
+        return EXIT_FROZEN
+    if cfg.symbol and claimed_candidate.symbol != cfg.symbol:
+        _row("CLAIM", "FROZEN", "proposal %s escaped symbol whitelist"
+             % candidate.proposal_id)
+        return EXIT_FROZEN
+    proposal_cfg = dataclasses.replace(
+        cfg, symbol=claimed_candidate.symbol)
     open_code = cmd_open(
-        cfg, request, sleep=sleep, now_ms=now_ms,
+        proposal_cfg, request, sleep=sleep, now_ms=now_ms,
         proposal_id=candidate.proposal_id)
-    opened = _load_after("OPEN", cfg)
+    opened = _load_after("OPEN", proposal_cfg)
     opened_state = opened.get("state") if opened else ST_NONE
     _row("OPEN", "DONE" if open_code == 0 else "HELD",
          "proposal %s position command exit %s state %s"
@@ -405,6 +485,13 @@ def _positive_seconds(value: str) -> float:
     return parsed
 
 
+def _config_from_env(env, symbol_arg: str) -> PositionConfig:
+    """Load shared policy while keeping SYMBOL an optional whitelist."""
+    requested = symbol_arg or env.get("SYMBOL", "")
+    cfg = config_from_env(env, requested or "ALLUSDT")
+    return dataclasses.replace(cfg, symbol=cfg.symbol if requested else "")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="restart-safe one-position basis supervisor")
@@ -414,13 +501,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     mode.add_argument("--run", metavar="SECONDS", type=_positive_seconds,
                       help="run ticks at this interval until the halt file")
     parser.add_argument("--symbol", default="",
-                        help="basis symbol (default: SYMBOL environment)")
+                        help="optional proposal-symbol whitelist (default: "
+                             "SYMBOL environment; unset means all)")
     parser.add_argument("--halt-file",
                         help="loop halt path (default: RECEIPT_DIR/HALT)")
     args = parser.parse_args(argv)
 
     try:
-        cfg = config_from_env(os.environ, args.symbol)
+        cfg = _config_from_env(os.environ, args.symbol)
     except PositionError as error:
         _row("CONFIG", "FROZEN", error)
         return EXIT_FROZEN

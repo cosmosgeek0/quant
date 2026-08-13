@@ -36,6 +36,8 @@ from tests.test_basis_position import (  # noqa: E402
 
 
 _real_getaddrinfo = socket.getaddrinfo
+ALT_SYMBOL = "ETHUSDT"
+ALT_BASE = "ETH"
 
 
 def setUpModule():
@@ -79,11 +81,42 @@ class BasisSupervisorTests(unittest.TestCase):
         self.addCleanup(holder.cleanup)
         self.dir = holder.name
         self.cfg = PositionConfig(
-            symbol=SYMBOL, sha=SHA, receipt_dir=self.dir,
+            symbol="", sha=SHA, receipt_dir=self.dir,
             max_hold_ms=86400000,
             min_remaining_edge_pct=Decimal("0.01"),
             max_adverse_move_pct=Decimal("0.5"))
         self.write_proposal()
+
+    def cfg_for(self, symbol):
+        return dataclasses.replace(self.cfg, symbol=symbol)
+
+    def spec_for(self, symbol, base_asset):
+        def replace_symbols(value):
+            if isinstance(value, dict):
+                return {key: replace_symbols(item)
+                        for key, item in value.items()}
+            if isinstance(value, list):
+                return [replace_symbols(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(replace_symbols(item) for item in value)
+            if isinstance(value, str):
+                return value.replace(SYMBOL, symbol).replace("BTC", base_asset)
+            return value
+
+        spec = replace_symbols(happy_spec())
+        spec.update({
+            "spot_commission": {
+                "symbol": symbol,
+                "standardCommission": {
+                    "maker": "0.00100000", "taker": "0.00100000"}},
+            "usdm_commission": {
+                "symbol": symbol, "makerCommissionRate": "0.000200",
+                "takerCommissionRate": "0.000400"},
+            "symbol_config": [{"symbol": symbol, "leverage": "1"}],
+            "leverage_post": {"symbol": symbol, "leverage": 1},
+            "position": [{"symbol": symbol, "positionAmt": "0.000"}],
+        })
+        return spec
 
     def write_proposal(self, payload=None, proposal_id=PROPOSAL_ID):
         directory = os.path.join(self.dir, bp.PROPOSAL_DIR)
@@ -109,13 +142,15 @@ class BasisSupervisorTests(unittest.TestCase):
                 now_ms=lambda: T_OPEN, claimant=claimant)
         return code, output.getvalue()
 
-    def open_directly(self, spec=None):
+    def open_directly(self, spec=None, symbol=SYMBOL,
+                      proposal_id=PROPOSAL_ID):
         output = io.StringIO()
         transport = ScriptedTransport(spec or happy_spec())
         with redirect_stdout(output):
             code = bp.cmd_open(
-                self.cfg, transport, sleep=lambda _seconds: None,
-                now_ms=lambda: T_OPEN, proposal_id=PROPOSAL_ID)
+                self.cfg_for(symbol), transport,
+                sleep=lambda _seconds: None,
+                now_ms=lambda: T_OPEN, proposal_id=proposal_id)
         self.assertEqual(code, 0, output.getvalue())
 
     def test_claim_open_happy_path_from_valid_proposal(self):
@@ -133,6 +168,99 @@ class BasisSupervisorTests(unittest.TestCase):
         self.assertTrue(claim["utc"].endswith("Z"))
         self.assertLess(output.index("SUPERVISOR | CLAIM | CREATED"),
                         output.index("SUPERVISOR | OPEN | DONE"))
+
+    def test_best_net_proposal_across_symbols_opens_its_symbol(self):
+        better_id = "eth-better"
+        better = proposal_payload(better_id)
+        better.update({"symbol": ALT_SYMBOL, "net_edge_pct": "0.50"})
+        self.write_proposal(better, better_id)
+        transport = ScriptedTransport(self.spec_for(ALT_SYMBOL, ALT_BASE))
+
+        code, output = self.run_tick(transport)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertTrue(os.path.exists(self.claim_path(better_id)))
+        self.assertFalse(os.path.exists(self.claim_path(PROPOSAL_ID)))
+        self.assertEqual(self.position()["proposal_id"], better_id)
+        self.assertEqual(self.position()["symbol"], ALT_SYMBOL)
+        symbol_params = [params["symbol"]
+                         for _method, _url, _path, params, _signed
+                         in transport.calls if "symbol" in params]
+        self.assertTrue(symbol_params)
+        self.assertEqual(set(symbol_params), {ALT_SYMBOL})
+
+    def test_standing_position_on_one_symbol_blocks_other_symbol_claim(self):
+        self.open_directly()
+        other_id = "eth-next"
+        other = proposal_payload(other_id)
+        other.update({"symbol": ALT_SYMBOL, "net_edge_pct": "0.90"})
+        self.write_proposal(other, other_id)
+        transport = PositionSequenceTransport(
+            happy_spec(),
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]])
+
+        code, output = self.run_tick(transport)
+
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertFalse(os.path.exists(self.claim_path(other_id)))
+        self.assertNotIn("SUPERVISOR | CLAIM", output)
+        self.assertEqual(self.position()["symbol"], SYMBOL)
+
+    def test_resume_check_and_close_use_persisted_symbol_without_filter(self):
+        proposal_id = "eth-position"
+        proposal = proposal_payload(proposal_id)
+        proposal["symbol"] = ALT_SYMBOL
+        self.write_proposal(proposal, proposal_id)
+        alt_spec = self.spec_for(ALT_SYMBOL, ALT_BASE)
+        self.open_directly(alt_spec, ALT_SYMBOL, proposal_id)
+        with open(os.path.join(self.dir, bp.EMERGENCY_FILE), "w",
+                  encoding="utf-8") as handle:
+            handle.write("owner emergency\n")
+        transport = PositionSequenceTransport(
+            alt_spec,
+            [[{"symbol": ALT_SYMBOL, "positionAmt": "-0.098"}],
+             [{"symbol": ALT_SYMBOL, "positionAmt": "0.000"}]])
+
+        code, output = self.run_tick(transport)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertEqual(self.position()["state"], bp.ST_CLOSED)
+        self.assertEqual(self.position()["symbol"], ALT_SYMBOL)
+        symbol_params = [params["symbol"]
+                         for _method, _url, _path, params, _signed
+                         in transport.calls if "symbol" in params]
+        self.assertTrue(symbol_params)
+        self.assertEqual(set(symbol_params), {ALT_SYMBOL})
+        self.assertIn("SUPERVISOR | CLOSE | AUTOMATIC", output)
+
+    def test_environment_symbol_is_only_a_proposal_whitelist(self):
+        better_id = "eth-filtered"
+        better = proposal_payload(better_id)
+        better.update({"symbol": ALT_SYMBOL, "net_edge_pct": "0.90"})
+        self.write_proposal(better, better_id)
+        env = {
+            "SYMBOL": SYMBOL,
+            "QUANT_SHA": SHA,
+            "RECEIPT_DIR": self.dir,
+            "MAX_HOLD_MS": "86400000",
+            "MIN_REMAINING_EDGE_PCT": "0.01",
+            "MAX_ADVERSE_MOVE_PCT": "0.5",
+        }
+        cfg = bs._config_from_env(env, "")
+        transport = ScriptedTransport(happy_spec())
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            code = bs.tick(
+                cfg, transport, sleep=lambda _seconds: None,
+                now_ms=lambda: T_OPEN, claimant="test-supervisor")
+
+        text = output.getvalue()
+        self.assertEqual(code, bs.EXIT_ACTED, text)
+        self.assertEqual(self.position()["symbol"], SYMBOL)
+        self.assertTrue(os.path.exists(self.claim_path(PROPOSAL_ID)))
+        self.assertFalse(os.path.exists(self.claim_path(better_id)))
+        self.assertIn("SUPERVISOR | PROPOSAL | FILTERED", text)
 
     def test_expired_proposal_is_skipped_once(self):
         expired = proposal_payload()
@@ -243,7 +371,7 @@ class BasisSupervisorTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             code = bp.cmd_open(
-                self.cfg, ScriptedTransport(unknown_spec),
+                self.cfg_for(SYMBOL), ScriptedTransport(unknown_spec),
                 sleep=lambda _seconds: None, now_ms=lambda: T_OPEN,
                 proposal_id=PROPOSAL_ID)
         self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output.getvalue())

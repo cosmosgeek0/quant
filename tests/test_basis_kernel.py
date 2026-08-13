@@ -91,6 +91,8 @@ def make_snapshot(**overrides):
         leg_skew_ms=0,
         spot_ask_ladder=((D("100.02"), D(500)),),
         perp_bid_ladder=((D("100.8"), D(500)),),
+        spot_bid_ladder=((D("100"), D(500)),),
+        perp_ask_ladder=((D("100.82"), D(500)),),
         mark=bk.FundingMark(
             mark_price=D("100.81"),
             funding_rate=D("0.0001"),
@@ -120,6 +122,7 @@ def gap_snapshot(gap_pct, **overrides):
         perp_book=bk.Book(bid=perp_bid, ask=perp_ask,
                           bid_qty=D(500), ask_qty=D(500)),
         perp_bid_ladder=((perp_bid, D(500)),),
+        perp_ask_ladder=((perp_ask, D(500)),),
         mark=bk.FundingMark(
             mark_price=mark,
             funding_rate=D("0.0001"),
@@ -129,6 +132,15 @@ def gap_snapshot(gap_pct, **overrides):
     )
     base.update(overrides)
     return make_snapshot(**base)
+
+
+def profitable_snapshot(**overrides):
+    """Default book with enough known carry to clear the full equation."""
+    overrides.setdefault("mark", bk.FundingMark(
+        mark_price=D("100.81"), funding_rate=D("0.01"),
+        next_funding_ts=NOW + 3_600_000, ts=NOW,
+    ))
+    return make_snapshot(**overrides)
 
 
 class KernelAssertions(unittest.TestCase):
@@ -200,6 +212,11 @@ class MathGapAndSpreadFixtures(KernelAssertions):
             bk.exit_gap_pct(inputs["spotBid"], inputs["perpAsk"]),
             expected["gapOutPct"],
         )
+
+    def test_intended_exit_gap_cost_floors_favorable_pair_at_zero(self):
+        self.assertEqual(bk.intended_exit_gap_pct(D("101"), D("100")), D(0))
+        self.assertEqual(bk.intended_exit_gap_pct(D("100"), D("100.82")),
+                         D("0.82"))
 
     def test_spread_bps_spot_default(self):
         inputs, expected = fixture("math", "spread_bps_spot_default")
@@ -426,24 +443,49 @@ class MathNetEdgeFixtures(KernelAssertions):
         )
         carry = bk.discounted_carry_pct(raw_carry, inputs["flipRisk"])
         fees = bk.fees_pct(inputs["spotTakerFeePct"], inputs["perpTakerFeePct"])
+        exit_gap = bk.intended_exit_gap_pct(D("100"), D("100.82"))
         edge = bk.net_edge(
-            gross, fees, inputs["slippagePct"], carry, inputs["borrowCostPct"]
+            gross, fees, inputs["slippagePct"], carry, inputs["borrowCostPct"],
+            exit_gap, D(0), CFG.safety_buffer_pct,
         )
         self.assertClose(edge.gross_pct, expected["grossPct"])
         self.assertClose(edge.carry_pct, expected["carryPct"])
-        self.assertClose(edge.total_costs_pct, expected["totalCostsPct"])
-        self.assertClose(edge.net_pct, expected["netPct"])
-        # oldTestAssertion: net in (0.45, 0.52), feesPct == 0.3 exactly.
-        self.assertTrue(D("0.45") < edge.net_pct < D("0.52"))
+        self.assertClose(edge.entry_costs_pct, expected["totalCostsPct"])
+        # The old spec pins entry-only net.  Preserve that measurement on the
+        # entry subtotal; the commander's full equation overrides it as the
+        # decision net by adding exit cost and the explicit safety buffer.
+        self.assertClose(edge.entry_side_subtotal_pct, expected["netPct"])
+        self.assertClose(
+            edge.net_pct,
+            D(str(expected["netPct"])) - exit_gap - CFG.safety_buffer_pct,
+        )
+        self.assertTrue(D("0.45") < edge.entry_side_subtotal_pct < D("0.52"))
         self.assertEqual(edge.fees_pct, D("0.3"))
         # settlementsCrossed 1, as constructed.
         self.assertEqual(inputs["settlementsCrossed"], 1)
+
+    def test_commander_full_equation_worked_example(self):
+        edge = bk.net_edge(
+            D("1.20"), D("0.30"), D("0.04"), D("0.05"), D(0),
+            D("0.20"), D("0.06"), D("0.10"),
+        )
+        self.assertEqual(edge.entry_side_subtotal_pct, D("0.91"))
+        self.assertEqual(edge.net_pct, D("0.55"))
+
+    def test_safety_buffer_is_subtracted_once(self):
+        without = bk.net_edge(D(1), D("0.2"), D("0.01"), D("0.03"),
+                              D(0), D("0.1"), D("0.02"), D(0))
+        with_buffer = bk.net_edge(
+            D(1), D("0.2"), D("0.01"), D("0.03"), D(0), D("0.1"),
+            D("0.02"), D("0.25"),
+        )
+        self.assertEqual(without.net_pct - with_buffer.net_pct, D("0.25"))
 
     def test_net_edge_unknown_carry_stays_null(self):
         inputs, expected = fixture("math", "net_edge_unknown_carry_stays_null")
         edge = bk.net_edge(
             inputs["grossPct"], inputs["feesPct"], inputs["slippagePct"],
-            inputs["carryPct"], inputs["borrowCostPct"],
+            inputs["carryPct"], inputs["borrowCostPct"], D(0), D(0), D(0),
         )
         # note: costs assembled with carry treated as 0, net still null.
         self.assertIsNone(edge.net_pct)
@@ -462,17 +504,18 @@ class MathNetEdgeFixtures(KernelAssertions):
         verdict = bk.evaluate(gap_snapshot("0.25"))
         self.assertEqual(verdict["reason"], "edge_below_fees")
         self.assertClose(verdict["components"]["gap_pct"], D("0.25"))
-        # g=0.45 -> net 0.16 < 0.25 rejects edge_below_threshold.
+        # g=0.45 -> the old entry-only subtotal is 0.16.
         verdict = bk.evaluate(gap_snapshot("0.45"))
         self.assertEqual(verdict["reason"], "edge_below_threshold")
-        self.assertClose(verdict["components"]["net_pct"], D("0.16"))
-        # g=0.60 -> proposal.  The fixture's "survives refresh
-        # (proposal_updated)" clause is proposal-object behavior owned by
-        # the lifecycle area, not this stateless kernel; reproduced here as
-        # the accepting entry decision only.
+        self.assertClose(
+            verdict["components"]["entry_side_subtotal_pct"], D("0.16"))
+        self.assertClose(verdict["components"]["net_pct"], D("-0.58009"))
+        # WAIVER: the old fixture calls g=0.60 a proposal, but the commander's
+        # full-equation override subtracts intended exit, exit slippage and
+        # safety buffer, so it must now refuse at the same guard position.
         verdict = bk.evaluate(gap_snapshot("0.6"))
-        self.assertTrue(verdict["accept"])
-        self.assertEqual(verdict["reason"], "proposal")
+        self.assertFalse(verdict["accept"])
+        self.assertEqual(verdict["reason"], "edge_below_threshold")
         # g=0.12 -> below watchGapPct 0.15.  The fixture's "kills proposal
         # with gap_closed" clause is the exit sweep (lifecycle area); the
         # entry ladder's decision for the same book is ignore, asserted here.
@@ -1123,11 +1166,18 @@ class NullGuardTests(KernelAssertions):
         self.assertClose(risk, D("0.32"))
 
     def test_net_edge_null_propagation(self):
-        edge = bk.net_edge(None, D("0.3"), D(0), D("0.01"))
+        edge = bk.net_edge(
+            None, D("0.3"), D(0), D("0.01"), D(0), D(0), D(0), D(0))
         self.assertIsNone(edge.net_pct)
-        edge = bk.net_edge(D(1), D("0.3"), None, D("0.01"))
+        edge = bk.net_edge(
+            D(1), D("0.3"), None, D("0.01"), D(0), D(0), D(0), D(0))
         self.assertIsNone(edge.net_pct)
         self.assertIsNone(edge.total_costs_pct)
+
+    def test_omitted_round_trip_inputs_fail_closed(self):
+        edge = bk.net_edge(D(1), D("0.3"), D(0), D("0.01"))
+        self.assertEqual(edge.entry_side_subtotal_pct, D("0.71"))
+        self.assertIsNone(edge.net_pct)
 
     def test_funding_context_fail_closed_variants(self):
         def ctx(**overrides):
@@ -1169,12 +1219,18 @@ class NullGuardTests(KernelAssertions):
 # ==========================================================================
 
 class EvaluateLadderTests(KernelAssertions):
-    def test_default_snapshot_is_the_measured_proposal(self):
+    def test_auditor_scenario_entry_only_accepts_but_full_net_refuses(self):
         verdict = bk.evaluate(make_snapshot())
-        self.assertTrue(verdict["accept"])
-        self.assertEqual(verdict["reason"], "proposal")
+        self.assertFalse(verdict["accept"])
+        self.assertEqual(verdict["reason"], "edge_below_threshold")
         self.assertClose(
-            verdict["components"]["net_pct"], D("0.48984403119376246")
+            verdict["components"]["entry_side_subtotal_pct"],
+            D("0.48984403119376246"),
+        )
+        self.assertGreater(verdict["components"]["entry_side_subtotal_pct"],
+                           CFG.min_net_basis_pct)
+        self.assertClose(
+            verdict["components"]["net_pct"], D("-0.58015596880623754")
         )
         self.assertEqual(verdict["components"]["fees_pct"], D("0.3"))
 
@@ -1250,15 +1306,15 @@ class EvaluateLadderTests(KernelAssertions):
         # default, and the engine sees the full breakdown but cannot arm.
         self.assertTrue(bk.BasisSnapshot.__dataclass_fields__[
             "kill_switch_on"].default)
-        verdict = bk.evaluate(make_snapshot(kill_switch_on=True))
+        verdict = bk.evaluate(profitable_snapshot(kill_switch_on=True))
         self.assertFalse(verdict["accept"])
         self.assertEqual(verdict["reason"], "kill_switch_on")
         self.assertClose(
-            verdict["components"]["net_pct"], D("0.48984403119376246")
+            verdict["components"]["net_pct"], D("0.40984403119376245")
         )
 
     def test_persistence_short_is_focus_at_default_thresholds(self):
-        verdict = bk.evaluate(make_snapshot(persist_ticks=4))
+        verdict = bk.evaluate(profitable_snapshot(persist_ticks=4))
         self.assertEqual(verdict["reason"], "focus")  # gap 0.78 >= focus 0.3
 
     def test_persistence_short_watch_below_focus_gap(self):
@@ -1270,7 +1326,14 @@ class EvaluateLadderTests(KernelAssertions):
             perp_taker_fee_pct=D("0.02"),
             min_net_basis_pct=D("0.1"),
         )
-        verdict = bk.evaluate(gap_snapshot("0.2", persist_ticks=1), cfg)
+        perp_bid = D("100.02") * (D(1) + D("0.2") / D(100))
+        verdict = bk.evaluate(gap_snapshot(
+            "0.2", persist_ticks=1,
+            mark=bk.FundingMark(
+                (perp_bid + perp_bid + D("0.02")) / D(2), D("0.01"),
+                NOW + 3_600_000, NOW,
+            ),
+        ), cfg)
         self.assertEqual(verdict["reason"], "watch")
 
     def test_guard_order_stale_beats_spread(self):
@@ -1325,13 +1388,13 @@ class EvaluateLadderTests(KernelAssertions):
 
     def test_survived_persistence_is_immune_to_cv(self):
         # The AND is the hysteresis: persisted N ticks overrides noisiness.
-        verdict = bk.evaluate(make_snapshot(stability_cv=D("0.9"),
-                                            persist_ticks=5))
+        verdict = bk.evaluate(profitable_snapshot(
+            stability_cv=D("0.9"), persist_ticks=5))
         self.assertTrue(verdict["accept"])
 
     def test_guard_order_persistence_beats_kill_switch(self):
-        verdict = bk.evaluate(make_snapshot(persist_ticks=2,
-                                            kill_switch_on=True))
+        verdict = bk.evaluate(profitable_snapshot(
+            persist_ticks=2, kill_switch_on=True))
         self.assertEqual(verdict["reason"], "focus")
 
     def test_reject_vocabulary_is_frozen(self):
@@ -1356,6 +1419,7 @@ class ConfigValidationTests(KernelAssertions):
         cfg = bk.KernelConfig()
         self.assertEqual(cfg.max_spread_bps, D(25))
         self.assertEqual(cfg.min_net_basis_pct, D("0.25"))
+        self.assertEqual(cfg.safety_buffer_pct, D("0.25"))
         self.assertEqual(cfg.persist_ticks, 5)
         self.assertEqual(cfg.funding_period_ms, 28_800_000)
 
@@ -1395,6 +1459,12 @@ class ConfigValidationTests(KernelAssertions):
             bk.KernelConfig(watch_gap_pct=D(0), focus_gap_pct=D("0.3"))
         with self.assertRaises(ValueError):
             bk.KernelConfig(max_funding_drag_pct=D("-0.1"))
+        with self.assertRaises(ValueError):
+            bk.KernelConfig(safety_buffer_pct=D("-0.01"))
+
+    def test_safety_buffer_defaults_to_overridden_spec_minimum(self):
+        cfg = bk.KernelConfig(min_net_basis_pct=D("0.11"))
+        self.assertEqual(cfg.safety_buffer_pct, D("0.11"))
 
     def test_negative_zero_rejected(self):
         with self.assertRaises(ValueError):

@@ -27,6 +27,12 @@ GUARD ORDER (spec state_machine.entry_ladder_ordered_guards, KEEP): the
 evaluate() ladder applies every gate in the frozen order and the FIRST
 failing guard names the reject — reject-code parity with the old engine
 depends on the order as much as on the numbers.
+
+COMMANDER ROUND-TRIP OVERRIDE: the old entry-only net is retained as an
+auditable component, but it no longer drives decisions.  Decision net also
+subtracts the non-favorable current exit-pair gap, exit-side slippage and the
+configured safety buffer.  Actual exit is later at convergence; the current
+exit pair is the conservative model for crossing that unwind spread.
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ __all__ = [
     "executable_return_pct",
     "entry_gap_pct",
     "exit_gap_pct",
+    "intended_exit_gap_pct",
     "spread_bps",
     "mark_divergence_bps",
     "fees_pct",
@@ -190,6 +197,11 @@ class KernelConfig:
     watch_gap_pct: Decimal = Decimal("0.15")
     focus_gap_pct: Decimal = Decimal("0.3")
     min_net_basis_pct: Decimal = Decimal("0.25")
+    # Commander override: the old min-net threshold is the default explicit
+    # round-trip safety buffer.  None keeps direct config overrides backward
+    # compatible by following min_net_basis_pct unless a distinct buffer is
+    # supplied.
+    safety_buffer_pct: Optional[Decimal] = None
     persist_ticks: int = 5
     max_gap_cv: Decimal = Decimal("0.6")
     tick_ms: int = 2_000
@@ -204,6 +216,8 @@ class KernelConfig:
     no_ladder_component: Decimal = Decimal("0.7")
 
     def __post_init__(self) -> None:
+        if self.safety_buffer_pct is None:
+            object.__setattr__(self, "safety_buffer_pct", self.min_net_basis_pct)
         for spec_field in dataclasses.fields(self):
             value = getattr(self, spec_field.name)
             if isinstance(value, bool):
@@ -233,6 +247,7 @@ class KernelConfig:
             "spot_taker_fee_pct", "perp_taker_fee_pct", "max_future_skew_ms",
             "flip_weight", "magnitude_weight", "unknown_skew_component",
             "unknown_divergence_component", "no_ladder_component",
+            "safety_buffer_pct",
         )
         for name in non_negative:
             if getattr(self, name) < 0:
@@ -306,16 +321,21 @@ class DataQuality:
 
 @dataclass(frozen=True)
 class EdgeBreakdown:
-    """Itemised cost assembly (spec cost_assembly + net_edge, KEEP)."""
+    """Itemised entry subtotal plus the commander's full round-trip net."""
 
     gross_pct: Optional[Decimal]
+    intended_exit_gap_pct: Optional[Decimal]
     fees_pct: Optional[Decimal]
-    slippage_pct: Optional[Decimal]
+    slippage_pct: Optional[Decimal]      # legacy alias: entry slippage
+    exit_slippage_pct: Optional[Decimal]
+    safety_buffer_pct: Optional[Decimal]
     funding_drag_pct: Decimal           # max(0, -carry); 0 when carry unknown
     borrow_cost_pct: Decimal            # always 0 for NORMAL
     carry_pct: Optional[Decimal]
-    total_costs_pct: Optional[Decimal]  # assembled for display even w/o carry
-    net_pct: Optional[Decimal]          # None when gross or carry is unknown
+    entry_costs_pct: Optional[Decimal]
+    entry_side_subtotal_pct: Optional[Decimal]
+    total_costs_pct: Optional[Decimal]  # includes exit costs and safety buffer
+    net_pct: Optional[Decimal]          # None when any money input is unknown
 
 
 @dataclass(frozen=True)
@@ -346,6 +366,8 @@ class BasisSnapshot:
     #   the old toy 10 USD default (spec old_sizing_default, REJECT)
     kill_switch_on: bool = True              # ADAPT money_control_flags: starts
     #   halted; see-but-cannot-arm is preserved by guard order
+    spot_bid_ladder: Optional[Sequence[Sequence[Any]]] = None  # NORMAL exit
+    perp_ask_ladder: Optional[Sequence[Sequence[Any]]] = None  # NORMAL exit
 
 
 # --------------------------------------------------------------------------
@@ -389,6 +411,20 @@ def exit_gap_pct(spot_bid: Any, perp_ask: Any) -> Optional[Decimal]:
     engine's entry-gap-below-watch rule (lifecycle area), for parity.
     """
     return executable_return_pct(spot_bid, perp_ask)
+
+
+def intended_exit_gap_pct(spot_bid: Any, perp_ask: Any) -> Optional[Decimal]:
+    """Modeled NORMAL unwind gap cost at the decision-time executable pair.
+
+    Actual exit occurs later at converged prices.  This term prices crossing
+    the currently observable exit pair (sell Spot at bid, buy Perp at ask):
+    ``(perp_ask - spot_bid) / spot_bid * 100``.  A favorable current exit
+    pair is floored at zero so it can never manufacture extra entry edge.
+    """
+    cost = executable_return_pct(perp_ask, spot_bid)
+    if cost is None:
+        return None
+    return cost if cost > 0 else Decimal(0)
 
 
 # --------------------------------------------------------------------------
@@ -680,6 +716,38 @@ def assess_liquidity(
         ladder_backed=spot_ask_ladder is not None and perp_bid_ladder is not None,
         book_pressure=book_pressure(spot_book, perp_book),
     )
+
+
+def _exit_slippage_pct(
+    spot_book: Optional[Book],
+    perp_book: Optional[Book],
+    spot_bid_ladder: Optional[Sequence[Sequence[Any]]],
+    perp_ask_ladder: Optional[Sequence[Sequence[Any]]],
+    notional_usd: Any,
+    config: KernelConfig,
+) -> Optional[Decimal]:
+    """NORMAL unwind slippage: Spot bids plus Perp asks at intended size."""
+    spot_slippage = leg_slippage_pct(
+        spot_bid_ladder,
+        notional_usd,
+        spot_book.bid if spot_book is not None else None,
+        spot_book.bid_qty if spot_book is not None else None,
+        config.slippage_pct_estimate,
+        config,
+    )
+    perp_slippage = leg_slippage_pct(
+        perp_ask_ladder,
+        notional_usd,
+        perp_book.ask if perp_book is not None else None,
+        perp_book.ask_qty if perp_book is not None else None,
+        config.slippage_pct_estimate,
+        config,
+    )
+    if spot_slippage is None or perp_slippage is None:
+        return None
+    with localcontext() as context:
+        context.prec = PRECISION
+        return spot_slippage + perp_slippage
 
 
 # --------------------------------------------------------------------------
@@ -1129,41 +1197,66 @@ def net_edge(
     slippage_pct: Any,
     carry_pct: Any,
     borrow_cost_pct: Any = Decimal(0),
+    intended_exit_gap_pct: Any = None,
+    exit_slippage_pct: Any = None,
+    safety_buffer_pct: Any = None,
 ) -> EdgeBreakdown:
-    """Cost assembly + net edge (KEEP).
+    """Assemble the entry subtotal and commander's full round-trip edge.
 
-    funding_drag = max(0, -carry) (drag only); total_costs = fees +
-    slippage + drag + borrow (borrow = 0 for NORMAL).  Positive carry is
-    NOT a cost — it enters only as the net-edge bonus:
-    net = gross - total_costs + max(0, carry).  net is None when gross is
-    None OR carry is unknown, even though the cost breakdown is still
-    assembled treating unknown carry as 0 for display.  Carry here is the
-    flip-risk-discounted value.
+    ``slippage_pct`` remains the entry-side slippage name for API parity.
+    The decision-driving equation is::
+
+        gross - intended_exit_gap + carry - fees - entry_slippage
+              - exit_slippage - safety_buffer
+
+    Carry is still itemised as drag/bonus for the existing funding guard.
+    The entry-only subtotal is retained explicitly so old differential
+    fixtures remain measurable without driving an unsafe decision.  The
+    three new round-trip inputs default to unknown, not zero, so an older
+    caller cannot silently recover the defective entry-only net.
     """
     gross = _dec(gross_pct)
     fee_total = _dec(fees)
-    slippage = _dec(slippage_pct)
+    entry_slippage = _dec(slippage_pct)
     carry = _dec(carry_pct)
     borrow = _dec(borrow_cost_pct)
+    exit_gap = _dec(intended_exit_gap_pct)
+    exit_slippage = _dec(exit_slippage_pct)
+    safety_buffer = _dec(safety_buffer_pct)
     with localcontext() as context:
         context.prec = PRECISION
         drag = Decimal(0)
         if carry is not None and carry < 0:
             drag = -carry
-        total_costs: Optional[Decimal] = None
-        if fee_total is not None and slippage is not None and borrow is not None:
-            total_costs = fee_total + slippage + drag + borrow
-        net: Optional[Decimal] = None
-        if gross is not None and carry is not None and total_costs is not None:
+        entry_costs: Optional[Decimal] = None
+        if fee_total is not None and entry_slippage is not None \
+                and borrow is not None:
+            entry_costs = fee_total + entry_slippage + drag + borrow
+        entry_subtotal: Optional[Decimal] = None
+        if gross is not None and carry is not None and entry_costs is not None:
             bonus = carry if carry > 0 else Decimal(0)
-            net = gross - total_costs + bonus
+            entry_subtotal = gross - entry_costs + bonus
+        total_costs: Optional[Decimal] = None
+        if entry_costs is not None and exit_gap is not None \
+                and exit_slippage is not None and safety_buffer is not None:
+            total_costs = (entry_costs + exit_gap + exit_slippage
+                           + safety_buffer)
+        net: Optional[Decimal] = None
+        if entry_subtotal is not None and exit_gap is not None \
+                and exit_slippage is not None and safety_buffer is not None:
+            net = entry_subtotal - exit_gap - exit_slippage - safety_buffer
     return EdgeBreakdown(
         gross_pct=gross,
+        intended_exit_gap_pct=exit_gap,
         fees_pct=fee_total,
-        slippage_pct=slippage,
+        slippage_pct=entry_slippage,
+        exit_slippage_pct=exit_slippage,
+        safety_buffer_pct=safety_buffer,
         funding_drag_pct=drag,
         borrow_cost_pct=borrow if borrow is not None else Decimal(0),
         carry_pct=carry,
+        entry_costs_pct=entry_costs,
+        entry_side_subtotal_pct=entry_subtotal,
         total_costs_pct=total_costs,
         net_pct=net,
     )
@@ -1198,8 +1291,13 @@ def evaluate(
     perp_spread = None
     if spot_book is not None and perp_book is not None:
         gap = entry_gap_pct(spot_book.ask, perp_book.bid)
+        intended_exit_gap = intended_exit_gap_pct(
+            spot_book.bid, perp_book.ask
+        )
         spot_spread = spread_bps(spot_book.bid, spot_book.ask)
         perp_spread = spread_bps(perp_book.bid, perp_book.ask)
+    else:
+        intended_exit_gap = None
 
     liquidity = assess_liquidity(
         spot_book,
@@ -1230,13 +1328,29 @@ def evaluate(
         cfg,
     )
     fee_total = fees_pct(cfg.spot_taker_fee_pct, cfg.perp_taker_fee_pct)
+    exit_slippage = _exit_slippage_pct(
+        spot_book,
+        perp_book,
+        snapshot.spot_bid_ladder,
+        snapshot.perp_ask_ladder,
+        snapshot.notional_usd,
+        cfg,
+    )
     edge = net_edge(
-        gap, fee_total, liquidity.slippage_pct, funding.carry_pct, Decimal(0)
+        gap,
+        fee_total,
+        liquidity.slippage_pct,
+        funding.carry_pct,
+        Decimal(0),
+        intended_exit_gap,
+        exit_slippage,
+        cfg.safety_buffer_pct,
     )
     stability_cv = _dec(snapshot.stability_cv)
 
     components: Dict[str, Any] = {
         "gap_pct": gap,
+        "entry_gap_pct": gap,
         "spot_spread_bps": spot_spread,
         "perp_spread_bps": perp_spread,
         "dq_score": quality.score,
@@ -1244,9 +1358,12 @@ def evaluate(
         "mark_divergence_bps": quality.mark_divergence_bps,
         "depth_score": liquidity.depth_score,
         "slippage_pct": liquidity.slippage_pct,
+        "entry_slippage_pct": liquidity.slippage_pct,
+        "exit_slippage_pct": edge.exit_slippage_pct,
         "ladder_backed": liquidity.ladder_backed,
         "book_pressure": liquidity.book_pressure,
         "fees_pct": edge.fees_pct,
+        "four_commissions_pct": edge.fees_pct,
         "funding_fresh": funding.fresh,
         "funding_rate": funding.funding_rate,
         "ms_to_funding": funding.ms_to_funding,
@@ -1254,10 +1371,16 @@ def evaluate(
         "carry_raw_pct": funding.carry_raw_pct,
         "flip_risk": funding.flip_risk,
         "carry_pct": funding.carry_pct,
+        "expected_funding_carry_pct": funding.carry_pct,
         "capture_factor": funding.capture_factor,
         "funding_drag_pct": edge.funding_drag_pct,
         "borrow_cost_pct": edge.borrow_cost_pct,
         "gross_pct": edge.gross_pct,
+        "intended_exit_gap_pct": edge.intended_exit_gap_pct,
+        "exit_gap_pct": edge.intended_exit_gap_pct,
+        "safety_buffer_pct": edge.safety_buffer_pct,
+        "entry_costs_pct": edge.entry_costs_pct,
+        "entry_side_subtotal_pct": edge.entry_side_subtotal_pct,
         "total_costs_pct": edge.total_costs_pct,
         "net_pct": edge.net_pct,
         "stability_cv": stability_cv,
@@ -1323,8 +1446,10 @@ def evaluate(
         and snapshot.persist_ticks < cfg.persist_ticks
     ):
         return _decision(False, "gap_not_persistent")
-    # (15) net edge threshold
-    if edge.net_pct is None or edge.net_pct < cfg.min_net_basis_pct:
+    # (15) net edge threshold, same guard position and reject vocabulary.
+    # The configured minimum is already subtracted as the safety buffer, so
+    # only a strictly positive full round trip can proceed to persistence.
+    if edge.net_pct is None or edge.net_pct <= 0:
         return _decision(False, "edge_below_threshold")
     # (16) persistence gate: short -> watch/focus (keeps accruing)
     if snapshot.persist_ticks < cfg.persist_ticks:
