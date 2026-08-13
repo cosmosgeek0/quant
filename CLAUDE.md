@@ -31,6 +31,12 @@ deployed runtime under the owner's own activation. STOP (in the receipt dir)
 seals entry unconditionally; exits and reconciliation always run. Entry
 exists only via an immutable, priced, unexpired proposal, revalidated
 against fresh books before the one pre-entry mutation (leverage) runs last.
+RESTRICTED LIVE-TEST JOBS (owner standard 2026-08-14): the owner arms the
+deterministic job runner ONCE; thereafter the Lead queues strictly-validated
+job RECORDS (op whitelist only, notional clamped ≤ 8 USDT, leverage forced
+1x, one job at a time, mandatory expiry, run-at-most-once claims, freeze-on-
+UNKNOWN) and reads the receipts. No per-test human press, no pasted
+commands, no arbitrary shell near money — job files in, receipts out.
 
 ## Lead operating loop (why this works — keep it exactly)
 - CODEX FIRST: `codex exec --skip-git-repo-check -s workspace-write -C <dir>`
@@ -48,6 +54,13 @@ against fresh books before the one pre-entry mutation (leverage) runs last.
   the canonical checkout at Desktop/quant synced (pull --ff-only).
 - Fresh-eyes adversarial review at integration points (builders never review
   their own work); confirmed findings get repaired before merge.
+- MONEY FIRST, LIVE FIRST (owner law, the FIRST rule): every change exists
+  because the money needs it. Every new money capability gets its tiny live
+  attempt through the job runner IN THE SAME TASK — never postponed to the
+  end, never parked behind a human paste. Offline tests stay only for what
+  must never happen live (crashes, duplicate submissions, corrupted state)
+  and are NEVER completion evidence. Simulated-test pileup with the live
+  test pushed to the end is the named disaster that killed the old project.
 - HONEST STATES: never self-declare a completion verdict — the owner or the
   commander accepts. Claims carry MEASURED / INFERRED / UNVERIFIED. Victory
   tone banned. "I don't know" is an answer. Test totals are not progress;

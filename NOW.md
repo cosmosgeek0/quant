@@ -35,6 +35,6 @@
   queued next in sequence.
 - Money history: one CLOSED spot round trip (d1b204b); one honest
   OPEN_EXPOSURE freeze whose residual was later sold by the ordered
-  reconcile; zero futures fills ever; zero completed basis cycles; profit
+  reconcile; futures fills: two (the 2026-08-13T22:13Z proof); zero completed basis cycles; profit
   proven: none. Not guaranteed money — the machine refuses when the full
   equation is negative, which today it is.
