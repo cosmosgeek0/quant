@@ -1,8 +1,10 @@
 # NOW.md — current orders and measured truth (one page, rewritten in place)
 
 ## Orders (owner + commander 2026-08-14: MONEY FIRST, LIVE FIRST)
-- FEATURE FREEZE: no new scanners, test waves, panels, UI expansion, or
-  documentation until three live receipts exist.
+- FREEZE LIFTED 2026-08-13T23:21Z: all three live receipts exist (futures
+  short, four-leg basis, momentum long on a machine-picked 119x ignition).
+  Parallel build resumes; every new money capability gets its tiny live
+  attempt through the runner IN THE SAME TASK.
 - THE RAIL: deterministic job runner on the host — owner arms ONCE
   (scripts/arm_jobs_on_host.sh), then the Lead queues restricted job records
   and reads receipts; no per-test press, no pasted commands.
@@ -35,7 +37,7 @@
 - BASIS CYCLE PROVEN 2026-08-13T22:20Z: four real fills (spot 568.1 in/568
   out, short 568 open/reduce-only close), verdict CLOSED, hedged exposure
   none, 0.1 TST dust recorded — the complete mechanics chain is live.
-  Remaining receipt: momentum's first real entry + exit (money needs it).
+  MOMENTUM PROVEN 2026-08-13T23:21Z (receipt three).
 - Money history: one CLOSED spot round trip (d1b204b); one honest
   OPEN_EXPOSURE freeze whose residual was later sold by the ordered
   reconcile; futures fills: four (short proof + basis cycle, 2026-08-13);

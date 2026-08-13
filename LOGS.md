@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+THIRD LIVE RECEIPT — MOMENTUM 2026-08-13T23:21Z | EXECUTION_MECHANICS_ONLY | freeze lifts per the recorded order
+signal | the machine's own stream pass caught 1000000MOGUSDT at 119x median volume — the APR-class ignition, found live, not alphabetically
+job | 6a7e511b41eb MOMENTUM_ROUNDTRIP ceiling 8 | capped IOC long open + same-quantity reduce-only close, both terminal | receipt futures-hand-6a7e5160c69e71.json
+sequence | all three commander receipts now exist: futures short, four-leg basis, directional momentum | queue open, zero freezes, zero presses since arming
+verdict | CLOSED | profit proven: still none (mechanics by design) | next phase: parallel build with a tiny live attempt inside every money task
+
 FIRST COMPLETE BASIS CYCLE 2026-08-13T22:20Z | EXECUTION_MECHANICS_ONLY | four real fills, via the job runner, zero presses
 job | 6a7e42b37787 BASIS_ROUNDTRIP TSTUSDT ceiling 8 | run 6a7e43140dc9bf at c7739b51
 fills | ENTER_SPOT 568.1 | ENTER_SHORT 568 (fee-netted, step-floored hedge — the BNB-failure math proven live) | EXIT_SHORT 568 reduce-only FIRST | EXIT_SPOT 568

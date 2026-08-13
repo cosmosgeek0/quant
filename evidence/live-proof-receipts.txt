@@ -217,3 +217,8 @@ WAVE-4 LIVE PROOF RECEIPTS — sanitized raw exports from the execution host, 20
   "sell_base_fee": "0",
   "residual_base_from_
 $ $ 
+=== RECEIPT futures-hand-6a7e5160c69e71 (MOMENTUM_ROUNDTRIP)")
+print(json.dumps(r, indent=1, default=str)[:3000])
+PY
+
+echo 
