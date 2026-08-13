@@ -1,0 +1,3629 @@
+{
+ "math": {
+  "area": "math (server/src/engine/basis: math.ts, config.ts, features.ts; plus edge.ts, liquidity.ts, funding.ts, scanner.ts, types.ts, proposals.ts invalidation sweep, engine/v0/config.ts, app config.ts defaults, test engine-basis.mjs \u2014 all read from a shallow read-only clone of arbitrage-cosmos@current-main, commit 475bd57)",
+  "verdict": "PORTABLE \u2014 the money math is a pure, stateless, unit-explicit kernel (math.ts declares no state/clock/IO and delivers) with fail-closed nulls everywhere; every formula and default was MEASURED from source plus a zero-network synthetic proof test that pins concrete numbers. NORMAL-basis port needs ~23 rules and must reproduce the 33 fixtures below; the biggest port hazards are the three unit conventions (percent vs bps vs fraction-per-period) and the guard ORDER, which determines reject-code parity.",
+  "rules": [
+   {
+    "name": "executable_return_law",
+    "behavior": "Canonical versioned law (schema ExecutableBasisReturnContractV1, version basis-executable-long-leg-notional-v1, law RETURN_ON_LONG_LEG_ENTRY_NOTIONAL): return_pct = (sell_proceeds_price - long_entry_price) / long_entry_price * 100. Null unless BOTH prices > 0. Denominator is always the price of the leg BOUGHT at entry. One law owns both constructions.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Single denominator law prevents the classic which-side-do-I-divide-by bug; the old repo's own Python parity module is version-locked to it."
+   },
+   {
+    "name": "entry_gap_normal",
+    "behavior": "Entry gap for NORMAL (buy spot, short perp): gap_in_pct = (perp_bid - spot_ask) / spot_ask * 100. Computed ONLY from real touch bid/ask \u2014 never mids, never mark price. Units: percent (0.78 means 0.78%).",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Exactly the brief's Spot-ask-vs-Futures-bid entry; measured verbatim."
+   },
+   {
+    "name": "exit_gap_pair",
+    "behavior": "Unwind price pair for NORMAL (sell spot at bid, buy back perp at ask): gap_out_pct = (spot_bid - perp_ask) / perp_ask * 100 under the same law. NOTE: in the old code this exact formula is the REVERSE-construction entry gap; the old runtime never priced an explicit exit P&L \u2014 its exit trigger for an open NORMAL signal was the recomputed ENTRY gap falling below watchGapPct (reason gap_closed).",
+    "defaults": {},
+    "verdict": "ADAPT",
+    "reason": "Formula measured and correct for the exit pair; the new kernel should expose it as exit math while keeping the old entry-gap-below-watch exit trigger for behavioral parity."
+   },
+   {
+    "name": "spread_bps",
+    "behavior": "spread_bps = (ask - bid) / mid * 10000 with mid = (bid + ask)/2. Null when bid <= 0, ask <= 0, or ask < bid (crossed book); ask == bid gives 0. Gate: either leg's spread > maxSpreadBps rejects spread_too_wide.",
+    "defaults": {
+     "maxSpreadBps": 25
+    },
+    "verdict": "KEEP",
+    "reason": "Standard mid-referenced spread; 25 bps per leg is a sane taker-arb bound."
+   },
+   {
+    "name": "mark_divergence_bps",
+    "behavior": "divergence_bps = abs(perp_mid - mark_price) / mark_price * 10000. Null unless both > 0. Large values are treated as a bad-tick smell and degrade the data-quality composite.",
+    "defaults": {
+     "maxMarkDivergenceBps": 50
+    },
+    "verdict": "KEEP",
+    "reason": "Cheap independent cross-check of the perp book against the exchange mark."
+   },
+   {
+    "name": "four_leg_fees",
+    "behavior": "fees_pct = 2 * spot_taker_fee_pct + 2 * perp_taker_fee_pct (open both legs + close both legs, all taker; inputs are percent PER LEG). Defaults 0.1 and 0.05 give the 0.30% round trip that matches the frozen v0 aggregate feesPct = 0.3.",
+    "defaults": {
+     "spotTakerFeePct": 0.1,
+     "perpTakerFeePct": 0.05,
+     "impliedRoundTripPct": 0.3
+    },
+    "verdict": "KEEP",
+    "reason": "Correct 4-leg model; defaults are Binance no-discount taker rates \u2014 re-verify against the live venue fee tier at deploy time."
+   },
+   {
+    "name": "ladder_slippage_walk",
+    "behavior": "Walk depth rows [price, base_qty] best-first consuming notional_usd: per row take_usd = min(remaining, price*qty), accumulate cost_usd and filled_base = take/price; avg_px = cost_usd/filled_base; slippage_pct = abs(avg_px - touch) / touch * 100. Null when ladder empty, notional <= 0, touch <= 0, or the ladder cannot cover the size.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Exact average-fill-vs-touch definition; the null on underfill is load-bearing (triggers the penalty rule)."
+   },
+   {
+    "name": "thin_ladder_penalty",
+    "behavior": "Ladder exists but cannot fill the intended size: per-leg slippage = slippagePctEstimate * 4 (default 0.20%).",
+    "defaults": {
+     "slippagePctEstimate": 0.05,
+     "penaltyMultiple": 4
+    },
+    "verdict": "KEEP",
+    "reason": "Deliberate fail-expensive placeholder; in practice the depth gate usually rejects first, this just keeps net edge pessimistic."
+   },
+   {
+    "name": "top_of_book_slippage",
+    "behavior": "No ladder: per-leg slippage = base * max(1, consumption / 0.25) with consumption = notional_usd / (touch_px * touch_qty) and base = slippagePctEstimate / 2 (0.025%). Consuming <= 25% of visible touch costs the base estimate; scales linearly beyond. Invalid touch inputs (px/qty/notional <= 0) return base * 4. Self-described as crude by design: monotonic, explainable penalty, not a microstructure thesis.",
+    "defaults": {
+     "baseSlippagePct": 0.025,
+     "kneeConsumption": 0.25
+    },
+    "verdict": "KEEP",
+    "reason": "Honest fallback with documented intent; keep for parity, revisit only with real fill data."
+   },
+   {
+    "name": "total_slippage_legs",
+    "behavior": "slippage_pct = spot_leg + perp_leg, each leg priced on the side the direction must HIT. NORMAL entry hits spot ASKS and perp BIDS. Each leg independently picks ladder walk vs top-of-book fallback.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Round-trip cost needs both legs; side selection is direction-critical and measured."
+   },
+   {
+    "name": "depth_score",
+    "behavior": "Per leg: visible_usd = sum(price*qty) over the hit-side ladder (fallback: touch px*qty; null if neither); coverage = visible_usd / notional_usd; score = clamp(log10(1 + coverage) / log10(11), 0, 1). So 10x coverage = 1.0 exactly, 1x coverage = 0.2890648 (note: BELOW the 0.3 gate \u2014 default gate needs ~1.05x visible coverage). Pair score = min(spot_leg, perp_leg); null if either leg null. Gate: score < minDepthScore rejects depth_too_thin.",
+    "defaults": {
+     "minDepthScore": 0.3
+    },
+    "verdict": "KEEP",
+    "reason": "Smooth log coverage curve with an exact 10x=1.0 anchor; two-leg min is the right conservatism."
+   },
+   {
+    "name": "funding_carry_discrete_settlements",
+    "behavior": "Carry accrues ONLY at discrete funding timestamps crossed by the hold. If ms_to_next_funding > hold_ms: carry = 0. Else crossings = 1 + floor((hold_ms - ms_to_next) / period_ms). If crossings exceed the count of KNOWN settlement rates: carry = null (a crossed settlement with no known rate stays unknown \u2014 never prorated from the current rate). Null guards: hold_ms finite >= 0, period_ms > 0, ms_to_next > 0, crossings a safe integer, every rate finite with abs(rate) <= 0.1. carry_pct = sum over crossed settlements of rate * 100 * sign; sign = +1 for long_spot_short_perp (the short perp leg RECEIVES positive funding), -1 for the other direction.",
+    "defaults": {
+     "fundingPeriodMs": 28800000,
+     "rateSanityAbsMax": 0.1
+    },
+    "verdict": "KEEP",
+    "reason": "The discrete-settlement model (vs naive time-prorating) is the most defensible funding decision in the file; null-on-unknown is fail-closed money math."
+   },
+   {
+    "name": "unit_conventions",
+    "behavior": "Three unit regimes coexist: (1) gaps, fees, slippage, carry, drag, borrow cost, net edge = PERCENT (x100); (2) spreads and mark divergence = BPS (x10000); (3) funding rate = FRACTION per settlement period (0.0001 = 1bp = 0.01%), converted to percent by x100 inside carry. Borrow hourlyRatePct = percent per hour. The 0.1 sanity cap on funding is 10% per period expressed as a fraction.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Mixing x100 and x10000 is the single most likely differential-harness failure; the new kernel must document and test these explicitly."
+   },
+   {
+    "name": "flip_risk_discount",
+    "behavior": "flip_risk = clamp(0.6 * sign_flip_share + 0.4 * clamp(1 - abs(rate)/0.0005, 0, 1), 0, 1), computed from >= 3 finite history rates (null otherwise); sign_flip_share = consecutive nonzero sign changes / (n-1). POSITIVE raw carry is discounted: carry = raw * (1 - flip_risk); NEGATIVE carry is never discounted (pessimistic about drag). Unknown flip risk leaves positive carry undiscounted.",
+    "defaults": {
+     "flipWeight": 0.6,
+     "magnitudeWeight": 0.4,
+     "magnitudeAnchorFractionPerPeriod": 0.0005
+    },
+    "verdict": "ADAPT",
+    "reason": "The asymmetric discount (haircut the bonus, never the drag) is sound and worth keeping; the 0.6/0.4 weights and 5bp anchor are hand-tuned \u2014 reproduce for parity, then re-fit."
+   },
+   {
+    "name": "expected_hold",
+    "behavior": "If gap_pct > 0 and slope_pct_per_min < -1e-6 (closing): hold_ms = clamp((gap_pct / abs(slope)) * 60000, minHoldMs, maxHoldMs). Widening or flat gaps: clamp(defaultHoldMs, min, max). This hold feeds the funding-carry settlement count.",
+    "defaults": {
+     "defaultHoldMs": 14400000,
+     "minHoldMs": 600000,
+     "maxHoldMs": 86400000
+    },
+    "verdict": "KEEP",
+    "reason": "Simple convergence-time estimate with sane clamps (4h default, 10min floor, 24h cap)."
+   },
+   {
+    "name": "funding_freshness_fail_closed",
+    "behavior": "Carry is computed only from a fresh mark observation: finite rate with abs <= 0.1, mark_price > 0, ts a positive safe integer, staleness within [-maxFutureSkewMs, fundingStaleMs], and next_funding_ts strictly > now (a past schedule cannot manufacture a settlement). Anything else: carry = null, funding not fresh, scanner rejects data_stale. Net edge is NEVER computed by assuming zero funding.",
+    "defaults": {
+     "fundingStaleMs": 10000,
+     "maxFutureSkewMs": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "Fail-closed on funding is a money-safety invariant the tests pin repeatedly (NaN rate, missing mark, stale mark, past nextFundingTs all end in data_stale)."
+   },
+   {
+    "name": "cost_assembly",
+    "behavior": "funding_drag_pct = max(0, -carry_pct) (drag only; >= 0). total_costs_pct = fees_pct + slippage_pct + funding_drag_pct + borrow_cost_pct (borrow = 0 for NORMAL). Positive carry is NOT inside costs \u2014 it enters only as the net-edge bonus.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Itemised breakdown makes every proposal auditable; drag/bonus separation avoids double counting."
+   },
+   {
+    "name": "net_edge",
+    "behavior": "net_pct = gross_pct - total_costs_pct + max(0, carry_pct). net is NULL when gross is null OR carry is unknown (null) \u2014 even though the cost breakdown is still assembled treating unknown carry as 0 for display. The carry used is the flip-risk-discounted value.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "The full expected-net formula; null-propagation on unknown carry is the fail-closed behavior the differential harness must match."
+   },
+   {
+    "name": "entry_thresholds",
+    "behavior": "gap < watchGapPct: ignore (not a reject). While persistence accrues: kind = focus if gap >= focusGapPct else watch. edge_below_fees when gross <= fees_pct + slippage_pct (ONLY those two terms \u2014 drag and borrow are gated separately). funding_against_trade when funding_drag_pct > maxFundingDragPct. gap_not_persistent when stability_cv > maxGapCv AND persist_ticks < persistTicks. edge_below_threshold when net < minNetBasisPct. Proposal only after persistTicks consecutive qualifying ticks (2s tick cadence).",
+    "defaults": {
+     "watchGapPct": 0.15,
+     "focusGapPct": 0.3,
+     "minNetBasisPct": 0.25,
+     "persistTicks": 5,
+     "maxGapCv": 0.6,
+     "tickMs": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "watchGapPct 0.15 / focusGapPct 0.3 / minNet 0.25 / persist 5 are the owner's documented posture (v0 header cites fees 0.30%, min net 0.25%); tests routinely override persistTicks to 3 \u2014 keep it a parameter."
+   },
+   {
+    "name": "gap_stability_stats",
+    "behavior": "Over the tracking window: sample mean; sample stdDev with n-1 denominator (null under 2 samples); cv = stdDev / max(abs(mean), 1e-9). Slope: least-squares fit of value vs time with x = (ts - t0)/60000 (minutes), slope = (n*Sxy - Sx*Sy)/(n*Sxx - Sx^2), null with < 2 samples or denominator < 1e-12. Units: pct per minute, positive = widening.",
+    "defaults": {
+     "gapWindowSize": 60
+    },
+    "verdict": "KEEP",
+    "reason": "Textbook stats with explicit degeneracy guards; window of 60 samples at 2s ticks = 2 minutes of gap history."
+   },
+   {
+    "name": "dq_composite",
+    "behavior": "score = min(spot_fresh, perp_fresh, mark_fresh) * (0.5 + 0.5*skew_comp) * (0.6 + 0.4*div_comp) * ladder_comp, clamped 0..1. Freshness components = clamp(1 - staleness/limit, 0, 1) (books use staleMs, mark uses fundingStaleMs; never-seen = 0). skew_comp = clamp(1 - leg_skew/maxLegSkewMs, 0, 1), 0.5 when unknown. div_comp = clamp(1 - divergence_bps/maxMarkDivergenceBps, 0, 1), 0.75 when unknown. ladder_comp = 1.0 when ladder-backed else 0.7. Gate: score < minDataQuality rejects data_stale. Separate hard gates fire first: either book staler than staleMs, or leg_skew > maxLegSkewMs (a gap across skewed books is fiction).",
+    "defaults": {
+     "minDataQuality": 0.4,
+     "staleMs": 5000,
+     "maxLegSkewMs": 2500
+    },
+    "verdict": "ADAPT",
+    "reason": "The freshness-backbone-times-modifiers shape is sensible but the 0.5/0.6/0.75/0.7 constants are hand-tuned; reproduce exactly for differential parity, then consider simplifying."
+   },
+   {
+    "name": "config_validation_invariants",
+    "behavior": "Reject config unless: watchGapPct <= focusGapPct; minHoldMs <= defaultHoldMs <= maxHoldMs; maxHoldMs/fundingPeriodMs <= 1000; rolling windows (gapWindowSize, fundingHistoryKeep) >= 3; minNetBasisPct, watchGapPct, maxFundingDragPct strictly > 0; every numeric finite and range-checked; config content identity rejects negative zero. Changing any effective money threshold produces a new config version, expires open proposals (reason config_changed) and clears signal-derived priorities.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Cheap invariants that each block a real footgun; invalidate-derived-state-on-config-change is a correctness behavior, not hygiene."
+   },
+   {
+    "name": "money_control_flags",
+    "behavior": "App-level flags that changed money behavior (there is no basis-local feature-flag registry \u2014 assigned features.ts is the per-tick snapshot builder): killSwitch defaults ON (halted), liveTradingEnabled false, fundsLocked true, automationPaused true, borrowing/funds control modes blocked. Under kill switch the scanner keeps evaluating but converts a would-be proposal into reject kill_switch_on, and the intent bridge blocks with a ledgered risk_rejected. Pausing basis intake blocks intents AND expires the already-open proposal. Runtime feesPct/minNetBasisPct edits are clamped (0..10 and 0..100) and flow through config revision.",
+    "defaults": {
+     "killSwitchDefault": true,
+     "liveTradingDefault": false
+    },
+    "verdict": "ADAPT",
+    "reason": "Control plane rather than math, but two behaviors must survive the port: fail-closed defaults (starts halted) and see-but-cannot-arm under kill switch."
+   }
+  ],
+  "fixtures": [
+   {
+    "name": "return_law_reverse_denominator",
+    "inputs": {
+     "sellProceedsPrice": 100,
+     "longEntryPrice": 100.62
+    },
+    "expected": {
+     "returnPct": -0.6161796859471322,
+     "mustNotEqual_wrongDenominator": -0.62
+    }
+   },
+   {
+    "name": "return_law_equal_prices",
+    "inputs": {
+     "sellProceedsPrice": 100,
+     "longEntryPrice": 100
+    },
+    "expected": {
+     "returnPct": 0
+    }
+   },
+   {
+    "name": "return_law_profitable",
+    "inputs": {
+     "sellProceedsPrice": 101,
+     "longEntryPrice": 100
+    },
+    "expected": {
+     "returnPct": 1
+    }
+   },
+   {
+    "name": "return_law_nonpositive_price_null",
+    "inputs": {
+     "sellProceedsPrice": 0,
+     "longEntryPrice": 100
+    },
+    "expected": {
+     "returnPct": null
+    }
+   },
+   {
+    "name": "entry_gap_default_book",
+    "inputs": {
+     "spotAsk": 100.02,
+     "perpBid": 100.8
+    },
+    "expected": {
+     "gapInPct": 0.7798440311937624
+    }
+   },
+   {
+    "name": "exit_gap_pair_default_book",
+    "inputs": {
+     "spotBid": 100,
+     "perpAsk": 100.82
+    },
+    "expected": {
+     "gapOutPct": -0.8133306883554783
+    }
+   },
+   {
+    "name": "spread_bps_spot_default",
+    "inputs": {
+     "bid": 100,
+     "ask": 100.02
+    },
+    "expected": {
+     "spreadBps": 1.9998000199976025
+    }
+   },
+   {
+    "name": "spread_bps_perp_default",
+    "inputs": {
+     "bid": 100.8,
+     "ask": 100.82
+    },
+    "expected": {
+     "spreadBps": 1.9839301656577741
+    }
+   },
+   {
+    "name": "spread_bps_crossed_null",
+    "inputs": {
+     "bid": 101,
+     "ask": 100
+    },
+    "expected": {
+     "spreadBps": null
+    }
+   },
+   {
+    "name": "four_leg_fees_default",
+    "inputs": {
+     "spotTakerFeePct": 0.1,
+     "perpTakerFeePct": 0.05
+    },
+    "expected": {
+     "feesPct": 0.3
+    }
+   },
+   {
+    "name": "ladder_slippage_touch_covers_size",
+    "inputs": {
+     "levels": [
+      [
+       100.02,
+       500
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "slippagePct": 0
+    }
+   },
+   {
+    "name": "ladder_slippage_two_level_walk",
+    "inputs": {
+     "levels": [
+      [
+       100,
+       0.05
+      ],
+      [
+       100.5,
+       1
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "slippagePct": 0.24937655860347263
+    }
+   },
+   {
+    "name": "ladder_slippage_cannot_fill",
+    "inputs": {
+     "levels": [
+      [
+       100.02,
+       0.02
+      ]
+     ],
+     "notionalUsd": 10,
+     "slippagePctEstimate": 0.05
+    },
+    "expected": {
+     "walkResult": null,
+     "perLegPenaltySlippagePct": 0.2
+    }
+   },
+   {
+    "name": "top_of_book_slippage_2x_consumption",
+    "inputs": {
+     "touchPx": 100,
+     "touchQty": 0.05,
+     "notionalUsd": 10,
+     "baseSlippagePct": 0.025
+    },
+    "expected": {
+     "slippagePct": 0.2
+    }
+   },
+   {
+    "name": "top_of_book_slippage_invalid_inputs",
+    "inputs": {
+     "touchPx": 0,
+     "touchQty": 0,
+     "notionalUsd": 10,
+     "baseSlippagePct": 0.025
+    },
+    "expected": {
+     "slippagePct": 0.1
+    }
+   },
+   {
+    "name": "depth_score_10x_coverage_saturates",
+    "inputs": {
+     "levels": [
+      [
+       100,
+       1
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 1
+    }
+   },
+   {
+    "name": "depth_score_1x_coverage",
+    "inputs": {
+     "levels": [
+      [
+       100,
+       0.1
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 0.2890648263178878,
+     "note": "below the 0.3 default gate"
+    }
+   },
+   {
+    "name": "depth_score_thin_spot_leg",
+    "inputs": {
+     "levels": [
+      [
+       100.02,
+       0.02
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 0.07604789568600906,
+     "gateOutcome": "depth_too_thin at minDepthScore 0.3"
+    }
+   },
+   {
+    "name": "mark_divergence_default_book_vs_95",
+    "inputs": {
+     "perpMid": 100.81,
+     "markPrice": 95
+    },
+    "expected": {
+     "divergenceBps": 611.5789473684213,
+     "gateOutcome": "exceeds maxMarkDivergenceBps 50"
+    }
+   },
+   {
+    "name": "funding_carry_no_settlement_crossed",
+    "inputs": {
+     "knownRates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 14400001
+    },
+    "expected": {
+     "carryPct": 0
+    }
+   },
+   {
+    "name": "funding_carry_one_settlement",
+    "inputs": {
+     "knownRates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": 0.1
+    }
+   },
+   {
+    "name": "funding_carry_unknown_second_settlement_null",
+    "inputs": {
+     "knownRates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 61200000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": null,
+     "crossings": 3,
+     "knownRatesCount": 1
+    }
+   },
+   {
+    "name": "funding_carry_two_known_settlements_sum",
+    "inputs": {
+     "knownRates": [
+      0.001,
+      0.0002
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 43200000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": 0.12000000000000001
+    }
+   },
+   {
+    "name": "funding_carry_insane_rate_null",
+    "inputs": {
+     "knownRates": [
+      0.2
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": null,
+     "reason": "abs(rate) > 0.1 sanity cap"
+    }
+   },
+   {
+    "name": "funding_carry_negative_drag_boundary_equal_msToNext",
+    "inputs": {
+     "knownRates": [
+      -0.01
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 14400000
+    },
+    "expected": {
+     "carryPct": -1,
+     "note": "msToNext == hold still crosses; drag 1.0 > maxFundingDragPct 0.15 rejects funding_against_trade"
+    }
+   },
+   {
+    "name": "flip_risk_alternating_history",
+    "inputs": {
+     "historyRates": [
+      0.001,
+      -0.001,
+      0.001
+     ],
+     "currentRate": 0.001
+    },
+    "expected": {
+     "flipRisk": 0.6
+    }
+   },
+   {
+    "name": "expected_hold_closing_clamped_to_min",
+    "inputs": {
+     "gapPct": 0.8,
+     "slopePctPerMin": -0.2,
+     "minHoldMs": 600000,
+     "defaultHoldMs": 14400000,
+     "maxHoldMs": 86400000
+    },
+    "expected": {
+     "holdMs": 600000,
+     "rawConvergenceMs": 240000
+    }
+   },
+   {
+    "name": "expected_hold_flat_uses_default",
+    "inputs": {
+     "gapPct": 0.8,
+     "slopePctPerMin": 0,
+     "minHoldMs": 600000,
+     "defaultHoldMs": 14400000,
+     "maxHoldMs": 86400000
+    },
+    "expected": {
+     "holdMs": 14400000
+    }
+   },
+   {
+    "name": "slope_per_minute_two_points",
+    "inputs": {
+     "samples": [
+      {
+       "ts": 0,
+       "v": 0.4
+      },
+      {
+       "ts": 60000,
+       "v": 0.5
+      }
+     ]
+    },
+    "expected": {
+     "slopePctPerMin": 0.1
+    }
+   },
+   {
+    "name": "stability_cv_flickering_gap",
+    "inputs": {
+     "windowValues": [
+      1.4,
+      0.35,
+      1.4,
+      0.35
+     ]
+    },
+    "expected": {
+     "mean": 0.875,
+     "stdDevSample": 0.606217782649107,
+     "cv": 0.6928203230275508,
+     "gateOutcome": "cv > maxGapCv 0.6 while persistence short rejects gap_not_persistent"
+    }
+   },
+   {
+    "name": "net_edge_full_pipeline_default_proposal",
+    "inputs": {
+     "spotAsk": 100.02,
+     "perpBid": 100.8,
+     "spotTakerFeePct": 0.1,
+     "perpTakerFeePct": 0.05,
+     "slippagePct": 0,
+     "fundingRateFractionPerPeriod": 0.0001,
+     "settlementsCrossed": 1,
+     "flipRisk": null,
+     "borrowCostPct": 0
+    },
+    "expected": {
+     "grossPct": 0.7798440311937624,
+     "carryPct": 0.01,
+     "totalCostsPct": 0.3,
+     "netPct": 0.48984403119376246,
+     "oldTestAssertion": "net in (0.45, 0.52), feesPct == 0.3 exactly"
+    }
+   },
+   {
+    "name": "net_edge_unknown_carry_stays_null",
+    "inputs": {
+     "grossPct": 1,
+     "carryPct": null,
+     "feesPct": 0.3,
+     "slippagePct": 0.01,
+     "borrowCostPct": 0
+    },
+    "expected": {
+     "netPct": null,
+     "totalCostsPct": 0.31,
+     "note": "costs assembled with carry treated as 0, net still null"
+    }
+   },
+   {
+    "name": "entry_and_exit_thresholds_by_construction",
+    "inputs": {
+     "spotAsk": 100.02,
+     "grossGapExamplesPct": [
+      0.25,
+      0.45,
+      0.6,
+      0.12
+     ],
+     "generator": "perpBid = spotAsk * (1 + g/100) makes entry gap exactly g"
+    },
+    "expected": {
+     "g_0.25": "reject edge_below_fees (gross <= fees 0.3 + slippage 0)",
+     "g_0.45": "net 0.16 < 0.25 rejects edge_below_threshold",
+     "g_0.60": "open proposal survives refresh (proposal_updated)",
+     "g_0.12": "below watchGapPct 0.15 kills proposal with gap_closed"
+    }
+   }
+  ],
+  "not_ported": [
+   "Reverse basis as a tradeable direction (short_spot_long_perp) \u2014 excluded by port scope; only its price-pair formula survives, repurposed as the NORMAL exit pair",
+   "Borrow module: borrow_cost_pct = hourlyRatePct * holdMs/3600000, preflight (headroom = size x borrowSafetyFactor 1.5, rate cap maxBorrowHourlyRatePct 0.01, borrowStaleMs 60000, borrow_unknown/unavailable/too_small/cost_too_high rejects) \u2014 reverse-basis only",
+   "Proposal object model, acceptance/claim flow, stagedSizeFractions [0.25, 0.5, 1] (explicitly metadata-only, never places orders) \u2014 only the invalidation thresholds are ported as exit rules",
+   "Priority scoring lane: multiplicative components, priorityMomentumWeight 0.25, captureFactor = clamp(1 - msToFunding/period, 0, 1) as priority bump, fundingExtremeAbs 0.0005 focus flag \u2014 ranking, not money",
+   "Gap causality attribution (initiating market, quadrants, causalMoveThresholdPct 0.005, causalExpiryMs 15000) and the two causal test files \u2014 observability only",
+   "Reject-vocabulary historical remapping (borrow_required -> borrow_unknown etc.) \u2014 replay/reporting concern",
+   "v0 volume-scanner defaults inherited into BasisConfig (vol1sMultiple 8, vol5sMultiple 4, followthrough, one-print) \u2014 unused by basis money math; snapshot volume windows are left empty by basis",
+   "App-level risk limits (maxOrderNotionalUsd 12, daily caps, allowedSymbols) and borrowGuard block \u2014 risk-engine area, separate from edge math",
+   "deriveBasisConfigVersion hashing mechanics \u2014 implementation-specific identity; keep only its two behaviors (negative-zero rejection, invalidate-on-change)",
+   "BasisRuntime timers/generations/ledger error isolation and all exchange adapters \u2014 adapters excluded by scope",
+   "Bounded-state caps (maxUniverseSize 2500, maxDepthLevels 5000, fundingHistoryKeep 32, proposalHistoryKeep 2000) \u2014 engine hygiene, sizes are implementation-specific (ADAPT if reused)",
+   "rawMidBasisPct (perp mid vs spot mid) \u2014 evidence-only diagnostic in decisions, never used in any gate",
+   "quant/src/quant_edge/labels/basis.py exact-ratio module \u2014 existing Python consumer of the same return contract; useful as a cross-check, not a porting source under the per-item-permit rule"
+  ],
+  "notes": [
+   "PROVENANCE: fixtures return_law_* , funding_carry_no/one/unknown, net_edge_unknown_carry, four_leg_fees, and the threshold outcomes in entry_and_exit_thresholds are asserted verbatim by server/test/engine-basis.mjs (MEASURED); the remaining exact expected values are derived by me from the measured formulas and verified numerically (INFERRED-derived) \u2014 old tests only pin them as ranges (net in 0.45..0.52) or inequalities (cv > 0.6, divergence > 50).",
+   "BASIS: MEASURED for everything above \u2014 I read math.ts, config.ts, features.ts (assigned), plus edge.ts, liquidity.ts, funding.ts, scanner.ts, types.ts, proposals.ts invalidation sweep, engine/v0/config.ts, app config.ts, engine-basis.mjs, and the header of quant_edge/labels/basis.py, all in the scratchpad clone (branch current-main, commit 475bd57).",
+   "NOT CHECKED: gapTracker.ts internals (how persistTicks/gapAgeMs/window actually update per tick), engine.ts orchestration, lifecycle.ts, priority.ts formula internals, marketState.ts ingestion/chronology rules, borrow.ts internals, rolling24hEdgeStatistic.ts, publicOpportunityObservation.ts, and I did not build or execute the old test suite (UNVERIFIED that it passes at this commit).",
+   "Assigned features.ts is the per-tick BasisFeatureSnapshot builder, not a flag registry; no basis-local feature-flag mechanism exists in the repo \u2014 money-behavior toggles are the app-config control flags captured in rule money_control_flags.",
+   "Key behavioral facts from features.ts worth porting: gaps computed only from real touch bid/ask; the gap tracker is fed exactly once per engine tick (observe=true) and read-only elsewhere; liquidity is assessed at cfg.suggestedNotionalUsd (default 10 USD \u2014 deployment sizing, ADAPT); snapshot baselineReady requires >= 3 gap samples.",
+   "Old tests synthesize books as perpBid = spotAsk * (1 + g/100) so the entry gap equals g exactly up to float64 \u2014 a convenient generator for the differential harness (expect ~1e-13 relative FP noise, e.g. 0.600000000000004).",
+   "Float comparison guidance: old tests use eps 1e-6 (default), 1e-12 for the return law, exact equality for fees; the expected values here are float64 results of the stated formulas.",
+   "Guard ORDER is part of the spec: edge_below_fees compares gross against fees+slippage only (drag and borrow are gated separately and later), and the first failing guard names the reject \u2014 reproducing order is required for reject-code parity, not just numeric parity.",
+   "fundingPeriodMs default 28800000 (8h) carries an old-code caveat: some symbols settle every 4h/1h and the old code planned to make it data-driven; the new kernel should take the period per symbol as input rather than hardcoding 8h.",
+   "Numbers in this spec were cross-verified by running the formulas in Python during mining (no live calls, no writes outside the scratchpad clone)."
+  ],
+  "state_machine": {
+   "scope": "Entry decision ladder (scanner, evaluated per direction per 2s tick) and exit sweep (proposal invalidation). The math area itself is stateless; these are the guard-ordered flows that consume it. Symbol lifecycle (IDLE/WATCH/FOCUS/COOLDOWN) belongs to the lifecycle area and is not mined here.",
+   "entry_ladder_ordered_guards": [
+    {
+     "step": 1,
+     "guard": "spot book present",
+     "fail": "reject spot_missing"
+    },
+    {
+     "step": 2,
+     "guard": "perp book present",
+     "fail": "reject perp_missing"
+    },
+    {
+     "step": 3,
+     "guard": "both book stalenesses known and <= staleMs (5000)",
+     "fail": "reject data_stale"
+    },
+    {
+     "step": 4,
+     "guard": "leg skew <= maxLegSkewMs (2500)",
+     "fail": "reject data_stale (gap across skewed books is fiction)"
+    },
+    {
+     "step": 5,
+     "guard": "dq composite score >= minDataQuality (0.4)",
+     "fail": "reject data_stale"
+    },
+    {
+     "step": 6,
+     "guard": "funding fresh AND rate known AND carry known",
+     "fail": "reject data_stale"
+    },
+    {
+     "step": 7,
+     "guard": "entry gap computable",
+     "fail": "reject book_missing"
+    },
+    {
+     "step": 8,
+     "guard": "gap >= watchGapPct (0.15)",
+     "fail": "IGNORE (not a reject)"
+    },
+    {
+     "step": 9,
+     "guard": "both leg spreads <= maxSpreadBps (25)",
+     "fail": "reject spread_too_wide"
+    },
+    {
+     "step": 10,
+     "guard": "depthScore >= minDepthScore (0.3) at intended size",
+     "fail": "reject depth_too_thin"
+    },
+    {
+     "step": 11,
+     "guard": "gross > feesPct + slippagePct (only these two)",
+     "fail": "reject edge_below_fees"
+    },
+    {
+     "step": 12,
+     "guard": "fundingDragPct <= maxFundingDragPct (0.15)",
+     "fail": "reject funding_against_trade"
+    },
+    {
+     "step": 13,
+     "guard": "(reverse only) borrow cleared \u2014 out of port scope",
+     "fail": "reject borrow_*"
+    },
+    {
+     "step": 14,
+     "guard": "NOT (stabilityCv > maxGapCv (0.6) AND persistTicks < persistTicks)",
+     "fail": "reject gap_not_persistent"
+    },
+    {
+     "step": 15,
+     "guard": "netEdgePct >= minNetBasisPct (0.25)",
+     "fail": "reject edge_below_threshold"
+    },
+    {
+     "step": 16,
+     "guard": "persistTicks >= persistTicks (5)",
+     "fail": "WATCH if gap < focusGapPct (0.3) else FOCUS (keeps accruing)"
+    },
+    {
+     "step": 17,
+     "guard": "kill switch off",
+     "fail": "reject kill_switch_on (engine keeps seeing, cannot arm)",
+     "pass": "PROPOSAL"
+    }
+   ],
+   "direction_pick": "Both directions evaluated every tick; higher decision-kind rank wins (proposal > focus > watch > reject > ignore); equal rank picks the bigger gapPct, ties prefer direction A. Collapses to a no-op in a NORMAL-only port.",
+   "exit_sweep_ordered_checks": [
+    {
+     "step": 1,
+     "check": "now >= expiresTs (created + proposalTtlMs 600000; refresh preserves ORIGINAL expiry)",
+     "kill": "ttl_elapsed"
+    },
+    {
+     "step": 2,
+     "check": "no feature snapshot for symbol",
+     "kill": "market_data_missing"
+    },
+    {
+     "step": 3,
+     "check": "entry-direction gap null",
+     "kill": "book_missing"
+    },
+    {
+     "step": 4,
+     "check": "funding not fresh or carry unknown",
+     "kill": "funding_stale"
+    },
+    {
+     "step": 5,
+     "check": "(reverse only) borrow verdict failed",
+     "kill": "borrow_invalid"
+    },
+    {
+     "step": 6,
+     "check": "dq score < minDataQuality",
+     "kill": "data_quality_failed"
+    },
+    {
+     "step": 7,
+     "check": "recomputed ENTRY gap < gapClosesBelowPct (= watchGapPct 0.15 at creation)",
+     "kill": "gap_closed  <-- the old system's exit trigger"
+    },
+    {
+     "step": 8,
+     "check": "carry < -maxFundingDragPct (same tolerance as entry, not any negative carry)",
+     "kill": "funding_flipped_against"
+    },
+    {
+     "step": 9,
+     "check": "either book staleness > maxStaleMs (= staleMs)",
+     "kill": "data_stale"
+    },
+    {
+     "step": 10,
+     "check": "either leg spread > spreadAboveBps (= maxSpreadBps)",
+     "kill": "spread_widened"
+    },
+    {
+     "step": 11,
+     "check": "depthScore null or < depthBelowScore (= minDepthScore)",
+     "kill": "depth_vanished"
+    }
+   ],
+   "other_transitions": [
+    "Universe removal of a symbol expires its proposal immediately and prunes market/lifecycle/priority state",
+    "Any effective config revision expires open proposals (config_changed) and clears priorities",
+    "Pausing basis intake expires the open proposal and blocks the intent bridge",
+    "data_stale reject puts the symbol into COOLDOWN (cooldownMs 600000) during which it is skipped"
+   ]
+  }
+ },
+ "funding": {
+  "area": "funding-liquidity (server/src/engine/basis/funding.ts + liquidity.ts, plus their pure math in math.ts, defaults in config.ts + v0/config.ts, ingestion guards in marketState.ts, refusal wiring in scanner.ts \u2014 all read in full)",
+  "verdict": "PORT. Every focus behavior is a small pure deterministic function with no I/O; the whole area is reproducible in ~200 lines of Python. Basis: MEASURED \u2014 every fixture below was produced by executing the original TS logic (copies diff-verified logic-identical, only import specifiers rewritten) under node --experimental-strip-types, cross-checked against the old suite server/test/engine-basis.mjs. Clone: current-main @ 475bd57. Critical discipline for the port: fundingRate is a FRACTION per period (0.0001 = 1 bps); carry/slippage/fees outputs are PERCENT of notional; divergence and spreads are bps.",
+  "rules": [
+   {
+    "name": "expected_hold_from_gap_slope",
+    "behavior": "hold_ms = clamp((gapPct / -slopePctPerMin) minutes -> ms, minHoldMs, maxHoldMs) only when gapPct > 0 AND slopePctPerMin < -1e-6 (gap closing); widening, flat, near-zero slope, or null gap falls back to clamp(defaultHoldMs, min, max). Units: gapPct in pct, slope in pct/min.",
+    "defaults": {
+     "defaultHoldMs": 14400000,
+     "minHoldMs": 600000,
+     "maxHoldMs": 86400000,
+     "closingSlopeEpsilonPctPerMin": 1e-06
+    },
+    "verdict": "KEEP",
+    "reason": "Simple, explainable hold estimate; clamps defend against absurd extrapolation."
+   },
+   {
+    "name": "funding_carry_discrete_settlements",
+    "behavior": "carryPct = sum over crossed settlements of rate_i * 100 * sign, where sign = +1 for long_spot_short_perp (short perp RECEIVES positive funding) and -1 for short_spot_long_perp. Crossed settlements: 0 if msToNextFunding > holdMs (carry = 0, no proration); else count = 1 + floor((holdMs - msToNextFunding) / fundingPeriodMs). Returns null (unknown, fail closed) when: count exceeds the known-rates list; any used rate non-finite or |rate| > 0.1 fraction; msToNextFunding <= 0; holdMs < 0 or non-finite; periodMs <= 0. Input rates are per-period fractions; output is pct of notional.",
+    "defaults": {
+     "fundingPeriodMs": 28800000,
+     "maxAbsFundingRateFraction": 0.1
+    },
+    "verdict": "KEEP",
+    "reason": "The core law: funding is charged only at known discrete settlement timestamps, never time-prorated; an unknown future settlement rate poisons the estimate to null rather than being guessed."
+   },
+   {
+    "name": "only_current_rate_is_known",
+    "behavior": "The engine passes exactly [currentFundingRate] as the known-settlement list, and 'next funding' is a TIMESTAMP only \u2014 the next period's rate is never assumed. Consequence: any expected hold that crosses >= 2 settlements yields carry = null, which the scanner converts to a data_stale refusal. Long expected holds fail closed by design (old test 5b: 17h hold, 8h period -> null).",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Deliberate epistemic honesty; a differential port must not 'improve' this by prorating or extrapolating the current rate."
+   },
+   {
+    "name": "funding_freshness_gate",
+    "behavior": "Funding context is fresh only if ALL hold: mark exists; fundingRate finite and |rate| <= 0.1 fraction; markPrice finite > 0; mark.ts safe integer > 0; markStalenessMs known and within [-maxFutureSkewMs, fundingStaleMs]; nextFundingTs safe integer and STRICTLY > now. Not fresh -> context is all-null (fresh=false, rate/carry/flipRisk/msToFunding null, captureFactor 0, expectedHoldMs still computed, reported staleness floored at 0) and the scanner refuses with data_stale.",
+    "defaults": {
+     "fundingStaleMs": 10000,
+     "maxFutureSkewMs": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "Fail-closed: a past nextFundingTs or stale mark cannot manufacture a settlement."
+   },
+   {
+    "name": "funding_flip_risk",
+    "behavior": "Needs >= 3 finite history rates, else null. flipShare = signFlips / (n-1), counting a flip only when consecutive rates have different sign AND both are nonzero (zero-touching transitions are not flips). magRisk = clamp(1 - |rate|/0.0005, 0, 1) using the current rate if finite else the last history rate (0.0005 fraction = 5 bps/period = confident sign; ~0 = coin toss). flipRisk = clamp(0.6*flipShare + 0.4*magRisk, 0, 1).",
+    "defaults": {
+     "minHistoryPoints": 3,
+     "magnitudeNormFraction": 0.0005,
+     "flipShareWeight": 0.6,
+     "magnitudeWeight": 0.4
+    },
+    "verdict": "KEEP",
+    "reason": "Formula is load-bearing for the carry discount; the 0.6/0.4 weights are arbitrary-old-defaults but only modulate a bonus, so keep for parity and tune later."
+   },
+   {
+    "name": "flip_discount_asymmetry",
+    "behavior": "carry = rawCarry * (1 - flipRisk) only when rawCarry > 0 and flipRisk is known; NEGATIVE carry is never discounted. An unreliable bonus is not a bonus; drag is taken at face value.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Deliberate pessimism asymmetry \u2014 discounting drag would understate risk."
+   },
+   {
+    "name": "capture_factor",
+    "behavior": "captureFactor = clamp(1 - msToFunding/fundingPeriodMs, 0, 1) only when RAW (pre-discount) carry > 0 AND msToFunding <= holdMs; else 0. A paying settlement landing inside the hold earns a priority bump, more if imminent. Metadata for priority ranking only \u2014 not a gate.",
+    "defaults": {
+     "fundingPeriodMs": 28800000
+    },
+    "verdict": "KEEP",
+    "reason": "Cheap, explainable priority signal; uses raw carry so flip-discount does not zero the bump."
+   },
+   {
+    "name": "funding_ingestion_and_history",
+    "behavior": "A markFunding tick is stored only if: in-order (ts >= previous), fresh within fundingStaleMs, markPrice finite > 0, rate finite with |rate| <= 0.1, and nextFundingTs is null or inside [ts - maxFutureSkewMs, ts + 2*fundingPeriodMs]. An INVALID tick CLEARS the stored mark (fail closed, no last-good reuse). History: a point is appended only when the rate differs from the last stored point (history = rate-CHANGE events, not per-period samples), bounded to fundingHistoryKeep newest; seeding sorts by ts, drops duplicate ts, filters |rate| > 0.1 and future ts.",
+    "defaults": {
+     "fundingHistoryKeep": 32,
+     "nextFundingWindowPeriods": 2
+    },
+    "verdict": "KEEP",
+    "reason": "Fail-closed ingestion is what makes downstream nulls trustworthy; flipShare semantics depend on the change-event dedup."
+   },
+   {
+    "name": "funding_drag_refusal",
+    "behavior": "Cost assembly: fundingDragPct = max(0, -carryPct) enters costs; positive carry is added back to net edge separately. Scanner refusal: if fundingDragPct > maxFundingDragPct -> reject funding_against_trade (after fees check, before borrow/stability/net-edge). If carry is null (unknown/stale) -> reject data_stale ('funding unavailable or stale') earlier in the ladder, and net edge is forced null.",
+    "defaults": {
+     "maxFundingDragPct": 0.15
+    },
+    "verdict": "KEEP",
+    "reason": "0.15% of notional over the hold is a coherent bound relative to fees 0.3% + minNet 0.25%."
+   },
+   {
+    "name": "liquidity_sides",
+    "behavior": "Direction A (long_spot_short_perp) consumes spot ASKS + perp BIDS; direction B (short_spot_long_perp) consumes spot BIDS + perp ASKS. All depth walking, depth scoring, and touch-fallbacks use exactly these sides; book pressure compares them to the opposite sides.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Executable-side discipline \u2014 mid-based liquidity would be fiction."
+   },
+   {
+    "name": "depth_score_at_size",
+    "behavior": "Per leg: visibleUsd = sum(px*qty) over ALL levels of the consumed ladder side; if no ladder, visibleUsd = touchPx*touchQty; no data or notional <= 0 -> null. coverage = visibleUsd/notionalUsd; legScore = clamp01(log10(1+coverage)/log10(11)) so 10x coverage -> 1.0, 1x -> ~0.289, <1x proportionally poor. Combined depthScore = min(spotLeg, perpLeg) \u2014 a two-leg trade is only as deep as its thinner leg; null if either leg is null.",
+    "defaults": {
+     "fullScoreCoverageMultiple": 10
+    },
+    "verdict": "KEEP",
+    "reason": "Monotonic, size-aware, explainable; the min() across legs is the safety property."
+   },
+   {
+    "name": "ladder_slippage_walk",
+    "behavior": "Walk the consumed side best-first, taking min(remainingUsd, px*qty) per level, accumulating costUsd and filledBase = take/px. If the ladder cannot fill the notional -> null, and the caller substitutes penalty slippage = slippagePctEstimate * 4 for that leg. Else avgPx = costUsd/filledBase and slippagePct = |avgPx - touch|/touch * 100 (touch = first level price; touch <= 0 or empty ladder or notional <= 0 -> null).",
+    "defaults": {
+     "tooThinPenaltyMultiplier": 4
+    },
+    "verdict": "KEEP",
+    "reason": "Exact average-fill vs touch; the x4 penalty keeps thin ladders economically radioactive without refusing here (depth gate refuses)."
+   },
+   {
+    "name": "top_of_book_slippage_fallback",
+    "behavior": "When a leg has no ladder: base = slippagePctEstimate / 2; invalid touch (px, qty, or notional <= 0) -> base * 4; else slippage = base * max(1, consumption/0.25) where consumption = notionalUsd/(touchPx*touchQty) \u2014 consuming <= 25% of visible touch costs the base estimate, beyond that scales linearly. Total slippagePct = spot leg + perp leg (both directions, both models mixable per leg). ladderBacked = true only when BOTH legs had ladders.",
+    "defaults": {
+     "slippagePctEstimate": 0.05,
+     "consumptionKnee": 0.25
+    },
+    "verdict": "KEEP",
+    "reason": "Crude by design \u2014 monotonic explainable penalty, not a microstructure thesis (their words); parity first, refine later."
+   },
+   {
+    "name": "book_pressure",
+    "behavior": "bookPressure = (spotTouchPx*spotTouchQty + perpTouchPx*perpTouchQty on the HIT sides) / (same product on the OPPOSITE sides); null unless both books present and opposite-side USD > 0. Informational only (evidence + priority), never a refusal gate.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Cheap fill-degradation signal; keep non-gating exactly as old code."
+   },
+   {
+    "name": "min_liquidity_refusal",
+    "behavior": "Scanner guard (after spread check, before economics): depthScore == null OR depthScore < minDepthScore -> reject depth_too_thin, evaluated at notional = suggestedNotionalUsd. Null depth (no ladder AND no touch qty) refuses \u2014 unknown depth is not deep.",
+    "defaults": {
+     "minDepthScore": 0.3,
+     "suggestedNotionalUsd": 10
+    },
+    "verdict": "KEEP",
+    "reason": "Threshold 0.3 (~= coverage 1.05x on the thinner leg) is a sane floor; keep the mechanism and threshold."
+   },
+   {
+    "name": "old_sizing_default",
+    "behavior": "suggestedNotionalUsd = 10 USD drives all liquidity/slippage/refusal evaluation in the old engine.",
+    "defaults": {
+     "suggestedNotionalUsd": 10
+    },
+    "verdict": "REJECT",
+    "reason": "Arbitrary toy-sized old default; new kernel must take intended notional as an input (fixtures below pin it at 10 only for differential parity)."
+   },
+   {
+    "name": "funding_period_fixed_8h",
+    "behavior": "fundingPeriodMs is a single global config value (8h) used for settlement counting and capture factor; old code comments admit some symbols run 4h/1h.",
+    "defaults": {
+     "fundingPeriodMs": 28800000
+    },
+    "verdict": "ADAPT",
+    "reason": "Keep the formula, make the period a per-symbol input (old code named this as future work; a wrong period silently miscounts settlements)."
+   },
+   {
+    "name": "data_quality_composite",
+    "behavior": "score = clamp01( min(spotFresh, perpFresh, markFresh) * (0.5 + 0.5*skewComp) * (0.6 + 0.4*divComp) * ladderComp ). Components (each 1 = pristine): book fresh = clamp01(1 - stalenessMs/staleMs), null staleness -> 0 + reason leg_never_seen; markFresh = clamp01(1 - markStalenessMs/fundingStaleMs), null -> 0 + funding_never_seen, over limit adds funding_stale; skewComp = 0.5 when legSkew unknown, else clamp01(1 - legSkewMs/maxLegSkewMs), over limit adds leg_timestamp_skew; divComp = 0.75 when mark or perp mid unknown (mild distrust), else clamp01(1 - divergenceBps/maxMarkDivergenceBps) with divergenceBps = |perpMid - mark|/mark * 10000, over limit adds mark_book_divergence; ladderComp = 1 if ladder-backed else 0.7. Scanner refuses data_stale when: either book staleness null/over staleMs, OR legSkewMs > maxLegSkewMs (direct check), OR score < minDataQuality.",
+    "defaults": {
+     "staleMs": 5000,
+     "fundingStaleMs": 10000,
+     "maxLegSkewMs": 2500,
+     "maxMarkDivergenceBps": 50,
+     "minDataQuality": 0.4,
+     "unknownSkewComponent": 0.5,
+     "unknownDivergenceComponent": 0.75,
+     "noLadderComponent": 0.7
+    },
+    "verdict": "KEEP",
+    "reason": "Freshness-is-backbone shape (min of freshness, modulated multiplicatively) is the deliberate design; component constants are old defaults but the E2E thresholds (staleMs, skew, divergence, 0.4 gate) are proven by the old suite."
+   },
+   {
+    "name": "depth_ladder_ingestion",
+    "behavior": "A depth ladder is stored only if: in-order ts, fresh within staleMs, sides are arrays with <= maxDepthLevels rows, every row is [finite>0 price, finite>0 qty], bids non-increasing, asks non-decreasing, and best bid <= best ask. Invalid/stale -> stored ladder CLEARED (leg falls back to top-of-book slippage model). Books similarly: finite positive px/qty, bid <= ask, in-order, fresh \u2014 invalid clears.",
+    "defaults": {
+     "maxDepthLevels": 5000
+    },
+    "verdict": "KEEP",
+    "reason": "The walk assumes best-first sorted uncrossed ladders; ingestion is what guarantees it."
+   }
+  ],
+  "fixtures": [
+   {
+    "name": "hold_closing_fast_clamped_to_min",
+    "inputs": {
+     "gapPct": 0.8,
+     "slopePctPerMin": -0.2,
+     "cfg": "defaults"
+    },
+    "expected": {
+     "expectedHoldMs": 600000
+    }
+   },
+   {
+    "name": "hold_closing_slow",
+    "inputs": {
+     "gapPct": 0.8,
+     "slopePctPerMin": -0.002,
+     "cfg": "defaults"
+    },
+    "expected": {
+     "expectedHoldMs": 24000000
+    }
+   },
+   {
+    "name": "hold_widening_uses_default",
+    "inputs": {
+     "gapPct": 0.8,
+     "slopePctPerMin": 0.1,
+     "cfg": "defaults"
+    },
+    "expected": {
+     "expectedHoldMs": 14400000
+    }
+   },
+   {
+    "name": "hold_slope_within_epsilon_uses_default",
+    "inputs": {
+     "gapPct": 0.8,
+     "slopePctPerMin": -1e-07
+    },
+    "expected": {
+     "expectedHoldMs": 14400000
+    }
+   },
+   {
+    "name": "flip_stable_small_magnitude",
+    "inputs": {
+     "historyRates": [
+      0.0001,
+      0.0002,
+      0.0001
+     ],
+     "current": 0.0001
+    },
+    "expected": {
+     "flipRisk": 0.32000000000000006
+    }
+   },
+   {
+    "name": "flip_alternating",
+    "inputs": {
+     "historyRates": [
+      0.0001,
+      -0.0001,
+      0.0001,
+      -0.0001
+     ],
+     "current": -0.0001
+    },
+    "expected": {
+     "flipRisk": 0.92
+    }
+   },
+   {
+    "name": "flip_needs_three_points",
+    "inputs": {
+     "historyRates": [
+      0.0001,
+      -0.0001
+     ],
+     "current": 0.0001
+    },
+    "expected": {
+     "flipRisk": null
+    }
+   },
+   {
+    "name": "flip_strong_stable_rate_is_zero_risk",
+    "inputs": {
+     "historyRates": [
+      0.001,
+      0.001,
+      0.001
+     ],
+     "current": 0.001
+    },
+    "expected": {
+     "flipRisk": 0
+    }
+   },
+   {
+    "name": "flip_zero_transitions_not_counted_current_null_uses_last",
+    "inputs": {
+     "historyRates": [
+      0.0001,
+      0,
+      -0.0001
+     ],
+     "current": null
+    },
+    "expected": {
+     "flipRisk": 0.32000000000000006
+    }
+   },
+   {
+    "name": "carry_hold_ends_before_settlement",
+    "inputs": {
+     "rates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 14400001
+    },
+    "expected": {
+     "carryPct": 0
+    }
+   },
+   {
+    "name": "carry_one_settlement_direction_A",
+    "inputs": {
+     "rates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": 0.1
+    }
+   },
+   {
+    "name": "carry_one_settlement_direction_B_sign_flips",
+    "inputs": {
+     "rates": [
+      0.001
+     ],
+     "direction": "short_spot_long_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": -0.1
+    }
+   },
+   {
+    "name": "carry_unknown_second_settlement_is_null",
+    "inputs": {
+     "rates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 61200000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": null
+    }
+   },
+   {
+    "name": "carry_two_known_settlements_sum",
+    "inputs": {
+     "rates": [
+      0.001,
+      -0.0005
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 43200000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": 0.05
+    }
+   },
+   {
+    "name": "carry_nonpositive_msToNext_is_null",
+    "inputs": {
+     "rates": [
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 0
+    },
+    "expected": {
+     "carryPct": null
+    }
+   },
+   {
+    "name": "carry_rate_beyond_10pct_band_is_null",
+    "inputs": {
+     "rates": [
+      0.2
+     ],
+     "direction": "long_spot_short_perp",
+     "holdMs": 14400000,
+     "periodMs": 28800000,
+     "msToNextFunding": 60000
+    },
+    "expected": {
+     "carryPct": null
+    }
+   },
+   {
+    "name": "ctx_fresh_paying_capture",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": 0.001,
+      "nextFundingTs": "now+3600000",
+      "ts": "now"
+     },
+     "historyRates": [
+      0.0008,
+      0.0009,
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "gap": {
+      "gapPct": 1,
+      "slopePctPerMin": 0
+     },
+     "markStalenessMs": 0,
+     "cfg": "defaults"
+    },
+    "expected": {
+     "fresh": true,
+     "msToFunding": 3600000,
+     "carryPctOverHold": 0.1,
+     "expectedHoldMs": 14400000,
+     "flipRisk": 0,
+     "captureFactor": 0.875
+    }
+   },
+   {
+    "name": "ctx_flip_risky_bonus_discounted",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": 0.0001,
+      "nextFundingTs": "now+3600000",
+      "ts": "now"
+     },
+     "historyRates": [
+      0.0001,
+      -0.0001,
+      0.0001,
+      -0.0001
+     ],
+     "direction": "long_spot_short_perp",
+     "gap": {
+      "gapPct": 1,
+      "slopePctPerMin": 0
+     },
+     "markStalenessMs": 0
+    },
+    "expected": {
+     "fresh": true,
+     "flipRisk": 0.92,
+     "carryPctOverHold": 0.0007999999999999996,
+     "captureFactor": 0.875
+    }
+   },
+   {
+    "name": "ctx_negative_carry_never_discounted",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": -0.0001,
+      "nextFundingTs": "now+3600000",
+      "ts": "now"
+     },
+     "historyRates": [
+      0.0001,
+      -0.0001,
+      0.0001,
+      -0.0001
+     ],
+     "direction": "long_spot_short_perp",
+     "gap": {
+      "gapPct": 1,
+      "slopePctPerMin": 0
+     },
+     "markStalenessMs": 0
+    },
+    "expected": {
+     "fresh": true,
+     "flipRisk": 0.92,
+     "carryPctOverHold": -0.01,
+     "captureFactor": 0
+    }
+   },
+   {
+    "name": "ctx_stale_mark_all_null",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": 0.001,
+      "nextFundingTs": "now+3600000",
+      "ts": "now"
+     },
+     "markStalenessMs": 20000,
+     "cfg": {
+      "fundingStaleMs": 10000
+     }
+    },
+    "expected": {
+     "fresh": false,
+     "fundingRate": null,
+     "carryPctOverHold": null,
+     "flipRisk": null,
+     "captureFactor": 0,
+     "stalenessMs": 20000,
+     "expectedHoldMs": 14400000
+    }
+   },
+   {
+    "name": "ctx_past_nextFundingTs_not_fresh",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": 0.001,
+      "nextFundingTs": "now-1",
+      "ts": "now"
+     },
+     "markStalenessMs": 0
+    },
+    "expected": {
+     "fresh": false,
+     "carryPctOverHold": null
+    }
+   },
+   {
+    "name": "ctx_rate_out_of_band_not_fresh",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": 0.2,
+      "nextFundingTs": "now+3600000",
+      "ts": "now"
+     },
+     "markStalenessMs": 0
+    },
+    "expected": {
+     "fresh": false,
+     "carryPctOverHold": null
+    }
+   },
+   {
+    "name": "ctx_settlement_beyond_hold_zero_carry_zero_capture",
+    "inputs": {
+     "mark": {
+      "markPrice": 100,
+      "fundingRate": 0.001,
+      "nextFundingTs": "now+21600000",
+      "ts": "now"
+     },
+     "historyRates": [
+      0.0008,
+      0.0009,
+      0.001
+     ],
+     "direction": "long_spot_short_perp",
+     "gap": {
+      "gapPct": 1,
+      "slopePctPerMin": 0
+     },
+     "markStalenessMs": 0
+    },
+    "expected": {
+     "fresh": true,
+     "carryPctOverHold": 0,
+     "captureFactor": 0
+    }
+   },
+   {
+    "name": "walk_two_levels_average_fill",
+    "inputs": {
+     "ladder": [
+      [
+       100,
+       0.05
+      ],
+      [
+       101,
+       0.06
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "slippagePct": 0.4975124378109399
+    }
+   },
+   {
+    "name": "walk_ladder_too_thin_null",
+    "inputs": {
+     "ladder": [
+      [
+       100.02,
+       0.02
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "slippagePct": null
+    }
+   },
+   {
+    "name": "walk_single_level_covers_zero_slippage",
+    "inputs": {
+     "ladder": [
+      [
+       100.02,
+       500
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "slippagePct": 0
+    }
+   },
+   {
+    "name": "tob_fallback_half_visible_consumed",
+    "inputs": {
+     "touchPx": 100.02,
+     "touchQty": 0.2,
+     "notionalUsd": 10,
+     "baseSlippagePct": 0.025
+    },
+    "expected": {
+     "slippagePct": 0.049990001999600076
+    }
+   },
+   {
+    "name": "tob_fallback_invalid_touch_4x_base",
+    "inputs": {
+     "touchPx": 0,
+     "touchQty": 0,
+     "notionalUsd": 10,
+     "baseSlippagePct": 0.025
+    },
+    "expected": {
+     "slippagePct": 0.1
+    }
+   },
+   {
+    "name": "depthscore_10x_coverage_full",
+    "inputs": {
+     "ladder": [
+      [
+       100,
+       1
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 1
+    }
+   },
+   {
+    "name": "depthscore_1x_coverage",
+    "inputs": {
+     "ladder": [
+      [
+       100,
+       0.1
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 0.2890648263178879
+    }
+   },
+   {
+    "name": "depthscore_fifth_coverage",
+    "inputs": {
+     "ladder": [
+      [
+       100.02,
+       0.02
+      ]
+     ],
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 0.07604789568600907
+    }
+   },
+   {
+    "name": "liq_A_generous_ladders",
+    "inputs": {
+     "direction": "long_spot_short_perp",
+     "spotBook": {
+      "bid": 100,
+      "ask": 100.02,
+      "bidQty": 500,
+      "askQty": 500
+     },
+     "perpBook": {
+      "bid": 100.8,
+      "ask": 100.82,
+      "bidQty": 500,
+      "askQty": 500
+     },
+     "spotDepth": {
+      "bids": [
+       [
+        100,
+        500
+       ]
+      ],
+      "asks": [
+       [
+        100.02,
+        500
+       ]
+      ]
+     },
+     "perpDepth": {
+      "bids": [
+       [
+        100.8,
+        500
+       ]
+      ],
+      "asks": [
+       [
+        100.82,
+        500
+       ]
+      ]
+     },
+     "notionalUsd": 10,
+     "cfg": "defaults"
+    },
+    "expected": {
+     "depthScore": 1,
+     "slippagePct": 0,
+     "ladderBacked": true,
+     "bookPressure": 1
+    }
+   },
+   {
+    "name": "liq_A_thin_ladders_penalty_slippage",
+    "inputs": {
+     "sameAs": "liq_A_generous_ladders",
+     "except": "all ladder qtys 0.02"
+    },
+    "expected": {
+     "depthScore": 0.07604789568600907,
+     "slippagePct": 0.4,
+     "ladderBacked": true,
+     "bookPressure": 1
+    }
+   },
+   {
+    "name": "liq_A_no_ladders_tob_model",
+    "inputs": {
+     "direction": "long_spot_short_perp",
+     "spotBook": {
+      "bid": 100,
+      "ask": 100.02,
+      "bidQty": 0.2,
+      "askQty": 0.2
+     },
+     "perpBook": {
+      "bid": 100.8,
+      "ask": 100.82,
+      "bidQty": 0.2,
+      "askQty": 0.2
+     },
+     "spotDepth": null,
+     "perpDepth": null,
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 0.4582125106035577,
+     "slippagePct": 0.09959317660277468,
+     "ladderBacked": false,
+     "bookPressure": 1
+    }
+   },
+   {
+    "name": "liq_A_walked_slippage_and_min_leg",
+    "inputs": {
+     "direction": "long_spot_short_perp",
+     "spotBook": {
+      "bid": 99.98,
+      "ask": 100,
+      "bidQty": 500,
+      "askQty": 0.05
+     },
+     "perpBook": {
+      "bid": 100.8,
+      "ask": 100.82,
+      "bidQty": 500,
+      "askQty": 500
+     },
+     "spotDepth": {
+      "bids": [
+       [
+        100,
+        500
+       ]
+      ],
+      "asks": [
+       [
+        100,
+        0.05
+       ],
+       [
+        101,
+        0.06
+       ]
+      ]
+     },
+     "perpDepth": {
+      "bids": [
+       [
+        100.8,
+        500
+       ]
+      ],
+      "asks": [
+       [
+        100.82,
+        500
+       ]
+      ]
+     },
+     "notionalUsd": 10
+    },
+    "expected": {
+     "depthScore": 0.31060172734007896,
+     "slippagePct": 0.4975124378109399,
+     "ladderBacked": true,
+     "bookPressure": 0.5020418326693227
+    }
+   },
+   {
+    "name": "liq_A_book_pressure_imbalance",
+    "inputs": {
+     "direction": "long_spot_short_perp",
+     "spotBook": {
+      "bid": 100,
+      "ask": 100.02,
+      "bidQty": 500,
+      "askQty": 5
+     },
+     "perpBook": {
+      "bid": 100.8,
+      "ask": 100.82,
+      "bidQty": 5,
+      "askQty": 500
+     },
+     "spotDepth": null,
+     "perpDepth": null,
+     "notionalUsd": 10
+    },
+    "expected": {
+     "bookPressure": 0.009999999999999998,
+     "depthScore": 1,
+     "slippagePct": 0.05,
+     "ladderBacked": false
+    }
+   },
+   {
+    "name": "liq_zero_notional_null_score",
+    "inputs": {
+     "sameAs": "liq_A_generous_ladders",
+     "except": "notionalUsd 0"
+    },
+    "expected": {
+     "depthScore": null,
+     "slippagePct": 0.4,
+     "ladderBacked": true,
+     "bookPressure": 1
+    }
+   },
+   {
+    "name": "dq_pristine",
+    "inputs": {
+     "spotStalenessMs": 0,
+     "perpStalenessMs": 0,
+     "markStalenessMs": 0,
+     "legSkewMs": 0,
+     "perpBook": {
+      "bid": 100.8,
+      "ask": 100.82
+     },
+     "markPrice": 100.81,
+     "ladderBacked": true,
+     "cfg": "defaults"
+    },
+    "expected": {
+     "score": 1,
+     "markDivergenceBps": 0,
+     "suspectReasons": []
+    }
+   },
+   {
+    "name": "dq_mark_divergence_zeroes_component",
+    "inputs": {
+     "sameAs": "dq_pristine",
+     "except": "markPrice 95"
+    },
+    "expected": {
+     "score": 0.6,
+     "markDivergenceBps": 611.5789473684213,
+     "suspectReasons": [
+      "mark_book_divergence"
+     ]
+    }
+   },
+   {
+    "name": "dq_mark_never_seen_zero_score",
+    "inputs": {
+     "sameAs": "dq_pristine",
+     "except": "markStalenessMs null, markPrice null"
+    },
+    "expected": {
+     "score": 0,
+     "suspectReasons": [
+      "funding_never_seen"
+     ]
+    }
+   },
+   {
+    "name": "dq_unknown_skew_half_component",
+    "inputs": {
+     "sameAs": "dq_pristine",
+     "except": "legSkewMs null"
+    },
+    "expected": {
+     "score": 0.75,
+     "suspectReasons": []
+    }
+   },
+   {
+    "name": "dq_no_ladder_no_mark",
+    "inputs": {
+     "sameAs": "dq_pristine",
+     "except": "ladderBacked false, perpBook null, markPrice null"
+    },
+    "expected": {
+     "score": 0.63,
+     "suspectReasons": []
+    }
+   },
+   {
+    "name": "dq_half_stale_book_backbone_min",
+    "inputs": {
+     "sameAs": "dq_pristine",
+     "except": "spotStalenessMs 2500, perpStalenessMs 1000"
+    },
+    "expected": {
+     "score": 0.5
+    }
+   },
+   {
+    "name": "dq_skew_over_limit",
+    "inputs": {
+     "sameAs": "dq_pristine",
+     "except": "legSkewMs 4000"
+    },
+    "expected": {
+     "score": 0.5,
+     "suspectReasons": [
+      "leg_timestamp_skew"
+     ]
+    }
+   },
+   {
+    "name": "e2e_min_liquidity_refusal",
+    "inputs": {
+     "scenario": "engine-basis.mjs section 15: books qty 500, ladders qty 0.02 both legs, notionalUsd 10, defaults",
+     "depthScoreComputed": 0.07604789568600907
+    },
+    "expected": {
+     "decision": "reject",
+     "rejectCode": "depth_too_thin",
+     "because": "0.076 < minDepthScore 0.3"
+    }
+   },
+   {
+    "name": "e2e_funding_drag_refusal",
+    "inputs": {
+     "scenario": "engine-basis.mjs section 5: gap 0.78% direction A, fundingRate -0.01, nextFundingTs now+4h, hold 4h (default), defaults"
+    },
+    "expected": {
+     "decision": "reject",
+     "rejectCode": "funding_against_trade",
+     "carryPctOverHold": -1,
+     "because": "drag 1.0% > maxFundingDragPct 0.15%"
+    }
+   },
+   {
+    "name": "e2e_unknown_carry_keeps_net_edge_null",
+    "inputs": {
+     "scenario": "engine-basis.mjs section 5b: fresh funding context but carryPctOverHold null fed to edge estimator"
+    },
+    "expected": {
+     "netEdgePct": null,
+     "scannerOutcome": "reject data_stale (funding unavailable)"
+    }
+   }
+  ],
+  "not_ported": [
+   "Reverse-basis borrow model (borrow.ts preflightBorrow, borrowCostPctOverHold, borrow_unknown/unavailable/too_small/cost_too_high refusals) \u2014 out of port scope per brief",
+   "quant/src/quant_edge/derivatives/funding.py + quant/tests/q08 \u2014 a separate research-lane fixed-point feature-contract system in the same repo, different lineage from the basis engine; not the old kernel being ported",
+   "Proposals layer (proposals.ts): invalidationSpec.depthBelowScore / fundingFlipsAgainst re-checks and staged sizes \u2014 proposals miner's area",
+   "Priority components liquidity/fundingUsefulness/momentum (priority.ts) \u2014 priority miner's area; this spec only feeds them depthScore/captureFactor/flipRisk",
+   "Gap tracking and causality (gapTracker.ts, GapState.slopePctPerMin production) \u2014 gap miner's area; expectedHoldMs consumes its outputs",
+   "Edge assembly beyond funding-drag wiring (edge.ts/netEdgePct/fees) \u2014 edge/costs miner's area; overlap documented in funding_drag_refusal rule only",
+   "Data-quality suspectReason strings beyond the six emitted here \u2014 reject vocabulary mapping is scanner/lifecycle area",
+   "rolling24hEdgeStatistic.ts, publicOpportunityObservation*.ts \u2014 observation/statistics side systems, not the decision kernel"
+  ],
+  "notes": [
+   "MEASURED basis: funding.ts, liquidity.ts, math.ts, config.ts, v0/config.ts, v0/types.ts (tick shapes), types.ts, scanner.ts, features.ts, edge.ts, marketState.ts (ingestion+staleness), server/test/engine-basis.mjs \u2014 read in full from clone current-main @ 475bd57. All numeric fixtures executed against the original logic (copies diff-verified identical except import specifiers) via node 22 strip-types; probe kept at scratchpad cosmos-funding-liquidity/work/probe.ts for re-runs.",
+   "NOT CHECKED: engine.ts/lifecycle.ts/snapshots.ts internals, web/ consumers, ops/verification trees, packages/ \u2014 outside area. INFERRED (not executed): the two e2e_* fixtures' reject codes come from reading engine-basis.mjs assertions, not from running the built engine; the -1.0 carry number follows the measured carry law.",
+   "Units table for the port: fundingRate = fraction per period (0.0001 = 1 bps); carryPctOverHold, slippagePct, fees, gaps = PERCENT of notional; spreads and mark divergence = bps; flip magnitude norm 0.0005 = fraction. Mixing bps/fraction/pct is the highest-risk porting defect in this area.",
+   "Effective defaults consumed by this area (BASIS_DEFAULTS over ENGINE_DEFAULTS): staleMs 5000, fundingStaleMs 10000, maxFutureSkewMs 2000, maxLegSkewMs 2500, maxMarkDivergenceBps 50, minDataQuality 0.4, minDepthScore 0.3, slippagePctEstimate 0.05, suggestedNotionalUsd 10, defaultHoldMs 4h, minHoldMs 10m, maxHoldMs 24h, fundingPeriodMs 8h, maxFundingDragPct 0.15, fundingExtremeAbs 0.0005, fundingHistoryKeep 32, maxDepthLevels 5000.",
+   "Old suite tolerance is approx(a,b,eps=1e-6); fixtures above carry full float64 values so the differential harness can choose eps (recommend 1e-9 for the pure functions).",
+   "Config validator constraints worth porting: minHoldMs <= defaultHoldMs <= maxHoldMs; maxHoldMs/fundingPeriodMs <= 1000; fundingHistoryKeep >= 3; fundingPeriodMs > 0 (updateConfig({fundingPeriodMs:0}) throws in old suite).",
+   "Refusal guard ORDER matters for differential parity of reject codes: structure -> book staleness -> leg skew -> dq composite -> funding fresh/carry-known -> gap exists -> spread -> depth_too_thin -> edge_below_fees -> funding_against_trade -> (borrow, B only) -> gap stability -> edge_below_threshold -> persistence. First failing guard names the reject.",
+   "fundingExtremeAbs (0.0005 fraction) appears in config for focus/priority labeling of extreme funding, not as a funding.ts/liquidity.ts gate \u2014 priority miner's concern, listed here only because it shares the 5 bps constant with flip-risk magnitude norm."
+  ]
+ },
+ "scanner": {
+  "area": "scanner-stability",
+  "verdict": "COMPLETE \u2014 repo cloned read-only (current-main @ 475bd57). Both named files exist and were read in full: server/src/engine/basis/gapTracker.ts and server/src/engine/basis/scanner.ts (plus a second, LEGACY server/src/engine/scanner.ts \u2014 mark-price based, superseded; mined and mostly REJECTed). Supporting reads: config.ts, math.ts, marketState.ts, engine.ts, priority.ts, lifecycle.ts, features.ts, liquidity.ts(assessDataQuality), funding.ts(expectedHoldMs), rejectVocabulary.ts, and test suites engine-basis.mjs + engine-basis-causal-gap.test.mjs. Basis: MEASURED for every rule below unless a note says INFERRED. Key portability finding: the causality sub-machine is evidence-only (never gates a decision), so a normal-basis Python kernel can ship without it and still reproduce every decision fixture.",
+  "rules": [
+   {
+    "name": "executable_gap_law",
+    "behavior": "Normal basis (direction long_spot_short_perp): gap_pct = (perp_bid - spot_ask) / spot_ask * 100. Return on the long-leg entry notional (contract 'basis-executable-long-leg-notional-v1'). Executable bid/ask only, never mid or mark. null unless both prices > 0.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Core economics; frozen versioned contract in math.ts."
+   },
+   {
+    "name": "watch_and_focus_thresholds",
+    "behavior": "gap < watchGapPct -> decision 'ignore' AND persistence resets. While persisting but persistTicks < required: kind = 'focus' if gap >= focusGapPct else 'watch'. Config validation enforces 0 < watchGapPct <= focusGapPct.",
+    "defaults": {
+     "watchGapPct": 0.15,
+     "focusGapPct": 0.3
+    },
+    "verdict": "KEEP",
+    "reason": "Coherent with the 0.3% round-trip fee floor (watch = half fees, focus = fee breakeven); keep tunable."
+   },
+   {
+    "name": "persistence_counting",
+    "behavior": "persistTicks = consecutive engine ticks (tick cadence tickMs) with gap >= watchGapPct, per symbol+direction. openedTs latched at first crossing; gapAgeMs = now - openedTs. Any tick below watch OR with gap null/non-finite resets ticks to 0 and age to null. Proposal requires persistTicks >= cfg.persistTicks after all economic guards pass.",
+    "defaults": {
+     "persistTicks": 5,
+     "tickMs": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "The anti-noise debounce; default 5 ticks x 2s = 10s. Old proof suite runs with 3 \u2014 5 is the frozen v0 default."
+   },
+   {
+    "name": "gap_sample_window",
+    "behavior": "Rolling per symbol+direction window of (ts, gap_pct) samples, capped at gapWindowSize by dropping oldest. Slope and CV are computed from it. Missing-gap ticks add no sample (window is not cleared, only persistence resets).",
+    "defaults": {
+     "gapWindowSize": 60
+    },
+    "verdict": "KEEP",
+    "reason": "60 samples ~ 2 min at 2s ticks; config validation requires >= 3."
+   },
+   {
+    "name": "slope_pct_per_min",
+    "behavior": "Least-squares slope over window samples with x = (ts - ts_first)/60000 minutes, y = gap pct. Returns null when < 2 samples or |n*Sxx - Sx^2| < 1e-12 (indistinct timestamps). Positive = widening, negative = closing. Also feeds expectedHoldMs: if gap > 0 and slope < -1e-6, hold_ms = clamp((gap/-slope) minutes, minHoldMs, maxHoldMs), else defaultHoldMs.",
+    "defaults": {
+     "degenerate_denominator_epsilon": 1e-12,
+     "closing_slope_epsilon": -1e-06,
+     "defaultHoldMs": 14400000,
+     "minHoldMs": 600000,
+     "maxHoldMs": 86400000
+    },
+    "verdict": "KEEP",
+    "reason": "Simple, explainable trend estimate reused by priority momentum and hold estimation."
+   },
+   {
+    "name": "stability_cv",
+    "behavior": "stabilityCv = sample_stddev(n-1 denominator) / max(|mean|, 1e-9), computed over ONLY the last max(2*persistTicks, 6) samples of the window (all-window CV would punish a gap for having opened at all). null when < 3 recent samples.",
+    "defaults": {
+     "recent_window": "max(2*persistTicks, 6)",
+     "min_samples_for_cv": 3,
+     "mean_floor": 1e-09
+    },
+    "verdict": "KEEP",
+    "reason": "Flickering-gap detector; the recent-window slice is deliberate and load-bearing."
+   },
+   {
+    "name": "stability_guard",
+    "behavior": "Reject 'gap_not_persistent' ONLY when stabilityCv is non-null AND stabilityCv > maxGapCv AND persistTicks < required persistTicks. A gap that already persisted N ticks is immune to the CV reject (both conditions required).",
+    "defaults": {
+     "maxGapCv": 0.6
+    },
+    "verdict": "KEEP",
+    "reason": "The AND is the hysteresis: survived persistence overrides noisiness. 0.6 is a judgment default \u2014 keep tunable."
+   },
+   {
+    "name": "feed_freshness_guard",
+    "behavior": "Reject 'data_stale' when either leg staleness is null (never seen \u2014 fails closed) or > staleMs. Staleness = max(0, now - book.ts). Funding leg: not fresh, fundingRate null, or carry unknown -> also 'data_stale' (funding fresh requires markStaleness <= fundingStaleMs, |rate| <= 0.1, nextFundingTs > now).",
+    "defaults": {
+     "staleMs": 5000,
+     "fundingStaleMs": 10000
+    },
+    "verdict": "KEEP",
+    "reason": "Null-fails-closed is the core safety posture; 5s/10s match 2s tick cadence."
+   },
+   {
+    "name": "cross_market_skew_guard",
+    "behavior": "legSkewMs = |spot_book.ts - perp_book.ts|. If > maxLegSkewMs -> reject 'data_stale' (a cross-market gap computed from books cut at different times is fiction). Checked at scan time and again independently for causality pairs.",
+    "defaults": {
+     "maxLegSkewMs": 2500
+    },
+    "verdict": "KEEP",
+    "reason": "Prevents phantom gaps from asynchronous feeds; 2.5s ~ one tick + margin."
+   },
+   {
+    "name": "data_quality_composite",
+    "behavior": "score = min(spotFresh, perpFresh, markFresh) * (0.5 + 0.5*skewComp) * (0.6 + 0.4*divComp) * ladderComp, clamped 0..1. freshComp = clamp(1 - staleness/limit, 0, 1) with limit staleMs (books) / fundingStaleMs (mark); null staleness -> 0 + suspect reason. skewComp = clamp(1 - legSkew/maxLegSkewMs, 0, 1), 0.5 when skew unknown. divComp = clamp(1 - markDivergenceBps/maxMarkDivergenceBps, 0, 1), 0.75 when mark unknown. ladderComp = 1 if depth-ladder-backed else 0.7. Reject 'data_stale' when score < minDataQuality.",
+    "defaults": {
+     "minDataQuality": 0.4,
+     "maxMarkDivergenceBps": 50,
+     "unknown_skew_component": 0.5,
+     "unknown_divergence_component": 0.75,
+     "top_of_book_only_component": 0.7
+    },
+    "verdict": "ADAPT",
+    "reason": "Freshness-backbone structure is sound; the modulation weights (0.5/0.5, 0.6/0.4, 0.7, 0.75) are arbitrary old defaults \u2014 reproduce for differential parity, then retune."
+   },
+   {
+    "name": "mark_divergence",
+    "behavior": "markDivergenceBps = |perp_mid - mark| / mark * 10000. Feeds the dq composite only \u2014 there is NO direct divergence reject; a divergent mark surfaces as data_stale via the quality score.",
+    "defaults": {
+     "maxMarkDivergenceBps": 50
+    },
+    "verdict": "KEEP",
+    "reason": "Bad-tick smell test; indirect gating is intentional (mark is advisory, books are truth)."
+   },
+   {
+    "name": "future_timestamp_guard",
+    "behavior": "Ingest accepts a timestamp only when now - ts is in [-maxFutureSkewMs, maxAge]. Source event times must additionally be safe integers > 0, fresh within staleMs, and <= receipt_ts + maxFutureSkewMs. Violations invalidate the observation (book cleared, not priced).",
+    "defaults": {
+     "maxFutureSkewMs": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "Small clock-skew allowance; anything further in the future is rejected."
+   },
+   {
+    "name": "ingest_book_validity",
+    "behavior": "A book is accepted only if bid, ask, bidQty, askQty are finite, > 0, <= 1e15 and bid <= ask. Invalid/crossed/stale input CLEARS the live book (subsequent scan rejects spot_missing/perp_missing) rather than pricing it. Unknown symbols allocate nothing.",
+    "defaults": {
+     "max_market_number": 1000000000000000
+    },
+    "verdict": "KEEP",
+    "reason": "Trust boundary: malformed data never enters live state."
+   },
+   {
+    "name": "ingest_monotonicity_and_watermarks",
+    "behavior": "Receipt-ts regressions never replace the live book. For changed prices: source-event-time below the per-symbol accepted max or per-leg watermark -> SOURCE_CLOCK_REVERSAL; sequence regression -> SOURCE_SEQUENCE_REVERSAL; identical source stamp with a different price -> SOURCE_REPLAY_CONFLICT; receipt-clock regression -> RECEIPT_CLOCK_REVERSAL. Any DISCONTINUITY resets causal lifecycles for both directions of the symbol. Watermarks survive missing/invalid book clears (a delayed old cut cannot re-bootstrap behind an accepted newer one); only the explicit restart fence (resetBookContinuity) clears watermarks \u2014 and it also clears the whole gap tracker.",
+    "defaults": {},
+    "verdict": "ADAPT",
+    "reason": "Keep clock-reversal and replay guards; sequence guards only apply if the new feed supplies sequences \u2014 port conditionally."
+   },
+   {
+    "name": "causal_pair_usable",
+    "behavior": "Both the before AND after pair of an accepted book event are judged at that event's own acceptedAtMs: each leg age (max(0, acceptedAt - leg.ts)) <= staleMs AND |spot.ts - perp.ts| <= maxLegSkewMs, else causality is reset for the symbol. A later refresh of the opposite leg can never make a stale/over-skewed baseline look usable after the fact.",
+    "defaults": {
+     "staleMs": 5000,
+     "maxLegSkewMs": 2500
+    },
+    "verdict": "KEEP",
+    "reason": "Anti-laundering rule; only needed if the causality sub-machine is ported."
+   },
+   {
+    "name": "causal_lifecycle_attribution",
+    "behavior": "Evidence-only (never gates decisions). Per direction, from an accepted single-initiator book event: delta = gap_after - gap_before. Start a lifecycle only when gap_after >= watchGapPct AND |delta| >= causalMoveThresholdPct AND trend known (delta != 0); quadrant = {RISING|FALLING}_{SPOT|PERPETUAL}_LED, baseline = gap_before, persistenceEvents = 1, evolution GROWING, follower = the other market, confirmation PENDING. Advance on same-market same-trend significant moves (GROWING) or insignificant nonzero drifts (GROWING/DECAYING by distance from baseline), persistenceEvents capped at gapWindowSize. Follower CONFIRMED only when the other market's executable quote (dir A: perp->bid, spot->ask; dir B: spot->bid, perp->ask) moves in the initiator's price direction while the gap decays toward baseline -> evolution DECAYING. Trend flip or initiator price-trend flip restarts the lifecycle (fresh source, age 0, persistence 1). Resolved (cleared) when the gap crosses back through baseline. Expired when now - initiatedAtAcceptedMs > causalExpiryMs (accepted-at clock; public ageMs uses the source clock: now - initiatingSourceTs). Everything unprovable reports UNKNOWN.",
+    "defaults": {
+     "causalMoveThresholdPct": 0.005,
+     "causalExpiryMs": 15000,
+     "validation": "0 < causalMoveThresholdPct < watchGapPct"
+    },
+    "verdict": "ADAPT",
+    "reason": "Large observability sub-machine; decisions are identical without it. Port later if initiator attribution is wanted in the new UI; defer from the minimal kernel."
+   },
+   {
+    "name": "universe_filter",
+    "behavior": "Runtime eligibility predicate: hasSpot AND hasPerp AND finite(quoteVolume24hUsd) AND quoteVolume24hUsd >= minQuoteVolume24hUsd. Engine meta validation: quote must be 'USDT', symbol must equal base+quote, symbol/asset regexes ^[A-Z0-9]{2,32}$ / ^[A-Z0-9]{1,16}$, eligible implies hasSpot AND hasPerp. setUniverse REPLACES the universe; > maxUniverseSize throws (never silently truncates). Departed symbols drop tracker buckets, lifecycle, priority rows and expire their proposals immediately.",
+    "defaults": {
+     "minQuoteVolume24hUsd": 3000000,
+     "maxUniverseSize": 2500
+    },
+    "verdict": "KEEP",
+    "reason": "$3M 24h floor is a judgment default but reasonable; the replace-not-append and prune-derived-state semantics are load-bearing."
+   },
+   {
+    "name": "symbol_policy_gate",
+    "behavior": "symbolAllowed = (allowlist is null OR contains symbol) AND not policy-blocked AND not operator-blocked AND meta.eligible. Blocked -> reject 'symbol_blocked' before any direction evaluation. Operator overlay survives application-config refresh; blocking expires open proposals for the symbol.",
+    "defaults": {
+     "symbol_regex": "^[A-Z0-9]{4,20}$"
+    },
+    "verdict": "KEEP",
+    "reason": "Two independent blocklists (policy vs operator) prevented refreshes from silently unblocking."
+   },
+   {
+    "name": "guard_ladder_order",
+    "behavior": "Frozen per-direction order \u2014 the FIRST failing guard names the reject: (1) spot book missing -> spot_missing; (2) perp missing -> perp_missing; (3) book staleness -> data_stale; (4) leg skew -> data_stale; (5) dq score -> data_stale; (6) funding missing/stale -> data_stale; (7) gap not computable -> book_missing; (8) gap < watch -> ignore; (9) either leg spreadBps > maxSpreadBps -> spread_too_wide (spreadBps = (ask-bid)/mid*10000); (10) depthScore null or < minDepthScore -> depth_too_thin; (11) gap <= feesPct+slippagePct -> edge_below_fees (fees = 2*spotTakerFeePct + 2*perpTakerFeePct); (12) fundingDragPct > maxFundingDragPct -> funding_against_trade; (13) [direction B only: borrow guards \u2014 out of scope]; (14) stability CV guard -> gap_not_persistent; (15) netEdge null or < minNetBasisPct -> edge_below_threshold; (16) persistTicks short -> watch/focus; else proposal. Reject vocabulary is the frozen 16-code set, never invented per run.",
+    "defaults": {
+     "maxSpreadBps": 25,
+     "minDepthScore": 0.3,
+     "spotTakerFeePct": 0.1,
+     "perpTakerFeePct": 0.05,
+     "feesPct": 0.3,
+     "maxFundingDragPct": 0.15,
+     "minNetBasisPct": 0.25
+    },
+    "verdict": "KEEP",
+    "reason": "Order is deliberate (structure -> data quality -> existence -> cost -> stability -> threshold -> persistence); economics rejects fire BEFORE the persistence gate, so a thin edge never even watches."
+   },
+   {
+    "name": "direction_pick",
+    "behavior": "Both directions evaluated independently each tick; pick by kind rank proposal(5) > focus(4) > watch(3) > reject(2) > ignore(1); equal rank -> larger gapPct wins (null gap = -infinity); exact tie -> direction A (long_spot_short_perp). Persistence/stability state is tracked per symbol+direction.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "Actionable kinds outrank rejects; economically bigger gap is primary."
+   },
+   {
+    "name": "kill_switch_and_intake_pause",
+    "behavior": "Kill switch converts a picked 'proposal' into reject 'kill_switch_on' AFTER evaluation \u2014 observation, watching, and focus continue; only arming stops. Intake pause similarly converts proposals to reject 'intake_paused' at the engine layer and expires open proposals.",
+    "defaults": {},
+    "verdict": "KEEP",
+    "reason": "'The engine keeps seeing, it just cannot arm' \u2014 preserves signal history through operational stops."
+   },
+   {
+    "name": "priority_ranking",
+    "behavior": "score = netEdgeN * max(persistenceN, 0.1) * max(liquidityN, 0.05) * fundingUsefulness * dqScore * momentum. netEdgeN = clamp(netEdgePct/(2*minNetBasisPct), 0, 1.5); persistenceN = clamp(persistTicks/persistTicks_required, 0, 1); liquidityN = clamp(depthScore, 0, 1); fundingUsefulness = clamp(0.5 + carryPct/(2*maxFundingDragPct) + 0.25*captureFactor, 0, 1); dqScore = clamp(dq, 0, 1); momentum = clamp(1 + priorityMomentumWeight*tanh(slopePctPerMin/watchGapPct), 0.5, 1.5). All components shipped with the score (explainability).",
+    "defaults": {
+     "priorityMomentumWeight": 0.25,
+     "persistence_floor": 0.1,
+     "liquidity_floor": 0.05,
+     "momentum_clamp": "[0.5, 1.5]"
+    },
+    "verdict": "ADAPT",
+    "reason": "Multiplicative explainable model is worth keeping; the floors and 0.25 weight are arbitrary old defaults \u2014 reproduce for parity, retune with data."
+   },
+   {
+    "name": "focus_capacity_hysteresis",
+    "behavior": "Focus is scarce. Already-focused symbols refresh score and stay. Unpinned admission: size < softCap -> free entry; softCap <= size < hardCap -> enter only if score > weakest unpinned (pool grows, NO eviction); size >= hardCap -> evict weakest unpinned iff strictly stronger, else deny. Pinned always enters (at hard cap evicts weakest unpinned; denied only if everything is pinned). Denied symbols stay WATCHING candidates. Unpinned focus sessions older than focusMaxAgeMs are closed (max_focus_time) back to WATCHING.",
+    "defaults": {
+     "focusSoftCap": 10,
+     "focusHardCap": 25,
+     "focusMaxAgeMs": 900000
+    },
+    "verdict": "KEEP",
+    "reason": "Score-based eviction with a soft/hard band is the promote/demote discipline; hard cap is never exceeded."
+   },
+   {
+    "name": "cooldown_and_candidate_ttl",
+    "behavior": "A reject that lands while the symbol is FOCUS or PROPOSED ('advanced signal died with a named reason') -> COOLDOWN until now + cooldownMs; cooldown symbols are wholly skipped by the tick (no decisions at all) until expiry, then IDLE with correlation cleared. Proposal expiry (gap_closed / ttl / conditions broke) -> same cooldown. A shallow reject (never advanced) -> REJECTED, then back to IDLE after > 2*tickMs. WATCHING candidates older than candidateTtlMs expire to IDLE. 'watch' while FOCUS/PROPOSED closes focus (signal weakened below focus grade but alive) -> WATCHING. 'ignore' closes everything -> IDLE.",
+    "defaults": {
+     "cooldownMs": 600000,
+     "candidateTtlMs": 300000,
+     "shallow_reject_dwell": "2*tickMs"
+    },
+    "verdict": "KEEP",
+    "reason": "Anti-flapping core: a died advanced signal cannot re-arm for 10 min; dropping tracker state on cooldown means persistence restarts honestly."
+   },
+   {
+    "name": "tracker_memory_bounds",
+    "behavior": "Gap tracker holds at most 2*maxUniverseSize buckets (symbol x 2 directions); overflow buckets are transient (computed but not stored). Universe refresh prunes buckets for departed symbols; per-symbol reset drops both directions; lifecycle map similarly capped at maxUniverseSize.",
+    "defaults": {
+     "bucket_cap": "2*maxUniverseSize"
+    },
+    "verdict": "KEEP",
+    "reason": "Bounded state under adversarial symbol churn."
+   },
+   {
+    "name": "legacy_mark_scanner",
+    "behavior": "LEGACY server/src/engine/scanner.ts (superseded): gap = |basisPct| from spot vs perp MARK price (not executable bid/ask). Open hysteresis: ticksAbove >= persistTicks with gross >= feesPct + minNetBasisPct (0.55%). Exit hysteresis: proposal closes only after ticksBelow >= persistTicks consecutive ticks with gross < feesPct (0.3%) \u2014 an ASYMMETRIC enter/exit band with N-tick debounce on both sides; any tick back above fees resets ticksBelow. Missing/stale evidence or volume floor failure retires state immediately (approvability removed before persistence writes).",
+    "defaults": {
+     "enter_threshold": "feesPct+minNetBasisPct = 0.55",
+     "exit_threshold": "feesPct = 0.3"
+    },
+    "verdict": "REJECT",
+    "reason": "Mark-price gap is not executable \u2014 superseded by the basis engine's bid/ask law. ONE idea worth stealing (ADAPT candidate): the debounced asymmetric exit band; the new engine instead closes via proposal invalidation at a single threshold."
+   }
+  ],
+  "fixtures": [
+   {
+    "name": "gap_forward_basic",
+    "inputs": {
+     "spot_ask": 100.02,
+     "perp_bid": 100.8
+    },
+    "expected": {
+     "gap_pct": 0.7798440311937624
+    }
+   },
+   {
+    "name": "gap_reverse_divides_by_long_leg",
+    "inputs": {
+     "spot_bid": 100,
+     "perp_ask": 100.62,
+     "direction": "short_spot_long_perp"
+    },
+    "expected": {
+     "gap_pct": -0.6161796859471322,
+     "note": "divisor is the perp long-entry ask 100.62, NOT spot; (100-100.62)/100 would be -0.62 and is wrong"
+    }
+   },
+   {
+    "name": "gap_degenerate",
+    "inputs": {
+     "cases": [
+      {
+       "sell": 100,
+       "buy": 100
+      },
+      {
+       "sell": 101,
+       "buy": 100
+      },
+      {
+       "sell": 100,
+       "buy": 0
+      }
+     ]
+    },
+    "expected": {
+     "returns": [
+      0,
+      1,
+      null
+     ]
+    }
+   },
+   {
+    "name": "spread_bps",
+    "inputs": {
+     "cases": [
+      {
+       "bid": 100,
+       "ask": 100.6
+      },
+      {
+       "bid": 100,
+       "ask": 100.02
+      },
+      {
+       "bid": 101,
+       "ask": 100
+      }
+     ]
+    },
+    "expected": {
+     "spread_bps": [
+      59.820538384844895,
+      1.9998000199976025,
+      null
+     ],
+     "note": "first > maxSpreadBps 25 -> spread_too_wide"
+    }
+   },
+   {
+    "name": "slope_two_points",
+    "inputs": {
+     "samples": [
+      {
+       "ts": 0,
+       "v": 1
+      },
+      {
+       "ts": 60000,
+       "v": 2
+      }
+     ]
+    },
+    "expected": {
+     "slope_pct_per_min": 1
+    }
+   },
+   {
+    "name": "slope_four_points_2s_apart",
+    "inputs": {
+     "samples": [
+      {
+       "ts": 0,
+       "v": 0.4
+      },
+      {
+       "ts": 2000,
+       "v": 0.5
+      },
+      {
+       "ts": 4000,
+       "v": 0.65
+      },
+      {
+       "ts": 6000,
+       "v": 0.8
+      }
+     ]
+    },
+    "expected": {
+     "slope_pct_per_min": 4.050000000000001
+    }
+   },
+   {
+    "name": "slope_degenerate",
+    "inputs": {
+     "cases": [
+      [
+       {
+        "ts": 5,
+        "v": 1
+       },
+       {
+        "ts": 5,
+        "v": 2
+       }
+      ],
+      [
+       {
+        "ts": 5,
+        "v": 1
+       }
+      ]
+     ]
+    },
+    "expected": {
+     "slope_pct_per_min": [
+      null,
+      null
+     ]
+    }
+   },
+   {
+    "name": "cv_flicker_series",
+    "inputs": {
+     "recent_values": [
+      1.4,
+      0.35,
+      1.4,
+      0.35
+     ]
+    },
+    "expected": {
+     "mean": 0.875,
+     "sample_stddev": 0.606217782649107,
+     "cv": 0.6928203230275508,
+     "exceeds_maxGapCv_0.6": true
+    }
+   },
+   {
+    "name": "cv_insufficient_samples",
+    "inputs": {
+     "recent_values": [
+      1,
+      1.1
+     ]
+    },
+    "expected": {
+     "stability_cv": null,
+     "note": "state() requires >= 3 recent samples"
+    }
+   },
+   {
+    "name": "persistence_and_age",
+    "inputs": {
+     "watchGapPct": 0.15,
+     "tick_interval_ms": 2000,
+     "gap_sequence_pct": [
+      0.78,
+      0.78,
+      0.78,
+      0.12
+     ]
+    },
+    "expected": {
+     "persist_ticks": [
+      1,
+      2,
+      3,
+      0
+     ],
+     "gap_age_ms": [
+      0,
+      2000,
+      4000,
+      null
+     ]
+    }
+   },
+   {
+    "name": "decision_sequence_persist3",
+    "inputs": {
+     "cfg": {
+      "persistTicks": 3,
+      "rest": "BASIS_DEFAULTS"
+     },
+     "gap_pct_each_tick": [
+      0.78,
+      0.78,
+      0.78
+     ],
+     "books": "deep ladder, funding +0.0001, next funding in 4h"
+    },
+    "expected": {
+     "kinds": [
+      "focus",
+      "focus",
+      "proposal"
+     ],
+     "proposal_direction": "long_spot_short_perp",
+     "gross_edge_pct": 0.7798440311937624,
+     "fees_pct": 0.3,
+     "net_edge_pct_range": [
+      0.45,
+      0.52
+     ]
+    }
+   },
+   {
+    "name": "edge_below_fees",
+    "inputs": {
+     "gap_pct": 0.25,
+     "fees_pct": 0.3,
+     "slippage_pct": 0
+    },
+    "expected": {
+     "kind": "reject",
+     "reject_code": "edge_below_fees",
+     "fires_on_tick": 1,
+     "note": "before persistence gate"
+    }
+   },
+   {
+    "name": "edge_below_threshold",
+    "inputs": {
+     "gap_pct": 0.45,
+     "fees_pct": 0.3,
+     "funding_carry_pct": 0.01,
+     "minNetBasisPct": 0.25
+    },
+    "expected": {
+     "net_edge_pct": 0.16,
+     "kind": "reject",
+     "reject_code": "edge_below_threshold",
+     "fires_on_tick": 1
+    }
+   },
+   {
+    "name": "flicker_rejects_not_persistent",
+    "inputs": {
+     "cfg": {
+      "persistTicks": 5,
+      "minNetBasisPct": 0.01
+     },
+     "gap_sequence_pct": [
+      1.4,
+      0.35,
+      1.4,
+      0.35
+     ]
+    },
+    "expected": {
+     "final_kind": "reject",
+     "reject_code": "gap_not_persistent",
+     "evidence_stability_cv": 0.6928203230275508,
+     "persist_ticks_at_reject": 4,
+     "note": "all 4 gaps >= watch so persistence counts, but CV > 0.6 and 4 < 5"
+    }
+   },
+   {
+    "name": "stale_books_then_cooldown",
+    "inputs": {
+     "last_books_at_ms": 2000,
+     "evaluate_at_ms": 12000,
+     "staleMs": 5000,
+     "prior_state": "FOCUS",
+     "cooldownMs": 600000
+    },
+    "expected": {
+     "kind": "reject",
+     "reject_code": "data_stale",
+     "staleness_ms": 10000,
+     "next_tick": "symbol skipped entirely (COOLDOWN)",
+     "cooldown_active_after_600000ms": false
+    }
+   },
+   {
+    "name": "cross_leg_skew_reject",
+    "inputs": {
+     "spot_ts_offset_ms": 0,
+     "perp_ts_offset_ms": -4000,
+     "maxLegSkewMs": 2500
+    },
+    "expected": {
+     "leg_skew_ms": 4000,
+     "kind": "reject",
+     "reject_code": "data_stale",
+     "human_reason_contains": "skew"
+    }
+   },
+   {
+    "name": "depth_score_curve",
+    "inputs": {
+     "formula": "clamp(log10(1+coverage)/log10(11), 0, 1)",
+     "coverage_cases": [
+      10,
+      1,
+      0.2
+     ]
+    },
+    "expected": {
+     "scores": [
+      1,
+      0.2890648263178879,
+      0.07603399483797445
+     ],
+     "note": "coverage 0.2 ($2 visible vs $10 notional) < minDepthScore 0.3 -> depth_too_thin"
+    }
+   },
+   {
+    "name": "priority_momentum",
+    "inputs": {
+     "formula": "clamp(1 + 0.25*tanh(slope/watchGapPct), 0.5, 1.5)",
+     "watchGapPct": 0.15,
+     "slope_cases": [
+      0.15,
+      -0.15,
+      0
+     ]
+    },
+    "expected": {
+     "momentum": [
+      1.190398538988941,
+      0.8096014610110588,
+      1
+     ]
+    }
+   },
+   {
+    "name": "focus_caps_eviction",
+    "inputs": {
+     "focusSoftCap": 2,
+     "focusHardCap": 3,
+     "same_tick_arrival_order": [
+      "AAAUSDT",
+      "BBBUSDT",
+      "CCCUSDT",
+      "DDDUSDT"
+     ],
+     "gaps_pct": [
+      0.6,
+      0.7,
+      0.8,
+      1
+     ]
+    },
+    "expected": {
+     "active_focus_count": 3,
+     "evicted": [
+      "AAAUSDT"
+     ],
+     "evicted_exit_reason": "capacity_evicted",
+     "holding_focus": [
+      "BBBUSDT",
+      "CCCUSDT",
+      "DDDUSDT"
+     ],
+     "note": "CCC grows pool 2->3 without eviction (between caps); DDD at hard cap evicts weakest AAA"
+    }
+   },
+   {
+    "name": "causal_quadrants",
+    "inputs": {
+     "seed": {
+      "spot": [
+       99.98,
+       100
+      ],
+      "perp": [
+       101,
+       101.02
+      ]
+     },
+     "single_leg_moves": [
+      {
+       "leg": "perp",
+       "to": [
+        101.5,
+        101.52
+       ]
+      },
+      {
+       "leg": "spot",
+       "to": [
+        99.48,
+        99.5
+       ]
+      },
+      {
+       "leg": "spot",
+       "to": [
+        100.48,
+        100.5
+       ]
+      },
+      {
+       "leg": "perp",
+       "to": [
+        100.5,
+        100.52
+       ]
+      }
+     ]
+    },
+    "expected": {
+     "quadrants": [
+      "RISING_PERPETUAL_LED",
+      "RISING_SPOT_LED",
+      "FALLING_SPOT_LED",
+      "FALLING_PERPETUAL_LED"
+     ],
+     "tie_both_legs_equal_source_time": "DISCONTINUITY AMBIGUOUS_PAIRED_CHANGE -> UNKNOWN"
+    }
+   },
+   {
+    "name": "causal_growth_then_confirmed_decay",
+    "inputs": {
+     "seed_at": "T",
+     "events": [
+      {
+       "at": "T+1000",
+       "leg": "perp",
+       "to": [
+        101.5,
+        101.52
+       ]
+      },
+      {
+       "at": "T+1500",
+       "leg": "perp",
+       "to": [
+        101.7,
+        101.72
+       ]
+      },
+      {
+       "at": "T+2000",
+       "leg": "spot",
+       "to": [
+        100.18,
+        100.2
+       ]
+      }
+     ]
+    },
+    "expected": {
+     "quadrant": "RISING_PERPETUAL_LED",
+     "initiating_source_ts": "T+1000",
+     "persistence_events": 3,
+     "evolution": "DECAYING",
+     "follower_market": "SPOT",
+     "follower_confirmation": "CONFIRMED",
+     "public_age_ms_at_T+2000": 1000
+    }
+   },
+   {
+    "name": "causal_flip_resets",
+    "inputs": {
+     "events": [
+      {
+       "at": "T+1000",
+       "leg": "perp",
+       "to": [
+        101.5,
+        101.52
+       ]
+      },
+      {
+       "at": "T+1500",
+       "leg": "perp",
+       "to": [
+        101.2,
+        101.22
+       ]
+      }
+     ]
+    },
+    "expected": {
+     "quadrant": "FALLING_PERPETUAL_LED",
+     "initiating_source_ts": "T+1500",
+     "age_ms": 0,
+     "persistence_events": 1,
+     "follower_confirmation": "PENDING"
+    }
+   },
+   {
+    "name": "causal_expiry_and_source_reversal",
+    "inputs": {
+     "expiry_case": {
+      "causalExpiryMs": 1000,
+      "init_at": "T+1000",
+      "next_event_at": "T+2500"
+     },
+     "reversal_case": {
+      "accepted_source_time_max": "T+1050",
+      "changed_leg_source_time": "T+800"
+     }
+    },
+    "expected": {
+     "expiry": "quadrant UNKNOWN (lifecycle expired on accepted-at clock)",
+     "reversal": "DISCONTINUITY SOURCE_CLOCK_REVERSAL -> causality all UNKNOWN/null, persist_ticks unaffected only if gap still computable; decisions/proposals themselves unaffected (causality never gates)"
+    }
+   }
+  ],
+  "state_machine": {
+   "symbol_lifecycle": {
+    "states": [
+     "IDLE",
+     "WATCHING",
+     "FOCUS",
+     "PROPOSED",
+     "REJECTED",
+     "COOLDOWN"
+    ],
+    "transitions": [
+     {
+      "from": "any",
+      "on": "decision ignore",
+      "to": "IDLE",
+      "effect": "close focus if advanced; drop candidate; correlation cleared"
+     },
+     {
+      "from": "any",
+      "on": "decision watch",
+      "to": "WATCHING",
+      "effect": "open/refresh candidate; if was FOCUS/PROPOSED close focus (signal_expired \u2014 weakened below focus grade)"
+     },
+     {
+      "from": "any",
+      "on": "decision focus + capacity granted",
+      "to": "FOCUS",
+      "guard": "tryFocus caps (soft 10 / hard 25, score vs weakest unpinned, pinned override)"
+     },
+     {
+      "from": "any",
+      "on": "decision focus + capacity denied",
+      "to": "WATCHING",
+      "effect": "stays a candidate"
+     },
+     {
+      "from": "any",
+      "on": "decision proposal",
+      "to": "PROPOSED",
+      "effect": "holds a focus slot when available"
+     },
+     {
+      "from": "FOCUS|PROPOSED",
+      "on": "decision reject",
+      "to": "COOLDOWN",
+      "effect": "close focus with reject-code-projected exit reason; cooldownUntil = now + cooldownMs (600000); symbol skipped entirely while cooling"
+     },
+     {
+      "from": "IDLE|WATCHING",
+      "on": "decision reject",
+      "to": "REJECTED",
+      "effect": "shallow reject; back to IDLE after > 2*tickMs via maintain()"
+     },
+     {
+      "from": "PROPOSED|FOCUS",
+      "on": "proposal expired (gap_closed/ttl/invalidation)",
+      "to": "COOLDOWN",
+      "effect": "same cooldown"
+     },
+     {
+      "from": "WATCHING",
+      "on": "candidate age > candidateTtlMs (300000)",
+      "to": "IDLE",
+      "effect": "candidate_rejected(ttl); correlation cleared"
+     },
+     {
+      "from": "FOCUS",
+      "on": "session age > focusMaxAgeMs (900000) and not pinned",
+      "to": "WATCHING",
+      "effect": "focus closed max_focus_time"
+     },
+     {
+      "from": "COOLDOWN",
+      "on": "now >= cooldownUntil",
+      "to": "IDLE",
+      "effect": "correlation cleared"
+     }
+    ]
+   },
+   "causal_gap_lifecycle_per_symbol_direction": {
+    "states": [
+     "NONE(UNKNOWN)",
+     "ACTIVE{quadrant, evolution GROWING|DECAYING, follower PENDING|CONFIRMED|UNKNOWN}"
+    ],
+    "transitions": [
+     {
+      "from": "NONE",
+      "on": "accepted single-initiator event",
+      "to": "ACTIVE",
+      "guard": "gap_after >= watchGapPct AND |delta| >= causalMoveThresholdPct (0.005) AND delta != 0 AND both pair cuts usable at acceptedAtMs"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "same-market significant move, same gap-trend and same initiator price-trend",
+      "to": "ACTIVE",
+      "effect": "advance GROWING; persistenceEvents+1 (cap gapWindowSize)"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "same-market significant move with gap-trend flip OR initiator price-trend flip",
+      "to": "ACTIVE(restarted)",
+      "effect": "new source cut: fresh source ts/seq, age 0, persistence 1, follower PENDING"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "opposite-market move matching initiator price-trend while gap decays toward baseline",
+      "to": "ACTIVE",
+      "effect": "follower CONFIRMED; evolution DECAYING"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "opposite-market significant non-confirming move",
+      "to": "ACTIVE(restarted)",
+      "effect": "that market becomes the new initiator; nothing leaks across the flip"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "insignificant nonzero drift",
+      "to": "ACTIVE",
+      "effect": "advance; DECAYING if toward baseline else GROWING"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "gap crosses back through baseline",
+      "to": "NONE",
+      "effect": "resolved"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "now - initiatedAtAcceptedMs > causalExpiryMs (15000) OR clock regression",
+      "to": "NONE",
+      "effect": "expired"
+     },
+     {
+      "from": "ACTIVE",
+      "on": "gap < watchGapPct OR gap null OR causal pair unusable OR any ingest DISCONTINUITY",
+      "to": "NONE",
+      "effect": "reset; reports UNKNOWN"
+     }
+    ]
+   }
+  },
+  "not_ported": [
+   "Reverse-basis borrow preflight (borrow.ts; borrow_unknown/unavailable/too_small/cost_too_high guards, borrowSafetyFactor 1.5, maxBorrowHourlyRatePct 0.01) \u2014 port scope is normal basis only",
+   "Funding carry / flip-risk / captureFactor internals and edge assembly (funding.ts, edge.ts) \u2014 separate mining area; this spec only consumes fresh/carry/drag/netEdge at the guard boundary",
+   "Proposal store: TTL, invalidation spec, staged sizes, revision/acceptance, prepareOrderIntents risk bridge (proposals.ts, engine execution path) \u2014 proposals/execution excluded",
+   "BasisHandoffLifecycle (lifecycle.ts bottom half) \u2014 execution-side, constructed default-OFF, single-use; disabled system",
+   "Historical reject-code map and replay projection (rejectVocabulary.ts historical spellings borrow_required/risk_blocked/account_not_connected) \u2014 back-compat replay only",
+   "Event emitter, snapshots, replay harness, correlation-id plumbing (events.ts, snapshots.ts, replay.ts) \u2014 infrastructure, not kernel math",
+   "Legacy mark-price scanner (server/src/engine/scanner.ts) \u2014 superseded by executable-gap engine; only its asymmetric exit band recorded as an ADAPT candidate",
+   "BasisRuntime adapter beyond the universe eligibility predicate (generation ownership, ledger failure isolation, decay governance ticks) \u2014 transport/ops, not scanner math",
+   "v0 volume-spike scanner defaults (vol1sMultiple etc. in v0/config.ts) \u2014 different lane",
+   "publicOpportunityObservation*, rolling24hEdgeStatistic \u2014 observation/statistics side-channels, not decision math"
+  ],
+  "notes": [
+   "MEASURED: full reads of gapTracker.ts, basis/scanner.ts, config.ts, math.ts, marketState.ts, engine.ts, priority.ts, lifecycle.ts, features.ts, legacy engine/scanner.ts, rejectVocabulary codes, engine-basis.mjs (873 lines) and engine-basis-causal-gap.test.mjs (649 lines); assessDataQuality and expectedHoldMs read as targeted excerpts. Clone: current-main @ 475bd57, read-only in scratchpad.",
+   "INFERRED (labeled): exact fixture decimals were recomputed by running the ported formulas in node (not asserted verbatim in old tests, which use tolerances: gross within 0.01 of 0.78, net in [0.45,0.52], CV > 0.6); the arithmetic matches all old-test tolerance assertions.",
+   "not_checked: edge.ts, borrow.ts, funding.ts remainder (flipRisk/captureFactor bodies), liquidity.ts assessLiquidity body, proposals.ts, snapshots.ts, replay.ts, events.ts, basisRuntime.ts full, engine-basis-runtime-causality.test.mjs, test/realGaps fixtures.",
+   "UNITS: every *Pct value is percent (0.78 means 0.78%); spreads are bps (x10000 of fraction); fundingRate is a per-settlement FRACTION (0.0001 = 1bp) and carry pct = rate*100; causalMoveThresholdPct is percentage POINTS of gap; all timestamps ms.",
+   "Causality (quadrant/initiator/follower) is evidence-only \u2014 no scanner guard reads it \u2014 so the minimal Python kernel reproduces every decision fixture without the causal sub-machine; port it later for attribution UI parity.",
+   "Two scanner.ts files exist; the canonical one for this area is server/src/engine/basis/scanner.ts. server/src/engine/scanner.ts is the older mark-price monitor with asymmetric enter(0.55%)/exit(0.3%) N-tick hysteresis \u2014 mined, verdict REJECT except the exit-band idea.",
+   "persistTicks frozen v0 default is 5; the old proof suite overrides to 3 \u2014 fixtures state which config they assume. Proposal fires on the tick where persistTicks reaches the requirement (observe increments before the scanner evaluates).",
+   "Two subtle orderings worth preserving in the port: (a) economics rejects (fees/threshold/funding) fire BEFORE the persistence watch/focus gate, so weak edges never enter watching; (b) the stability CV reject requires persistTicks < required \u2014 survived persistence overrides noisiness.",
+   "Cooldown is a full scan skip (the symbol produces zero decisions while cooling), and entering cooldown does not clear tracker samples \u2014 but universe departure and config revision DO clear tracker state (gaps.clear on updateConfig, retainSymbols on setUniverse).",
+   "Config validation worth porting: watchGapPct <= focusGapPct, causalMoveThresholdPct in (0, watchGapPct), minHold <= defaultHold <= maxHold, gapWindowSize >= 3, focusSoftCap <= focusHardCap, maxUniverseSize <= 10000, universe over cap throws before allocation."
+  ]
+ },
+ "lifecycle": {
+  "area": "lifecycle",
+  "verdict": "PORTABLE. The old repo has NO single machine literally named candidate/ready/opening/open/closing/closed/unknown. The lifecycle is three measured layers: (1) signal layer IDLE/WATCHING/FOCUS/PROPOSED/REJECTED/COOLDOWN in server/src/engine/basis/lifecycle.ts (assigned file, read in full); (2) position/plan layer CREATED..READY/OPENING/ONE_LEG_EXPOSED/HEDGED_OPEN/CLOSE_REQUESTED/CLOSING/RECONCILING/CLOSED/RECOVERY_REQUIRED/FAILED/CANCELLED/EXPIRED in server/src/foundation/contracts/execution.ts + foundation/execution/reducer.ts; (3) while-OPEN exit authority (convergence, max-hold, edge-inversion, emergency, UNKNOWN-freeze) in server/src/capitalFoundation/supervision/{common,basis}.ts. engine.ts and basisRuntime.ts (assigned, read in full) carry tick order, kill-switch/intake-pause, restart fences, and freshness. The 7-state Python collapse maps cleanly (see state_machine.python_target_mapping) provided the listed guards, the UNKNOWN-blocks semantics, and the restart query-first rule are preserved. Fixtures below feed the differential harness; they are transcribed from the repo's committed test suites, not re-executed.",
+  "rules": [
+   {
+    "name": "signal_state_from_decision",
+    "behavior": "Fold one scanner decision per tick into the symbol machine: ignore -> close focus (signal_expired) if FOCUS/PROPOSED, drop candidate, state=IDLE, correlationId=null; watch -> upsert candidate, close focus if advanced, state=WATCHING; focus -> upsert candidate, tryFocus() ? FOCUS : WATCHING (capacity denied stays candidate); proposal -> upsert candidate, tryFocus best-effort, state=PROPOSED; reject -> close focus with projected exit reason if advanced, drop candidate, state=REJECTED, and if it WAS advanced (FOCUS/PROPOSED) also cooldownUntil=now+cooldownMs and state=COOLDOWN",
+    "defaults": {
+     "cooldownMs": 600000
+    },
+    "verdict": "KEEP",
+    "reason": "This is the candidate stage of the new machine; measured in lifecycle.ts applyDecision()"
+   },
+   {
+    "name": "shallow_vs_advanced_reject",
+    "behavior": "Only a reject that hit an advanced state (FOCUS/PROPOSED) cools down; a shallow reject (never focused) sits in REJECTED and returns to IDLE after 2*tickMs in maintain(), correlationId cleared",
+    "defaults": {
+     "tickMs": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "Prevents cooldown-flapping punishment for symbols that never earned attention"
+   },
+   {
+    "name": "cooldown_scan_suppression",
+    "behavior": "tick() skips any symbol whose cooldownUntilTs > now before building features; cooldown expiry in maintain() sets IDLE and clears correlation; activeCooldownCount() computes against now without requiring a tick",
+    "defaults": {
+     "cooldownMs": 600000
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "candidate_ttl",
+    "behavior": "A WATCHING candidate older than candidateTtlMs is dropped: emit candidate_rejected 'candidate expired (ttl)', state IDLE, correlation cleared",
+    "defaults": {
+     "candidateTtlMs": 300000
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "focus_max_age",
+    "behavior": "Unpinned focus session older than focusMaxAgeMs closes with exit max_focus_time and FOCUS->WATCHING. NOTE: this is signal-attention max age, NOT the position max-hold",
+    "defaults": {
+     "focusMaxAgeMs": 900000
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "focus_capacity",
+    "behavior": "Admission under caps: existing session just rescores; pinned always enters unless everything is pinned at hard cap; above softCap only score > weakest-unpinned enters; at hardCap the weakest unpinned is evicted (exit capacity_evicted, FOCUS->WATCHING) for a stronger signal, else denied; hard cap never exceeded",
+    "defaults": {
+     "focusSoftCap": 10,
+     "focusHardCap": 25
+    },
+    "verdict": "ADAPT",
+    "reason": "For a one-position Python kernel a cap of 1 collapses this to 'strongest candidate wins'; keep eviction-by-score semantics"
+   },
+   {
+    "name": "proposal_expiry_to_cooldown",
+    "behavior": "onProposalExpired(symbol, why) only acts from PROPOSED/FOCUS: close focus with exit gap_closed iff why=='gap_closed' else signal_expired, drop candidate, cooldown now+cooldownMs",
+    "defaults": {
+     "cooldownMs": 600000
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "proposal_invalidation_ladder",
+    "behavior": "Engine sweep kills open proposals in order: ttl_elapsed (now>=expiresTs); market_data_missing; book_missing (gapPct null); funding_stale; borrow_invalid (reverse only); data_quality_failed (dq < minDataQuality); gap_closed (gapPct < spec.gapClosesBelowPct = watchGapPct at creation); funding_flipped_against (carryPctOverHold < -maxFundingDragPct); data_stale (leg staleness > spec.maxStaleMs); spread_widened; depth_vanished. Each expiry feeds onProposalExpired",
+    "defaults": {
+     "proposalTtlMs": 600000,
+     "watchGapPct": 0.15,
+     "maxFundingDragPct": 0.15,
+     "minDataQuality": 0.4,
+     "staleMs": 5000
+    },
+    "verdict": "KEEP",
+    "reason": "These are the candidate-stage exit reasons; gap_closed is the pre-position convergence exit"
+   },
+   {
+    "name": "reject_vocabulary_projection",
+    "behavior": "projectBasisRejectDisposition: current scanner codes and intake_paused -> focusExitReason 'cooldown'; historical risk_blocked -> 'risk_rejected' (owner FOUNDATION_RISK); borrow_required retires to borrow_unknown; account_not_connected -> ACCOUNT_TRUTH_BLOCKED (owner CAPITAL_ELIGIBILITY); anything else INVALID -> cooldown",
+    "verdict": "ADAPT",
+    "reason": "Port only the current-code -> cooldown path; historical projections matter only if replaying old ledgers"
+   },
+   {
+    "name": "universe_retention",
+    "behavior": "Symbols leaving the universe: active focus closed as signal_expired, candidates/lifecycles/pins deleted, proposals expired (symbol_left_universe if gone, symbol_ineligible if present-but-ineligible), priorities and decision log pruned; engine emits universe_refreshed",
+    "defaults": {
+     "maxUniverseSize": 2500
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "config_revision_reset",
+    "behavior": "Any accepted config change: expire ALL proposals (config_changed), lifecycle.resetSignals() (closes focus signal_expired, clears candidates+lifecycles, preserves pins), clear gap history, priorities, decision log, tick/heartbeat marks; universe larger than new maxUniverseSize throws",
+    "verdict": "KEEP",
+    "reason": "State derived under old thresholds is invalid by definition"
+   },
+   {
+    "name": "kill_switch_semantics",
+    "behavior": "Kill switch ON: observation and scanning continue, proposals still form; only prepareOrderIntents refuses (verdict kill_switch_on, risk_rejected event). Runtime re-applies config.killSwitch every refresh; a universe-refresh failure forces kill switch ON, empties the universe, nulls freshness",
+    "verdict": "KEEP",
+    "reason": "Fail-closed on the execution edge only; eyes stay open"
+   },
+   {
+    "name": "intake_pause_semantics",
+    "behavior": "setIntakePaused(true): expire all open proposals (intake_paused); scanner 'proposal' decisions are demoted to reject intake_paused while paused; prepareOrderIntents refuses intake_paused and expires the named proposal. Observation continues",
+    "verdict": "KEEP"
+   },
+   {
+    "name": "prepare_intents_entry_guard",
+    "behavior": "Execution bridge (metadata only, never places orders): sweep first; refuse intake_paused; refuse proposal_not_open unless status open/updated; validate direction in {long_spot_short_perp, short_spot_long_perp}, symbol eligible + allowed by policy + not blocked, suggestedNotionalUsd finite > 0, else expire proposal_invalid; refuse kill_switch_on; else two legs (long_spot_short_perp = BUY spot + SELL perp) at proposal notional",
+    "defaults": {
+     "suggestedNotionalUsd": 10
+    },
+    "verdict": "KEEP",
+    "reason": "suggestedNotionalUsd=10 itself is REJECT as arbitrary dev-safe placeholder; the guard chain is KEEP"
+   },
+   {
+    "name": "tick_determinism",
+    "behavior": "tick(): for each symbol (skip cooldown) build features -> scanner evaluate -> intake-pause demotion -> correlation stamp (ignore keeps or mints idle corr; others ensureCorrelation) -> priority -> applyDecision -> proposal upsert if kind proposal -> emit strategy_decision; then proposals.sweep(fresh non-observing snapshots) -> onProposalExpired each; then lifecycle.maintain(); heartbeat every heartbeatMs; decision log capped 2000",
+    "defaults": {
+     "tickMs": 2000,
+     "heartbeatMs": 30000,
+     "decisionLogKeep": 2000
+    },
+    "verdict": "KEEP",
+    "reason": "Order matters: sweep after scan, maintain after sweep \u2014 the differential harness must replay this order"
+   },
+   {
+    "name": "runtime_cadence_freshness",
+    "behavior": "Runtime polls both all-symbol book endpoints every 1500ms with a 10s acquisition timeout racing the transport's 8s abort; universe refresh every 15min (also re-run on config/policy change and whenever eligible set is empty); book/mark reported 'fresh' iff age < 10000ms on a latched clock; mark goes null when no mark seen for fundingStaleMs; ledger events deduped per signature for 60s; ingestion and engine.tick() happen in the same turn so snapshot is one coherent book",
+    "defaults": {
+     "BOOK_REFRESH_MS": 1500,
+     "BOOK_ACQUISITION_TIMEOUT_MS": 10000,
+     "UNIVERSE_REFRESH_MS": 900000,
+     "LEDGER_REPEAT_MS": 60000,
+     "freshWindowMs": 10000,
+     "fundingStaleMs": 10000
+    },
+    "verdict": "ADAPT",
+    "reason": "Keep the stale windows and same-turn tick; polling cadence is deployment-specific"
+   },
+   {
+    "name": "latched_clock",
+    "behavior": "latchedNowMs() = max(lastObserved, now): a backward NTP step freezes observed time instead of making freshness ages negative (stale reporting fresh). All freshness math uses it",
+    "verdict": "KEEP",
+    "reason": "F-080 regression fix; cheap and load-bearing"
+   },
+   {
+    "name": "stop_restart_book_fence",
+    "behavior": "stop(): bump generation (cancels in-flight work), clear timers, engine.stop(), engine.resetBookContinuity() (market + gap tracker cleared) so no causal move bridges an observation outage; start(): null lastBookTs/lastMarkTs; generation ownership checked after every await",
+    "verdict": "KEEP"
+   },
+   {
+    "name": "usable_book_guard",
+    "behavior": "A book observation is usable iff bid/ask/bidQty/askQty all finite, prices > 0, ask >= bid, qtys > 0; unusable legs are passed as null (never zero-filled)",
+    "verdict": "KEEP"
+   },
+   {
+    "name": "plan_lifecycle_graph",
+    "behavior": "Position/plan machine transitions (full graph in state_machine). Design invariants: OPENING reachable only via READY; CLOSED only via CLOSING or RECONCILING; EXPIRED reachable only before capital is exposed \u2014 naked-duration expiry AFTER exposure is RECOVERY_REQUIRED, never EXPIRED; terminal = CLOSED/FAILED/CANCELLED/EXPIRED",
+    "verdict": "KEEP"
+   },
+   {
+    "name": "exposure_derived_from_leg_facts",
+    "behavior": "After every OPEN-phase leg event, plan state is derived only from leg facts, never optimism: isSafelyHedged (known exposure, no ambiguous leg, no over-close, no pending opening order, |normResidual(SPOT)-normResidual(PERP)| <= 1e-12) -> HEDGED_OPEN; else any fill -> ONE_LEG_EXPOSED; opening-leg rejected with zero fills while OPENING -> FAILED. Close phase: close-leg REJECTED or ambiguity-unresolved -> RECOVERY_REQUIRED; naked while CLOSING -> ONE_LEG_EXPOSED. Over-close or terminal-with-working-leg = invariant violation (event rejected)",
+    "defaults": {
+     "EPSILON": 1e-12
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "naked_duration_timer",
+    "behavior": "hasNakedExposure includes ambiguous legs AND submitting/working orders (timer starts at submission, not fill); exposedSinceMs latches at first naked event and clears when hedged; NAKED_DURATION_EXPIRED is valid only when occurredAtMs >= exposedSinceMs + plan.maxNakedDurationMs and forces RECOVERY_REQUIRED. maxNakedDurationMs is a required positive per-plan field cross-checked against declared risk terms \u2014 no global default",
+    "verdict": "KEEP",
+    "reason": "This is the position-level one-leg emergency clock at the execution layer"
+   },
+   {
+    "name": "restart_recovery_while_open",
+    "behavior": "Restore = replay the checkpointed event log through the reducer (checksum-verified). If restored lifecycle is non-terminal and any leg has submittedQuantity > 0 (or normal-basis progress demands QUERY_REQUIRED/CANCEL_ELIGIBLE/AWAIT_TERMINAL), restartRecoveryPending: every such leg must be re-verified by venue lookup on its deterministic clientOrderId BEFORE any progression; lookup timeout/contradiction emits RESTART_RECOVERY_BLOCKED -> RECOVERY_REQUIRED. Recovery recommendations are data-only, automatic:false always: AMBIGUOUS/SUBMITTING -> VERIFY_AMBIGUOUS_ORDER; open ACKNOWLEDGED/PARTIALLY_FILLED/CANCEL_PENDING -> CANCEL_REMAINDER (risk-reducing); known exposure -> CLOSE_EXPOSED_LEG (+ HEDGE_RESIDUAL when ONE_LEG_EXPOSED with exposedSince); RECOVERY_REQUIRED -> MANUAL_REVIEW",
+    "verdict": "KEEP",
+    "reason": "The restart-while-OPEN contract: query-first, never resubmit on trust"
+   },
+   {
+    "name": "supervision_directive_ladder",
+    "behavior": "While a position exists, one directive is chosen by strict priority (first match wins). Universal: position CLOSED -> HOLD; one-leg exposure > 0: reconciliation not PASS or state RECOVERY_REQUIRED -> REQUEST_EMERGENCY_UNWIND(ONE_LEG_RECONCILIATION_UNCERTAIN, deadline now); invalid common policy -> EMERGENCY_UNWIND; one-leg duration unknown or > emergencyOneLegDurationMs -> EMERGENCY_UNWIND(ONE_LEG_DURATION_EMERGENCY); else REQUEST_HEDGE(ONE_LEG_EXPOSURE) with hardDeadline = oneLegSince + maximumOneLegDurationMs. Then: reconciliation not exact / RECOVERY_REQUIRED -> FREEZE_NEW_ACTIONS (EMERGENCY if recon BREACH); thesis invalidated / max-hold breach / target reached -> REQUEST_EXIT (THESIS_INVALIDATED urgent / MAXIMUM_HOLDING_HORIZON urgent / THESIS_TARGET_REACHED routine); gross-exposure breach -> REDUCE urgent; depth or exit-capacity breach -> REDUCE elevated; outstanding-intents breach -> FREEZE. Basis-specific (only if nothing above fired): liquidation-distance or margin-distance breach or borrow RECALLED -> REQUEST_EMERGENCY_UNWIND(BASIS_CAPITAL_SURVIVAL_LIMIT, deadline now); borrow UNAVAILABLE -> REQUEST_EXIT(BORROW_UNAVAILABLE); hedge-drift breach -> REQUEST_HEDGE; remaining-edge breach -> REQUEST_EXIT(REMAINING_EDGE_EXHAUSTED); divergence breach -> REQUEST_EXIT(BASIS_DIVERGENCE_INVALIDATION); funding/borrow-rate/liquidity breach -> REDUCE elevated; ANY check UNKNOWN -> FREEZE_NEW_ACTIONS(BASIS_REQUIRED_TRUTH_UNKNOWN); all PASS + truth allows increase -> ADD_STAGE; else HOLD",
+    "verdict": "KEEP",
+    "reason": "This ladder IS the exit-reason engine the task asked for: emergency, max-hold, edge-inversion, convergence-target"
+   },
+   {
+    "name": "exit_convergence",
+    "behavior": "Two convergence facts: (a) BASIS_PATH check: sort path by observedAtMs, count the trailing run where |executableBasis| is non-increasing (count starts at 1 for non-empty); count >= requiredConvergingObservationsForAdd -> PASS (supports ADD), else WATCH \u2014 convergence gates adds, it does not itself exit. (b) The convergence EXIT is thesisAssessment.targetReached == true -> THESIS_TARGET check WATCH -> REQUEST_EXIT(THESIS_TARGET_REACHED, ROUTINE) \u2014 take-profit on gap convergence",
+    "defaults": {
+     "requiredConvergingObservationsForAdd_testPolicy": 3
+    },
+    "verdict": "KEEP"
+   },
+   {
+    "name": "exit_max_hold",
+    "behavior": "THESIS_AGE check: age = now - thesis.openedAtMs; age >= thesis.maximumHoldingHorizonMs -> BREACH -> REQUEST_EXIT(MAXIMUM_HOLDING_HORIZON, URGENT, deadline now); age >= expectedHorizonMs -> WATCH. Horizons are per-thesis fields (validated maximumHoldingHorizonMs >= expectedHorizonMs), NOT the engine's defaultHoldMs/minHoldMs/maxHoldMs (those are funding-carry estimate bounds: 4h default, 10min..24h)",
+    "defaults": {
+     "engine_defaultHoldMs": 14400000,
+     "engine_minHoldMs": 600000,
+     "engine_maxHoldMs": 86400000
+    },
+    "verdict": "KEEP",
+    "reason": "Do not confuse carry-estimate hold with position max-hold \u2014 separate concepts in the old code"
+   },
+   {
+    "name": "exit_edge_inversion",
+    "behavior": "BASIS_REMAINING_EDGE: expectedRemainingEdgeAfterExitCosts <= minimumRemainingEdge -> BREACH -> exit REMAINING_EDGE_EXHAUSTED; < minimumRemainingEdgeForAdd -> WATCH (blocks add only); policy requires minimumRemainingEdgeForAdd >= minimumRemainingEdge. BASIS_DIVERGENCE: adverseMove = max(0, |currentExecutableBasis| - |entryExecutableBasis|); > maximumAdverseBasisMove -> BREACH -> exit BASIS_DIVERGENCE_INVALIDATION. All values are canonical exact-decimal strings in RATIO units; policy bounds are content-addressed (revision must equal derived hash) \u2014 no global numeric defaults exist",
+    "verdict": "KEEP"
+   },
+   {
+    "name": "exit_funding_adverse",
+    "behavior": "Adverse funding = direction PAID and |rate| > maximumAdverseFundingRate and nextFundingAtMs <= now + fundingExitLeadTimeMs -> BASIS_FUNDING BREACH -> REDUCE (elevated), not full exit; missing/unknown funding fields -> UNKNOWN (freeze). The lead time exists to act before the next funding event, not after",
+    "verdict": "KEEP"
+   },
+   {
+    "name": "unknown_blocks",
+    "behavior": "What UNKNOWN blocks: any UNKNOWN check forces FREEZE_NEW_ACTIONS \u2014 no new/increasing action, ADD impossible (allTruthAllowsIncrease requires every check PASS) \u2014 but UNKNOWN never fabricates an exit, and the risk-reducing emergency ladder sits ABOVE the freeze so one-leg/reconciliation emergencies still fire. Malformed shapes become UNKNOWN, never guesses; DIVERGENT truth is BREACH, not UNKNOWN; an invalid position projection returns NO_ACTION_UNKNOWN (URGENT) and an invalid source-identity binding throws. Position state UNKNOWN is lifecycle-consistent only with capitalLifecycle UNKNOWN or RECOVERY_REQUIRED",
+    "verdict": "KEEP",
+    "reason": "Fail-closed asymmetry: unknowns freeze increases, never trigger or suppress risk reduction"
+   },
+   {
+    "name": "handoff_machine",
+    "behavior": "BasisHandoffLifecycle: exactly one already-accepted proposal claimed atomically by id (disabled/already-bound refuse BEFORE the store is touched, so no acceptance burns without a handoff); binds acceptance facts verbatim, handoffId = 'bh_'+proposalId; single-use instance. States AWAITING_FEEDBACK -> TERMINAL only; progress ONLY on matching TERMINAL or CANCEL_CONFIRMED feedback carrying a canonical non-negative exact-decimal cumulative base quantity recorded verbatim (never summed/scaled/USD-converted; never compared to acceptedNotionalUsd). Refusal order: DISABLED, NO_ACTIVE_HANDOFF, FEEDBACK_MALFORMED, WRONG_IDENTITY, REVISION_MISMATCH, ALREADY_TERMINAL, STALE_SEQUENCE, DUPLICATE_SEQUENCE, STALE_OBSERVATION (observedAtMs < boundTs or < last), QUANTITY_NOT_EXACT. Nonterminal WORKING/AMBIGUOUS/CANCEL_REQUESTED advance ordering only (AMBIGUOUS increments a counter); quantity smuggled on nonterminal is ignored. Terminal clock failure or regression throws and leaves the record wholly awaiting. Nonzero CANCEL_CONFIRMED is a first-leg terminal fact \u2014 no flatness/residual/unwind claims. Default OFF; runtime constructs it disabled with no enable path",
+    "verdict": "KEEP",
+    "reason": "This is the open->closed settlement record for the Python port's close accounting"
+   },
+   {
+    "name": "capital_lifecycle_graph",
+    "behavior": "20-state capital graph (OBSERVED..UNKNOWN, terminal CLOSED/CANCELLED/EXPIRED) with two fail-closed gated edges in the pure guard: AWAITING_APPROVAL->AWAITING_RISK only via the approvals lane, AWAITING_RISK->READY_FOR_EXECUTION only via Foundation execution; plus a 7-stage OBSERVE..EXIT ladder where ADD requires fresh evidence + reservation + approval + future risk recheck and adverse-price-move-alone is forbidden (AVERAGING_DOWN_FORBIDDEN)",
+    "verdict": "ADAPT",
+    "reason": "Over-engineered for a small kernel; port only the anti-averaging-down ADD gate and the fail-closed approval/risk edges as booleans on the collapsed machine"
+   }
+  ],
+  "fixtures": [
+   {
+    "name": "persistence_gate_then_proposal",
+    "inputs": {
+     "harness": "createReplayHarness({persistTicks:3}, T0=1000000), SYM=TESTUSDT, spotAsk=100.02, perpBid=spotAsk*1.0078 (0.78% gap), 3 ticks at T0+2000/4000/6000, qty 500 both legs, fundingRate 0.0001"
+    },
+    "expected": {
+     "openProposals": 1,
+     "direction": "long_spot_short_perp",
+     "grossEdgePct": "~0.78 (+/-0.01)",
+     "netEdgePct": "in (0.45,0.52)",
+     "costBreakdown.feesPct": 0.3,
+     "borrowRequired": false,
+     "stagedSizes": "3 stages, first notionalUsd ~2.5 (0.25*10)",
+     "first_two_decisions": "kind=focus (persistence gate), proposal on 3rd persisting tick"
+    }
+   },
+   {
+    "name": "stale_data_cooldown_cycle",
+    "inputs": {
+     "setup": "books at T0+2000 then silence",
+     "tick1": "T0+12000 (10s silence > staleMs 5000)",
+     "tick2": "T0+14000",
+     "then": "clock.advance(cooldownMs=600000)"
+    },
+    "expected": {
+     "tick1_decision": "reject data_stale",
+     "tick2_decisions": 0,
+     "lifecycle_state": "COOLDOWN",
+     "activeCooldownCount_before": 1,
+     "activeCooldownCount_after_advance": 0
+    }
+   },
+   {
+    "name": "focus_caps_eviction",
+    "inputs": {
+     "config": "{persistTicks:10, focusSoftCap:2, focusHardCap:3}",
+     "symbols": [
+      "AAAUSDT",
+      "BBBUSDT",
+      "CCCUSDT",
+      "DDDUSDT"
+     ],
+     "gapsPct": [
+      0.6,
+      0.7,
+      0.8,
+      1
+     ],
+     "one_tick": "all four in the same tick"
+    },
+    "expected": {
+     "activeFocusCount": "<=3",
+     "focus_closed capacity_evicted": "exactly 1, symbol AAAUSDT",
+     "surviving_focus": [
+      "BBBUSDT",
+      "CCCUSDT",
+      "DDDUSDT"
+     ]
+    }
+   },
+   {
+    "name": "historical_risk_blocked_focus_exit",
+    "inputs": {
+     "setup": "symbol in FOCUS (one 0.78% tick, persistTicks 3)",
+     "action": "applyDecision({kind:'reject', rejectCode:'risk_blocked'}, priority)"
+    },
+    "expected": {
+     "projection": "projectBasisRejectDisposition('risk_blocked') = {classification:HISTORICAL, owner:FOUNDATION_RISK, successorOutcome:risk_rejected, focusExitReason:risk_rejected}",
+     "focus_session_exitReason": "risk_rejected (never signal_expired)"
+    }
+   },
+   {
+    "name": "universe_removal_prunes_state",
+    "inputs": {
+     "setup": "open proposal on TESTUSDT after 3x0.78% ticks",
+     "action": "setUniverse([meta('NEWUSDT')]) without tick"
+    },
+    "expected": {
+     "market_has_TESTUSDT": false,
+     "lifecycle_rows_have_TESTUSDT": false,
+     "priorityOf_TESTUSDT": null,
+     "old_proposal_status": "expired",
+     "open_proposals": 0
+    }
+   },
+   {
+    "name": "handoff_disabled_refuses_inert",
+    "inputs": {
+     "runtime": "BasisRuntime constructed with throwing ledger/universe/fetch, never started",
+     "calls": [
+      "consumeAcceptedBasisProposal('bp_whatever')",
+      "applyBasisHandoffFeedback(full TERMINAL msg qty '0.5')"
+     ]
+    },
+    "expected": {
+     "both_results": "{ok:false, refusal:'DISABLED'}",
+     "snapshot": "{enabled:false, handoff:null}",
+     "side_effects": "none (throwing deps prove nothing touched)",
+     "store_burned": false
+    }
+   },
+   {
+    "name": "handoff_terminal_records_verbatim",
+    "inputs": {
+     "setup": "bind one engine-produced accepted proposal (enabled:true); WORKING seq 1 applied",
+     "feedback": "TERMINAL seq 2, cumulativeFilledQuantity '0.0075'",
+     "clock_cases": [
+      "clock throws at terminal",
+      "clock returns boundTs-1",
+      "clock = boundTs"
+     ]
+    },
+    "expected": {
+     "clock_throw": "raises, record unchanged (still AWAITING_FEEDBACK)",
+     "clock_regress": "raises 'must not regress', record unchanged",
+     "success": "{progressed:true, state:'TERMINAL', terminalKind:'TERMINAL_REPORTED', cumulativeFilledQuantity:'0.0075' (string, verbatim), lastSequence:2, terminalTs:boundTs}"
+    }
+   },
+   {
+    "name": "handoff_cancel_confirmed_zero_and_partial",
+    "inputs": {
+     "case_zero": "CANCEL_CONFIRMED seq 4 qty '0'",
+     "case_partial": "CANCEL_CONFIRMED seq 9 qty '0.004' (fresh binding)"
+    },
+    "expected": {
+     "both": "progressed:true, state TERMINAL, terminalKind CANCEL_CONFIRMED",
+     "qty_recorded": "'0' and '0.004' verbatim",
+     "record_keys": "exactly the 18 declared fields \u2014 no flatness/residual/unwind/recovery fields exist"
+    }
+   },
+   {
+    "name": "handoff_quantity_canonicality",
+    "inputs": {
+     "rejected_forms": [
+      "0.0045000",
+      "00.5",
+      " 0.5",
+      "0.5 ",
+      "+0.5",
+      "1e-3",
+      "-0.5",
+      "",
+      "abc",
+      "0.5 as number",
+      "null",
+      "undefined"
+     ],
+     "accepted_form": "'250' while acceptedNotionalUsd=10"
+    },
+    "expected": {
+     "rejected": "each -> {ok:false, refusal:'QUANTITY_NOT_EXACT'}, record unchanged",
+     "accepted": "progressed:true, qty '250' \u2014 base qty and USD notional are different units, never compared"
+    }
+   },
+   {
+    "name": "handoff_ordering_refusals",
+    "inputs": {
+     "state": "after WORKING seq 5 at observedAtMs=boundTs+5000",
+     "cases": [
+      [
+       "seq5 obs+6000",
+       "DUPLICATE_SEQUENCE"
+      ],
+      [
+       "seq4 obs+6000",
+       "STALE_SEQUENCE"
+      ],
+      [
+       "seq6 obs+4999",
+       "STALE_OBSERVATION"
+      ],
+      [
+       "seq6 obs boundTs-1",
+       "STALE_OBSERVATION"
+      ],
+      [
+       "seq 1.5",
+       "FEEDBACK_MALFORMED"
+      ],
+      [
+       "seq -1",
+       "FEEDBACK_MALFORMED"
+      ],
+      [
+       "seq MAX_SAFE_INTEGER+1",
+       "FEEDBACK_MALFORMED"
+      ],
+      [
+       "observedAtMs 1.5",
+       "FEEDBACK_MALFORMED"
+      ],
+      [
+       "acceptedRevisionTs NaN",
+       "FEEDBACK_MALFORMED"
+      ]
+     ]
+    },
+    "expected": {
+     "each": "{ok:false, refusal:<named>}, record byte-identical after every refusal"
+    }
+   },
+   {
+    "name": "handoff_terminal_immutable",
+    "inputs": {
+     "state": "TERMINAL after qty '5' at seq 2",
+     "attempts": [
+      "TERMINAL seq3 qty '9'",
+      "CANCEL_CONFIRMED seq3 qty '1'",
+      "WORKING/AMBIGUOUS/CANCEL_REQUESTED seq3"
+     ]
+    },
+    "expected": {
+     "all": "{ok:false, refusal:'ALREADY_TERMINAL'}",
+     "record": "unchanged, qty stays '5'"
+    }
+   },
+   {
+    "name": "supervision_baseline_add",
+    "inputs": {
+     "NOW": 1800000000000,
+     "position": "BASIS, legs LONG spot + SHORT perp quoteExposure '100' each, states ACTIVE/ACTIVE, reconciliation EXACT, all truth fresh (maxAgeMs 1000, sourceTime NOW-100)",
+     "policies": "common: oneLegExposure<=50, oneLegDuration<=1000ms, emergency 2000ms, gross<=1000, reduceTo 100; basis: minRemainingEdge '1', minForAdd '2', maxAdverseMove '0.02', maxAdverseFunding '0.01', fundingLead 60000, maxBorrowRate '0.02', maxHedgeDrift '0.05', minLiqDist '2', minMarginDist '2', maxLiqDeterioration '0.5', requiredConverging 3",
+     "facts": "entry '0.04', current '0.01', path 0.03->0.02->0.01, remaining '10', funding PAID '0.0001' next NOW+30000, borrow AVAILABLE '0.001', drift '0', liqDist '10', marginDist '10', liquidity '0.1', valid stage authority consuming '100'"
+    },
+    "expected": {
+     "intent.kind": "ADD_STAGE",
+     "determinism": "same input + same nowMs = byte-equivalent decision"
+    }
+   },
+   {
+    "name": "supervision_one_leg_hedge",
+    "inputs": {
+     "delta": "legs=[LONG spot '100' only], executionLifecycle ONE_LEG_EXPOSED, oneLegSinceMs NOW-500, reconciliation EXACT"
+    },
+    "expected": {
+     "intent.kind": "REQUEST_HEDGE",
+     "target": "{kind:'DELTA', quoteNotional:'-100'} (negated net directional exposure)",
+     "riskEffect": "RISK_REDUCING",
+     "hardDeadlineMs": "oneLegSince + 1000"
+    }
+   },
+   {
+    "name": "supervision_one_leg_overdue_emergency",
+    "inputs": {
+     "delta": "same but oneLegSinceMs NOW-2500 (> emergency 2000)"
+    },
+    "expected": {
+     "intent.kind": "REQUEST_EMERGENCY_UNWIND",
+     "reason": "ONE_LEG_DURATION_EMERGENCY",
+     "target.quoteNotional": "'0'",
+     "hardDeadlineMs": "NOW"
+    }
+   },
+   {
+    "name": "supervision_one_leg_reconciliation_uncertain",
+    "inputs": {
+     "delta": "one leg + reconciliationStatus DIVERGED"
+    },
+    "expected": {
+     "intent.kind": "REQUEST_EMERGENCY_UNWIND",
+     "why_includes": "ONE_LEG_RECONCILIATION_UNCERTAIN",
+     "riskEffect": "RISK_REDUCING"
+    }
+   },
+   {
+    "name": "supervision_edge_and_divergence_exits",
+    "inputs": {
+     "case_edge": "expectedRemainingEdgeAfterExitCosts '0' (<= min '1')",
+     "case_divergence": "currentExecutableBasis '0.1' (adverse |0.1|-|0.04| = 0.06 > '0.02')"
+    },
+    "expected": {
+     "both.intent.kind": "REQUEST_EXIT",
+     "edge_reason": "REMAINING_EDGE_EXHAUSTED",
+     "divergence_reason": "BASIS_DIVERGENCE_INVALIDATION",
+     "keys": "different why[0], different idempotencyKey, different decisionKey"
+    }
+   },
+   {
+    "name": "supervision_target_and_depth",
+    "inputs": {
+     "case_target": "thesisAssessment.targetReached=true",
+     "case_depth": "market.availableDepth '10' (< min '150')"
+    },
+    "expected": {
+     "target.intent.kind": "REQUEST_EXIT with THESIS_TARGET_REACHED (convergence take-profit)",
+     "depth.intent.kind": "REDUCE",
+     "depth.target.quoteNotional": "'100' (reductionTargetExposure)"
+    }
+   },
+   {
+    "name": "supervision_survival_emergencies",
+    "inputs": {
+     "case_recall": "borrow.availability RECALLED",
+     "case_margin": "marginDistance '0.5' (< '2')"
+    },
+    "expected": {
+     "both.intent.kind": "REQUEST_EMERGENCY_UNWIND",
+     "reason": "BASIS_CAPITAL_SURVIVAL_LIMIT"
+    }
+   },
+   {
+    "name": "supervision_carry_liquidity_reduce",
+    "inputs": {
+     "case_liquidity": "spotLiquidityDeterioration '0.8' (> '0.5')",
+     "case_funding": "funding.rate '0.02' PAID, nextFunding NOW+30000 <= NOW+60000 lead"
+    },
+    "expected": {
+     "both.intent.kind": "REDUCE",
+     "liquidity.target.quoteNotional": "'100'"
+    }
+   },
+   {
+    "name": "supervision_unknown_freeze",
+    "inputs": {
+     "case_missing": "basis.truth requiredValuePresent=false",
+     "case_stale": "basis.truth sourceTimeMs NOW-10000 (maxAge 1000)"
+    },
+    "expected": {
+     "both.intent.kind": "FREEZE_NEW_ACTIONS",
+     "missing.completeness": "UNKNOWN",
+     "stale.completeness": "STALE",
+     "blockingFacts_include": "BASIS_FACT_FRESHNESS",
+     "note": "no exit fabricated from unknown"
+    }
+   },
+   {
+    "name": "supervision_posture_hold",
+    "inputs": {
+     "postures": [
+      "PAUSED_NEW_EXPOSURE",
+      "KILL_NEW_EXPOSURE"
+     ]
+    },
+    "expected": {
+     "intent.kind": "HOLD (blocks increase, never hides exposure)",
+     "stageTransitionAuthorization": null,
+     "kill_with_invalidated_thesis": "still REQUEST_EXIT \u2014 risk reduction survives kill posture"
+    }
+   },
+   {
+    "name": "reducer_naked_duration_expiry",
+    "inputs": {
+     "state": "exposedSinceMs set, plan.maxNakedDurationMs per plan",
+     "event": "NAKED_DURATION_EXPIRED at occurredAtMs"
+    },
+    "expected": {
+     "occurredAtMs < exposedSince+max": "event rejected INVALID_EVENT",
+     "occurredAtMs >= exposedSince+max": "lifecycle -> RECOVERY_REQUIRED (never EXPIRED after exposure)"
+    }
+   }
+  ],
+  "not_ported": [
+   "Reverse basis (short_spot_long_perp) scanning/borrow preflight \u2014 outside port scope by instruction; borrow appears in the port only as the supervision UNKNOWN/RECALLED/UNAVAILABLE exit inputs",
+   "server/src/liveEdge/adapters/normalBasis/* twin adapter \u2014 record-only synthetic-fixture simulation (sendEligible:false, actionAuthority NONE_RECORD_ONLY everywhere); useful as vocabulary reference only",
+   "capitalFoundation stages/approvals/economics/budgets/allocation lanes \u2014 owner-gated capital allocation machinery beyond a one-position kernel (ADAPT rule capital_lifecycle_graph keeps only its two fail-closed edges and the anti-averaging-down gate)",
+   "VOLUME strategy supervision (supervision/volume.ts) \u2014 different strategy",
+   "M0 spot single-leg execution files (spotCore/spotLifecycle/spotTransportCoordinator/m0Spot*) \u2014 single-leg spot program, not the two-leg basis machine",
+   "BasisProposalStore formation/upsert/staging internals and scanner thresholds \u2014 another miner's area; only the acceptance guards, sweep reasons, and status vocabulary (open/updated/expired/rejected/approved_manual) are cited here as lifecycle inputs",
+   "Strategy-decay coordinator (engine/decay) \u2014 cadence plumbing, blocked dispositions only logged",
+   "UI/web, ledger persistence internals, news/intelligence runtimes",
+   "BasisHandoffLifecycle enablement plumbing \u2014 deliberately OFF in the old code with no runtime toggle; port the machine, keep the default-off posture decision with the owner"
+  ],
+  "notes": [
+   "BASIS: MEASURED = read in full: engine/basis/lifecycle.ts, engine.ts, services/basisRuntime.ts (all three assigned files), engine/basis/config.ts, rejectVocabulary.ts, v0/config.ts, capitalFoundation/supervision/{types,basis,common}.ts, capitalFoundation/contracts/lifecycle.ts, foundation/execution/recovery.ts, liveEdge/normalBasis/types.ts; sections read: foundation/contracts/execution.ts (lifecycle graphs), foundation/execution/reducer.ts (exposure/naked/transition logic), coordinator.ts (restart recovery), checkpoint.ts (restore heads), proposals.ts (accept + sweep), v0/types.ts (focus types). Repo: current-main @ 475bd57, shallow read-only clone in scratchpad.",
+   "NAMED-FILES CLARIFICATION: the assigned files exist and were read, but the machine described in the task (candidate/ready/opening/open/closing/closed/unknown) is not in them verbatim; the equivalent modules actually read are named in the verdict and state_machine. lifecycle.ts holds the signal machine + handoff record, not the position machine.",
+   "FIXTURE PROVENANCE: all fixtures transcribed from committed test suites (server/test/engine-basis.mjs, server/test/m1/basis-handoff-lifecycle.test.mjs, server/test/capitalFoundation/supervision/supervision.test.mjs); tests were NOT executed in this session \u2014 expected values are the repo's asserted values (MEASURED as source text, INFERRED that they pass on current-main).",
+   "UNIT HAZARD (bps vs fraction vs percent): engine layer uses float PERCENT (gap 0.78 = 0.78%, feesPct 0.3 = 0.3% four-leg round trip, minNetBasisPct 0.25 = 0.25%); spreads in BPS (maxSpreadBps 25); fundingRate is a raw per-period fraction (fundingExtremeAbs 0.0005 = 5 bps per 8h period); supervision layer uses canonical exact-decimal STRINGS in RATIO units ('0.04' = 4%). The Python kernel must pick ONE unit and convert at boundaries; the differential harness must compare in the source layer's unit.",
+   "FEE SPLIT: runtime derives spotTakerFeePct = feesPct/3 and perpTakerFeePct = feesPct/6 (2:1 spot/perp), so 2 spot legs + 2 perp legs = feesPct exactly.",
+   "MAX-HOLD DISAMBIGUATION: engine config defaultHoldMs 4h / minHoldMs 10m / maxHoldMs 24h bound the funding-carry ESTIMATE horizon only; the actual position max-hold exit is per-thesis maximumHoldingHorizonMs via THESIS_AGE BREACH -> REQUEST_EXIT(MAXIMUM_HOLDING_HORIZON). Old code has no global max-hold constant \u2014 the Python default must be a new owner decision (flag, not invent).",
+   "RESTART WHILE OPEN in one line: restore by replaying the checkpointed event log; any leg with submittedQuantity>0 in a non-terminal plan forces query-first verification by deterministic clientOrderId before ANY progression; verification failure -> RECOVERY_REQUIRED; all recovery output is data-only recommendations with automatic:false.",
+   "UNKNOWN BLOCKS: increases only. Any UNKNOWN supervision check -> FREEZE_NEW_ACTIONS; ADD requires every check PASS; but the emergency one-leg/reconciliation ladder evaluates BEFORE the freeze, so unknowns can never suppress risk reduction, and unknowns never fabricate an exit. Position state UNKNOWN pairs only with capitalLifecycle UNKNOWN or RECOVERY_REQUIRED.",
+   "NOT_CHECKED: coordinator.ts full flow (2252 lines \u2014 only restart/ambiguity paths read); reducer.ts leg-bookkeeping and normal-basis journal details; checkpoint serialization/checksum internals; scanner.ts decision thresholds (another area); engine-basis.mjs sections 8-16/19-21; whether any second engine-level position machine exists outside the read modules (grep says no); tests not executed.",
+   "suggestedNotionalUsd=10 is an arbitrary-old-default dev placeholder (REJECT as a production value; the acceptance path caps acceptedNotionalUsd at the proposal's suggested value and setSizeCeiling is downward-only \u2014 that downward-only owner rule is worth keeping)."
+  ],
+  "state_machine": {
+   "reality_note": "Three measured layers replace the single named machine. Layer files: signal = server/src/engine/basis/lifecycle.ts (LifecycleManager); plan/position = server/src/foundation/contracts/execution.ts (graph) + server/src/foundation/execution/reducer.ts (derivation) + coordinator.ts (restart) + recovery.ts (recommendations); exit authority while OPEN = server/src/capitalFoundation/supervision/common.ts + basis.ts; settlement record = BasisHandoffLifecycle in engine/basis/lifecycle.ts; capital overlay = capitalFoundation/contracts/lifecycle.ts (20-state graph, reference only).",
+   "python_target_mapping": {
+    "candidate": "signal IDLE/WATCHING/FOCUS/PROPOSED (+ REJECTED/COOLDOWN as candidate sub-outcomes); capital OBSERVED/ELIGIBLE",
+    "ready": "plan READY (after CREATED->AWAITING_APPROVAL->PREFLIGHTING); capital READY_FOR_EXECUTION; guards: proposal open/updated + fresh (expiresTs, maxAgeMs), symbol allowed, notional finite>0, kill switch off, intake not paused, approval + preflight passed",
+    "opening": "plan OPENING (+ ONE_LEG_EXPOSED as the naked sub-state with its bounded timer); capital ENTERING/PARTIALLY_EXPOSED",
+    "open": "plan HEDGED_OPEN; capital HEDGED/ACTIVE; supervised every evaluation by the directive ladder",
+    "closing": "plan CLOSE_REQUESTED/CLOSING/RECONCILING; capital REDUCING/EXITING",
+    "closed": "plan CLOSED (only via CLOSING or RECONCILING, requires no residual/ambiguity/working leg) + handoff TERMINAL record; FAILED/CANCELLED/EXPIRED are distinct terminals worth keeping",
+    "unknown": "plan RECOVERY_REQUIRED + leg AMBIGUOUS + position state UNKNOWN: blocks all new/increasing actions (FREEZE_NEW_ACTIONS), demands query-first verification and manual review; risk-reducing recommendations remain available"
+   },
+   "signal_layer_transitions": [
+    "IDLE -> WATCHING on decision watch|focus-denied-capacity [candidate opened, score recorded]",
+    "IDLE/WATCHING -> FOCUS on decision focus [tryFocus admits under caps: pinned always; >softCap only score>weakest; at hardCap evict weakest unpinned else deny]",
+    "any -> PROPOSED on decision proposal [focus slot held best-effort]",
+    "FOCUS/PROPOSED -> WATCHING on decision watch [focus closed signal_expired]",
+    "FOCUS/PROPOSED -> IDLE on decision ignore [focus closed signal_expired, candidate dropped, correlation cleared]",
+    "FOCUS/PROPOSED -> REJECTED -> COOLDOWN on decision reject [focus closed with projected exit reason; cooldownUntil = now + cooldownMs 600000]",
+    "state<FOCUS -> REJECTED on decision reject [shallow: back to IDLE after 2*tickMs]",
+    "PROPOSED/FOCUS -> COOLDOWN on proposal expiry [exit gap_closed iff why==gap_closed else signal_expired]",
+    "WATCHING -> IDLE on candidate TTL 300000ms",
+    "FOCUS -> WATCHING on focus max age 900000ms (unpinned only) [exit max_focus_time] or capacity eviction [exit capacity_evicted]",
+    "COOLDOWN -> IDLE when now >= cooldownUntilTs [correlation cleared]",
+    "any -> deleted on universe removal [focus closed signal_expired]; all signal state -> cleared on config revision (pins preserved)"
+   ],
+   "plan_layer_states": [
+    "CREATED",
+    "AWAITING_APPROVAL",
+    "PREFLIGHTING",
+    "READY",
+    "OPENING",
+    "ONE_LEG_EXPOSED",
+    "HEDGED_OPEN",
+    "CLOSE_REQUESTED",
+    "CLOSING",
+    "RECONCILING",
+    "CLOSED",
+    "RECOVERY_REQUIRED",
+    "FAILED",
+    "CANCELLED",
+    "EXPIRED"
+   ],
+   "plan_layer_transitions": {
+    "CREATED": [
+     "AWAITING_APPROVAL",
+     "PREFLIGHTING",
+     "CANCELLED",
+     "EXPIRED"
+    ],
+    "AWAITING_APPROVAL": [
+     "PREFLIGHTING",
+     "CANCELLED",
+     "EXPIRED"
+    ],
+    "PREFLIGHTING": [
+     "READY",
+     "FAILED",
+     "CANCELLED",
+     "EXPIRED"
+    ],
+    "READY": [
+     "OPENING",
+     "CANCELLED",
+     "EXPIRED"
+    ],
+    "OPENING": [
+     "ONE_LEG_EXPOSED",
+     "HEDGED_OPEN",
+     "RECONCILING",
+     "RECOVERY_REQUIRED",
+     "FAILED",
+     "CANCELLED"
+    ],
+    "ONE_LEG_EXPOSED": [
+     "HEDGED_OPEN",
+     "CLOSE_REQUESTED",
+     "CLOSING",
+     "RECONCILING",
+     "RECOVERY_REQUIRED",
+     "FAILED"
+    ],
+    "HEDGED_OPEN": [
+     "CLOSE_REQUESTED",
+     "RECONCILING",
+     "RECOVERY_REQUIRED",
+     "FAILED"
+    ],
+    "CLOSE_REQUESTED": [
+     "CLOSING",
+     "RECONCILING",
+     "RECOVERY_REQUIRED",
+     "FAILED"
+    ],
+    "CLOSING": [
+     "RECONCILING",
+     "CLOSED",
+     "ONE_LEG_EXPOSED",
+     "RECOVERY_REQUIRED",
+     "FAILED"
+    ],
+    "RECONCILING": [
+     "CLOSED",
+     "HEDGED_OPEN",
+     "ONE_LEG_EXPOSED",
+     "RECOVERY_REQUIRED",
+     "FAILED"
+    ],
+    "RECOVERY_REQUIRED": [
+     "RECONCILING",
+     "CLOSING",
+     "FAILED"
+    ],
+    "CLOSED": [],
+    "FAILED": [],
+    "CANCELLED": [],
+    "EXPIRED": []
+   },
+   "plan_layer_guards": [
+    "Exposure states derived from leg facts only: safely-hedged (known exposure, no ambiguity, no over-close, no pending opening order, |normResidual SPOT - normResidual PERP| <= 1e-12) -> HEDGED_OPEN; any opening fill -> ONE_LEG_EXPOSED; opening-leg rejected with zero fills while OPENING -> FAILED",
+    "Naked exposure includes ambiguous AND submitting/working legs; exposedSinceMs latches at first naked event; NAKED_DURATION_EXPIRED valid only at/after exposedSince + plan.maxNakedDurationMs -> RECOVERY_REQUIRED (EXPIRED is unreachable after exposure)",
+    "Close-phase leg REJECTED or ambiguity-unresolved -> RECOVERY_REQUIRED; naked while CLOSING -> ONE_LEG_EXPOSED",
+    "ENTRY_WINDOW_EXPIRED: risk may exist (exposure/working/ambiguous) -> RECOVERY_REQUIRED; else OPENING -> FAILED; else -> EXPIRED (proposal freshness: expiresTs and maxAgeMs both enforced)",
+    "CANCELLED requires no known exposure, no ambiguous leg, no working leg (else UNRESOLVED_EXPOSURE); terminal state with an active working leg = invariant violation; over-close = invariant violation",
+    "CLOSED via normal-basis baseline requires all four legs terminal AND account-baseline-flat proof",
+    "Leg machine: PLANNED->VALIDATED->SUBMITTING->{ACKNOWLEDGED,PARTIALLY_FILLED,FILLED,REJECTED,AMBIGUOUS}; lost response during SUBMITTING becomes AMBIGUOUS never a guess; CANCEL_PENDING may still FILL (cancel is a request, not a fact); AMBIGUOUS resolves only to evidence-backed outcomes",
+    "Restart: checkpoint restore replays the event log; non-terminal plan with any submittedQuantity>0 => query-first verification per leg by deterministic clientOrderId before any progression; failed lookup emits RESTART_RECOVERY_BLOCKED -> RECOVERY_REQUIRED"
+   ],
+   "supervision_exit_ladder_priority_rows": [
+    "1 position CLOSED -> HOLD(POSITION_CLOSED)",
+    "2 one-leg>0 + (reconciliation!=PASS or RECOVERY_REQUIRED) -> REQUEST_EMERGENCY_UNWIND(ONE_LEG_RECONCILIATION_UNCERTAIN, deadline now)",
+    "3 one-leg>0 + invalid policy -> REQUEST_EMERGENCY_UNWIND(ONE_LEG_SUPERVISION_POLICY_INVALID)",
+    "4 one-leg>0 + duration unknown or > emergencyOneLegDurationMs -> REQUEST_EMERGENCY_UNWIND(ONE_LEG_DURATION_EMERGENCY)",
+    "5 one-leg>0 -> REQUEST_HEDGE(ONE_LEG_EXPOSURE, deadline oneLegSince+maximumOneLegDurationMs, urgency URGENT on exposure/duration BREACH else ELEVATED)",
+    "6 reconciliation!=PASS or RECOVERY_REQUIRED -> FREEZE_NEW_ACTIONS(RECONCILIATION_NOT_EXACT, EMERGENCY if recon BREACH else URGENT)",
+    "7 THESIS_INVALIDATION BREACH or THESIS_AGE BREACH (age>=maximumHoldingHorizonMs = MAX-HOLD) or THESIS_TARGET reached (= CONVERGENCE take-profit) -> REQUEST_EXIT(THESIS_INVALIDATED urgent | MAXIMUM_HOLDING_HORIZON urgent | THESIS_TARGET_REACHED routine)",
+    "8 GROSS_EXPOSURE_LIMIT BREACH -> REDUCE urgent; 9 MARKET_DEPTH or EXIT_CAPACITY BREACH -> REDUCE elevated; 10 OUTSTANDING_INTENTS BREACH -> FREEZE",
+    "11 basis: liquidation/margin distance BREACH or borrow RECALLED -> REQUEST_EMERGENCY_UNWIND(BASIS_CAPITAL_SURVIVAL_LIMIT, deadline now)",
+    "12 borrow UNAVAILABLE -> REQUEST_EXIT(BORROW_UNAVAILABLE urgent)",
+    "13 BASIS_HEDGE_DRIFT BREACH -> REQUEST_HEDGE urgent",
+    "14 BASIS_REMAINING_EDGE BREACH (edge inversion) -> REQUEST_EXIT(REMAINING_EDGE_EXHAUSTED); BASIS_DIVERGENCE BREACH -> REQUEST_EXIT(BASIS_DIVERGENCE_INVALIDATION)",
+    "15 BASIS_FUNDING/BASIS_BORROW-rate/BASIS_LIQUIDITY BREACH -> REDUCE elevated",
+    "16 any check UNKNOWN -> FREEZE_NEW_ACTIONS(BASIS_REQUIRED_TRUTH_UNKNOWN) \u2014 what UNKNOWN blocks",
+    "17 all PASS + truth allows increase -> ADD_STAGE routine; 18 else HOLD(BASIS_THESIS_REMAINS_WITHIN_POLICY)"
+   ],
+   "handoff_layer": {
+    "states": [
+     "AWAITING_FEEDBACK",
+     "TERMINAL"
+    ],
+    "progress_facts": [
+     "TERMINAL",
+     "CANCEL_CONFIRMED"
+    ],
+    "observations": [
+     "WORKING",
+     "AMBIGUOUS (counter)",
+     "CANCEL_REQUESTED"
+    ],
+    "guards": "identity+acceptedRevisionTs exact match; sequence strictly increasing; observedAtMs >= boundTs and non-decreasing; quantity must equal its own canonical non-negative exact-decimal form; terminal immutable; single-use; default OFF"
+   }
+  }
+ }
+}
