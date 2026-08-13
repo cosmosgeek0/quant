@@ -1,22 +1,28 @@
 # TASK.md — current work orders
 
-WAVE 3R — RESTART-SAFE RUNTIME VERTICAL (commander order 2026-08-13, in
-force; wave-3 completion verdict REJECTED; no arming of scripts/basis_auto.sh,
-no live mutation anywhere):
-1. Persist an IMMUTABLE proposal: id, TTL, config/SHA, executable entry and
-   intended-exit economics, four measured commissions, entry+exit slippage,
-   funding, safety buffer, final net edge, quantity.
-2. basis_position --open accepts ONLY a valid proposal id; raw-gap entry
-   removed/refused.
-3. STOP is a GLOBAL entry interlock; every read-only position/order/balance/
-   margin check completes BEFORE any leverage change.
-4. ONE supervisor: claim proposal -> open -> continuous reconcile/check ->
-   automatic close on exit or emergency -> safe crash-resume. UNKNOWN and
-   ONE_LEG freeze new entry and reconcile.
-5. The full supervision ladder wired into the real runtime; executable exit
-   prices plus current funding drive exits.
-6. End-to-end injected tests: STOP, negative-net entry refusal, proposal
-   expiry, exit routing, emergency close, every crash boundary.
-7. Deploy paused/GET-only only; commit sanitized raw evidence of deployed
-   SHA, STOP, process/cron state, balances, positions, open orders.
-Recorded state until this passes: WAVE3_COMPONENTS_BUILT__RUNTIME_NOT_READY.
+WAVE 4 — ONE TOKEN STREAM, TWO TRADES, ONE HAND (commander order 2026-08-13,
+owner-transmitted; simultaneous lanes, no lane waits on another's tests; test
+totals are not progress; operating loop = tiny live attempt -> actual Binance
+failure -> repair -> ONE targeted regression -> rerun live):
+1. FUTURES MECHANICS PROOF: the existing futures hand runs ONE capped live
+   short + reduce-only close on the host (zero new code, MAX_NOTIONAL=8,
+   TSTUSDT already 1x, EXECUTION_MECHANICS_ONLY — never called profit).
+   Trigger prepared; fires on the owner's press only.
+2. STREAM: one continuous Spot+Futures universe stream — every USDT market
+   (490 spot, 527 perps, incl. the 169 futures-only the old scanners were
+   blind to; APRUSDT class). One live record per token: price, volume +
+   surge ratio, OI, funding, basis gap where both venues exist. No
+   alphabetical caps. Restart-safe.
+3. MOMENTUM: dynamic entry/add/reduce/exit lifecycle against the shared
+   stream (ignition = volume surge + persistence; add only on strengthening;
+   trail on deterioration; exit on break). Terminology law: funding and
+   basis are different numbers; momentum and basis are different trades on
+   the same token record; the system decides which trade a token offers.
+4. BASIS-CONNECT: basis reads the SAME token stream (private scans retired)
+   and executes through the SAME one hand.
+5. UI: serves actual candidates, orders, positions, fees, funding, realized
+   PnL from runtime truth — not fixtures.
+Serial only: dependent orders, same-symbol mutations, unclear-response
+reconciliation. Everything else concurrent. Not guaranteed money: APR
+collapsed 36.5% after its peak; chasing late loses — the machine trades
+transitions, never regret.
