@@ -14,9 +14,9 @@
   runtime endpoints.
 
 ## Truth (measured 2026-08-14)
-- Release main @ 4433830-line: runtime ALIVE-PAUSED on host — cron fires the
-  supervisor every 2 min, STOP seals entry, first tick measured honest IDLE.
-  Host module hashes == local 4/4.
+- Runtime ALIVE-PAUSED on host: cron fires the supervisor every 2 min, STOP
+  seals entry, first tick measured honest IDLE. Deployed modules sha-verified
+  host == local 4/4 (code state as of commit 4433830).
 - Built and green (696 tests): token stream (TRADING+PERPETUAL universe,
   measured live 132 spot-only / 167 perp-only / 357 both = 656), momentum
   lifecycle (APRUSDT fixture passes), stream-fed basis, six live-truth UI

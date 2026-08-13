@@ -34,8 +34,10 @@ against fresh books before the one pre-entry mutation (leverage) runs last.
 
 ## Lead operating loop (why this works — keep it exactly)
 - CODEX FIRST: `codex exec --skip-git-repo-check -s workspace-write -C <dir>`
-  with the prompt on stdin. Up to 50 in parallel; compute is free. Opus
-  subagents allowed for genuinely important build/review work.
+  with the prompt on stdin, PLUS `-c sandbox_workspace_write.network_access=false`
+  by default — omit that flag only for lanes whose dispatch allows named
+  public GETs. Up to 50 in parallel; compute is free. Opus subagents allowed
+  for genuinely important build/review work.
 - One task = one narrow 10–20 minute scope: exact files, exact defect text
   with line numbers, explicit boundaries. Vague dispatches produce drift.
 - Parallelism is bounded by FILE OWNERSHIP: disjoint files fan out,
