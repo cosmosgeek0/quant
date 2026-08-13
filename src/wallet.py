@@ -305,9 +305,13 @@ class BinanceClient:
             )
             if kind != "ok":
                 return kind, payload
-            if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+            if not isinstance(payload, dict):
                 return "schema_error", {"error": "InvalidTransferHistory"}
-            rows.extend(payload["rows"])
+            # An empty window comes back as {"total": 0} with no rows key.
+            page_rows = payload.get("rows") or []
+            if not isinstance(page_rows, list):
+                return "schema_error", {"error": "InvalidTransferHistory"}
+            rows.extend(page_rows)
             total = payload.get("total", len(rows))
             if not isinstance(total, int) or total <= len(rows):
                 return "ok", rows
