@@ -35,20 +35,28 @@ true round-trip friction ≈ 0.02 USDT plus ~0.62 retained dust value; an
 earlier 5 USDT attempt was correctly REFUSED before the BUY. The spot hand is
 PROVEN by the four-way match.
 
-FUTURES: capability last measured 2026-08-12 canTrade=false; the owner has
-since reported enabling it — UNVERIFIED, no fresh preflight run. No futures
-order, live or test, has ever been sent. USD-M wallet held 1.00000000 USDT at
-the last snapshot; its origin was a 2026-07-20 internal transfer (LOGS).
+FUTURES, measured 2026-08-13 by signed GET-only host read: canTrade=TRUE via
+/fapi/v1/accountConfig — the 2026-08-12 canTrade=false was a /fapi/v3/account
+endpoint false-negative, now fixed in code. USD-M USDT 1.00000000
+wallet/available; zero positions, zero open orders; position mode ONE_WAY;
+exchange-side symbolConfig BTCUSDT 10x, ETH/SOL 5x CROSSED (the hand sets 1x
+one-shot before any order). No futures order, live or test, has ever been
+sent; trade capability stays unproven until a real order.
 
-WAVE-1 LANDED (2026-08-13, measured): all four lanes DONE and merged with the
-Lead's src/basis_cycle.py (spot-long + USD-M-short lifecycle, offline only,
-exchange-truth fee-aware sizing, quoteOrderQty-bounded entry, short-leg-first
-exit) at candidate 3046dd975bf10f67f0e0da3f78b0b02e33433027 on main. An
-adversarial 4-lens panel confirmed 9 findings (1 HIGH); all repaired before
-the merge; 113 offline tests green. Nothing deployed, nothing live, no host
-action; quarantine unchanged. NEXT, on owner word only: the executor wave —
-arming the cycle on the host — plus the futures-capability preflight, still
-UNVERIFIED since 2026-08-12.
+WAVE-1 LANDED at 3046dd97 (basis_cycle + four lanes, 4-lens panel, 9 repaired
+findings, 113 tests). WAVE-2 LANDED (2026-08-13, measured): capability fix
+(canTrade from accountConfig), one-shot src/basis_executor.py composing the
+proven pieces (signed read-only preflight before any order, exchange-truth
+fee-aware sizing, spot-step shortfall honesty, cross-lane receipt gate,
+PREFLIGHT_REFUSED exit 5), closed-candle restart-safe paper volume, and the
+served read-only UI — merged at ec9cff37558863f8d7c91e7eb27da8a24587b767
+after a 3-lens panel confirmed 9 findings (1 HIGH), all repaired pre-merge;
+285 offline tests green. Live executor code exists but is deliberately
+UNVERIFIED live. THE EXACT REMAINING BLOCKER: USD-M available balance is
+1.00000000 USDT — below the ~10 USDT margin the minimum basis cycle needs at
+1x, so the executor's own preflight would refuse; one receipted Spot->USD-M
+transfer (wallet.py mechanics, <=10 ceiling) unlocks it, and that is a live
+action waiting on the owner's word, as is the first live executor run.
 
 PARKED, awaiting owner words someday: L6 reverse-basis spec (needs borrow
 power); L8's seven old-project import candidates (per-item permits); the
