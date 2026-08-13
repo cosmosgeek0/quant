@@ -1690,16 +1690,20 @@ def derive_resume(position: Dict[str, Any],
             "recommendations": [] if entered_spot else
             [{"action": "CLOSE_EXPOSED_LEG", "automatic": False}],
         }
-    if entered_spot and not sold_spot and base_free >= spot_step:
+    if entered_spot and base_free >= spot_step:
+        # A partial exit fill never proves flatness: the account's own base
+        # balance is the truth, sold or not (panel HIGH 2026-08-13 — the old
+        # sold_spot short-circuit declared CLOSED over a sellable residual).
         return {
             "state": ST_ONE_LEG, "verdict": "ONE_LEG_EXPOSED",
-            "note": "spot leg held with no hedge standing",
+            "note": "sellable spot base still standing"
+                    + ("" if not sold_spot else " after a partial exit fill"),
             "exposure": "spot base free %s at or above the spot step %s"
                         % (fmt(base_free), fmt(spot_step)),
             "recommendations": [{"action": "CLOSE_EXPOSED_LEG",
                                  "automatic": False}],
         }
-    if entered_spot and (sold_spot or base_free < spot_step):
+    if entered_spot and base_free < spot_step:
         return {
             "state": ST_CLOSED, "verdict": "CLOSED",
             "note": "every leg terminal, futures flat, no sellable base",

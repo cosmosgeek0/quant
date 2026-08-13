@@ -1,0 +1,113 @@
+{
+ "confirmed": [
+  {
+   "file": "src/basis_watch.py",
+   "line": 146,
+   "claim": "Every symbol is priced with the global 8h funding_period_ms (DEFAULTS line 146, stamped into every observation at line 1084 and folded into each symbol's KernelConfig in _kernel_decision), so for non-8h-interval perps funding_carry_pct undercounts settlement crossings and silently prices the uncounted crossings as zero \u2014 bypassing the kernel's own fail-closed law that an unknown crossed settlement must make carry None (data_stale refusal). The spec's oracle explicitly flags this: funding area rule funding_period_fixed_8h is verdict ADAPT with 'make the period a per-symbol input... a wrong period silently miscounts settlements', and the kernel API supports it (tests/test_basis_kernel.py test_funding_period_is_an_input_not_a_constant), but the watch feeds the constant to all symbols. The watch already fetches /fapi/v1/fundingRate whose per-row fundingTime spacing reveals the true interval, and parse_funding_history (lines 497-506) discards those timestamps, keeping only rates; no interval endpoint is fetched. Error direction on Binance (intervals <= 8h) is strictly crossings-undercount, i.e. funding drag understated and net edge overstated \u2014 the unsafe accept direction.",
+   "severity": "MEDIUM",
+   "scenario": "A 1h-funding-interval symbol (the spec's math-area notes state some symbols settle every 4h/1h; these high-funding listings are exactly the large-raw-gap finalists this scanner selects) shows gap 0.6%, current rate -0.001 (drag side), next settlement in 10 min, default 4h hold. Truth: 4 crossings, only 1 rate known, so the old engine yields carry=None and rejects data_stale. The port computes crossings = 1 + floor((14400000-600000)/28800000) = 1, carry = -0.1%, drag 0.1 <= max_funding_drag_pct 0.15 passes guard 12, and net = 0.6 - 0.3 - 0.1 = 0.2... with slippage 0 the symbol advances to watch/focus/proposal-grade with ~0.3% of true drag silently dropped; at gap 0.75% it clears min_net_basis_pct 0.25 outright and a symbol the frozen ladder refuses becomes a proposal (kernel arithmetic MEASURED by probe; symbol-interval existence stated by the spec oracle itself).",
+   "lens": "kernel-math",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_kernel.py",
+   "line": 933,
+   "claim": "funding_carry_pct breaks the module's NULL LAW ('any out-of-guard input makes the affected result None') by raising decimal.InvalidOperation (DivisionImpossible) instead of returning None: the crossings safe-integer guard sits AFTER the Decimal floor division '(hold - ms_to_next) // period', which itself blows up under the prec-50 localcontext whenever the integer quotient needs more than 50 digits. The spec's null guard is 'crossings a safe integer' -> null (the old float engine returned null past MAX_SAFE_INTEGER).",
+   "severity": "LOW",
+   "scenario": "MEASURED: funding_carry_pct(Decimal('1e60'), Decimal(1), Decimal(1), [Decimal('0.0001')], DIRECTION_NORMAL) raises InvalidOperation[DivisionImpossible] rather than returning None. Unreachable through evaluate/funding_context (expected_hold_ms clamps hold and config validation caps hold/period at ~1000), but funding_carry_pct is exported in __all__ for direct use \u2014 a differential harness or lifecycle caller replaying extreme old-engine cases crashes where the contract promises a refusal; basis_watch's blanket except converts it to a frozen 'unknown', masking the contract break.",
+   "lens": "kernel-math",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_kernel.py",
+   "line": 246,
+   "claim": "KernelConfig.__post_init__ enforces the spec invariant 'maxHoldMs/fundingPeriodMs <= 1000' with integer floor division (self.max_hold_ms // self.funding_period_ms > 1000), so any real ratio in (1000, 1001) validates even though the spec's config_validation_invariants rule pins the real-valued ratio; the settlement-count bound the invariant exists to guarantee can then reach 1001 crossings.",
+   "severity": "LOW",
+   "scenario": "MEASURED: KernelConfig(min_hold_ms=1, default_hold_ms=2, max_hold_ms=1000500, funding_period_ms=1000) constructs successfully (ratio 1000.5), and funding_carry_pct(1000500, 250, 1000, [rate]*1001, NORMAL) then sums 1001 crossings (probe returned 10.0100). Within the kernel's own composition known_rates is always [rate] so crossings>1 refuses anyway; the divergence matters to a differential harness validating config rejection parity and to direct multi-rate callers.",
+   "lens": "kernel-math",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_kernel.py",
+   "line": 942,
+   "claim": "funding_carry_pct gates each used rate against the hardcoded DEFAULT_CONFIG.rate_sanity_abs_max instead of a config parameter, while funding_context gates the same rate against the caller's cfg.rate_sanity_abs_max \u2014 the two halves of one pipeline enforce different sanity caps whenever the config overrides the default.",
+   "severity": "LOW",
+   "scenario": "MEASURED: with KernelConfig(rate_sanity_abs_max=Decimal('0.5')) and a mark rate of 0.3, funding_context returns fresh=True, funding_rate=0.3, but carry_pct=None (the inner check refuses 0.3 > 0.1), so evaluate's guard 6 rejects data_stale on every tick for a rate the configuration declares sane \u2014 a permanent, silent over-refusal (fail-closed direction, no unsafe accept) and an internally inconsistent config contract; a narrowed cap is consistent only because funding_context happens to refuse first.",
+   "lens": "kernel-math",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_position.py",
+   "line": 1702,
+   "claim": "derive_resume declares CLOSED and cmd_resume releases the lane lock whenever any EXIT_SPOT/UNWIND_SPOT fill is nonzero, skipping the observed base-balance check entirely (`sold_spot or base_free < spot_step` short-circuits), so a partial spot exit with a proven sellable residual is reported as 'every leg terminal, futures flat, no sellable base' \u2014 violating the spec guard that CLOSED requires account-baseline-flat proof, unblocking new entries in both lanes while unhedged spot stands.",
+   "severity": "HIGH",
+   "scenario": "Reproduced by direct call: position entered 1.0 spot + 1.0 short; --close fills EXIT_SHORT 1.0 and EXIT_SPOT terminal-partial 0.4 (cmd_close itself flags ONE_LEG_EXPOSED, printing '--resume reconciles'); owner runs --resume; queries return EXIT_SPOT executedQty 0.4 > 0, futures flat, base_free 0.6 with spot_step 0.001 (600x sellable). derive_resume returns state CLOSED / verdict CLOSED / note 'no sellable base' with zero recommendations; cmd_resume line 1785 then releases basis-executor.lock. 0.6 base of unhedged spot exposure stands untracked while --open and the one-shot executor are free to trade the same account.",
+   "lens": "money-path",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_position.py",
+   "line": 1451,
+   "claim": "cmd_close reads entry[\"short\"][\"filled_qty\"] unconditionally, but a resume-proven OPEN position (short leg UNKNOWN during --open, then --resume proves the fill from the exchange \u2014 a path the test suite itself constructs) never had entry[\"short\"] persisted, so the only exit command for OPEN crashes with an unhandled KeyError and the position cannot be closed through the CLI; the short quantity resume measured from positionRisk is discarded instead of persisted.",
+   "severity": "MEDIUM",
+   "scenario": "Reproduced via the suite's own harness: --open with ENTER_SHORT submit unclear + query unclear -> state UNKNOWN; --resume with positionRisk -0.098 -> state OPEN, 'short' not in entry (test_resume_proves_unknown_short_filled pins this state); owner runs --close -> KeyError: 'short' traceback before any mutation. --check can meanwhile emit REQUEST_EXIT/MAXIMUM_HOLDING_HORIZON, but every close attempt dies; exit only possible by hand outside the machine.",
+   "lens": "money-path",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_position.py",
+   "line": 1465,
+   "claim": "After a partial reduce-only close (state CLOSING -> --resume derives OPEN), a second --close persists and submits the ORIGINAL entry short quantity from the stale entry snapshot rather than the remaining exchange position that resume itself just measured and stored in reconcile.futures_position, so live the reduce-only order exceeds the position and is rejected every attempt \u2014 the position becomes permanently unclosable through the CLI (the fake transport in tests masks this by filling the oversized quantity).",
+   "severity": "MEDIUM",
+   "scenario": "Reproduced via the harness: OPEN with short 0.098; --close where EXIT_SHORT fills 0.05 of 0.098 -> OPEN_EXPOSURE/CLOSING; --resume with positionRisk -0.048 -> OPEN; second --close submits reduceOnly BUY quantity 0.098 against the 0.048 short. Binance rejects reduce-only orders exceeding the position (-2022), so cmd_close takes the 'rejected' branch, resets to OPEN, and every subsequent --close resubmits the same stale 0.098 forever; the hedged-but-shrunken pair can never be exited by the machine.",
+   "lens": "money-path",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_position.py",
+   "line": 1036,
+   "claim": "cmd_open enforces no verdict-less prior-receipt gate: both sibling lanes refuse to trade when any *.json in the shared receipt directory lacks a verdict (basis_executor.acquire lines 1015-1030 'whatever lane wrote it'; spot_roundtrip lines 328-338), and spot_roundtrip guards its exposure with its own run.lock which cmd_open never checks \u2014 so the position lane opens new exposure over a crashed sibling run's unreconciled client ids on the same account.",
+   "severity": "MEDIUM",
+   "scenario": "spot_roundtrip (same default RECEIPT_DIR ~/quant_receipts) is killed mid-run: roundtrip-<rid>.json exists with no verdict and run.lock is on disk, its buy/sell orders possibly live. basis_executor --execute in that state refuses BLOCKED_UNRESOLVED; basis_position --open checks only basis-position.json state and basis-executor.lock, passes both, takes the lane lock, and submits a new spot BUY + futures SELL while the crashed run's ids are unreconciled \u2014 exactly the double-exposure case the sibling gates exist to block.",
+   "lens": "money-path",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_position.py",
+   "line": 1425,
+   "claim": "_spot_usdt_fees sums only USDT-denominated commissions, so spot fees paid in BNB (a standard account setting; recorded in the persisted fee_by_asset exchange truth and reducing neither base quantity nor quote proceeds) are silently dropped from pnl.total_usdt with no UNKNOWN marker \u2014 the total is presented as exact while a real cost is missing.",
+   "severity": "LOW",
+   "scenario": "Account has 'pay fees in BNB' enabled: spot BUY and SELL legs report commissionAsset BNB; fee_by_asset persists {\"BNB\": ...} on both spot legs; net_base equals executedQty (no base fee) and quote_received is gross. cmd_close computes spot_fees_usdt = 0 and total_usdt = spot_pnl + short_pnl + funding + usdm_commission, overstating realized P&L by the full BNB commission value on every closed position.",
+   "lens": "money-path",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_watch.py",
+   "line": 564,
+   "claim": "read_commission_rates can never parse the commission-rates.json that basis_position.cmd_rates (src/basis_position.py:955-971) actually writes: the writer's record is at the top level (not under 'symbols'/<symbol>/'default', the only three candidates tried), and its {'spot': {'taker': ...}, 'usdm': {'taker': ...}} shape matches neither the percent-per-leg keys nor the accepted fraction shapes (takerCommissionRate / standardCommission.taker). Measured per-symbol fee truth therefore silently degrades to the ESTIMATED spec defaults, contradicting the module docstring's promise that the lifecycle tool's file 'is read when present'. The only test at this seam (tests/test_basis_watch.py:1151) writes its own {'default': {...}} shape instead of the writer's, masking the break; no test round-trips writer to reader.",
+   "severity": "HIGH",
+   "scenario": "Verified by execution: writing the exact payload cmd_rates produces and calling read_commission_rates returns {'spot_taker_fee_pct': 0.1, 'perp_taker_fee_pct': 0.05, 'source': 'ESTIMATED'}. Owner runs basis_position --rates recording real (e.g. VIP/BNB-discounted, or per-symbol elevated) taker rates; every basis_watch pass still gates edge_below_fees and net-edge on the spec defaults (0.10/0.05 per leg), so candidates are wrongly rejected when real fees are lower, or wrongly promoted to proposal grade when a symbol's real fees exceed the defaults.",
+   "lens": "integration",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_watch.py",
+   "line": 895,
+   "claim": "The watch's default state file RECEIPT_DIR/basis_watch_state.json is written into the shared receipt directory (~/quant_receipts for all three tools) with no 'verdict' key, violating the receipt-dir cross-lane contract that basis_executor.acquire() enforces (src/basis_executor.py:1015-1030: any verdict-less *.json in the receipt dir -> BLOCKED_UNRESOLVED) and that basis_position deliberately honors (STATE_VERDICT comment at src/basis_position.py:144-153; cmd_rates writes 'verdict': 'RATES_RECORDED'). One default-config watch pass permanently blocks every subsequent executor run.",
+   "severity": "HIGH",
+   "scenario": "Run 'basis_watch --once' with default RECEIPT_DIR, then run the basis executor: acquire() lists basis_watch_state.json, finds no 'verdict' key, and every executor run exits BLOCKED_UNRESOLVED with the misleading instruction to 'reconcile its client ids' against a file that contains no orders, until an operator manually moves/deletes the watch state file (destroying watch persistence).",
+   "lens": "integration",
+   "confirmed": true
+  },
+  {
+   "file": "src/basis_position.py",
+   "line": 1382,
+   "claim": "cmd_check performs an unlocked read-modify-write of the whole basis-position.json: it loads the position, spends seconds on public reads (gap_row with retries), then save_position() rewrites the entire file to record last_check. No lock coordinates position commands (the basis-executor.lock lane lock only blocks a new --open; --check/--close/--resume never acquire anything), so a concurrent --close or --resume \u2014 the designed usage is a --check hold loop plus owner-initiated --close \u2014 can have its just-persisted pending_intent/client_ids and state transition (OPEN->CLOSING) clobbered by check's stale full-file write, breaking the module's core contract that 'the exact order intent and client id are persisted BEFORE every mutation, so a crash between persist and POST leaves an id to query, never a mystery'.",
+   "severity": "MEDIUM",
+   "scenario": "Hold loop starts a --check tick (loads position state OPEN, begins public reads). Owner runs --close: state->CLOSING saved, persist_intent saves pending_intent + client_ids for EXIT_SHORT, the reduce-only close is POSTed. The check tick's reads finish and save_position writes its stale copy: state reverts to OPEN, pending_intent and the EXIT_SHORT client id vanish from disk. If the close process then dies before its next save, --resume queries only the surviving client_ids and reports the pair OPEN while a submitted close order is invisible to query-first recovery \u2014 exactly the mystery the persist-before-mutation discipline exists to prevent.",
+   "lens": "integration",
+   "confirmed": true
+  }
+ ],
+ "rejectedCount": 2
+}
