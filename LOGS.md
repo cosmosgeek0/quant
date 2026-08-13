@@ -1,11 +1,9 @@
 # LOGS.md — builders write what was achieved; the Lead and the owner read it
 
-Contract: newest entry on top, exact shape defined in BUILDER.md, written
-LEAD-CLEAN (defined in LEAD.md): plain rows, no secrets; operational IDs last-4;
-Git SHAs last-8 in entries and exact in finals; no raw
-logs or error dumps — evidence referenced by path. One entry per task. No prose
-beyond the shape. The Lead translates these for the owner in plain words on
-every step.
+Contract (report shape in AGENTS.md): newest entry on top, plain rows, no
+secrets; operational IDs last-4; Git SHAs last-8 in entries and exact in
+finals; no raw logs or error dumps — evidence referenced by path. One entry
+per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
