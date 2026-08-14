@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+LEAD BOOT VERIFY 2026-08-14 | fresh Lead lane first pass | read-only, no mutation anywhere
+local | canonical main 5a583fe == origin, clean, worktrees intact | suite re-run: 789 green in 4.1s (MEASURED)
+host | GET-only SSM read 02:46Z | cron runner 1m + runtime chain 3m | BOTH STOPs PRESENT | supervisor honest IDLE every 3 min | RELEASE byte-matches 26b5a8d2 | no jobs since the three CLOSED proofs
+correction | NOW.md truth row claimed a 2-min supervisor cron; measured is the 3-min runtime chain — record fixed to measured
+standing | one item remains, owner-activated (runtime_control start ARM): the runner's first naturally generated held trade | STOP stays active until that word arrives in-channel
+
 VERTICAL HARDENED + DEPLOYED PAUSED 2026-08-14 | release 26b5a8d2ef318eed38f2ee430da6910e2cd0f8c5 | 789 tests green (Lead-measured)
 built | momentum OPEN/HOLD-across-ticks/EXIT on exchange-truth fills | unified runtime: one control, one STOP honored by ALL consumers incl. the runner, RELEASE-file identity, per-stage failure capture | whole-universe feed with sharded ws connections | UI on runtime truth
 monitor | Opus-max monitor: 14 ranked findings (2 would have stranded a live position or run the OLD runner) | all repaired by 5 parallel codex lanes | monitor also certified: atomic state, crash-safe idempotent jobs, query-only recovery, conservative fee-netting HELD under attack

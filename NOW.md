@@ -23,7 +23,8 @@
 ## Truth (measured 2026-08-14)
 - Runtime ALIVE-PAUSED on host: release 26b5a8d2 deployed, 11 files
   sha-verified host == local, cron unified (runner 1m + runtime chain 3m),
-  RELEASE identity valid, both STOP interlocks present, ticks honest IDLE.
+  RELEASE identity valid, both STOP interlocks present, ticks honest IDLE
+  (re-measured 2026-08-14T02:46Z; no new jobs since the three CLOSED proofs).
 - Built and green (789 tests): token stream (TRADING+PERPETUAL universe,
   measured live 132 spot-only / 167 perp-only / 357 both = 656), momentum
   lifecycle (APRUSDT fixture passes), stream-fed basis, six live-truth UI
