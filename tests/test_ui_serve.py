@@ -173,7 +173,7 @@ class TestStaticServing(ServerHarness):
                                     b"Quant", b"Journal", b"QUANT",
                                     b'id="sidebar"')),
                 ("/index.html", "text/html",
-                 (b'id="topbar"', b'id="g-exec"', b'id="g-auth"',
+                 (b'id="masthead"', b'id="g-exec"', b'id="g-auth"',
                   b'id="root-overview"', b'id="root-basis"',
                   b'id="root-volume"', b'id="root-quant"',
                   b'id="root-journal"', b'src="tabs/overview.js"',

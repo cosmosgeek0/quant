@@ -431,7 +431,7 @@ function renderStrip() {
     "Delivery age: " + ageText(pull.age_seconds) +
     " · market pass: " + (market.state || "unknown"));
 
-  var side = clearTo("side-status");
+  var side = clearTo("statuschips");
   var pullLevel = !pull.present ? "gray" :
     (pull.level === "green" ? "green" :
       (pull.level === "amber" ? "amber" : "red"));
@@ -647,6 +647,10 @@ function selectTab(name) {
     document.getElementById("panel-" + tab)
       .classList.toggle("on", tab === name);
   });
+  var titleNode = document.getElementById("pagetitle");
+  if (titleNode) {
+    titleNode.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+  }
   if (window.location.hash !== "#" + name) {
     window.history.replaceState(null, "", "#" + name);
   }
@@ -728,7 +732,7 @@ window.QuantUI = {
 
 if (typeof document !== "undefined") {
   document.addEventListener("DOMContentLoaded", function () {
-    if (!document.getElementById("topbar")) return;
+    if (!document.getElementById("masthead")) return;
     TABS.forEach(function (tab) {
       document.getElementById("tab-" + tab).addEventListener("click",
         function () { selectTab(tab); });

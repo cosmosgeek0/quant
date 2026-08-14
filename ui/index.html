@@ -12,14 +12,13 @@
   <div class="brand">
     <svg viewBox="0 0 100 100" aria-hidden="true">
       <g fill="currentColor">
-        <polygon points="50,14 82,37 70,74 30,74 18,37"/>
-        <polygon points="50,2 62,10 54,22 44,22 38,10" transform="rotate(0 50 50)" fill="none"/>
-        <rect x="2" y="42" width="22" height="16" rx="4"/>
-        <polygon points="20,12 38,26 30,38 12,26"/>
-        <polygon points="80,12 88,26 70,38 62,26"/>
-        <polygon points="20,88 12,74 30,62 38,76"/>
-        <polygon points="80,88 62,76 70,62 88,74"/>
-        <circle cx="50" cy="50" r="16" fill="#fff"/>
+        <polygon points="72.0,50.0 56.8,29.1 32.2,37.1 32.2,62.9 56.8,70.9"/>
+        <path d="M 33.4,38.0 L 33.4,62.0 L 7.4,65.0 L 7.4,41.0 Z"/>
+        <path d="M 56.3,30.5 L 33.4,38.0 L 22.8,18.3 L 45.7,10.8 Z"/>
+        <path d="M 33.4,62.0 L 56.3,69.5 L 53.3,91.7 L 30.4,84.2 Z"/>
+        <path d="M 70.5,50.0 L 56.3,30.5 L 65.3,19.0 L 79.5,38.5 Z"/>
+        <path d="M 56.3,69.5 L 70.5,50.0 L 82.6,53.8 L 68.4,73.3 Z"/>
+        <polygon points="63.5,50.0 54.2,37.2 39.1,42.1 39.1,57.9 54.2,62.8" fill="#fff"/>
       </g>
     </svg>
     <span>
@@ -38,12 +37,17 @@
   <p class="navgroup">Records</p>
   <button class="navitem" role="tab" id="tab-journal" aria-selected="false" aria-controls="panel-journal"><span class="dot"></span>Journal</button>
 
-  <div id="side-status"></div>
 </aside>
 
 <div class="maincol">
 
-  <div id="topbar" aria-label="Global machine state">
+  <div id="masthead">
+  <div id="cmdbar">
+    <span id="pagetitle">Overview</span>
+    <span id="statuschips"></span>
+    <span id="clockpill">--:--:-- UTC</span>
+  </div>
+  <div id="cockpit" aria-label="Global machine state">
     <div class="gcell" id="g-exec">
       <p class="glabel">Execution</p>
       <p class="gvalue skel">loading</p>
@@ -79,7 +83,7 @@
       <p class="gvalue skel">loading</p>
       <p class="gsub"></p>
     </div>
-    <span id="clockpill">--:--:-- UTC</span>
+  </div>
   </div>
 
   <div id="connbar" role="status"></div>
