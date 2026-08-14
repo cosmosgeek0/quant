@@ -6,203 +6,103 @@
 <title>Quant</title>
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="shell">
 
-<div id="connbar" role="status"></div>
-
-<header>
-  <div class="wrap">
-    <div class="brandrow">
-      <span class="brand">QUANT</span>
-      <span class="brand-sub">owner dashboard &middot; read-only</span>
-    </div>
-    <div id="gstrip" aria-label="Global machine state">
-      <div class="gcell" id="g-exec">
-        <p class="glabel">Execution</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-      <div class="gcell" id="g-auth">
-        <p class="glabel">Authority</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-      <div class="gcell" id="g-equity">
-        <p class="glabel">Equity</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-      <div class="gcell" id="g-net">
-        <p class="glabel">Net today</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-      <div class="gcell" id="g-expo">
-        <p class="glabel">Exposure</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-      <div class="gcell" id="g-risk">
-        <p class="glabel">Risk</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-      <div class="gcell" id="g-data">
-        <p class="glabel">Data</p>
-        <p class="gvalue skel">loading</p>
-        <p class="gsub"></p>
-      </div>
-    </div>
-  </div>
-</header>
-
-<nav role="tablist" aria-label="Sections">
-  <button role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview">Overview</button>
-  <button role="tab" id="tab-basis" aria-selected="false" aria-controls="panel-basis">Basis</button>
-  <button role="tab" id="tab-volume" aria-selected="false" aria-controls="panel-volume">Volume</button>
-  <button role="tab" id="tab-quant" aria-selected="false" aria-controls="panel-quant">Quant</button>
-  <button role="tab" id="tab-journal" aria-selected="false" aria-controls="panel-journal">Journal</button>
-</nav>
-
-<main class="wrap">
-
-  <div role="tabpanel" id="panel-overview" class="on" aria-labelledby="tab-overview">
-    <section class="block">
-      <h2>Net profit and loss — today</h2>
-      <p class="bignum unavailable" id="ov-net">Unavailable — ledger incomplete</p>
-      <p class="meta" id="ov-net-note">Account-wide accounting does not exist yet. Partial records below are real but incomplete.</p>
-    </section>
-    <div class="grid2">
-      <section class="block">
-        <h2>Current exposure</h2>
-        <div id="ov-exposure"><p class="empty skel">loading</p></div>
-      </section>
-      <section class="block">
-        <h2>Capital</h2>
-        <div id="ov-capital"></div>
-      </section>
-    </div>
-    <div class="grid2">
-      <section class="block">
-        <h2>Realized records — Basis (partial)</h2>
-        <div id="ov-basis-realized"><p class="empty skel">loading</p></div>
-      </section>
-      <section class="block">
-        <h2>Realized records — Volume (partial)</h2>
-        <div id="ov-momentum-realized"><p class="empty skel">loading</p></div>
-      </section>
-    </div>
-    <div class="grid2">
-      <section class="block">
-        <h2>Risk usage</h2>
-        <div id="ov-risk"><p class="empty skel">loading</p></div>
-      </section>
-      <section class="block">
-        <h2>Recent activity</h2>
-        <div id="ov-activity"><p class="empty skel">loading</p></div>
-      </section>
-    </div>
+<aside id="sidebar">
+  <div class="brand">
+    <svg viewBox="0 0 100 100" aria-hidden="true">
+      <g fill="currentColor">
+        <polygon points="50,14 82,37 70,74 30,74 18,37"/>
+        <polygon points="50,2 62,10 54,22 44,22 38,10" transform="rotate(0 50 50)" fill="none"/>
+        <rect x="2" y="42" width="22" height="16" rx="4"/>
+        <polygon points="20,12 38,26 30,38 12,26"/>
+        <polygon points="80,12 88,26 70,38 62,26"/>
+        <polygon points="20,88 12,74 30,62 38,76"/>
+        <polygon points="80,88 62,76 70,62 88,74"/>
+        <circle cx="50" cy="50" r="16" fill="#fff"/>
+      </g>
+    </svg>
+    <span>
+      <span class="wordmark">QUANT</span>
+      <span class="wordsub">owner room</span>
+    </span>
   </div>
 
-  <div role="tabpanel" id="panel-basis" aria-labelledby="tab-basis">
-    <section class="block">
-      <h2>Basis — both-venue opportunities</h2>
-      <div class="toolbar" id="basis-toolbar">
-        <input type="search" id="basis-search" placeholder="symbol" aria-label="Search symbol">
-        <button class="fbtn" data-filter="all" aria-pressed="true">All</button>
-        <button class="fbtn" data-filter="edge" aria-pressed="false">Positive edge</button>
-        <button class="fbtn" data-filter="proposal" aria-pressed="false">Proposal</button>
-        <button class="fbtn" data-filter="open" aria-pressed="false">Open</button>
-      </div>
-      <div class="tablewrap">
-        <table class="data" id="basis-table">
-          <thead><tr>
-            <th data-sort="symbol">Asset</th>
-            <th data-sort="spot">Spot</th>
-            <th data-sort="perp">Perp</th>
-            <th data-sort="gap">Gap</th>
-            <th data-sort="edge" class="sorted">Edge</th>
-            <th data-sort="funding">Funding</th>
-            <th data-sort="planned">Planned</th>
-            <th data-sort="phase">Phase</th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="rankchip" id="basis-rankchip">Ranks changed while inspecting. <button type="button">Apply new order</button></p>
-      <p class="meta" id="basis-meta"></p>
-    </section>
-  </div>
+  <p class="navgroup">Overview</p>
+  <button class="navitem" role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview"><span class="dot"></span>Overview</button>
+  <p class="navgroup">Engine</p>
+  <button class="navitem" role="tab" id="tab-basis" aria-selected="false" aria-controls="panel-basis"><span class="dot"></span>Basis</button>
+  <button class="navitem" role="tab" id="tab-volume" aria-selected="false" aria-controls="panel-volume"><span class="dot"></span>Volume</button>
+  <p class="navgroup">Control</p>
+  <button class="navitem" role="tab" id="tab-quant" aria-selected="false" aria-controls="panel-quant"><span class="dot"></span>Quant</button>
+  <p class="navgroup">Records</p>
+  <button class="navitem" role="tab" id="tab-journal" aria-selected="false" aria-controls="panel-journal"><span class="dot"></span>Journal</button>
 
-  <div role="tabpanel" id="panel-volume" aria-labelledby="tab-volume">
-    <section class="block">
-      <h2>Volume — interesting movers</h2>
-      <div class="toolbar" id="volume-toolbar">
-        <input type="search" id="volume-search" placeholder="symbol" aria-label="Search symbol">
-        <button class="fbtn" data-filter="interesting" aria-pressed="true">Interesting</button>
-        <button class="fbtn" data-filter="both" aria-pressed="false">Both venues</button>
-        <button class="fbtn" data-filter="spot" aria-pressed="false">Spot</button>
-        <button class="fbtn" data-filter="perp" aria-pressed="false">Perp</button>
-      </div>
-      <div class="tablewrap">
-        <table class="data" id="volume-table">
-          <thead><tr>
-            <th data-sort="symbol">Asset</th>
-            <th data-sort="market">Market</th>
-            <th data-sort="route">Route</th>
-            <th data-sort="price">Price</th>
-            <th data-sort="surge" class="sorted">Surge</th>
-            <th data-sort="phase">Phase</th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="rankchip" id="volume-rankchip">Ranks changed while inspecting. <button type="button">Apply new order</button></p>
-      <p class="meta" id="volume-meta"></p>
-    </section>
-  </div>
+  <div id="side-status"></div>
+</aside>
 
-  <div role="tabpanel" id="panel-quant" aria-labelledby="tab-quant">
-    <div class="quantgrid">
-      <section class="block trail">
-        <h2>Decision trail</h2>
-        <p class="meta" id="quant-state"></p>
-        <div id="quant-trail"><p class="empty skel">loading</p></div>
-      </section>
-      <div>
-        <section class="block">
-          <h2>Authority</h2>
-          <div id="quant-authority"></div>
-        </section>
-        <section class="block">
-          <h2>Policy — effective values</h2>
-          <div id="quant-policy"></div>
-        </section>
-      </div>
+<div class="maincol">
+
+  <div id="topbar" aria-label="Global machine state">
+    <div class="gcell" id="g-exec">
+      <p class="glabel">Execution</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
     </div>
+    <div class="gcell" id="g-auth">
+      <p class="glabel">Authority</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
+    </div>
+    <div class="gcell" id="g-equity">
+      <p class="glabel">Equity</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
+    </div>
+    <div class="gcell" id="g-net">
+      <p class="glabel">Net today</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
+    </div>
+    <div class="gcell" id="g-expo">
+      <p class="glabel">Exposure</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
+    </div>
+    <div class="gcell" id="g-risk">
+      <p class="glabel">Risk</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
+    </div>
+    <div class="gcell" id="g-data">
+      <p class="glabel">Data</p>
+      <p class="gvalue skel">loading</p>
+      <p class="gsub"></p>
+    </div>
+    <span id="clockpill">--:--:-- UTC</span>
   </div>
 
-  <div role="tabpanel" id="panel-journal" aria-labelledby="tab-journal">
-    <section class="block">
-      <h2>Journal — durable records (partial)</h2>
-      <p class="meta">The complete journal contract does not exist yet. These are the durable records the current machine already exposes.</p>
-      <div id="journal-rows"><p class="empty skel">loading</p></div>
-    </section>
-    <section class="block">
-      <h2>Historical evidence — archived spot runs</h2>
-      <p class="meta">Archived fixture of the first real spot runs. Historical evidence, not live data.</p>
-      <div id="journal-history"><p class="empty skel">loading</p></div>
-    </section>
-  </div>
+  <div id="connbar" role="status"></div>
 
-</main>
+  <main>
+    <div role="tabpanel" id="panel-overview" class="on" aria-labelledby="tab-overview"><div id="root-overview"></div></div>
+    <div role="tabpanel" id="panel-basis" aria-labelledby="tab-basis"><div id="root-basis"></div></div>
+    <div role="tabpanel" id="panel-volume" aria-labelledby="tab-volume"><div id="root-volume"></div></div>
+    <div role="tabpanel" id="panel-quant" aria-labelledby="tab-quant"><div id="root-quant"></div></div>
+    <div role="tabpanel" id="panel-journal" aria-labelledby="tab-journal"><div id="root-journal"></div></div>
+  </main>
 
-<footer>
-  <div class="wrap">
+  <footer>
     <p>Every value on this page comes from the machine&rsquo;s own recorded files. Missing data renders as unavailable &mdash; never as zero, never as a sample. This page reads; it cannot trade, pause, or arm.</p>
-  </div>
-</footer>
+  </footer>
+
+</div>
 
 <script src="app.js"></script>
+<script src="tabs/overview.js"></script>
+<script src="tabs/basis.js"></script>
+<script src="tabs/volume.js"></script>
+<script src="tabs/quant.js"></script>
+<script src="tabs/journal.js"></script>
 </body>
 </html>
