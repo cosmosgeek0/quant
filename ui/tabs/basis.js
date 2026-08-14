@@ -3,19 +3,101 @@
 /* Basis tab — both-venue opportunity product. Owned by the Basis lane.
    Sources: stream (selection contains basis_gap, venues both), candidates
    (real proposals with the full equation), position (Open state).
-   Honesty: Edge exists only where a real proposal was evaluated; charts
-   say History collecting; the browser never recalculates the kernel. */
+   Honesty: Edge exists only where a real proposal was evaluated; the
+   browser never recalculates the kernel. The ONLY client arithmetic is
+   the contract-sanctioned approximate leg/gross notionals, derived from
+   the proposal's own frozen quantity and prices and always ≈-labeled.
+   Charts say History collecting until a real history endpoint exists;
+   no time selector or chart toggle ships before then (no dead controls).
+   Phase claims only Observed / Proposal / Open — Focused, Confirming and
+   Refused wait for the watcher decision read model. */
 
 (function () {
   var UI = window.QuantUI;
   var table = null;
   var filter = "all";
+  var stats = null;
+
+  var EMPTY_LINES = {
+    all: "No both-venue symbols in the current delivery.",
+    edge: "No positive net edge now.",
+    proposal: "No standing proposals.",
+    open: "No open Basis position.",
+    search: "No symbols match the search."
+  };
+
+  /* ---------- pure helpers ---------- */
+
+  function finite(raw) {
+    if (raw === null || raw === undefined || raw === "") return null;
+    var value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  /* Approximate notionals from the proposal's own frozen fields only.
+     quantity is the shared base-asset quantity proven per leg by the
+     watcher; spot_ask/perp_bid are the prices it evaluated. Display
+     scale only — never part of the edge equation. */
+  function legNotionals(proposal) {
+    if (!proposal) return null;
+    var quantity = finite(proposal.quantity);
+    var spot = finite(proposal.spot_ask);
+    var perp = finite(proposal.perp_bid);
+    if (quantity === null || spot === null || perp === null) return null;
+    return {
+      spot: quantity * spot,
+      perp: quantity * perp,
+      gross: quantity * (spot + perp)
+    };
+  }
+
+  function ownerExpiryText(iso) {
+    var ttl = UI.secondsUntil(iso);
+    if (ttl === null) return "Expiry unrecorded";
+    if (ttl > 0) return "Opportunity expires in " + ttl + "s";
+    return "Proposal expired " + (-ttl) + "s ago";
+  }
+
+  function fundingPeriodHours(ms) {
+    var value = finite(ms);
+    if (value === null || value <= 0) return null;
+    return UI.fmtNum(value / 3600000, 2);
+  }
+
+  /* ---------- dom ---------- */
+
+  function makeStat(label) {
+    var node = UI.el("span", "chip");
+    var dot = UI.el("span", "cdot c-gray");
+    var sub = UI.el("span", "cmuted", "loading");
+    node.appendChild(dot);
+    node.appendChild(UI.el("span", null, label));
+    node.appendChild(sub);
+    return { node: node, dot: dot, sub: sub };
+  }
+
+  function setStat(stat, level, text) {
+    stat.dot.className = "cdot c-" + level;
+    if (stat.sub.textContent !== text) stat.sub.textContent = text;
+  }
 
   function init() {
     var root = document.getElementById("root-basis");
     root.textContent = "";
     var block = UI.el("section", "block");
     block.appendChild(UI.el("h2", null, "Basis — both-venue opportunities"));
+
+    stats = {
+      universe: makeStat("Both-venue"),
+      proposals: makeStat("Proposals"),
+      best: makeStat("Best edge")
+    };
+    var band = UI.el("div", "toolbar");
+    band.id = "basis-band";
+    band.appendChild(stats.universe.node);
+    band.appendChild(stats.proposals.node);
+    band.appendChild(stats.best.node);
+    block.appendChild(band);
 
     var toolbar = UI.el("div", "toolbar");
     toolbar.id = "basis-toolbar";
@@ -51,6 +133,11 @@
       "</tr></thead><tbody></tbody>";
     wrap.appendChild(tableNode);
     block.appendChild(wrap);
+
+    var emptyLine = UI.el("p", "empty", "");
+    emptyLine.id = "basis-empty";
+    emptyLine.style.display = "none";
+    block.appendChild(emptyLine);
 
     var chipRow = UI.el("p", "rankchip");
     chipRow.id = "basis-rankchip";
@@ -99,20 +186,26 @@
             cls: Number(r.edge) > 0 ? "pos" : "neg" };
         } },
         { key: "funding", cls: "num", render: function (r) {
-          return { text: UI.fmtPct(r.funding) || "—" };
+          var text = UI.fmtPct(r.funding);
+          if (text === null) return { text: "—", cls: "dim" };
+          var carry = r.proposal ? UI.fmtPct(r.proposal.carry_pct) : null;
+          return { text: carry === null ? text :
+            text + " · carry " + carry };
         } },
         { key: "planned", cls: "num", render: function (r) {
           return r.planned === null ? { text: "—", cls: "dim" } :
-            { text: UI.fmtNum(r.planned) + " /leg" };
+            { text: "≈ " + UI.fmtNum(r.planned, 2) + " USDT /leg" };
         } },
         { key: "phase", render: function (r) {
-          return { text: r.phase,
-            cls: r.phase === "Open" ? "pos" :
-              (r.phase === "Proposal" ? "" : "dim") };
+          var cls = r.phase === "Open" ? "b-green" :
+            (r.phase === "Proposal" ? "b-blue" : "b-gray");
+          return { node: UI.el("span", "badge " + cls, r.phase) };
         } }
       ]
     });
   }
+
+  /* ---------- row assembly ---------- */
 
   function proposalsBySymbol() {
     var map = {};
@@ -126,12 +219,24 @@
     return map;
   }
 
+  /* Open only when the persisted state actually reads as holding — the
+     position file may hold a finished (CLOSED) receipt. */
+  function openBasisSymbol() {
+    var pos = UI.state.data.position;
+    if (!pos || !pos.position || typeof pos.position !== "object") {
+      return null;
+    }
+    if (UI.ownerPhaseForState(pos.position.state) !== "Holding") return null;
+    return pos.position.symbol || null;
+  }
+
+  var lastTotal = 0;
+
   function rows() {
     var stream = UI.state.data.stream;
-    if (!stream || !Array.isArray(stream.tokens)) return [];
+    if (!stream || !Array.isArray(stream.tokens)) { lastTotal = 0; return []; }
     var proposals = proposalsBySymbol();
-    var pos = UI.state.data.position;
-    var openSymbol = pos && pos.position && pos.position.symbol;
+    var openSymbol = openBasisSymbol();
     var out = [];
     stream.tokens.forEach(function (token) {
       var sel = token.selection || [];
@@ -141,6 +246,7 @@
       if (data.basis_gap_pct === null ||
           data.basis_gap_pct === undefined) return;
       var proposal = proposals[token.symbol] || null;
+      var legs = legNotionals(proposal);
       out.push({
         key: token.symbol,
         symbol: token.symbol,
@@ -149,13 +255,14 @@
         gap: data.basis_gap_pct,
         funding: data.funding_rate,
         edge: proposal ? proposal.net_edge_pct : null,
-        planned: proposal ? proposal.quantity : null,
+        planned: legs ? legs.spot : null,
         phase: openSymbol === token.symbol ? "Open" :
           (proposal ? "Proposal" : "Observed"),
         proposal: proposal,
         data: data
       });
     });
+    lastTotal = out.length;
     if (filter === "edge") {
       out = out.filter(function (row) {
         return row.edge !== null && Number(row.edge) > 0;
@@ -175,8 +282,14 @@
     return out;
   }
 
+  /* ---------- expanded row ---------- */
+
   function expand(row) {
     var box = UI.el("div");
+    box.appendChild(UI.el("p", "unavail", "History collecting — no " +
+      "measured price series exists yet. Gap and price charts appear " +
+      "when a real history endpoint delivers points; nothing is drawn " +
+      "from snapshots."));
     if (row.proposal) {
       var proposal = row.proposal;
       box.appendChild(UI.el("p", "meta", "Cost waterfall — values exactly " +
@@ -202,13 +315,39 @@
       wf("Executable net edge", UI.fmtPct(proposal.net_edge_pct), true);
       box.appendChild(waterfall);
       box.appendChild(UI.el("p", "meta",
-        "Intended action: buy Spot, short Perp · quantity " +
-        (UI.fmtNum(proposal.quantity) || "?") + " evaluated per leg."));
-      var ttl = UI.secondsUntil(proposal.expires_utc);
-      box.appendChild(UI.el("p", "meta", ttl === null ?
-        "Expiry unrecorded" : (ttl > 0 ?
-          "Opportunity expires in " + ttl + "s" :
-          "Proposal expired " + (-ttl) + "s ago")));
+        "Intended action: Buy Spot / Short Perp — shared quantity " +
+        (UI.fmtNum(proposal.quantity) || "not supplied") + " per leg."));
+      var legs = legNotionals(proposal);
+      if (legs) {
+        box.appendChild(UI.el("p", "meta",
+          "≈ " + UI.fmtNum(legs.spot, 2) + " USDT spot leg · ≈ " +
+          UI.fmtNum(legs.perp, 2) + " USDT perp leg · ≈ " +
+          UI.fmtNum(legs.gross, 2) + " USDT gross across both legs " +
+          "(approximate — derived only from the proposal's own frozen " +
+          "quantity and prices)."));
+      } else {
+        box.appendChild(UI.el("p", "unavail",
+          "Leg notionals not derivable — the proposal record is missing " +
+          "quantity or price fields."));
+      }
+      var period = fundingPeriodHours(proposal.funding_period_ms);
+      box.appendChild(UI.el("p", "meta",
+        "Funding " + (UI.fmtPct(proposal.funding_rate) || "not supplied") +
+        (period ? " per " + period + "h period" : "") +
+        " · next-settlement countdown and projected credit/debit stay " +
+        "unavailable until the backend emits those fields."));
+      var proposalLine = UI.el("p", "meta",
+        "Proposal " + (proposal.proposal_id || "(id unrecorded)") +
+        " · standing · ");
+      var expiry = UI.el("span", null,
+        ownerExpiryText(proposal.expires_utc));
+      expiry.setAttribute("data-expires", proposal.expires_utc || "");
+      proposalLine.appendChild(expiry);
+      box.appendChild(proposalLine);
+      box.appendChild(UI.el("p", "unavail",
+        "Persistence, stability and exact pass reasoning are not exposed " +
+        "to this page yet — they arrive with the watcher decision read " +
+        "model."));
     } else {
       box.appendChild(UI.el("p", "unavail",
         "Not evaluated — the watcher’s decision rows are not exposed to " +
@@ -222,29 +361,86 @@
       " USDT · Perp step " + (UI.fmtNum(data.perp_step) || "?") +
       ", min " + (UI.fmtNum(data.perp_min_notional) || "?") +
       " USDT · funding " + (UI.fmtPct(data.funding_rate) || "?")));
-    box.appendChild(UI.el("p", "unavail", "History collecting — no " +
-      "measured price series exists yet, so there is no chart to show."));
     box.appendChild(UI.techDrawer(row.proposal || row.data));
     return box;
   }
 
+  /* ---------- render ---------- */
+
+  function renderBand() {
+    var stream = UI.state.data.stream;
+    var candidates = UI.state.data.candidates;
+    if (stream && stream.present) {
+      var count = finite(stream.basis_gap_count);
+      setStat(stats.universe, "green",
+        (count === null ? "?" : count) + " symbols");
+    } else {
+      setStat(stats.universe, "gray", "no delivery");
+    }
+    if (!candidates || !candidates.present) {
+      setStat(stats.proposals, "gray", "no delivery yet");
+      setStat(stats.best, "gray", "none evaluated");
+      return;
+    }
+    var list = Array.isArray(candidates.candidates) ?
+      candidates.candidates : [];
+    setStat(stats.proposals, list.length > 0 ? "green" : "gray",
+      list.length + " standing");
+    var first = list.length > 0 ?
+      (list[0].proposal || list[0]) : null;
+    var best = first ? UI.fmtPct(first.net_edge_pct) : null;
+    if (best !== null) {
+      setStat(stats.best, "green", best + " " + (first.symbol || ""));
+    } else {
+      setStat(stats.best, "gray", "none evaluated");
+    }
+  }
+
   function render() {
     if (!table) return;
+    var meta = document.getElementById("basis-meta");
+    var emptyLine = document.getElementById("basis-empty");
+    var stream = UI.state.data.stream;
+    renderBand();
+
+    if (!UI.state.lastGoodAt && !stream) {
+      meta.textContent = "Loading market data…";
+      emptyLine.style.display = "none";
+      return;
+    }
+
     var list = rows();
     table.update(list);
-    var stream = UI.state.data.stream;
-    var meta = document.getElementById("basis-meta");
-    if (!stream) {
-      meta.textContent = "Loading market data…";
-    } else if (!stream.present) {
+
+    /* In-place countdown refresh: expiry text ticks every poll without
+       rebuilding the expansion (live-update rule: cells, not sections). */
+    document.querySelectorAll("#basis-table [data-expires]")
+      .forEach(function (node) {
+        var text = ownerExpiryText(node.getAttribute("data-expires"));
+        if (node.textContent !== text) node.textContent = text;
+      });
+
+    if (!stream || !stream.present) {
       meta.textContent = "Market data unavailable — nothing has been " +
         "delivered to this page yet.";
-    } else {
-      meta.textContent = list.length + " both-venue symbols in the " +
-        "current delivery · data " +
-        (UI.shortTime(stream.as_of || "") || "age unknown") +
-        " · Edge exists only where a real proposal was evaluated.";
+      emptyLine.style.display = "none";
+      return;
     }
+
+    if (list.length === 0) {
+      var query = document.getElementById("basis-search").value.trim();
+      emptyLine.textContent = query ? EMPTY_LINES.search :
+        EMPTY_LINES[filter] || EMPTY_LINES.all;
+      emptyLine.style.display = "";
+    } else {
+      emptyLine.style.display = "none";
+    }
+
+    meta.textContent = lastTotal + " both-venue symbols in the " +
+      "current delivery" +
+      (list.length === lastTotal ? "" : " · " + list.length + " shown") +
+      " · data " + (UI.shortTime(stream.as_of || "") || "age unknown") +
+      " · Edge exists only where a real proposal was evaluated.";
   }
 
   window.QuantTabs.basis = {
