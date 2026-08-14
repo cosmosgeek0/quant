@@ -725,6 +725,38 @@ class LiveFeedMergeTests(OfflineCase):
 
 
 class FeedDispositionTests(OfflineCase):
+    def test_feed_written_within_future_skew_is_accepted(self):
+        self.write_feed(
+            {"AAAUSDT": feed_row("spot", "1", "2")},
+            written_ms=FIXED_MS + ms.FUTURE_SKEW_MS,
+        )
+
+        result = ms.load_fresh_feed_state(self.feed_path, FIXED_MS)
+
+        self.assertIsNotNone(result.snapshot)
+        self.assertEqual(result.reason, "accepted")
+
+    def test_feed_written_beyond_future_skew_is_rejected(self):
+        self.write_feed(
+            {"AAAUSDT": feed_row("spot", "1", "2")},
+            written_ms=FIXED_MS + ms.FUTURE_SKEW_MS + 1,
+        )
+
+        result = ms.load_fresh_feed_state(self.feed_path, FIXED_MS)
+
+        self.assertIsNone(result.snapshot)
+        self.assertEqual(result.reason, "written_ms_future")
+
+    def test_negative_feed_age_clamps_to_zero(self):
+        self.assertEqual(
+            ms._clamped_age_ms(
+                FIXED_MS,
+                FIXED_MS + ms.FUTURE_SKEW_MS,
+                source_age_ms=1,
+            ),
+            0,
+        )
+
     def test_every_feed_rejection_path_has_a_stable_reason(self):
         self.assertEqual(
             ms.load_fresh_feed_state(None, FIXED_MS).reason,
@@ -765,7 +797,13 @@ class FeedDispositionTests(OfflineCase):
             ("written_ms_boolean", changed("written_ms", True)),
             ("written_ms_invalid", changed("written_ms", "bad")),
             ("written_ms_negative", changed("written_ms", "-1")),
-            ("written_ms_future", changed("written_ms", str(FIXED_MS + 1))),
+            (
+                "written_ms_future",
+                changed(
+                    "written_ms",
+                    str(FIXED_MS + ms.FUTURE_SKEW_MS + 1),
+                ),
+            ),
             (
                 "snapshot_stale",
                 changed(

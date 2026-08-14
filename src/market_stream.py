@@ -27,9 +27,9 @@ credential, signing, POST, order, or account path in this module.
 When ``--feed-state`` names a fresh versioned snapshot from
 ``market_feed --serve``, its complete ticker snapshot and closed 1m windows are
 merged before the bounded REST focus reads.  Books fall back to REST when a
-configured snapshot is absent, invalid, future-dated, or stale; surge ratios
-then clear for the whole pass because full-universe volume freshness is not
-proved.
+configured snapshot is absent, invalid, too far future-dated, or stale; surge
+ratios then clear for the whole pass because full-universe volume freshness is
+not proved.
 """
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ DEFAULT_THRESHOLDS = (Decimal("2"), Decimal("3"), Decimal("5"))
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_REQUEST_SPACING_SECONDS = 0.05
 DEFAULT_FEED_MAX_AGE_MS = 5_000
+FUTURE_SKEW_MS = 2_000
 DEFAULT_WINDOW_MIN_COVERAGE_PCT = Decimal("90")
 DEFAULT_BASIS_MAX_SKEW_MS = 1_000
 CANDLE_INTERVAL_MS = 60_000
@@ -193,6 +194,12 @@ def now_utc() -> str:
 
 def epoch_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _clamped_age_ms(
+    now_ms: int, observed_ms: int, source_age_ms: int = 0
+) -> int:
+    return max(0, now_ms - observed_ms + source_age_ms)
 
 
 def decimal_value(raw: Any, source: str) -> Decimal:
@@ -397,9 +404,9 @@ def load_fresh_feed_state(
         return FeedLoadResult(None, "written_ms_invalid")
     if written_ms < 0:
         return FeedLoadResult(None, "written_ms_negative")
-    if written_ms > now_ms:
+    if written_ms - now_ms > FUTURE_SKEW_MS:
         return FeedLoadResult(None, "written_ms_future")
-    if now_ms - written_ms > max_age_ms:
+    if _clamped_age_ms(now_ms, written_ms) > max_age_ms:
         return FeedLoadResult(None, "snapshot_stale")
     raw_symbols = payload.get("symbols")
     if not isinstance(raw_symbols, dict):
@@ -1346,7 +1353,11 @@ class MarketStream:
                     total_age = (
                         None
                         if source_age is None
-                        else pass_start_ms - feed_snapshot.written_ms + source_age
+                        else _clamped_age_ms(
+                            pass_start_ms,
+                            feed_snapshot.written_ms,
+                            source_age,
+                        )
                     )
                     if (
                         total_age is not None
