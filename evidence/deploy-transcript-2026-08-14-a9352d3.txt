@@ -1,0 +1,20 @@
+RAW HOST TRANSCRIPT (sanitized excerpt; full decision pass lives in host decisions.jsonl)
+== DEPLOY 2026-08-14T06:10:13Z release a9352d323be079ed0481c1281365c3f2e4e95a9c ==
+untar: ok
+RELEASE: a9352d323be079ed0481c1281365c3f2e4e95a9c
+== hashes == (sha256 of sha256sum src/*.py scripts/runtime_tick.sh runtime_control.sh job_tick.sh)
+e23aa74f4a5bbc5d0a60bf154e9b8ad5f9ede7b8e71f7ecf1773caf0d87a0525
+== legacy sweep == (no legacy scripts present in deploy dir; repo-side retired at commit "legacy entry paths retired")
+== gate removal == gate: inactive | ui-on-8080: 200 (Cloudflare Access + YubiKey is the single door)
+== cron + seals ==
+cron: * * * * * .../job_tick.sh
+cron: */3 * * * * .../runtime_tick.sh
+seal: STOP
+seal: STOP-JOBS
+== manual tick (first tick on the new release, both seals present) ==
+RUNTIME | observation under STOP | entries sealed
+symbols_seen total=656 spot_only=132 perp_only=167 both=357
+requests actual=29 budget=29 | focus cap=12 | volume window_closed_1m=240 coverage=90pct
+feed_used=no reason=written_ms_future   <-- follow-up: same-host clock-order tolerance
+WATCH | pass 1 | mode STREAM-FED | finalists 0 | honest refusals
+momentum decisions: 656 written, jobs_recovered 0, jobs_written 0 (decision rows carry full lifecycle state, phase WATCH, FLAT)
