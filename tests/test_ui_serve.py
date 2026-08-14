@@ -185,7 +185,7 @@ class TestStaticServing(ServerHarness):
                   b'"/api/strip"', b'"/api/position"', b'"/api/momentum"',
                   b"Unavailable", b"executionPhase", b"QuantTabs")),
                 ("/tabs/overview.js", "text/javascript",
-                 (b"ledger incomplete", b"QuantTabs.overview")),
+                 (b"Ledger incomplete", b"QuantTabs.overview")),
                 ("/tabs/basis.js", "text/javascript",
                  (b"basis_gap", b"Not evaluated", b"QuantTabs.basis")),
                 ("/tabs/volume.js", "text/javascript",
