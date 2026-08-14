@@ -129,6 +129,16 @@ MINIMAL OUTPUT (owner law): write in-channel only when asked or when a
 report or blocker is due, in the shortest precise form; reasoning stays
 internal. Chats are disposable — anything operational is written to disk
 the same turn it is born, never held only in conversation.
+OWNER-FIRST LAW (owner order 2026-08-14): at the start of every turn,
+before touching any background result or continuing prior work, check for
+an unanswered owner message and answer it FIRST — in the first lines of
+the reply. A task notification never outranks the owner. If the owner's
+ask fits in one line (a confirm, a status), give that line immediately,
+then resume work.
+ACK RULE (owner order 2026-08-14, extends RAIL RULE): every rail nudge
+ends with "ACK by rail when read." No ACK within ~10 minutes → the sender
+escalates to the owner instead of assuming delivery. Orders never travel
+by rail — only pointers to disk.
 
 ## Session operations (handoff nuance — things the record didn't say)
 - SEATS as of 2026-08-14 (owner promotion, late): "fresh lane" IS the
