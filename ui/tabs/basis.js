@@ -1,451 +1,196 @@
 "use strict";
 
-/* Basis tab — both-venue opportunity product. Owned by the Basis lane.
-   Sources: stream (selection contains basis_gap, venues both), candidates
-   (real proposals with the full equation), position (Open state).
-   Honesty: Edge exists only where a real proposal was evaluated; the
-   browser never recalculates the kernel. The ONLY client arithmetic is
-   the contract-sanctioned approximate leg/gross notionals, derived from
-   the proposal's own frozen quantity and prices and always ≈-labeled.
-   Charts say History collecting until a real history endpoint exists;
-   no time selector or chart toggle ships before then (no dead controls).
-   Phase claims only Observed / Proposal / Open — Focused, Confirming and
-   Refused wait for the watcher decision read model. */
+/* Basis — both-venue opportunities (contract §5.2, iteration-1 truth).
+   Rows come from /api/stream rows whose selection includes basis_gap;
+   Edge exists only where the backend evaluated a proposal (via
+   /api/candidates); everything else says Not evaluated. The browser
+   never recalculates the equation. Charts say History collecting. */
 
 (function () {
-  var UI = window.QuantUI;
-  var table = null;
-  var filter = "all";
-  var stats = null;
+  var U = window.QuantUI;
+  var view = { filter: "all" };
+  var tape = null, host = null;
 
-  var EMPTY_LINES = {
-    all: "No both-venue symbols in the current delivery.",
-    edge: "No positive net edge now.",
-    proposal: "No standing proposals.",
-    open: "No open Basis position.",
-    search: "No symbols match the search."
-  };
-
-  /* ---------- pure helpers ---------- */
-
-  function finite(raw) {
-    if (raw === null || raw === undefined || raw === "") return null;
-    var value = Number(raw);
-    return Number.isFinite(value) ? value : null;
-  }
-
-  /* Approximate notionals from the proposal's own frozen fields only.
-     quantity is the shared base-asset quantity proven per leg by the
-     watcher; spot_ask/perp_bid are the prices it evaluated. Display
-     scale only — never part of the edge equation. */
-  function legNotionals(proposal) {
-    if (!proposal) return null;
-    var quantity = finite(proposal.quantity);
-    var spot = finite(proposal.spot_ask);
-    var perp = finite(proposal.perp_bid);
-    if (quantity === null || spot === null || perp === null) return null;
-    return {
-      spot: quantity * spot,
-      perp: quantity * perp,
-      gross: quantity * (spot + perp)
-    };
-  }
-
-  function ownerExpiryText(iso) {
-    var ttl = UI.secondsUntil(iso);
-    if (ttl === null) return "Expiry unrecorded";
-    if (ttl > 0) return "Opportunity expires in " + ttl + "s";
-    return "Proposal expired " + (-ttl) + "s ago";
-  }
-
-  function fundingPeriodHours(ms) {
-    var value = finite(ms);
-    if (value === null || value <= 0) return null;
-    return UI.fmtNum(value / 3600000, 2);
-  }
-
-  /* ---------- dom ---------- */
-
-  function makeStat(label) {
-    var node = UI.el("span", "chip");
-    var dot = UI.el("span", "cdot c-gray");
-    var sub = UI.el("span", "cmuted", "loading");
-    node.appendChild(dot);
-    node.appendChild(UI.el("span", null, label));
-    node.appendChild(sub);
-    return { node: node, dot: dot, sub: sub };
-  }
-
-  function setStat(stat, level, text) {
-    stat.dot.className = "cdot c-" + level;
-    if (stat.sub.textContent !== text) stat.sub.textContent = text;
-  }
-
-  function init() {
-    var root = document.getElementById("root-basis");
-    root.textContent = "";
-    var block = UI.el("section", "block");
-    block.appendChild(UI.el("h2", null, "Basis — both-venue opportunities"));
-
-    stats = {
-      universe: makeStat("Both-venue"),
-      proposals: makeStat("Proposals"),
-      best: makeStat("Best edge")
-    };
-    var band = UI.el("div", "toolbar");
-    band.id = "basis-band";
-    band.appendChild(stats.universe.node);
-    band.appendChild(stats.proposals.node);
-    band.appendChild(stats.best.node);
-    block.appendChild(band);
-
-    var toolbar = UI.el("div", "toolbar");
-    toolbar.id = "basis-toolbar";
-    var search = document.createElement("input");
-    search.type = "search";
-    search.id = "basis-search";
-    search.placeholder = "symbol";
-    search.setAttribute("aria-label", "Search symbol");
-    toolbar.appendChild(search);
-    [["all", "All"], ["edge", "Positive edge"], ["proposal", "Proposal"],
-     ["open", "Open"]].forEach(function (pair, index) {
-      var btn = UI.el("button", "fbtn", pair[1]);
-      btn.setAttribute("data-filter", pair[0]);
-      btn.setAttribute("aria-pressed", index === 0 ? "true" : "false");
-      toolbar.appendChild(btn);
-    });
-    block.appendChild(toolbar);
-
-    var wrap = UI.el("div", "tablewrap");
-    var tableNode = document.createElement("table");
-    tableNode.className = "data";
-    tableNode.id = "basis-table";
-    tableNode.innerHTML =
-      "<thead><tr>" +
-      '<th data-sort="symbol">Asset</th>' +
-      '<th data-sort="spot">Spot</th>' +
-      '<th data-sort="perp">Perp</th>' +
-      '<th data-sort="gap">Gap</th>' +
-      '<th data-sort="edge" class="sorted">Edge</th>' +
-      '<th data-sort="funding">Funding</th>' +
-      '<th data-sort="planned">Planned</th>' +
-      '<th data-sort="phase">Phase</th>' +
-      "</tr></thead><tbody></tbody>";
-    wrap.appendChild(tableNode);
-    block.appendChild(wrap);
-
-    var emptyLine = UI.el("p", "empty", "");
-    emptyLine.id = "basis-empty";
-    emptyLine.style.display = "none";
-    block.appendChild(emptyLine);
-
-    var chipRow = UI.el("p", "rankchip");
-    chipRow.id = "basis-rankchip";
-    chipRow.appendChild(document.createTextNode(
-      "Ranks changed while inspecting. "));
-    chipRow.appendChild(UI.el("button", null, "Apply new order"));
-    block.appendChild(chipRow);
-    var meta = UI.el("p", "meta");
-    meta.id = "basis-meta";
-    block.appendChild(meta);
-    root.appendChild(block);
-
-    toolbar.addEventListener("click", function (ev) {
-      var btn = ev.target.closest(".fbtn");
-      if (!btn) return;
-      toolbar.querySelectorAll(".fbtn").forEach(function (node) {
-        node.setAttribute("aria-pressed", node === btn ? "true" : "false");
-      });
-      filter = btn.getAttribute("data-filter");
-      render();
-    });
-    search.addEventListener("input", render);
-
-    table = new UI.KeyedTable({
-      tableId: "basis-table",
-      rankchipId: "basis-rankchip",
-      sortKey: "edge",
-      expandRender: expand,
-      columns: [
-        { key: "symbol", cls: "sym",
-          render: function (r) { return { text: r.symbol }; } },
-        { key: "spot", cls: "num", render: function (r) {
-          return { text: UI.fmtNum(r.spot) || "—" };
-        } },
-        { key: "perp", cls: "num", render: function (r) {
-          return { text: UI.fmtNum(r.perp) || "—" };
-        } },
-        { key: "gap", cls: "num", render: function (r) {
-          var text = UI.fmtPct(r.gap);
-          return { text: text || "—",
-            cls: Number(r.gap) > 0 ? "pos" : "neg" };
-        } },
-        { key: "edge", cls: "num", render: function (r) {
-          if (r.edge === null) return { text: "Not evaluated", cls: "dim" };
-          return { text: UI.fmtPct(r.edge),
-            cls: Number(r.edge) > 0 ? "pos" : "neg" };
-        } },
-        { key: "funding", cls: "num", render: function (r) {
-          var text = UI.fmtPct(r.funding);
-          if (text === null) return { text: "—", cls: "dim" };
-          var carry = r.proposal ? UI.fmtPct(r.proposal.carry_pct) : null;
-          return { text: carry === null ? text :
-            text + " · carry " + carry };
-        } },
-        { key: "planned", cls: "num", render: function (r) {
-          return r.planned === null ? { text: "—", cls: "dim" } :
-            { text: "≈ " + UI.fmtNum(r.planned, 2) + " USDT /leg" };
-        } },
-        { key: "phase", render: function (r) {
-          var cls = r.phase === "Open" ? "b-green" :
-            (r.phase === "Proposal" ? "b-blue" : "b-gray");
-          return { node: UI.el("span", "badge " + cls, r.phase) };
-        } }
-      ]
+  function streamBasisRows() {
+    var stream = U.state.data.stream;
+    var records = (stream && Array.isArray(stream.records)) ?
+      stream.records : [];
+    return records.filter(function (record) {
+      var sel = Array.isArray(record.selection) ? record.selection : [];
+      return sel.indexOf("basis_gap") >= 0;
     });
   }
-
-  /* ---------- row assembly ---------- */
-
-  function proposalsBySymbol() {
-    var map = {};
-    var payload = UI.state.data.candidates;
-    if (payload && Array.isArray(payload.candidates)) {
-      payload.candidates.forEach(function (candidate) {
-        var record = candidate.proposal || candidate;
-        if (record && record.symbol) map[record.symbol] = record;
-      });
+  function candidateFor(symbol) {
+    var c = U.state.data.candidates;
+    var list = (c && Array.isArray(c.candidates)) ? c.candidates :
+      ((c && Array.isArray(c.records)) ? c.records : []);
+    for (var i = 0; i < list.length; i++) {
+      if ((list[i].symbol || "") === symbol) return list[i];
     }
-    return map;
+    return null;
+  }
+  function openSymbol() {
+    var pos = U.state.data.position;
+    return (pos && pos.position && pos.position.symbol) || null;
   }
 
-  /* Open only when the persisted state actually reads as holding — the
-     position file may hold a finished (CLOSED) receipt. */
-  function openBasisSymbol() {
-    var pos = UI.state.data.position;
-    if (!pos || !pos.position || typeof pos.position !== "object") {
-      return null;
-    }
-    if (UI.ownerPhaseForState(pos.position.state) !== "Holding") return null;
-    return pos.position.symbol || null;
+  function buildRows() {
+    var open = openSymbol();
+    return streamBasisRows().map(function (record) {
+      var cand = candidateFor(record.symbol);
+      var gap = record.basis_gap_pct !== undefined ?
+        record.basis_gap_pct : record.gap_pct;
+      var edge = cand && (cand.net_edge_pct !== undefined ?
+        cand.net_edge_pct : (cand.equation &&
+          cand.equation.net_edge_pct));
+      var phase = open === record.symbol ? "Open" :
+        (cand ? "Proposed" : "Watching");
+      if (view.filter === "proposals" && !cand) return null;
+      if (view.filter === "open" && phase !== "Open") return null;
+      return {
+        key: record.symbol, symbol: record.symbol,
+        spot: record.spot_ask !== undefined ? record.spot_ask :
+          record.spot_price,
+        perp: record.perp_bid !== undefined ? record.perp_bid :
+          record.futures_price,
+        gap: gap, edge: edge === undefined ? null : edge,
+        funding: record.funding_rate, phase: phase, cand: cand,
+        raw: record
+      };
+    }).filter(Boolean);
   }
-
-  var lastTotal = 0;
-
-  function rows() {
-    var stream = UI.state.data.stream;
-    if (!stream || !Array.isArray(stream.tokens)) { lastTotal = 0; return []; }
-    var proposals = proposalsBySymbol();
-    var openSymbol = openBasisSymbol();
-    var out = [];
-    stream.tokens.forEach(function (token) {
-      var sel = token.selection || [];
-      if (sel.indexOf("basis_gap") < 0) return;
-      var data = token.data || {};
-      if (data.venues !== "both") return;
-      if (data.basis_gap_pct === null ||
-          data.basis_gap_pct === undefined) return;
-      var proposal = proposals[token.symbol] || null;
-      var legs = legNotionals(proposal);
-      out.push({
-        key: token.symbol,
-        symbol: token.symbol,
-        spot: data.spot_ask,
-        perp: data.perp_bid,
-        gap: data.basis_gap_pct,
-        funding: data.funding_rate,
-        edge: proposal ? proposal.net_edge_pct : null,
-        planned: legs ? legs.spot : null,
-        phase: openSymbol === token.symbol ? "Open" :
-          (proposal ? "Proposal" : "Observed"),
-        proposal: proposal,
-        data: data
-      });
-    });
-    lastTotal = out.length;
-    if (filter === "edge") {
-      out = out.filter(function (row) {
-        return row.edge !== null && Number(row.edge) > 0;
-      });
-    } else if (filter === "proposal") {
-      out = out.filter(function (row) { return row.proposal; });
-    } else if (filter === "open") {
-      out = out.filter(function (row) { return row.phase === "Open"; });
-    }
-    var query = document.getElementById("basis-search").value.trim()
-      .toUpperCase();
-    if (query) {
-      out = out.filter(function (row) {
-        return row.symbol.indexOf(query) >= 0;
-      });
-    }
-    return out;
-  }
-
-  /* ---------- expanded row ---------- */
 
   function expand(row) {
-    var box = UI.el("div");
-    box.appendChild(UI.el("p", "unavail", "History collecting — no " +
-      "measured price series exists yet. Gap and price charts appear " +
-      "when a real history endpoint delivers points; nothing is drawn " +
-      "from snapshots."));
-    if (row.proposal) {
-      var proposal = row.proposal;
-      box.appendChild(UI.el("p", "meta", "Cost waterfall — values exactly " +
-        "as the Basis backend supplied them; this page recalculates " +
-        "nothing."));
-      var waterfall = document.createElement("table");
-      waterfall.className = "waterfall";
-      function wf(label, value, total) {
-        var tr = UI.el("tr", total ? "total" : "");
-        tr.appendChild(UI.el("td", null, label));
-        tr.appendChild(UI.el("td", null,
-          value === null ? "not supplied" : value));
-        waterfall.appendChild(tr);
-      }
-      wf("Raw entry gap", UI.fmtPct(proposal.entry_gap_pct));
-      wf("Spot taker fee", UI.fmtPct(proposal.spot_taker_commission_pct));
-      wf("Perp taker fee", UI.fmtPct(proposal.perp_taker_commission_pct));
-      wf("Entry slippage", UI.fmtPct(proposal.entry_slippage_pct));
-      wf("Exit slippage", UI.fmtPct(proposal.exit_slippage_pct));
-      wf("Funding carry", UI.fmtPct(proposal.carry_pct));
-      wf("Exit gap assumption", UI.fmtPct(proposal.exit_gap_pct));
-      wf("Safety buffer", UI.fmtPct(proposal.safety_buffer_pct));
-      wf("Executable net edge", UI.fmtPct(proposal.net_edge_pct), true);
-      box.appendChild(waterfall);
-      box.appendChild(UI.el("p", "meta",
-        "Intended action: Buy Spot / Short Perp — shared quantity " +
-        (UI.fmtNum(proposal.quantity) || "not supplied") + " per leg."));
-      var legs = legNotionals(proposal);
-      if (legs) {
-        box.appendChild(UI.el("p", "meta",
-          "≈ " + UI.fmtNum(legs.spot, 2) + " USDT spot leg · ≈ " +
-          UI.fmtNum(legs.perp, 2) + " USDT perp leg · ≈ " +
-          UI.fmtNum(legs.gross, 2) + " USDT gross across both legs " +
-          "(approximate — derived only from the proposal's own frozen " +
-          "quantity and prices)."));
-      } else {
-        box.appendChild(UI.el("p", "unavail",
-          "Leg notionals not derivable — the proposal record is missing " +
-          "quantity or price fields."));
-      }
-      var period = fundingPeriodHours(proposal.funding_period_ms);
-      box.appendChild(UI.el("p", "meta",
-        "Funding " + (UI.fmtPct(proposal.funding_rate) || "not supplied") +
-        (period ? " per " + period + "h period" : "") +
-        " · next-settlement countdown and projected credit/debit stay " +
-        "unavailable until the backend emits those fields."));
-      var proposalLine = UI.el("p", "meta",
-        "Proposal " + (proposal.proposal_id || "(id unrecorded)") +
-        " · standing · ");
-      var expiry = UI.el("span", null,
-        ownerExpiryText(proposal.expires_utc));
-      expiry.setAttribute("data-expires", proposal.expires_utc || "");
-      proposalLine.appendChild(expiry);
-      box.appendChild(proposalLine);
-      box.appendChild(UI.el("p", "unavail",
-        "Persistence, stability and exact pass reasoning are not exposed " +
-        "to this page yet — they arrive with the watcher decision read " +
-        "model."));
-    } else {
-      box.appendChild(UI.el("p", "unavail",
-        "Not evaluated — the watcher’s decision rows are not exposed to " +
-        "this page yet. Only symbols with a current proposal show a real " +
-        "net edge."));
-    }
-    var data = row.data || {};
-    box.appendChild(UI.el("p", "meta",
-      "Exchange facts: Spot step " + (UI.fmtNum(data.spot_step) || "?") +
-      ", min " + (UI.fmtNum(data.spot_min_notional) || "?") +
-      " USDT · Perp step " + (UI.fmtNum(data.perp_step) || "?") +
-      ", min " + (UI.fmtNum(data.perp_min_notional) || "?") +
-      " USDT · funding " + (UI.fmtPct(data.funding_rate) || "?")));
-    box.appendChild(UI.techDrawer(row.proposal || row.data));
-    return box;
-  }
-
-  /* ---------- render ---------- */
-
-  function renderBand() {
-    var stream = UI.state.data.stream;
-    var candidates = UI.state.data.candidates;
-    if (stream && stream.present) {
-      var count = finite(stream.basis_gap_count);
-      setStat(stats.universe, "green",
-        (count === null ? "?" : count) + " symbols");
-    } else {
-      setStat(stats.universe, "gray", "no delivery");
-    }
-    if (!candidates || !candidates.present) {
-      setStat(stats.proposals, "gray", "no delivery yet");
-      setStat(stats.best, "gray", "none evaluated");
-      return;
-    }
-    var list = Array.isArray(candidates.candidates) ?
-      candidates.candidates : [];
-    setStat(stats.proposals, list.length > 0 ? "green" : "gray",
-      list.length + " standing");
-    var first = list.length > 0 ?
-      (list[0].proposal || list[0]) : null;
-    var best = first ? UI.fmtPct(first.net_edge_pct) : null;
-    if (best !== null) {
-      setStat(stats.best, "green", best + " " + (first.symbol || ""));
-    } else {
-      setStat(stats.best, "gray", "none evaluated");
-    }
-  }
-
-  function render() {
-    if (!table) return;
-    var meta = document.getElementById("basis-meta");
-    var emptyLine = document.getElementById("basis-empty");
-    var stream = UI.state.data.stream;
-    renderBand();
-
-    if (!UI.state.lastGoodAt && !stream) {
-      meta.textContent = "Loading market data…";
-      emptyLine.style.display = "none";
-      return;
-    }
-
-    var list = rows();
-    table.update(list);
-
-    /* In-place countdown refresh: expiry text ticks every poll without
-       rebuilding the expansion (live-update rule: cells, not sections). */
-    document.querySelectorAll("#basis-table [data-expires]")
-      .forEach(function (node) {
-        var text = ownerExpiryText(node.getAttribute("data-expires"));
-        if (node.textContent !== text) node.textContent = text;
+    var wrap = U.el("div");
+    if (row.cand) {
+      var eq = row.cand.equation || row.cand;
+      var pairs = [];
+      [["Raw entry gap", eq.gross_gap_pct !== undefined ?
+          eq.gross_gap_pct : row.gap, "%"],
+        ["Trading fees (4 legs)", eq.fees_pct, "%"],
+        ["Slippage", eq.slippage_pct, "%"],
+        ["Funding carry", eq.carry_pct !== undefined ? eq.carry_pct :
+          eq.funding_carry_pct, "%"],
+        ["Exit-gap assumption", eq.exit_gap_pct, "%"],
+        ["Safety buffer", eq.safety_buffer_pct, "%"],
+        ["Executable net edge", eq.net_edge_pct, "%"],
+        ["Planned notional (per leg)", eq.notional_usdt ||
+          row.cand.notional_usdt, " USDT"],
+        ["Proposal", row.cand.proposal_id || row.cand.id, ""],
+        ["Expires", row.cand.expires_utc || row.cand.expiry_utc, ""]
+      ].forEach(function (item) {
+        if (item[1] !== undefined && item[1] !== null) {
+          pairs.push([item[0],
+            (U.fmtNum(item[1], 4) || String(item[1])) + item[2]]);
+        }
       });
-
-    if (!stream || !stream.present) {
-      meta.textContent = "Market data unavailable — nothing has been " +
-        "delivered to this page yet.";
-      emptyLine.style.display = "none";
-      return;
-    }
-
-    if (list.length === 0) {
-      var query = document.getElementById("basis-search").value.trim();
-      emptyLine.textContent = query ? EMPTY_LINES.search :
-        EMPTY_LINES[filter] || EMPTY_LINES.all;
-      emptyLine.style.display = "";
+      wrap.appendChild(U.facts(pairs));
     } else {
-      emptyLine.style.display = "none";
+      wrap.appendChild(U.facts([
+        ["Decision", "Not evaluated — no live proposal for this " +
+          "symbol in the delivered data"],
+        ["Intended action", "Buy Spot / Short Perp (when evaluated)"]
+      ]));
     }
+    wrap.appendChild(U.stateBlock("unavailable", "History collecting.",
+      "Gap and price charts arrive with the measured history " +
+      "endpoint — nothing is fabricated from snapshots."));
+    wrap.appendChild(U.techDrawer(row.raw));
+    return wrap;
+  }
 
-    meta.textContent = lastTotal + " both-venue symbols in the " +
-      "current delivery" +
-      (list.length === lastTotal ? "" : " · " + list.length + " shown") +
-      " · data " + (UI.shortTime(stream.as_of || "") || "age unknown") +
-      " · Edge exists only where a real proposal was evaluated.";
+  function columns() {
+    return [
+      { key: "sym", label: "Asset", sort: "symbol",
+        render: function (r) {
+          return { node: U.c2(r.symbol, "both venues") };
+        } },
+      { key: "spot", label: "Spot", cls: "num", sort: "spot",
+        render: function (r) {
+          return { node: U.c2(U.fmtNum(r.spot, 6) || "—", "Spot ask",
+            { num: true }) };
+        } },
+      { key: "perp", label: "Perp", cls: "num", sort: "perp",
+        render: function (r) {
+          return { node: U.c2(U.fmtNum(r.perp, 6) || "—", "Perp bid",
+            { num: true }) };
+        } },
+      { key: "gap", label: "Gap", cls: "num", sort: "gap",
+        render: function (r) {
+          var text = U.fmtPct(r.gap);
+          return { node: U.c2(text || "—", "entry executable",
+            { num: true, tone: r.gap > 0 ? "good" : null }) };
+        } },
+      { key: "edge", label: "Edge", cls: "num", sort: "edge",
+        render: function (r) {
+          if (r.edge === null) {
+            return { node: U.c2("—", "Not evaluated", { num: true }) };
+          }
+          return { node: U.c2(U.fmtPct(r.edge) || "—",
+            "backend equation",
+            { num: true, tone: Number(r.edge) > 0 ? "good" : "bad" }) };
+        } },
+      { key: "funding", label: "Funding", cls: "num", sort: "funding",
+        render: function (r) {
+          return { node: U.c2(U.fmtPct(r.funding) || "—",
+            "current rate", { num: true }) };
+        } },
+      { key: "phase", label: "Phase",
+        render: function (r) {
+          var tone = r.phase === "Open" ? "warn" :
+            (r.phase === "Proposed" ? "info" : "");
+          return { node: U.chip(r.phase, tone) };
+        } }
+    ];
+  }
+
+  function render(fresh) {
+    var rows = buildRows();
+    if (fresh || !host) {
+      var root = U.clearTo("pageroot");
+      host = U.el("div", "frame");
+      root.appendChild(host);
+      var count = streamBasisRows().length;
+      var candCount = rows.filter(function (r) { return r.cand; }).length;
+      host.appendChild(U.tiles([
+        U.tile({ label: "Eligible pairs (delivered)",
+          value: String(count),
+          sub: "stream rows with a measurable two-venue gap" }),
+        U.tile({ label: "Valid proposals", value: String(candCount),
+          sub: candCount ? "full equation available" :
+            "none unexpired in the delivered data" }),
+        U.tile({ label: "Open position",
+          value: openSymbol() || "None",
+          tone: openSymbol() ? "warn" : null,
+          sub: openSymbol() ? "supervised" : "flat" })
+      ]));
+      host.appendChild(U.pillBar([
+        { key: "all", label: "All" },
+        { key: "proposals", label: "Proposals" },
+        { key: "open", label: "Open" }
+      ], view.filter, function (key) {
+        view.filter = key; render(true);
+      }));
+      if (rows.length === 0) {
+        host.appendChild(U.stateBlock("empty",
+          view.filter === "all" ?
+            "No two-venue gaps in the delivered data right now." :
+            "Nothing matches this filter right now.",
+          "Rows appear when the stream delivers measurable Spot/Perp " +
+          "gaps."));
+        tape = null;
+        return;
+      }
+      var t = U.tapeTable(760, columns());
+      host.appendChild(t.wrap);
+      tape = new U.Tape({ table: t.table, columns: columns(),
+        expandRender: expand, sortKey: "edge" });
+    }
+    if (tape) tape.update(rows);
   }
 
   window.QuantTabs.basis = {
-    needs: ["stream", "candidates"],
-    init: init,
-    render: render
+    needs: ["stream", "candidates", "pnl"],
+    init: function () {}, render: render
   };
 })();

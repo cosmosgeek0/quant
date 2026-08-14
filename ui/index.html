@@ -5,98 +5,65 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
 <link rel="stylesheet" href="style.css">
-<link rel="stylesheet" href="parts.css">
 </head>
-<body class="shell">
+<body>
 
-<aside id="sidebar">
+<header id="topbar">
   <div class="brand">
-    <img class="brandmark" src="brand-mark.png" alt="">
-    <span>
-      <span class="wordmark">QUANT</span>
-      <span class="wordsub">owner room</span>
+    <img class="brand-mark" src="brand-mark.png" alt="">
+    <span class="brand-text">
+      <span class="brand-name">QUANT</span>
+      <span class="brand-sub">OWNER ROOM</span>
     </span>
   </div>
-
-  <p class="navgroup">Overview</p>
-  <button class="navitem" role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview"><span class="ic nvic" style="--ic:url(vendor/icons/gauge.svg)"></span>Overview</button>
-  <p class="navgroup">Engine</p>
-  <button class="navitem" role="tab" id="tab-basis" aria-selected="false" aria-controls="panel-basis"><span class="ic nvic" style="--ic:url(vendor/icons/scale.svg)"></span>Basis</button>
-  <button class="navitem" role="tab" id="tab-volume" aria-selected="false" aria-controls="panel-volume"><span class="ic nvic" style="--ic:url(vendor/icons/chart-line.svg)"></span>Volume</button>
-  <p class="navgroup">Control</p>
-  <button class="navitem" role="tab" id="tab-quant" aria-selected="false" aria-controls="panel-quant"><span class="ic nvic" style="--ic:url(vendor/icons/activity.svg)"></span>Quant</button>
-  <p class="navgroup">Records</p>
-  <button class="navitem" role="tab" id="tab-journal" aria-selected="false" aria-controls="panel-journal"><span class="ic nvic" style="--ic:url(vendor/icons/file-text.svg)"></span>Journal</button>
-
-  <div id="side-bottom"></div>
-
-</aside>
-
-<div class="maincol">
-
-  <div id="masthead">
-  <div id="cmdbar">
-    <span id="pagetitle">Overview</span>
+  <button id="searchfield" type="button" aria-label="Search (Cmd K)">
+    <span class="ic sf-ic" style="--ic:url(vendor/icons/search.svg)"></span>
+    <span class="sf-ph">Search markets, records…</span>
+    <kbd class="sf-key">⌘K</kbd>
+  </button>
+  <div id="topright">
     <span id="statuschips"></span>
-    <span id="clockpill">--:--:-- UTC</span>
+    <span id="clockchip" title="Owner clock">
+      <span class="ic ck-ic" style="--ic:url(vendor/icons/clock.svg)"></span>
+      <span id="clocktime">--:--:--</span>
+      <span class="ck-dot"></span>
+      <span id="clockzone">UTC</span>
+    </span>
   </div>
-  <div id="cockpit" aria-label="Global machine state">
-    <div class="gcell" id="g-exec">
-      <p class="glabel">Execution</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-    <div class="gcell" id="g-auth">
-      <p class="glabel">Authority</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-    <div class="gcell" id="g-equity">
-      <p class="glabel">Equity</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-    <div class="gcell" id="g-net">
-      <p class="glabel">Net today</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-    <div class="gcell" id="g-expo">
-      <p class="glabel">Exposure</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-    <div class="gcell" id="g-risk">
-      <p class="glabel">Risk</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-    <div class="gcell" id="g-data">
-      <p class="glabel">Data</p>
-      <p class="gvalue skel">loading</p>
-      <p class="gsub"></p>
-    </div>
-  </div>
-  </div>
+</header>
 
-  <div id="connbar" role="status"></div>
+<div id="cockpit" aria-label="Global machine truth"></div>
+<div id="connbar" role="status"></div>
 
-  <main>
-    <div role="tabpanel" id="panel-overview" class="on" aria-labelledby="tab-overview"><div class="pageband" id="band-overview"></div><div class="pageframe" id="root-overview"></div></div>
-    <div role="tabpanel" id="panel-basis" aria-labelledby="tab-basis"><div class="pageband" id="band-basis"></div><div class="pageframe" id="root-basis"></div></div>
-    <div role="tabpanel" id="panel-volume" aria-labelledby="tab-volume"><div class="pageband" id="band-volume"></div><div class="pageframe" id="root-volume"></div></div>
-    <div role="tabpanel" id="panel-quant" aria-labelledby="tab-quant"><div class="pageband" id="band-quant"></div><div id="root-quant"></div></div>
-    <div role="tabpanel" id="panel-journal" aria-labelledby="tab-journal"><div class="pageband" id="band-journal"></div><div class="pageframe" id="root-journal"></div></div>
+<div id="body">
+  <aside id="sidebar">
+    <nav id="sidenav" aria-label="Pages">
+      <p class="nav-eyebrow">Overview</p>
+      <button class="nav-item" type="button" role="tab" id="tab-overview" aria-selected="true"><span class="ic" style="--ic:url(vendor/icons/gauge.svg)"></span><span class="lbl">Overview</span></button>
+      <p class="nav-eyebrow">Engine</p>
+      <button class="nav-item" type="button" role="tab" id="tab-basis" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/scale.svg)"></span><span class="lbl">Basis</span></button>
+      <button class="nav-item" type="button" role="tab" id="tab-volume" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/chart-line.svg)"></span><span class="lbl">Volume</span></button>
+      <p class="nav-eyebrow">Control</p>
+      <button class="nav-item" type="button" role="tab" id="tab-quant" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/activity.svg)"></span><span class="lbl">Quant</span></button>
+      <p class="nav-eyebrow">Records</p>
+      <button class="nav-item" type="button" role="tab" id="tab-journal" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/file-text.svg)"></span><span class="lbl">Journal</span></button>
+    </nav>
+    <div id="sidebottom"></div>
+  </aside>
+
+  <main id="main">
+    <div id="pageband"></div>
+    <div id="pageroot"></div>
   </main>
-
-  <footer>
-    <p>Every value on this page comes from the machine&rsquo;s own recorded files. Missing data renders as unavailable &mdash; never as zero, never as a sample. This page reads; it cannot trade, pause, or arm.</p>
-  </footer>
-
 </div>
 
+<footer id="foot">
+  <p>Every value on this page comes from the machine&rsquo;s own recorded
+  files. Missing data renders as unavailable &mdash; never as zero, never
+  as a sample. This page reads; it cannot trade, pause, or arm.</p>
+</footer>
+
 <script src="app.js"></script>
-<script src="parts.js"></script>
 <script src="tabs/overview.js"></script>
 <script src="tabs/basis.js"></script>
 <script src="tabs/volume.js"></script>

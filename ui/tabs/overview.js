@@ -1,228 +1,130 @@
 "use strict";
 
-/* Overview — the money page (contract §5.1, spec §overview).
-   Assembled from QuantParts components. Honest-calm absence: a missing
-   number is an em dash with its reason, never a shouted word, never a
-   zero. The global topstrip is the only strip; this page adds richer
-   context, not duplicates. */
+/* Overview — the money page (contract §5.1). Net today leads and says
+   "—" with its reason until the ledger exists (Ledger incomplete);
+   partial records stay separate and are never summed. */
 
 (function () {
   var U = window.QuantUI;
-  var P = window.QuantParts;
-
-  function money(raw) {
-    var text = U.fmtNum(raw, 4);
-    if (text === null) return null;
-    return text.replace("-", "−");
-  }
-
-  function feedTime(iso) {
-    var text = U.shortTime(iso);
-    return text ? text.replace(" UTC", "Z") : null;
-  }
 
   function hasNet(net) {
-    return net !== undefined && net !== null && money(net) !== null;
+    return net !== undefined && net !== null && U.fmtNum(net, 4) !== null;
   }
 
-  function card(title, meta) {
-    var box = U.el("section", "card");
-    var head = U.el("div", "card-head");
-    head.appendChild(U.el("span", "card-title", title));
-    if (meta) head.appendChild(U.el("span", "card-meta", meta));
-    box.appendChild(head);
-    var body = U.el("div", "card-body");
-    box.appendChild(body);
-    return { box: box, body: body };
+  function recordRows(host, records, kind) {
+    records.slice(0, 6).forEach(function (record) {
+      var net = record.realized && record.realized.net_usdt;
+      if (net === undefined) net = record.net_usdt;
+      var verdict = String(record.verdict || record.action || kind);
+      host.appendChild(U.feedRow({
+        timeText: U.shortTime(record.utc) || null,
+        title: verdict,
+        caption: hasNet(net) ? "net " + U.fmtUsdt(net) :
+          "net not recorded",
+        tone: verdict === "CLOSED" ? "ok" :
+          (verdict.indexOf("REJECT") >= 0 ? "warn" :
+            (hasNet(net) && Number(net) < 0 ? "bad" : "info")),
+        symbol: record.symbol || null,
+        onExpand: function () {
+          return U.facts([
+            ["Verdict", verdict],
+            ["Net", hasNet(net) ? U.fmtUsdt(net) : "—"],
+            ["Recorded", record.utc || "—"]
+          ]);
+        }
+      }));
+    });
   }
 
-  function statRowTop() {
-    var d = U.state.data;
-    var strip = d.strip || {};
-    var cards = [];
-
-    cards.push(P.statCard({
-      label: "Net profit and loss — today",
-      absent: true,
-      absentWhy: "Ledger incomplete — account-wide accounting is not built yet",
-      title: "Partial Basis and Volume records render below; they are " +
-        "never summed into a total."
-    }));
-
-    var expo = U.exposureLines();
-    if (expo.length === 0) {
-      cards.push(P.statCard({
-        label: "Current exposure", value: "None", sub: "The account is flat"
-      }));
-    } else {
-      var first = expo[0];
-      cards.push(P.statCard({
-        label: "Current exposure",
-        value: first.symbol,
-        tone: "warn",
-        sub: first.strategy + " · " + U.ownerPhaseForState(first.st) +
-          (expo.length > 1 ? " · +" + (expo.length - 1) + " more" : "")
-      }));
-    }
-
-    cards.push(P.statCard({
-      label: "Capital",
-      absent: true,
-      absentWhy: "No account contract yet — equity arrives with the " +
-        "account snapshot endpoint"
-    }));
-
+  function render() {
+    var root = U.clearTo("pageroot");
+    var frame = U.el("div", "frame");
+    var strip = U.state.data.strip || {};
     var gov = strip.governor || {};
-    if (gov.present) {
-      cards.push(P.statCard({
-        label: "Risk used today",
+    var pull = strip.pull || {};
+    var expo = U.exposureLines();
+
+    var tl = [];
+    tl.push(U.tile({ label: "Net profit and loss — today", absent: true,
+      absentWhy: "Ledger incomplete — account-wide accounting is not " +
+        "built yet",
+      title: "Partial records below are real but never summed." }));
+    tl.push(expo.length === 0 ?
+      U.tile({ label: "Current exposure", value: "None",
+        sub: "The account is flat" }) :
+      U.tile({ label: "Current exposure", value: expo[0].symbol,
+        tone: "warn",
+        sub: expo[0].strategy + " · " +
+          U.ownerPhaseForState(expo[0].st) +
+          (expo.length > 1 ? " · +" + (expo.length - 1) + " more" : "") }));
+    tl.push(U.tile({ label: "Capital", absent: true,
+      absentWhy: "No account contract yet — equity arrives with the " +
+        "account snapshot endpoint" }));
+    tl.push(gov.present ?
+      U.tile({ label: "Risk used today",
         value: gov.entries_used + " of " + gov.entries_cap + " entries",
         tone: gov.entries_used >= gov.entries_cap ? "bad" :
           (gov.entries_used > 0 ? "warn" : null),
         sub: "Loss+fees " + gov.loss_fees_used_usdt + " of " +
-          gov.loss_fees_cap_usdt + " USDT"
-      }));
-    } else {
-      cards.push(P.statCard({
-        label: "Risk used today",
-        value: "0 of 5 entries",
-        sub: "No entries recorded today · caps are code law"
-      }));
-    }
-
-    var pull = strip.pull || {};
-    var dataTone = null, dataValue = "Live";
-    if (!pull.present) { dataValue = null; }
-    else if (pull.ok === false || pull.level === "red") {
-      dataValue = "Stale"; dataTone = "bad";
-    } else if (pull.level === "amber") {
-      dataValue = "Delayed"; dataTone = "warn";
-    } else { dataValue = "Live"; dataTone = "good"; }
-    cards.push(P.statCard({
-      label: "Data",
-      value: dataValue,
-      tone: dataTone,
-      absent: dataValue === null,
+          gov.loss_fees_cap_usdt + " USDT" }) :
+      U.tile({ label: "Risk used today", value: "0 of 5 entries",
+        sub: "No entries recorded today · caps are code law" }));
+    tl.push(U.tile({ label: "Data",
+      value: !pull.present ? null :
+        (pull.ok === false || pull.level === "red" ? "Stale" :
+          (pull.level === "amber" ? "Delayed" : "Live")),
+      tone: pull.level === "green" ? "good" :
+        (pull.level === "amber" ? "warn" : "bad"),
       absentWhy: "No data delivery yet",
-      sub: pull.present ? "Updated " + U.ageText(pull.age_seconds) : null
-    }));
+      sub: pull.present ? "Updated " + U.ageText(pull.age_seconds) :
+        null }));
+    frame.appendChild(U.tiles(tl));
 
-    return P.statRow(cards);
-  }
-
-  function basisRecordsCard() {
-    var c = card("Realized records — Basis", "partial");
+    var split = U.el("div", "split band");
+    var left = U.band("Realized records — Basis", "partial");
     var pnl = U.state.data.pnl;
-    var records = (pnl && Array.isArray(pnl.records)) ? pnl.records : [];
-    if (records.length === 0) {
-      c.body.appendChild(P.stateBlock("empty",
+    var basisRecords = (pnl && Array.isArray(pnl.records)) ?
+      pnl.records : [];
+    if (basisRecords.length === 0) {
+      left.appendChild(U.stateBlock("empty",
         "No completed Basis accounting records in the delivered data.",
         "Basis accounting records only — never account-wide P&L."));
-      return c.box;
-    }
-    records.slice(0, 6).forEach(function (record) {
-      var net = record.realized && record.realized.net_usdt;
-      var verdict = String(record.verdict || "record");
-      c.body.appendChild(P.feedRow({
-        timeText: feedTime(record.utc),
-        title: verdict,
-        caption: hasNet(net) ? "net " + money(net) + " USDT" :
-          "net not recorded",
-        tone: verdict === "CLOSED" ? "ok" :
-          (verdict.indexOf("REJECT") >= 0 ? "warn" : "bad"),
-        symbol: record.symbol || null,
-        onExpand: function () {
-          return P.tapeWaterfall([
-            { label: "Verdict", value: verdict },
-            { label: "Net", value: hasNet(net) ?
-                money(net) + " USDT" : "—" },
-            { label: "Recorded", value: record.utc || "—" }
-          ]);
-        }
-      }));
-    });
-    c.body.appendChild(U.el("p", "card-note",
-      "Fees and funding completeness depend on each receipt; rows are " +
-      "never summed."));
-    return c.box;
-  }
-
-  function volumeRecordsCard() {
-    var c = card("Realized records — Volume", "partial");
+    } else recordRows(left, basisRecords, "record");
+    split.appendChild(left);
+    var right = U.band("Realized records — Volume", "partial");
     var mom = U.state.data.momentum;
-    var records = (mom && mom.realized && Array.isArray(mom.realized.records))
-      ? mom.realized.records : [];
-    if (records.length === 0) {
-      c.body.appendChild(P.stateBlock("empty",
+    var volRecords = (mom && mom.realized &&
+      Array.isArray(mom.realized.records)) ? mom.realized.records : [];
+    if (volRecords.length === 0) {
+      right.appendChild(U.stateBlock("empty",
         "No realized Volume results in the delivered data.",
         "Runner realized results only — not account-wide profit."));
-      return c.box;
-    }
-    records.slice(0, 6).forEach(function (record) {
-      var net = record.realized && record.realized.net_usdt;
-      if (net === undefined) net = record.net_usdt;
-      var verdict = String(record.verdict || record.action || "closed");
-      c.body.appendChild(P.feedRow({
-        timeText: feedTime(record.utc),
-        title: verdict,
-        caption: hasNet(net) ? "net " + money(net) + " USDT" :
-          "realized net not recorded",
-        tone: hasNet(net) && Number(net) > 0 ? "ok" :
-          (hasNet(net) && Number(net) < 0 ? "bad" : "info"),
-        symbol: record.symbol || null,
-        onExpand: function () {
-          return P.tapeWaterfall([
-            { label: "Result", value: verdict },
-            { label: "Net", value: hasNet(net) ?
-                money(net) + " USDT" : "—" },
-            { label: "Recorded", value: record.utc || "—" }
-          ]);
-        }
-      }));
-    });
-    c.body.appendChild(U.el("p", "card-note",
-      "Runner realized results only — not account-wide profit."));
-    return c.box;
-  }
+    } else recordRows(right, volRecords, "closed");
+    split.appendChild(right);
+    frame.appendChild(split);
 
-  function activityCard() {
-    var c = card("Recent activity", "last 5 · partial sources");
+    var activity = U.band("Recent activity", "last 5 · partial sources");
     var events = U.buildEventList().slice(0, 5);
     if (events.length === 0) {
-      c.body.appendChild(P.stateBlock("empty",
+      activity.appendChild(U.stateBlock("empty",
         "No completed trades yet.", "The machine is watching markets."));
-      return c.box;
+    } else {
+      events.forEach(function (event) {
+        activity.appendChild(U.feedRow({
+          timeText: U.shortTime(event.ts) || null,
+          title: event.strat + (event.sym ? " · " + event.sym : ""),
+          caption: event.text,
+          tone: U.eventTone(event),
+          symbol: null, onExpand: null
+        }));
+      });
     }
-    events.forEach(function (event) {
-      c.body.appendChild(P.feedRow({
-        timeText: feedTime(event.ts),
-        title: event.strat + (event.sym ? " · " + event.sym : ""),
-        caption: event.text,
-        tone: event.sev === "attention" ? "bad" :
-          (event.sev === "refused" ? "warn" :
-            (event.sev === "trade" ? "ok" : "info")),
-        symbol: null,
-        onExpand: null
-      }));
-    });
-    return c.box;
-  }
-
-  function render() {
-    var root = U.clearTo("root-overview");
-    root.appendChild(statRowTop());
-
-    var grid = U.el("div", "grid2 ov-grid");
-    grid.appendChild(basisRecordsCard());
-    grid.appendChild(volumeRecordsCard());
-    root.appendChild(grid);
-
-    root.appendChild(activityCard());
+    frame.appendChild(activity);
+    root.appendChild(frame);
   }
 
   window.QuantTabs.overview = {
     needs: ["pnl", "decisions", "fees"],
-    init: function () {},
-    render: render
+    init: function () {}, render: render
   };
 })();
