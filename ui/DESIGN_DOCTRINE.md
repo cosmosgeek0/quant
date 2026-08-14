@@ -199,6 +199,81 @@ Before ANY chart work, additionally load the `dataviz` skill.
 5. node --check every touched JS file; `python3 -m unittest
    tests.test_ui_serve -q` green.
 
+## L. Reference products — MEASURED in-browser 2026-08-14 (owner-given)
+
+Owner-supplied examples, each opened and probed live (computed styles,
+not guesses). What they share is the language the owner is pointing at.
+
+- TradingView /markets/: white canvas, ink #0f0f0f; GLOBAL
+  font-feature-settings "lnum","tnum"; delta green #06806b / red
+  #cc2f3c at 14–16px weight 500; true U+2212 minus in production;
+  column micro-headers 11px uppercase, 0.4px tracking, #707070; name
+  16px/500 + ticker 12px/600 stacked; value big + unit tiny
+  ("225.30 ᵁˢᴰ"); charts colored by direction (green/red line + soft
+  gradient fill), hairline grid; timeframe segmented pills; H1 56px
+  brand face for marketing only — data stays system-face.
+- Coinbase /price/bitcoin: ink #0a0b0d on white; hero price 40px in a
+  DEDICATED display face (CoinbaseDisplay) weight 400, tabular-nums —
+  hero carries by size, not boldness; direction shown TWICE: color +
+  ↗/↘ arrow glyph (green #098551); stat blocks = micro caps label
+  over value, dotted underline for definitions; production honesty:
+  "Not enough data" rendered as plain text in the price table.
+- Coinbase /explore: market strip ABOVE the table (mkt cap, dominance,
+  vol, buy-sell ratio as label+value+arrow-delta chips); filter pills;
+  sorted column highlighted; 76px two-line consumer rows (structure
+  good, looseness rejected for our operator density).
+- Binance /markets: BinanceNova face; delta red #f6465d / green
+  #2ebd85 14px/500; 12px column headers; TWO-LINE numeric cells
+  (native qty over muted fiat equivalent); dense mini-boards (Hot /
+  New / Gainer / Volume) as four 3-row columns.
+- Uniswap /portfolio/tokens: Basel face at weight 485 (variable
+  in-between weight); muted = ink at 63% ALPHA (alpha-muted tokens);
+  money cells font-variant-numeric: lining-nums tabular-nums;
+  portfolio vocabulary worth keeping: Price / Avg cost / 1D change /
+  Balance / Value / Unrealized P/L / Allocation; skeletons only for
+  known-inbound demo-wallet load.
+- Aave app /markets: Inter 14px body (!), slate ink #303549, canvas
+  #f1f1f3; dark headline band over light content with 21px/800 market
+  stats; two-line cells (token amount / muted $); honest "—" for n/a
+  (#62677b), "< 0.01%" thresholds, "(Disabled)" state text; quiet
+  outline Details button per row.
+- Aave.com + TradingView home (marketing craft): one message, one CTA,
+  atmosphere from photography/gradient light — brand voice lives on
+  marketing pages; product pages stay instrument-plain.
+
+### What the seven agree on (the owner's examples speak one language)
+1. Ink is near-black on white — nobody ships pale meaning-carrying
+   text. (Confirms §B.1.)
+2. Data is monochrome; color exists only on change/status. Green/red
+   pairs are TUNED (teal-leaning greens, coral-leaning reds), never
+   pure #0f0/#f00.
+3. Tabular + lining numerals, everywhere, enforced in CSS.
+4. Direction is stated twice: sign or arrow glyph + color.
+5. Two-line numeric cells pair a primary value with a muted secondary
+   reading.
+6. Micro caps column headers, 11–12px, muted, letter-spaced.
+7. Value large, unit tiny and muted, tight to the value.
+8. Segmented pills for scope/timeframe; active = filled.
+9. Honest empties shipped in production: "Not enough data", "—",
+   "< 0.01%", "(Disabled)".
+10. One brand accent, spent on interaction only — data never wears it.
+
+### Adoption queue (each item needs the owner's yes before build)
+- A1 Direction glyphs (↗/↘ or ▲▼) beside every colored delta/verdict
+  where direction/sign is the meaning (also closes §D color-alone).
+- A2 Two-line cells where a second reading exists (qty + USDT value;
+  amount + fee-adjusted).
+- A3 Unit-tiny rendering for money values (value in ink, unit 10px
+  muted caps, tight).
+- A4 Standardize micro caps headers 11px/600/+0.04em muted app-wide.
+- A5 Market-strip chips above dense tables (label + value + delta)
+  where a table has a natural summary row.
+- A6 Sparklines colored by direction for market-fact series only.
+- A7 "—" for structurally-absent, "< x" for below-threshold, exact
+  otherwise (rendering law; backend strings stay the source).
+- A8 Optional: dark headline band identity for the cockpit strip
+  (Aave pattern) — owner taste call.
+
 ## Sources (studied 2026-08-14)
 
 - UI Density (four densities, value density) — mattstromawn.com/writing/ui-density/
