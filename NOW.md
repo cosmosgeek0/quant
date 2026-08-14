@@ -1,29 +1,23 @@
 # NOW.md — current orders and measured truth (one page, rewritten in place)
 
-## Orders (owner + commander 2026-08-14: MONEY FIRST, LIVE FIRST)
-- WIRED AND HELD 2026-08-14: stream -> momentum decisions -> job records ->
-  runner, plus the continuous basis chain and supervisor, all on host cron,
-  every entry path sealed by verified STOP files (a missing receipts-dir
-  STOP was discovered and sealed — the near-miss is in LOGS). The owner's
-  single activation opens the machine; runner caps bind regardless.
-- FREEZE LIFTED 2026-08-13T23:21Z: all three live receipts exist (futures
-  short, four-leg basis, momentum long on a machine-picked 119x ignition).
-  Parallel build resumes; every new money capability gets its tiny live
-  attempt through the runner IN THE SAME TASK.
-- THE RAIL: deterministic job runner on the host — owner arms ONCE
-  (scripts/arm_jobs_on_host.sh), then the Lead queues restricted job records
-  and reads receipts; no per-test press, no pasted commands.
-- SEQUENCE, live receipts gating each step: (1) FUTURES_ROUNDTRIP job — $8
-  short + reduce-only close, two real fills, flat, receipted; a Binance
-  rejection is repaired exactly, one regression, redeploy, rerun. (2) BASIS
-  mechanics cycle — four real fills + reconciliation, mechanics-only, cents
-  accepted (runner unlocks it only after the futures proof passes).
-  (3) Momentum made real — smallest adapter to the existing hands, one real
-  tiny entry + exit; futures-only tokens get the directional futures path.
-  (4) Only then: parallel build resumes, every new money capability tested
-  live in the same task.
-- Serial only: dependent orders, same-symbol mutations, unclear-response
-  reconciliation. Everything else concurrent.
+## Orders (commander audit 2026-08-14, in force)
+- KEEP STOP ACTIVE. No activation until the one vertical live lifecycle
+  works end to end.
+- BUILD THE VERTICAL, nothing else: momentum OPEN -> HOLD across ticks ->
+  strategy-driven REDUCE/EXIT with actual fills feeding state; full-universe
+  live volume into momentum; basis_watch actually wired to the supervisor
+  on the host; ONE unified runtime control, one STOP, real commit identity,
+  failure propagation, UI paths matching runtime truth.
+- Deploy paused; prove processes, cron, hashes, UI, account state.
+- THEN: the runner — not a human, not a pasted job — takes ONE naturally
+  generated capped live trade, holds it across ticks, exits from the
+  strategy, and records exact fills, fees, P&L, balances, flatness.
+- AUDIT CORRECTIONS ON RECORD: the momentum receipt was queued manually by
+  the Lead (autonomous signal-to-trade is NOT yet proven); the old
+  MOMENTUM_ROUNDTRIP cannot hold and must never be armed as strategy; the
+  "~five cents" cost figure is UNVERIFIED until commissions and ledger
+  reconciliation are read signed; prior ws-feed and basis-cron wiring gaps
+  are the current build.
 
 ## Truth (measured 2026-08-14)
 - Runtime ALIVE-PAUSED on host: cron fires the supervisor every 2 min, STOP
