@@ -11,46 +11,54 @@
    ============================================================ */
 
 :root {
-  /* surfaces */
+  /* surfaces — measured from the owner's control-room grammar */
   --canvas: #f5f6f8;
   --panel: #ffffff;
   --panel-2: #fafbfc;
-  --inset: #f2f3f6;
+  --inset: #f5f6f8;       /* tile */
+  --tile-hover: #eff1f4;
+  --hover: #f7f8fa;       /* row/card hover */
 
   /* ink */
   --ink: #0b0e14;
-  --ink-2: #333947;
-  --muted: #667085;
-  --muted-2: #98a2b3;
+  --ink-2: #2c313a;
+  --muted: #697180;
+  --muted-2: #9aa3b2;
 
   /* lines + elevation */
-  --line: #e4e7ec;
-  --line-soft: #eef0f4;
-  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --line: #e4e7ec;        /* main hairline */
+  --line-soft: #eef0f3;   /* fine row line */
+  --line-strong: #d3d7df; /* focus / selected borders */
+  --shadow-xs: 0 1px 2px rgba(16, 20, 28, 0.05);
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06),
                0 1px 3px rgba(16, 24, 40, 0.07);
   --shadow-md: 0 4px 10px -2px rgba(16, 24, 40, 0.08),
                0 2px 4px -2px rgba(16, 24, 40, 0.06);
+  --shadow-pop: 0 12px 40px -12px rgba(16, 20, 28, 0.26);
 
-  /* status */
-  --green: #157f3d;
-  --green-soft: #e8f5ec;
-  --green-line: #b9e0c5;
-  --amber: #99640a;
+  /* status — truth grammar unchanged; hues tuned to the owner's room */
+  --green: #0a9b64;
+  --green-soft: #e6f5ef;
+  --green-line: #b3e0cd;
+  --amber: #9a6a08;       /* text-safe warning ink */
+  --warn-mark: #d6a11d;   /* small marks/bars only, never body text */
   --amber-soft: #fdf5e1;
   --amber-line: #ead9a8;
-  --red: #bb3129;
+  --red: #e0414b;
+  --red-deep: #bb3129;    /* red text on soft ground */
   --red-soft: #fceeec;
   --red-line: #f0cdc8;
-  --gray: #98a2b3;
-  --blue: #2557d6;
-  --blue-soft: #eef2fd;
-  --blue-line: #c7d4f4;
+  --gray: #9aa3b2;
+  --blue: #2f6bff;
+  --blue-ink: #1d4ed8;    /* accent as text */
+  --blue-soft: rgba(47, 107, 255, 0.11);
+  --blue-line: rgba(47, 107, 255, 0.42);
+  --info-mark: #4f7df3;
 
   /* type */
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas,
     monospace;
-  --sans: InterVariable, Inter, "SF Pro Text", -apple-system,
+  --sans: "InterVariable", Inter, "SF Pro Text", -apple-system,
     BlinkMacSystemFont, "Segoe UI", sans-serif;
 
   /* shape + motion */
@@ -60,15 +68,45 @@
   --fast: 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
+/* Self-hosted faces — the exact professional files, no system roulette */
+@font-face {
+  font-family: "InterVariable";
+  src: url("fonts/InterVariable.woff2") format("woff2");
+  font-weight: 100 900; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("fonts/JetBrainsMono-Regular.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("fonts/JetBrainsMono-Medium.woff2") format("woff2");
+  font-weight: 500; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("fonts/JetBrainsMono-SemiBold.woff2") format("woff2");
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+
 * { box-sizing: border-box; }
 html { background: var(--canvas); }
 body {
   margin: 0;
   color: var(--ink);
   font: 13.5px/1.5 var(--sans);
-  font-feature-settings: "tnum" 1, "cv05" 1;
+  font-feature-settings: "lnum" 1, "tnum" 1, "cv05" 1;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* Lucide icon via CSS mask — tints with currentColor, never emoji */
+.ic {
+  display: inline-block; width: 16px; height: 16px; flex: 0 0 16px;
+  background: currentColor;
+  -webkit-mask: var(--ic) center / contain no-repeat;
+  mask: var(--ic) center / contain no-repeat;
 }
 ::selection { background: var(--blue-soft); }
 
@@ -140,6 +178,8 @@ body {
   opacity: 0.75;
 }
 .navitem[aria-selected="true"] .nico { opacity: 1; }
+.nvic { width: 15px; height: 15px; flex: 0 0 15px; opacity: 0.72; }
+.navitem[aria-selected="true"] .nvic { opacity: 1; }
 
 /* legacy dot fallback (unused when icons present) */
 .navitem .dot {
@@ -197,9 +237,9 @@ body {
   letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted-2);
 }
 .gcell .gvalue {
-  margin: 0; font-family: var(--mono); font-size: 14.5px;
-  font-weight: 650; font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em; display: flex; align-items: center; gap: 6px;
+  margin: 0; font-size: 14px;
+  font-weight: 640; font-variant-numeric: lining-nums tabular-nums;
+  letter-spacing: -0.005em; display: flex; align-items: center; gap: 6px;
 }
 .gcell .gsub {
   margin: 1px 0 0; font-size: 10px; color: var(--muted);
@@ -209,7 +249,7 @@ body {
 .gvalue.s-green { color: var(--green); }
 .gvalue.s-amber { color: var(--amber); }
 .gvalue.s-red { color: var(--red); }
-.gvalue.s-gray { color: var(--gray); font-weight: 520; }
+.gvalue.s-gray { color: var(--muted); font-weight: 500; }
 
 /* status lamps on the two machine-state cells */
 #g-exec .gvalue::before, #g-data .gvalue::before {

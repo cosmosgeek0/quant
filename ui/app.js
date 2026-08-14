@@ -437,9 +437,16 @@ function renderStrip() {
       (pull.level === "amber" ? "amber" : "red"));
   side.appendChild(chip("Mirror", pullLevel,
     pull.present ? ageText(pull.age_seconds) : "none"));
-  side.appendChild(chip("Machine",
-    strip.stop_present || strip.stop_jobs_present ? "amber" : "green",
-    strip.machine || ""));
+  /* Seals in owner language only; the raw machine word (e.g. ARMED)
+     never renders — contract acceptance #26. Absent seals in the
+     mirror prove nothing, so they read as unverified, not as armed. */
+  if (strip.stop_present) {
+    side.appendChild(chip("Paused", "green", "entries sealed"));
+  } else if (strip.stop_jobs_present) {
+    side.appendChild(chip("Entries paused", "green", "jobs sealed"));
+  } else {
+    side.appendChild(chip("Seals", "gray", "not in mirror"));
+  }
 }
 
 function tickClock() {
