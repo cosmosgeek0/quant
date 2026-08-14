@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+VERTICAL HARDENED + DEPLOYED PAUSED 2026-08-14 | release 26b5a8d2ef318eed38f2ee430da6910e2cd0f8c5 | 789 tests green (Lead-measured)
+built | momentum OPEN/HOLD-across-ticks/EXIT on exchange-truth fills | unified runtime: one control, one STOP honored by ALL consumers incl. the runner, RELEASE-file identity, per-stage failure capture | whole-universe feed with sharded ws connections | UI on runtime truth
+monitor | Opus-max monitor: 14 ranked findings (2 would have stranded a live position or run the OLD runner) | all repaired by 5 parallel codex lanes | monitor also certified: atomic state, crash-safe idempotent jobs, query-only recovery, conservative fee-netting HELD under attack
+repairs | tick-tolerance entry-price match | sparse-v3 flat rows tolerated (aligned to the measured saga) | contiguous-time volume windows (manufactured-surge hole closed) | same-source basis legs | feed handshake honesty + aged-window restarts | provenance-clean job_tick from RELEASE
+deploy | 11 files sha-verified | cron unified: runner 1m + runtime chain 3m | RELEASE valid (byte-checked) | one-time release-stage race at first fire, next ticks clean exit 0 | both STOP interlocks present | supervisor ticks honest IDLE
+standing | the commander's final item is the activation moment: the runner takes ONE naturally generated capped trade, holds across ticks, exits by strategy, full ledger | that word is the owner's
+
 FULL WIRING + STOP NEAR-MISS 2026-08-14 | parallel batch landed (747 tests) | machine wired end to end, held by STOP
 built | all-token ws feed (fail-closed books) | momentum brain -> runner jobs with signal-evidenced decisions.jsonl | continuous basis chain with metadata sizing + health.jsonl | UI health/decisions/failures
 live-first | fresh momentum tick on real data refused honestly on 15s-stale quotes, every refusal reasoned — fail-closed proven before wiring

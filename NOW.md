@@ -8,7 +8,8 @@
   live volume into momentum; basis_watch actually wired to the supervisor
   on the host; ONE unified runtime control, one STOP, real commit identity,
   failure propagation, UI paths matching runtime truth.
-- Deploy paused; prove processes, cron, hashes, UI, account state.
+- DEPLOYED PAUSED 2026-08-14 (release 26b5a8d2): unified cron live, RELEASE
+  identity valid, both STOP interlocks verified, ticks green and honest.
 - THEN: the runner — not a human, not a pasted job — takes ONE naturally
   generated capped live trade, holds it across ticks, exits from the
   strategy, and records exact fills, fees, P&L, balances, flatness.
