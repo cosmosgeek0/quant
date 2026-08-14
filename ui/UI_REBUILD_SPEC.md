@@ -110,6 +110,30 @@ where derivable) + severity pillbar + table Time|Severity|Strategy|
 Symbol|Event(.cell2 bold kind + muted exact reason)|Outcome(chip).
 Expanded: §5.5 fields that exist today; evidence collapsed.
 
+## LIVING UI (owner order 2026-08-14: "not basic static UI slap")
+The product must feel ALIVE — a machine you can watch working — while
+staying honest. From ask.txt: the trader trail behaves like a coding
+agent's activity view — a pinned NOW line showing what the machine is
+doing this second, and finished items dropping down into history.
+- Signature piece: the LIVE TRAIL. Pinned now-card with a breathing
+  state lamp; when a new event arrives on poll, it slides in at the
+  top (200ms ease-out) and the previous now-line settles into the
+  trail. No fabricated activity: the now-line shows the real current
+  phase and the real newest record; a quiet machine shows its calm
+  heartbeat ("Watching — last pass 12s ago"), never invented motion.
+- Breathing lamps: Watching = slow 3s ease-in-out opacity breath on
+  the lamp glow; Attention = 1.2s urgent pulse; Paused/sealed =
+  steady, no motion. Lamp only — never whole cards.
+- Flash-on-change: every polled numeric cell pulses its background
+  one soft token step, fading <=500ms, when its VALUE changes.
+- HONEST-MOTION LAW: motion signals arrival, change, or state —
+  never drama. Money digits never tween/count-up (a number is a fact:
+  flash the cell, never animate the digits). Nothing loops except
+  lamps. prefers-reduced-motion disables everything, states swap
+  instantly.
+- Expands, drawers, pills, day cards: 160-200ms ease-out, the one
+  easing family, as already specified.
+
 ## Hard rules for every lane
 - node --check passes; zero console errors; no innerHTML from
   unsanitized strings (use the existing esc() helper).
