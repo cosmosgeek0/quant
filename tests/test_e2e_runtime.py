@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -234,6 +235,25 @@ class RuntimeCase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"QUANT_SHA": SHA})
         env.start()
         self.addCleanup(env.stop)
+        self.write_entry_authorization()
+
+    def write_entry_authorization(self, operator="e2e-supervisor",
+                                  now=T_OPEN):
+        created = datetime.fromtimestamp(
+            now / 1000, timezone.utc).replace(microsecond=0)
+        expires = created + timedelta(minutes=10)
+        acceptance = {
+            "operator": operator,
+            "created_utc": created.isoformat().replace("+00:00", "Z"),
+            "expires_utc": expires.isoformat().replace("+00:00", "Z"),
+            "max_notional": "32",
+        }
+        with open(os.path.join(self.receipt_dir, bs.ACCEPT_ONE_FILE), "w",
+                  encoding="utf-8") as handle:
+            json.dump(acceptance, handle, sort_keys=True)
+        with open(os.path.join(self.receipt_dir, "OPERATOR"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"operator": operator}, handle, sort_keys=True)
 
     def config(self, **changes):
         values = {
@@ -484,6 +504,7 @@ class ExitRoutingE2ETests(RuntimeCase):
 
 class CrashBoundaryE2ETests(RuntimeCase):
     def test_crash_after_claim_before_open_is_adopted_once(self):
+        self.write_entry_authorization(operator="stable-supervisor")
         proposal_id = self.publish_watch_proposal()
         output = io.StringIO()
         with self.assertRaises(SimulatedCrash):
