@@ -1,0 +1,12 @@
+FREEZE CHECKPOINT PROOF (commander order; raw host rows)
+RELEASE: 51520655951f8ff99baca37bca9bcdbbff607919 (code freeze; 907/907 Lead-run twice)
+market_stream.py: host sha256 93591208ec1624c1 == local (delivered via 8KB-chunk assembly after the
+  PTY rail refused bulk paste under the new feed-daemon load; chunks each sha-verified, whole verified)
+seals: STOP + STOP-JOBS present throughout
+TICK 1 07:04:34Z | observation under STOP | feed_used=yes reason=accepted | 656 symbols | jobs_written 0
+TICK 2 07:05:00Z | observation under STOP | feed_used=yes reason=accepted | 656 symbols | jobs_written 0
+TICK 3 07:05:27Z | observation under STOP | feed_used=yes reason=accepted | 656 symbols | jobs_written 0
+test-count lineage (commander flagged 892 vs 904): 892 = G-wave commit total; 904 = rebase folded the
+UI lane's 12 hardening tests; 907 = +3 feed-skew tests. All Lead-run, one lineage, no discrepancy.
+next per commander: review-lane audit of this exact SHA -> then owner's ACCEPT ONE (max $8, 1x, one
+natural entry, HOLD >= 1 tick, strategy/safety exit, flat, auto-reseal). Nothing armed now.
