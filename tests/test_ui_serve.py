@@ -1110,6 +1110,35 @@ class TestStripEndpoint(ServerHarness):
         self.assertEqual(governor["loss_fees_remaining_usdt"], "0.87")
         self.assertFalse(governor["entry_lock_present"])
 
+    def test_slow_cycle_manifest_widens_thresholds(self):
+        # A ~45s declared cycle makes a 75s age healthy green; without the
+        # declaration the same age would be amber under the 45s default.
+        root = self.tempdir()
+        sources = self.empty_sources(root / "missing")
+        live = root / "live"
+        live.mkdir()
+        aged = datetime.now(timezone.utc) - timedelta(seconds=75)
+        sources["manifest"] = live / "pull_manifest.json"
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(aged), "ok": True, "interval_ms": 45000}))
+        base = self.start(sources)
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["pull"]["level"], "green")
+        # cycle_ms >= 5s also counts as a cadence declaration.
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(aged), "ok": True, "cycle_ms": 45000}))
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["pull"]["level"], "green")
+        # A tiny cycle_ms is a copy DURATION, not a cadence — ignored.
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(aged), "ok": True, "cycle_ms": 42}))
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["pull"]["level"], "amber")
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(aged), "ok": True}))
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["pull"]["level"], "amber")
+
     def test_stale_or_failed_pull_goes_red(self):
         root = self.tempdir()
         sources = self.empty_sources(root / "missing")

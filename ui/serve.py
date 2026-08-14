@@ -1246,7 +1246,7 @@ def _strip_pull_facts(sources, now):
     """Distill pull freshness from the mirror manifest, fail-closed."""
     path = Path(sources.get("manifest", LIVE_DIR / "pull_manifest.json"))
     present, manifest, parse_errors = _read_json(path)
-    utc = ok = error = cycle_ms = None
+    utc = ok = error = cycle_ms = interval_ms = None
     if present and isinstance(manifest, dict):
         if isinstance(manifest.get("utc"), str):
             utc = manifest["utc"]
@@ -1256,18 +1256,34 @@ def _strip_pull_facts(sources, now):
             error = manifest["error"]
         if isinstance(manifest.get("cycle_ms"), (int, float)):
             cycle_ms = manifest["cycle_ms"]
+        if isinstance(manifest.get("interval_ms"), (int, float)):
+            interval_ms = manifest["interval_ms"]
     elif present:
         parse_errors += 1
     age = _age_seconds(utc, now)
+    # The mirror declares its loop cadence via interval_ms (host ~5s, Mac
+    # pull ~30-60s); thresholds adapt so a healthy slow cycle never reads
+    # amber. cycle_ms is accepted only when it plausibly IS an interval —
+    # some writers record the copy duration there (tens of ms).
+    amber_after = STRIP_PULL_AMBER_AFTER_SECONDS
+    red_after = STRIP_PULL_RED_AFTER_SECONDS
+    cadence_ms = interval_ms
+    if cadence_ms is None and isinstance(cycle_ms, (int, float)) \
+            and cycle_ms >= 5000:
+        cadence_ms = cycle_ms
+    if isinstance(cadence_ms, (int, float)) and cadence_ms > 0:
+        cadence_seconds = cadence_ms / 1000.0
+        amber_after = max(amber_after, cadence_seconds * 2)
+        red_after = max(red_after, cadence_seconds * 4)
     if not present:
         level = "absent"
     elif ok is False or (present and manifest is None):
         level = "red"
     elif age is None:
         level = "amber"
-    elif age > STRIP_PULL_RED_AFTER_SECONDS:
+    elif age > red_after:
         level = "red"
-    elif age > STRIP_PULL_AMBER_AFTER_SECONDS:
+    elif age > amber_after:
         level = "amber"
     else:
         level = "green"
@@ -1278,6 +1294,7 @@ def _strip_pull_facts(sources, now):
         "utc": utc,
         "age_seconds": age,
         "cycle_ms": cycle_ms,
+        "interval_ms": interval_ms,
         "error": error,
         "level": level,
         "parse_errors": parse_errors,
