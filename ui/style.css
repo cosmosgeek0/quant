@@ -283,9 +283,60 @@ body {
   border-color: var(--red-line);
 }
 
-main { padding: 20px 24px 56px; flex: 1 0 auto; }
+main { padding: 14px 16px 44px; flex: 1 0 auto; }
 [role="tabpanel"] { display: none; }
 [role="tabpanel"].on { display: block; }
+
+/* ============================================================
+   Route frame: one continuous surface per page — never floating
+   boxes on a gray sea (owner's room grammar, measured)
+   ============================================================ */
+.pageband {
+  display: flex; align-items: center; gap: 10px;
+  min-height: 44px; padding: 2px 4px 10px;
+}
+.pageband .pb-ic {
+  width: 22px; height: 22px; color: var(--ink-2);
+}
+.pageband .pb-title {
+  font-size: 20px; font-weight: 540; letter-spacing: -0.014em;
+  line-height: 28px;
+}
+.pageband .pb-live {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 440; color: var(--muted);
+  margin-left: 4px;
+}
+.pageband .pb-live::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--gray);
+}
+.pageband .pb-live.ok::before { background: var(--green); }
+.pageband .pb-live.warn::before { background: var(--warn-mark); }
+.pageband .pb-live.bad::before { background: var(--red); }
+.pageband .pb-meta {
+  margin-left: auto; font-size: 11.5px; font-weight: 420;
+  color: var(--muted-2);
+}
+.pageframe {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+}
+.pageframe > .card, .pageframe .ov-grid > .card {
+  border: 0; border-radius: 0; margin: 0; box-shadow: none;
+}
+.pageframe > .card { border-top: 1px solid var(--line); }
+.pageframe > :first-child { border-top: 0; }
+.pageframe > .stat-row {
+  margin: 0; padding: 12px 14px; gap: 10px;
+}
+.pageframe > .ov-grid {
+  margin: 0; gap: 0; border-top: 1px solid var(--line);
+}
+.pageframe .ov-grid > .card + .card { border-left: 1px solid var(--line); }
 
 /* ============================================================
    Status chips

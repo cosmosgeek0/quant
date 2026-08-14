@@ -664,8 +664,43 @@ function selectTab(name) {
   renderCurrent();
 }
 
+var PAGE_ICONS = {
+  overview: "gauge", basis: "scale", volume: "chart-line",
+  quant: "activity", journal: "file-text"
+};
+
+function renderPageBand(name) {
+  var band = document.getElementById("band-" + name);
+  if (!band) return;
+  var strip = state.data.strip || {};
+  var pull = strip.pull || {};
+  var liveCls, liveText;
+  if (!pull.present) { liveCls = ""; liveText = "No data delivery yet"; }
+  else if (pull.ok === false || pull.level === "red") {
+    liveCls = "bad"; liveText = "Stale · " + ageText(pull.age_seconds);
+  } else if (pull.level === "amber") {
+    liveCls = "warn"; liveText = "Delayed · " + ageText(pull.age_seconds);
+  } else { liveCls = "ok"; liveText = "Live · " + ageText(pull.age_seconds); }
+  var title = name.charAt(0).toUpperCase() + name.slice(1);
+  var rendered = band.getAttribute("data-r");
+  var next = title + "|" + liveCls + "|" + liveText;
+  if (rendered === next) return;
+  band.setAttribute("data-r", next);
+  band.textContent = "";
+  var icon = el("span", "ic pb-ic");
+  icon.style.setProperty("--ic",
+    "url(vendor/icons/" + (PAGE_ICONS[name] || "gauge") + ".svg)");
+  band.appendChild(icon);
+  band.appendChild(el("span", "pb-title", title));
+  band.appendChild(el("span",
+    "pb-live" + (liveCls ? " " + liveCls : ""), liveText));
+  band.appendChild(el("span", "pb-meta",
+    "reads only — cannot trade, pause, or arm"));
+}
+
 function renderCurrent() {
   renderStrip();
+  renderPageBand(state.tab);
   var module = window.QuantTabs[state.tab];
   if (module && typeof module.render === "function") module.render();
 }
