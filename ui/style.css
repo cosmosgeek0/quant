@@ -326,6 +326,30 @@ section.block > h2, .card > h2 {
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 
+/* card grammar (rebuild wave): quiet head band, sentence-case title */
+.card { padding: 0; overflow: hidden; }
+.card-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; padding: 11px 16px 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.card-title {
+  font-size: 13px; font-weight: 540; letter-spacing: -0.006em;
+  color: var(--ink);
+}
+.card-meta {
+  font-size: 11px; font-weight: 420; color: var(--muted);
+  text-transform: none; white-space: nowrap;
+}
+.card-body { padding: 4px 0 6px; }
+.card-body > .stateblock, .card-body > .c7-state { margin: 0 16px; }
+.card-note {
+  margin: 8px 16px 10px; font-size: 11px; font-weight: 420;
+  color: var(--muted-2);
+}
+.ov-grid { margin-bottom: 16px; }
+.stat-row { margin-bottom: 16px; }
+
 .bignum {
   font-family: var(--mono); font-size: 27px; font-weight: 720;
   font-variant-numeric: tabular-nums; margin: 0; letter-spacing: -0.02em;

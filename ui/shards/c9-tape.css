@@ -1,0 +1,162 @@
+.tape {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.tape thead {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+}
+
+.tape thead th {
+  min-height: 32px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 430;
+  line-height: 17px;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+  vertical-align: middle;
+}
+
+.tape thead th.num {
+  text-align: right;
+}
+
+.tape thead th[data-sort] {
+  cursor: pointer;
+  user-select: none;
+}
+
+.tape thead th[data-sort]::after {
+  --ic: url(/vendor/icons/chevron-down.svg);
+
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 4px;
+  background-color: currentColor;
+  opacity: 0.4;
+  vertical-align: -2px;
+  transform-origin: center;
+  -webkit-mask: var(--ic) center / 12px 12px no-repeat;
+  mask: var(--ic) center / 12px 12px no-repeat;
+}
+
+.tape thead th.sorted {
+  color: var(--ink-2);
+}
+
+.tape thead th.sorted::after {
+  opacity: 1;
+}
+
+.tape thead th.sorted.asc::after {
+  transform: rotate(180deg);
+}
+
+.tape tbody > tr {
+  height: 46px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel);
+}
+
+.tape tbody > tr:not(.exprow):hover {
+  background: var(--hover);
+}
+
+.tape tbody td {
+  padding: 6px 12px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.tape tbody td.num {
+  text-align: right;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.tape tbody > tr.exprow > td {
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: var(--inset);
+}
+
+.tape-waterfall {
+  width: 100%;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.tape-waterfall-row {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 10px;
+  align-items: center;
+  min-height: 34px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.tape-waterfall-label {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 540;
+  line-height: 17px;
+}
+
+.tape-waterfall-valuebox {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.tape-waterfall-valuebox-num {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.tape-waterfall-value {
+  max-width: 100%;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 440;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
+
+.tape-waterfall-why {
+  max-width: 100%;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 420;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
+
+@keyframes tape-row-enter {
+  from {
+    opacity: 0.55;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tape tbody > tr:not(.exprow) {
+    animation: tape-row-enter 180ms ease-out both;
+    transition: background-color 160ms ease-out;
+  }
+}
