@@ -1,0 +1,199 @@
+[data-theme="dark"] {
+  --canvas: #0b0e11;
+  --panel: #15181d;
+  --panel-2: #171b21;
+  --inset: #1b1f26;
+  --tile-hover: #20252d;
+  --hover: #171b21;
+  --ink: #e8edf4;
+  --ink-2: #aeb7c4;
+  --muted: #717b8a;
+  --muted-2: #626c79;
+  --line: #262d38;
+  --line-soft: #181c22;
+  --line-strong: #2b3139;
+  --green: #2ebd85;
+  --red: #f6465d;
+  --amber: #e0a43c;
+  --gray: #4d5664;
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-pop: 0 16px 48px -14px rgba(0, 0, 0, 0.7);
+}
+
+[data-motion="off"] * {
+  animation: none !important;
+  transition: none !important;
+}
+
+.s3-settings__trigger {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 40px;
+  margin-top: auto;
+  padding: 0 10px;
+  gap: 9px;
+  border: 0;
+  border-radius: var(--r-md);
+  appearance: none;
+  background: transparent;
+  color: var(--ink-2);
+  font: 510 13px/1 var(--sans, Inter, sans-serif);
+  font-variant-numeric: lining-nums tabular-nums;
+  text-align: left;
+  cursor: pointer;
+}
+
+.s3-settings__trigger:hover,
+.s3-settings__trigger[aria-expanded="true"] {
+  background: var(--inset);
+  color: var(--ink);
+}
+
+.s3-settings__trigger:focus-visible {
+  outline: 2px solid var(--blue-line);
+  outline-offset: 2px;
+}
+
+.s3-settings__trigger-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  opacity: 0.72;
+}
+
+.s3-settings__trigger[aria-expanded="true"] .s3-settings__trigger-icon {
+  opacity: 1;
+}
+
+.s3-settings__trigger-label {
+  min-width: 0;
+}
+
+.s3-settings__panel {
+  position: fixed;
+  z-index: 120;
+  box-sizing: border-box;
+  width: 260px;
+  max-width: calc(100vw - 20px);
+  max-height: calc(100vh - 20px);
+  padding: 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow-pop);
+  color: var(--ink);
+  font-family: var(--sans, Inter, sans-serif);
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.s3-settings__panel[hidden] {
+  display: none;
+}
+
+.s3-settings__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 38px;
+  padding: 3px 2px;
+  gap: 8px;
+}
+
+.s3-settings__row + .s3-settings__row {
+  border-top: 1px solid var(--line-soft);
+}
+
+.s3-settings__label {
+  flex: 0 0 46px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 540;
+  line-height: 1;
+}
+
+.s3-settings__segments {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  gap: 3px;
+}
+
+.s3-settings__pill {
+  box-sizing: border-box;
+  height: 26px;
+  min-width: 34px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 12px;
+  appearance: none;
+  background: var(--inset);
+  color: var(--ink-2);
+  font: 510 12px/1 var(--sans, Inter, sans-serif);
+  font-variant-numeric: lining-nums tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.s3-settings__pill:hover {
+  background: var(--tile-hover);
+  color: var(--ink);
+}
+
+.s3-settings__pill--selected,
+.s3-settings__pill--selected:hover {
+  background: var(--ink);
+  color: var(--panel);
+}
+
+.s3-settings__pill:focus-visible {
+  outline: 2px solid var(--blue-line);
+  outline-offset: 1px;
+}
+
+.s3-settings__accents {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.s3-settings__accent {
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  appearance: none;
+  background: var(--s3-settings-swatch);
+  cursor: pointer;
+}
+
+.s3-settings__accent:hover {
+  outline: 1px solid var(--ink-2);
+  outline-offset: 1px;
+}
+
+.s3-settings__accent--selected,
+.s3-settings__accent--selected:hover,
+.s3-settings__accent:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .s3-settings__trigger,
+  .s3-settings__pill {
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+
+  .s3-settings__trigger-icon {
+    transition: opacity 120ms ease;
+  }
+}

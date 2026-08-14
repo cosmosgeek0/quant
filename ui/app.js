@@ -772,6 +772,47 @@ window.QuantUI = {
 
 /* ---------- boot ---------- */
 
+/* Palette index: only real destinations and real delivered symbols. */
+function paletteIndex() {
+  var out = [];
+  TABS.forEach(function (tab) {
+    out.push({
+      group: "Pages",
+      label: tab.charAt(0).toUpperCase() + tab.slice(1),
+      sub: null,
+      iconName: (typeof PAGE_ICONS === "object" && PAGE_ICONS[tab]) || null,
+      action: function () { selectTab(tab); }
+    });
+  });
+  var seen = new Set();
+  function addSymbol(symbol, sub, tab) {
+    if (!symbol || seen.has(symbol)) return;
+    seen.add(symbol);
+    out.push({
+      group: "Symbols",
+      label: symbol,
+      sub: sub,
+      iconName: null,
+      action: function () { selectTab(tab); }
+    });
+  }
+  U_exposure().forEach(function (line) {
+    addSymbol(line.symbol, line.strategy + " · open", line.tab);
+  });
+  var stream = state.data.stream;
+  if (stream && Array.isArray(stream.records)) {
+    stream.records.slice(0, 200).forEach(function (record) {
+      var sel = Array.isArray(record.selection) ? record.selection : [];
+      var isBasis = sel.indexOf("basis_gap") >= 0;
+      addSymbol(record.symbol,
+        isBasis ? "Basis gap delivered" : "Volume surge delivered",
+        isBasis ? "basis" : "volume");
+    });
+  }
+  return out;
+}
+function U_exposure() { return exposureLines(); }
+
 if (typeof document !== "undefined") {
   document.addEventListener("DOMContentLoaded", function () {
     if (!document.getElementById("masthead")) return;
@@ -783,8 +824,40 @@ if (typeof document !== "undefined") {
     });
     var initial = window.location.hash.replace("#", "");
     selectTab(TABS.indexOf(initial) >= 0 ? initial : "overview");
-    tickClock();
-    window.setInterval(tickClock, 1000);
+
+    var P = window.QuantParts || {};
+    /* Appearance prefs: applied before first paint of the session. */
+    if (typeof P.settings === "function") {
+      var settings = P.settings();
+      var slot = document.getElementById("side-bottom");
+      if (slot && settings && settings.trigger) {
+        slot.appendChild(settings.trigger);
+        if (settings.panel) document.body.appendChild(settings.panel);
+      }
+    }
+    /* Clock chip (falls back to the plain clockpill text). */
+    var clockNode = document.getElementById("clockpill");
+    if (typeof P.clockChip === "function" && clockNode) {
+      var chip = P.clockChip();
+      clockNode.replaceWith(chip.node);
+      chip.node.id = "clockpill";
+      chip.tick();
+      window.setInterval(chip.tick, 1000);
+    } else {
+      tickClock();
+      window.setInterval(tickClock, 1000);
+    }
+    /* Global search: field trigger + command palette. */
+    if (typeof P.palette === "function" &&
+        typeof P.searchField === "function") {
+      var pal = P.palette(paletteIndex);
+      var field = P.searchField(function () { pal.open(); });
+      var chips = document.getElementById("statuschips");
+      if (chips && chips.parentNode) {
+        chips.parentNode.insertBefore(field, chips.nextSibling);
+      }
+    }
+
     pollOnce();
     window.setInterval(pollOnce, REFRESH_MS);
   });

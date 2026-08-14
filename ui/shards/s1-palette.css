@@ -1,0 +1,236 @@
+.s1-palette {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 11vh 4vw 24px;
+  background: rgba(10, 13, 18, 0.34);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  color: var(--ink);
+  font-family: var(--sans, Inter, sans-serif);
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.s1-palette[hidden] {
+  display: none;
+}
+
+.s1-palette__modal {
+  box-sizing: border-box;
+  width: min(600px, 92vw);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel);
+  box-shadow: var(--shadow-pop);
+  transform-origin: top center;
+}
+
+.s1-palette__input-row {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 14px 17px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.s1-palette__search-icon {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+  color: var(--muted);
+}
+
+.s1-palette__input {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  appearance: none;
+  background: transparent;
+  color: var(--ink);
+  font: 440 15.5px/1.35 var(--sans, Inter, sans-serif);
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.s1-palette__input::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.s1-palette__list {
+  box-sizing: border-box;
+  max-height: 50vh;
+  padding: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--panel);
+}
+
+.s1-palette__group {
+  box-sizing: border-box;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 8px 11px 4px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 540;
+  font-variant-numeric: lining-nums tabular-nums;
+  line-height: 1.3;
+  letter-spacing: 0.04em;
+}
+
+.s1-palette__group-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.s1-palette__group-note {
+  color: var(--muted);
+  font-weight: 420;
+  letter-spacing: 0;
+}
+
+.s1-palette__item {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 9px 11px;
+  gap: 12px;
+  border: 0;
+  border-radius: 10px;
+  appearance: none;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.s1-palette__item:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.s1-palette__item--selected,
+.s1-palette__item--selected:hover {
+  background: var(--inset);
+  color: var(--ink);
+}
+
+.s1-palette__item:focus-visible {
+  outline: 2px solid var(--blue-line);
+  outline-offset: -2px;
+}
+
+.s1-palette__item:disabled {
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+}
+
+.s1-palette__item-icon {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+  color: var(--muted);
+}
+
+.s1-palette__item-icon--empty {
+  visibility: hidden;
+}
+
+.s1-palette__item-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.s1-palette__item-label {
+  color: currentColor;
+  font-size: 13.5px;
+  font-weight: 470;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.s1-palette__item-sub,
+.s1-palette__item-note {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 420;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.s1-palette__empty {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 70px;
+  padding: 16px 11px;
+  gap: 3px;
+}
+
+.s1-palette__empty-value {
+  color: var(--ink-2);
+  font-size: 15.5px;
+  font-weight: 510;
+  line-height: 1.2;
+}
+
+.s1-palette__empty-note {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 420;
+  line-height: 1.35;
+}
+
+.s1-palette__footer {
+  box-sizing: border-box;
+  padding: 9px 15px;
+  overflow: hidden;
+  border-top: 1px solid var(--line-soft);
+  background: var(--inset);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 420;
+  font-variant-numeric: lining-nums tabular-nums;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes s1-palette-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .s1-palette:not([hidden]) .s1-palette__modal {
+    animation: s1-palette-enter 160ms ease-out;
+  }
+
+  .s1-palette__item {
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+}

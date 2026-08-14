@@ -131,11 +131,13 @@ body {
 #sidebar {
   width: 200px; flex: 0 0 200px;
   border-right: 1px solid var(--line);
-  padding: 16px 12px 20px;
+  padding: 16px 12px 12px;
   position: sticky; top: 0; align-self: flex-start;
   height: 100vh; overflow-y: auto;
   background: var(--panel);
+  display: flex; flex-direction: column;
 }
+#side-bottom { margin-top: auto; padding-top: 12px; }
 
 .brand {
   display: flex; align-items: center; gap: 9px;

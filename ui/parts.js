@@ -1504,3 +1504,847 @@ window.QuantParts = window.QuantParts || {};
     return true;
   };
 }(window.QuantParts = window.QuantParts || {}));
+
+/* ===== shards/s1-palette.js ===== */
+(function registerPalette() {
+  "use strict";
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function cleanText(value) {
+    if (typeof value !== "string") return null;
+    value = value.trim();
+    return value ? value : null;
+  }
+
+  function safeIconName(value) {
+    var name = cleanText(value);
+    return name && /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(name) ? name : null;
+  }
+
+  function activeElementIsTextInput() {
+    var active = document.activeElement;
+    var tagName = active && active.tagName;
+    return tagName === "INPUT" || tagName === "TEXTAREA";
+  }
+
+  window.QuantParts = window.QuantParts || {};
+  window.QuantParts.palette = function palette(getIndex) {
+    var openState = false;
+    var previousFocus = null;
+    var selectedIndex = -1;
+    var renderedItems = [];
+
+    var overlay = el("div", "s1-palette");
+    var modal = el("div", "s1-palette__modal");
+    var inputRow = el("div", "s1-palette__input-row");
+    var searchIcon = el("span", "ic s1-palette__search-icon");
+    var input = el("input", "s1-palette__input");
+    var list = el("div", "s1-palette__list");
+    var footer = el(
+      "div",
+      "s1-palette__footer",
+      "↑↓ navigate · enter open · esc close"
+    );
+
+    overlay.hidden = true;
+    overlay.setAttribute("aria-hidden", "true");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Command palette");
+    searchIcon.setAttribute("aria-hidden", "true");
+    searchIcon.style.setProperty("--ic", "url(vendor/icons/search.svg)");
+    input.type = "text";
+    input.placeholder = "Search commands";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("aria-label", "Search commands");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-haspopup", "listbox");
+    input.setAttribute("aria-expanded", "false");
+    list.setAttribute("role", "listbox");
+    list.setAttribute("aria-label", "Command results");
+    footer.setAttribute("aria-hidden", "true");
+
+    inputRow.append(searchIcon, input);
+    modal.append(inputRow, list, footer);
+    overlay.appendChild(modal);
+
+    function mount() {
+      var mountPoint;
+      if (overlay.isConnected) return;
+      mountPoint = document.body || document.documentElement;
+      mountPoint.appendChild(overlay);
+    }
+
+    function currentIndex() {
+      var source;
+
+      if (typeof getIndex !== "function") {
+        return { available: false, entries: [] };
+      }
+
+      try {
+        source = getIndex();
+      } catch (error) {
+        return { available: false, entries: [] };
+      }
+
+      if (!Array.isArray(source)) {
+        return { available: false, entries: [] };
+      }
+
+      return {
+        available: true,
+        entries: source.map(function normalizeEntry(entry, sourceIndex) {
+          var record = entry && typeof entry === "object" ? entry : {};
+          return {
+            group: cleanText(record.group),
+            label: cleanText(record.label),
+            sub: cleanText(record.sub),
+            iconName: safeIconName(record.iconName),
+            action: typeof record.action === "function" ? record.action : null,
+            sourceIndex: sourceIndex,
+          };
+        }),
+      };
+    }
+
+    function filteredGroups(entries, rawQuery) {
+      var query = rawQuery.trim().toLowerCase();
+      var groups = [];
+      var groupsByName = new Map();
+      var remaining = 40;
+
+      entries.forEach(function collectMatch(item) {
+        var label = item.label ? item.label.toLowerCase() : "";
+        var sub = item.sub ? item.sub.toLowerCase() : "";
+        var haystack = label + " " + sub;
+        var group;
+
+        if (query && haystack.indexOf(query) === -1) return;
+
+        group = groupsByName.get(item.group);
+        if (!group) {
+          group = { label: item.group, matches: [] };
+          groupsByName.set(item.group, group);
+          groups.push(group);
+        }
+
+        group.matches.push({
+          item: item,
+          rank:
+            query && (label.indexOf(query) === 0 || sub.indexOf(query) === 0)
+              ? 0
+              : 1,
+        });
+      });
+
+      groups.forEach(function rankMatches(group) {
+        group.matches.sort(function compareMatches(left, right) {
+          return left.rank - right.rank || left.item.sourceIndex - right.item.sourceIndex;
+        });
+      });
+
+      return groups.reduce(function capGroups(capped, group) {
+        var included;
+        if (!remaining) return capped;
+        included = group.matches.slice(0, remaining);
+        remaining -= included.length;
+        if (included.length) {
+          capped.push({
+            label: group.label,
+            items: included.map(function unwrap(match) {
+              return match.item;
+            }),
+          });
+        }
+        return capped;
+      }, []);
+    }
+
+    function setSelection(index, scrollIntoView) {
+      var selected;
+
+      if (
+        index < 0 ||
+        index >= renderedItems.length ||
+        typeof renderedItems[index].item.action !== "function"
+      ) {
+        index = -1;
+      }
+
+      selectedIndex = index;
+      renderedItems.forEach(function syncSelection(rendered, renderedIndex) {
+        var isSelected = renderedIndex === selectedIndex;
+        rendered.node.classList.toggle(
+          "s1-palette__item--selected",
+          isSelected
+        );
+        rendered.node.setAttribute("aria-selected", isSelected ? "true" : "false");
+      });
+
+      selected = selectedIndex >= 0 ? renderedItems[selectedIndex] : null;
+      if (selected && scrollIntoView) {
+        selected.node.scrollIntoView({ block: "nearest" });
+      }
+    }
+
+    function firstSelectableIndex() {
+      return renderedItems.findIndex(function findSelectable(rendered) {
+        return typeof rendered.item.action === "function";
+      });
+    }
+
+    function appendEmpty(message) {
+      var empty = el("div", "s1-palette__empty");
+      empty.append(el("span", "s1-palette__empty-value", "—"));
+      empty.append(el("span", "s1-palette__empty-note", message));
+      list.appendChild(empty);
+    }
+
+    function buildItem(item) {
+      var renderedIndex = renderedItems.length;
+      var row = el("button", "s1-palette__item");
+      var icon;
+      var copy = el("span", "s1-palette__item-copy");
+      var label = el(
+        "span",
+        "s1-palette__item-label",
+        item.label || "—"
+      );
+      var rendered = { item: item, node: row };
+
+      row.type = "button";
+      row.tabIndex = -1;
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", "false");
+
+      if (item.iconName) {
+        icon = el("span", "ic s1-palette__item-icon");
+        icon.style.setProperty(
+          "--ic",
+          "url(vendor/icons/" + item.iconName + ".svg)"
+        );
+      } else {
+        icon = el(
+          "span",
+          "s1-palette__item-icon s1-palette__item-icon--empty"
+        );
+      }
+      icon.setAttribute("aria-hidden", "true");
+
+      copy.appendChild(label);
+      if (!item.label) {
+        copy.appendChild(
+          el("span", "s1-palette__item-note", "Label unavailable")
+        );
+      }
+      if (item.sub) {
+        copy.appendChild(el("span", "s1-palette__item-sub", item.sub));
+      }
+      if (!item.action) {
+        row.disabled = true;
+        row.setAttribute("aria-disabled", "true");
+        copy.appendChild(
+          el("span", "s1-palette__item-note", "Action unavailable")
+        );
+      }
+
+      row.append(icon, copy);
+      row.addEventListener("mouseenter", function selectFromPointer() {
+        if (item.action) setSelection(renderedIndex, false);
+      });
+      row.addEventListener("mousedown", function retainSearchFocus(event) {
+        event.preventDefault();
+      });
+      row.addEventListener("click", function runFromPointer() {
+        runAction(renderedIndex);
+      });
+      renderedItems.push(rendered);
+      return row;
+    }
+
+    function renderResults(query) {
+      var snapshot = currentIndex();
+      var groups = snapshot.available
+        ? filteredGroups(snapshot.entries, query)
+        : [];
+      var fragment = document.createDocumentFragment();
+
+      renderedItems = [];
+      selectedIndex = -1;
+      list.replaceChildren();
+
+      groups.forEach(function buildGroup(group) {
+        var header = el("div", "s1-palette__group");
+
+        header.setAttribute("role", "presentation");
+        if (group.label) {
+          header.appendChild(
+            el("span", "s1-palette__group-label", group.label)
+          );
+        } else {
+          header.appendChild(el("span", "s1-palette__group-label", "—"));
+          header.appendChild(
+            el("span", "s1-palette__group-note", "Group unavailable")
+          );
+        }
+        fragment.appendChild(header);
+        group.items.forEach(function appendItem(item) {
+          fragment.appendChild(buildItem(item));
+        });
+      });
+
+      list.appendChild(fragment);
+      if (!snapshot.available) {
+        appendEmpty("Command index unavailable");
+      } else if (!snapshot.entries.length) {
+        appendEmpty("No commands available");
+      } else if (!renderedItems.length) {
+        appendEmpty("No matching commands");
+      }
+
+      setSelection(firstSelectableIndex(), false);
+      list.scrollTop = 0;
+    }
+
+    function moveSelection(direction) {
+      var selectable = [];
+      var currentPosition;
+      var nextPosition;
+
+      renderedItems.forEach(function collectSelectable(rendered, index) {
+        if (rendered.item.action) selectable.push(index);
+      });
+      if (!selectable.length) return;
+
+      currentPosition = selectable.indexOf(selectedIndex);
+      if (currentPosition === -1) {
+        nextPosition = direction > 0 ? 0 : selectable.length - 1;
+      } else {
+        nextPosition =
+          (currentPosition + direction + selectable.length) % selectable.length;
+      }
+      setSelection(selectable[nextPosition], true);
+    }
+
+    function closePalette(restoreFocus) {
+      var focusTarget = previousFocus;
+      if (!openState) return;
+
+      openState = false;
+      overlay.hidden = true;
+      overlay.setAttribute("aria-hidden", "true");
+      input.setAttribute("aria-expanded", "false");
+      input.value = "";
+      list.replaceChildren();
+      renderedItems = [];
+      selectedIndex = -1;
+      previousFocus = null;
+
+      if (
+        restoreFocus &&
+        focusTarget &&
+        focusTarget.isConnected &&
+        typeof focusTarget.focus === "function"
+      ) {
+        focusTarget.focus({ preventScroll: true });
+      }
+    }
+
+    function runAction(index) {
+      var rendered = renderedItems[index];
+      if (!rendered || typeof rendered.item.action !== "function") return;
+
+      try {
+        rendered.item.action();
+      } finally {
+        closePalette(false);
+      }
+    }
+
+    function openPalette() {
+      if (openState) return;
+
+      mount();
+      previousFocus = document.activeElement;
+      input.value = "";
+      renderResults("");
+      openState = true;
+      overlay.hidden = false;
+      overlay.setAttribute("aria-hidden", "false");
+      input.setAttribute("aria-expanded", "true");
+      input.focus({ preventScroll: true });
+    }
+
+    input.addEventListener("input", function filterFromCurrentIndex() {
+      renderResults(input.value);
+    });
+
+    document.addEventListener(
+      "click",
+      function closeFromOutsideClick(event) {
+        if (openState && !modal.contains(event.target)) closePalette(true);
+      },
+      true
+    );
+
+    document.addEventListener("keydown", function handlePaletteKeys(event) {
+      var key = typeof event.key === "string" ? event.key : "";
+
+      if (event.defaultPrevented || event.isComposing) return;
+
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey &&
+        key.toLowerCase() === "k"
+      ) {
+        event.preventDefault();
+        if (openState) closePalette(true);
+        else openPalette();
+        return;
+      }
+
+      if (
+        key === "/" &&
+        !openState &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !activeElementIsTextInput()
+      ) {
+        event.preventDefault();
+        openPalette();
+        return;
+      }
+
+      if (!openState) return;
+
+      if (key === "Escape") {
+        event.preventDefault();
+        closePalette(true);
+      } else if (key === "ArrowDown") {
+        event.preventDefault();
+        moveSelection(1);
+      } else if (key === "ArrowUp") {
+        event.preventDefault();
+        moveSelection(-1);
+      } else if (key === "Enter") {
+        event.preventDefault();
+        runAction(selectedIndex);
+      }
+    });
+
+    return {
+      open: openPalette,
+      close: function close() {
+        closePalette(true);
+      },
+      isOpen: function isOpen() {
+        return openState;
+      },
+    };
+  };
+})();
+
+/* ===== shards/s2-search.js ===== */
+(function registerSearchField(parts) {
+  "use strict";
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  parts.searchField = function searchField(onActivate) {
+    const trigger = el("button", "s2-search");
+    const icon = el("span", "ic s2-search__icon");
+    const placeholder = el(
+      "span",
+      "s2-search__placeholder",
+      "Search markets, records\u2026"
+    );
+    const keycap = el("span", "s2-search__keycap", "\u2318K");
+
+    trigger.type = "button";
+    trigger.setAttribute("aria-label", "Search markets and records");
+    trigger.setAttribute("aria-keyshortcuts", "Meta+K");
+    icon.setAttribute("aria-hidden", "true");
+    icon.style.setProperty("--ic", "url(vendor/icons/search.svg)");
+    keycap.setAttribute("aria-hidden", "true");
+    trigger.append(icon, placeholder, keycap);
+
+    function activate() {
+      if (typeof onActivate === "function") onActivate();
+    }
+
+    trigger.addEventListener("focus", activate);
+    trigger.addEventListener("click", activate);
+
+    return trigger;
+  };
+}(window.QuantParts = window.QuantParts || {}));
+
+/* ===== shards/s3-settings.js ===== */
+(function registerSettings(parts) {
+  "use strict";
+
+  var STORAGE_KEY = "quant-ui-prefs";
+  var DEFAULT_PREFS = {
+    theme: "light",
+    accent: "blue",
+    zoom: 1,
+    clockZone: "UTC",
+    motion: "on",
+  };
+  var ACCENTS = [
+    { key: "red", label: "Red", color: "#e5484d", ink: "#b42318", rgb: [229, 72, 77] },
+    { key: "orange", label: "Orange", color: "#f2760c", ink: "#b45309", rgb: [242, 118, 12] },
+    { key: "yellow", label: "Yellow", color: "#eab308", ink: "#8a6d00", rgb: [234, 179, 8] },
+    { key: "green", label: "Green", color: "#12a150", ink: "#0a7c3d", rgb: [18, 161, 80] },
+    { key: "blue", label: "Blue", color: "#2f6bff", ink: "#1d4ed8", rgb: [47, 107, 255] },
+    { key: "indigo", label: "Indigo", color: "#5b5bef", ink: "#4338ca", rgb: [91, 91, 239] },
+    { key: "violet", label: "Violet", color: "#9333ea", ink: "#7c22ce", rgb: [147, 51, 234] },
+  ];
+  var ZOOMS = [0.9, 1, 1.1, 1.25];
+  var volatilePrefs = null;
+  var instanceCount = 0;
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function copyPrefs(prefs) {
+    return {
+      theme: prefs.theme,
+      accent: prefs.accent,
+      zoom: prefs.zoom,
+      clockZone: prefs.clockZone,
+      motion: prefs.motion,
+    };
+  }
+
+  function accentFor(key) {
+    var match = ACCENTS.find(function findAccent(accent) {
+      return accent.key === key;
+    });
+    return match || ACCENTS[4];
+  }
+
+  function normalizePrefs(value) {
+    var source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    var accent = accentFor(source.accent);
+
+    return {
+      theme: source.theme === "dark" ? "dark" : DEFAULT_PREFS.theme,
+      accent: accent.key,
+      zoom: ZOOMS.indexOf(source.zoom) >= 0 ? source.zoom : DEFAULT_PREFS.zoom,
+      clockZone: source.clockZone === "IST" ? "IST" : DEFAULT_PREFS.clockZone,
+      motion: source.motion === "off" ? "off" : DEFAULT_PREFS.motion,
+    };
+  }
+
+  function readPrefs() {
+    if (volatilePrefs) return copyPrefs(volatilePrefs);
+
+    try {
+      var stored = window.localStorage.getItem(STORAGE_KEY);
+      if (stored !== null) return normalizePrefs(JSON.parse(stored));
+    } catch (error) {
+      return copyPrefs(DEFAULT_PREFS);
+    }
+
+    return copyPrefs(DEFAULT_PREFS);
+  }
+
+  function rgba(rgb, alpha) {
+    return "rgba(" + rgb.join(", ") + ", " + alpha + ")";
+  }
+
+  function applyRootPrefs(prefs) {
+    var root = document.documentElement;
+    var accent = accentFor(prefs.accent);
+    var zoomPercent = {
+      "0.9": "90%",
+      "1": "100%",
+      "1.1": "110%",
+      "1.25": "125%",
+    }[String(prefs.zoom)];
+
+    root.dataset.theme = prefs.theme;
+    root.style.setProperty("--blue", accent.color);
+    root.style.setProperty("--blue-ink", accent.ink);
+    root.style.setProperty("--blue-soft", rgba(accent.rgb, "0.11"));
+    root.style.setProperty("--blue-line", rgba(accent.rgb, "0.42"));
+    root.style.fontSize = zoomPercent;
+
+    if (prefs.motion === "off") root.dataset.motion = "off";
+    else delete root.dataset.motion;
+  }
+
+  parts.getPrefs = function getPrefs() {
+    return readPrefs();
+  };
+
+  parts.settings = function settings() {
+    var controls = [];
+    var isOpen = false;
+    var panelId = "s3-settings-panel-" + String(++instanceCount);
+    var trigger = el("button", "s3-settings__trigger");
+    var triggerIcon = el("span", "ic s3-settings__trigger-icon");
+    var triggerLabel = el("span", "s3-settings__trigger-label", "Appearance");
+    var panel = el("div", "s3-settings__panel");
+
+    trigger.type = "button";
+    trigger.setAttribute("aria-haspopup", "dialog");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("aria-controls", panelId);
+    triggerIcon.setAttribute("aria-hidden", "true");
+    triggerIcon.style.setProperty("--ic", "url(vendor/icons/settings.svg)");
+    trigger.append(triggerIcon, triggerLabel);
+
+    panel.id = panelId;
+    panel.hidden = true;
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "Appearance settings");
+
+    function syncControls(prefs) {
+      controls.forEach(function syncControl(control) {
+        var selected = prefs[control.pref] === control.value;
+        control.node.classList.toggle(control.selectedClass, selected);
+        control.node.setAttribute("aria-pressed", selected ? "true" : "false");
+      });
+    }
+
+    function apply() {
+      var prefs = readPrefs();
+      applyRootPrefs(prefs);
+      syncControls(prefs);
+      return copyPrefs(prefs);
+    }
+
+    function savePreference(pref, value) {
+      var next = readPrefs();
+      var persisted = false;
+
+      next[pref] = value;
+      next = normalizePrefs(next);
+
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+        persisted = true;
+        volatilePrefs = null;
+      } catch (error) {
+        volatilePrefs = copyPrefs(next);
+      }
+
+      if (persisted) apply();
+      else {
+        applyRootPrefs(next);
+        syncControls(next);
+      }
+    }
+
+    function addSegmentedRow(label, pref, options) {
+      var row = el("div", "s3-settings__row");
+      var rowLabel = el("span", "s3-settings__label", label);
+      var segments = el("div", "s3-settings__segments");
+
+      segments.setAttribute("role", "group");
+      segments.setAttribute("aria-label", label);
+
+      options.forEach(function addOption(option) {
+        var button = el("button", "s3-settings__pill", option.label);
+        button.type = "button";
+        button.setAttribute("aria-pressed", "false");
+        button.addEventListener("click", function selectOption() {
+          savePreference(pref, option.value);
+        });
+        controls.push({
+          node: button,
+          pref: pref,
+          value: option.value,
+          selectedClass: "s3-settings__pill--selected",
+        });
+        segments.appendChild(button);
+      });
+
+      row.append(rowLabel, segments);
+      panel.appendChild(row);
+    }
+
+    function addAccentRow() {
+      var row = el("div", "s3-settings__row");
+      var rowLabel = el("span", "s3-settings__label", "Accent");
+      var accents = el("div", "s3-settings__accents");
+
+      accents.setAttribute("role", "group");
+      accents.setAttribute("aria-label", "Accent");
+
+      ACCENTS.forEach(function addAccent(accent) {
+        var button = el("button", "s3-settings__accent");
+        button.type = "button";
+        button.setAttribute("aria-label", accent.label + " accent");
+        button.setAttribute("aria-pressed", "false");
+        button.style.setProperty("--s3-settings-swatch", accent.color);
+        button.addEventListener("click", function selectAccent() {
+          savePreference("accent", accent.key);
+        });
+        controls.push({
+          node: button,
+          pref: "accent",
+          value: accent.key,
+          selectedClass: "s3-settings__accent--selected",
+        });
+        accents.appendChild(button);
+      });
+
+      row.append(rowLabel, accents);
+      panel.appendChild(row);
+    }
+
+    addSegmentedRow("Theme", "theme", [
+      { label: "Light", value: "light" },
+      { label: "Dark", value: "dark" },
+    ]);
+    addAccentRow();
+    addSegmentedRow("Zoom", "zoom", [
+      { label: "90%", value: 0.9 },
+      { label: "100%", value: 1 },
+      { label: "110%", value: 1.1 },
+      { label: "125%", value: 1.25 },
+    ]);
+    addSegmentedRow("Clock", "clockZone", [
+      { label: "UTC", value: "UTC" },
+      { label: "IST", value: "IST" },
+    ]);
+    addSegmentedRow("Motion", "motion", [
+      { label: "On", value: "on" },
+      { label: "Off", value: "off" },
+    ]);
+
+    function positionPanel() {
+      var triggerRect = trigger.getBoundingClientRect();
+      var panelRect = panel.getBoundingClientRect();
+      var viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+      var viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+      var width = panelRect.width || 260;
+      var height = panelRect.height || 210;
+      var maxLeft = Math.max(10, viewportWidth - width - 10);
+      var maxTop = Math.max(10, viewportHeight - height - 10);
+      var left = Math.max(10, Math.min(triggerRect.right + 8, maxLeft));
+      var top = Math.max(10, Math.min(triggerRect.bottom - height, maxTop));
+
+      panel.style.left = Math.round(left) + "px";
+      panel.style.top = Math.round(top) + "px";
+    }
+
+    function setOpen(next, returnFocus) {
+      isOpen = Boolean(next);
+      panel.hidden = !isOpen;
+      trigger.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      if (isOpen) positionPanel();
+      else if (returnFocus) trigger.focus();
+    }
+
+    trigger.addEventListener("click", function togglePanel() {
+      setOpen(!isOpen, false);
+    });
+
+    document.addEventListener("click", function closeOnOutsideClick(event) {
+      if (isOpen && !trigger.contains(event.target) && !panel.contains(event.target)) {
+        setOpen(false, false);
+      }
+    });
+
+    document.addEventListener("keydown", function closeOnEscape(event) {
+      if (isOpen && event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false, true);
+      }
+    });
+
+    window.addEventListener("resize", function repositionOnResize() {
+      if (isOpen) positionPanel();
+    });
+    window.addEventListener(
+      "scroll",
+      function repositionOnScroll() {
+        if (isOpen) positionPanel();
+      },
+      true
+    );
+
+    apply();
+
+    return { trigger: trigger, panel: panel, apply: apply };
+  };
+})(window.QuantParts = window.QuantParts || {});
+
+/* ===== shards/s4-clock.js ===== */
+(function registerClockChip() {
+  "use strict";
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function pad2(value) {
+    return String(value).padStart(2, "0");
+  }
+
+  function clockZone() {
+    if (typeof window.QuantParts.getPrefs !== "function") return "UTC";
+
+    const prefs = window.QuantParts.getPrefs();
+    return prefs && prefs.clockZone === "IST" ? "IST" : "UTC";
+  }
+
+  window.QuantParts = window.QuantParts || {};
+  window.QuantParts.clockChip = function clockChip() {
+    const node = el("span", "s4-clock");
+    const icon = el("span", "ic s4-clock__icon");
+    const time = el("span", "s4-clock__time");
+    const separator = el("span", "s4-clock__separator");
+    const zone = el("span", "s4-clock__zone");
+
+    node.setAttribute("role", "timer");
+    icon.setAttribute("aria-hidden", "true");
+    icon.style.setProperty("--ic", "url(vendor/icons/clock.svg)");
+    separator.setAttribute("aria-hidden", "true");
+    node.append(icon, time, separator, zone);
+
+    function tick() {
+      const now = new Date();
+      const activeZone = clockZone();
+      const offsetMinutes = activeZone === "IST" ? 330 : 0;
+      const zonedTime = new Date(now.getTime() + offsetMinutes * 60 * 1000);
+      const display = [
+        pad2(zonedTime.getUTCHours()),
+        pad2(zonedTime.getUTCMinutes()),
+        pad2(zonedTime.getUTCSeconds()),
+      ].join(":");
+
+      time.textContent = display;
+      zone.textContent = activeZone;
+      node.setAttribute("aria-label", "Current time " + display + " " + activeZone);
+    }
+
+    tick();
+    return { node: node, tick: tick };
+  };
+})();

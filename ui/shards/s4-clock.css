@@ -1,0 +1,45 @@
+.s4-clock {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 9px 0 7px;
+  border: 1px solid color-mix(in srgb, var(--ink) 16%, var(--line));
+  border-radius: 10px;
+  background: transparent;
+  font-family: var(--sans, Inter, sans-serif);
+  font-variant-numeric: lining-nums tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.s4-clock__icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  color: var(--blue-ink);
+}
+
+.s4-clock__time {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+
+.s4-clock__separator {
+  width: 3px;
+  height: 3px;
+  flex: 0 0 3px;
+  margin: 0 6px;
+  border-radius: 50%;
+  background: var(--muted-2);
+}
+
+.s4-clock__zone {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 620;
+  letter-spacing: 0.045em;
+}
