@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+FULL WIRING + STOP NEAR-MISS 2026-08-14 | parallel batch landed (747 tests) | machine wired end to end, held by STOP
+built | all-token ws feed (fail-closed books) | momentum brain -> runner jobs with signal-evidenced decisions.jsonl | continuous basis chain with metadata sizing + health.jsonl | UI health/decisions/failures
+live-first | fresh momentum tick on real data refused honestly on 15s-stale quotes, every refusal reasoned — fail-closed proven before wiring
+wired | host cron now: runner (1m) + supervisor (2m) + momentum chain (3m: stream pass -> decisions -> job records) | all STOP-gated
+NEAR-MISS | the receipts-dir STOP the record claimed was sealing supervisor entry DID NOT EXIST on the host — entry was safe only because no proposal-writer ran there | sealed on discovery, measured, both STOPs verified present
+evidence | complete receipts x3 + momentum signal snapshot + job records committed | tick provenance repinned
+verdict | the autonomous machine is fully wired and fully held | the owner's single activation opens it; caps (<=8, 1x, one position, freeze-on-unknown) bind regardless
+
 THIRD LIVE RECEIPT — MOMENTUM 2026-08-13T23:21Z | EXECUTION_MECHANICS_ONLY | freeze lifts per the recorded order
 signal | the machine's own stream pass caught 1000000MOGUSDT at 119x median volume — the APR-class ignition, found live, not alphabetically
 job | 6a7e511b41eb MOMENTUM_ROUNDTRIP ceiling 8 | capped IOC long open + same-quantity reduce-only close, both terminal | receipt futures-hand-6a7e5160c69e71.json

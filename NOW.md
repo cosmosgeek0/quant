@@ -1,6 +1,11 @@
 # NOW.md — current orders and measured truth (one page, rewritten in place)
 
 ## Orders (owner + commander 2026-08-14: MONEY FIRST, LIVE FIRST)
+- WIRED AND HELD 2026-08-14: stream -> momentum decisions -> job records ->
+  runner, plus the continuous basis chain and supervisor, all on host cron,
+  every entry path sealed by verified STOP files (a missing receipts-dir
+  STOP was discovered and sealed — the near-miss is in LOGS). The owner's
+  single activation opens the machine; runner caps bind regardless.
 - FREEZE LIFTED 2026-08-13T23:21Z: all three live receipts exist (futures
   short, four-leg basis, momentum long on a machine-picked 119x ignition).
   Parallel build resumes; every new money capability gets its tiny live
