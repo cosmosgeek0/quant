@@ -124,9 +124,12 @@ internal. Chats are disposable — anything operational is written to disk
 the same turn it is born, never held only in conversation.
 
 ## Session operations (handoff nuance — things the record didn't say)
-- SEATS as of 2026-08-14: "fresh lane" = operational Lead (this playbook is
-  yours); "UI lane" = owns ui/ ONLY, view-only screens, modifies on the
-  owner's words; "review lane" = owner's read-only chitchat, sends nothing.
+- SEATS as of 2026-08-14 (owner order: GRADUAL takeover): the main Fable
+  lane remains the SOLE operational money/host Lead; "fresh lane" is
+  transition/shadow Lead — read-only audits, no host or money operations,
+  until the owner promotes it; "UI lane" = owns ui/ ONLY, view-only screens,
+  modifies on the owner's words; "review lane" = owner's read-only chitchat.
+  Two simultaneous operational leads around money is the named disaster.
   Never edit another lane's files; drop a rail message instead.
 - BUILD DIR: the active worktree is Desktop/worktrees/basis-w3 (branch
   wave3/basis-strategy); push with `git push origin HEAD:main`, then
