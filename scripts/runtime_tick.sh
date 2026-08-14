@@ -75,6 +75,33 @@ run_stage() {
   return 0
 }
 
+momentum_position_standing() {
+  [ -r "$MOMENTUM_POSITION" ] \
+    && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("state") in {"OPEN", "OPENING", "CLOSING", "EXIT_PENDING", "UNKNOWN"} else 1)' \
+      "$MOMENTUM_POSITION" 2>/dev/null
+}
+
+stream_stage() {
+  python3 "$DEPLOY_DIR/src/market_stream.py" --once \
+    --state-file "$STREAM_STATE" \
+    --log-file "$STREAM_LOG" \
+    --windows-file "$STREAM_WINDOWS" \
+    --feed-state "$FEED_STATE"
+}
+
+momentum_stage() {
+  python3 "$DEPLOY_DIR/src/momentum_live.py" \
+    --tick "$STREAM_STATE" \
+    --state "$MOMENTUM_STATE" \
+    --receipts "$MOMENTUM_RECEIPTS" \
+    --decisions "$DECISIONS" \
+    --jobs-dir "$JOBS_DIR" \
+    --position "$MOMENTUM_POSITION" \
+    --results "$JOB_RESULTS" \
+    --max-freshness-ms 90000 \
+    "$@"
+}
+
 read_feed_pid() {
   local pid
   [ -r "$FEED_PID_FILE" ] || return 1
@@ -170,18 +197,15 @@ supervisor_stage() {
   python3 "$DEPLOY_DIR/src/basis_supervisor.py" --tick
 }
 
-# STOP pauses fresh decisions, but the supervisor must still reconcile and
-# close standing exposure. STOP-JOBS independently prevents job publication.
+# STOP pauses fresh decisions, but standing momentum exposure still receives
+# stream updates and manage-only HOLD/EXIT decisions. STOP-JOBS independently
+# prevents entry publication while preserving the same position management.
 if [ ! -e "$STOP_FILE" ]; then
   run_stage feed "0" \
     feed_stage
 
   run_stage stream "0" \
-    python3 "$DEPLOY_DIR/src/market_stream.py" --once \
-      --state-file "$STREAM_STATE" \
-      --log-file "$STREAM_LOG" \
-      --windows-file "$STREAM_WINDOWS" \
-      --feed-state "$FEED_STATE"
+    stream_stage
 
   run_stage basis_watch "0" \
     python3 "$DEPLOY_DIR/src/basis_watch.py" --once \
@@ -191,18 +215,19 @@ if [ ! -e "$STOP_FILE" ]; then
 
   if [ ! -e "$STOP_JOBS_FILE" ]; then
     run_stage momentum_live "0" \
-      python3 "$DEPLOY_DIR/src/momentum_live.py" \
-        --tick "$STREAM_STATE" \
-        --state "$MOMENTUM_STATE" \
-        --receipts "$MOMENTUM_RECEIPTS" \
-        --decisions "$DECISIONS" \
-        --jobs-dir "$JOBS_DIR" \
-        --position "$MOMENTUM_POSITION" \
-        --results "$JOB_RESULTS" \
-        --max-freshness-ms 90000
+      momentum_stage
+  elif momentum_position_standing; then
+    run_stage momentum_live "0" \
+      momentum_stage --manage-only
   else
     echo "RUNTIME | momentum_live skipped | STOP-JOBS present"
   fi
+elif momentum_position_standing; then
+  run_stage stream "0" \
+    stream_stage
+
+  run_stage momentum_live "0" \
+    momentum_stage --manage-only
 else
   echo "RUNTIME | fresh stages skipped | STOP present"
 fi

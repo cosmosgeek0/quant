@@ -66,6 +66,28 @@ print_flag() {
   fi
 }
 
+momentum_position_standing() {
+  [ -r "$MOMENTUM_POSITION" ] \
+    && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("state") in {"OPEN", "OPENING", "CLOSING", "EXIT_PENDING", "UNKNOWN"} else 1)' \
+      "$MOMENTUM_POSITION" 2>/dev/null
+}
+
+print_manage_status() {
+  local standing=no
+  local mode=normal
+  if momentum_position_standing; then
+    standing=yes
+  fi
+  if [ -e "$STOP_FILE" ] || [ -e "$STOP_JOBS_FILE" ]; then
+    if [ "$standing" = yes ]; then
+      mode=manage-only
+    else
+      mode=skipped
+    fi
+  fi
+  printf 'MANAGE | standing=%s | mode=%s\n' "$standing" "$mode"
+}
+
 print_tail() {
   local label=$1
   local path=$2
@@ -150,6 +172,7 @@ print_status() {
   print_cron
   print_flag STOP "$STOP_FILE"
   print_flag STOP-JOBS "$STOP_JOBS_FILE"
+  print_manage_status
   print_feed_status
   print_tail HEALTH "$HEALTH"
   print_tail RESULT "$JOB_RESULTS"
