@@ -145,7 +145,15 @@ class ServerHarness(unittest.TestCase):
             "momentum_decisions": missing_root / "momentum-decisions.jsonl",
             "job_results": missing_root / "jobs" / "results.jsonl",
             "job_receipts_dir": missing_root / "jobs" / "receipts",
+            "governor_dir": missing_root,
+            "governor_lock": missing_root / "account-governor.lock",
+            "manifest": missing_root / "pull_manifest.json",
         }
+
+    @staticmethod
+    def utc_text(moment):
+        return moment.astimezone(timezone.utc).isoformat(
+            timespec="milliseconds").replace("+00:00", "Z")
 
 
 class TestStaticServing(ServerHarness):
@@ -773,6 +781,93 @@ class TestFailuresEndpoint(ServerHarness):
         self.assertFalse(missing.exists())
 
 
+class TestStripEndpoint(ServerHarness):
+
+    def test_no_pull_claims_nothing(self):
+        root = self.tempdir()
+        base = self.start(self.empty_sources(root / "missing"))
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["machine"], "NO-DATA")
+        self.assertEqual(payload["market_pass"]["state"], "no-data")
+        self.assertFalse(payload["pull"]["present"])
+        self.assertEqual(payload["pull"]["level"], "absent")
+        self.assertFalse(payload["governor"]["present"])
+        self.assertIsNone(payload["supervisor"])
+
+    def test_paused_with_fresh_pull_shows_sealed_never_blank(self):
+        root = self.tempdir()
+        sources = self.empty_sources(root / "missing")
+        live = root / "live"
+        live.mkdir()
+        sources["manifest"] = live / "pull_manifest.json"
+        sources["stop"] = live / "STOP"
+        sources["stop_jobs"] = live / "STOP-JOBS"
+        now = datetime.now(timezone.utc)
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(now), "ok": True, "files": 3}))
+        sources["stop"].touch()
+        base = self.start(sources)
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["machine"], "PAUSED")
+        self.assertTrue(payload["stop_present"])
+        self.assertIn("sealed", payload["paused_note"])
+        self.assertEqual(payload["market_pass"]["state"], "sealed")
+        self.assertEqual(payload["pull"]["level"], "green")
+
+    def test_armed_counts_governor_ledger(self):
+        root = self.tempdir()
+        sources = self.empty_sources(root / "missing")
+        live = root / "live"
+        live.mkdir()
+        now = datetime.now(timezone.utc)
+        sources["manifest"] = live / "pull_manifest.json"
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(now), "ok": True}))
+        sources["stop"] = live / "STOP"
+        sources["stop_jobs"] = live / "STOP-JOBS"
+        sources["governor_dir"] = live
+        sources["governor_lock"] = live / "account-governor.lock"
+        ledger = live / ("account-governor-%s.jsonl"
+                         % now.date().isoformat())
+        rows = [
+            {"kind": "entry", "utc_day": now.date().isoformat()},
+            {"kind": "entry", "utc_day": now.date().isoformat()},
+            {"kind": "realized", "net_usdt": "-0.10", "fees_usdt": "0.02"},
+            {"kind": "realized", "net_usdt": "0.30", "fees_usdt": "0.01"},
+        ]
+        ledger.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows))
+        base = self.start(sources)
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["machine"], "ARMED")
+        governor = payload["governor"]
+        self.assertTrue(governor["present"])
+        self.assertEqual(governor["entries_used"], 2)
+        self.assertEqual(governor["entries_cap"], 5)
+        self.assertEqual(governor["loss_fees_used_usdt"], "0.13")
+        self.assertEqual(governor["loss_fees_remaining_usdt"], "0.87")
+        self.assertFalse(governor["entry_lock_present"])
+
+    def test_stale_or_failed_pull_goes_red(self):
+        root = self.tempdir()
+        sources = self.empty_sources(root / "missing")
+        live = root / "live"
+        live.mkdir()
+        stale = datetime.now(timezone.utc) - timedelta(minutes=10)
+        sources["manifest"] = live / "pull_manifest.json"
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(stale), "ok": True}))
+        base = self.start(sources)
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["pull"]["level"], "red")
+        sources["manifest"].write_text(json.dumps(
+            {"utc": self.utc_text(datetime.now(timezone.utc)),
+             "ok": False, "error": "ssm session refused"}))
+        payload = self.get_json(base, "/api/strip")
+        self.assertEqual(payload["pull"]["level"], "red")
+        self.assertEqual(payload["pull"]["error"], "ssm session refused")
+
+
 class TestReadOnlyGuarantees(ServerHarness):
 
     def test_mutating_methods_all_answer_405_on_runtime_routes(self):
@@ -793,10 +888,11 @@ class TestReadOnlyGuarantees(ServerHarness):
         self.assertEqual(payload["bind"], "127.0.0.1")
         self.assertEqual(payload["methods"], ["GET", "HEAD"])
         self.assertEqual(sorted(payload["sources"]), [
-            "basis_position", "basis_receipts_dir", "events", "fees", "health",
-            "job_receipts_dir", "job_results", "jobs_log",
-            "momentum_decisions", "momentum_receipts", "momentum_state",
-            "proposals_dir", "stop", "stop_jobs", "stream_log", "stream_state",
+            "basis_position", "basis_receipts_dir", "events", "fees",
+            "governor_dir", "governor_lock", "health", "job_receipts_dir",
+            "job_results", "jobs_log", "manifest", "momentum_decisions",
+            "momentum_receipts", "momentum_state", "proposals_dir", "stop",
+            "stop_jobs", "stream_log", "stream_state",
         ])
 
     def test_head_matches_status_and_has_empty_body(self):
@@ -886,58 +982,54 @@ class TestHostCheck(unittest.TestCase):
 
 class TestDefaultSources(unittest.TestCase):
 
-    def test_defaults_use_shared_runtime_path_contract(self):
-        self.assertEqual(serve.resolve_runtime_paths.__module__,
-                         "src.runtime_paths")
+    def test_defaults_read_only_the_pulled_live_mirror(self):
+        # Owner-endorsed correction 2026-08-14: the UI never reads the
+        # writer's runtime paths or the host; it reads only the ui/live/
+        # mirror that the seated Lead's pull script maintains.
         old = os.environ.get("RECEIPT_DIR")
         old_jobs_log = os.environ.get("JOBS_LOG")
         try:
             os.environ["RECEIPT_DIR"] = "/tmp-example/quant-receipts"
             os.environ.pop("JOBS_LOG", None)
             sources = serve.default_sources()
-            receipt_dir = Path("/tmp-example/quant-receipts")
-            runtime = serve.resolve_runtime_paths()
-            self.assertEqual(sources["stream_state"], runtime.stream_state)
-            self.assertEqual(sources["stream_log"], runtime.stream_log)
-            self.assertEqual(sources["proposals_dir"], runtime.proposals_dir)
-            self.assertEqual(sources["momentum_state"],
-                             runtime.momentum_position)
-            self.assertEqual(sources["momentum_receipts"],
-                             runtime.momentum_receipts)
-            self.assertEqual(sources["health"], runtime.health)
-            self.assertEqual(sources["momentum_decisions"],
-                             runtime.decisions)
-            self.assertEqual(sources["job_results"], runtime.job_results)
+            live = UI_DIR / "live"
             self.assertEqual(sources["stream_state"],
-                             receipt_dir / "stream_state.json")
+                             live / "stream_state.json")
             self.assertEqual(sources["stream_log"],
-                             receipt_dir / "stream_log.jsonl")
-            self.assertEqual(sources["proposals_dir"],
-                             receipt_dir / "proposals")
+                             live / "stream_log.jsonl")
+            self.assertEqual(sources["proposals_dir"], live / "proposals")
             self.assertEqual(sources["basis_position"],
-                             receipt_dir / "basis-position.json")
-            self.assertEqual(sources["basis_receipts_dir"], receipt_dir)
+                             live / "basis-position.json")
+            self.assertEqual(sources["basis_receipts_dir"], live)
             self.assertEqual(sources["fees"],
-                             receipt_dir / "commission-rates.json")
+                             live / "commission-rates.json")
             self.assertEqual(sources["momentum_state"],
-                             receipt_dir / "momentum-position.json")
+                             live / "momentum-position.json")
             self.assertEqual(sources["momentum_receipts"],
-                             receipt_dir / "momentum-paper-receipts.jsonl")
-            self.assertEqual(sources["health"],
-                             receipt_dir / "health.jsonl")
-            self.assertEqual(sources["jobs_log"],
-                             UI_DIR.parent / "jobs.log")
-            self.assertEqual(sources["stop"], receipt_dir / "STOP")
-            self.assertEqual(sources["stop_jobs"],
-                             receipt_dir / "STOP-JOBS")
+                             live / "momentum-paper-receipts.jsonl")
+            self.assertEqual(sources["health"], live / "health.jsonl")
+            self.assertEqual(sources["jobs_log"], live / "jobs.log")
+            self.assertEqual(sources["stop"], live / "STOP")
+            self.assertEqual(sources["stop_jobs"], live / "STOP-JOBS")
             self.assertEqual(sources["momentum_decisions"],
-                             receipt_dir / "decisions.jsonl")
+                             live / "decisions.jsonl")
             self.assertEqual(sources["job_results"],
-                             receipt_dir / "jobs" / "results.jsonl")
+                             live / "jobs" / "results.jsonl")
             self.assertEqual(sources["job_receipts_dir"],
-                             receipt_dir / "jobs" / "receipts")
+                             live / "jobs" / "receipts")
+            self.assertEqual(sources["governor_dir"], live)
+            self.assertEqual(sources["governor_lock"],
+                             live / "account-governor.lock")
+            self.assertEqual(sources["manifest"],
+                             live / "pull_manifest.json")
             self.assertEqual(sources["events"],
                              UI_DIR / "fixtures" / "events.jsonl")
+            for name, path in sources.items():
+                if name == "events":
+                    continue
+                self.assertTrue(
+                    str(path).startswith(str(live)),
+                    "%s escapes ui/live/: %s" % (name, path))
         finally:
             if old is None:
                 os.environ.pop("RECEIPT_DIR", None)

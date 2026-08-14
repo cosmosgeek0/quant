@@ -35,6 +35,7 @@ from urllib.parse import unquote, urlsplit
 
 UI_DIR = Path(__file__).resolve().parent
 ROOT_DIR = UI_DIR.parent
+LIVE_DIR = UI_DIR / "live"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 try:
@@ -105,6 +106,13 @@ HEALTH_AMBER_AFTER_SECONDS = 90
 HEALTH_RED_AFTER_SECONDS = 300
 JOB_AMBER_AFTER_SECONDS = 90
 JOB_RED_AFTER_SECONDS = 180
+# The Lead's pull cycle is ~30s over SSM; older than these means it is dying.
+STRIP_PULL_AMBER_AFTER_SECONDS = 45
+STRIP_PULL_RED_AFTER_SECONDS = 120
+# Display mirrors of the account-governor defaults; the ledger is the truth.
+GOVERNOR_ENTRIES_CAP = 5
+GOVERNOR_LOSS_FEES_CAP = Decimal("1.00")
+GOVERNOR_LEDGER_PREFIX = "account-governor-"
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 UTC_IN_TEXT_RE = re.compile(
@@ -136,27 +144,34 @@ CONTENT_TYPES = {
 
 
 def default_sources():
-    """Resolve the canonical writer paths at call time."""
-    runtime = resolve_runtime_paths()
-    receipt_dir = runtime.receipt_dir
+    """Resolve source paths inside the pulled host mirror at ui/live/.
+
+    The UI seat never reads the host or the writer's runtime paths directly;
+    the seated Lead's pull script mirrors the host receipt dir into ui/live/
+    (~30s cycle, atomic per-file, manifest written last). Absent files render
+    as honest empties until the first pull lands.
+    """
     return {
         "events": UI_DIR / "fixtures" / "events.jsonl",
-        "stream_state": runtime.stream_state,
-        "stream_log": runtime.stream_log,
-        "proposals_dir": runtime.proposals_dir,
-        "basis_position": receipt_dir / "basis-position.json",
-        "basis_receipts_dir": receipt_dir,
-        "fees": receipt_dir / "commission-rates.json",
-        "momentum_state": runtime.momentum_position,
-        "momentum_receipts": runtime.momentum_receipts,
-        "health": runtime.health,
+        "stream_state": LIVE_DIR / "stream_state.json",
+        "stream_log": LIVE_DIR / "stream_log.jsonl",
+        "proposals_dir": LIVE_DIR / "proposals",
+        "basis_position": LIVE_DIR / "basis-position.json",
+        "basis_receipts_dir": LIVE_DIR,
+        "fees": LIVE_DIR / "commission-rates.json",
+        "momentum_state": LIVE_DIR / "momentum-position.json",
+        "momentum_receipts": LIVE_DIR / "momentum-paper-receipts.jsonl",
+        "health": LIVE_DIR / "health.jsonl",
         "jobs_log": Path(os.path.expanduser(os.environ.get(
-            "JOBS_LOG", str(ROOT_DIR / "jobs.log")))),
-        "stop": runtime.stop,
-        "stop_jobs": runtime.stop_jobs,
-        "momentum_decisions": runtime.decisions,
-        "job_results": runtime.job_results,
-        "job_receipts_dir": runtime.jobs_dir / "receipts",
+            "JOBS_LOG", str(LIVE_DIR / "jobs.log")))),
+        "stop": LIVE_DIR / "STOP",
+        "stop_jobs": LIVE_DIR / "STOP-JOBS",
+        "momentum_decisions": LIVE_DIR / "decisions.jsonl",
+        "job_results": LIVE_DIR / "jobs" / "results.jsonl",
+        "job_receipts_dir": LIVE_DIR / "jobs" / "receipts",
+        "governor_dir": LIVE_DIR,
+        "governor_lock": LIVE_DIR / "account-governor.lock",
+        "manifest": LIVE_DIR / "pull_manifest.json",
     }
 
 
@@ -1113,7 +1128,160 @@ def api_failures(sources):
     }
 
 
+def _strip_pull_facts(sources, now):
+    """Distill pull freshness from the mirror manifest, fail-closed."""
+    path = Path(sources.get("manifest", LIVE_DIR / "pull_manifest.json"))
+    present, manifest, parse_errors = _read_json(path)
+    utc = ok = error = cycle_ms = None
+    if present and isinstance(manifest, dict):
+        if isinstance(manifest.get("utc"), str):
+            utc = manifest["utc"]
+        if isinstance(manifest.get("ok"), bool):
+            ok = manifest["ok"]
+        if isinstance(manifest.get("error"), str):
+            error = manifest["error"]
+        if isinstance(manifest.get("cycle_ms"), (int, float)):
+            cycle_ms = manifest["cycle_ms"]
+    elif present:
+        parse_errors += 1
+    age = _age_seconds(utc, now)
+    if not present:
+        level = "absent"
+    elif ok is False or (present and manifest is None):
+        level = "red"
+    elif age is None:
+        level = "amber"
+    elif age > STRIP_PULL_RED_AFTER_SECONDS:
+        level = "red"
+    elif age > STRIP_PULL_AMBER_AFTER_SECONDS:
+        level = "amber"
+    else:
+        level = "green"
+    return {
+        "source": str(path),
+        "present": present,
+        "ok": ok,
+        "utc": utc,
+        "age_seconds": age,
+        "cycle_ms": cycle_ms,
+        "error": error,
+        "level": level,
+        "parse_errors": parse_errors,
+    }
+
+
+def _strip_governor_facts(sources, now):
+    """Read today's governor day ledger; the ledger rows are the only truth."""
+    day = now.date().isoformat()
+    ledger_dir = Path(sources.get("governor_dir", LIVE_DIR))
+    path = ledger_dir / (GOVERNOR_LEDGER_PREFIX + day + ".jsonl")
+    present, rows, parse_errors = _read_jsonl(path)
+    entries_used = 0
+    loss_fees_used = Decimal("0")
+    for row in rows:
+        if not isinstance(row, dict):
+            parse_errors += 1
+            continue
+        kind = row.get("kind")
+        if kind == "entry":
+            entries_used += 1
+        elif kind == "realized":
+            try:
+                net = Decimal(str(row.get("net_usdt", "0")))
+                fees = Decimal(str(row.get("fees_usdt", "0")))
+            except (InvalidOperation, ValueError):
+                parse_errors += 1
+                continue
+            loss_fees_used += fees
+            if net < 0:
+                loss_fees_used += -net
+    lock_path = Path(sources.get(
+        "governor_lock", LIVE_DIR / "account-governor.lock"))
+    lock_present = lock_path.is_file()
+    remaining = GOVERNOR_LOSS_FEES_CAP - loss_fees_used
+    return {
+        "source": str(path),
+        "present": present,
+        "utc_day": day,
+        "entries_used": entries_used,
+        "entries_cap": GOVERNOR_ENTRIES_CAP,
+        "loss_fees_used_usdt": format(loss_fees_used, "f"),
+        "loss_fees_cap_usdt": format(GOVERNOR_LOSS_FEES_CAP, "f"),
+        "loss_fees_remaining_usdt": format(remaining, "f"),
+        "caps_basis": "display mirror of governor defaults",
+        "entry_lock_present": lock_present,
+        "parse_errors": parse_errors,
+    }
+
+
+def api_strip(sources, now=None):
+    """One-glance machine state distilled from the pulled mirror only."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    pull = _strip_pull_facts(sources, now)
+    stop_present = Path(sources["stop"]).is_file()
+    stop_jobs_present = Path(sources["stop_jobs"]).is_file()
+    # Mirrored flag absence is meaningless before the first completed pull:
+    # claiming ARMED off an empty mirror would be a fabricated state.
+    if not pull["present"]:
+        machine = "NO-DATA"
+    elif stop_present:
+        machine = "PAUSED"
+    else:
+        machine = "ENTRY-SEALED" if stop_jobs_present else "ARMED"
+
+    state_path = Path(sources["stream_state"])
+    state_present, state, _ = _read_json(state_path)
+    market_as_of = _record_as_of(state) if state_present else None
+    if market_as_of is None and state_present:
+        market_as_of = _path_as_of(state_path)
+    market_age = _age_seconds(market_as_of, now)
+    # While the machine is paused the feed is sealed by design: that is a
+    # state to display, never a blank. Before the first pull, no claim.
+    if state_present:
+        market_state = "live"
+    elif machine == "PAUSED":
+        market_state = "sealed"
+    elif machine == "NO-DATA":
+        market_state = "no-data"
+    else:
+        market_state = "absent"
+
+    health = api_health(sources, now=now)
+    supervisor = None
+    for service in health.get("services", []):
+        if service.get("service") == "basis_supervisor":
+            supervisor = {
+                "level": service.get("level"),
+                "reported_status": service.get("reported_status"),
+                "last_seen_utc": service.get("last_seen_utc"),
+                "age_seconds": service.get("last_seen_age_seconds"),
+            }
+            break
+
+    return {
+        "ok": True,
+        "read_only": True,
+        "as_of": now.isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"),
+        "machine": machine,
+        "stop_present": stop_present,
+        "stop_jobs_present": stop_jobs_present,
+        "paused_note": (
+            "machine paused — positions and P&L stay empty; market passes "
+            "may be sealed too" if machine == "PAUSED" else None),
+        "market_pass": {
+            "state": market_state,
+            "as_of": market_as_of,
+            "age_seconds": market_age,
+        },
+        "supervisor": supervisor,
+        "governor": _strip_governor_facts(sources, now),
+        "pull": pull,
+    }
+
+
 API_ROUTES = {
+    "/api/strip": api_strip,
     "/api/health": api_health,
     "/api/decisions": api_decisions,
     "/api/failures": api_failures,

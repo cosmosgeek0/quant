@@ -17,6 +17,18 @@
 .health-amber .health-state { color: #8a5900; }
 .health-red .health-state, .failure-reason { color: #9f1c13; }
 .failure-reason { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .82rem; }
+#status-strip { margin: .8rem 0 1.1rem; }
+.strip-row { display: flex; flex-wrap: wrap; gap: .55rem; }
+.strip-card { flex: 1 1 10rem; min-width: 10rem; padding: .6rem .75rem; border: 1px solid #e3e3dc; border-top-width: .3rem; background: #fdfdfa; }
+.strip-card p { margin: 0; }
+.strip-label { font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; color: #6b6b62; }
+.strip-value { font: 600 1.05rem/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.strip-green { border-top-color: #26843b; }
+.strip-amber { border-top-color: #b87600; }
+.strip-red { border-top-color: #b42318; }
+.strip-gray { border-top-color: #9a9a90; }
+.strip-note { margin-top: .45rem; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -25,6 +37,11 @@
   <p class="sub">read-only &middot; local runtime files &middot; automatic refresh every 2 seconds</p>
   <button id="refresh-runtime" type="button">refresh runtime files</button>
 </header>
+
+<section id="status-strip" aria-labelledby="strip-h">
+  <h2 id="strip-h" class="visually-hidden">Machine status strip</h2>
+  <div id="strip"><p class="meta">loading /api/strip&hellip;</p></div>
+</section>
 
 <section id="system-health" aria-labelledby="health-h">
   <h2 id="health-h">System health &mdash; service ticks and stop flags</h2>

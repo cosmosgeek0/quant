@@ -1,0 +1,40 @@
+CLONED 475bd5759ef4cd81258c7da64ed6fdb1d459ea21
+PAGE
+1. Dashboard — executive account and runtime overview | single bordered canvas, six metrics, area chart, status rail, dense runtime table | what is worth taking: LAYOUT / DENSITY / CHART-STYLE
+2. Markets — multi-view market universe data screen | crisp white panel, four-stat band, pill tabs, sparklines, wide sortable table | what is worth taking: LAYOUT / DENSITY / CHART-STYLE
+3. Token Detail — deep single-asset market intelligence workspace | four-metric header, large price chart, paired flow cards, dense evidence bands | what is worth taking: LAYOUT / CHART-STYLE / DENSITY
+4. Volume Scanner — ranked volume anomaly decision workspace | compact toolbar, four metrics, pill filters, expandable eight-column decision rows | what is worth taking: DENSITY / INTERACTION-PATTERN / LAYOUT
+5. Basis Scanner — executable basis comparison decision workspace | ultra-wide nine-column table, green edge figures, expandable evidence drawers, restrained chrome | what is worth taking: DENSITY / LAYOUT / INTERACTION-PATTERN
+6. Opportunities — cross-strategy proposal economics comparison screen | four-stat summary, segmented views, wide evidence table, muted neutral panels | what is worth taking: LAYOUT / DENSITY
+7. Risk — operator risk posture and limits screen | status-led header, limit meters, validation tables, amber and red control accents | what is worth taking: COLORS / LAYOUT / INTERACTION-PATTERN
+8. Account — read-only multi-tab capital accounts workspace | four-value summary, blue pill tabs, wallet rows, tabular account facts | what is worth taking: LAYOUT / DENSITY / INTERACTION-PATTERN
+9. Borrow — liability inventory and preflight workspace | four-stat band, guarded action badge, wide asset tables, amber warning states | what is worth taking: LAYOUT / COLORS / DENSITY
+10. Fills — durable execution tape and inspector | three-stat strip, compact filters, dense numeric table, right-side selected-fill details | what is worth taking: LAYOUT / DENSITY / INTERACTION-PATTERN
+11. PnL — realized performance and cost attribution screen | summary strip, segmented lenses, green-red area chart, paired attribution tables | what is worth taking: CHART-STYLE / LAYOUT / COLORS
+12. Health — machine readiness and recovery workspace | four-state summary, thin status bands, recovery panel, component health table | what is worth taking: LAYOUT / COLORS / DENSITY
+13. Watchdog — incident-oriented machine evidence control screen | cardless six-section ledger, aligned figures, hairlines, mono provenance, one shaded control zone | what is worth taking: LAYOUT / DENSITY / COLORS
+14. Research Lab — preserved experiment evidence exploration workspace | spacious masthead, outcome map, family catalog, analytical tabs, polished modal layers | what is worth taking: LAYOUT / INTERACTION-PATTERN / DENSITY
+15. Economic Calendar — weekly macro event intelligence tape | seven day cards, impact bars, sticky columns, dense actual-forecast-prior rows | what is worth taking: LAYOUT / DENSITY / INTERACTION-PATTERN
+16. News — filtered seven-day headline intelligence screen | owner freshness chips, day cards, colored impact tabs, dense headline tape | what is worth taking: LAYOUT / COLORS / DENSITY
+17. Notifications — curated incident inbox and routing screen | command summary, eight-day rail, severity rows, connector grids, red-green states | what is worth taking: LAYOUT / DENSITY / COLORS
+18. Logs — searchable seven-day event ledger screen | day count cards, severity pills, narrow columns, expandable dense event rows | what is worth taking: DENSITY / LAYOUT / INTERACTION-PATTERN
+19. System Dashboard — tabbed whole-machine operations evidence overview | left vertical rail, five-metric strip, compact bands, status rows, node graph | what is worth taking: LAYOUT / DENSITY / INTERACTION-PATTERN
+20. Product Control Room — supervisory inventory and controls screen | stacked evidence bands, monospace badges, dense two-column registries, amber-red barriers | what is worth taking: DENSITY / COLORS / LAYOUT
+COMPONENT
+21. Topbar Command Suite — global operations and preference command rail | slim icon row, multicolor identity marks, clock pill, morphing dropdown sheets | what is worth taking: INTERACTION-PATTERN / COLORS / DENSITY
+22. Sidebar Navigation — grouped primary application navigation rail | narrow left column, quiet labels, blue active glyph tiles, compact groups | what is worth taking: LAYOUT / DENSITY / COLORS
+23. Account Cockpit Rail — shared account truth status tape | twelve facts in hairline grid, neutral values, colored exceptions, horizontal narrow reflow | what is worth taking: DENSITY / LAYOUT / COLORS
+24. Research Family Catalog — sortable preserved-family experiment evidence table | roomy 76-pixel rows, muted headers, verdict colors, numbered comparison checkboxes | what is worth taking: DENSITY / INTERACTION-PATTERN / LAYOUT
+25. Research Evidence Analytics — tabbed verdict, gate, and timing lenses | three-tab header, stacked bars, ranked tracks, compact tables, source drawers | what is worth taking: CHART-STYLE / LAYOUT / DENSITY
+26. Research Detail Sheet — experiment audit and custody side-sheet inspector | 640-pixel overlay, sticky header, labeled fact rows, mono custody values | what is worth taking: INTERACTION-PATTERN / LAYOUT / DENSITY
+27. Research Comparison Modal — two-family preserved evidence comparison workspace | large centered overlay, three-column alignment, fixed headers, paired evidence rows | what is worth taking: LAYOUT / INTERACTION-PATTERN / DENSITY
+28. Artifact Workbench — preserved artifact browsing and reading panel | 276-pixel file rail, tall document pane, view tabs, mono raw content | what is worth taking: LAYOUT / DENSITY / INTERACTION-PATTERN
+29. Watchdog Owner Ledger — expandable owner census evidence table | flat aligned rows, sticky headings, status chips, expandable provenance details | what is worth taking: DENSITY / LAYOUT / INTERACTION-PATTERN
+30. Connection Path Chain — upstream-to-downstream machine custody path visualization | horizontal hop chain, compact nodes, clear break markers, focused owner highlighting | what is worth taking: LAYOUT / COLORS / INTERACTION-PATTERN
+31. Performance Chart Suite — account equity and realized-return charts | TradingView-like line areas, dashed zero, daily bars, right-axis labels, end chips | what is worth taking: CHART-STYLE / COLORS / DENSITY
+STYLE
+32. Dual Theme Palette — light and dark control-room color system | white or charcoal surfaces, blue accents, restrained green-red semantics, minimal dark shadows | what is worth taking: COLORS
+33. Status Color Grammar — operational state color emphasis hierarchy | neutral default ink, amber uncertainty, red failure, green reserved for positive state | what is worth taking: COLORS
+34. Continuous Frame Geometry — shared dense page composition language | twelve-pixel outer radius, 57-pixel toolbars, 102-pixel summaries, hairline-separated sections | what is worth taking: LAYOUT / DENSITY
+35. Responsive Density System — container-driven adaptive desktop-to-mobile reflow language | grids collapse, tabs scroll, tables preserve width, overlays become full-screen | what is worth taking: LAYOUT / DENSITY / INTERACTION-PATTERN
+END — 35 items, looks only, zero code imported.

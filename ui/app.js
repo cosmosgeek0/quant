@@ -14,6 +14,7 @@ var EVENTS_URL = "/api/events";
 var HEALTH_URL = "/api/health";
 var DECISIONS_URL = "/api/decisions";
 var FAILURES_URL = "/api/failures";
+var STRIP_URL = "/api/strip";
 var REFRESH_MS = 2000;
 
 function valueText(value) {
@@ -488,11 +489,25 @@ if (typeof document !== "undefined") {
       return;
     }
     groupRuns(payload.events).forEach(function (run) {
-      var box = el("div", "run");
+      var verdict = null;
+      run.events.forEach(function (event) {
+        if (event.kind === "run_verdict" && event.verdict) {
+          verdict = event.verdict;
+        }
+      });
+      var verdictClass = verdict === "CLOSED" ? "verdict-good" :
+        (verdict === "REJECTED_BEFORE_BUY" ? "verdict-warn" :
+          (verdict ? "verdict-bad" : "verdict-none"));
+      var box = el("div", "run run-card " + verdictClass);
       var heading = el("p", "run-head");
-      heading.appendChild(el("span", null, "run " + run.run_id));
+      if (verdict) {
+        heading.appendChild(
+          el("span", "verdict-badge " + verdictClass, verdict));
+      }
+      heading.appendChild(el("span", "run-symbol",
+        run.symbol || "(no symbol)"));
       heading.appendChild(el("span", "muted",
-        " · " + (run.symbol || "") + " · sha8 " + (run.sha8 || "")));
+        " · run " + run.run_id + " · sha8 " + (run.sha8 || "")));
       box.appendChild(heading);
       var result = table(["ts (UTC)", "kind", "detail"]);
       run.events.forEach(function (event) {
@@ -508,7 +523,93 @@ if (typeof document !== "undefined") {
     });
   }
 
+  function stripCard(label, value, level, detail) {
+    var safe = ["green", "amber", "red", "gray"].indexOf(level) >= 0 ?
+      level : "gray";
+    var card = el("div", "strip-card strip-" + safe);
+    card.appendChild(el("p", "strip-label", label));
+    card.appendChild(el("p", "strip-value", value));
+    if (detail) card.appendChild(el("p", "meta", detail));
+    return card;
+  }
+
+  function renderStrip(payload) {
+    var root = clearTo("strip");
+    var row = el("div", "strip-row");
+
+    var machineLevel = payload.machine === "ARMED" ? "green" :
+      (payload.machine === "ENTRY-SEALED" ? "amber" : "gray");
+    row.appendChild(stripCard("machine", valueText(payload.machine),
+      machineLevel,
+      payload.machine === "NO-DATA" ?
+        "no pull yet — flag states unknown, nothing claimed" :
+        "STOP " + (payload.stop_present ? "present" : "clear") +
+        " · STOP-JOBS " + (payload.stop_jobs_present ? "present" : "clear")));
+
+    var market = payload.market_pass || {};
+    var marketLevel = market.state === "live" ? "green" :
+      (market.state === "sealed" || market.state === "no-data" ?
+        "gray" : "amber");
+    row.appendChild(stripCard("market pass",
+      valueText(market.state || "absent"), marketLevel,
+      market.state === "sealed" ? "sealed while paused — not blank" :
+        (market.state === "no-data" ? "waiting for first pull" :
+          ageText(market.age_seconds))));
+
+    var sup = payload.supervisor;
+    if (sup) {
+      row.appendChild(stripCard("supervisor",
+        valueText(sup.reported_status || sup.level), sup.level,
+        ageText(sup.age_seconds)));
+    } else {
+      row.appendChild(stripCard("supervisor", "no tick yet", "gray",
+        "no basis_supervisor row in pulled health"));
+    }
+
+    var gov = payload.governor || {};
+    if (gov.present) {
+      var entriesLevel = gov.entries_used >= gov.entries_cap ?
+        "red" : (gov.entries_used > 0 ? "amber" : "green");
+      row.appendChild(stripCard("entries today",
+        gov.entries_used + " of " + gov.entries_cap, entriesLevel,
+        gov.entry_lock_present ? "entry lock PRESENT — attempt in progress"
+          : "entry lock clear"));
+      var used = parseFloat(gov.loss_fees_used_usdt);
+      var cap = parseFloat(gov.loss_fees_cap_usdt);
+      var budgetLevel = used >= cap ? "red" :
+        (used >= cap / 2 ? "amber" : "green");
+      row.appendChild(stripCard("loss+fees budget",
+        gov.loss_fees_used_usdt + " of " + gov.loss_fees_cap_usdt +
+        " USDT", budgetLevel,
+        gov.loss_fees_remaining_usdt + " remaining · " +
+        valueText(gov.utc_day)));
+    } else {
+      row.appendChild(stripCard("entries today", "no ledger yet", "gray",
+        "governor day ledger absent from pull"));
+    }
+
+    var pull = payload.pull || {};
+    var pullLevel = pull.level === "absent" ? "gray" : pull.level;
+    var pullDetail;
+    if (!pull.present) {
+      pullDetail = "no pull manifest yet — live sections stay empty";
+    } else if (pull.ok === false) {
+      pullDetail = "pull FAILED: " + valueText(pull.error || "no error text");
+    } else {
+      pullDetail = "pulled " + ageText(pull.age_seconds);
+    }
+    row.appendChild(stripCard("data age",
+      pull.present ? ageText(pull.age_seconds) : "no pull yet",
+      pullLevel, pullDetail));
+
+    root.appendChild(row);
+    if (payload.paused_note) {
+      root.appendChild(el("p", "meta strip-note", payload.paused_note));
+    }
+  }
+
   function refreshRuntime() {
+    getJson(STRIP_URL, renderStrip, "strip");
     getJson(HEALTH_URL, renderHealth, "health");
     getJson(DECISIONS_URL, renderDecisions, "decisions");
     getJson(FAILURES_URL, renderFailures, "failures");

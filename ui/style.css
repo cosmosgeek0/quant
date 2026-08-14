@@ -104,4 +104,32 @@ td {
 }
 
 td.ts, td.kind { font-family: var(--mono); white-space: nowrap; }
+td.kind { color: var(--muted); font-size: 0.78rem; }
 td.detail { font-family: var(--mono); overflow-wrap: anywhere; }
+
+/* History run cards — verdicts are recorded facts, colors restate them. */
+.run-card {
+  border: 1px solid var(--line);
+  border-left-width: 0.3rem;
+  padding: 0.7rem 0.85rem 0.4rem;
+  background: #fdfdfa;
+}
+.run-card.verdict-good { border-left-color: #26843b; }
+.run-card.verdict-warn { border-left-color: #b87600; }
+.run-card.verdict-bad { border-left-color: #b42318; }
+.run-card.verdict-none { border-left-color: #9a9a90; }
+.run-symbol { font-weight: 600; font-family: var(--mono); }
+.verdict-badge {
+  float: right;
+  font: 600 0.68rem/1.7 var(--mono);
+  letter-spacing: 0.06em;
+  padding: 0 0.45rem;
+  border: 1px solid;
+  border-radius: 3px;
+}
+.verdict-badge.verdict-good { color: #1f6f33; border-color: #26843b; }
+.verdict-badge.verdict-warn { color: #8a5900; border-color: #b87600; }
+.verdict-badge.verdict-bad { color: #9f1c13; border-color: #b42318; }
+.run-card table { font-size: 0.8rem; }
+.run-card td, .run-card th { border-bottom-color: #eeeee6; }
+.run-card tr:last-child td { border-bottom: none; }
