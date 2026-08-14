@@ -48,6 +48,15 @@ commands, no arbitrary shell near money — job files in, receipts out.
   with line numbers, explicit boundaries. Vague dispatches produce drift.
 - Parallelism is bounded by FILE OWNERSHIP: disjoint files fan out,
   same-file work chains. Never two writers on one file.
+- SPLIT HARDER (owner law 2026-08-14 — TIME is the only scarce resource;
+  compute is unlimited across 5 codex accounts): (1) src and tests are
+  DIFFERENT FILES — for every module, one worker builds the code and a
+  second builds the tests against a frozen API contract, in parallel;
+  (2) new functionality is born as SMALL files so ownership splits;
+  (3) a review worker starts on each lane's diff the moment it lands while
+  other lanes still build; (4) fixtures, glue scripts, and evidence
+  formatting are their own lanes. A 20-minute bundled task is three
+  7-minute tasks — split it. Never pad with redundant read-only lanes.
 - Workers NEVER run git. The Lead verifies every result with its own diff
   read and its own test run before a checkpoint commit — a worker's report
   is a hypothesis. Checkpoint after every verified task; push often; keep
