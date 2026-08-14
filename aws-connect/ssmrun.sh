@@ -10,7 +10,7 @@ WAIT="${2:-45}"
 TARGET=i-0e87fe0e7ba2063a9
 REGION=ap-south-1
 {
-  sleep 3
+  sleep 10
   cat "$SCRIPT"
   printf '\necho __SSMRUN_DONE__\n'
   sleep "$WAIT"
