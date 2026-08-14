@@ -39,11 +39,17 @@ JOB_FIELDS = {
     "expires_utc",
     "requested_by",
 }
+ACCEPT_ONE_FIELDS = {
+    "operator", "created_utc", "expires_utc", "max_notional",
+}
+OPERATOR_FIELDS = {"operator"}
 RESULT_FIELDS = {
     "job_id", "op", "symbol", "verdict", "exit_code", "receipt_path", "utc"
 }
 MOMENTUM_LEDGER_FIELDS = {"fills", "fees", "realized"}
 MOMENTUM_RESULT_FIELDS = RESULT_FIELDS | MOMENTUM_LEDGER_FIELDS
+ADVERSE_STOP_REFUSAL_FIELDS = {"kind", "error", "symbol", "utc"}
+ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
 OPS = {
     "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
     "MOMENTUM_OPEN", "MOMENTUM_EXIT",
@@ -61,6 +67,7 @@ UTC_RE = re.compile(
 )
 FREEZE_VERDICTS = {"UNKNOWN", "OPEN_EXPOSURE", "BLOCKED_UNRESOLVED"}
 MOMENTUM_STATE_VERSION = 1
+FIRST_AUTONOMOUS_CLOSE_MARKER = "first_autonomous_close_passed"
 RECEIPT_PATTERNS = (
     "futures-hand-*.json",
     "basis-executor-*.json",
@@ -90,6 +97,14 @@ class Job:
     created_utc: datetime
     expires_utc: datetime
     requested_by: str
+
+
+@dataclass(frozen=True)
+class AcceptOne:
+    operator: str
+    created_utc: datetime
+    expires_utc: datetime
+    max_notional: Decimal
 
 
 @dataclass(frozen=True)
@@ -170,8 +185,73 @@ def _timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _load_marker_object(path: str) -> Dict[str, Any]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            value = json.load(
+                handle,
+                parse_float=Decimal,
+                parse_int=Decimal,
+                parse_constant=_reject_constant,
+                object_pairs_hook=_strict_object,
+            )
+    except FileNotFoundError:
+        raise
+    except (JobRefusal, OSError, UnicodeError, ValueError,
+            json.JSONDecodeError):
+        raise ValueError("marker JSON is invalid") from None
+    if not isinstance(value, dict):
+        raise ValueError("marker JSON is not an object")
+    return value
+
+
+def _load_accept_one(path: str, now: datetime) -> Optional[AcceptOne]:
+    try:
+        raw = _load_marker_object(path)
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        raise JobRefusal("ACCEPT_ONE_INVALID") from None
+    try:
+        if set(raw) != ACCEPT_ONE_FIELDS:
+            raise ValueError
+        if any(type(raw[name]) is not str for name in ACCEPT_ONE_FIELDS):
+            raise ValueError
+        created = _timestamp(raw["created_utc"])
+        expires = _timestamp(raw["expires_utc"])
+        maximum = Decimal(raw["max_notional"])
+        if not maximum.is_finite() or maximum <= 0:
+            raise ValueError
+        if expires <= created or expires - created > MAX_JOB_AGE:
+            raise ValueError
+        if now >= expires:
+            raise ValueError
+    except (JobRefusal, ArithmeticError, ValueError):
+        raise JobRefusal("ACCEPT_ONE_INVALID") from None
+    return AcceptOne(
+        operator=raw["operator"],
+        created_utc=created,
+        expires_utc=expires,
+        max_notional=maximum,
+    )
+
+
+def _load_operator(path: str) -> Optional[str]:
+    try:
+        raw = _load_marker_object(path)
+    except (FileNotFoundError, ValueError):
+        return None
+    if set(raw) != OPERATOR_FIELDS or type(raw.get("operator")) is not str:
+        return None
+    return raw["operator"]
+
+
 def _validate_job(raw: Dict[str, Any], filename_id: str,
-                  now: datetime) -> Job:
+                  now: datetime, receipt_dir: str = "") -> Job:
     unknown = set(raw) - JOB_FIELDS
     if unknown:
         raise JobRefusal("UNKNOWN_FIELD")
@@ -204,12 +284,16 @@ def _validate_job(raw: Dict[str, Any], filename_id: str,
         raise JobRefusal("BAD_EXPIRY_WINDOW")
     if now >= expires:
         raise JobRefusal("EXPIRED")
+    notional_cap = limits.FIRST_TRADE_CAP_USDT
+    if receipt_dir and os.path.isfile(os.path.join(
+            receipt_dir, FIRST_AUTONOMOUS_CLOSE_MARKER)):
+        notional_cap = limits.PER_LEG_CAP_USDT
     return Job(
         job_id=raw["job_id"],
         op=raw["op"],
         symbol=raw["symbol"],
         requested_max_notional=requested,
-        effective_notional=min(requested, limits.PER_LEG_CAP_USDT),
+        effective_notional=min(requested, notional_cap),
         created_utc=created,
         expires_utc=expires,
         requested_by=raw["requested_by"],
@@ -232,12 +316,16 @@ def _paths(receipt_dir: str) -> Dict[str, str]:
         "results": os.path.join(jobs_dir, "results.jsonl"),
         "proof": os.path.join(jobs_dir, "futures_proof_passed"),
         "basis_proof": os.path.join(jobs_dir, "basis_proof_passed"),
+        "first_autonomous_close": os.path.join(
+            receipt_dir, FIRST_AUTONOMOUS_CLOSE_MARKER
+        ),
         "momentum_position": os.path.join(
             receipt_dir, "momentum-position.json"
         ),
         "bare_stop": os.path.join(receipt_dir, "STOP"),
         "stop": os.path.join(receipt_dir, "STOP-JOBS"),
         "accept_one": os.path.join(receipt_dir, "ACCEPT-ONE"),
+        "operator": os.path.join(receipt_dir, "OPERATOR"),
         "tick_lock": os.path.join(jobs_dir, ".job-runner-active"),
     }
 
@@ -253,63 +341,41 @@ def _touch_stop(path: str) -> None:
     os.chmod(path, 0o600)
 
 
-def _halt_marker(paths: Dict[str, str]) -> str:
-    for name in ("bare_stop", "stop"):
-        if os.path.exists(paths[name]):
-            return os.path.basename(paths[name])
+def _entry_ticket_refusal(job: Job, paths: Dict[str, str],
+                          now: datetime) -> str:
+    try:
+        acceptance = _load_accept_one(paths["accept_one"], now)
+    except JobRefusal as error:
+        return error.reason
+    if acceptance is None:
+        return "ENTRY_BLOCKED_NOT_ACCEPTED"
+    operator = _load_operator(paths["operator"])
+    if operator is None or job.requested_by != operator \
+            or acceptance.operator != operator:
+        return "OPERATOR_MISMATCH"
     return ""
 
 
-def _consume_accept_one(path: str) -> bool:
-    """Atomically consume one stop override without following its target."""
-    claim_path = path + ".claimed"
-    try:
-        descriptor = os.open(
-            claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-    except FileExistsError:
+def _consume_accept_one(path: str, job_id: str) -> bool:
+    """Atomically rename one filled entry ticket to its job claim."""
+    if type(job_id) is not str or not JOB_ID_RE.fullmatch(job_id):
         return False
+    claim_path = path + ".claimed-" + job_id
+    if os.path.lexists(claim_path):
+        return False
+    try:
+        os.rename(path, claim_path)
     except OSError:
         return False
-    consumed = False
     try:
-        os.write(descriptor, (str(os.getpid()) + "\n").encode("ascii"))
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
+        directory = os.open(os.path.dirname(path), os.O_RDONLY)
         try:
-            os.unlink(path)
-        except (FileNotFoundError, IsADirectoryError, PermissionError):
-            return False
-        except OSError:
-            return False
-        consumed = True
-        try:
-            directory = os.open(os.path.dirname(path), os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except OSError:
-            pass
-        return True
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if not consumed:
-            try:
-                os.unlink(claim_path)
-            except OSError:
-                pass
-
-
-def _reseal_interlock(paths: Dict[str, str], marker: str) -> None:
-    path = paths["bare_stop"] if marker == "STOP" else paths["stop"]
-    _touch_stop(path)
-    try:
-        os.unlink(paths["accept_one"] + ".claimed")
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError:
         pass
+    return True
 
 
 def _account_governor_api():
@@ -437,8 +503,20 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                 if not line.strip():
                     return set(), True, False
                 row = json.loads(line)
-                if not isinstance(row, dict) or set(row) not in (
-                        RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
+                if not isinstance(row, dict):
+                    return set(), True, False
+                fields = set(row)
+                if fields == ADVERSE_STOP_REFUSAL_FIELDS:
+                    if row["kind"] != "adverse_stop_refusal" or any(
+                            type(row[name]) is not str for name in fields):
+                        return set(), True, False
+                    continue
+                if fields == ADVERSE_STOP_BLOCKED_FIELDS:
+                    if row["kind"] != "adverse_stop_blocked_unknown" or any(
+                            type(row[name]) is not str for name in fields):
+                        return set(), True, False
+                    continue
+                if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
                     return set(), True, False
                 if type(row["job_id"]) is not str or row["job_id"] in identifiers:
                     return set(), True, False
@@ -554,6 +632,28 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
     return path
 
 
+def _append_results_row(paths: Dict[str, str], row: Dict[str, Any]) -> None:
+    line = json.dumps(row, separators=(",", ":")) + "\n"
+    descriptor = os.open(paths["results"],
+                         os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    os.write(descriptor, line.encode("utf-8"))
+    os.fsync(descriptor)
+    os.close(descriptor)
+
+
+def _append_adverse_stop_event(paths: Dict[str, str], kind: str, symbol: str,
+                               now: datetime, error: str = "") -> None:
+    row = {"kind": kind}
+    if error:
+        row["error"] = error
+    row.update({
+        "symbol": symbol,
+        "utc": _utc_text(now),
+    })
+    _append_results_row(paths, row)
+    print(json.dumps(row, separators=(",", ":")))
+
+
 def _append_result(paths: Dict[str, str], job_id: str, op: str, symbol: str,
                    outcome: Outcome, now: datetime) -> None:
     row = {
@@ -572,12 +672,7 @@ def _append_result(paths: Dict[str, str], job_id: str, op: str, symbol: str,
             "fees": list(ledger["fees"]),
             "realized": dict(ledger["realized"]),
         })
-    line = json.dumps(row, separators=(",", ":")) + "\n"
-    descriptor = os.open(paths["results"],
-                         os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-    os.write(descriptor, line.encode("utf-8"))
-    os.fsync(descriptor)
-    os.close(descriptor)
+    _append_results_row(paths, row)
 
 
 def _write_proof_marker(path: str, job_id: str, utc: str) -> bool:
@@ -804,6 +899,26 @@ def _one_way_position(rows: Any, symbol: str, label: str) -> Decimal:
     return nonzero[0] if nonzero else Decimal(0)
 
 
+def _position_mark_price(rows: Any, symbol: str) -> Optional[Decimal]:
+    matches = [row for row in rows if row.get("symbol") == symbol]
+    nonzero = []
+    for row in matches:
+        amount = _momentum_decimal(
+            row.get("positionAmt"), "position-risk positionAmt",
+            allow_zero=True, allow_negative=True,
+        )
+        if amount != 0:
+            nonzero.append(row)
+    if len(nonzero) != 1:
+        return None
+    try:
+        return _momentum_decimal(
+            nonzero[0].get("markPrice"), "position-risk markPrice"
+        )
+    except MomentumStateError:
+        return None
+
+
 def _momentum_measure(symbol: str) -> Dict[str, Any]:
     try:
         risks = futures_hand.signed_read(
@@ -838,6 +953,7 @@ def _momentum_measure(symbol: str) -> Dict[str, Any]:
         raise MomentumStateError("momentum leverage is not proven 1x")
     return {
         "qty": risk_qty,
+        "price": _position_mark_price(risks, symbol),
         "open_orders": len(orders),
         "leverage": leverage,
     }
@@ -1243,6 +1359,7 @@ def _resolve_momentum_open(paths: Dict[str, str],
         "pending_intent": None,
         "measured_qty": _decimal_text(measured["qty"]),
         "entry": {
+            "side": "LONG",
             "qty": _decimal_text(facts["qty"]),
             "price": _decimal_text(facts["price"]),
             "quote": _decimal_text(facts["quote"]),
@@ -1266,6 +1383,9 @@ def _resolve_momentum_exit(paths: Dict[str, str],
                            submission_kind: str, now: datetime,
                            recovering: bool = False) -> Outcome:
     pending = position["pending_intent"]
+    outcome_reason = pending.get("reason", "")
+    if type(outcome_reason) is not str:
+        outcome_reason = ""
     measured_before = _momentum_decimal(
         pending.get("measured_qty"), "persisted exit measurement"
     )
@@ -1374,7 +1494,7 @@ def _resolve_momentum_exit(paths: Dict[str, str],
         "failure_reason": "",
     })
     _save_momentum_position(paths, position, now)
-    return Outcome("CLOSED", 0, "", "", ledger)
+    return Outcome("CLOSED", 0, "", outcome_reason, ledger)
 
 
 def _run_momentum_open(job: Job, receipt_dir: str,
@@ -1445,7 +1565,9 @@ def _run_momentum_open(job: Job, receipt_dir: str,
 
 
 def _run_momentum_exit(job: Job, receipt_dir: str,
-                       paths: Dict[str, str], now: datetime) -> Outcome:
+                       paths: Dict[str, str], now: datetime,
+                       measurement: Optional[Dict[str, Any]] = None,
+                       outcome_reason: str = "") -> Outcome:
     try:
         position = _load_momentum_position(paths)
     except MomentumStateError as error:
@@ -1472,15 +1594,18 @@ def _run_momentum_exit(job: Job, receipt_dir: str,
         )
     except MomentumStateError as error:
         return _momentum_unknown(paths, position, str(error), now)
-    if not _ensure_leverage_1x(job.symbol):
-        return _momentum_unknown(
-            paths, position, "LEVERAGE_UNPROVEN", now
-        )
-    _configure_futures_hand(receipt_dir)
-    try:
-        measured = _momentum_measure(job.symbol)
-    except MomentumStateError as error:
-        return _momentum_unknown(paths, position, str(error), now)
+    if measurement is None:
+        if not _ensure_leverage_1x(job.symbol):
+            return _momentum_unknown(
+                paths, position, "LEVERAGE_UNPROVEN", now
+            )
+        _configure_futures_hand(receipt_dir)
+        try:
+            measured = _momentum_measure(job.symbol)
+        except MomentumStateError as error:
+            return _momentum_unknown(paths, position, str(error), now)
+    else:
+        measured = measurement
     if measured["open_orders"] != 0 or measured["qty"] != persisted_qty:
         return _momentum_unknown(
             paths, position, "MOMENTUM_POSITION_MEASUREMENT_MISMATCH", now
@@ -1496,6 +1621,8 @@ def _run_momentum_exit(job: Job, receipt_dir: str,
         "intent": dict(intent),
         "persisted_utc": _utc_text(now),
     }
+    if outcome_reason:
+        position["pending_intent"]["reason"] = outcome_reason
     _save_momentum_position(paths, position, now)
     try:
         query_state, order, fills, kind = _momentum_submit(intent)
@@ -1597,7 +1724,8 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
 def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
              futures_entry: Optional[Callable[[], Any]],
              basis_entry: Optional[Callable[[Any], Any]],
-             now: datetime, governor_token: str = "") -> Outcome:
+             now: datetime, governor_token: str = "",
+             momentum_measurement: Optional[Dict[str, Any]] = None) -> Outcome:
     sha = os.environ.get("QUANT_SHA", "").lower()
     if not SHA_RE.fullmatch(sha):
         return Outcome("REFUSED", 2, "", "BAD_QUANT_SHA")
@@ -1623,7 +1751,10 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
                 job, receipt_dir, paths, now, governor_token
             )
         if job.op == "MOMENTUM_EXIT":
-            return _run_momentum_exit(job, receipt_dir, paths, now)
+            return _run_momentum_exit(
+                job, receipt_dir, paths, now,
+                measurement=momentum_measurement,
+            )
         if job.op == "MOMENTUM_ROUNDTRIP":
             blocked = _momentum_roundtrip_allowed(paths)
             if blocked is not None:
@@ -1639,6 +1770,10 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
 
 def _entry_outcome_terminal(outcome: Outcome) -> bool:
     return outcome.verdict not in FREEZE_VERDICTS
+
+
+def _entry_outcome_succeeded(outcome: Outcome) -> bool:
+    return outcome.exit_code == 0 and outcome.verdict in {"OPEN", "CLOSED"}
 
 
 def _release_recovered_governor(token: str, receipt_dir: str) -> bool:
@@ -1692,6 +1827,12 @@ def _record_realized_close(outcome: Outcome, receipt_dir: str) -> bool:
 def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
                     op: str, symbol: str, outcome: Outcome,
                     now: datetime) -> int:
+    if op in ENTRY_OPS and _entry_outcome_succeeded(outcome) \
+            and not _consume_accept_one(paths["accept_one"], job_id):
+        outcome = Outcome(
+            "UNKNOWN", 4, outcome.receipt_path,
+            "ACCEPT_ONE_CLAIM_FAILED", outcome.ledger,
+        )
     if outcome.reason or outcome.ledger is not None:
         receipt_path = _write_runner_receipt(
             paths, job_id, op, symbol, outcome.verdict, outcome.reason, now,
@@ -1706,8 +1847,15 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
             "FUTURES_ROUNDTRIP": paths["proof"],
             "BASIS_ROUNDTRIP": paths["basis_proof"],
         }.get(op)
+        published_job = os.path.isfile(os.path.join(
+            paths["jobs"], "job-%s.json" % job_id
+        ))
+        if op == "MOMENTUM_EXIT" and published_job:
+            proof_path = paths["first_autonomous_close"]
         if proof_path:
             _write_proof_marker(proof_path, job_id, _utc_text(now))
+        if op == "MOMENTUM_EXIT":
+            _touch_stop(paths["stop"])
     if outcome.verdict in FREEZE_VERDICTS:
         _touch_stop(paths["stop"])
     _append_result(paths, job_id, op, symbol, outcome, now)
@@ -1718,6 +1866,112 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
         job_id, op or "INVALID", outcome.verdict, outcome.exit_code
     ))
     return outcome.exit_code
+
+
+def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
+                      now: datetime) \
+        -> Tuple[Optional[int], Optional[Dict[str, Any]], bool]:
+    try:
+        position = _load_momentum_position(paths)
+    except MomentumStateError:
+        print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_POSITION")
+        return 2, None, False
+    if position is not None and position["state"] == "UNKNOWN":
+        _touch_stop(paths["stop"])
+        _append_adverse_stop_event(
+            paths, "adverse_stop_blocked_unknown", position["symbol"], now
+        )
+        return None, None, True
+    if position is None or position["state"] != "OPEN":
+        return None, None, False
+
+    sha = str(position.get("sha", "")).lower()
+    try:
+        effective = _momentum_decimal(
+            position.get("effective_notional"),
+            "persisted effective notional",
+        )
+    except MomentumStateError:
+        print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_CONFIG")
+        return 2, None, False
+    if not SHA_RE.fullmatch(sha):
+        print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_CONFIG")
+        return 2, None, False
+
+    values = {
+        "SYMBOL": position["symbol"],
+        "MAX_NOTIONAL": _decimal_text(effective),
+        "QUANT_SHA": sha,
+        "RECEIPT_DIR": receipt_dir,
+    }
+    with _environment(values):
+        _configure_futures_hand(receipt_dir)
+        try:
+            measured = _momentum_measure(position["symbol"])
+        except Exception as error:
+            _append_adverse_stop_event(
+                paths, "adverse_stop_refusal", position["symbol"], now,
+                type(error).__name__,
+            )
+            return 2, None, False
+
+        entry = position.get("entry")
+        try:
+            entry_price = _momentum_decimal(
+                entry.get("price") if isinstance(entry, dict) else None,
+                "persisted entry price",
+            )
+        except MomentumStateError:
+            print(
+                "JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | "
+                "UNKNOWN_ENTRY_PRICE"
+            )
+            return 2, None, False
+        try:
+            current_price = _momentum_decimal(
+                measured.get("price"), "current mark price"
+            )
+        except MomentumStateError as error:
+            _append_adverse_stop_event(
+                paths, "adverse_stop_refusal", position["symbol"], now,
+                type(error).__name__,
+            )
+            return 2, None, False
+
+        side = entry.get("side", "LONG")
+        # _one_way_position rejects negative amounts, so only LONG is reachable.
+        if side not in ("LONG", "BUY"):
+            print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_SIDE")
+            return 2, None, False
+        adverse_pct = (
+            (entry_price - current_price) * Decimal("100") / entry_price
+        )
+        if adverse_pct + limits.MEASURED_ROUNDTRIP_FEE_PCT \
+                < limits.MAX_ADVERSE_PCT:
+            return None, measured, False
+
+        job_id = "max-adverse-" + secrets.token_hex(8)
+        if not _claim(paths, job_id, now):
+            print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | CLAIM_FAILED")
+            return 3, None, False
+        job = Job(
+            job_id=job_id,
+            op="MOMENTUM_EXIT",
+            symbol=position["symbol"],
+            requested_max_notional=effective,
+            effective_notional=effective,
+            created_utc=now,
+            expires_utc=now + MAX_JOB_AGE,
+            requested_by="job-runner",
+        )
+        outcome = _run_momentum_exit(
+            job, receipt_dir, paths, now, measurement=measured,
+            outcome_reason="max_adverse_stop",
+        )
+    code = _finish_claimed(
+        paths, receipt_dir, job.job_id, job.op, job.symbol, outcome, now
+    )
+    return code, None, False
 
 
 def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
@@ -1767,6 +2021,10 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             _touch_stop(paths["stop"])
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
             return 3
+        adverse_code, standing_measurement, adverse_blocked_unknown = \
+            _max_adverse_stop(
+                paths, receipt_dir, now
+            )
 
         for path in sorted(glob.glob(os.path.join(paths["jobs"], "job-*.json"))):
             match = JOB_NAME_RE.fullmatch(os.path.basename(path))
@@ -1780,7 +2038,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             job = None
             try:
                 raw = _load_job(path)
-                job = _validate_job(raw, filename_id, now)
+                job = _validate_job(raw, filename_id, now, receipt_dir)
                 if job.created_utc > now:
                     continue
             except JobRefusal as rejected:
@@ -1794,51 +2052,47 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 return _finish_claimed(
                     paths, receipt_dir, filename_id, op, symbol, outcome, now
                 )
-            one_shot_marker = ""
             if job.op in ENTRY_OPS:
-                halt_marker = _halt_marker(paths)
-                if halt_marker:
-                    if not _consume_accept_one(paths["accept_one"]):
-                        reason = "ENTRY_BLOCKED_" + halt_marker.replace(
-                            "-", "_"
-                        )
-                        outcome = Outcome("REFUSED", 2, "", reason)
-                        return _finish_claimed(
-                            paths, receipt_dir, job.job_id, job.op,
-                            job.symbol, outcome, now
-                        )
-                    one_shot_marker = halt_marker
-            try:
-                governor_token = ""
-                release_governor = None
-                if job.op in ENTRY_OPS:
-                    governor_token, release_governor, refusal = \
-                        _acquire_governor(job, receipt_dir)
-                    if refusal:
-                        outcome = Outcome("REFUSED", 2, "", refusal)
-                    else:
-                        outcome = _execute(
-                            job, receipt_dir, paths, futures_entry,
-                            basis_entry, now, governor_token
-                        )
+                refusal = _entry_ticket_refusal(job, paths, now)
+                if refusal:
+                    outcome = Outcome("REFUSED", 2, "", refusal)
+                    return _finish_claimed(
+                        paths, receipt_dir, job.job_id, job.op,
+                        job.symbol, outcome, now
+                    )
+            governor_token = ""
+            release_governor = None
+            if job.op in ENTRY_OPS:
+                governor_token, release_governor, refusal = \
+                    _acquire_governor(job, receipt_dir)
+                if refusal:
+                    outcome = Outcome("REFUSED", 2, "", refusal)
                 else:
                     outcome = _execute(
                         job, receipt_dir, paths, futures_entry,
-                        basis_entry, now
+                        basis_entry, now, governor_token,
+                        momentum_measurement=standing_measurement,
                     )
-                code = _finish_claimed(
-                    paths, receipt_dir, job.job_id, job.op, job.symbol,
-                    outcome, now
+            else:
+                outcome = _execute(
+                    job, receipt_dir, paths, futures_entry,
+                    basis_entry, now,
+                    momentum_measurement=standing_measurement,
                 )
-                if governor_token and _entry_outcome_terminal(outcome) \
-                        and not _release_governor(
-                            release_governor, governor_token, receipt_dir
-                        ):
-                    _touch_stop(paths["stop"])
-                return code
-            finally:
-                if one_shot_marker:
-                    _reseal_interlock(paths, one_shot_marker)
+            code = _finish_claimed(
+                paths, receipt_dir, job.job_id, job.op, job.symbol,
+                outcome, now
+            )
+            if governor_token and _entry_outcome_terminal(outcome) \
+                    and not _release_governor(
+                        release_governor, governor_token, receipt_dir
+                    ):
+                _touch_stop(paths["stop"])
+            return code
+        if adverse_blocked_unknown:
+            return 0
+        if adverse_code is not None:
+            return adverse_code
         print("JOB-RUNNER | IDLE | no due unclaimed job")
         return 0
     finally:

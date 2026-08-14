@@ -1472,6 +1472,39 @@ class CliTests(PipelineCase):
         self.assertEqual(reads.universe_calls, 1)
         self.assertTrue(os.path.exists(self.state_path))
 
+    def test_observe_only_runs_full_pass_without_proposal_artifact(self):
+        now = int(basis_watch.time.time() * 1000)
+        watch = self.make_watch()
+        for index in range(4):
+            row = self.tick(
+                watch, now - 8000 + 2000 * index, rate="0.01")
+            self.assertEqual(row["kind"], "focus")
+
+        reads = FakeReads(
+            [universe_row("TESTUSDT")],
+            {"TESTUSDT": scenario_bundle(now, rate="0.01")},
+        )
+        code, output = self.run_main(
+            ["--once", "--observe-only"] + self.base_args(), reads)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(reads.universe_calls, 1)
+        self.assertEqual(len(self.kernel_log), 5)
+        self.assertIn("TESTUSDT", output)
+        self.assertIn("suppressed_observe_only", output)
+        self.assertEqual(glob(os.path.join(
+            self.tmp.name, "proposals", "proposal-*.json")), [])
+        with open(self.state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        self.assertEqual(state["watermark"]["pass_count"], 5)
+        self.assertEqual(state["symbols"]["TESTUSDT"]["state"], "PROPOSED")
+        with open(os.path.join(self.tmp.name, basis_watch.HEALTH_FILE_NAME),
+                  encoding="utf-8") as handle:
+            health = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual(len(health), 5)
+        self.assertEqual(health[-1]["pass_count"], 5)
+        self.assertEqual(health[-1]["state_counts"]["PROPOSED"], 1)
+
     def test_stream_flag_replaces_only_universe_read_and_reports_mode(self):
         path = self.write_stream({
             "STREAMUSDT": stream_record("0.78"),

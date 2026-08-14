@@ -64,7 +64,8 @@ PROPOSALS: a positive-net kernel proposal is published once under
 RECEIPT_DIR/proposals/proposal-<id>.json.  Each file is a complete, atomic,
 120-second-by-default market authority, chmod 0400 after publication, and is
 never updated or removed by this observer.  A live proposal for the same
-symbol suppresses duplicates.
+symbol suppresses duplicates.  With --observe-only, every normal proposal
+check still runs but publication is suppressed and reported on the factual row.
 
 COMMISSION: RECEIPT_DIR/commission-rates.json (written by the lifecycle
 tool from the signed commission endpoints) is read when present; maker and
@@ -1253,9 +1254,11 @@ class StreamStateReads:
 
 class Watch:
     def __init__(self, state_path: str, receipt_dir: str = RECEIPT_DIR,
-                 cfg: Optional[Dict[str, Any]] = None) -> None:
+                 cfg: Optional[Dict[str, Any]] = None,
+                 observe_only: bool = False) -> None:
         self.cfg = cfg if cfg is not None else watch_config()
         validate_config(self.cfg)
+        self.observe_only = observe_only
         self.state_path = state_path
         self.receipt_dir = receipt_dir
         self.symbols: Dict[str, SymbolState] = {}
@@ -1503,6 +1506,8 @@ class Watch:
             proposal_id, symbol, now_ms, market_row, observation, decision)
         if payload is None:
             return None, "refused_incomplete_proposal"
+        if self.observe_only:
+            return None, "suppressed_observe_only"
         self._write_proposal(payload)
         return proposal_id, "written"
 
@@ -1814,7 +1819,10 @@ class Watch:
             lifecycle_kind = decision["kind"]
             if lifecycle_kind == "proposal" and proposal_status.startswith(
                     "refused_"):
-                lifecycle_kind = "unknown"  # no PROPOSED state without artifact
+                # A refusal freezes lifecycle.  Observe-only suppression is not
+                # a refusal: it persists the proposal-grade observation while
+                # deliberately omitting the entry artifact.
+                lifecycle_kind = "unknown"
             self.apply_decision(symbol, lifecycle_kind,
                                 decision.get("reject_code"), score, sym_now)
             spot_leg = leg_depth_score(
@@ -1913,6 +1921,8 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
     parser.add_argument("--stream-state", default=None, metavar="PATH",
                         help="read the cheap universe pass from stream_state "
                              "instead of direct all-universe GETs")
+    parser.add_argument("--observe-only", action="store_true",
+                        help="run full passes but suppress proposal files")
     parser.add_argument("--finalists", type=int, default=DEFAULTS["finalist_cap"],
                         help="cap-fitting best-gap finalist bound")
     parser.add_argument("--notional-usd", default=None,
@@ -1936,7 +1946,8 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
         overrides["notional_usd"] = notional
     try:
         config = watch_config(overrides)
-        watch = Watch(state_path, receipt_dir, config)
+        watch = Watch(state_path, receipt_dir, config,
+                      observe_only=args.observe_only)
     except WatchError as exc:
         print("ERROR: %s" % exc)
         return 4
