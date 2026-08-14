@@ -37,6 +37,11 @@ job RECORDS (op whitelist only, notional clamped ≤ 8 USDT, leverage forced
 1x, one job at a time, mandatory expiry, run-at-most-once claims, freeze-on-
 UNKNOWN) and reads the receipts. No per-test human press, no pasted
 commands, no arbitrary shell near money — job files in, receipts out.
+WORD-TIME FLATNESS (review-lane condition, adopted 2026-08-14): the same
+signed GET-only flat read (positions + open orders both venues + balances,
+raw rows committed to evidence/) runs immediately BEFORE any ACCEPT-ONE
+marker is placed, every time — flatness is a word-time fact, never a
+freeze-time fact.
 
 ## Lead operating loop (why this works — keep it exactly)
 - CODEX FIRST: `codex exec --skip-git-repo-check -s workspace-write -C <dir>`
