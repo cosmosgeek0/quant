@@ -12,11 +12,15 @@ Job ids are derived only from symbol plus the ignition stream timestamp, and
 publication is an atomic create-if-absent operation.  A restart in the
 state-to-job crash window therefore recovers the same immutable job instead of
 issuing another.
+
+``--manage-only`` suppresses every new OPEN intent while preserving runner
+reconciliation and standing-position HOLD/EXIT management.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -859,9 +863,13 @@ def _recover_unlogged_entries(
     requested_by: str,
     job_ttl: timedelta,
     now_fn: Callable[[], str],
+    allowed_ops: Iterable[str] = JOB_OPS,
 ) -> Tuple[Dict[str, Any], ...]:
     """Recover an OPEN/EXIT receipt created before its decision-ledger row."""
     issued = set(issued_job_ids)
+    allowed = frozenset(allowed_ops)
+    if not allowed.issubset(JOB_OPS):
+        raise MomentumLiveError("unlogged recovery contains an invalid job op")
     action_receipts = _action_receipts(receipt_path)
     pending_jobs: List[Dict[str, Any]] = []
     for symbol in sorted(state.tokens):
@@ -889,6 +897,9 @@ def _recover_unlogged_entries(
         ignition_by_symbol[symbol] = ignition_utc
         op = JOB_OPEN_OP if action == lifecycle.ACTION_ENTER_SMALL else JOB_EXIT_OP
         job_id = deterministic_job_id(symbol, ignition_utc, op)
+        if op not in allowed:
+            lifecycle.bind_job_id(state, symbol, action, job_id)
+            continue
         if job_id in issued:
             continue
         decision = {
@@ -1128,6 +1139,70 @@ def _decision_row(
     return row
 
 
+def _manage_only_refusal_row(
+    token: Mapping[str, Any],
+    record: Optional[lifecycle.StreamRecord],
+    decision_utc: str,
+    ignition_utc: Optional[str],
+    max_job_notional: Decimal,
+    requested_by: str,
+    job_ttl: timedelta,
+) -> Dict[str, Any]:
+    row = _decision_row(
+        {
+            "action": "REFUSED",
+            "phase": token.get("phase"),
+            "reason": "manage_only",
+            "receipt_id": None,
+            "add_checks": None,
+            "deterioration_checks": None,
+        },
+        token,
+        record,
+        decision_utc,
+        ignition_utc,
+        max_job_notional,
+        requested_by,
+        job_ttl,
+    )
+    row["job_reason"] = "manage_only"
+    return row
+
+
+def _manage_only_noop_row(decision_utc: str) -> Dict[str, Any]:
+    return {
+        "decision_id": _decision_id(
+            "MANAGE_ONLY", "NOOP", None, None, decision_utc
+        ),
+        "decision_utc": decision_utc,
+        "stream_utc": None,
+        "ignition_utc": None,
+        "symbol": None,
+        "action": "NOOP",
+        "phase": None,
+        "reason": "no_standing_position",
+        "receipt_id": None,
+        "surge_ratio": None,
+        "price": None,
+        "price_venue": None,
+        "perp_price": None,
+        "vol_1m_quote": None,
+        "vol_med_1m": None,
+        "oi": None,
+        "oi_change_pct": None,
+        "basis_gap_pct": None,
+        "venues": None,
+        "freshness_ms": None,
+        "observation_id": None,
+        "lifecycle_state": None,
+        "add_checks": None,
+        "deterioration_checks": None,
+        "job_eligible": False,
+        "job_reason": "no_standing_position",
+        "job": None,
+    }
+
+
 def _validate_runtime_config(
     max_job_notional: Decimal, requested_by: str, job_ttl: timedelta
 ) -> Decimal:
@@ -1163,8 +1238,11 @@ def run_tick(
     job_writer: Optional[
         Callable[[Path, Mapping[str, Any]], bool]
     ] = None,
+    manage_only: bool = False,
 ) -> TickResult:
     """Process one snapshot, reconcile runner truth, and publish job intents."""
+    if not isinstance(manage_only, bool):
+        raise MomentumLiveError("manage_only must be a bool")
     maximum = _validate_runtime_config(
         max_job_notional, requested_by, job_ttl
     )
@@ -1206,18 +1284,99 @@ def run_tick(
         requested_by,
         job_ttl,
         now_fn,
+        allowed_ops={JOB_EXIT_OP} if manage_only else JOB_OPS,
     )
     _bind_ledger_jobs(state, prior_job_rows)
+    runner_position = read_runner_position(resolved_position_path)
+    result_rows = read_results_ledger(resolved_results_path)
     reconcile_runner_truth(
         state,
-        read_runner_position(resolved_position_path),
-        read_results_ledger(resolved_results_path),
+        runner_position,
+        result_rows,
         resolved_config,
     )
     rows: List[Dict[str, Any]] = []
     pending_jobs: List[Dict[str, Any]] = []
+    standing_symbol = (
+        runner_position.symbol
+        if runner_position is not None
+        and runner_position.state in {"OPEN", "EXIT_PENDING"}
+        else None
+    )
 
-    for symbol in sorted(set(state.tokens).union(records)):
+    symbols = sorted(set(state.tokens).union(records))
+    if manage_only:
+        refused_symbols = set()
+        with tempfile.TemporaryDirectory(
+            prefix="momentum-manage-only-"
+        ) as temporary_dir:
+            shadow_receipt_path = Path(temporary_dir) / "receipts.jsonl"
+            for symbol in symbols:
+                if symbol == standing_symbol:
+                    continue
+                token = state.tokens.get(symbol)
+                pending_open = bool(
+                    token is not None
+                    and token.get("phase") == lifecycle.PHASE_ENTER_SMALL
+                )
+                record = records.get(symbol)
+                if record is not None:
+                    shadow_state = lifecycle.LifecycleState(
+                        tokens={}
+                        if token is None
+                        else {symbol: copy.deepcopy(token)}
+                    )
+                    shadow_decision = lifecycle.process_record(
+                        shadow_state,
+                        record,
+                        resolved_config,
+                        shadow_receipt_path,
+                        now_fn,
+                    )
+                    if shadow_decision.get("action") \
+                            == lifecycle.ACTION_ENTER_SMALL:
+                        if token is None:
+                            raise MomentumLiveError(
+                                "manage-only entry attempt has no prior token"
+                            )
+                        lifecycle._commit_observation(
+                            token,
+                            record,
+                            lifecycle.basis_availability(
+                                record, resolved_config
+                            ),
+                        )
+                        pending_open = True
+                    else:
+                        state.tokens[symbol] = shadow_state.tokens[symbol]
+                        token = state.tokens[symbol]
+                if not pending_open:
+                    continue
+                assert token is not None
+                decision_utc = now_fn()
+                ignition_utc = token.get("ignition_utc") \
+                    or ignition_by_symbol.get(symbol)
+                row = _manage_only_refusal_row(
+                    token,
+                    record,
+                    decision_utc,
+                    ignition_utc,
+                    maximum,
+                    requested_by,
+                    job_ttl,
+                )
+                append_decision(Path(decisions_path), row)
+                rows.append(row)
+                refused_symbols.add(symbol)
+
+        if standing_symbol is None and not refused_symbols:
+            row = _manage_only_noop_row(now_fn())
+            append_decision(Path(decisions_path), row)
+            rows.append(row)
+
+    for symbol in symbols:
+        if manage_only and symbol != standing_symbol:
+            continue
         record = records.get(symbol)
         if record is None:
             decision = lifecycle.process_missing_token(
@@ -1261,8 +1420,16 @@ def run_tick(
             ignition_by_symbol.pop(symbol, None)
 
     lifecycle.save_state(Path(state_path), state, now_fn)
+    recovery_rows = (
+        prior_job_rows
+        if not manage_only
+        else tuple(
+            row for row in prior_job_rows
+            if row.get("action") == lifecycle.ACTION_EXIT
+        )
+    )
     recovered = list(
-        _recover_jobs(prior_job_rows, resolved_jobs_dir, resolved_job_writer)
+        _recover_jobs(recovery_rows, resolved_jobs_dir, resolved_job_writer)
     )
     for job in unlogged_jobs:
         if resolved_job_writer(resolved_jobs_dir, job):
@@ -1306,6 +1473,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-ttl-seconds", type=_positive_seconds,
                         default=DEFAULT_JOB_TTL)
     parser.add_argument("--requested-by", default=REQUESTED_BY)
+    parser.add_argument(
+        "--manage-only",
+        action="store_true",
+        help="refuse new OPEN publication while managing standing exposure",
+    )
     return parser
 
 
@@ -1325,6 +1497,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_job_notional=args.max_job_notional,
             requested_by=args.requested_by,
             job_ttl=args.job_ttl_seconds,
+            manage_only=args.manage_only,
         )
     except (MomentumLiveError, lifecycle.MomentumLifecycleError, OSError) as exc:
         print(f"momentum_live_error={exc}", file=sys.stderr)

@@ -661,6 +661,143 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertEqual(summary["jobs_written"], 1)
         self.assertEqual(self.jobs_by_op()[live.JOB_OPEN_OP]["op"], live.JOB_OPEN_OP)
 
+    def test_manage_only_publishes_exit_for_standing_position(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        self.inject_open(open_job)
+
+        result = self.tick(
+            stream_payload(
+                3, "80", "0.5", "50", "900", oi_change_pct="-8"
+            ),
+            manage_only=True,
+        )
+
+        self.assertEqual(result.decisions[0]["action"], lifecycle.ACTION_EXIT)
+        jobs = self.jobs_by_op()
+        self.assertEqual(set(jobs), {live.JOB_OPEN_OP, live.JOB_EXIT_OP})
+        self.assertEqual(result.written_job_ids, (jobs[live.JOB_EXIT_OP]["job_id"],))
+
+    def test_manage_only_refuses_entry_publication(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+
+        result = self.tick(
+            stream_payload(
+                2, "108", "75", "7600", "1070", spread_pct="0.007"
+            ),
+            manage_only=True,
+        )
+
+        self.assertEqual(len(result.decisions), 1)
+        self.assertEqual(result.decisions[0]["action"], "REFUSED")
+        self.assertEqual(result.decisions[0]["reason"], "manage_only")
+        self.assertIsNone(result.decisions[0]["job"])
+        self.assertEqual(self.job_paths(), [])
+        self.assertNotIn(
+            lifecycle.ACTION_ENTER_SMALL,
+            [row["action"] for row in self.decision_rows()],
+        )
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token["phase"], lifecycle.PHASE_WATCH)
+        self.assertIsNone(token["open_job_id"])
+
+    def test_manage_only_refuses_persisted_open_recovery(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+        payload = stream_payload(
+            2, "108", "75", "7600", "1070", spread_pct="0.007"
+        )
+
+        def killed(_jobs_dir, _job):
+            raise SimulatedKill("killed before OPEN publication")
+
+        with self.assertRaises(SimulatedKill):
+            self.tick(payload, job_writer=killed)
+        enter_rows = [
+            row for row in self.decision_rows()
+            if row["action"] == lifecycle.ACTION_ENTER_SMALL
+        ]
+        calls = []
+
+        def recording_writer(_jobs_dir, job):
+            calls.append(job)
+            return False
+
+        result = self.tick(
+            payload, manage_only=True, job_writer=recording_writer
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result.decisions[0]["action"], "REFUSED")
+        self.assertEqual(result.decisions[0]["reason"], "manage_only")
+        self.assertEqual(self.job_paths(), [])
+        self.assertEqual(
+            [
+                row for row in self.decision_rows()
+                if row["action"] == lifecycle.ACTION_ENTER_SMALL
+            ],
+            enter_rows,
+        )
+
+    def test_manage_only_flat_cli_reports_noop_and_exits_zero(self):
+        self.stream.write_text(
+            json.dumps({
+                "AAAUSDT": stream_payload(0, "100", "2", "100", "1000")
+            }),
+            encoding="utf-8",
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        args = [
+            "--tick", str(self.stream),
+            "--state", str(self.state),
+            "--receipts", str(self.receipts),
+            "--decisions", str(self.decisions),
+            "--jobs-dir", str(self.jobs),
+            "--position", str(self.position),
+            "--results", str(self.results),
+            "--initial-notional", "8",
+            "--manage-only",
+        ]
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = live.main(args)
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        output = stdout.getvalue().splitlines()
+        self.assertEqual(json.loads(output[0])["jobs_written"], 0)
+        row = json.loads(output[1])
+        self.assertEqual(row["action"], "NOOP")
+        self.assertEqual(row["reason"], "no_standing_position")
+        self.assertEqual(self.job_paths(), [])
+
+    def test_normal_mode_still_publishes_open(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+
+        result = self.tick(
+            stream_payload(
+                2, "108", "75", "7600", "1070", spread_pct="0.007"
+            )
+        )
+
+        self.assertEqual(
+            result.decisions[0]["action"], lifecycle.ACTION_ENTER_SMALL
+        )
+        self.assertEqual(set(self.jobs_by_op()), {live.JOB_OPEN_OP})
+
     def test_300_symbol_tick_decision_work_stays_bounded_across_history(self):
         symbols = [f"S{index:03d}USDT" for index in range(300)]
         clock = AdvancingClock()
