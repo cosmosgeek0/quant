@@ -148,6 +148,9 @@ CONTENT_TYPES = {
     ".json": "application/json; charset=utf-8",
     ".jsonl": "text/plain; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".woff2": "font/woff2",
 }
 
 SECURITY_HEADERS = (
@@ -157,8 +160,8 @@ SECURITY_HEADERS = (
     ("Content-Security-Policy",
      "default-src 'none'; script-src 'self'; "
      "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
-     "img-src 'self'; base-uri 'none'; form-action 'none'; "
-     "frame-ancestors 'none'"),
+     "img-src 'self'; font-src 'self'; base-uri 'none'; "
+     "form-action 'none'; frame-ancestors 'none'"),
 )
 
 _SOURCE_PARSE_CACHE = OrderedDict()

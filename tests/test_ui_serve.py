@@ -236,8 +236,8 @@ class TestBackendHardening(ServerHarness):
         "Content-Security-Policy": (
             "default-src 'none'; script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
-            "img-src 'self'; base-uri 'none'; form-action 'none'; "
-            "frame-ancestors 'none'"),
+            "img-src 'self'; font-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'"),
     }
 
     def assert_security_headers(self, headers):
