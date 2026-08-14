@@ -82,10 +82,18 @@ print_manage_status() {
     if [ "$standing" = yes ]; then
       mode=manage-only
     else
-      mode=skipped
+      mode=decision-only
     fi
   fi
   printf 'MANAGE | standing=%s | mode=%s\n' "$standing" "$mode"
+}
+
+print_mode_status() {
+  local mode=trading
+  if [ -e "$STOP_FILE" ] || [ -e "$STOP_JOBS_FILE" ]; then
+    mode=observing
+  fi
+  printf 'MODE | %s\n' "$mode"
 }
 
 print_tail() {
@@ -172,6 +180,7 @@ print_status() {
   print_cron
   print_flag STOP "$STOP_FILE"
   print_flag STOP-JOBS "$STOP_JOBS_FILE"
+  print_mode_status
   print_manage_status
   print_feed_status
   print_tail HEALTH "$HEALTH"

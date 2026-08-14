@@ -25,6 +25,7 @@ export PYTHONDONTWRITEBYTECODE=1
 FEED_STATE="$WATCH_DIR/feed_state.json"
 FEED_LOG="$WATCH_DIR/feed.log"
 FEED_PID_FILE="$WATCH_DIR/feed.pid"
+FEED_STOP_FILE="$WATCH_DIR/feed.stop"
 
 mkdir -p "$RECEIPT_DIR" "$JOBS_DIR" "$PROPOSALS_DIR" "$WATCH_DIR" || exit 2
 
@@ -125,7 +126,7 @@ start_feed() {
   local pid checks=0
   nohup python3 "$DEPLOY_DIR/src/market_feed.py" --serve \
     --state-file "$FEED_STATE" \
-    --stop-file "$STOP_FILE" \
+    --stop-file "$FEED_STOP_FILE" \
     >> "$FEED_LOG" 2>&1 < /dev/null &
   pid=$!
   if ! printf '%s\n' "$pid" > "$FEED_PID_FILE"; then
@@ -197,39 +198,45 @@ supervisor_stage() {
   python3 "$DEPLOY_DIR/src/basis_supervisor.py" --tick
 }
 
-# STOP pauses fresh decisions, but standing momentum exposure still receives
-# stream updates and manage-only HOLD/EXIT decisions. STOP-JOBS independently
-# prevents entry publication while preserving the same position management.
-if [ ! -e "$STOP_FILE" ]; then
-  run_stage feed "0" \
-    feed_stage
+# STOP seals entries while the public observation chain continues. STOP-JOBS
+# independently seals momentum publication. Standing exposure additionally
+# receives manage-only HOLD/EXIT decisions under either seal.
+if [ -e "$STOP_FILE" ]; then
+  echo "RUNTIME | observation under STOP | entries sealed"
+fi
 
-  run_stage stream "0" \
-    stream_stage
+run_stage feed "0" \
+  feed_stage
 
+run_stage stream "0" \
+  stream_stage
+
+if [ -e "$STOP_FILE" ]; then
+  run_stage basis_watch "0" \
+    python3 "$DEPLOY_DIR/src/basis_watch.py" --once \
+      --receipt-dir "$RECEIPT_DIR" \
+      --state-file "$BASIS_WATCH_STATE" \
+      --stream-state "$STREAM_STATE" \
+      --observe-only
+else
   run_stage basis_watch "0" \
     python3 "$DEPLOY_DIR/src/basis_watch.py" --once \
       --receipt-dir "$RECEIPT_DIR" \
       --state-file "$BASIS_WATCH_STATE" \
       --stream-state "$STREAM_STATE"
+fi
 
-  if [ ! -e "$STOP_JOBS_FILE" ]; then
+if [ -e "$STOP_FILE" ] || [ -e "$STOP_JOBS_FILE" ]; then
+  if momentum_position_standing; then
     run_stage momentum_live "0" \
-      momentum_stage
-  elif momentum_position_standing; then
-    run_stage momentum_live "0" \
-      momentum_stage --manage-only
+      momentum_stage --decision-only --manage-only
   else
-    echo "RUNTIME | momentum_live skipped | STOP-JOBS present"
+    run_stage momentum_live "0" \
+      momentum_stage --decision-only
   fi
-elif momentum_position_standing; then
-  run_stage stream "0" \
-    stream_stage
-
-  run_stage momentum_live "0" \
-    momentum_stage --manage-only
 else
-  echo "RUNTIME | fresh stages skipped | STOP present"
+  run_stage momentum_live "0" \
+    momentum_stage
 fi
 
 # basis_supervisor documents 0=acted, 1=held, 2=frozen, 3=idle. HELD and IDLE
