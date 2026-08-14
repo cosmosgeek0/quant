@@ -44,6 +44,13 @@ commands, no arbitrary shell near money — job files in, receipts out.
   by default — omit that flag only for lanes whose dispatch allows named
   public GETs. Up to 50 in parallel; compute is free. Opus subagents allowed
   for genuinely important build/review work.
+- THE FABLE-BURN TRAP (owner correction 2026-08-14, paid for twice): the
+  in-harness Workflow and Agent tools spawn FABLE subagents and bleed the
+  owner's Fable usage invisibly — NEVER use them for grind: audits, builds,
+  reviews, sweeps, digests all route through `codex exec` (5.6-sol max,
+  /fast). Opus subagents only for judgment-critical monitoring the owner
+  endorsed. Fable does exactly one thing alone: lead. If you are about to
+  fan out and the tool name is not codex, stop.
 - One task = one narrow 10–20 minute scope: exact files, exact defect text
   with line numbers, explicit boundaries. Vague dispatches produce drift.
 - Parallelism is bounded by FILE OWNERSHIP: disjoint files fan out,
