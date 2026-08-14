@@ -54,6 +54,10 @@ _HAS_JOB_AWARE_ACCEPT_ONE = (
     hasattr(jr, "_consume_accept_one")
     and _module_mentions(jr, "ENTRY_BLOCKED_NOT_ACCEPTED")
 )
+_HAS_TICKET_BOUND = _module_mentions(
+    jr, "ACCEPT_ONE_NOTIONAL_EXCEEDED"
+)
+_HAS_TICKET_RESEAL = _module_mentions(jr, "ACCEPT-ONE.expired-")
 
 
 class LeverageTransport:
@@ -423,6 +427,43 @@ class AcceptOneReworkTests(unittest.TestCase):
             self.assertEqual(json.load(handle), acceptance)
         self.assertFalse(os.path.exists(self.claimed_acceptance("refused")))
 
+    @unittest.skipUnless(
+        _HAS_TICKET_BOUND,
+        "ticket-bound ACCEPT-ONE interface has not landed",
+    )
+    def test_ticket_bound_refuses_then_preserved_ticket_accepts_eight(self):
+        self.write_operator()
+        acceptance = self.valid_acceptance(max_notional="8")
+        self.job("ticket-overflow", max_notional=32)
+
+        self.assertEqual(self.tick(), 2)
+
+        refused = self.results()[-1]
+        self.assertEqual(refused["verdict"], "REFUSED")
+        self.assertEqual(
+            self.reason(refused), "ACCEPT_ONE_NOTIONAL_EXCEEDED"
+        )
+        self.assert_no_entry_order()
+        self.assertTrue(os.path.isfile(self.accept_path))
+        with open(self.accept_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), acceptance)
+        self.assertFalse(os.path.exists(
+            self.claimed_acceptance("ticket-overflow")
+        ))
+
+        self.job("ticket-compliant", max_notional=8)
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(self.results()[-1]["verdict"], "CLOSED")
+        self.assertEqual(len(self.hand_calls), 1)
+        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
+        self.assertFalse(os.path.exists(self.accept_path))
+        claim = self.claimed_acceptance("ticket-compliant")
+        self.assertTrue(os.path.isfile(claim))
+        with open(claim, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), acceptance)
+
     def test_expired_acceptance_is_invalid_and_places_no_order(self):
         self.write_operator()
         self.valid_acceptance(
@@ -576,10 +617,66 @@ class AcceptOneReworkTests(unittest.TestCase):
         self.assertEqual(stop_after.st_ino, stop_stat.st_ino)
         self.assertEqual(stop_after.st_mtime_ns, stop_stat.st_mtime_ns)
 
+    @unittest.skipUnless(
+        _HAS_TICKET_RESEAL,
+        "seal-on-flat ticket expiry interface has not landed",
+    )
+    def test_seal_on_flat_expires_ticket_and_refuses_queued_entry(self):
+        self.write_operator()
+        self.valid_acceptance()
+        self.momentum_markers()
+        self.job("reseal-open", op="MOMENTUM_OPEN", max_notional=8)
+        quantity = Decimal("0.04")
+        self.momentum_http.queue_position(quantity)
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 0)
+
+        standing = self.valid_acceptance(max_notional="8")
+        self.job("reseal-exit", op="MOMENTUM_EXIT")
+        self.momentum_http.queue_position(quantity, mark_price="200")
+        self.momentum_http.queue_position(Decimal("0"), mark_price=None)
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 0)
+
+        expired = self.accept_path + ".expired-" + utc(NOW)
+        self.assertFalse(os.path.exists(self.accept_path))
+        self.assertTrue(os.path.isfile(expired))
+        with open(expired, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), standing)
+        self.assertEqual(
+            list(Path(self.receipt_dir).glob("ACCEPT-ONE.expired-*")),
+            [Path(expired)],
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+        before_intents = list(self.momentum_http.intents)
+        before_expired = os.stat(expired)
+        self.job("reseal-queued-entry", op="MOMENTUM_OPEN", max_notional=8)
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 2)
+
+        refused = self.results()[-1]
+        self.assertEqual(refused["job_id"], "reseal-queued-entry")
+        self.assertEqual(refused["verdict"], "REFUSED")
+        self.assertEqual(self.momentum_http.intents, before_intents)
+        self.assertEqual(len(self.hand_calls), 0)
+        self.assertEqual(len(self.basis_calls), 0)
+        after_expired = os.stat(expired)
+        self.assertEqual(after_expired.st_ino, before_expired.st_ino)
+        self.assertEqual(
+            after_expired.st_mtime_ns, before_expired.st_mtime_ns
+        )
+        self.assertEqual(
+            list(Path(self.receipt_dir).glob("ACCEPT-ONE.expired-*")),
+            [Path(expired)],
+        )
+
     def test_pre_close_marker_entry_is_clamped_to_eight(self):
         self.write_operator()
         self.valid_acceptance()
-        self.job("cap-first", max_notional=99)
+        self.job("cap-first", max_notional=32)
 
         self.assertEqual(self.tick(), 0)
 
@@ -596,7 +693,7 @@ class AcceptOneReworkTests(unittest.TestCase):
         )
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write("prior-close %s\n" % utc(NOW - timedelta(minutes=1)))
-        self.job("cap-proven", max_notional=99)
+        self.job("cap-proven", max_notional=32)
 
         self.assertEqual(self.tick(), 0)
 
@@ -604,6 +701,17 @@ class AcceptOneReworkTests(unittest.TestCase):
         self.assertEqual(self.hand_calls[0]["max_notional"], "32")
         self.assertEqual(self.hand_calls[0]["module_max_notional"], "32")
         self.assertEqual(jr.limits.PER_LEG_CAP_USDT, Decimal("32"))
+
+    def test_job_bound_is_effective_below_ticket_and_clamp(self):
+        self.write_operator()
+        self.valid_acceptance(max_notional="32")
+        self.job("cap-job", max_notional=6)
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(len(self.hand_calls), 1)
+        self.assertEqual(self.hand_calls[0]["max_notional"], "6")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "6")
 
 
 if __name__ == "__main__":

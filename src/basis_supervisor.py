@@ -67,6 +67,7 @@ from job_runner import (
     _entry_outcome_succeeded,
     _entry_outcome_terminal,
     _entry_ticket_refusal,
+    _load_operator,
     _paths,
     _release_governor,
     _release_recovered_governor,
@@ -307,7 +308,7 @@ def _call_capped_open(cfg: PositionConfig, request, sleep, now_ms,
             basis_position.load_entry_proposal = original_loader
 
 
-def _basis_entry_job(candidate: ProposalCandidate, claimant: str,
+def _basis_entry_job(candidate: ProposalCandidate, requested_by: str,
                      cap: Optional[Decimal]) -> Job:
     requested = candidate.requested_notional
     effective = min(requested, cap) if cap is not None else requested
@@ -323,7 +324,7 @@ def _basis_entry_job(candidate: ProposalCandidate, claimant: str,
             candidate.created_ms / 1000, timezone.utc),
         expires_utc=datetime.fromtimestamp(
             candidate.expires_ms / 1000, timezone.utc),
-        requested_by=_text(claimant, 128),
+        requested_by=requested_by,
     )
 
 
@@ -692,6 +693,7 @@ def _tick(cfg: PositionConfig, request, *,
           rejects: Optional[Dict[str, int]] = None) -> int:
     """Run exactly one restart-safe supervisor cycle."""
     rejects = rejects if rejects is not None else {}
+    operator = _load_operator(_paths(cfg.receipt_dir)["operator"])
     claimant = claimant or _default_claimant()
 
     # Reconcile before every decision whenever position state (or its shared
@@ -717,23 +719,15 @@ def _tick(cfg: PositionConfig, request, *,
         lock_stands = os.path.exists(os.path.join(cfg.receipt_dir, LOCK_FILE))
         ownership_inconsistent = (state == ST_OPEN and not lock_stands) \
             or (state in (ST_NONE, ST_CLOSED) and lock_stands)
-        if resume_code != 0 or state in FREEZE_STATES or position is None:
-            _row("TICK", "FROZEN",
-                 "reconciliation is the only action; state %s"
-                 % (state or "UNREADABLE"))
-            return EXIT_FROZEN
-        if ownership_inconsistent:
-            _row("TICK", "FROZEN",
-                 "reconciliation is the only action; state/lock ownership "
-                 "is inconsistent")
-            return EXIT_FROZEN
-        proposal_id = position.get("proposal_id")
+        proposal_id = position.get("proposal_id") if position else None
         recovered_token = _claim_governor_token(cfg, proposal_id) \
             if isinstance(proposal_id, str) else ""
+        acceptance_claimed = True
         if recovered_token:
-            acceptance_claimed = True
-            entry = position.get("entry")
-            if state in (ST_OPEN, ST_CLOSED) and isinstance(entry, dict):
+            entry = position.get("entry") if position else None
+            consumes_ticket = state == ST_ONE_LEG or (
+                state in (ST_OPEN, ST_CLOSED) and isinstance(entry, dict))
+            if consumes_ticket:
                 digest = position.get("proposal_digest")
                 if not isinstance(digest, str):
                     acceptance_claimed = False
@@ -751,6 +745,17 @@ def _tick(cfg: PositionConfig, request, *,
                         cfg.receipt_dir, RUNNER_STOP_FILE))
                     _count_reject(rejects, "accept_one_claim_failed")
                     _row("ENTRY", "FROZEN", "ACCEPT_ONE_CLAIM_FAILED")
+        if resume_code != 0 or state in FREEZE_STATES or position is None:
+            _row("TICK", "FROZEN",
+                 "reconciliation is the only action; state %s"
+                 % (state or "UNREADABLE"))
+            return EXIT_FROZEN
+        if ownership_inconsistent:
+            _row("TICK", "FROZEN",
+                 "reconciliation is the only action; state/lock ownership "
+                 "is inconsistent")
+            return EXIT_FROZEN
+        if recovered_token:
             if acceptance_claimed and _release_recovered_governor(
                     recovered_token, cfg.receipt_dir):
                 if not _write_claim_governor_token(
@@ -824,9 +829,10 @@ def _tick(cfg: PositionConfig, request, *,
 
     # CLOSED/NONE state does not stand.  STOP gates only entry; reconciliation,
     # checks, and exits above never consult it.
-    if os.path.exists(os.path.join(cfg.receipt_dir, STOP_FILE)):
-        _row("ENTRY", "SKIPPED", "STOP file present")
-        return EXIT_IDLE
+    for seal_name in (STOP_FILE, RUNNER_STOP_FILE):
+        if os.path.exists(os.path.join(cfg.receipt_dir, seal_name)):
+            _row("ENTRY", "SKIPPED", "%s file present" % seal_name)
+            return EXIT_IDLE
 
     tick_ms = now_ms()
     try:
@@ -837,6 +843,10 @@ def _tick(cfg: PositionConfig, request, *,
     if candidate is None:
         _row("ENTRY", "IDLE", "no valid proposal")
         return EXIT_IDLE
+    if operator is None or not operator.strip() or len(operator) > 128:
+        _count_reject(rejects, "operator_mismatch")
+        _row("ENTRY", "HELD", "OPERATOR_MISMATCH")
+        return EXIT_HELD
     try:
         claimed = _claim(candidate, cfg, claimant, tick_ms)
     except OSError as error:
@@ -885,7 +895,7 @@ def _tick(cfg: PositionConfig, request, *,
             return EXIT_FROZEN
 
     notional_cap = _entry_notional_cap(cfg.receipt_dir)
-    entry_job = _basis_entry_job(claimed_candidate, claimant, notional_cap)
+    entry_job = _basis_entry_job(claimed_candidate, operator, notional_cap)
     ticket_refusal = _entry_ticket_refusal(
         entry_job, _paths(cfg.receipt_dir),
         datetime.fromtimestamp(tick_ms / 1000, timezone.utc))

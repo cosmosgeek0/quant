@@ -81,6 +81,13 @@ BASIS_ACCEPTANCE_READY = bool(
         or _module_mentions(bs, "ENTRY_BLOCKED_NOT_ACCEPTED")
     )
 )
+BASIS_OPERATOR_IDENTITY_READY = bool(
+    BASIS_ACCEPTANCE_READY
+    and (
+        _module_mentions(bs, "OPERATOR_MISMATCH")
+        or any("operator" in name.lower() for name in vars(bs))
+    )
+)
 
 NOW = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
 NOW_TEXT = "2026-08-14T12:00:00.000Z"
@@ -501,6 +508,58 @@ class AcceptanceLifecycleE2ETests(_OfflineCase):
     "basis universal acceptance gate has not landed",
 )
 class BasisAcceptanceE2ETests(_OfflineCase):
+    def basis_fixture(self, *, with_operator, with_accept_one,
+                      proposal_id):
+        from tests.test_basis_position import (
+            SHA as BASIS_SHA,
+            ScriptedTransport,
+            T_OPEN,
+            happy_spec,
+            proposal_payload,
+        )
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        receipt_dir = Path(holder.name)
+        self.deny_network()
+        self.install_governor()
+        env = mock.patch.dict(
+            os.environ, {"QUANT_SHA": BASIS_SHA}, clear=False
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+        if with_operator:
+            (receipt_dir / "OPERATOR").write_text(
+                json.dumps({"operator": OPERATOR}), encoding="utf-8"
+            )
+        if with_accept_one:
+            opened = datetime.fromtimestamp(T_OPEN / 1000, timezone.utc)
+            (receipt_dir / "ACCEPT-ONE").write_text(
+                json.dumps({
+                    "operator": OPERATOR,
+                    "created_utc": _utc(opened - timedelta(minutes=1)),
+                    "expires_utc": _utc(opened + timedelta(minutes=10)),
+                    "max_notional": "32",
+                }),
+                encoding="utf-8",
+            )
+        proposal_dir = receipt_dir / bp.PROPOSAL_DIR
+        proposal_dir.mkdir(mode=0o700)
+        (proposal_dir / ("proposal-" + proposal_id + ".json")).write_text(
+            json.dumps(proposal_payload(proposal_id), sort_keys=True),
+            encoding="utf-8",
+        )
+        cfg = bp.PositionConfig(
+            symbol="",
+            sha=BASIS_SHA,
+            receipt_dir=str(receipt_dir),
+            max_hold_ms=86400000,
+            min_remaining_edge_pct=Decimal("0.01"),
+            max_adverse_move_pct=Decimal("0.5"),
+        )
+        return receipt_dir, cfg, ScriptedTransport(happy_spec()), T_OPEN
+
     def test_basis_tick_without_accept_one_refuses_before_transport(self):
         from tests.test_basis_position import (
             SHA as BASIS_SHA,
@@ -556,6 +615,94 @@ class BasisAcceptanceE2ETests(_OfflineCase):
         self.assertEqual(transport.calls, [])
         self.assertIsNone(bp.load_position(str(receipt_dir)))
         self.assertFalse((receipt_dir / "ACCEPT-ONE").exists())
+
+    @unittest.skipUnless(
+        BASIS_OPERATOR_IDENTITY_READY,
+        "basis OPERATOR identity interface has not landed",
+    )
+    def test_basis_entry_uses_operator_value_not_pid_identity(self):
+        proposal_id = "basis-operator-identity"
+        receipt_dir, cfg, transport, tick_ms = self.basis_fixture(
+            with_operator=True,
+            with_accept_one=True,
+            proposal_id=proposal_id,
+        )
+        claimant = "pid-424242"
+        acquired = []
+        releases = []
+
+        def acquire(job, directory):
+            acquired.append((job, directory))
+
+            def release(token, released_dir):
+                releases.append((token, released_dir))
+
+            return "basis-operator-slot", release, ""
+
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.object(
+                bs, "_acquire_governor", side_effect=acquire):
+            code = bs.tick(
+                cfg,
+                transport,
+                sleep=lambda _seconds: None,
+                now_ms=lambda: tick_ms,
+                claimant=claimant,
+            )
+
+        text = output.getvalue()
+        self.assertEqual(code, bs.EXIT_ACTED, text)
+        self.assertEqual(len(acquired), 1)
+        entry_job, directory = acquired[0]
+        self.assertEqual(directory, str(receipt_dir))
+        self.assertEqual(entry_job.requested_by, OPERATOR)
+        self.assertNotEqual(entry_job.requested_by, claimant)
+        self.assertEqual(len(transport.posts), 2)
+        self.assertFalse((receipt_dir / "ACCEPT-ONE").exists())
+        self.assertTrue((receipt_dir / (
+            "ACCEPT-ONE.claimed-" + proposal_id
+        )).is_file())
+        self.assertEqual(
+            releases, [("basis-operator-slot", str(receipt_dir))]
+        )
+
+    @unittest.skipUnless(
+        BASIS_OPERATOR_IDENTITY_READY,
+        "basis OPERATOR identity interface has not landed",
+    )
+    def test_basis_entry_without_operator_refuses_before_claim(self):
+        proposal_id = "basis-missing-operator"
+        receipt_dir, cfg, transport, tick_ms = self.basis_fixture(
+            with_operator=False,
+            with_accept_one=True,
+            proposal_id=proposal_id,
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output), \
+                mock.patch.object(bs, "_claim", return_value=False) as claim, \
+                mock.patch.object(bs, "cmd_open") as open_call, \
+                mock.patch.object(bs, "_acquire_governor") as acquire:
+            code = bs.tick(
+                cfg,
+                transport,
+                sleep=lambda _seconds: None,
+                now_ms=lambda: tick_ms,
+                claimant="pid-424242",
+            )
+
+        text = output.getvalue()
+        self.assertEqual(code, bs.EXIT_HELD, text)
+        self.assertIn("OPERATOR_MISMATCH", text)
+        claim.assert_not_called()
+        open_call.assert_not_called()
+        acquire.assert_not_called()
+        self.assertEqual(transport.calls, [])
+        self.assertTrue((receipt_dir / "ACCEPT-ONE").is_file())
+        self.assertFalse((receipt_dir / bp.PROPOSAL_DIR / (
+            "proposal-" + proposal_id + ".claim"
+        )).exists())
+        self.assertIsNone(bp.load_position(str(receipt_dir)))
 
 
 if __name__ == "__main__":

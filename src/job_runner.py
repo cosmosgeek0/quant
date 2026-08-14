@@ -322,7 +322,6 @@ def _paths(receipt_dir: str) -> Dict[str, str]:
         "momentum_position": os.path.join(
             receipt_dir, "momentum-position.json"
         ),
-        "bare_stop": os.path.join(receipt_dir, "STOP"),
         "stop": os.path.join(receipt_dir, "STOP-JOBS"),
         "accept_one": os.path.join(receipt_dir, "ACCEPT-ONE"),
         "operator": os.path.join(receipt_dir, "OPERATOR"),
@@ -353,6 +352,8 @@ def _entry_ticket_refusal(job: Job, paths: Dict[str, str],
     if operator is None or job.requested_by != operator \
             or acceptance.operator != operator:
         return "OPERATOR_MISMATCH"
+    if job.requested_max_notional > acceptance.max_notional:
+        return "ACCEPT_ONE_NOTIONAL_EXCEEDED"
     return ""
 
 
@@ -365,6 +366,26 @@ def _consume_accept_one(path: str, job_id: str) -> bool:
         return False
     try:
         os.rename(path, claim_path)
+    except OSError:
+        return False
+    try:
+        directory = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        pass
+    return True
+
+
+def _expire_accept_one(path: str, now: datetime) -> bool:
+    """Atomically retire any ticket standing when a lifecycle seals flat."""
+    expired_path = os.path.join(
+        os.path.dirname(path), "ACCEPT-ONE.expired-" + _utc_text(now)
+    )
+    try:
+        os.rename(path, expired_path)
     except OSError:
         return False
     try:
@@ -1850,12 +1871,15 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
         published_job = os.path.isfile(os.path.join(
             paths["jobs"], "job-%s.json" % job_id
         ))
-        if op == "MOMENTUM_EXIT" and published_job:
+        clean_momentum_close = op == "MOMENTUM_EXIT" and published_job
+        if clean_momentum_close:
             proof_path = paths["first_autonomous_close"]
         if proof_path:
             _write_proof_marker(proof_path, job_id, _utc_text(now))
         if op == "MOMENTUM_EXIT":
             _touch_stop(paths["stop"])
+        if clean_momentum_close:
+            _expire_accept_one(paths["accept_one"], now)
     if outcome.verdict in FREEZE_VERDICTS:
         _touch_stop(paths["stop"])
     _append_result(paths, job_id, op, symbol, outcome, now)
@@ -1874,7 +1898,11 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
     try:
         position = _load_momentum_position(paths)
     except MomentumStateError:
-        print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_POSITION")
+        _touch_stop(paths["stop"])
+        _append_adverse_stop_event(
+            paths, "adverse_stop_refusal", "", now,
+            "UNKNOWN_POSITION",
+        )
         return 2, None, False
     if position is not None and position["state"] == "UNKNOWN":
         _touch_stop(paths["stop"])
@@ -1892,10 +1920,18 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
             "persisted effective notional",
         )
     except MomentumStateError:
-        print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_CONFIG")
+        _touch_stop(paths["stop"])
+        _append_adverse_stop_event(
+            paths, "adverse_stop_refusal", position["symbol"], now,
+            "UNKNOWN_CONFIG",
+        )
         return 2, None, False
     if not SHA_RE.fullmatch(sha):
-        print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_CONFIG")
+        _touch_stop(paths["stop"])
+        _append_adverse_stop_event(
+            paths, "adverse_stop_refusal", position["symbol"], now,
+            "UNKNOWN_CONFIG",
+        )
         return 2, None, False
 
     values = {
@@ -1909,6 +1945,7 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
         try:
             measured = _momentum_measure(position["symbol"])
         except Exception as error:
+            _touch_stop(paths["stop"])
             _append_adverse_stop_event(
                 paths, "adverse_stop_refusal", position["symbol"], now,
                 type(error).__name__,
@@ -1922,9 +1959,10 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
                 "persisted entry price",
             )
         except MomentumStateError:
-            print(
-                "JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | "
-                "UNKNOWN_ENTRY_PRICE"
+            _touch_stop(paths["stop"])
+            _append_adverse_stop_event(
+                paths, "adverse_stop_refusal", position["symbol"], now,
+                "UNKNOWN_ENTRY_PRICE",
             )
             return 2, None, False
         try:
@@ -1932,6 +1970,7 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
                 measured.get("price"), "current mark price"
             )
         except MomentumStateError as error:
+            _touch_stop(paths["stop"])
             _append_adverse_stop_event(
                 paths, "adverse_stop_refusal", position["symbol"], now,
                 type(error).__name__,
@@ -1941,7 +1980,11 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
         side = entry.get("side", "LONG")
         # _one_way_position rejects negative amounts, so only LONG is reachable.
         if side not in ("LONG", "BUY"):
-            print("JOB-RUNNER | MAX_ADVERSE_STOP | REFUSED | UNKNOWN_SIDE")
+            _touch_stop(paths["stop"])
+            _append_adverse_stop_event(
+                paths, "adverse_stop_refusal", position["symbol"], now,
+                "UNKNOWN_SIDE",
+            )
             return 2, None, False
         adverse_pct = (
             (entry_price - current_price) * Decimal("100") / entry_price

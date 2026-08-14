@@ -22,6 +22,9 @@ import momentum_live as live
 
 
 FIXED_NOW = "2026-08-14T12:00:00.000Z"
+DECISION_ONLY_SHADOW_READY = (
+    "evaluation_state" in live.run_tick.__code__.co_varnames
+)
 
 
 def fixed_now():
@@ -798,7 +801,11 @@ class MomentumLiveTests(unittest.TestCase):
         )
         self.assertEqual(set(self.jobs_by_op()), {live.JOB_OPEN_OP})
 
-    def test_decision_only_records_open_without_runner_or_receipt_writes(self):
+    @unittest.skipUnless(
+        DECISION_ONLY_SHADOW_READY,
+        "decision-only shadow state has not landed",
+    )
+    def test_decision_only_ignition_preserves_state_then_enters_normally(self):
         def denied(*_args, **_kwargs):
             raise AssertionError("decision-only touched the runner")
 
@@ -809,29 +816,32 @@ class MomentumLiveTests(unittest.TestCase):
         ), mock.patch.object(
             live, "reconcile_runner_truth", side_effect=denied
         ):
-            results = [
-                self.tick(
-                    stream_payload(0, "100", "2", "100", "1000"),
-                    decision_only=True,
-                    job_writer=denied,
+            results = []
+            results.append(self.tick(
+                stream_payload(0, "100", "2", "100", "1000"),
+                decision_only=True,
+                job_writer=denied,
+            ))
+            results.append(self.tick(
+                stream_payload(
+                    1, "105", "70", "7000", "1050",
+                    spread_pct="0.008",
                 ),
-                self.tick(
-                    stream_payload(
-                        1, "105", "70", "7000", "1050",
-                        spread_pct="0.008",
-                    ),
-                    decision_only=True,
-                    job_writer=denied,
+                decision_only=True,
+                job_writer=denied,
+            ))
+            state_before = self.state.read_bytes()
+            token_before = lifecycle.load_state(
+                self.state
+            ).tokens["AAAUSDT"]
+            results.append(self.tick(
+                stream_payload(
+                    2, "108", "75", "7600", "1070",
+                    spread_pct="0.007",
                 ),
-                self.tick(
-                    stream_payload(
-                        2, "108", "75", "7600", "1070",
-                        spread_pct="0.007",
-                    ),
-                    decision_only=True,
-                    job_writer=denied,
-                ),
-            ]
+                decision_only=True,
+                job_writer=denied,
+            ))
 
         self.assertEqual(
             [result.decisions[0]["action"] for result in results],
@@ -849,7 +859,24 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertEqual(results[-1].written_job_ids, ())
         self.assertEqual(self.job_paths(), [])
         self.assertFalse(self.receipts.exists())
-        self.assertIs(self.decision_rows()[-1]["decision_only"], True)
+        persisted_row = self.decision_rows()[-1]
+        self.assertIs(persisted_row["decision_only"], True)
+        self.assertEqual(persisted_row["decision_id"], row["decision_id"])
+        self.assertEqual(self.state.read_bytes(), state_before)
+        token_after = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token_after["phase"], lifecycle.PHASE_WATCH)
+        self.assertEqual(
+            (
+                token_after["phase"],
+                token_after["open_job_id"],
+                token_after["exit_job_id"],
+            ),
+            (
+                token_before["phase"],
+                token_before["open_job_id"],
+                token_before["exit_job_id"],
+            ),
+        )
 
         resumed = self.tick(
             stream_payload(
@@ -857,9 +884,17 @@ class MomentumLiveTests(unittest.TestCase):
             )
         )
         self.assertEqual(resumed.recovered_job_ids, ())
-        self.assertEqual(resumed.written_job_ids, ())
-        self.assertEqual(self.job_paths(), [])
+        self.assertEqual(
+            resumed.decisions[0]["action"], lifecycle.ACTION_ENTER_SMALL
+        )
+        self.assertNotIn("decision_only", resumed.decisions[0])
+        self.assertEqual(len(resumed.written_job_ids), 1)
+        self.assertEqual(set(self.jobs_by_op()), {live.JOB_OPEN_OP})
 
+    @unittest.skipUnless(
+        DECISION_ONLY_SHADOW_READY,
+        "decision-only shadow state has not landed",
+    )
     def test_decision_only_records_standing_exit_without_publication(self):
         self.signal()
         open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
@@ -872,6 +907,8 @@ class MomentumLiveTests(unittest.TestCase):
         )
         jobs_before = self.job_paths()
         receipts_before = self.receipts.read_bytes()
+        state_before = self.state.read_bytes()
+        token_before = lifecycle.load_state(self.state).tokens["AAAUSDT"]
 
         def denied(*_args, **_kwargs):
             raise AssertionError("decision-only touched the runner")
@@ -898,8 +935,12 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertEqual(result.written_job_ids, ())
         self.assertEqual(self.job_paths(), jobs_before)
         self.assertEqual(self.receipts.read_bytes(), receipts_before)
-        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
-        self.assertEqual(token["exit_job_id"], row["job"]["job_id"])
+        self.assertEqual(self.state.read_bytes(), state_before)
+        token_after = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(
+            (token_after["phase"], token_after["exit_job_id"]),
+            (token_before["phase"], token_before["exit_job_id"]),
+        )
 
     def test_manage_only_publishes_standing_exit_when_both_flags_are_set(self):
         self.signal()

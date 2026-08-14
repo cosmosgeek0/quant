@@ -1111,7 +1111,7 @@ def _decision_row(
             token["symbol"],
             str(decision.get("action", "")),
             evidence["observation_id"],
-            decision.get("receipt_id"),
+            None if decision_only else decision.get("receipt_id"),
             decision_utc,
         ),
         "decision_utc": decision_utc,
@@ -1408,16 +1408,37 @@ def run_tick(
             if symbol_decision_only
             else Path(receipt_path)
         )
+        persisted_token = state.tokens.get(symbol)
+        evaluation_state = state
+        if symbol_decision_only:
+            evaluation_state = lifecycle.LifecycleState(
+                tokens={}
+                if persisted_token is None
+                else {symbol: copy.deepcopy(persisted_token)}
+            )
         record = records.get(symbol)
         if record is None:
             decision = lifecycle.process_missing_token(
-                state, symbol, resolved_config, symbol_receipt_path, now_fn
+                evaluation_state,
+                symbol,
+                resolved_config,
+                symbol_receipt_path,
+                now_fn,
             )
         else:
             decision = lifecycle.process_record(
-                state, record, resolved_config, symbol_receipt_path, now_fn
+                evaluation_state,
+                record,
+                resolved_config,
+                symbol_receipt_path,
+                now_fn,
             )
-        token = state.tokens[symbol]
+        token = evaluation_state.tokens[symbol]
+        if symbol_decision_only and (
+            persisted_token is None
+            or token.get("phase") == persisted_token.get("phase")
+        ):
+            state.tokens[symbol] = copy.deepcopy(token)
         ignition_utc = token.get("ignition_utc") or ignition_by_symbol.get(symbol)
         if isinstance(ignition_utc, str):
             ignition_by_symbol[symbol] = ignition_utc
@@ -1437,7 +1458,10 @@ def run_tick(
         job = row["job"]
         if job is not None:
             lifecycle.bind_job_id(
-                state, symbol, str(decision.get("action")), job["job_id"]
+                evaluation_state,
+                symbol,
+                str(decision.get("action")),
+                job["job_id"],
             )
             row["lifecycle_state"] = _state_snapshot(token)
         append_decision(Path(decisions_path), row)

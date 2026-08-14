@@ -198,9 +198,9 @@ supervisor_stage() {
   python3 "$DEPLOY_DIR/src/basis_supervisor.py" --tick
 }
 
-# STOP seals entries while the public observation chain continues. STOP-JOBS
-# independently seals momentum publication. Standing exposure additionally
-# receives manage-only HOLD/EXIT decisions under either seal.
+# STOP and STOP-JOBS both seal basis entry publication while the public
+# observation chain continues. Standing exposure additionally receives
+# manage-only HOLD/EXIT decisions under either seal.
 if [ -e "$STOP_FILE" ]; then
   echo "RUNTIME | observation under STOP | entries sealed"
 fi
@@ -211,7 +211,7 @@ run_stage feed "0" \
 run_stage stream "0" \
   stream_stage
 
-if [ -e "$STOP_FILE" ]; then
+if [ -e "$STOP_FILE" ] || [ -e "$STOP_JOBS_FILE" ]; then
   run_stage basis_watch "0" \
     python3 "$DEPLOY_DIR/src/basis_watch.py" --once \
       --receipt-dir "$RECEIPT_DIR" \

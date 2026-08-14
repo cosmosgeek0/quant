@@ -490,7 +490,7 @@ class JobRunnerTests(unittest.TestCase):
 
     def open_momentum(self, job_id="open", max_notional=6):
         self.momentum_markers()
-        self.write_accept_one()
+        self.write_accept_one(max_notional=str(max_notional))
         marker = os.path.join(
             self.receipt_dir, "first_autonomous_close_passed"
         )
@@ -507,7 +507,7 @@ class JobRunnerTests(unittest.TestCase):
 
     def open_momentum_http(self, job_id="http-open", max_notional=6):
         self.momentum_markers()
-        self.write_accept_one()
+        self.write_accept_one(max_notional=str(max_notional))
         marker = os.path.join(
             self.receipt_dir, "first_autonomous_close_passed"
         )
@@ -544,6 +544,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.reason(self.results()[0]), "BAD_OP")
 
     def test_oversize_notional_is_clamped_to_first_trade_cap(self):
+        self.write_accept_one(max_notional="800")
         self.job("clamped", max_notional=800)
         self.assertEqual(self.tick(), 0)
         self.assertEqual(len(self.hand_calls), 1)
@@ -837,6 +838,7 @@ class JobRunnerTests(unittest.TestCase):
         )))
 
     def test_basis_is_sequence_locked_then_accepted_after_marker(self):
+        self.write_accept_one(max_notional="99")
         self.job("basis1", op="BASIS_ROUNDTRIP", max_notional=99)
         self.assertEqual(self.tick(), 2)
         first = self.results()[0]
@@ -903,6 +905,7 @@ class JobRunnerTests(unittest.TestCase):
         Path(os.path.join(self.jobs_dir, "futures_proof_passed")).touch()
         Path(os.path.join(self.jobs_dir, "basis_proof_passed")).touch()
         self.leverage.current = 5
+        self.write_accept_one(max_notional="800")
         self.job(
             "momentum-clamped", op="MOMENTUM_ROUNDTRIP", max_notional=800
         )
@@ -1237,6 +1240,71 @@ class JobRunnerTests(unittest.TestCase):
         ))
         self.assertNotIn(
             "JOB-RUNNER | IDLE | no due unclaimed job", printed
+        )
+
+    def _assert_persisted_adverse_stop_refusal(
+            self, job_id, expected_error, field=None, value=None,
+            corrupt=False):
+        quantity = self.open_momentum_http(job_id + "-open")
+        state_path = os.path.join(
+            self.receipt_dir, "momentum-position.json"
+        )
+        if corrupt:
+            with open(state_path, "w", encoding="utf-8") as handle:
+                handle.write("{not-json")
+        else:
+            state = self.momentum_state()
+            state["entry"][field] = value
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+            self.queue_momentum_measurement(quantity)
+        before_intents = list(self.momentum_intents)
+
+        with self.momentum_http_runtime():
+            self.assertEqual(self.tick(), 2)
+
+        events = self.result_events("adverse_stop_refusal")
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0].get("symbol"), str)
+        event = dict(events[0])
+        del event["symbol"]
+        self.assertEqual(event, {
+            "kind": "adverse_stop_refusal",
+            "error": expected_error,
+            "utc": utc(NOW),
+        })
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertEqual(self.momentum_intents, before_intents)
+
+    @unittest.skipUnless(
+        hasattr(jr, "_max_adverse_stop"),
+        "max-adverse-stop interface has not landed",
+    )
+    def test_corrupt_position_file_writes_typed_refusal_and_seals(self):
+        self._assert_persisted_adverse_stop_refusal(
+            "adverse-corrupt", "UNKNOWN_POSITION", corrupt=True
+        )
+
+    @unittest.skipUnless(
+        hasattr(jr, "_max_adverse_stop"),
+        "max-adverse-stop interface has not landed",
+    )
+    def test_bad_persisted_price_writes_typed_refusal_and_seals(self):
+        self._assert_persisted_adverse_stop_refusal(
+            "adverse-bad-price", "UNKNOWN_ENTRY_PRICE",
+            field="price", value="not-a-decimal",
+        )
+
+    @unittest.skipUnless(
+        hasattr(jr, "_max_adverse_stop"),
+        "max-adverse-stop interface has not landed",
+    )
+    def test_unknown_side_writes_typed_refusal_and_seals(self):
+        self._assert_persisted_adverse_stop_refusal(
+            "adverse-unknown-side", "UNKNOWN_SIDE",
+            field="side", value="SIDEWAYS",
         )
 
     def test_max_adverse_stop_runs_while_stop_seals_entries(self):

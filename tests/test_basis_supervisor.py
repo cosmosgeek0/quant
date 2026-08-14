@@ -48,6 +48,32 @@ ALT_SYMBOL = "ETHUSDT"
 ALT_BASE = "ETH"
 
 
+def _basis_operator_identity_ready():
+    if any("operator" in name.lower() for name in vars(bs)):
+        return True
+    code = getattr(bs._tick, "__code__", None)
+    if code is None:
+        return False
+
+    def mentions(value):
+        return any(
+            item == "OPERATOR_MISMATCH" or (
+                hasattr(item, "co_consts") and mentions(item))
+            for item in value.co_consts
+        )
+
+    return mentions(code)
+
+
+BASIS_OPERATOR_IDENTITY_READY = _basis_operator_identity_ready()
+BASIS_DUAL_SEAL_READY = any(
+    value == "STOP-JOBS" for value in vars(bp).values()
+)
+BASIS_ITEMS_16_TO_18_READY = (
+    BASIS_OPERATOR_IDENTITY_READY and BASIS_DUAL_SEAL_READY
+)
+
+
 def setUpModule():
     def deny(*args, **kwargs):
         raise AssertionError("network access attempted in offline tests")
@@ -96,6 +122,7 @@ class BasisSupervisorTests(unittest.TestCase):
         self.governor_jobs = []
         self.governor_releases = []
         self.write_proposal()
+        self.write_operator()
 
     def acquire_governor(self, job, receipt_dir):
         self.governor_jobs.append((job, receipt_dir))
@@ -152,6 +179,11 @@ class BasisSupervisorTests(unittest.TestCase):
     def position(self):
         return bp.load_position(self.dir)
 
+    def write_operator(self, operator="test-supervisor"):
+        with open(os.path.join(self.dir, "OPERATOR"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"operator": operator}, handle, sort_keys=True)
+
     def write_accept_one(self, operator="test-supervisor"):
         created = datetime.fromtimestamp(
             T_OPEN / 1000, timezone.utc).replace(microsecond=0)
@@ -165,9 +197,7 @@ class BasisSupervisorTests(unittest.TestCase):
         with open(os.path.join(self.dir, bs.ACCEPT_ONE_FILE), "w",
                   encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
-        with open(os.path.join(self.dir, "OPERATOR"), "w",
-                  encoding="utf-8") as handle:
-            json.dump({"operator": operator}, handle, sort_keys=True)
+        self.write_operator(operator)
 
     def run_tick(self, transport, claimant="test-supervisor", *,
                  accept_result=True, governor_result=None,
@@ -295,6 +325,57 @@ class BasisSupervisorTests(unittest.TestCase):
         self.assertEqual(self.position()["state"], bp.ST_UNKNOWN)
         self.assertEqual(len(self.governor_jobs), 1)
         self.assertEqual(self.governor_releases, [])
+
+    @unittest.skipUnless(
+        BASIS_ITEMS_16_TO_18_READY,
+        "basis ONE_LEG consuming recovery interface has not landed",
+    )
+    def test_one_leg_recovery_consumes_ticket_but_retains_governor_and_lock(
+            self):
+        self.write_accept_one()
+        unknown_spec = happy_spec()
+        unknown_spec["legs"]["enter_short"] = {
+            "submit": ("unclear", {"http": 504}),
+            "query": [lambda _params: ("unclear", {})],
+        }
+
+        code, output = self.run_tick(
+            ScriptedTransport(unknown_spec), accept_result=None)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertEqual(self.position()["state"], bp.ST_UNKNOWN)
+        accept_path = os.path.join(self.dir, bs.ACCEPT_ONE_FILE)
+        claimed_path = accept_path + ".claimed-" + PROPOSAL_ID
+        self.assertTrue(os.path.isfile(accept_path))
+        self.assertFalse(os.path.exists(claimed_path))
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, bp.LOCK_FILE)))
+        with open(self.claim_path(), encoding="utf-8") as handle:
+            self.assertEqual(
+                json.load(handle)["governor_token"],
+                "basis-governor-token",
+            )
+        self.assertEqual(self.governor_releases, [])
+
+        resume_spec = happy_spec()
+        resume_spec["legs"]["enter_short"] = {"query": [MISSING]}
+        transport = ScriptedTransport(resume_spec)
+        with mock.patch.object(
+                bs, "_release_recovered_governor",
+                return_value=True) as recovered_release:
+            code, output = self.run_tick(transport, accept_result=None)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertEqual(self.position()["state"], bp.ST_ONE_LEG)
+        self.assertFalse(os.path.exists(accept_path))
+        self.assertTrue(os.path.isfile(claimed_path))
+        recovered_release.assert_not_called()
+        self.assertEqual(self.governor_releases, [])
+        with open(self.claim_path(), encoding="utf-8") as handle:
+            self.assertEqual(
+                json.load(handle)["governor_token"],
+                "basis-governor-token",
+            )
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, bp.LOCK_FILE)))
 
     def test_reconciled_unknown_releases_persisted_governor_slot(self):
         unknown_spec = happy_spec()
@@ -604,6 +685,102 @@ class BasisSupervisorTests(unittest.TestCase):
                          ["exit_short", "exit_spot"])
         self.assertEqual(self.position()["state"], bp.ST_CLOSED)
         self.assertIn("DECISION: REQUEST_EXIT", output)
+        self.assertIn("SUPERVISOR | CLOSE | AUTOMATIC", output)
+        self.assertNotIn("SUPERVISOR | ENTRY", output)
+
+    @unittest.skipUnless(
+        BASIS_DUAL_SEAL_READY,
+        "basis STOP-JOBS entry seal interface has not landed",
+    )
+    def test_cmd_open_refuses_under_either_entry_seal_before_transport(self):
+        for seal_name in (bp.STOP_FILE, bs.RUNNER_STOP_FILE):
+            with self.subTest(seal=seal_name), tempfile.TemporaryDirectory() \
+                    as receipt_dir:
+                proposal_dir = Path(receipt_dir, bp.PROPOSAL_DIR)
+                proposal_dir.mkdir(mode=0o700)
+                Path(proposal_dir, "proposal-%s.json" % PROPOSAL_ID).write_text(
+                    json.dumps(proposal_payload(PROPOSAL_ID), sort_keys=True),
+                    encoding="utf-8",
+                )
+                Path(receipt_dir, seal_name).touch()
+                cfg = dataclasses.replace(
+                    self.cfg, receipt_dir=receipt_dir, symbol=SYMBOL)
+                transport = ScriptedTransport(happy_spec())
+                output = io.StringIO()
+
+                with redirect_stdout(output):
+                    code = bp.cmd_open(
+                        cfg, transport, sleep=lambda _seconds: None,
+                        now_ms=lambda: T_OPEN, proposal_id=PROPOSAL_ID)
+
+                self.assertEqual(code, bp.EXIT_CODE["BLOCKED"],
+                                 output.getvalue())
+                self.assertEqual(transport.calls, [])
+                self.assertIsNone(bp.load_position(receipt_dir))
+                self.assertFalse(Path(receipt_dir, bp.LOCK_FILE).exists())
+
+    @unittest.skipUnless(
+        BASIS_DUAL_SEAL_READY,
+        "basis STOP-JOBS entry seal interface has not landed",
+    )
+    def test_supervisor_refuses_entry_under_either_seal_before_claim(self):
+        self.write_accept_one()
+        accept_path = Path(self.dir, bs.ACCEPT_ONE_FILE)
+
+        for seal_name in (bp.STOP_FILE, bs.RUNNER_STOP_FILE):
+            with self.subTest(seal=seal_name):
+                seal_path = Path(self.dir, seal_name)
+                seal_path.touch()
+                transport = ScriptedTransport(happy_spec())
+                with mock.patch.object(
+                        bs, "_claim", return_value=False) as claim, \
+                        mock.patch.object(bs, "cmd_open") as open_call, \
+                        mock.patch.object(bs, "_acquire_governor") as acquire:
+                    code, output = self.run_tick(
+                        transport, patch_entry_gates=False)
+
+                self.assertIn(code, (bs.EXIT_HELD, bs.EXIT_IDLE), output)
+                claim.assert_not_called()
+                open_call.assert_not_called()
+                acquire.assert_not_called()
+                self.assertEqual(transport.calls, [])
+                self.assertTrue(accept_path.is_file())
+                self.assertFalse(os.path.exists(self.claim_path()))
+                seal_path.unlink()
+
+    @unittest.skipUnless(
+        BASIS_DUAL_SEAL_READY,
+        "basis STOP-JOBS entry seal interface has not landed",
+    )
+    def test_stop_jobs_keeps_open_position_exit_running(self):
+        self.open_directly()
+        Path(self.dir, bs.RUNNER_STOP_FILE).touch()
+        spec = happy_spec()
+        spec["spot_book"] = {
+            "symbol": SYMBOL, "bidPrice": "100.0", "askPrice": "100.0"}
+        spec["usdm_book"] = {
+            "symbol": SYMBOL, "bidPrice": "100.0", "askPrice": "100.1",
+            "time": T_OPEN}
+        transport = PositionSequenceTransport(
+            spec, [[{"symbol": SYMBOL, "positionAmt": "-0.098"}],
+                   FLAT_POSITION])
+
+        with mock.patch.object(
+                bs, "_entry_ticket_refusal",
+                side_effect=AssertionError("exit consulted entry ticket")), \
+                mock.patch.object(
+                    bs, "_consume_accept_one",
+                    side_effect=AssertionError("exit consulted ACCEPT-ONE")), \
+                mock.patch.object(
+                    bs, "_acquire_governor",
+                    side_effect=AssertionError("exit consulted governor")):
+            code, output = self.run_tick(
+                transport, patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertEqual(post_stages(transport.base),
+                         ["exit_short", "exit_spot"])
+        self.assertEqual(self.position()["state"], bp.ST_CLOSED)
         self.assertIn("SUPERVISOR | CLOSE | AUTOMATIC", output)
         self.assertNotIn("SUPERVISOR | ENTRY", output)
 
