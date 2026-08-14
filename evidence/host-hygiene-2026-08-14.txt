@@ -1,0 +1,9 @@
+HOST HYGIENE APPLY (safe subset; Lead-read script, single-sudo, no service restarts)
+journald: persistent, capped 1G/64M files, 30d retention — restarted+rotated, usage 109.0M
+logrotate: cosmos-runtime + cloudflared policies installed, syntax verified
+unit hardening drop-ins (activate next restart): cosmos-app (inert, retired unit) + cloudflared —
+  Restart=on-failure, NoNewPrivileges, ProtectSystem, kernel protections, TasksMax, UMask 0027
+permissions: /home/ssm-user/quant-run 0750; top dirs 6 -> 0750; top files 18 -> 0640
+excluded by design: credentials, exchange keys, money code, live actions
+follow-up queued: same drop-in set for quant-ui.service (created after the digest)
+machine verified ticking after apply (health row advancing)
