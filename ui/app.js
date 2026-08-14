@@ -697,95 +697,33 @@ function techDrawer(payload) {
 
 /* ---------- cockpit strip (contract §4) ---------- */
 
-var CK_CELLS = [
-  ["exec", "Execution", true], ["auth", "Authority", false],
-  ["equity", "Equity", false], ["net", "Net today", false],
-  ["expo", "Exposure", false], ["risk", "Risk", false],
-  ["data", "Data", true]
-];
-function buildCockpit() {
-  var strip = document.getElementById("cockpit");
-  CK_CELLS.forEach(function (cell) {
-    var box = el("div", "ck-cell");
-    box.id = "ck-" + cell[0];
-    box.appendChild(el("p", "ck-l", cell[1]));
-    box.appendChild(el("p", "ck-v" + (cell[2] ? " ck-lamp" : ""), ""));
-    box.appendChild(el("p", "ck-s", ""));
-    strip.appendChild(box);
-  });
-}
-function setCell(name, value, tone, sub, title) {
-  var cell = document.getElementById("ck-" + name);
-  if (!cell) return;
-  var v = cell.querySelector(".ck-v");
-  var lamp = v.classList.contains("ck-lamp");
-  v.className = "ck-v" + (lamp ? " ck-lamp" : "") +
-    (tone ? " " + tone : "");
-  if (v.textContent !== value) v.textContent = value;
-  var s = cell.querySelector(".ck-s");
-  if (s.textContent !== (sub || "")) s.textContent = sub || "";
-  cell.title = title || "";
-}
+/* Global truth lives as compact topbar chips (owner order: no big
+   status bar). Execution phase, data freshness, seals — owner words
+   only; the raw machine word never renders (§4, #26). */
 function renderStrip() {
   var strip = state.data.strip;
   if (!strip) return;
+  var chips = clearTo("statuschips");
   var phase = currentPhase();
   var phaseTone = phase === "Attention" ? "bad" :
-    (phase === "Offline" ? "off" :
-      (phase === "Watching" || phase === "Evaluating" ? "good" : "warn"));
-  setCell("exec", phase, phaseTone,
-    ownerStopLine(strip.stop_present, strip.stop_jobs_present));
-  setCell("auth", "Unavailable", "off", "No operator contract yet",
-    "Entry authority is never inferred from machine flags.");
-  setCell("equity", "Unavailable", "off", "No account contract yet");
-  setCell("net", "Unavailable", "off", "Ledger incomplete");
+    (phase === "Offline" ? "" :
+      (phase === "Watching" || phase === "Evaluating" ? "ok" : "warn"));
+  var stopLine = ownerStopLine(strip.stop_present,
+    strip.stop_jobs_present);
+  chips.appendChild(chip(phase, phaseTone, stopLine ? "sealed" : null));
   var expo = exposureLines();
-  if (expo.length === 0) setCell("expo", "None", null, "Flat");
-  else {
-    var first = expo[0];
-    setCell("expo", first.symbol, "warn",
-      first.strategy + " · " + ownerPhaseForState(first.st) +
-      (expo.length > 1 ? " · +" + (expo.length - 1) + " more" : ""));
-  }
-  var gov = strip.governor || {};
-  if (gov.present) {
-    setCell("risk", gov.entries_used + " of " + gov.entries_cap,
-      gov.entries_used >= gov.entries_cap ? "bad" :
-        (gov.entries_used > 0 ? "warn" : null),
-      "loss+fees " + gov.loss_fees_used_usdt + " of " +
-      gov.loss_fees_cap_usdt + " USDT");
-  } else {
-    setCell("risk", "0 of 5", null, "No entries recorded today",
-      "The governor day ledger has no rows today; caps are code law.");
+  if (expo.length > 0) {
+    chips.appendChild(chip(expo[0].symbol, "warn",
+      expo.length > 1 ? "+" + (expo.length - 1) + " more" : "open"));
   }
   var pull = strip.pull || {};
-  if (!pull.present) {
-    setCell("data", "Unavailable", "off", "No data delivery yet");
-  } else if (pull.ok === false || pull.level === "red") {
-    setCell("data", "Stale", "bad",
-      "Delivery stopped " + ageText(pull.age_seconds));
-  } else if (pull.level === "amber") {
-    setCell("data", "Delayed", "warn",
-      "Updated " + ageText(pull.age_seconds));
-  } else {
-    setCell("data", "Live", "good",
-      "Updated " + ageText(pull.age_seconds));
-  }
-  var chips = clearTo("statuschips");
   var pullTone = !pull.present ? "" :
     (pull.level === "green" ? "ok" :
       (pull.level === "amber" ? "warn" : "bad"));
-  chips.appendChild(chip("Mirror", pullTone,
-    pull.present ? ageText(pull.age_seconds) : "none"));
-  /* Owner words only — the raw machine word never renders (§4, #26).
-     Absent seals in the mirror prove nothing. */
-  if (strip.stop_present) {
-    chips.appendChild(chip("Paused", "ok", "entries sealed"));
-  } else if (strip.stop_jobs_present) {
-    chips.appendChild(chip("Entries paused", "ok", "jobs sealed"));
-  } else {
-    chips.appendChild(chip("Seals", "", "not in mirror"));
-  }
+  chips.appendChild(chip(!pull.present ? "No data" :
+    (pull.level === "green" ? "Live" :
+      (pull.level === "amber" ? "Delayed" : "Stale")), pullTone,
+    pull.present ? ageText(pull.age_seconds) : null));
 }
 
 /* ---------- nav + page band + router ---------- */
@@ -1134,9 +1072,8 @@ window.QuantUI = {
 
 if (typeof document !== "undefined") {
   document.addEventListener("DOMContentLoaded", function () {
-    if (!document.getElementById("cockpit")) return;
+    if (!document.getElementById("sidenav")) return;
     applyPrefs();
-    buildCockpit();
     buildNav();
     buildAppearance();
     var pal = buildPalette();
