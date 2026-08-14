@@ -350,6 +350,15 @@ section.block > h2, .card > h2 {
 .ov-grid { margin-bottom: 16px; }
 .stat-row { margin-bottom: 16px; }
 
+/* Quant page: activity 65 / policy 35 */
+.quantwrap {
+  display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px;
+  align-items: start;
+}
+@media (max-width: 980px) {
+  .quantwrap { grid-template-columns: 1fr; }
+}
+
 .bignum {
   font-family: var(--mono); font-size: 27px; font-weight: 720;
   font-variant-numeric: tabular-nums; margin: 0; letter-spacing: -0.02em;
