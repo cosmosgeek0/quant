@@ -8,8 +8,9 @@
   live volume into momentum; basis_watch actually wired to the supervisor
   on the host; ONE unified runtime control, one STOP, real commit identity,
   failure propagation, UI paths matching runtime truth.
-- DEPLOYED PAUSED 2026-08-14 (release 26b5a8d2): unified cron live, RELEASE
-  identity valid, both STOP interlocks verified, ticks green and honest.
+- DEPLOYED PAUSED 2026-08-14 (release 26b5a8d2, superseded same day by
+  7dcfd195 with the commander tracks): unified cron live, RELEASE identity
+  valid, both STOP interlocks verified, ticks green and honest.
 - THEN: the runner — not a human, not a pasted job — takes ONE naturally
   generated capped live trade, holds it across ticks, exits from the
   strategy, and records exact fills, fees, P&L, balances, flatness.
@@ -21,11 +22,20 @@
   are the current build.
 
 ## Truth (measured 2026-08-14)
-- Runtime ALIVE-PAUSED on host: release 26b5a8d2 deployed, 11 files
-  sha-verified host == local, cron unified (runner 1m + runtime chain 3m),
-  RELEASE identity valid, both STOP interlocks present, ticks honest IDLE
-  (re-measured 2026-08-14T02:46Z; no new jobs since the three CLOSED proofs).
-- Built and green (789 tests): token stream (TRADING+PERPETUAL universe,
+- Runtime ALIVE-PAUSED on host: release 7dcfd195 deployed (RELEASE byte-read
+  matches, seat-verified 2026-08-14T03:44Z), cron unified (runner 1m + runtime
+  chain 3m), BOTH STOP interlocks present, no ACCEPT-ONE flag anywhere,
+  supervisor honest IDLE every 3 min, market feed honestly STOPPED (feed
+  stage runs only when STOP absent — runtime_tick.sh:175), no jobs since the
+  three CLOSED proofs.
+- Commander tracks live (815 tests, seat re-run green in 4s): STOP blocks NEW
+  ENTRIES ONLY (exits+reconciliation sacred), account governor (one entry
+  lock across strategies, daily budgets 5 entries / 1.00 USDT loss+fees,
+  fail-closed), ACCEPT-ONE one-shot entry override consumed atomically by
+  the runner then resealed, feed supervised into the runtime, executable
+  sizing metadata. Exact acceptance-moment sequence: being pinned from code
+  by a codex read — do not accept until it is on record here.
+- Built and green: token stream (TRADING+PERPETUAL universe,
   measured live 132 spot-only / 167 perp-only / 357 both = 656), momentum
   lifecycle (APRUSDT fixture passes), stream-fed basis, six live-truth UI
   endpoints, proposal-only entry, full-equation net edge, supervisor with
