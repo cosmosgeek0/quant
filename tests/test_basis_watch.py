@@ -318,11 +318,15 @@ class StubKernel:
 
 def universe_row(symbol: str, entry_bps: str = "78",
                  fits: bool = True, spot_step: str = "0.001",
-                 perp_step: str = "0.001") -> Dict[str, Any]:
+                 perp_step: str = "0.001",
+                 spot_min_notional: str = "5",
+                 perp_min_notional: str = "5") -> Dict[str, Any]:
     return {"symbol": symbol, "entry_gap_bps": D(entry_bps),
             "exit_gap_bps": D("0"), "funding_bps": D("1"),
             "min_valid_notional": D("5"), "fits_10_cap": fits,
-            "spot_step": D(spot_step), "perp_step": D(perp_step)}
+            "spot_step": D(spot_step), "perp_step": D(perp_step),
+            "spot_min_notional": D(spot_min_notional),
+            "perp_min_notional": D(perp_min_notional)}
 
 
 def funding_history_rows(period_ms: int, count: int = 3,
@@ -1256,6 +1260,91 @@ class ProposalFileTests(PipelineCase):
         quantity = D(proposal["quantity"])
         self.assertEqual(quantity % D("0.003"), D(0))
         self.assertEqual(quantity % D("0.002"), D(0))
+
+    def test_stream_metadata_replaces_unknown_quantity_with_real_sizing(self):
+        now = T0 + 2000
+        bundle = scenario_bundle(now, rate="0.01")
+        absent_path = os.path.join(self.tmp.name, "stream-absent.json")
+        with open(absent_path, "w", encoding="utf-8") as handle:
+            json.dump({"TESTUSDT": stream_record("0.78")}, handle)
+        cfg = watch_config({"persist_ticks": 1})
+        absent = Watch(self.state_path + ".absent", self.tmp.name, cfg)
+        absent_reads = StreamStateReads(
+            absent_path, FakeReads([], {"TESTUSDT": bundle}), cfg["stale_ms"])
+        absent_row = absent.run_pass(absent_reads, now)[0]
+        self.assertEqual(absent_row["proposal_status"],
+                         "refused_incomplete_proposal")
+
+        enriched = stream_record("0.78")
+        enriched.update({
+            "spot_step_size": "0.003", "perp_step_size": "0.002",
+            "spot_min_notional": "9.5", "perp_min_notional": "9.5",
+        })
+        enriched_path = os.path.join(self.tmp.name, "stream-enriched.json")
+        with open(enriched_path, "w", encoding="utf-8") as handle:
+            json.dump({"TESTUSDT": enriched}, handle)
+        watch = Watch(self.state_path + ".enriched", self.tmp.name, cfg)
+        reads = StreamStateReads(
+            enriched_path, FakeReads([], {"TESTUSDT": bundle}),
+            cfg["stale_ms"])
+        row = watch.run_pass(reads, now)[0]
+
+        self.assertEqual(row["proposal_status"], "written")
+        with open(self.paths()[0], encoding="utf-8") as handle:
+            proposal = json.load(handle)
+        quantity = D(proposal["quantity"])
+        self.assertEqual(quantity, D("0.096"))
+        self.assertEqual(quantity % D("0.003"), D(0))
+        self.assertEqual(quantity % D("0.002"), D(0))
+        self.assertGreaterEqual(quantity * D(proposal["spot_ask"]), D("9.5"))
+        self.assertGreaterEqual(quantity * D(proposal["perp_bid"]), D("9.5"))
+
+    def test_stream_min_notional_that_cannot_fit_refuses_quantity(self):
+        now = T0 + 2000
+        record = stream_record("0.78")
+        record.update({
+            "spot_step_size": "0.001", "perp_step_size": "0.001",
+            "spot_min_notional": "10", "perp_min_notional": "10",
+        })
+        path = os.path.join(self.tmp.name, "stream-too-small.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"TESTUSDT": record}, handle)
+        cfg = watch_config({"persist_ticks": 1})
+        reads = StreamStateReads(
+            path,
+            FakeReads([], {"TESTUSDT": scenario_bundle(now, rate="0.01")}),
+            cfg["stale_ms"])
+
+        row = Watch(self.state_path, self.tmp.name, cfg).run_pass(reads, now)[0]
+
+        self.assertEqual(row["proposal_status"],
+                         "refused_incomplete_proposal")
+        self.assertEqual(self.paths(), [])
+
+    def test_health_jsonl_records_success_failure_age_and_rejects(self):
+        now = T0 + 2000
+        watch = self.make_watch()
+        row = self.tick(watch, now, perp_ts=now - 4000)
+        self.assertEqual(row["reject_code"], "data_stale")
+
+        class BrokenReads:
+            def universe_rows(self):
+                raise basis_scan.ScanError("offline injected failure")
+
+        with self.assertRaises(basis_scan.ScanError):
+            watch.run_pass(BrokenReads(), now + 5000)
+        with open(os.path.join(self.tmp.name, basis_watch.HEALTH_FILE_NAME),
+                  encoding="utf-8") as handle:
+            health = [json.loads(line) for line in handle if line.strip()]
+
+        self.assertEqual(len(health), 2)
+        self.assertEqual(health[0]["component"], "basis_watch")
+        self.assertEqual(health[0]["state_counts"]["REJECTED"], 1)
+        self.assertEqual(health[0]["reject_histogram"], {"data_stale": 1})
+        self.assertEqual(health[0]["last_pass_age_ms"], 0)
+        self.assertEqual(health[1]["status"], "ERROR")
+        self.assertEqual(health[1]["error"], "ScanError")
+        self.assertEqual(health[1]["last_pass_age_ms"], 5000)
 
     def test_negative_net_kernel_proposal_is_refused(self):
         class NegativeProposalKernel:

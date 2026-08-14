@@ -11,7 +11,9 @@ the files written beneath RECEIPT_DIR:
   /api/fees        commission-rates.json verbatim
   /api/pnl         explicit P&L blocks in CLOSED/reconcile basis receipts
   /api/events      the recorded spot-run fixture, history only
-  /api/health      bind, method, and resolved-source facts
+  /api/health      service ticks, job-log tail, stop flags, and tick ages
+  /api/decisions   recent momentum decisions with recorded signal evidence
+  /api/failures    recent REFUSED/UNKNOWN job results and recorded reasons
 
 Missing sources are honest empty responses. Malformed input is counted, never
 repaired. GET and HEAD are the only accepted methods. The server never writes a
@@ -21,6 +23,7 @@ file and never calls the network.
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -33,6 +36,21 @@ BIND_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
 STREAM_TOP_N = 20
 RECENT_MOMENTUM_RECEIPTS = 50
+RECENT_HEALTH_RECORDS = 200
+RECENT_JOB_LOG_LINES = 40
+RECENT_DECISIONS = 50
+RECENT_FAILURES = 50
+FAILURE_SCAN_RECORDS = 250
+TAIL_BYTES = 1024 * 1024
+HEALTH_AMBER_AFTER_SECONDS = 90
+HEALTH_RED_AFTER_SECONDS = 300
+JOB_AMBER_AFTER_SECONDS = 90
+JOB_RED_AFTER_SECONDS = 180
+
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+UTC_IN_TEXT_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+)
 
 PROPOSAL_REQUIRED_FIELDS = frozenset({
     "proposal_id", "created_utc", "expires_utc", "quant_sha",
@@ -73,6 +91,14 @@ def default_sources():
         "fees": receipt_dir / "commission-rates.json",
         "momentum_state": receipt_dir / "momentum-paper-state.json",
         "momentum_receipts": receipt_dir / "momentum-paper-receipts.jsonl",
+        "health": receipt_dir / "health.jsonl",
+        "jobs_log": Path(os.path.expanduser(os.environ.get(
+            "JOBS_LOG", str(UI_DIR.parent / "jobs.log")))),
+        "stop": receipt_dir / "STOP",
+        "stop_jobs": receipt_dir / "STOP-JOBS",
+        "momentum_decisions": UI_DIR.parent / "decisions.jsonl",
+        "job_results": receipt_dir / "jobs" / "results.jsonl",
+        "job_receipts_dir": receipt_dir / "jobs" / "receipts",
     }
 
 
@@ -113,6 +139,48 @@ def _read_jsonl(path):
     return True, records, parse_errors
 
 
+def _read_tail_lines(path, limit):
+    """Return a bounded tail without treating a partial first line as data."""
+    try:
+        with open(path, "rb") as handle:
+            end = handle.seek(0, os.SEEK_END)
+            start = max(0, end - TAIL_BYTES)
+            handle.seek(start)
+            raw = handle.read()
+    except OSError:
+        return False, [], 0, False
+    truncated = start > 0
+    if truncated:
+        boundary = raw.find(b"\n")
+        raw = raw[boundary + 1:] if boundary >= 0 else b""
+    encoding_errors = 0
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+        encoding_errors = 1
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return True, lines[-limit:], encoding_errors, truncated
+
+
+def _read_jsonl_tail(path, limit, scan_limit=None):
+    """Return valid objects from a bounded JSONL tail in file order."""
+    line_limit = scan_limit or max(limit * 4, limit)
+    present, lines, parse_errors, truncated = _read_tail_lines(
+        path, line_limit)
+    if not present:
+        return False, [], 0, False
+    records = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        records.append(value)
+    return True, records[-limit:], parse_errors, truncated
+
+
 def _path_as_of(path):
     """UTC mtime for a read source, used only when the record has no clock."""
     try:
@@ -125,8 +193,9 @@ def _path_as_of(path):
 
 def _record_as_of(record, fallback=None):
     if isinstance(record, dict):
-        for key in ("as_of", "updated_utc", "updated_at", "ts",
-                    "timestamp", "finished_utc", "closed_utc", "created_utc"):
+        for key in ("as_of", "last_tick_utc", "tick_utc", "decision_utc",
+                    "updated_utc", "updated_at", "utc", "ts", "timestamp",
+                    "finished_utc", "closed_utc", "created_utc"):
             if record.get(key) not in (None, ""):
                 return record[key]
     return fallback
@@ -157,6 +226,23 @@ def _parse_utc(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _age_seconds(value, now):
+    parsed = _parse_utc(value)
+    if parsed is None:
+        return None
+    age = (now - parsed).total_seconds()
+    if age < 0:
+        return None
+    return round(age, 3)
+
+
+def _positive_seconds(value):
+    number = _finite_decimal(value)
+    if number is None or number <= 0:
+        return None
+    return float(number)
 
 
 def _stream_symbols(payload):
@@ -551,18 +637,363 @@ def api_pnl(sources):
     return payload
 
 
-def api_health(sources):
+def _reported_health_level(record):
+    if not isinstance(record, dict):
+        return None, None
+    value = None
+    for key in ("level", "health", "status", "state", "verdict"):
+        if record.get(key) not in (None, ""):
+            value = str(record[key])
+            break
+    if value is None:
+        return None, None
+    normalized = value.strip().upper()
+    if normalized in {"RED", "ERROR", "FAILED", "FAIL", "DOWN", "HALTED",
+                      "UNKNOWN", "REFUSED"} \
+            or "ERROR" in normalized or "FAIL" in normalized \
+            or "UNKNOWN" in normalized or "REFUSED" in normalized:
+        return value, "red"
+    if normalized in {"AMBER", "WARN", "WARNING", "DEGRADED", "STALE",
+                      "BLOCKED", "BUSY", "STOPPED"} \
+            or "WARN" in normalized or "DEGRADED" in normalized \
+            or "STALE" in normalized or "BLOCKED" in normalized:
+        return value, "amber"
+    if normalized in {"GREEN", "OK", "HEALTHY", "RUNNING", "PASS", "IDLE",
+                      "TICK"}:
+        return value, "green"
+    return value, None
+
+
+def _health_thresholds(record, amber_default, red_default):
+    cadence = None
+    if isinstance(record, dict):
+        for key in ("cadence_seconds", "interval_seconds", "tick_seconds"):
+            cadence = _positive_seconds(record.get(key))
+            if cadence is not None:
+                break
+    amber = None
+    red = None
+    if isinstance(record, dict):
+        for key in ("amber_after_seconds", "stale_after_seconds",
+                    "max_age_seconds"):
+            amber = _positive_seconds(record.get(key))
+            if amber is not None:
+                break
+        for key in ("red_after_seconds", "dead_after_seconds"):
+            red = _positive_seconds(record.get(key))
+            if red is not None:
+                break
+    if amber is None:
+        amber = cadence * 2 if cadence is not None else amber_default
+    if red is None:
+        red = cadence * 5 if cadence is not None else red_default
+    return amber, max(red, amber)
+
+
+def _health_level(record, age, amber_default=HEALTH_AMBER_AFTER_SECONDS,
+                  red_default=HEALTH_RED_AFTER_SECONDS):
+    reported, explicit = _reported_health_level(record)
+    amber_after, red_after = _health_thresholds(
+        record, amber_default, red_default)
+    if age is None:
+        return explicit or "red", reported, "reported_status" \
+            if explicit else "last_seen_unknown"
+    if age > red_after:
+        return "red", reported, "last_seen_age"
+    if age > amber_after and explicit != "red":
+        return "amber", reported, "last_seen_age"
+    if explicit is not None:
+        return explicit, reported, "reported_status"
+    return "green", reported, "last_seen_age"
+
+
+def _service_name(record):
+    if not isinstance(record, dict):
+        return None
+    for key in ("service", "component", "lane", "name", "worker"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _jobs_log_summary(path, now):
+    present, lines, encoding_errors, truncated = _read_tail_lines(
+        path, RECENT_JOB_LOG_LINES)
+    if not present:
+        return {
+            "source": str(path), "present": False, "as_of": None,
+            "last_tick_utc": None, "last_tick_age_seconds": None,
+            "last_tick_basis": None, "level": None, "level_basis": None,
+            "tail": [], "line_count": 0, "parse_errors": 0,
+            "tail_truncated": False,
+        }
+    tick_utc = None
+    tick_index = None
+    for index in range(len(lines) - 1, -1, -1):
+        match = UTC_IN_TEXT_RE.search(lines[index])
+        if match and _parse_utc(match.group(0)) is not None:
+            tick_utc = match.group(0)
+            tick_index = index
+            break
+    file_as_of = _path_as_of(path)
+    last_seen = tick_utc or file_as_of
+    age = _age_seconds(last_seen, now)
+    tick_lines = lines[tick_index:] if tick_index is not None else lines[-5:]
+    text = " ".join(tick_lines).upper()
+    reported = "OK"
+    if any(word in text for word in (
+            "UNKNOWN", "REFUSED", "HALTED", "TRACEBACK", " ERROR", "FAILED")):
+        reported = "ERROR"
+    elif any(word in text for word in ("WARNING", "WARN", "BUSY", "STOPPED")):
+        reported = "WARNING"
+    level, _, basis = _health_level(
+        {"status": reported}, age,
+        JOB_AMBER_AFTER_SECONDS, JOB_RED_AFTER_SECONDS)
+    return {
+        "source": str(path), "present": True, "as_of": file_as_of,
+        "last_tick_utc": last_seen, "last_tick_age_seconds": age,
+        "last_tick_basis": "log_timestamp" if tick_utc else "file_mtime",
+        "level": level, "level_basis": basis, "tail": lines,
+        "line_count": len(lines), "parse_errors": encoding_errors,
+        "tail_truncated": truncated,
+    }
+
+
+def api_health(sources, now=None):
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    path = sources["health"]
+    present, raw_records, parse_errors, truncated = _read_jsonl_tail(
+        path, RECENT_HEALTH_RECORDS)
+    file_as_of = _path_as_of(path) if present else None
+    latest = {}
+    for record in raw_records:
+        name = _service_name(record)
+        if name is None:
+            parse_errors += 1
+            continue
+        latest[name] = record
+
+    services = []
+    for name in sorted(latest):
+        record = latest[name]
+        record_as_of = _record_as_of(record)
+        last_seen = record_as_of or file_as_of
+        age = _age_seconds(last_seen, now)
+        level, reported, basis = _health_level(record, age)
+        services.append({
+            "service": name,
+            "level": level,
+            "level_basis": basis,
+            "reported_status": reported,
+            "last_seen_utc": last_seen,
+            "last_seen_age_seconds": age,
+            "last_seen_basis": "record" if record_as_of else "file_mtime",
+            "record": record,
+        })
+
+    jobs = _jobs_log_summary(sources["jobs_log"], now)
+    flags = {}
+    for label, source_name in (("STOP", "stop"), ("STOP-JOBS", "stop_jobs")):
+        flag_path = sources[source_name]
+        flag_present = flag_path.is_file()
+        flags[label] = {
+            "source": str(flag_path),
+            "present": flag_present,
+            "as_of": _path_as_of(flag_path) if flag_present else None,
+        }
+
+    levels = [service["level"] for service in services]
+    if jobs["level"] is not None:
+        levels.append(jobs["level"])
+    if any(flag["present"] for flag in flags.values()):
+        levels.append("red")
+    system_level = None
+    if levels:
+        system_level = "red" if "red" in levels else (
+            "amber" if "amber" in levels else "green")
+    as_of = _latest_as_of(
+        [service["last_seen_utc"] for service in services]
+        + [jobs["last_tick_utc"]]
+        + [flag["as_of"] for flag in flags.values()],
+        file_as_of)
+    last_tick_ages = {
+        service["service"]: service["last_seen_age_seconds"]
+        for service in services
+    }
+    if jobs["present"]:
+        last_tick_ages["jobs"] = jobs["last_tick_age_seconds"]
     return {
         "ok": True,
         "read_only": True,
         "bind": BIND_HOST,
         "methods": ["GET", "HEAD"],
-        "sources": {name: str(path) for name, path in sources.items()},
+        "source": str(path),
+        "present": present or jobs["present"]
+        or any(flag["present"] for flag in flags.values()),
+        "as_of": as_of,
+        "system_level": system_level,
+        "service_count": len(services),
+        "services": services,
+        "last_tick_ages": last_tick_ages,
+        "jobs_log": jobs,
+        "flags": flags,
+        "stop": flags["STOP"]["present"],
+        "stop_jobs": flags["STOP-JOBS"]["present"],
+        "parse_errors": parse_errors + jobs["parse_errors"],
+        "tail_truncated": truncated,
+        "sources": {name: str(source) for name, source in sources.items()},
+    }
+
+
+def api_decisions(sources):
+    path = sources["momentum_decisions"]
+    present, raw_records, parse_errors, truncated = _read_jsonl_tail(
+        path, RECENT_DECISIONS)
+    decisions = []
+    for record in raw_records:
+        if isinstance(record, dict):
+            decisions.append(record)
+        else:
+            parse_errors += 1
+    as_of = None
+    for record in reversed(decisions):
+        as_of = _record_as_of(record)
+        if as_of is not None:
+            break
+    if as_of is None and present:
+        as_of = _path_as_of(path)
+    return {
+        "source": str(path),
+        "present": present,
+        "as_of": as_of,
+        "count": len(decisions),
+        "decisions": decisions,
+        "parse_errors": parse_errors,
+        "tail_truncated": truncated,
+    }
+
+
+def _failure_verdict(record):
+    if not isinstance(record, dict):
+        return None
+    value = record.get("verdict")
+    if not isinstance(value, str):
+        return None
+    verdict = value.strip().upper()
+    if verdict == "UNKNOWN" or "REFUSED" in verdict:
+        return verdict
+    return None
+
+
+def _recorded_reason(record):
+    if not isinstance(record, dict):
+        return None
+    for key in ("reason", "verdict_note", "error", "detail", "note",
+                "exposure"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("first_failure", "result", "outcome"):
+        nested = record.get(key)
+        if isinstance(nested, dict):
+            reason = _recorded_reason(nested)
+            if reason is not None:
+                return reason
+    return None
+
+
+def _runner_receipt_reason(directory, job_id):
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return None, 0
+    present, receipt, errors = _read_json(directory / ("job-%s.json" % job_id))
+    if not present:
+        return None, 0
+    if errors or not isinstance(receipt, dict) \
+            or receipt.get("job_id") != job_id:
+        return None, errors + (0 if errors else 1)
+    return _recorded_reason(receipt), 0
+
+
+def _contained_receipt_reason(directory, raw_path):
+    """Read an explicitly named receipt only when it stays under its source."""
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None, 0
+    try:
+        root = directory.resolve()
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = directory / candidate
+        candidate = candidate.resolve()
+    except OSError:
+        return None, 0
+    if candidate.suffix != ".json" \
+            or (candidate != root and root not in candidate.parents):
+        return None, 0
+    present, receipt, errors = _read_json(candidate)
+    if not present:
+        return None, 0
+    if errors or not isinstance(receipt, dict):
+        return None, errors + (0 if errors else 1)
+    return _recorded_reason(receipt), 0
+
+
+def api_failures(sources):
+    path = sources["job_results"]
+    receipts_dir = sources["job_receipts_dir"]
+    present, raw_records, parse_errors, truncated = _read_jsonl_tail(
+        path, FAILURE_SCAN_RECORDS, scan_limit=FAILURE_SCAN_RECORDS * 2)
+    failures = []
+    for record in raw_records:
+        verdict = _failure_verdict(record)
+        if verdict is None:
+            if not isinstance(record, dict):
+                parse_errors += 1
+            continue
+        failure = dict(record)
+        reason = _recorded_reason(record)
+        reason_source = "result" if reason is not None else None
+        if reason is None:
+            reason, errors = _runner_receipt_reason(
+                receipts_dir, record.get("job_id"))
+            parse_errors += errors
+            if reason is not None:
+                reason_source = "runner_receipt"
+        if reason is None:
+            reason, errors = _contained_receipt_reason(
+                sources["basis_receipts_dir"], record.get("receipt_path"))
+            parse_errors += errors
+            if reason is not None:
+                reason_source = "receipt_path"
+        failure["verdict"] = verdict
+        failure["reason"] = reason
+        failure["reason_source"] = reason_source
+        failure["as_of"] = _record_as_of(record)
+        failures.append(failure)
+    failures = failures[-RECENT_FAILURES:]
+    source_as_of = _path_as_of(path) if present else None
+    as_of = None
+    for failure in reversed(failures):
+        as_of = failure.get("as_of")
+        if as_of is not None:
+            break
+    return {
+        "source": str(path),
+        "reason_source": str(receipts_dir),
+        "present": present,
+        "reason_source_present": receipts_dir.is_dir(),
+        "as_of": as_of or source_as_of,
+        "count": len(failures),
+        "failures": failures,
+        "parse_errors": parse_errors,
+        "tail_truncated": truncated,
     }
 
 
 API_ROUTES = {
     "/api/health": api_health,
+    "/api/decisions": api_decisions,
+    "/api/failures": api_failures,
     "/api/events": api_events,
     "/api/stream": api_stream,
     "/api/candidates": api_candidates,
@@ -673,6 +1104,13 @@ def main(argv=None):
     parser.add_argument("--fees-file", type=Path, default=None)
     parser.add_argument("--momentum-state", type=Path, default=None)
     parser.add_argument("--momentum-receipts", type=Path, default=None)
+    parser.add_argument("--health-file", type=Path, default=None)
+    parser.add_argument("--jobs-log", type=Path, default=None)
+    parser.add_argument("--stop-file", type=Path, default=None)
+    parser.add_argument("--stop-jobs-file", type=Path, default=None)
+    parser.add_argument("--momentum-decisions", type=Path, default=None)
+    parser.add_argument("--job-results", type=Path, default=None)
+    parser.add_argument("--job-receipts-dir", type=Path, default=None)
     args = parser.parse_args(argv)
 
     overrides = {}
@@ -685,7 +1123,14 @@ def main(argv=None):
             (args.basis_receipts_dir, "basis_receipts_dir"),
             (args.fees_file, "fees"),
             (args.momentum_state, "momentum_state"),
-            (args.momentum_receipts, "momentum_receipts")):
+            (args.momentum_receipts, "momentum_receipts"),
+            (args.health_file, "health"),
+            (args.jobs_log, "jobs_log"),
+            (args.stop_file, "stop"),
+            (args.stop_jobs_file, "stop_jobs"),
+            (args.momentum_decisions, "momentum_decisions"),
+            (args.job_results, "job_results"),
+            (args.job_receipts_dir, "job_receipts_dir")):
         if argument is not None:
             overrides[source] = argument
 

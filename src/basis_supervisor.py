@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from basis_position import (
     EMERGENCY_FILE,
@@ -63,6 +63,10 @@ EXIT_IDLE = 3
 FREEZE_STATES = frozenset((ST_UNKNOWN, ST_ONE_LEG, ST_OPENING, ST_CLOSING))
 CLOSE_DECISIONS = frozenset((REQUEST_EXIT, REQUEST_EMERGENCY_UNWIND))
 PROPOSAL_NAME_RE = re.compile(r"proposal-(.+)\.json")
+HEALTH_FILE_NAME = "health.jsonl"
+WATCH_STATE_PATH = os.path.join("watch", "basis_watch_state.json")
+POSITION_STATES = (ST_NONE, ST_OPENING, ST_ONE_LEG, ST_OPEN, ST_CLOSING,
+                   ST_CLOSED, ST_UNKNOWN)
 
 # Public identity for callers which need the complete pure ladder.  Runtime
 # market checks stay in cmd_check: the supervisor must not reproduce its
@@ -92,6 +96,89 @@ def _row(action: str, outcome: str, note: Any) -> None:
 def _utc_from_ms(value: int) -> str:
     return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(
         timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _count_reject(histogram: Dict[str, int], reason: str) -> None:
+    histogram[reason] = histogram.get(reason, 0) + 1
+
+
+def _append_health_jsonl(receipt_dir: str,
+                         payload: Dict[str, Any]) -> bool:
+    """Append one compact UI telemetry record without gating supervision."""
+    path = os.path.join(receipt_dir, HEALTH_FILE_NAME)
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":"))
+               + "\n").encode("utf-8")
+    descriptor: Optional[int] = None
+    try:
+        os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags, 0o600)
+        if os.write(descriptor, encoded) != len(encoded):
+            raise OSError("short health append")
+        os.fsync(descriptor)
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _watch_last_pass_ms(receipt_dir: str) -> Optional[int]:
+    path = os.path.join(receipt_dir, WATCH_STATE_PATH)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        value = payload["watermark"]["last_pass_ms"]
+    except (OSError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _append_tick_health(cfg: PositionConfig, now_ms: int,
+                        code: Optional[int], error: Optional[str],
+                        rejects: Dict[str, int]) -> bool:
+    try:
+        position = load_position(cfg.receipt_dir)
+    except PositionError:
+        position = {"state": ST_UNKNOWN}
+    state = position.get("state") if isinstance(position, dict) else ST_NONE
+    if state not in POSITION_STATES:
+        state = ST_UNKNOWN
+    state_counts = {name: 0 for name in POSITION_STATES}
+    state_counts[state] = 1
+    last_pass_ms = _watch_last_pass_ms(cfg.receipt_dir)
+    age = None
+    if last_pass_ms is not None and now_ms >= last_pass_ms:
+        age = now_ms - last_pass_ms
+    if error is not None or code is None or code == EXIT_FROZEN:
+        status = "ERROR"
+    elif rejects:
+        status = "DEGRADED"
+    elif code == EXIT_IDLE:
+        status = "IDLE"
+    else:
+        status = "OK"
+    payload: Dict[str, Any] = {
+        "component": "basis_supervisor",
+        "cycle": "tick",
+        "exit_code": code,
+        "last_pass_age_ms": age,
+        "last_pass_ms": last_pass_ms,
+        "reject_histogram": dict(sorted(rejects.items())),
+        "state_counts": state_counts,
+        "status": status,
+        "ts": _utc_from_ms(now_ms),
+    }
+    if error is not None:
+        payload["error"] = error
+    return _append_health_jsonl(cfg.receipt_dir, payload)
 
 
 def _created_ms(payload: dict) -> int:
@@ -130,7 +217,8 @@ def _load_candidate(cfg: PositionConfig, proposal_id: str,
         digest=accepted.digest)
 
 
-def _scan_newest_valid(cfg: PositionConfig, tick_ms: int
+def _scan_newest_valid(cfg: PositionConfig, tick_ms: int,
+                       rejects: Optional[Dict[str, int]] = None
                        ) -> Optional[ProposalCandidate]:
     """Validate all proposals; select best edge, then newest, in whitelist."""
     directory = os.path.join(cfg.receipt_dir, PROPOSAL_DIR)
@@ -150,16 +238,24 @@ def _scan_newest_valid(cfg: PositionConfig, tick_ms: int
             continue
         proposal_id = match.group(1)
         if PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
+            if rejects is not None:
+                _count_reject(rejects, "proposal_id_invalid")
             _row("PROPOSAL", "SKIPPED", "%s has an invalid id" % name)
             continue
         try:
             candidate = _load_candidate(cfg, proposal_id, tick_ms)
             if cfg.symbol and candidate.symbol != cfg.symbol:
+                if rejects is not None:
+                    _count_reject(rejects, "proposal_symbol_filtered")
                 _row("PROPOSAL", "FILTERED", "%s symbol %s"
                      % (proposal_id, candidate.symbol))
                 continue
             valid.append(candidate)
         except (KeyError, TypeError, ValueError, PositionError) as error:
+            if rejects is not None:
+                reason = "proposal_expired" if "expired" in str(error) \
+                    else "proposal_invalid"
+                _count_reject(rejects, reason)
             _row("PROPOSAL", "SKIPPED", "%s: %s"
                  % (proposal_id, _text(error, 220)))
     if not valid:
@@ -310,7 +406,48 @@ def _default_claimant() -> str:
 def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.sleep,
          now_ms: Callable[[], int] = default_now_ms,
          claimant: Optional[str] = None) -> int:
+    """Run one cycle and append one non-authoritative health snapshot."""
+    observed_times: List[int] = []
+    rejects: Dict[str, int] = {}
+    code: Optional[int] = None
+    error_name: Optional[str] = None
+
+    def tracked_now_ms() -> int:
+        value = now_ms()
+        observed_times.append(value)
+        return value
+
+    try:
+        code = _tick(cfg, request, sleep=sleep, now_ms=tracked_now_ms,
+                     claimant=claimant, rejects=rejects)
+        return code
+    except Exception as error:
+        error_name = type(error).__name__
+        _count_reject(rejects, "tick_error")
+        raise
+    finally:
+        if code == EXIT_FROZEN and not rejects:
+            _count_reject(rejects, "tick_frozen")
+        if observed_times:
+            health_now = observed_times[-1]
+        else:
+            try:
+                health_now = now_ms()
+            except Exception:
+                health_now = default_now_ms()
+        try:
+            _append_tick_health(cfg, health_now, code, error_name, rejects)
+        except Exception:
+            pass
+
+
+def _tick(cfg: PositionConfig, request, *,
+          sleep: Callable[[float], None] = time.sleep,
+          now_ms: Callable[[], int] = default_now_ms,
+          claimant: Optional[str] = None,
+          rejects: Optional[Dict[str, int]] = None) -> int:
     """Run exactly one restart-safe supervisor cycle."""
+    rejects = rejects if rejects is not None else {}
     claimant = claimant or _default_claimant()
 
     # Reconcile before every decision whenever position state (or its shared
@@ -410,8 +547,9 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
 
     tick_ms = now_ms()
     try:
-        candidate = _scan_newest_valid(cfg, tick_ms)
+        candidate = _scan_newest_valid(cfg, tick_ms, rejects)
     except OSError:
+        _count_reject(rejects, "proposal_scan_error")
         return EXIT_FROZEN
     if candidate is None:
         _row("ENTRY", "IDLE", "no valid proposal")
@@ -419,10 +557,12 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
     try:
         claimed = _claim(candidate, cfg, claimant, tick_ms)
     except OSError as error:
+        _count_reject(rejects, "claim_error")
         _row("CLAIM", "FROZEN", "%s: %s"
              % (candidate.proposal_id, type(error).__name__))
         return EXIT_FROZEN
     if not claimed:
+        _count_reject(rejects, "claim_owned")
         return EXIT_IDLE
 
     # The claim owns the proposal id.  Re-read the immutable proposal after
@@ -431,14 +571,17 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
         claimed_candidate = _load_candidate(
             cfg, candidate.proposal_id, tick_ms)
     except (KeyError, TypeError, ValueError, PositionError) as error:
+        _count_reject(rejects, "claimed_proposal_invalid")
         _row("CLAIM", "FROZEN", "%s: %s"
              % (candidate.proposal_id, _text(error, 220)))
         return EXIT_FROZEN
     if claimed_candidate.digest != candidate.digest:
+        _count_reject(rejects, "claimed_proposal_changed")
         _row("CLAIM", "FROZEN", "proposal %s changed during claim"
              % candidate.proposal_id)
         return EXIT_FROZEN
     if cfg.symbol and claimed_candidate.symbol != cfg.symbol:
+        _count_reject(rejects, "proposal_symbol_filtered")
         _row("CLAIM", "FROZEN", "proposal %s escaped symbol whitelist"
              % candidate.proposal_id)
         return EXIT_FROZEN
@@ -452,6 +595,8 @@ def tick(cfg: PositionConfig, request, *, sleep: Callable[[float], None] = time.
     _row("OPEN", "DONE" if open_code == 0 else "HELD",
          "proposal %s position command exit %s state %s"
          % (candidate.proposal_id, open_code, opened_state))
+    if open_code != 0:
+        _count_reject(rejects, "open_refused")
     if opened is not None and opened_state in FREEZE_STATES:
         return EXIT_FROZEN
     return EXIT_ACTED

@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
 
 import basis_position as bp  # noqa: E402
 import basis_supervisor as bs  # noqa: E402
+import basis_watch as bw  # noqa: E402
 from basis_position import PositionConfig  # noqa: E402
 from tests.test_basis_position import (  # noqa: E402
     FLAT_POSITION,
@@ -32,6 +33,12 @@ from tests.test_basis_position import (  # noqa: E402
     happy_spec,
     post_stages,
     proposal_payload,
+)
+from tests.test_basis_watch import (  # noqa: E402
+    FakeReads,
+    StubKernel,
+    scenario_bundle,
+    stream_record,
 )
 
 
@@ -168,6 +175,68 @@ class BasisSupervisorTests(unittest.TestCase):
         self.assertTrue(claim["utc"].endswith("Z"))
         self.assertLess(output.index("SUPERVISOR | CLAIM | CREATED"),
                         output.index("SUPERVISOR | OPEN | DONE"))
+
+    def test_stream_watch_builds_and_tick_claims_with_shared_health(self):
+        os.unlink(os.path.join(
+            self.dir, bp.PROPOSAL_DIR,
+            "proposal-%s.json" % PROPOSAL_ID))
+        stream = stream_record("0.78")
+        stream.update({
+            "spot_step_size": "0.0001", "perp_step_size": "0.001",
+            "spot_min_notional": "5", "perp_min_notional": "5",
+        })
+        feed_dir = os.path.join(self.dir, "feed")
+        os.makedirs(feed_dir, exist_ok=True)
+        stream_path = os.path.join(feed_dir, "stream_state.json")
+        with open(stream_path, "w", encoding="utf-8") as handle:
+            json.dump({SYMBOL: stream}, handle)
+        watch_cfg = bw.watch_config({"persist_ticks": 1})
+        watch_state = os.path.join(
+            self.dir, bw.WATCH_STATE_DIR_NAME, bw.STATE_FILE_NAME)
+        watch = bw.Watch(watch_state, self.dir, watch_cfg)
+        reads = bw.StreamStateReads(
+            stream_path,
+            FakeReads([], {SYMBOL: scenario_bundle(T_OPEN, rate="0.01")}),
+            watch_cfg["stale_ms"])
+
+        with mock.patch.object(bw, "basis_kernel", StubKernel()), \
+                mock.patch.dict(os.environ, {"QUANT_SHA": SHA}):
+            built = watch.run_pass(reads, T_OPEN)[0]
+
+        self.assertEqual(built["proposal_status"], "written")
+        proposal_id = built["proposal_id"]
+        proposal_path = os.path.join(
+            self.dir, bp.PROPOSAL_DIR,
+            "proposal-%s.json" % proposal_id)
+        with open(proposal_path, encoding="utf-8") as handle:
+            proposal = json.load(handle)
+        self.assertEqual(Decimal(proposal["quantity"]), Decimal("0.099"))
+
+        open_spec = happy_spec()
+        open_spec["spot_book"] = {
+            "symbol": SYMBOL, "bidPrice": proposal["spot_bid"],
+            "askPrice": proposal["spot_ask"],
+        }
+        open_spec["usdm_book"] = {
+            "symbol": SYMBOL, "bidPrice": proposal["perp_bid"],
+            "askPrice": proposal["perp_ask"], "time": T_OPEN,
+        }
+        code, output = self.run_tick(ScriptedTransport(open_spec))
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertTrue(os.path.exists(self.claim_path(proposal_id)))
+        self.assertEqual(self.position()["proposal_id"], proposal_id)
+        self.assertEqual(self.position()["state"], bp.ST_OPEN)
+        with open(os.path.join(self.dir, bs.HEALTH_FILE_NAME),
+                  encoding="utf-8") as handle:
+            health = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual([row["component"] for row in health],
+                         ["basis_watch", "basis_supervisor"])
+        self.assertEqual(health[0]["state_counts"]["PROPOSED"], 1)
+        self.assertEqual(health[1]["state_counts"][bp.ST_OPEN], 1)
+        self.assertEqual(health[1]["last_pass_age_ms"], 0)
+        self.assertEqual(health[1]["reject_histogram"], {})
+        self.assertEqual(health[1]["status"], "OK")
 
     def test_best_net_proposal_across_symbols_opens_its_symbol(self):
         better_id = "eth-better"

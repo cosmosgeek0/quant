@@ -11,6 +11,9 @@ var MOMENTUM_URL = "/api/momentum";
 var FEES_URL = "/api/fees";
 var PNL_URL = "/api/pnl";
 var EVENTS_URL = "/api/events";
+var HEALTH_URL = "/api/health";
+var DECISIONS_URL = "/api/decisions";
+var FAILURES_URL = "/api/failures";
 var REFRESH_MS = 2000;
 
 function valueText(value) {
@@ -31,6 +34,35 @@ function fmtPairs(obj) {
   return Object.keys(obj).map(function (key) {
     return key + " " + valueText(obj[key]);
   }).join(", ");
+}
+
+function ageText(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return "age unknown";
+  }
+  var seconds = Math.max(0, Number(value));
+  if (seconds < 60) return seconds.toFixed(seconds < 10 ? 1 : 0) + "s ago";
+  if (seconds < 3600) return (seconds / 60).toFixed(1) + "m ago";
+  return (seconds / 3600).toFixed(1) + "h ago";
+}
+
+function decisionEvidence(record) {
+  if (!record || typeof record !== "object") return null;
+  var nested = record.signal_evidence || record.signals || record.evidence;
+  if (nested && typeof nested === "object") return nested;
+  var keys = [
+    "stream_utc", "observation_id", "venues", "surge_ratio", "price",
+    "price_venue", "perp_price", "vol_1m_quote", "vol_med_1m", "oi",
+    "oi_change_pct", "basis_gap_pct", "freshness_ms", "add_checks",
+    "deterioration_checks", "job_eligible", "job_reason"
+  ];
+  var evidence = {};
+  keys.forEach(function (key) {
+    if (record[key] !== undefined && record[key] !== null) {
+      evidence[key] = record[key];
+    }
+  });
+  return Object.keys(evidence).length ? evidence : null;
 }
 
 function eventRow(event) {
@@ -159,6 +191,109 @@ if (typeof document !== "undefined") {
       })
       .then(render)
       .catch(function (error) { couldNotLoad(targetId, url, error); });
+  }
+
+  function healthCard(name, level, status, age) {
+    var safeLevel = ["green", "amber", "red"].indexOf(level) >= 0 ?
+      level : "red";
+    var card = el("div", "health-card health-" + safeLevel);
+    card.appendChild(el("p", "run-head", name));
+    card.appendChild(el("p", "health-state", safeLevel.toUpperCase()));
+    card.appendChild(el("p", "meta", status || "no reported status"));
+    card.appendChild(el("p", "meta", ageText(age)));
+    return card;
+  }
+
+  function renderHealth(payload) {
+    var root = clearTo("health");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present) {
+      empty(root, "no health ticks, job log, or asserted stop flags");
+      return;
+    }
+    var strip = el("div", "health-strip");
+    (payload.services || []).forEach(function (service) {
+      strip.appendChild(healthCard(
+        valueText(service.service), service.level,
+        service.reported_status ? "reported " + service.reported_status :
+          "level from " + valueText(service.level_basis),
+        service.last_seen_age_seconds));
+    });
+    var jobs = payload.jobs_log || {};
+    if (jobs.present) {
+      strip.appendChild(healthCard(
+        "job runner", jobs.level,
+        "last tick from " + valueText(jobs.last_tick_basis),
+        jobs.last_tick_age_seconds));
+    }
+    Object.keys(payload.flags || {}).forEach(function (name) {
+      var flag = payload.flags[name];
+      strip.appendChild(healthCard(
+        name, flag.present ? "red" : "green",
+        flag.present ? "flag present" : "flag clear",
+        flag.present ? null : 0));
+    });
+    root.appendChild(strip);
+    if ((payload.services || []).length === 0) {
+      empty(root, "no service records in health.jsonl");
+    }
+    if (jobs.present && jobs.tail && jobs.tail.length) {
+      var result = table(["recent jobs.log tail"]);
+      jobs.tail.forEach(function (line) {
+        var row = el("tr");
+        row.appendChild(el("td", "detail", line));
+        result.tbody.appendChild(row);
+      });
+      root.appendChild(result.table);
+    } else {
+      empty(root, "no jobs.log tail");
+    }
+  }
+
+  function renderDecisions(payload) {
+    var root = clearTo("decisions");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || !payload.decisions || payload.decisions.length === 0) {
+      empty(root, "no momentum decisions recorded");
+      return;
+    }
+    payload.decisions.slice().reverse().forEach(function (record) {
+      var box = el("div", "run");
+      box.appendChild(el("p", "run-head",
+        valueText(record.decision_utc || record.utc || record.ts || record.as_of) + " · " +
+        valueText(record.symbol) + " · " + valueText(record.action)));
+      box.appendChild(el("p", "meta", "reason: " + valueText(record.reason)));
+      var evidence = decisionEvidence(record);
+      if (evidence) {
+        box.appendChild(el("p", "run-head", "signal evidence"));
+        box.appendChild(objectTable(evidence));
+      } else {
+        empty(box, "no signal evidence recorded for this decision");
+      }
+      root.appendChild(box);
+    });
+  }
+
+  function renderFailures(payload) {
+    var root = clearTo("failures");
+    root.appendChild(sourceMeta(payload.source, payload.present, payload.as_of));
+    parseErrorMeta(root, payload.parse_errors);
+    if (!payload.present || !payload.failures || payload.failures.length === 0) {
+      empty(root, "no recent REFUSED or UNKNOWN result");
+      return;
+    }
+    payload.failures.slice().reverse().forEach(function (record) {
+      var box = el("div", "run failure");
+      box.appendChild(el("p", "run-head",
+        valueText(record.as_of || record.utc) + " · " +
+        valueText(record.symbol) + " · " + valueText(record.verdict)));
+      box.appendChild(el("p", "failure-reason",
+        "reason: " + valueText(record.reason)));
+      box.appendChild(objectTable(record));
+      root.appendChild(box);
+    });
   }
 
   function renderStream(payload) {
@@ -351,6 +486,9 @@ if (typeof document !== "undefined") {
   }
 
   function refreshRuntime() {
+    getJson(HEALTH_URL, renderHealth, "health");
+    getJson(DECISIONS_URL, renderDecisions, "decisions");
+    getJson(FAILURES_URL, renderFailures, "failures");
     getJson(STREAM_URL, renderStream, "stream");
     getJson(CANDIDATES_URL, renderCandidates, "candidates");
     getJson(POSITION_URL, renderPosition, "position");
@@ -369,6 +507,8 @@ if (typeof document !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     valueText: valueText,
+    ageText: ageText,
+    decisionEvidence: decisionEvidence,
     receiptPairs: receiptPairs,
     eventRow: eventRow,
     groupRuns: groupRuns

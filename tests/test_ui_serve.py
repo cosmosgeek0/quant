@@ -9,6 +9,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -135,6 +136,13 @@ class ServerHarness(unittest.TestCase):
             "momentum_state": missing_root / "momentum-paper-state.json",
             "momentum_receipts": (
                 missing_root / "momentum-paper-receipts.jsonl"),
+            "health": missing_root / "health.jsonl",
+            "jobs_log": missing_root / "jobs.log",
+            "stop": missing_root / "STOP",
+            "stop_jobs": missing_root / "STOP-JOBS",
+            "momentum_decisions": missing_root / "momentum-decisions.jsonl",
+            "job_results": missing_root / "jobs" / "results.jsonl",
+            "job_receipts_dir": missing_root / "jobs" / "receipts",
         }
 
 
@@ -143,12 +151,15 @@ class TestStaticServing(ServerHarness):
     def test_runtime_page_and_assets_serve_over_http(self):
         base = self.start({})
         for path, kind, markers in (
-                ("/", "text/html", (b"Live tokens", b"Realized P&amp;L",
+                ("/", "text/html", (b"System health", b"Momentum decisions",
+                                      b"Failures", b"Live tokens", b"Realized P&amp;L",
                                       b"History &mdash; recorded spot runs")),
                 ("/index.html", "text/html",
-                 (b'id="refresh-runtime"', b"momentum paper positions")),
+                 (b'id="refresh-runtime"', b'id="health"', b'id="decisions"',
+                  b'id="failures"', b"momentum paper positions")),
                 ("/app.js", "text/javascript",
-                 (b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"')),
+                 (b'"/api/health"', b'"/api/decisions"', b'"/api/failures"',
+                  b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"')),
                 ("/style.css", "text/css", (b"read-only",)),
                 ("/fixtures/events.jsonl", "text/plain", (b'"run_id"',))):
             status, headers, body = self.get(base, path)
@@ -541,12 +552,193 @@ class TestPnlEndpoint(ServerHarness):
         self.assertFalse(missing.exists())
 
 
+class TestHealthEndpoint(ServerHarness):
+
+    def test_present_sources_aggregate_latest_ticks_log_flags_and_ages(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+        fresh = (now - timedelta(seconds=4)).isoformat().replace("+00:00", "Z")
+        health_path = root / "health.jsonl"
+        rows = [
+            {"service": "market-stream", "status": "ERROR", "utc": old},
+            {"service": "market-stream", "status": "OK", "utc": fresh,
+             "cadence_seconds": 10},
+            {"service": "momentum", "status": "DEGRADED", "utc": fresh},
+        ]
+        health_path.write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n{torn\n",
+            encoding="utf-8")
+        jobs_log = root / "jobs.log"
+        jobs_log.write_text(
+            "=== %s\nJOB-RUNNER | IDLE | no due unclaimed job\n" % fresh,
+            encoding="utf-8")
+        stop = root / "STOP"
+        stop.touch()
+
+        sources = self.empty_sources(root / "missing")
+        sources.update({
+            "health": health_path,
+            "jobs_log": jobs_log,
+            "stop": stop,
+            "stop_jobs": root / "STOP-JOBS",
+        })
+        payload = self.get_json(self.start(sources), "/api/health")
+
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["service_count"], 2)
+        services = {row["service"]: row for row in payload["services"]}
+        self.assertEqual(services["market-stream"]["level"], "green")
+        self.assertEqual(services["momentum"]["level"], "amber")
+        self.assertGreaterEqual(
+            services["market-stream"]["last_seen_age_seconds"], 0)
+        self.assertLess(
+            services["market-stream"]["last_seen_age_seconds"], 20)
+        self.assertEqual(payload["jobs_log"]["level"], "green")
+        self.assertIn("JOB-RUNNER | IDLE", payload["jobs_log"]["tail"][-1])
+        self.assertTrue(payload["flags"]["STOP"]["present"])
+        self.assertFalse(payload["flags"]["STOP-JOBS"]["present"])
+        self.assertTrue(payload["stop"])
+        self.assertFalse(payload["stop_jobs"])
+        self.assertEqual(payload["system_level"], "red")
+        self.assertEqual(payload["parse_errors"], 1)
+
+    def test_absent_health_sources_are_honest_empty_and_not_created(self):
+        root = self.tempdir()
+        missing = root / "missing"
+        payload = self.get_json(
+            self.start(self.empty_sources(missing)), "/api/health")
+        self.assertFalse(payload["present"])
+        self.assertIsNone(payload["system_level"])
+        self.assertEqual(payload["services"], [])
+        self.assertEqual(payload["last_tick_ages"], {})
+        self.assertFalse(payload["jobs_log"]["present"])
+        self.assertFalse(payload["flags"]["STOP"]["present"])
+        self.assertFalse(payload["flags"]["STOP-JOBS"]["present"])
+        self.assertFalse(missing.exists())
+
+
+class TestDecisionsEndpoint(ServerHarness):
+
+    def test_present_tail_preserves_decisions_and_signal_evidence(self):
+        root = self.tempdir()
+        path = root / "momentum-decisions.jsonl"
+        decisions = [
+            {
+                "decision_utc": "2026-08-14T10:00:00Z", "symbol": "APRUSDT",
+                "action": "WATCH", "reason": "ignition baseline",
+                "signal_evidence": {
+                    "surge_ratio": "9.40", "oi_change_pct": "1.20",
+                    "freshness_ms": "180",
+                },
+            },
+            {
+                "decision_utc": "2026-08-14T10:00:02Z", "symbol": "APRUSDT",
+                "action": "ENTER_SMALL", "reason": "persistence confirmed",
+                "surge_ratio": "10.20", "vol_1m_quote": "95000.00",
+            },
+        ]
+        path.write_text(
+            json.dumps(decisions[0]) + "\n[]\n{torn\n" +
+            json.dumps(decisions[1]) + "\n", encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["momentum_decisions"] = path
+
+        payload = self.get_json(self.start(sources), "/api/decisions")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["decisions"], decisions)
+        self.assertEqual(
+            payload["decisions"][0]["signal_evidence"]["surge_ratio"],
+            "9.40")
+        self.assertEqual(payload["as_of"], decisions[-1]["decision_utc"])
+        self.assertEqual(payload["parse_errors"], 2)
+
+    def test_absent_decisions_are_honest_empty_and_not_created(self):
+        root = self.tempdir()
+        missing = root / "missing"
+        payload = self.get_json(
+            self.start(self.empty_sources(missing)), "/api/decisions")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["decisions"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertIsNone(payload["as_of"])
+        self.assertFalse(missing.exists())
+
+
+class TestFailuresEndpoint(ServerHarness):
+
+    def test_present_results_filter_failures_and_surface_recorded_reasons(self):
+        root = self.tempdir()
+        jobs = root / "jobs"
+        receipts = jobs / "receipts"
+        receipts.mkdir(parents=True)
+        results = jobs / "results.jsonl"
+        rows = [
+            {"job_id": "done1", "symbol": "BTCUSDT", "verdict": "CLOSED",
+             "utc": "2026-08-14T10:00:00Z"},
+            {"job_id": "refused1", "symbol": "APRUSDT",
+             "verdict": "REFUSED", "reason": "SEQUENCE_LOCKED",
+             "utc": "2026-08-14T10:01:00Z"},
+            {"job_id": "preflight1", "symbol": "SOLUSDT",
+             "verdict": "PREFLIGHT_REFUSED",
+             "receipt_path": str(root / "basis-executor-preflight1.json"),
+             "utc": "2026-08-14T10:01:30Z"},
+            {"job_id": "unknown1", "symbol": "ETHUSDT",
+             "verdict": "UNKNOWN", "utc": "2026-08-14T10:02:00Z"},
+        ]
+        results.write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n{torn\n",
+            encoding="utf-8")
+        (receipts / "job-unknown1.json").write_text(json.dumps({
+            "job_id": "unknown1", "verdict": "UNKNOWN",
+            "reason": "LEVERAGE_UNPROVEN", "utc": rows[-1]["utc"],
+        }), encoding="utf-8")
+        (root / "basis-executor-preflight1.json").write_text(json.dumps({
+            "verdict": "PREFLIGHT_REFUSED",
+            "verdict_note": "actual leverage was not proven at 1x",
+        }), encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources.update({"job_results": results,
+                        "job_receipts_dir": receipts,
+                        "basis_receipts_dir": root})
+
+        payload = self.get_json(self.start(sources), "/api/failures")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["count"], 3)
+        by_job = {row["job_id"]: row for row in payload["failures"]}
+        self.assertEqual(by_job["refused1"]["reason"], "SEQUENCE_LOCKED")
+        self.assertEqual(by_job["refused1"]["reason_source"], "result")
+        self.assertEqual(by_job["unknown1"]["reason"],
+                         "LEVERAGE_UNPROVEN")
+        self.assertEqual(by_job["unknown1"]["reason_source"],
+                         "runner_receipt")
+        self.assertEqual(by_job["preflight1"]["reason"],
+                         "actual leverage was not proven at 1x")
+        self.assertEqual(by_job["preflight1"]["reason_source"],
+                         "receipt_path")
+        self.assertEqual(payload["as_of"], rows[-1]["utc"])
+        self.assertEqual(payload["parse_errors"], 1)
+
+    def test_absent_results_are_honest_empty_and_not_created(self):
+        root = self.tempdir()
+        missing = root / "missing"
+        payload = self.get_json(
+            self.start(self.empty_sources(missing)), "/api/failures")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["failures"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertIsNone(payload["as_of"])
+        self.assertFalse(missing.exists())
+
+
 class TestReadOnlyGuarantees(ServerHarness):
 
     def test_mutating_methods_all_answer_405_on_runtime_routes(self):
         self.start({})
         for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
-            for path in ("/api/stream", "/api/candidates", "/api/position",
+            for path in ("/api/health", "/api/decisions", "/api/failures",
+                         "/api/stream", "/api/candidates", "/api/position",
                          "/api/momentum", "/api/fees", "/api/pnl"):
                 status, body = self.request(method, path, body=b"{}")
                 self.assertEqual(status, 405, "%s %s" % (method, path))
@@ -560,9 +752,10 @@ class TestReadOnlyGuarantees(ServerHarness):
         self.assertEqual(payload["bind"], "127.0.0.1")
         self.assertEqual(payload["methods"], ["GET", "HEAD"])
         self.assertEqual(sorted(payload["sources"]), [
-            "basis_position", "basis_receipts_dir", "events", "fees",
-            "momentum_receipts", "momentum_state", "proposals_dir",
-            "stream_log", "stream_state",
+            "basis_position", "basis_receipts_dir", "events", "fees", "health",
+            "job_receipts_dir", "job_results", "jobs_log",
+            "momentum_decisions", "momentum_receipts", "momentum_state",
+            "proposals_dir", "stop", "stop_jobs", "stream_log", "stream_state",
         ])
 
     def test_head_matches_status_and_has_empty_body(self):
@@ -581,7 +774,8 @@ class TestReadOnlyGuarantees(ServerHarness):
         base = self.start(self.empty_sources(missing))
         for path in ("/api/events", "/api/stream", "/api/candidates",
                      "/api/position", "/api/momentum", "/api/fees",
-                     "/api/pnl", "/api/health"):
+                     "/api/pnl", "/api/health", "/api/decisions",
+                     "/api/failures"):
             self.get_json(base, path)
         self.assertEqual(list(root.iterdir()), [],
                          "GETs must never create a runtime source")
@@ -591,8 +785,10 @@ class TestDefaultSources(unittest.TestCase):
 
     def test_defaults_use_receipt_dir_path_conventions_only(self):
         old = os.environ.get("RECEIPT_DIR")
+        old_jobs_log = os.environ.get("JOBS_LOG")
         try:
             os.environ["RECEIPT_DIR"] = "/tmp-example/quant-receipts"
+            os.environ.pop("JOBS_LOG", None)
             sources = serve.default_sources()
             receipt_dir = Path("/tmp-example/quant-receipts")
             self.assertEqual(sources["stream_state"],
@@ -610,6 +806,19 @@ class TestDefaultSources(unittest.TestCase):
                              receipt_dir / "momentum-paper-state.json")
             self.assertEqual(sources["momentum_receipts"],
                              receipt_dir / "momentum-paper-receipts.jsonl")
+            self.assertEqual(sources["health"],
+                             receipt_dir / "health.jsonl")
+            self.assertEqual(sources["jobs_log"],
+                             UI_DIR.parent / "jobs.log")
+            self.assertEqual(sources["stop"], receipt_dir / "STOP")
+            self.assertEqual(sources["stop_jobs"],
+                             receipt_dir / "STOP-JOBS")
+            self.assertEqual(sources["momentum_decisions"],
+                             UI_DIR.parent / "decisions.jsonl")
+            self.assertEqual(sources["job_results"],
+                             receipt_dir / "jobs" / "results.jsonl")
+            self.assertEqual(sources["job_receipts_dir"],
+                             receipt_dir / "jobs" / "receipts")
             self.assertEqual(sources["events"],
                              UI_DIR / "fixtures" / "events.jsonl")
         finally:
@@ -617,6 +826,10 @@ class TestDefaultSources(unittest.TestCase):
                 os.environ.pop("RECEIPT_DIR", None)
             else:
                 os.environ["RECEIPT_DIR"] = old
+            if old_jobs_log is None:
+                os.environ.pop("JOBS_LOG", None)
+            else:
+                os.environ["JOBS_LOG"] = old_jobs_log
 
     def test_events_is_the_only_fixture_source(self):
         sources = serve.default_sources()

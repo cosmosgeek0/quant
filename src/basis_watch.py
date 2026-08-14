@@ -126,6 +126,7 @@ WATCH_STATE_DIR_NAME = "watch"
 STATE_FILE_NAME = "basis_watch_state.json"
 COMMISSION_FILE_NAME = "commission-rates.json"
 PROPOSAL_DIR_NAME = "proposals"
+HEALTH_FILE_NAME = "health.jsonl"
 STATE_VERSION = 1
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,32}$")  # spec universe_filter symbol regex
 MAX_MARKET_NUMBER = Decimal("1e15")   # spec ingest_book_validity max_market_number
@@ -915,14 +916,19 @@ def common_quantity_step(spot_step: Any, perp_step: Any) -> Optional[Decimal]:
 
 
 def proposal_quantity(notional_usd: Any, spot_ask: Any, perp_bid: Any,
-                      spot_step: Any, perp_step: Any) -> Optional[Decimal]:
-    """Fee-aware equal-leg quantity, floored to both venues' lot rules."""
+                      spot_step: Any, perp_step: Any,
+                      spot_min_notional: Any = None,
+                      perp_min_notional: Any = None) -> Optional[Decimal]:
+    """Fee-aware equal-leg quantity proven against both venue filters."""
     notional = dec(notional_usd)
     spot_price, perp_price = dec(spot_ask), dec(perp_bid)
     step = common_quantity_step(spot_step, perp_step)
+    spot_min = dec(spot_min_notional)
+    perp_min = dec(perp_min_notional)
     if notional is None or spot_price is None or perp_price is None \
-            or step is None or notional <= 0 or spot_price <= 0 \
-            or perp_price <= 0:
+            or step is None or spot_min is None or perp_min is None \
+            or notional <= 0 or spot_price <= 0 or perp_price <= 0 \
+            or spot_min < 0 or perp_min < 0:
         return None
     with localcontext() as context:
         context.prec = PREC
@@ -930,7 +936,10 @@ def proposal_quantity(notional_usd: Any, spot_ask: Any, perp_bid: Any,
         perp_capacity = notional / perp_price
         quantity = (min(spot_capacity, perp_capacity) / step).to_integral_value(
             rounding=ROUND_DOWN) * step
-    return quantity if quantity > 0 else None
+    if quantity <= 0 or quantity * spot_price < spot_min \
+            or quantity * perp_price < perp_min:
+        return None
+    return quantity
 
 
 def _proposal_utc(now_ms: int) -> str:
@@ -940,6 +949,32 @@ def _proposal_utc(now_ms: int) -> str:
 
 def _proposal_decimal(value: Optional[Decimal]) -> Optional[str]:
     return format(value, "f") if value is not None and value.is_finite() else None
+
+
+def _append_health_jsonl(receipt_dir: str,
+                         payload: Dict[str, Any]) -> bool:
+    """Append one compact UI telemetry record without gating the engine."""
+    path = os.path.join(receipt_dir, HEALTH_FILE_NAME)
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":"))
+               + "\n").encode("utf-8")
+    descriptor: Optional[int] = None
+    try:
+        os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags, 0o600)
+        if os.write(descriptor, encoded) != len(encoded):
+            raise OSError("short health append")
+        os.fsync(descriptor)
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1116,8 @@ class LiveReads:
             symbol = row["symbol"]
             row["spot_step"] = spot_meta[symbol]["step"]
             row["perp_step"] = fut_meta[symbol]["step"]
+            row["spot_min_notional"] = spot_meta[symbol]["min_notional"]
+            row["perp_min_notional"] = fut_meta[symbol]["min_notional"]
         return rows
 
     def _get(self, url: str) -> Any:
@@ -1108,13 +1145,23 @@ class LiveReads:
                 "funding_history": history, "premium": premium}
 
 
+def _stream_metadata_decimal(record: Dict[str, Any], venue: str,
+                             field: str) -> Optional[Decimal]:
+    """Read one exact flat filter emitted by ``market_feed``."""
+    suffix = "step_size" if field == "step" else "min_notional"
+    value = dec(record.get("%s_%s" % (venue, suffix)))
+    if value is None or (field == "step" and value <= 0) \
+            or (field == "min_notional" and value < 0):
+        return None
+    return value
+
+
 class StreamStateReads:
     """Shared-stream cheap pass plus the unchanged per-finalist deep reads.
 
-    The stream intentionally has no venue lot-size metadata.  Compatibility
-    rows therefore carry null steps: finalist discovery remains available,
-    while proposal construction fails closed unless that execution metadata
-    is supplied by a later contract.
+    Legacy stream rows without venue filters remain discovery-compatible but
+    cannot size a proposal.  Metadata-enriched rows carry each venue's lot
+    step and minimum notional through to proposal construction.
     """
 
     feed_mode = STREAM_FEED_MODE
@@ -1142,8 +1189,19 @@ class StreamStateReads:
                 continue
             funding_rate = dec(record.get("funding_rate"))
             spot_bid = dec(record.get("spot_bid"))
+            spot_ask = dec(record.get("spot_ask"))
+            perp_bid = dec(record.get("perp_bid"))
             perp_ask = dec(record.get("perp_ask"))
             exit_gap = return_pct(perp_ask, spot_bid)
+            spot_step = _stream_metadata_decimal(record, "spot", "step")
+            perp_step = _stream_metadata_decimal(record, "perp", "step")
+            spot_min = _stream_metadata_decimal(
+                record, "spot", "min_notional")
+            perp_min = _stream_metadata_decimal(
+                record, "perp", "min_notional")
+            sized = proposal_quantity(
+                CAP_USDT, spot_ask, perp_bid, spot_step, perp_step,
+                spot_min, perp_min)
             rows.append({
                 "symbol": symbol,
                 "entry_gap_bps": gap_pct * Decimal(100),
@@ -1151,14 +1209,17 @@ class StreamStateReads:
                 else exit_gap * Decimal(100),
                 "funding_bps": None if funding_rate is None
                 else funding_rate * Decimal(10_000),
-                "min_valid_notional": None,
+                "min_valid_notional": max(spot_min, perp_min)
+                if spot_min is not None and perp_min is not None else None,
                 # Keep valid non-positive rows in the universe so an already
                 # tracked symbol can be evaluated and demoted honestly.  Only
                 # positive NORMAL gaps enter the new-finalist ranking.
                 "finalist_eligible": gap_pct > 0,
-                "fits_10_cap": False,
-                "spot_step": None,
-                "perp_step": None,
+                "fits_10_cap": sized is not None,
+                "spot_step": spot_step,
+                "perp_step": perp_step,
+                "spot_min_notional": spot_min,
+                "perp_min_notional": perp_min,
             })
         rows.sort(key=lambda row: (-row["entry_gap_bps"], row["symbol"]))
         return rows
@@ -1297,7 +1358,9 @@ class Watch:
         net_edge = decision_decimal(decision, "net_pct")
         quantity = proposal_quantity(
             observation.get("notional_usd"), spot.get("ask"), perp.get("bid"),
-            market_row.get("spot_step"), market_row.get("perp_step"))
+            market_row.get("spot_step"), market_row.get("perp_step"),
+            market_row.get("spot_min_notional"),
+            market_row.get("perp_min_notional"))
         digest = decision.get("config_digest")
         fees = observation.get("fees") or {}
         required_decimals = (
@@ -1545,6 +1608,34 @@ class Watch:
         return sum(1 for state in self.symbols.values()
                    if state.in_cooldown(now_ms))
 
+    def _append_health(self, now_ms: int, status: str,
+                       error: Optional[str] = None) -> bool:
+        state_counts = {name: 0 for name in STATES}
+        reject_histogram: Dict[str, int] = {}
+        for state in self.symbols.values():
+            state_counts[state.state] = state_counts.get(state.state, 0) + 1
+            if state.last_reject:
+                reject_histogram[state.last_reject] = \
+                    reject_histogram.get(state.last_reject, 0) + 1
+        age = None
+        if self.last_pass_ms is not None and now_ms >= self.last_pass_ms:
+            age = now_ms - self.last_pass_ms
+        payload: Dict[str, Any] = {
+            "component": "basis_watch",
+            "cycle": "pass",
+            "feed_mode": self.last_feed_mode,
+            "last_pass_age_ms": age,
+            "last_pass_ms": self.last_pass_ms,
+            "pass_count": self.pass_count,
+            "reject_histogram": dict(sorted(reject_histogram.items())),
+            "state_counts": state_counts,
+            "status": status,
+            "ts": _proposal_utc(now_ms),
+        }
+        if error is not None:
+            payload["error"] = error
+        return _append_health_jsonl(self.receipt_dir, payload)
+
     # -- observation & pass -------------------------------------------------
 
     def _observation(self, symbol: str, now_ms: int,
@@ -1633,6 +1724,29 @@ class Watch:
 
     def run_pass(self, reads: Any, now_ms: Optional[int] = None
                  ) -> List[Dict[str, Any]]:
+        """Run one pass and append one non-authoritative health snapshot."""
+        attempt_now = now_ms if now_ms is not None \
+            else int(time.time() * 1000)
+        try:
+            rows = self._run_pass(reads, now_ms)
+        except Exception as exc:
+            failed_now = attempt_now if now_ms is not None \
+                else int(time.time() * 1000)
+            try:
+                self._append_health(failed_now, "ERROR", type(exc).__name__)
+            except Exception:
+                pass
+            raise
+        health_now = self.last_pass_ms \
+            if self.last_pass_ms is not None else attempt_now
+        try:
+            self._append_health(health_now, "OK")
+        except Exception:
+            pass
+        return rows
+
+    def _run_pass(self, reads: Any, now_ms: Optional[int] = None
+                  ) -> List[Dict[str, Any]]:
         """One tick: universe -> finalists -> enrich -> kernel -> fold ->
         maintain -> watermark -> atomic state write.  Returns factual rows.
 
