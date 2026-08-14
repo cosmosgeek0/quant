@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+UI SESSION PREP 2026-08-14 | owner order: prepare only, build NOTHING, show NOTHING until the owner's word
+serve rail | ui/serve.py smoke-passed on 127.0.0.1:8899 then stopped clean | index 200 | 10 live routes: /api/ health decisions failures events stream candidates position momentum fees pnl | absent sources render honest present:false, never fabricated
+show rail | when the owner says go: start serve.py, open http://127.0.0.1:8899 in Chrome (owner's browser or in-app pane) | nothing opened yet
+donor menu | L8 seven-candidate survey of the old cosmos UI recovered at branch codex/l8-old-ui-survey (eb23244, lane-notes/l8-old-ui-candidates.txt) | 0 imports ever made | per-item owner permit stays the gate | list is keyed to event contract v1 (08-12) — re-assess risks against today's 10-endpoint UI before any permit
+gap noted | on the Mac all live sources are honestly absent; the phase-1 pull-over-SSM loop from the owner's plan is NOT built — likely the first build item of the owner-led session
+standing | UI building starts only on the owner's word, listen-first with owner examples, real data only, per-item donor permits
+
 COMMANDER TRACKS LANDED + RAW-EVIDENCE DEPLOY 2026-08-14 | release 7dcfd195645390b6903627d144d2a13cbcb13f88 | 815 tests green (Lead-measured)
 money control | STOP blocks NEW ENTRIES ONLY — exits and reconciliation are sacred and run under both interlocks | save-before-publish crash window closed | account governor: ONE entry lock across basis+momentum, daily budgets (5 entries, 1.00 USDT realized-loss+fees), fail-closed if absent | ACCEPT-ONE mode: exactly one natural entry then auto-seal
 feed/basis | runtime supervises market_feed --serve (pidfile, restart, health) and consumes its state | stream records carry step/min-notional metadata | stream-fed basis proposals sized executable, missing metadata skipped counted
