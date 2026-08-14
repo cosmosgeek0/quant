@@ -339,7 +339,10 @@ def funding_history_rows(period_ms: int, count: int = 3,
 
 
 def stream_record(gap_pct: Optional[str], freshness_ms: str = "0",
-                  venues: str = "both") -> Dict[str, Any]:
+                  venues: str = "both", spot_step: str = "0.001",
+                  perp_step: str = "0.001",
+                  spot_min_notional: str = "5",
+                  perp_min_notional: str = "5") -> Dict[str, Any]:
     return {
         "utc": "2026-08-13T00:00:00.000Z",
         "venues": venues,
@@ -350,6 +353,9 @@ def stream_record(gap_pct: Optional[str], freshness_ms: str = "0",
         "oi": "10000", "oi_change_pct": "0.1",
         "funding_rate": "0.0001", "next_funding_ms": "14400000",
         "basis_gap_pct": gap_pct, "freshness_ms": freshness_ms,
+        "spot_step": spot_step, "perp_step": perp_step,
+        "spot_min_notional": spot_min_notional,
+        "perp_min_notional": perp_min_notional,
     }
 
 
@@ -1261,51 +1267,76 @@ class ProposalFileTests(PipelineCase):
         self.assertEqual(quantity % D("0.003"), D(0))
         self.assertEqual(quantity % D("0.002"), D(0))
 
-    def test_stream_metadata_replaces_unknown_quantity_with_real_sizing(self):
-        now = T0 + 2000
-        bundle = scenario_bundle(now, rate="0.01")
-        absent_path = os.path.join(self.tmp.name, "stream-absent.json")
-        with open(absent_path, "w", encoding="utf-8") as handle:
-            json.dump({"TESTUSDT": stream_record("0.78")}, handle)
-        cfg = watch_config({"persist_ticks": 1})
-        absent = Watch(self.state_path + ".absent", self.tmp.name, cfg)
-        absent_reads = StreamStateReads(
-            absent_path, FakeReads([], {"TESTUSDT": bundle}), cfg["stale_ms"])
-        absent_row = absent.run_pass(absent_reads, now)[0]
-        self.assertEqual(absent_row["proposal_status"],
-                         "refused_incomplete_proposal")
-
-        enriched = stream_record("0.78")
-        enriched.update({
-            "spot_step_size": "0.003", "perp_step_size": "0.002",
-            "spot_min_notional": "9.5", "perp_min_notional": "9.5",
-        })
-        enriched_path = os.path.join(self.tmp.name, "stream-enriched.json")
-        with open(enriched_path, "w", encoding="utf-8") as handle:
-            json.dump({"TESTUSDT": enriched}, handle)
-        watch = Watch(self.state_path + ".enriched", self.tmp.name, cfg)
-        reads = StreamStateReads(
-            enriched_path, FakeReads([], {"TESTUSDT": bundle}),
-            cfg["stale_ms"])
-        row = watch.run_pass(reads, now)[0]
-
-        self.assertEqual(row["proposal_status"], "written")
-        with open(self.paths()[0], encoding="utf-8") as handle:
-            proposal = json.load(handle)
-        quantity = D(proposal["quantity"])
-        self.assertEqual(quantity, D("0.096"))
-        self.assertEqual(quantity % D("0.003"), D(0))
-        self.assertEqual(quantity % D("0.002"), D(0))
-        self.assertGreaterEqual(quantity * D(proposal["spot_ask"]), D("9.5"))
-        self.assertGreaterEqual(quantity * D(proposal["perp_bid"]), D("9.5"))
-
-    def test_stream_min_notional_that_cannot_fit_refuses_quantity(self):
+    def test_stream_record_missing_metadata_is_skipped_and_counted(self):
         now = T0 + 2000
         record = stream_record("0.78")
-        record.update({
-            "spot_step_size": "0.001", "perp_step_size": "0.001",
-            "spot_min_notional": "10", "perp_min_notional": "10",
-        })
+        for field in ("spot_step", "perp_step",
+                      "spot_min_notional", "perp_min_notional"):
+            record.pop(field)
+        path = os.path.join(self.tmp.name, "stream-metadata-missing.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"TESTUSDT": record}, handle)
+        cfg = watch_config({"persist_ticks": 1})
+        reads = StreamStateReads(
+            path,
+            FakeReads([], {"TESTUSDT": scenario_bundle(now, rate="0.01")}),
+            cfg["stale_ms"],
+        )
+        watch = Watch(self.state_path, self.tmp.name, cfg)
+
+        self.assertEqual(watch.run_pass(reads, now), [])
+        self.assertEqual(reads.skip_counts,
+                         {basis_watch.STREAM_SKIP_METADATA: 1})
+        self.assertEqual(watch.last_skip_counts, reads.skip_counts)
+        self.assertEqual(self.paths(), [])
+
+    def test_proposal_quantity_matches_direct_and_stream_for_same_fixture(self):
+        now = T0 + 2000
+        cfg = watch_config({"persist_ticks": 1})
+        direct_dir = os.path.join(self.tmp.name, "direct")
+        stream_dir = os.path.join(self.tmp.name, "stream")
+        direct = Watch(self.state_path + ".direct", direct_dir, cfg)
+        direct_reads = FakeReads([
+            universe_row(
+                "TESTUSDT", spot_step="0.003", perp_step="0.002",
+                spot_min_notional="9.5", perp_min_notional="9.5",
+            )
+        ], {"TESTUSDT": scenario_bundle(now, rate="0.01")})
+        direct_row = direct.run_pass(direct_reads, now)[0]
+
+        record = stream_record(
+            "0.78", spot_step="0.003", perp_step="0.002",
+            spot_min_notional="9.5", perp_min_notional="9.5",
+        )
+        stream_path = os.path.join(self.tmp.name, "stream-enriched.json")
+        with open(stream_path, "w", encoding="utf-8") as handle:
+            json.dump({"TESTUSDT": record}, handle)
+        stream = Watch(self.state_path + ".stream", stream_dir, cfg)
+        reads = StreamStateReads(
+            stream_path,
+            FakeReads([], {"TESTUSDT": scenario_bundle(now, rate="0.01")}),
+            cfg["stale_ms"],
+        )
+        stream_row = stream.run_pass(reads, now)[0]
+
+        self.assertEqual(direct_row["proposal_status"], "written")
+        self.assertEqual(stream_row["proposal_status"], "written")
+        direct_path = glob(os.path.join(
+            direct_dir, "proposals", "proposal-*.json"))[0]
+        stream_proposal_path = glob(os.path.join(
+            stream_dir, "proposals", "proposal-*.json"))[0]
+        with open(direct_path, encoding="utf-8") as handle:
+            direct_proposal = json.load(handle)
+        with open(stream_proposal_path, encoding="utf-8") as handle:
+            stream_proposal = json.load(handle)
+        self.assertEqual(direct_proposal["quantity"], stream_proposal["quantity"])
+        self.assertEqual(D(stream_proposal["quantity"]), D("0.096"))
+
+    def test_stream_min_notional_that_cannot_fit_is_skipped(self):
+        now = T0 + 2000
+        record = stream_record(
+            "0.78", spot_min_notional="10", perp_min_notional="10"
+        )
         path = os.path.join(self.tmp.name, "stream-too-small.json")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({"TESTUSDT": record}, handle)
@@ -1315,10 +1346,12 @@ class ProposalFileTests(PipelineCase):
             FakeReads([], {"TESTUSDT": scenario_bundle(now, rate="0.01")}),
             cfg["stale_ms"])
 
-        row = Watch(self.state_path, self.tmp.name, cfg).run_pass(reads, now)[0]
+        watch = Watch(self.state_path, self.tmp.name, cfg)
+        rows = watch.run_pass(reads, now)
 
-        self.assertEqual(row["proposal_status"],
-                         "refused_incomplete_proposal")
+        self.assertEqual(rows, [])
+        self.assertEqual(reads.skip_counts,
+                         {basis_watch.STREAM_SKIP_NOT_EXECUTABLE: 1})
         self.assertEqual(self.paths(), [])
 
     def test_health_jsonl_records_success_failure_age_and_rejects(self):

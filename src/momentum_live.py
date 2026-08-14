@@ -7,10 +7,11 @@ This adapter performs no exchange, credential, or network operation.  It uses
 runner position stands, and publishes one ``MOMENTUM_EXIT`` when HOLD logic
 fails closed.  ADD and REDUCE remain durable decisions only.
 
-The decision ledger is durable before job publication.  Job ids are derived
-only from symbol plus the ignition stream timestamp, and publication is an
-atomic create-if-absent operation.  A restart in the decision-to-job crash
-window therefore recovers the same immutable job instead of issuing another.
+The decision ledger and lifecycle state are durable before job publication.
+Job ids are derived only from symbol plus the ignition stream timestamp, and
+publication is an atomic create-if-absent operation.  A restart in the
+state-to-job crash window therefore recovers the same immutable job instead of
+issuing another.
 """
 
 from __future__ import annotations
@@ -848,17 +849,15 @@ def _recover_unlogged_entries(
     decisions_path: Path,
     issued_job_ids: Iterable[str],
     ignition_by_symbol: Dict[str, str],
-    jobs_dir: Path,
     maximum: Decimal,
     requested_by: str,
     job_ttl: timedelta,
     now_fn: Callable[[], str],
-    job_writer: Callable[[Path, Mapping[str, Any]], bool],
-) -> Tuple[str, ...]:
+) -> Tuple[Dict[str, Any], ...]:
     """Recover an OPEN/EXIT receipt created before its decision-ledger row."""
     issued = set(issued_job_ids)
     action_receipts = _action_receipts(receipt_path)
-    recovered: List[str] = []
+    pending_jobs: List[Dict[str, Any]] = []
     for symbol in sorted(state.tokens):
         token = state.tokens[symbol]
         record = records.get(symbol)
@@ -916,9 +915,8 @@ def _recover_unlogged_entries(
         if payload is not None:
             lifecycle.bind_job_id(state, symbol, action, payload["job_id"])
             issued.add(payload["job_id"])
-            if job_writer(jobs_dir, payload):
-                recovered.append(payload["job_id"])
-    return tuple(recovered)
+            pending_jobs.append(payload)
+    return tuple(pending_jobs)
 
 
 def _state_snapshot(token: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1182,9 +1180,6 @@ def run_tick(
     resolved_job_writer = job_writer or write_job_record
 
     ignition_by_symbol = dict(decision_index.ignition_by_symbol)
-    recovered = list(
-        _recover_jobs(prior_job_rows, resolved_jobs_dir, resolved_job_writer)
-    )
     issued_job_ids = {
         payload["job_id"]
         for payload in (
@@ -1192,21 +1187,17 @@ def run_tick(
         )
         if payload is not None
     }
-    recovered.extend(
-        _recover_unlogged_entries(
-            state,
-            records,
-            Path(receipt_path),
-            Path(decisions_path),
-            issued_job_ids,
-            ignition_by_symbol,
-            resolved_jobs_dir,
-            maximum,
-            requested_by,
-            job_ttl,
-            now_fn,
-            resolved_job_writer,
-        )
+    unlogged_jobs = _recover_unlogged_entries(
+        state,
+        records,
+        Path(receipt_path),
+        Path(decisions_path),
+        issued_job_ids,
+        ignition_by_symbol,
+        maximum,
+        requested_by,
+        job_ttl,
+        now_fn,
     )
     _bind_ledger_jobs(state, prior_job_rows)
     reconcile_runner_truth(
@@ -1215,8 +1206,8 @@ def run_tick(
         read_results_ledger(resolved_results_path),
         resolved_config,
     )
-    written: List[str] = []
     rows: List[Dict[str, Any]] = []
+    pending_jobs: List[Dict[str, Any]] = []
 
     for symbol in sorted(set(state.tokens).union(records)):
         record = records.get(symbol)
@@ -1252,8 +1243,8 @@ def run_tick(
             row["lifecycle_state"] = _state_snapshot(token)
         append_decision(Path(decisions_path), row)
         rows.append(row)
-        if job is not None and resolved_job_writer(resolved_jobs_dir, job):
-            written.append(job["job_id"])
+        if job is not None:
+            pending_jobs.append(job)
 
         snapshot = row["lifecycle_state"]
         if snapshot.get("position_status") == "FLAT" \
@@ -1262,6 +1253,16 @@ def run_tick(
             ignition_by_symbol.pop(symbol, None)
 
     lifecycle.save_state(Path(state_path), state, now_fn)
+    recovered = list(
+        _recover_jobs(prior_job_rows, resolved_jobs_dir, resolved_job_writer)
+    )
+    for job in unlogged_jobs:
+        if resolved_job_writer(resolved_jobs_dir, job):
+            recovered.append(job["job_id"])
+    written: List[str] = []
+    for job in pending_jobs:
+        if resolved_job_writer(resolved_jobs_dir, job):
+            written.append(job["job_id"])
     return TickResult(
         decisions=tuple(rows),
         replayed_receipts=replayed,

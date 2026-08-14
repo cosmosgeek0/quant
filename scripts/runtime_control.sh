@@ -20,6 +20,8 @@ if ! PATH_ASSIGNMENTS=$(PYTHONDONTWRITEBYTECODE=1 \
 fi
 eval "$PATH_ASSIGNMENTS"
 
+FEED_PID_FILE="$WATCH_DIR/feed.pid"
+
 if [ -f "$DEPLOY_DIR/scripts/runtime_tick.sh" ]; then
   RUNTIME_TICK_TARGET="$DEPLOY_DIR/scripts/runtime_tick.sh"
 else
@@ -78,11 +80,77 @@ print_tail() {
   fi
 }
 
+read_feed_pid() {
+  local pid
+  [ -r "$FEED_PID_FILE" ] || return 1
+  pid=$(<"$FEED_PID_FILE")
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+feed_process_live() {
+  local pid=$1
+  local command
+  kill -0 "$pid" 2>/dev/null || return 1
+  command=$(ps -ww -p "$pid" -o command= 2>/dev/null) || return 1
+  case "$command" in
+    *"$DEPLOY_DIR/src/market_feed.py"*"--serve"*) return 0 ;;
+  esac
+  return 1
+}
+
+print_feed_status() {
+  local pid age
+  if pid=$(read_feed_pid); then
+    if feed_process_live "$pid"; then
+      age=$(ps -p "$pid" -o etime= 2>/dev/null | tr -d '[:space:]')
+      [ -n "$age" ] || age=UNKNOWN
+      printf 'FEED | pid=%s | age=%s | health=RUNNING\n' "$pid" "$age"
+    else
+      printf 'FEED | pid=%s | age=UNKNOWN | health=DEAD\n' "$pid"
+    fi
+  elif [ -e "$FEED_PID_FILE" ]; then
+    echo "FEED | pid=INVALID | age=UNKNOWN | health=DEAD"
+  elif [ -e "$STOP_FILE" ]; then
+    echo "FEED | pid=NONE | age=UNKNOWN | health=STOPPED"
+  else
+    echo "FEED | pid=NONE | age=UNKNOWN | health=MISSING"
+  fi
+}
+
+stop_feed() {
+  local pid waited=0
+  if ! pid=$(read_feed_pid); then
+    rm -f "$FEED_PID_FILE"
+    return $?
+  fi
+  if ! feed_process_live "$pid"; then
+    rm -f "$FEED_PID_FILE"
+    return $?
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  while feed_process_live "$pid" && [ "$waited" -lt 10 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if feed_process_live "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || true
+    waited=0
+    while feed_process_live "$pid" && [ "$waited" -lt 5 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+  feed_process_live "$pid" && return 1
+  rm -f "$FEED_PID_FILE"
+}
+
 print_status() {
   printf 'RECEIPT_DIR=%s\n' "$RECEIPT_DIR"
   print_cron
   print_flag STOP "$STOP_FILE"
   print_flag STOP-JOBS "$STOP_JOBS_FILE"
+  print_feed_status
   print_tail HEALTH "$HEALTH"
   print_tail RESULT "$JOB_RESULTS"
 }
@@ -170,9 +238,14 @@ case "$command_name" in
       usage
       exit 2
     fi
-    mkdir -p "$RECEIPT_DIR" || exit 2
+    mkdir -p "$RECEIPT_DIR" "$WATCH_DIR" || exit 2
     touch "$STOP_FILE" "$STOP_JOBS_FILE" || exit 2
     chmod 600 "$STOP_FILE" "$STOP_JOBS_FILE" || exit 2
+    if ! stop_feed; then
+      echo "CONTROL | STOP INCOMPLETE | feed process still running" >&2
+      print_status
+      exit 2
+    fi
     echo "CONTROL | STOPPED"
     print_status
     ;;

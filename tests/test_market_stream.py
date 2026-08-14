@@ -41,16 +41,37 @@ def premium(symbol, mark, funding="0.0001", next_ms="2000001000"):
     }
 
 
-def spot_info(symbol, status="TRADING"):
-    return {"symbol": symbol, "status": status}
+def spot_info(symbol, status="TRADING", step=None, min_notional=None):
+    row = {"symbol": symbol, "status": status}
+    filters = []
+    if step is not None:
+        filters.append({"filterType": "LOT_SIZE", "stepSize": str(step)})
+    if min_notional is not None:
+        filters.append({
+            "filterType": "NOTIONAL", "minNotional": str(min_notional)
+        })
+    if filters:
+        row["filters"] = filters
+    return row
 
 
-def perp_info(symbol, status="TRADING", contract_type="PERPETUAL"):
-    return {
+def perp_info(symbol, status="TRADING", contract_type="PERPETUAL",
+              step=None, min_notional=None):
+    row = {
         "symbol": symbol,
         "status": status,
         "contractType": contract_type,
     }
+    filters = []
+    if step is not None:
+        filters.append({"filterType": "LOT_SIZE", "stepSize": str(step)})
+    if min_notional is not None:
+        filters.append({
+            "filterType": "MIN_NOTIONAL", "notional": str(min_notional)
+        })
+    if filters:
+        row["filters"] = filters
+    return row
 
 
 def klines(volumes, first_close=1_000_000):
@@ -293,6 +314,85 @@ class SchemaCompletenessTests(OfflineCase):
         self.assertIsNone(record["spot_bid"])
         self.assertIsNone(record["spot_ask"])
 
+    def test_both_venue_records_are_stamped_with_executable_metadata(self):
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "10", "11")],
+            perp=[book("BBBUSDT", "12", "13")],
+            spot_symbols=[
+                spot_info("AAAUSDT", step="0.01", min_notional="5"),
+                spot_info("BBBUSDT", step="0.003", min_notional="6"),
+            ],
+            perp_symbols=[
+                perp_info("BBBUSDT", step="0.002", min_notional="7")
+            ],
+            premiums=[premium("BBBUSDT", "12.5")],
+            kline_batches={
+                "AAAUSDT": [klines(("1", "1", "1"))],
+                "BBBUSDT": [klines(("1", "1", "1"))],
+            },
+            oi={"BBBUSDT": "100"},
+        )
+
+        self.stream(reader, focus_cap=2).run_once()
+        state = self.read_state()
+
+        self.assertEqual(
+            {key: state["BBBUSDT"][key] for key in ms.SIZING_FIELDS},
+            {
+                "spot_step": "0.003",
+                "perp_step": "0.002",
+                "spot_min_notional": "6",
+                "perp_min_notional": "7",
+            },
+        )
+        self.assertTrue(
+            all(state["AAAUSDT"][key] is None for key in ms.SIZING_FIELDS)
+        )
+
+
+class MetadataCacheTests(OfflineCase):
+    def test_exchange_info_refreshes_at_the_thirty_minute_boundary(self):
+        clock = {"now": FIXED_MS}
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "100", "101")],
+            perp=[book("AAAUSDT", "102", "103")],
+            spot_symbols=[
+                spot_info("AAAUSDT", step="0.01", min_notional="5")
+            ],
+            perp_symbols=[
+                perp_info("AAAUSDT", step="0.01", min_notional="5")
+            ],
+            premiums=[premium("AAAUSDT", "102")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        stream = self.stream(
+            reader, focus_cap=1, ms_fn=lambda: clock["now"]
+        )
+
+        first = stream.run_once()
+        self.assertEqual(first.bulk_requests, 5)
+        metadata_path = self.state_path.with_name(ms.DEFAULT_METADATA_NAME)
+        self.assertTrue(metadata_path.exists())
+
+        reader.spot_symbols[0] = spot_info(
+            "AAAUSDT", step="0.001", min_notional="6"
+        )
+        clock["now"] = FIXED_MS + ms.METADATA_REFRESH_MS - 1
+        second = stream.run_once()
+        self.assertEqual(second.bulk_requests, 3)
+        self.assertEqual(self.read_state()["AAAUSDT"]["spot_step"], "0.01")
+
+        clock["now"] = FIXED_MS + ms.METADATA_REFRESH_MS
+        third = stream.run_once()
+        self.assertEqual(third.bulk_requests, 5)
+        self.assertEqual(self.read_state()["AAAUSDT"]["spot_step"], "0.001")
+        self.assertEqual(
+            sum(path == ms.SPOT_EXCHANGE_INFO_PATH
+                for _, path, _ in reader.calls),
+            2,
+        )
+
 
 class SurgeMathTests(OfflineCase):
     def test_short_window_is_null_then_median_and_ratio_are_decimal_text(self):
@@ -457,6 +557,47 @@ class LiveFeedMergeTests(OfflineCase):
         with patch("builtins.print") as printer:
             ms.print_stats(stats)
         printer.assert_any_call("feed_used=no reason=snapshot_stale")
+
+    def test_stale_feed_clears_persisted_surges_for_the_whole_universe(self):
+        closes = (1_000_000, 1_060_000, 1_120_000)
+        symbols = {
+            "AAAUSDT": feed_row(
+                "spot", "10", "11", zip(closes, ("1", "1", "4"))
+            ),
+            "BBBUSDT": feed_row(
+                "spot", "20", "21", zip(closes, ("10", "20", "90"))
+            ),
+        }
+        self.write_feed(symbols)
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
+            kline_batches={
+                "AAAUSDT": [klines(("1", "1", "4"))],
+                "BBBUSDT": [klines(("10", "20", "90"))],
+            },
+        )
+        stream = self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        )
+        stream.run_once()
+        self.assertEqual(self.read_state()["BBBUSDT"]["surge_ratio"], "4.5")
+
+        self.write_feed(
+            symbols,
+            written_ms=FIXED_MS - ms.DEFAULT_FEED_MAX_AGE_MS - 1,
+        )
+        stats = stream.run_once()
+        state = self.read_state()
+
+        self.assertFalse(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "snapshot_stale")
+        self.assertTrue(
+            all(record["surge_ratio"] is None for record in state.values())
+        )
+        self.assertFalse(any(
+            event["transition"] == "surge_threshold_crossed"
+            for event in self.read_log()
+        ))
 
     def test_sparse_four_candle_feed_repro_keeps_surge_unknown(self):
         latest_close = FIXED_MS - 3_000
@@ -753,6 +894,7 @@ class RestartContinuityTests(OfflineCase):
 
 class TransitionLogTests(OfflineCase):
     def test_new_listing_threshold_crossings_both_directions_and_venue_change(self):
+        clock = {"now": FIXED_MS}
         reader = FixtureReader(
             spot=[book("AAAUSDT", "1", "2")],
             kline_batches={
@@ -769,12 +911,14 @@ class TransitionLogTests(OfflineCase):
             reader,
             focus_cap=1,
             thresholds=(Decimal("2"), Decimal("3")),
+            ms_fn=lambda: clock["now"],
         )
         stream.run_once()
         stream.run_once()
         stream.run_once()
         reader.perp = [book("AAAUSDT", "1.5", "2.5")]
         reader.premiums = [premium("AAAUSDT", "2")]
+        clock["now"] += ms.METADATA_REFRESH_MS
         stream.run_once()
 
         events = self.read_log()

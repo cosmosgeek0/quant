@@ -2,11 +2,14 @@
 """One restart-safe Binance Spot + USD-M perpetual market truth stream.
 
 The per-pass universe comes from the two bulk book-ticker endpoints, filtered
-by the venues' exchange metadata.  It therefore has no alphabetical cap or
-fixed symbol list: every TRADING Spot symbol and every TRADING USD-M PERPETUAL
-ending in USDT is represented, including Spot-only, perpetual-only, and shared
-markets.  Mark price and funding are joined from one additional bulk USD-M
-premium-index read.
+by cached venue exchange metadata.  The two exchangeInfo documents are kept in
+an atomic sidecar beside the state file and refreshed on a 30-minute boundary.
+The stream therefore has no alphabetical cap or fixed symbol list: every
+TRADING Spot symbol and every TRADING USD-M PERPETUAL ending in USDT is
+represented, including Spot-only, perpetual-only, and shared markets.  Shared
+records also carry both venues' executable lot steps and minimum notionals when
+the exchange documents prove them.  Mark price and funding are joined from one
+additional bulk USD-M premium-index read.
 
 Expensive per-symbol reads are bounded by ``focus_cap``.  Half of the focus
 slots (rounded down) revisit the largest absolute price moves measurable from
@@ -23,8 +26,10 @@ credential, signing, POST, order, or account path in this module.
 
 When ``--feed-state`` names a fresh versioned snapshot from
 ``market_feed --serve``, its complete ticker snapshot and closed 1m windows are
-merged before the bounded REST focus reads.  An absent, invalid, future-dated,
-or stale optional snapshot is ignored, preserving the REST-only pass.
+merged before the bounded REST focus reads.  Books fall back to REST when a
+configured snapshot is absent, invalid, future-dated, or stale; surge ratios
+then clear for the whole pass because full-universe volume freshness is not
+proved.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ FAPI_OI_PATH = "/fapi/v1/openInterest"
 DEFAULT_STATE_PATH = Path("stream_state.json")
 DEFAULT_LOG_PATH = Path("stream_log.jsonl")
 DEFAULT_WINDOWS_NAME = "stream_windows.json"
+DEFAULT_METADATA_NAME = "stream_metadata.json"
 DEFAULT_WINDOW = 240
 DEFAULT_FOCUS_CAP = 12
 DEFAULT_THRESHOLDS = (Decimal("2"), Decimal("3"), Decimal("5"))
@@ -79,6 +85,8 @@ MAX_FOCUS_CAP = 200
 MAX_FEED_MAX_AGE_MS = 300_000
 MAX_BASIS_MAX_SKEW_MS = 60_000
 SIDECAR_VERSION = 1
+METADATA_CACHE_VERSION = 1
+METADATA_REFRESH_MS = 30 * 60 * 1_000
 FEED_STATE_VERSION = 1
 EXIT_INPUT = 2
 EXIT_HTTP = 3
@@ -90,8 +98,12 @@ STATE_FIELDS = (
     "venues",
     "spot_bid",
     "spot_ask",
+    "spot_step",
+    "spot_min_notional",
     "perp_bid",
     "perp_ask",
+    "perp_step",
+    "perp_min_notional",
     "mark",
     "vol_1m_quote",
     "vol_med_1m",
@@ -103,6 +115,12 @@ STATE_FIELDS = (
     "basis_gap_pct",
     "freshness_ms",
 )
+SIZING_FIELDS = frozenset({
+    "spot_step",
+    "perp_step",
+    "spot_min_notional",
+    "perp_min_notional",
+})
 NUMERIC_FIELDS = frozenset(STATE_FIELDS) - {"utc", "venues"}
 VENUE_VALUES = frozenset({"spot", "perp", "both"})
 
@@ -334,7 +352,11 @@ def load_state(path: Path) -> Dict[str, Dict[str, Any]]:
         symbol = _valid_symbol(raw_symbol)
         if symbol is None or not isinstance(raw_record, dict):
             raise DataReadError("stream state has an invalid symbol record")
-        if set(raw_record) != expected:
+        record_fields = set(raw_record)
+        if record_fields == expected - SIZING_FIELDS:
+            raw_record = dict(raw_record)
+            raw_record.update({field: None for field in SIZING_FIELDS})
+        elif record_fields != expected:
             raise DataReadError(f"stream state schema mismatch for {symbol}")
         if not isinstance(raw_record["utc"], str):
             raise DataReadError(f"stream state utc is invalid for {symbol}")
@@ -535,6 +557,69 @@ def load_sidecar(path: Path, window: int) -> Dict[str, Any]:
     }
 
 
+def _clean_cached_metadata(
+    raw: Any, venue: str
+) -> Dict[str, Dict[str, Optional[str]]]:
+    if not isinstance(raw, dict):
+        raise DataReadError(f"{venue} metadata cache is not a symbol mapping")
+    clean: Dict[str, Dict[str, Optional[str]]] = {}
+    for raw_symbol, raw_values in raw.items():
+        symbol = _valid_symbol(raw_symbol)
+        if symbol is None or not isinstance(raw_values, dict):
+            raise DataReadError(f"{venue} metadata cache has an invalid symbol")
+        values: Dict[str, Optional[str]] = {}
+        for field in ("step", "min_notional"):
+            raw_value = raw_values.get(field)
+            if raw_value is None:
+                values[field] = None
+                continue
+            if not isinstance(raw_value, str):
+                raise DataReadError(
+                    f"{venue} metadata cache {symbol}.{field} is invalid"
+                )
+            value = decimal_value(
+                raw_value, f"{venue} metadata cache {symbol}.{field}"
+            )
+            if (field == "step" and value <= 0) or (
+                field == "min_notional" and value < 0
+            ):
+                raise DataReadError(
+                    f"{venue} metadata cache {symbol}.{field} is invalid"
+                )
+            values[field] = decimal_string(value)
+        clean[symbol] = values
+    return clean
+
+
+def load_metadata_cache(path: Path, now_ms: int) -> Optional[Dict[str, Any]]:
+    """Load one fresh, fully validated exchange-info cache, or request refresh."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        payload = _read_json_file(path, "exchange metadata cache")
+        if not isinstance(payload, dict) \
+                or payload.get("version") != METADATA_CACHE_VERSION:
+            return None
+        raw_refreshed = payload.get("refreshed_ms")
+        if isinstance(raw_refreshed, bool):
+            return None
+        refreshed_ms = int(str(raw_refreshed))
+        if refreshed_ms < 0 or refreshed_ms > now_ms \
+                or now_ms - refreshed_ms >= METADATA_REFRESH_MS:
+            return None
+        spot = _clean_cached_metadata(payload.get("spot"), "Spot")
+        perp = _clean_cached_metadata(payload.get("perp"), "USD-M")
+    except (DataReadError, TypeError, ValueError):
+        return None
+    return {
+        "version": METADATA_CACHE_VERSION,
+        "refreshed_ms": refreshed_ms,
+        "spot": spot,
+        "perp": perp,
+    }
+
+
 def _require_list(payload: Any, source: str) -> List[Any]:
     if not isinstance(payload, list):
         raise DataReadError(f"{source} bulk response is not a list")
@@ -555,15 +640,42 @@ def book_map(payload: Any, source: str) -> Dict[str, Dict[str, Any]]:
     return result
 
 
-def trading_symbols(
+def _exchange_filter_value(
+    filters: Any,
+    filter_type: str,
+    keys: Sequence[str],
+    *,
+    positive: bool,
+) -> Optional[str]:
+    if not isinstance(filters, list):
+        return None
+    for raw_filter in filters:
+        if not isinstance(raw_filter, dict) \
+                or raw_filter.get("filterType") != filter_type:
+            continue
+        for key in keys:
+            if key not in raw_filter:
+                continue
+            try:
+                value = decimal_value(
+                    raw_filter[key], f"{filter_type}.{key}"
+                )
+            except DataReadError:
+                continue
+            if (positive and value > 0) or (not positive and value >= 0):
+                return decimal_string(value)
+    return None
+
+
+def trading_metadata(
     payload: Any, source: str, *, perpetual_only: bool = False
-) -> frozenset[str]:
+) -> Dict[str, Dict[str, Optional[str]]]:
     if not isinstance(payload, dict):
         raise DataReadError(f"{source} exchange info is not an object")
     rows = payload.get("symbols")
     if not isinstance(rows, list):
         raise DataReadError(f"{source} exchange info symbols is not a list")
-    result = set()
+    result: Dict[str, Dict[str, Optional[str]]] = {}
     for raw in rows:
         if not isinstance(raw, dict) or raw.get("status") != "TRADING":
             continue
@@ -571,8 +683,45 @@ def trading_symbols(
             continue
         symbol = _valid_symbol(raw.get("symbol"))
         if symbol is not None:
-            result.add(symbol)
-    return frozenset(result)
+            if symbol in result:
+                raise DataReadError(f"{source} exchange info repeats {symbol}")
+            filters = raw.get("filters")
+            step = _exchange_filter_value(
+                filters, "LOT_SIZE", ("stepSize",), positive=True
+            )
+            if perpetual_only:
+                min_notional = _exchange_filter_value(
+                    filters,
+                    "MIN_NOTIONAL",
+                    ("notional", "minNotional"),
+                    positive=False,
+                )
+            else:
+                min_notional = _exchange_filter_value(
+                    filters, "NOTIONAL", ("minNotional",), positive=False
+                )
+                if min_notional is None:
+                    min_notional = _exchange_filter_value(
+                        filters,
+                        "MIN_NOTIONAL",
+                        ("minNotional",),
+                        positive=False,
+                    )
+            result[symbol] = {
+                "step": step,
+                "min_notional": min_notional,
+            }
+    return result
+
+
+def trading_symbols(
+    payload: Any, source: str, *, perpetual_only: bool = False
+) -> frozenset[str]:
+    return frozenset(
+        trading_metadata(
+            payload, source, perpetual_only=perpetual_only
+        )
+    )
 
 
 def premium_map(payload: Any) -> Dict[str, Dict[str, Any]]:
@@ -862,6 +1011,7 @@ class MarketStream:
         state_path: Path = DEFAULT_STATE_PATH,
         log_path: Path = DEFAULT_LOG_PATH,
         windows_path: Optional[Path] = None,
+        metadata_path: Optional[Path] = None,
         feed_state_path: Optional[Path] = None,
         *,
         window: int = DEFAULT_WINDOW,
@@ -917,6 +1067,11 @@ class MarketStream:
             if windows_path is not None
             else self.state_path.with_name(DEFAULT_WINDOWS_NAME)
         )
+        self.metadata_path = (
+            Path(metadata_path)
+            if metadata_path is not None
+            else self.state_path.with_name(DEFAULT_METADATA_NAME)
+        )
         self.feed_state_path = (
             None if feed_state_path is None else Path(feed_state_path)
         )
@@ -936,6 +1091,27 @@ class MarketStream:
         self._request_count = 0
         self._request_kinds: Dict[str, int] = {"bulk": 0, "kline": 0, "oi": 0}
         self._last_request_monotonic: Optional[float] = None
+
+    def _exchange_metadata(self, now_ms: int) -> Dict[str, Any]:
+        cached = load_metadata_cache(self.metadata_path, now_ms)
+        if cached is not None:
+            return cached
+        spot_payload = self._read(
+            "bulk", SPOT_BASE_URL, SPOT_EXCHANGE_INFO_PATH, {}
+        )
+        perp_payload = self._read(
+            "bulk", FAPI_BASE_URL, FAPI_EXCHANGE_INFO_PATH, {}
+        )
+        metadata = {
+            "version": METADATA_CACHE_VERSION,
+            "refreshed_ms": now_ms,
+            "spot": trading_metadata(spot_payload, "Spot"),
+            "perp": trading_metadata(
+                perp_payload, "USD-M", perpetual_only=True
+            ),
+        }
+        atomic_write_json(self.metadata_path, metadata)
+        return metadata
 
     def _read(
         self, kind: str, base_url: str, path: str, params: Mapping[str, str]
@@ -1002,6 +1178,8 @@ class MarketStream:
         spot_row: Optional[Mapping[str, Any]],
         perp_row: Optional[Mapping[str, Any]],
         premium_row: Optional[Mapping[str, Any]],
+        spot_metadata: Optional[Mapping[str, Optional[str]]],
+        perp_metadata: Optional[Mapping[str, Optional[str]]],
     ) -> Dict[str, Any]:
         spot_bid, spot_ask = _book_prices(spot_row, f"Spot {symbol}")
         perp_bid, perp_ask = _book_prices(perp_row, f"USD-M {symbol}")
@@ -1031,8 +1209,16 @@ class MarketStream:
             "venues": venue,
             "spot_bid": spot_bid if venue in {"spot", "both"} else None,
             "spot_ask": spot_ask if venue in {"spot", "both"} else None,
+            "spot_step": spot_metadata.get("step")
+            if venue == "both" and spot_metadata is not None else None,
+            "spot_min_notional": spot_metadata.get("min_notional")
+            if venue == "both" and spot_metadata is not None else None,
             "perp_bid": perp_bid if venue in {"perp", "both"} else None,
             "perp_ask": perp_ask if venue in {"perp", "both"} else None,
+            "perp_step": perp_metadata.get("step")
+            if venue == "both" and perp_metadata is not None else None,
+            "perp_min_notional": perp_metadata.get("min_notional")
+            if venue == "both" and perp_metadata is not None else None,
             "mark": mark,
             "vol_1m_quote": vol,
             "vol_med_1m": vol_med,
@@ -1101,22 +1287,17 @@ class MarketStream:
         self._last_request_monotonic = None
         pass_start_ms = self.ms_fn()
 
-        spot_info_payload = self._read(
-            "bulk", SPOT_BASE_URL, SPOT_EXCHANGE_INFO_PATH, {}
-        )
-        perp_info_payload = self._read(
-            "bulk", FAPI_BASE_URL, FAPI_EXCHANGE_INFO_PATH, {}
-        )
+        exchange_metadata = self._exchange_metadata(pass_start_ms)
         spot_payload = self._read("bulk", SPOT_BASE_URL, SPOT_BOOK_PATH, {})
         spot_book_ms = self.ms_fn()
         perp_payload = self._read("bulk", FAPI_BASE_URL, FAPI_BOOK_PATH, {})
         perp_book_ms = self.ms_fn()
         premium_payload = self._read("bulk", FAPI_BASE_URL, FAPI_PREMIUM_PATH, {})
         basis_now_ms = self.ms_fn()
-        spot_universe = trading_symbols(spot_info_payload, "Spot")
-        perp_universe = trading_symbols(
-            perp_info_payload, "USD-M", perpetual_only=True
-        )
+        spot_metadata = exchange_metadata["spot"]
+        perp_metadata = exchange_metadata["perp"]
+        spot_universe = frozenset(spot_metadata)
+        perp_universe = frozenset(perp_metadata)
         spot = {
             symbol: row
             for symbol, row in book_map(spot_payload, "Spot book ticker").items()
@@ -1149,6 +1330,8 @@ class MarketStream:
                 spot.get(symbol),
                 perp.get(symbol),
                 premium.get(symbol),
+                spot_metadata.get(symbol),
+                perp_metadata.get(symbol),
             )
             observations: Dict[str, Tuple[str, int, int]] = {}
             if records[symbol]["spot_ask"] is not None:
@@ -1202,6 +1385,10 @@ class MarketStream:
         focus_now_ms = self.ms_fn()
         for symbol in selection.symbols:
             focus_failures += self._focus_symbol(symbol, records[symbol], focus_now_ms)
+
+        if self.feed_state_path is not None and feed_snapshot is None:
+            for record in records.values():
+                record["surge_ratio"] = None
 
         completed_ms = self.ms_fn()
         completed_utc = self.utc_fn()

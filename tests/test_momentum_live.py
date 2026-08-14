@@ -430,6 +430,11 @@ class MomentumLiveTests(unittest.TestCase):
         )
 
         def killed_after_publication(*_args, **_kwargs):
+            job_rows = [
+                row for row in self.decision_rows() if row["job"] is not None
+            ]
+            self.assertEqual(len(job_rows), 1)
+            self.assertTrue(live.write_job_record(self.jobs, job_rows[0]["job"]))
             self.assertEqual(len(self.job_paths()), 1)
             raise SimulatedKill("killed after job publication")
 
@@ -450,6 +455,84 @@ class MomentumLiveTests(unittest.TestCase):
             if row["action"] == lifecycle.ACTION_ENTER_SMALL
         ]
         self.assertEqual(len(enter_rows), 1)
+
+    def test_crash_after_state_save_before_job_publication_republishes_once(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+        payload = stream_payload(
+            2, "108", "75", "7600", "1070", spread_pct="0.007"
+        )
+        expected = live.deterministic_job_id(
+            "AAAUSDT", "2026-08-14T10:01:00.000Z", live.JOB_OPEN_OP
+        )
+
+        def killed_before_publication(_jobs_dir, job):
+            saved = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+            self.assertEqual(saved["open_job_id"], job["job_id"])
+            self.assertEqual(saved["phase"], lifecycle.PHASE_ENTER_SMALL)
+            raise SimulatedKill("killed after state save before publication")
+
+        with self.assertRaises(SimulatedKill):
+            self.tick(payload, job_writer=killed_before_publication)
+        self.assertEqual(self.job_paths(), [])
+        self.assertEqual(
+            lifecycle.load_state(self.state).tokens["AAAUSDT"]["open_job_id"],
+            expected,
+        )
+
+        created = []
+
+        def counting_writer(jobs_dir, job):
+            published = live.write_job_record(jobs_dir, job)
+            if published:
+                created.append(job["job_id"])
+            return published
+
+        recovered = self.tick(payload, job_writer=counting_writer)
+        self.assertEqual(recovered.recovered_job_ids, (expected,))
+        replay = self.tick(payload, job_writer=counting_writer)
+        self.assertEqual(replay.recovered_job_ids, ())
+        self.assertEqual(replay.written_job_ids, ())
+        self.assertEqual(created, [expected])
+        self.assertEqual(len(self.job_paths()), 1)
+
+    def test_crash_after_job_publication_keeps_ledger_reconcile_unchanged(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+        payload = stream_payload(
+            2, "108", "75", "7600", "1070", spread_pct="0.007"
+        )
+
+        def publish_then_kill(jobs_dir, job):
+            self.assertTrue(live.write_job_record(jobs_dir, job))
+            saved = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+            self.assertEqual(saved["open_job_id"], job["job_id"])
+            raise SimulatedKill("killed after job publication")
+
+        with self.assertRaises(SimulatedKill):
+            self.tick(payload, job_writer=publish_then_kill)
+        job_rows_before = [
+            row for row in self.decision_rows() if row["job"] is not None
+        ]
+        self.assertEqual(len(job_rows_before), 1)
+        self.assertEqual(len(self.job_paths()), 1)
+
+        replay = self.tick(payload)
+        job_rows_after = [
+            row for row in self.decision_rows() if row["job"] is not None
+        ]
+        self.assertEqual(replay.recovered_job_ids, ())
+        self.assertEqual(replay.written_job_ids, ())
+        self.assertEqual(job_rows_after, job_rows_before)
+        self.assertEqual(len(self.job_paths()), 1)
 
     def test_crash_before_open_decision_append_recovers_receipt_and_job(self):
         self.tick(stream_payload(0, "100", "2", "100", "1000"))

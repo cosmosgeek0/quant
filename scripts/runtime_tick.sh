@@ -22,6 +22,10 @@ eval "$PATH_ASSIGNMENTS"
 export RECEIPT_DIR
 export PYTHONDONTWRITEBYTECODE=1
 
+FEED_STATE="$WATCH_DIR/feed_state.json"
+FEED_LOG="$WATCH_DIR/feed.log"
+FEED_PID_FILE="$WATCH_DIR/feed.pid"
+
 mkdir -p "$RECEIPT_DIR" "$JOBS_DIR" "$PROPOSALS_DIR" "$WATCH_DIR" || exit 2
 
 append_failure() {
@@ -31,6 +35,13 @@ append_failure() {
   utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '{"stage":"%s","exit":%d,"utc":"%s"}\n' \
     "$stage" "$code" "$utc" >> "$HEALTH"
+}
+
+append_feed_restart() {
+  local utc
+  utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '{"service":"market-feed","status":"RESTARTED","event":"restart","restart_count":1,"utc":"%s"}\n' \
+    "$utc" >> "$HEALTH"
 }
 
 RELEASE_FILE="$DEPLOY_DIR/RELEASE"
@@ -61,6 +72,66 @@ run_stage() {
   esac
   append_failure "$stage" "$code"
   overall=1
+  return 0
+}
+
+read_feed_pid() {
+  local pid
+  [ -r "$FEED_PID_FILE" ] || return 1
+  pid=$(<"$FEED_PID_FILE")
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+feed_process_live() {
+  local pid=$1
+  local command
+  kill -0 "$pid" 2>/dev/null || return 1
+  command=$(ps -ww -p "$pid" -o command= 2>/dev/null) || return 1
+  case "$command" in
+    *"$DEPLOY_DIR/src/market_feed.py"*"--serve"*) return 0 ;;
+  esac
+  return 1
+}
+
+start_feed() {
+  local pid checks=0
+  nohup python3 "$DEPLOY_DIR/src/market_feed.py" --serve \
+    --state-file "$FEED_STATE" \
+    --stop-file "$STOP_FILE" \
+    >> "$FEED_LOG" 2>&1 < /dev/null &
+  pid=$!
+  if ! printf '%s\n' "$pid" > "$FEED_PID_FILE"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    return 1
+  fi
+  while [ "$checks" -lt 10 ]; do
+    if feed_process_live "$pid"; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    checks=$((checks + 1))
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  rm -f "$FEED_PID_FILE"
+  return 1
+}
+
+feed_stage() {
+  local pid
+  local restart=0
+  if [ -e "$FEED_PID_FILE" ]; then
+    if pid=$(read_feed_pid) && feed_process_live "$pid"; then
+      return 0
+    fi
+    restart=1
+    rm -f "$FEED_PID_FILE" || return 1
+  fi
+  start_feed || return 1
+  if [ "$restart" -eq 1 ]; then
+    append_feed_restart || return 1
+  fi
   return 0
 }
 
@@ -102,11 +173,15 @@ supervisor_stage() {
 # STOP pauses fresh decisions, but the supervisor must still reconcile and
 # close standing exposure. STOP-JOBS independently prevents job publication.
 if [ ! -e "$STOP_FILE" ]; then
+  run_stage feed "0" \
+    feed_stage
+
   run_stage stream "0" \
     python3 "$DEPLOY_DIR/src/market_stream.py" --once \
       --state-file "$STREAM_STATE" \
       --log-file "$STREAM_LOG" \
-      --windows-file "$STREAM_WINDOWS"
+      --windows-file "$STREAM_WINDOWS" \
+      --feed-state "$FEED_STATE"
 
   run_stage basis_watch "0" \
     python3 "$DEPLOY_DIR/src/basis_watch.py" --once \

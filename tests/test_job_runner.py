@@ -6,6 +6,8 @@ import os
 import socket
 import sys
 import tempfile
+import threading
+import types
 import unittest
 import urllib.request
 from contextlib import contextmanager
@@ -110,6 +112,50 @@ class JobRunnerTests(unittest.TestCase):
         self.momentum_plan_caps = []
         self.momentum_query_state = "terminal"
         self.open_quote_override = None
+        self.governor_budget = (True, "")
+        self.governor_budget_calls = []
+        self.governor_acquire_calls = []
+        self.governor_acquire_refusal = ""
+        self.governor_releases = []
+        self.governor_realized = []
+
+        class FakeGovernorRefusal(Exception):
+            def __init__(inner_self, reason):
+                super().__init__(reason)
+                inner_self.reason = reason
+
+        governor = types.ModuleType("account_governor")
+        governor.GovernorRefusal = FakeGovernorRefusal
+
+        def budgets_allow(receipt_dir):
+            self.governor_budget_calls.append(receipt_dir)
+            return self.governor_budget
+
+        def acquire_entry_slot(op, symbol, receipt_dir):
+            self.governor_acquire_calls.append(
+                (op, symbol, receipt_dir)
+            )
+            if self.governor_acquire_refusal:
+                raise FakeGovernorRefusal(self.governor_acquire_refusal)
+            return "governor-token-%s" % len(self.governor_acquire_calls)
+
+        def release_entry_slot(token, receipt_dir):
+            self.governor_releases.append((token, receipt_dir))
+
+        def record_realized(net_usdt, fees_usdt, receipt_dir):
+            self.governor_realized.append(
+                (net_usdt, fees_usdt, receipt_dir)
+            )
+
+        governor.budgets_allow = budgets_allow
+        governor.acquire_entry_slot = acquire_entry_slot
+        governor.release_entry_slot = release_entry_slot
+        governor.record_realized = record_realized
+        governor_patch = mock.patch.dict(
+            sys.modules, {"account_governor": governor}
+        )
+        governor_patch.start()
+        self.addCleanup(governor_patch.stop)
 
         env = mock.patch.dict(os.environ, {
             "RECEIPT_DIR": self.receipt_dir,
@@ -382,28 +428,79 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(len(self.hand_calls), 2)
         self.assertEqual([row["job_id"] for row in self.results()], ["a", "b"])
 
-    def test_stop_jobs_halts_without_claiming(self):
-        self.job("stopped")
-        stop = os.path.join(self.receipt_dir, "STOP-JOBS")
+    def test_both_stops_refuse_every_entry_class_after_claim(self):
+        sequence = 0
+        for marker in ("STOP", "STOP-JOBS"):
+            for op in sorted(jr.ENTRY_OPS):
+                with self.subTest(marker=marker, op=op):
+                    sequence += 1
+                    job_id = "stopped-%s" % sequence
+                    self.job(job_id, op=op)
+                    stop = os.path.join(self.receipt_dir, marker)
+                    Path(stop).touch()
+
+                    self.assertEqual(self.tick(), 2)
+
+                    row = self.results()[-1]
+                    self.assertEqual(row["job_id"], job_id)
+                    self.assertEqual(row["verdict"], "REFUSED")
+                    self.assertEqual(
+                        self.reason(row),
+                        "ENTRY_BLOCKED_" + marker.replace("-", "_"),
+                    )
+                    self.assertTrue(os.path.isfile(os.path.join(
+                        self.jobs_dir, "claims", "job-%s.claim" % job_id
+                    )))
+                    os.unlink(stop)
+        self.assertEqual(self.hand_calls, [])
+        self.assertEqual(self.basis_calls, [])
+        self.assertEqual(self.momentum_intents, [])
+        self.assertEqual(self.governor_budget_calls, [])
+
+    def test_accept_one_allows_one_entry_then_stop_reseals(self):
+        self.job("accepted-a")
+        self.job("accepted-b")
+        stop = os.path.join(self.receipt_dir, "STOP")
+        accept = os.path.join(self.receipt_dir, "ACCEPT-ONE")
         Path(stop).touch()
-        self.assertEqual(self.tick(), 0)
-        self.assertEqual(self.hand_calls, [])
-        self.assertEqual(self.results(), [])
-        self.assertFalse(os.path.exists(os.path.join(
-            self.jobs_dir, "claims", "job-stopped.claim"
-        )))
-
-    def test_bare_stop_halts_without_claiming(self):
-        self.job("bare-stopped")
-        Path(os.path.join(self.receipt_dir, "STOP")).touch()
+        Path(accept).touch()
 
         self.assertEqual(self.tick(), 0)
 
-        self.assertEqual(self.hand_calls, [])
-        self.assertEqual(self.results(), [])
-        self.assertFalse(os.path.exists(os.path.join(
-            self.jobs_dir, "claims", "job-bare-stopped.claim"
-        )))
+        self.assertEqual(len(self.hand_calls), 1)
+        self.assertFalse(os.path.exists(accept))
+        self.assertFalse(os.path.exists(accept + ".claimed"))
+        self.assertTrue(os.path.isfile(stop))
+        self.assertEqual(self.results()[0]["job_id"], "accepted-a")
+        self.assertEqual(len(self.governor_releases), 1)
+
+        self.assertEqual(self.tick(), 2)
+        self.assertEqual(len(self.hand_calls), 1)
+        self.assertEqual(self.results()[-1]["job_id"], "accepted-b")
+        self.assertEqual(
+            self.reason(self.results()[-1]), "ENTRY_BLOCKED_STOP"
+        )
+
+    def test_accept_one_atomic_consumer_wins_once_under_contention(self):
+        marker = os.path.join(self.receipt_dir, "ACCEPT-ONE")
+        Path(marker).touch()
+        barrier = threading.Barrier(3)
+        outcomes = []
+
+        def consume():
+            barrier.wait()
+            outcomes.append(jr._consume_accept_one(marker))
+
+        threads = [threading.Thread(target=consume) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(outcomes), [False, True])
+        self.assertFalse(os.path.exists(marker))
 
     def test_unknown_touches_stop_and_blocks_next_job(self):
         self.job("a")
@@ -416,9 +513,47 @@ class JobRunnerTests(unittest.TestCase):
         )))
         self.hand_verdict = "CLOSED"
         self.hand_exit = 0
-        self.assertEqual(self.tick(), 0)
+        self.assertEqual(self.tick(), 3)
         self.assertEqual(len(self.hand_calls), 1)
         self.assertEqual([row["job_id"] for row in self.results()], ["a"])
+
+    def test_governor_refusal_blocks_entry_before_executor(self):
+        self.governor_acquire_refusal = "ACCOUNT_FROZEN"
+        self.job("governor-refused")
+
+        self.assertEqual(self.tick(), 2)
+
+        self.assertEqual(self.hand_calls, [])
+        self.assertEqual(len(self.governor_budget_calls), 1)
+        self.assertEqual(len(self.governor_acquire_calls), 1)
+        self.assertEqual(self.governor_releases, [])
+        self.assertEqual(
+            self.reason(self.results()[0]), "ACCOUNT_FROZEN"
+        )
+
+    def test_governor_budget_refusal_blocks_entry_before_claim_slot(self):
+        self.governor_budget = (False, "DAILY_BUDGET_EXHAUSTED")
+        self.job("budget-refused")
+
+        self.assertEqual(self.tick(), 2)
+
+        self.assertEqual(self.hand_calls, [])
+        self.assertEqual(len(self.governor_budget_calls), 1)
+        self.assertEqual(self.governor_acquire_calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]), "DAILY_BUDGET_EXHAUSTED"
+        )
+
+    def test_governor_absence_fails_entry_closed(self):
+        self.job("governor-absent")
+
+        with mock.patch.dict(sys.modules, {"account_governor": None}):
+            self.assertEqual(self.tick(), 2)
+
+        self.assertEqual(self.hand_calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]), "GOVERNOR_ABSENT"
+        )
 
     def test_clearing_stop_cannot_bypass_unreconciled_unknown_receipt(self):
         self.job("a")
@@ -546,7 +681,7 @@ class JobRunnerTests(unittest.TestCase):
         )))
         self.hand_verdict = "CLOSED"
         self.hand_exit = 0
-        self.assertEqual(self.tick(), 0)
+        self.assertEqual(self.tick(), 3)
         self.assertEqual(len(self.hand_calls), 1)
         self.assertEqual(
             [row["job_id"] for row in self.results()], ["momentum-a"]
@@ -625,6 +760,27 @@ class JobRunnerTests(unittest.TestCase):
             self.reason(self.results()[0]), "NO_MOMENTUM_POSITION"
         )
 
+    def _assert_momentum_exit_runs_under(self, marker):
+        quantity = self.open_momentum("stop-exit-open")
+        Path(os.path.join(self.receipt_dir, marker)).touch()
+        self.job("stop-exit-close", op="MOMENTUM_EXIT")
+        self.queue_momentum_measurement(quantity)
+        self.queue_momentum_measurement(0)
+
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(self.results()[-1]["verdict"], "CLOSED")
+        self.assertEqual(self.momentum_intents[-1]["reduceOnly"], "true")
+        self.assertEqual(self.momentum_state()["state"], "CLOSED")
+        self.assertEqual(len(self.governor_realized), 1)
+
+    def test_momentum_exit_runs_under_stop(self):
+        self._assert_momentum_exit_runs_under("STOP")
+
+    def test_momentum_exit_runs_under_stop_jobs(self):
+        self._assert_momentum_exit_runs_under("STOP-JOBS")
+
     def test_momentum_exit_uses_measured_qty_and_records_realized_fees(self):
         quantity = self.open_momentum("fee-open")
         self.job(
@@ -659,6 +815,9 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(
             row["realized"]["commission_by_asset"], {"USDT": "0.005"}
         )
+        self.assertEqual(self.governor_realized, [(
+            Decimal("0.245"), Decimal("0.005"), self.receipt_dir,
+        )])
 
     def test_momentum_exit_accepts_sparse_account_flat_response(self):
         quantity = self.open_momentum("sparse-open")
@@ -772,7 +931,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(state["pending_intent"]["action"], "OPEN")
         self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
         self.job("after-unknown", op="MOMENTUM_OPEN")
-        self.assertEqual(self.tick(), 0)
+        self.assertEqual(self.tick(), 3)
         self.assertEqual(len(self.momentum_intents), 1)
 
     def test_momentum_open_exchange_cap_breach_freezes(self):
@@ -802,10 +961,13 @@ class JobRunnerTests(unittest.TestCase):
         pending = self.momentum_state()
         self.assertEqual(pending["state"], "OPENING")
         client_id = pending["pending_intent"]["client_id"]
+        governor_token = pending["pending_intent"]["governor_token"]
+        self.assertTrue(governor_token)
         self.assertEqual(self.results(), [])
         self.assertFalse(os.path.exists(os.path.join(
             self.receipt_dir, "STOP-JOBS"
         )))
+        Path(os.path.join(self.receipt_dir, "STOP")).touch()
 
         queried = []
 
@@ -826,6 +988,10 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.results()[0]["verdict"], "REFUSED")
         self.assertEqual(
             self.reason(self.results()[0]), "MOMENTUM_OPEN_NOT_ACCEPTED"
+        )
+        self.assertEqual(
+            self.governor_releases,
+            [(governor_token, self.receipt_dir)],
         )
 
     def test_closed_futures_writes_proof_marker(self):

@@ -47,6 +47,7 @@ OPS = {
     "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
     "MOMENTUM_OPEN", "MOMENTUM_EXIT",
 }
+ENTRY_OPS = OPS - {"MOMENTUM_EXIT"}
 MOMENTUM_OPS = {"MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT"}
 MOMENTUM_STANDING = {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}
 HARD_MAX_NOTIONAL = Decimal("8")
@@ -236,6 +237,7 @@ def _paths(receipt_dir: str) -> Dict[str, str]:
         ),
         "bare_stop": os.path.join(receipt_dir, "STOP"),
         "stop": os.path.join(receipt_dir, "STOP-JOBS"),
+        "accept_one": os.path.join(receipt_dir, "ACCEPT-ONE"),
         "tick_lock": os.path.join(jobs_dir, ".job-runner-active"),
     }
 
@@ -256,6 +258,140 @@ def _halt_marker(paths: Dict[str, str]) -> str:
         if os.path.exists(paths[name]):
             return os.path.basename(paths[name])
     return ""
+
+
+def _consume_accept_one(path: str) -> bool:
+    """Atomically consume one stop override without following its target."""
+    claim_path = path + ".claimed"
+    try:
+        descriptor = os.open(
+            claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    consumed = False
+    try:
+        os.write(descriptor, (str(os.getpid()) + "\n").encode("ascii"))
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.unlink(path)
+        except (FileNotFoundError, IsADirectoryError, PermissionError):
+            return False
+        except OSError:
+            return False
+        consumed = True
+        try:
+            directory = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            pass
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not consumed:
+            try:
+                os.unlink(claim_path)
+            except OSError:
+                pass
+
+
+def _reseal_interlock(paths: Dict[str, str], marker: str) -> None:
+    path = paths["bare_stop"] if marker == "STOP" else paths["stop"]
+    _touch_stop(path)
+    try:
+        os.unlink(paths["accept_one"] + ".claimed")
+    except OSError:
+        pass
+
+
+def _account_governor_api():
+    """Resolve the sibling governor only at a money-entry boundary."""
+    try:
+        import account_governor
+        from account_governor import (
+            acquire_entry_slot,
+            budgets_allow,
+            record_realized,
+            release_entry_slot,
+        )
+    except ModuleNotFoundError as error:
+        reason = "GOVERNOR_ABSENT" \
+            if error.name == "account_governor" else "GOVERNOR_ERROR"
+        raise JobRefusal(reason) from None
+    except (ImportError, AttributeError):
+        raise JobRefusal("GOVERNOR_ERROR") from None
+    except Exception:
+        raise JobRefusal("GOVERNOR_ERROR") from None
+    governor_refusal = getattr(account_governor, "GovernorRefusal", None)
+    if not isinstance(governor_refusal, type) \
+            or not issubclass(governor_refusal, Exception):
+        raise JobRefusal("GOVERNOR_ABSENT")
+    return (
+        acquire_entry_slot,
+        release_entry_slot,
+        record_realized,
+        budgets_allow,
+        governor_refusal,
+    )
+
+
+def _governor_reason(value: Any, fallback: str) -> str:
+    if type(value) is str and value.strip():
+        return " ".join(value.split())[:128]
+    return fallback
+
+
+def _acquire_governor(job: Job, receipt_dir: str) \
+        -> Tuple[str, Optional[Callable[..., Any]], str]:
+    try:
+        acquire, release, _record, budgets, refusal_type = \
+            _account_governor_api()
+    except JobRefusal as error:
+        return "", None, error.reason
+    try:
+        budget_result = budgets(receipt_dir)
+    except refusal_type as error:
+        return "", None, _governor_reason(
+            getattr(error, "reason", ""), "GOVERNOR_REFUSAL"
+        )
+    except Exception:
+        return "", None, "GOVERNOR_ERROR"
+    if type(budget_result) is not tuple or len(budget_result) != 2 \
+            or type(budget_result[0]) is not bool:
+        return "", None, "GOVERNOR_ERROR"
+    allowed, reason = budget_result
+    if not allowed:
+        return "", None, _governor_reason(reason, "GOVERNOR_REFUSAL")
+    try:
+        token = acquire(job.op, job.symbol, receipt_dir)
+    except refusal_type as error:
+        return "", None, _governor_reason(
+            getattr(error, "reason", ""), "GOVERNOR_REFUSAL"
+        )
+    except Exception:
+        return "", None, "GOVERNOR_ERROR"
+    if type(token) is not str or not token:
+        return "", None, "GOVERNOR_ERROR"
+    return token, release, ""
+
+
+def _release_governor(release: Optional[Callable[..., Any]], token: str,
+                      receipt_dir: str) -> bool:
+    if release is None or not token:
+        return False
+    try:
+        release(token, receipt_dir)
+    except Exception:
+        return False
+    return True
 
 
 def _acquire_tick_lock(path: str, now: datetime) -> Tuple[str, bool]:
@@ -1242,7 +1378,8 @@ def _resolve_momentum_exit(paths: Dict[str, str],
 
 
 def _run_momentum_open(job: Job, receipt_dir: str,
-                       paths: Dict[str, str], now: datetime) -> Outcome:
+                       paths: Dict[str, str], now: datetime,
+                       governor_token: str = "") -> Outcome:
     try:
         prior = _load_momentum_position(paths)
     except MomentumStateError as error:
@@ -1287,6 +1424,7 @@ def _run_momentum_open(job: Job, receipt_dir: str,
             "client_id": client_id,
             "intent": dict(intent),
             "persisted_utc": _utc_text(now),
+            "governor_token": governor_token,
         },
         "entry": None,
         "exit": None,
@@ -1394,7 +1532,7 @@ def _momentum_roundtrip_allowed(paths: Dict[str, str]) -> Optional[Outcome]:
 
 def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
                               result_ids: set, now: datetime) \
-        -> Optional[Tuple[str, str, str, Outcome]]:
+        -> Optional[Tuple[str, str, str, Outcome, str]]:
     try:
         position = _load_momentum_position(paths)
     except MomentumStateError:
@@ -1409,20 +1547,23 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
         return None
     pending = position["pending_intent"]
     action = pending["action"]
+    governor_token = pending.get("governor_token", "")
+    if type(governor_token) is not str:
+        governor_token = ""
     op = "MOMENTUM_OPEN" if action == "OPEN" else "MOMENTUM_EXIT"
     if not os.environ.get("BINANCE_API_KEY") \
             or not os.environ.get("BINANCE_API_SECRET"):
         outcome = _momentum_unknown(
             paths, position, "MISSING_CREDENTIALS_DURING_RECOVERY", now
         )
-        return job_id, op, position["symbol"], outcome
+        return job_id, op, position["symbol"], outcome, governor_token
     sha = str(position.get("sha", "")).lower()
     effective = str(position.get("effective_notional", ""))
     if not SHA_RE.fullmatch(sha) or not effective:
         outcome = _momentum_unknown(
             paths, position, "INVALID_PERSISTED_RECOVERY_CONFIG", now
         )
-        return job_id, op, position["symbol"], outcome
+        return job_id, op, position["symbol"], outcome, governor_token
     values = {
         "SYMBOL": position["symbol"],
         "MAX_NOTIONAL": effective,
@@ -1450,13 +1591,13 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
                     paths, position, query_state, order, [], "recovery", now,
                     recovering=True,
                 )
-    return job_id, op, position["symbol"], outcome
+    return job_id, op, position["symbol"], outcome, governor_token
 
 
 def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
              futures_entry: Optional[Callable[[], Any]],
              basis_entry: Optional[Callable[[Any], Any]],
-             now: datetime) -> Outcome:
+             now: datetime, governor_token: str = "") -> Outcome:
     sha = os.environ.get("QUANT_SHA", "").lower()
     if not SHA_RE.fullmatch(sha):
         return Outcome("REFUSED", 2, "", "BAD_QUANT_SHA")
@@ -1478,7 +1619,9 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
     }
     with _environment(values):
         if job.op == "MOMENTUM_OPEN":
-            return _run_momentum_open(job, receipt_dir, paths, now)
+            return _run_momentum_open(
+                job, receipt_dir, paths, now, governor_token
+            )
         if job.op == "MOMENTUM_EXIT":
             return _run_momentum_exit(job, receipt_dir, paths, now)
         if job.op == "MOMENTUM_ROUNDTRIP":
@@ -1492,6 +1635,58 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
         if job.op == "MOMENTUM_ROUNDTRIP":
             return _run_futures(receipt_dir, futures_entry, short=False)
         return _run_basis(receipt_dir, job.effective_notional, basis_entry)
+
+
+def _entry_outcome_terminal(outcome: Outcome) -> bool:
+    return outcome.verdict not in FREEZE_VERDICTS
+
+
+def _release_recovered_governor(token: str, receipt_dir: str) -> bool:
+    if not token:
+        return True
+    try:
+        _acquire, release, _record, _budgets, _refusal = \
+            _account_governor_api()
+    except JobRefusal:
+        return False
+    return _release_governor(release, token, receipt_dir)
+
+
+def _realized_close_values(outcome: Outcome) \
+        -> Optional[Tuple[Decimal, Decimal]]:
+    if outcome.verdict != "CLOSED" or not isinstance(outcome.ledger, dict):
+        return None
+    realized = outcome.ledger.get("realized")
+    if not isinstance(realized, dict):
+        return None
+    net_raw = realized.get("net_usdt")
+    totals = realized.get("commission_by_asset")
+    if type(net_raw) is not str or not isinstance(totals, dict) \
+            or any(type(key) is not str or type(value) is not str
+                   for key, value in totals.items()) \
+            or not set(totals).issubset({"USDT"}):
+        return None
+    try:
+        net = Decimal(net_raw)
+        fees = Decimal(totals.get("USDT", "0"))
+    except (ArithmeticError, ValueError):
+        return None
+    if not net.is_finite() or not fees.is_finite() or fees < 0:
+        return None
+    return net, fees
+
+
+def _record_realized_close(outcome: Outcome, receipt_dir: str) -> bool:
+    values = _realized_close_values(outcome)
+    if values is None:
+        return True
+    try:
+        _acquire, _release, record, _budgets, _refusal = \
+            _account_governor_api()
+        record(values[0], values[1], receipt_dir)
+    except Exception:
+        return False
+    return True
 
 
 def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
@@ -1516,6 +1711,9 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
     if outcome.verdict in FREEZE_VERDICTS:
         _touch_stop(paths["stop"])
     _append_result(paths, job_id, op, symbol, outcome, now)
+    if not _record_realized_close(outcome, receipt_dir):
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | GOVERNOR_RECORD_FAILED | entries stopped")
     print("JOB | %s | %s | %s | exit %s" % (
         job_id, op or "INVALID", outcome.verdict, outcome.exit_code
     ))
@@ -1535,10 +1733,6 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
     now = now.astimezone(timezone.utc)
     paths = _paths(receipt_dir)
     _make_dirs(paths)
-    halt_marker = _halt_marker(paths)
-    if halt_marker:
-        print("JOB-RUNNER | HALTED | %s present" % halt_marker)
-        return 0
 
     token, stale = _acquire_tick_lock(paths["tick_lock"], now)
     if stale:
@@ -1549,10 +1743,6 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
         print("JOB-RUNNER | BUSY | another tick is active")
         return 0
     try:
-        halt_marker = _halt_marker(paths)
-        if halt_marker:
-            print("JOB-RUNNER | HALTED | %s present" % halt_marker)
-            return 0
         result_ids, bad_results, unresolved_result = _result_ids(paths["results"])
         if bad_results or unresolved_result \
                 or _unresolved_account_state(receipt_dir):
@@ -1563,10 +1753,16 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             paths, receipt_dir, result_ids, now
         )
         if recovery is not None:
-            job_id, op, symbol, outcome = recovery
-            return _finish_claimed(
+            job_id, op, symbol, outcome, governor_token = recovery
+            code = _finish_claimed(
                 paths, receipt_dir, job_id, op, symbol, outcome, now
             )
+            if governor_token and _entry_outcome_terminal(outcome) \
+                    and not _release_recovered_governor(
+                        governor_token, receipt_dir
+                    ):
+                _touch_stop(paths["stop"])
+            return code
         if not _claims_are_resolved(paths, result_ids):
             _touch_stop(paths["stop"])
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
@@ -1598,12 +1794,51 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 return _finish_claimed(
                     paths, receipt_dir, filename_id, op, symbol, outcome, now
                 )
-            outcome = _execute(
-                job, receipt_dir, paths, futures_entry, basis_entry, now
-            )
-            return _finish_claimed(
-                paths, receipt_dir, job.job_id, job.op, job.symbol, outcome, now
-            )
+            one_shot_marker = ""
+            if job.op in ENTRY_OPS:
+                halt_marker = _halt_marker(paths)
+                if halt_marker:
+                    if not _consume_accept_one(paths["accept_one"]):
+                        reason = "ENTRY_BLOCKED_" + halt_marker.replace(
+                            "-", "_"
+                        )
+                        outcome = Outcome("REFUSED", 2, "", reason)
+                        return _finish_claimed(
+                            paths, receipt_dir, job.job_id, job.op,
+                            job.symbol, outcome, now
+                        )
+                    one_shot_marker = halt_marker
+            try:
+                governor_token = ""
+                release_governor = None
+                if job.op in ENTRY_OPS:
+                    governor_token, release_governor, refusal = \
+                        _acquire_governor(job, receipt_dir)
+                    if refusal:
+                        outcome = Outcome("REFUSED", 2, "", refusal)
+                    else:
+                        outcome = _execute(
+                            job, receipt_dir, paths, futures_entry,
+                            basis_entry, now, governor_token
+                        )
+                else:
+                    outcome = _execute(
+                        job, receipt_dir, paths, futures_entry,
+                        basis_entry, now
+                    )
+                code = _finish_claimed(
+                    paths, receipt_dir, job.job_id, job.op, job.symbol,
+                    outcome, now
+                )
+                if governor_token and _entry_outcome_terminal(outcome) \
+                        and not _release_governor(
+                            release_governor, governor_token, receipt_dir
+                        ):
+                    _touch_stop(paths["stop"])
+                return code
+            finally:
+                if one_shot_marker:
+                    _reseal_interlock(paths, one_shot_marker)
         print("JOB-RUNNER | IDLE | no due unclaimed job")
         return 0
     finally:

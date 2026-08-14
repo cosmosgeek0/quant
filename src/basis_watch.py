@@ -8,8 +8,10 @@ conventions).  Per pass:
    (five unsigned GETs: two exchangeInfo, two all-symbol bookTickers, one
    all-symbol premiumIndex).  With --stream-state it instead reads the shared
    stream_state.json snapshot and admits fresh, both-venue, positive NORMAL
-   basis gaps.  A missing, malformed, stale, or null stream value never
-   becomes a finalist.
+   basis gaps only when both venues' lot steps and minimum notionals prove an
+   executable quantity.  Missing sizing metadata is counted and skipped before
+   deep reads; a malformed, stale, or null stream value never becomes a
+   finalist.
 2. Finalists: cap-fitting rows with the best raw entry gaps (bounded by
    --finalists), plus every symbol already WATCHING/FOCUS/PROPOSED so
    demotion stays honest.  COOLDOWN symbols are wholly skipped (spec rule
@@ -138,6 +140,8 @@ FUNDING_PERIOD_JITTER_MS = 60_000     # exchange stamps may drift slightly
 PREC = 50
 DIRECT_FEED_MODE = "DIRECT-FETCH"
 STREAM_FEED_MODE = "STREAM-FED"
+STREAM_SKIP_METADATA = "metadata_missing"
+STREAM_SKIP_NOT_EXECUTABLE = "not_executable"
 
 STATES = ("IDLE", "WATCHING", "FOCUS", "PROPOSED", "REJECTED", "COOLDOWN")
 ADVANCED_STATES = ("FOCUS", "PROPOSED")
@@ -1147,9 +1151,8 @@ class LiveReads:
 
 def _stream_metadata_decimal(record: Dict[str, Any], venue: str,
                              field: str) -> Optional[Decimal]:
-    """Read one exact flat filter emitted by ``market_feed``."""
-    suffix = "step_size" if field == "step" else "min_notional"
-    value = dec(record.get("%s_%s" % (venue, suffix)))
+    """Read one exact flat filter emitted by ``market_stream``."""
+    value = dec(record.get("%s_%s" % (venue, field)))
     if value is None or (field == "step" and value <= 0) \
             or (field == "min_notional" and value < 0):
         return None
@@ -1159,9 +1162,9 @@ def _stream_metadata_decimal(record: Dict[str, Any], venue: str,
 class StreamStateReads:
     """Shared-stream cheap pass plus the unchanged per-finalist deep reads.
 
-    Legacy stream rows without venue filters remain discovery-compatible but
-    cannot size a proposal.  Metadata-enriched rows carry each venue's lot
-    step and minimum notional through to proposal construction.
+    Rows without all four venue filters are counted and skipped before any
+    deep read.  Complete rows carry each venue's lot step and minimum notional
+    through the same executable-quantity function as direct reads.
     """
 
     feed_mode = STREAM_FEED_MODE
@@ -1170,8 +1173,13 @@ class StreamStateReads:
         self.path = path
         self.deep_reads = deep_reads
         self.stale_ms = Decimal(stale_ms)
+        self.skip_counts: Dict[str, int] = {}
+
+    def _skip(self, reason: str) -> None:
+        self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
 
     def universe_rows(self) -> List[Dict[str, Any]]:
+        self.skip_counts = {}
         with open(self.path, encoding="utf-8") as handle:
             payload = json.load(handle, parse_float=Decimal)
         if not isinstance(payload, dict):
@@ -1199,9 +1207,16 @@ class StreamStateReads:
                 record, "spot", "min_notional")
             perp_min = _stream_metadata_decimal(
                 record, "perp", "min_notional")
+            if any(value is None for value in (
+                    spot_step, perp_step, spot_min, perp_min)):
+                self._skip(STREAM_SKIP_METADATA)
+                continue
             sized = proposal_quantity(
                 CAP_USDT, spot_ask, perp_bid, spot_step, perp_step,
                 spot_min, perp_min)
+            if sized is None:
+                self._skip(STREAM_SKIP_NOT_EXECUTABLE)
+                continue
             rows.append({
                 "symbol": symbol,
                 "entry_gap_bps": gap_pct * Decimal(100),
@@ -1215,7 +1230,7 @@ class StreamStateReads:
                 # tracked symbol can be evaluated and demoted honestly.  Only
                 # positive NORMAL gaps enter the new-finalist ranking.
                 "finalist_eligible": gap_pct > 0,
-                "fits_10_cap": sized is not None,
+                "fits_10_cap": True,
                 "spot_step": spot_step,
                 "perp_step": perp_step,
                 "spot_min_notional": spot_min,
@@ -1243,6 +1258,7 @@ class Watch:
         self.pass_count = 0
         self.last_pass_ms: Optional[int] = None
         self.last_feed_mode = DIRECT_FEED_MODE
+        self.last_skip_counts: Dict[str, int] = {}
         self.load_state()
 
     # -- state file ---------------------------------------------------------
@@ -1760,6 +1776,7 @@ class Watch:
         pass_now = clock()
         rows = reads.universe_rows()
         self.last_feed_mode = getattr(reads, "feed_mode", DIRECT_FEED_MODE)
+        self.last_skip_counts = dict(getattr(reads, "skip_counts", {}))
         market_rows = {row["symbol"]: row for row in rows}
         finalists = self._pick_finalists(rows, pass_now)
         out: List[Dict[str, Any]] = []
@@ -1865,6 +1882,10 @@ def print_pass(watch: Watch, rows: List[Dict[str, Any]]) -> None:
           % (watch.pass_count, watch.last_feed_mode, len(rows),
              "present" if basis_kernel is not None else "absent",
              watch.state_path))
+    skips = ",".join(
+        "%s=%d" % item for item in sorted(watch.last_skip_counts.items())
+    ) or "none"
+    print("WATCH | skipped %s" % skips)
     print(" | ".join(ROW_FIELDS))
     for row in rows:
         print(" | ".join(format_value(row[key]) for key in ROW_FIELDS))
