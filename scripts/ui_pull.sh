@@ -6,7 +6,12 @@ umask 077
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 SSMRUN=$REPO_ROOT/aws-connect/ssmrun.sh
-HOST_PRINTER=$REPO_ROOT/scripts/host_print_live.sh
+# The printer must NOT stream through the PTY (it drops lines under volume):
+# the Lead xfers scripts/host_print_live.sh to the host once; each cycle runs
+# a one-line driver that executes that host-side copy.
+HOST_PRINTER_REMOTE=${HOST_PRINTER_REMOTE:-/home/ssm-user/quant-run/host_print_live.sh}
+HOST_PRINTER=$(mktemp "${TMPDIR:-/tmp}/ui-pull-driver.XXXXXX")
+printf 'bash %s\n' "$HOST_PRINTER_REMOTE" > "$HOST_PRINTER"
 LIVE_DIR=${UI_LIVE_DIR:-$REPO_ROOT/ui/live}
 CYCLE=${CYCLE:-30}
 SSM_WAIT=${SSM_WAIT:-45}
