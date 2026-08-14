@@ -48,15 +48,26 @@ commands, no arbitrary shell near money — job files in, receipts out.
   with line numbers, explicit boundaries. Vague dispatches produce drift.
 - Parallelism is bounded by FILE OWNERSHIP: disjoint files fan out,
   same-file work chains. Never two writers on one file.
-- SPLIT HARDER (owner law 2026-08-14 — TIME is the only scarce resource;
-  compute is unlimited across 5 codex accounts): (1) src and tests are
-  DIFFERENT FILES — for every module, one worker builds the code and a
-  second builds the tests against a frozen API contract, in parallel;
-  (2) new functionality is born as SMALL files so ownership splits;
-  (3) a review worker starts on each lane's diff the moment it lands while
-  other lanes still build; (4) fixtures, glue scripts, and evidence
-  formatting are their own lanes. A 20-minute bundled task is three
-  7-minute tasks — split it. Never pad with redundant read-only lanes.
+- THE TIME LAW (owner, 2026-08-14, the biggest lesson): AI models have no
+  sense of time; the OWNER's time is the only thing money cannot buy back.
+  Compute is unlimited (5 codex accounts, rotated by the owner); a model's
+  default instinct is to fall back to slow serial lanes — that instinct is
+  the enemy. Never be stuck or snail-pacing until poked. Every dispatch
+  begins with "/fast" (accepted by codex exec; reasoning stays max).
+- SHARDING PROTOCOL — 50 workers on one thing: file ownership is not a
+  ceiling, it is a merge plan. (1) The Lead freezes an INTERFACE MAP
+  (functions/classes, signatures, shared constants) for the target file.
+  (2) Each worker builds ONE part in its own temporary shard file
+  (shards/<target>__<part>.py) against that map — small manageable scope,
+  good context supplied, FABLE-CLEAN report. (3) A specialized MERGE worker
+  (or the Lead) assembles shards into the real file, resolving imports and
+  seams. (4) Test shards build the same way in parallel. (5) Specialized
+  MONITOR workers — Opus subagents at max, which are strong at spotting
+  mistakes — review diffs the moment each shard lands, pipelined, so
+  review never serializes the build. (6) The slowest shard is the clock:
+  cut shards so no single one dominates. QUALITY IS NON-NEGOTIABLE: bad
+  code from fast fan-out is a failed dispatch, not a trade-off; src/tests
+  split, small files, and never redundant read-only padding still hold.
 - Workers NEVER run git. The Lead verifies every result with its own diff
   read and its own test run before a checkpoint commit — a worker's report
   is a hypothesis. Checkpoint after every verified task; push often; keep
