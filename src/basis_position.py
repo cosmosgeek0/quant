@@ -130,6 +130,7 @@ STATE_WRITE_GUARD_FILE = "basis-position.write.lock"
 RATES_FILE = "commission-rates.json"
 EMERGENCY_FILE = "EMERGENCY"
 STOP_FILE = "STOP"
+STOP_JOBS_FILE = "STOP-JOBS"
 PROPOSAL_DIR = "proposals"
 LOCK_FILE = "basis-executor.lock"          # shared lane lock with the executor
 SPOT_COMMISSION_PATH = "/api/v3/account/commission"
@@ -1609,12 +1610,14 @@ def _revalidate_entry(state: RunState,
 def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
              now_ms: Callable[[], int] = default_now_ms,
              proposal_id: Optional[str] = None) -> int:
-    # STOP is the global ENTRY interlock.  This must remain the first command
-    # check: do not inspect a proposal, receipt, state file, or transport first.
-    if os.path.exists(os.path.join(cfg.receipt_dir, STOP_FILE)):
-        print("OPEN | %s | BLOCKED | STOP file present; entry is disabled"
-              % cfg.symbol)
-        return EXIT_CODE["BLOCKED"]
+    # Both seals are global ENTRY interlocks.  This must remain the first
+    # command check: do not inspect a proposal, receipt, state file, or
+    # transport first.
+    for seal_file in (STOP_FILE, STOP_JOBS_FILE):
+        if os.path.exists(os.path.join(cfg.receipt_dir, seal_file)):
+            print("OPEN | %s | BLOCKED | %s file present; entry is disabled"
+                  % (cfg.symbol, seal_file))
+            return EXIT_CODE["BLOCKED"]
     proposal_now_ms = now_ms()
     try:
         accepted = load_entry_proposal(

@@ -973,22 +973,27 @@ class OpenTests(MachineCase):
         self.assertIn("net_edge_pct must be positive", out)
         self.assertEqual(transport.calls, [])
 
-    def test_stop_blocks_open_first_but_resume_and_close_still_run(self):
-        stop_path = os.path.join(self.dir, bp.STOP_FILE)
-        with open(stop_path, "w", encoding="utf-8") as handle:
-            handle.write("owner stop\n")
-        blocked = ScriptedTransport(happy_spec())
-        code, blocked, out = self.run_cmd(
-            bp.cmd_open, blocked, proposal_id=None)
-        self.assertEqual(code, 3)
-        self.assertIn("STOP file present", out)
-        self.assertNotIn("requires --proposal", out)
-        self.assertEqual(blocked.calls, [])
+    def test_stop_and_stop_jobs_block_open_before_proposal_or_transport(self):
+        for seal_file in (bp.STOP_FILE, bp.STOP_JOBS_FILE):
+            with self.subTest(seal_file=seal_file):
+                seal_path = os.path.join(self.dir, seal_file)
+                with open(seal_path, "w", encoding="utf-8") as handle:
+                    handle.write("owner stop\n")
+                blocked = ScriptedTransport(happy_spec())
+                code, blocked, out = self.run_cmd(
+                    bp.cmd_open, blocked, proposal_id=None)
+                self.assertEqual(code, 3)
+                self.assertIn("%s file present" % seal_file, out)
+                self.assertNotIn("requires --proposal", out)
+                self.assertEqual(blocked.calls, [])
+                os.unlink(seal_path)
 
-        os.unlink(stop_path)
+    def test_resume_and_close_still_run_with_both_entry_seals(self):
         self.open_position()
-        with open(stop_path, "w", encoding="utf-8") as handle:
-            handle.write("owner stop\n")
+        for seal_file in (bp.STOP_FILE, bp.STOP_JOBS_FILE):
+            with open(os.path.join(self.dir, seal_file), "w",
+                      encoding="utf-8") as handle:
+                handle.write("owner stop\n")
         resume_spec = happy_spec()
         resume_spec["position"] = [
             {"symbol": SYMBOL, "positionAmt": "-0.098"}]
