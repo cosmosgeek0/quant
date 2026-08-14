@@ -169,17 +169,22 @@ class TestStaticServing(ServerHarness):
     def test_runtime_page_and_assets_serve_over_http(self):
         base = self.start({})
         for path, kind, markers in (
-                ("/", "text/html", (b"System health", b"Momentum decisions",
-                                      b"Failures", b"Live tokens", b"Realized P&amp;L",
-                                      b"History &mdash; recorded spot runs")),
+                ("/", "text/html", (b"Overview", b"Basis", b"Volume",
+                                    b"Quant", b"Journal",
+                                    b"ledger incomplete")),
                 ("/index.html", "text/html",
-                 (b'id="refresh-runtime"', b'id="health"', b'id="decisions"',
-                  b'id="failures"', b'id="momentum-position"',
-                  b'id="momentum-realized"', b"realized ledger")),
+                 (b'id="gstrip"', b'id="g-exec"', b'id="g-auth"',
+                  b'role="tablist"', b'id="panel-overview"',
+                  b'id="basis-table"', b'id="volume-table"',
+                  b'id="quant-trail"', b'id="journal-rows"',
+                  b"read-only")),
                 ("/app.js", "text/javascript",
                  (b'"/api/health"', b'"/api/decisions"', b'"/api/failures"',
-                  b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"')),
-                ("/style.css", "text/css", (b"read-only",)),
+                  b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"',
+                  b'"/api/strip"', b'"/api/position"', b'"/api/momentum"',
+                  b"Unavailable", b"executionPhase")),
+                ("/style.css", "text/css", (b"--red", b"--amber",
+                                            b"--green")),
                 ("/fixtures/events.jsonl", "text/plain", (b'"run_id"',))):
             status, headers, body = self.get(base, path)
             self.assertEqual(status, 200, path)
