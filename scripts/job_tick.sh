@@ -12,7 +12,7 @@ SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --que
 export BINANCE_API_KEY="$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["BINANCE_API_KEY"])')"
 export BINANCE_API_SECRET="$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["BINANCE_API_SECRET"])')"
 unset SECRET_JSON
-export QUANT_SHA=c7739b5198ad07f7ad3f4198ee3027784e4455c8
+export QUANT_SHA=fd1bd00269bd1e6bd45dcb47ba52a44ea01bde04
 export RECEIPT_DIR="$R"
 
 cd "$D/src"

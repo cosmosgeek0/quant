@@ -1,0 +1,9 @@
+{
+ "job_id": "6a7e511b41eb",
+ "op": "MOMENTUM_ROUNDTRIP",
+ "symbol": "1000000MOGUSDT",
+ "max_notional": 8,
+ "created_utc": "2026-08-13T23:19:55Z",
+ "expires_utc": "2026-08-13T23:31:55Z",
+ "requested_by": "lead-fable"
+}

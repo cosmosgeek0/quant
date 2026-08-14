@@ -1,0 +1,9 @@
+{
+ "job_id": "6a7e410d7fad",
+ "op": "FUTURES_ROUNDTRIP",
+ "symbol": "TSTUSDT",
+ "max_notional": 8,
+ "created_utc": "2026-08-13T22:11:25Z",
+ "expires_utc": "2026-08-13T22:23:25Z",
+ "requested_by": "lead-fable"
+}

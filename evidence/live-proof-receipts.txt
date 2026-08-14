@@ -1,7 +1,7 @@
-WAVE-4 LIVE PROOF RECEIPTS — sanitized raw exports from the execution host, 2026-08-14
+WAVE-4 LIVE PROOF RECEIPTS — complete sanitized raw exports from the execution host, 2026-08-14
 (EXECUTION_MECHANICS_ONLY; ids last-4 by the receipts' own discipline; no secrets present)
 
-=== RECEIPT futures-hand-6a7e416f3c49b8
+==================== futures-hand-6a7e416f3c49b8
 {
  "hand": "short",
  "run_id": "6a7e416f3c49b8",
@@ -87,7 +87,8 @@ WAVE-4 LIVE PROOF RECEIPTS — sanitized raw exports from the execution host, 20
  "verdict_note": "capped IOC short open and same-quantity reduce-only market close are terminal",
  "finished_utc": "2026-08-13T22:13:06Z"
 }
-=== RECEIPT basis-executor-6a7e43140dc9bf
+
+==================== basis-executor-6a7e43140dc9bf
 {
  "run_id": "6a7e43140dc9bf",
  "sha": "c7739b5198ad07f7ad3f4198ee3027784e4455c8",
@@ -215,10 +216,104 @@ WAVE-4 LIVE PROOF RECEIPTS — sanitized raw exports from the execution host, 20
   "sold_qty": "568.00000000",
   "quote_received": "7.98040000",
   "sell_base_fee": "0",
-  "residual_base_from_
-$ $ 
-=== RECEIPT futures-hand-6a7e5160c69e71 (MOMENTUM_ROUNDTRIP)")
-print(json.dumps(r, indent=1, default=str)[:3000])
-PY
+  "residual_base_from_this_run": "0.10000000"
+ },
+ "final_futures_position": "0",
+ "outcomes": {
+  "ENTER_SPOT": "FILLED",
+  "ENTER_SHORT": "FILLED",
+  "EXIT_SHORT": "FILLED",
+  "EXIT_SPOT": "FILLED"
+ },
+ "verdict": "CLOSED",
+ "exposure": "none",
+ "verdict_note": "both legs entered and exited; short closed reduce-only first",
+ "finished_utc": "2026-08-13T22:20:09Z"
+}
 
-echo 
+==================== futures-hand-6a7e5160c69e71
+{
+ "hand": "long",
+ "run_id": "6a7e5160c69e71",
+ "open_client_id": "l2fh-6a7e5160c69e71-o",
+ "close_client_id": "l2fh-6a7e5160c69e71-c",
+ "sha": "c7739b5198ad07f7ad3f4198ee3027784e4455c8",
+ "symbol": "1000000MOGUSDT",
+ "requested_max_notional": "8",
+ "hard_ceiling_usdt": "10",
+ "started_utc": "2026-08-13T23:21:04Z",
+ "starting_state": {
+  "open_side": "BUY",
+  "quantity": "80.6",
+  "limit_price": "0.0992000",
+  "max_fill_notional": "7.99552000",
+  "min_notional": "5",
+  "close_notional_floor": "7.90359570000",
+  "step": "0.1",
+  "ask": "0.0991000",
+  "bid": "0.0990000",
+  "mark": "0.09905000",
+  "available_balance_sufficient": true,
+  "account_can_trade": true,
+  "position_mode": "ONE_WAY",
+  "open_orders": 0,
+  "position_amount": "0",
+  "current_leverage": 1,
+  "target_leverage": 1,
+  "leverage_change_required": false,
+  "margin_type": "CROSSED"
+ },
+ "leverage": {
+  "before": 1,
+  "target": 1,
+  "mutation_attempts": 0,
+  "after": 1,
+  "verified_utc": "2026-08-13T23:21:06Z",
+  "note": "already at compiled target; no leverage mutation sent"
+ },
+ "open": {
+  "submitted_utc": "2026-08-13T23:21:06Z",
+  "params": {
+   "symbol": "1000000MOGUSDT",
+   "side": "BUY",
+   "positionSide": "BOTH",
+   "type": "LIMIT",
+   "timeInForce": "IOC",
+   "quantity": "80.6",
+   "price": "0.0992000",
+   "reduceOnly": "false",
+   "newOrderRespType": "RESULT"
+  },
+  "client_id_last4": "71-o",
+  "order_id_last4": "1482",
+  "status": "FILLED",
+  "executed_qty": "80.6",
+  "cum_quote": "7.98746000"
+ },
+ "close": {
+  "submitted_utc": "2026-08-13T23:21:06Z",
+  "params": {
+   "symbol": "1000000MOGUSDT",
+   "side": "SELL",
+   "positionSide": "BOTH",
+   "type": "MARKET",
+   "quantity": "80.6",
+   "reduceOnly": "true",
+   "newOrderRespType": "RESULT"
+  },
+  "client_id_last4": "71-c",
+  "order_id_last4": "1485",
+  "status": "FILLED",
+  "executed_qty": "80.6",
+  "cum_quote": "7.97940000",
+  "reduce_only": true
+ },
+ "final_state": {
+  "position_amount": "0",
+  "open_orders": 0,
+  "leverage": 1
+ },
+ "verdict": "CLOSED",
+ "verdict_note": "capped IOC long open and same-quantity reduce-only market close are terminal",
+ "finished_utc": "2026-08-13T23:21:07Z"
+}
