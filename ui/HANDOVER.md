@@ -98,6 +98,23 @@ guessing rail names. The Lead is the CCD session titled "fresh lane".
 - Journal day-strip, stat bands, episode trail are new — expect owner
   polish requests there first.
 
+## Owner build laws added 2026-08-14 (rebuild wave, binding)
+- REDESIGN, don't polish: the current page is never the benchmark; the
+  bar is the owner's old control room (127.0.0.1:57317) and above.
+- CODEX GRANULARITY: one codex chat = ONE small component (a button, a
+  popup, a card, a strip) — never a full tab. Up to 50 parallel.
+- CODEX IS BLIND: workers get exact written values (px/hex/weights);
+  every visual call is the seat's own, by screenshot, every few
+  landings. Never judge visuals from code alone.
+- OLD-WEB PERMIT: 57317 source is mined by codex digest lanes only
+  (Fable never reads it raw); patterns/looks only, zero code/logic
+  ports. Owner-liked: the old Logs, News, Calendar tab UIs.
+- NO EDIT-ASKS: build to done quality and show proof; never hand the
+  owner an approval round he didn't ask for.
+- Working docs: ui/UI_REBUILD_SPEC.md (component class contract),
+  ui/DESIGN_DOCTRINE.md (craft law), scratchpad digests DIGEST-*.md
+  (measured old-room grammar; re-derivable from the 57317 source).
+
 ## First action for a fresh seat
 Confirm boot in ONE line, then ask the owner for his first input.
 Build nothing until he gives it. When he shows screenshots or examples,
