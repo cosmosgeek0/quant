@@ -798,6 +798,164 @@ class MomentumLiveTests(unittest.TestCase):
         )
         self.assertEqual(set(self.jobs_by_op()), {live.JOB_OPEN_OP})
 
+    def test_decision_only_records_open_without_runner_or_receipt_writes(self):
+        def denied(*_args, **_kwargs):
+            raise AssertionError("decision-only touched the runner")
+
+        with mock.patch.object(
+            live, "read_runner_position", side_effect=denied
+        ), mock.patch.object(
+            live, "read_results_ledger", side_effect=denied
+        ), mock.patch.object(
+            live, "reconcile_runner_truth", side_effect=denied
+        ):
+            results = [
+                self.tick(
+                    stream_payload(0, "100", "2", "100", "1000"),
+                    decision_only=True,
+                    job_writer=denied,
+                ),
+                self.tick(
+                    stream_payload(
+                        1, "105", "70", "7000", "1050",
+                        spread_pct="0.008",
+                    ),
+                    decision_only=True,
+                    job_writer=denied,
+                ),
+                self.tick(
+                    stream_payload(
+                        2, "108", "75", "7600", "1070",
+                        spread_pct="0.007",
+                    ),
+                    decision_only=True,
+                    job_writer=denied,
+                ),
+            ]
+
+        self.assertEqual(
+            [result.decisions[0]["action"] for result in results],
+            [
+                lifecycle.ACTION_WATCH,
+                lifecycle.ACTION_WATCH,
+                lifecycle.ACTION_ENTER_SMALL,
+            ],
+        )
+        self.assertNotIn("decision_only", results[0].decisions[0])
+        row = results[-1].decisions[0]
+        self.assertIs(row["decision_only"], True)
+        self.assertEqual(row["job"]["op"], live.JOB_OPEN_OP)
+        self.assertEqual(results[-1].recovered_job_ids, ())
+        self.assertEqual(results[-1].written_job_ids, ())
+        self.assertEqual(self.job_paths(), [])
+        self.assertFalse(self.receipts.exists())
+        self.assertIs(self.decision_rows()[-1]["decision_only"], True)
+
+        resumed = self.tick(
+            stream_payload(
+                3, "110", "80", "8000", "1080", spread_pct="0.007"
+            )
+        )
+        self.assertEqual(resumed.recovered_job_ids, ())
+        self.assertEqual(resumed.written_job_ids, ())
+        self.assertEqual(self.job_paths(), [])
+
+    def test_decision_only_records_standing_exit_without_publication(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        self.inject_open(open_job)
+        self.tick(
+            stream_payload(
+                3, "150", "90", "9000", "1100",
+                spread_pct="0.006", oi_change_pct="3",
+            )
+        )
+        jobs_before = self.job_paths()
+        receipts_before = self.receipts.read_bytes()
+
+        def denied(*_args, **_kwargs):
+            raise AssertionError("decision-only touched the runner")
+
+        with mock.patch.object(
+            live, "read_runner_position", side_effect=denied
+        ), mock.patch.object(
+            live, "read_results_ledger", side_effect=denied
+        ), mock.patch.object(
+            live, "reconcile_runner_truth", side_effect=denied
+        ):
+            result = self.tick(
+                stream_payload(
+                    4, "80", "0.5", "50", "900", oi_change_pct="-8"
+                ),
+                decision_only=True,
+                job_writer=denied,
+            )
+
+        row = result.decisions[0]
+        self.assertEqual(row["action"], lifecycle.ACTION_EXIT)
+        self.assertIs(row["decision_only"], True)
+        self.assertEqual(row["job"]["op"], live.JOB_EXIT_OP)
+        self.assertEqual(result.written_job_ids, ())
+        self.assertEqual(self.job_paths(), jobs_before)
+        self.assertEqual(self.receipts.read_bytes(), receipts_before)
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token["exit_job_id"], row["job"]["job_id"])
+
+    def test_manage_only_publishes_standing_exit_when_both_flags_are_set(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        self.inject_open(open_job)
+        self.tick(
+            stream_payload(
+                3, "150", "90", "9000", "1100",
+                spread_pct="0.006", oi_change_pct="3",
+            )
+        )
+
+        result = self.tick(
+            stream_payload(
+                4, "80", "0.5", "50", "900", oi_change_pct="-8"
+            ),
+            manage_only=True,
+            decision_only=True,
+        )
+
+        row = result.decisions[0]
+        self.assertEqual(row["action"], lifecycle.ACTION_EXIT)
+        self.assertNotIn("decision_only", row)
+        jobs = self.jobs_by_op()
+        self.assertEqual(set(jobs), {live.JOB_OPEN_OP, live.JOB_EXIT_OP})
+        self.assertEqual(
+            result.written_job_ids, (jobs[live.JOB_EXIT_OP]["job_id"],)
+        )
+
+    def test_decision_only_governs_flat_symbols_when_manage_only_is_set(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+
+        def denied(*_args, **_kwargs):
+            raise AssertionError("decision-only touched the runner")
+
+        result = self.tick(
+            stream_payload(
+                2, "108", "75", "7600", "1070",
+                spread_pct="0.007",
+            ),
+            manage_only=True,
+            decision_only=True,
+            job_writer=denied,
+        )
+
+        row = result.decisions[0]
+        self.assertEqual(row["action"], lifecycle.ACTION_ENTER_SMALL)
+        self.assertEqual(row["reason"], "configured persistence satisfied")
+        self.assertIs(row["decision_only"], True)
+        self.assertEqual(self.job_paths(), [])
+
     def test_300_symbol_tick_decision_work_stays_bounded_across_history(self):
         symbols = [f"S{index:03d}USDT" for index in range(300)]
         clock = AdvancingClock()
@@ -868,8 +1026,11 @@ class MomentumLiveTests(unittest.TestCase):
             )
 
     def test_max_job_notional_defaults_to_the_compiled_cap(self):
-        args = live.build_parser().parse_args(["--tick", str(self.stream)])
+        args = live.build_parser().parse_args([
+            "--tick", str(self.stream), "--decision-only",
+        ])
         self.assertEqual(args.max_job_notional, Decimal("32"))
+        self.assertTrue(args.decision_only)
         self.assertEqual(live.HARD_MAX_NOTIONAL, Decimal("32"))
 
 

@@ -266,16 +266,20 @@ class BasisSupervisorTests(unittest.TestCase):
                          [("basis-governor-token", self.dir)])
 
     def test_governor_refusal_holds_without_calling_open(self):
+        self.write_accept_one()
         transport = ScriptedTransport(happy_spec())
         with mock.patch.object(bs, "cmd_open") as open_call:
             code, output = self.run_tick(
                 transport,
+                accept_result=None,
                 governor_result=("", None, "ACCOUNT_FROZEN"))
 
         self.assertEqual(code, bs.EXIT_HELD, output)
         self.assertIn("SUPERVISOR | ENTRY | HELD | ACCOUNT_FROZEN", output)
         self.assertEqual(transport.calls, [])
         open_call.assert_not_called()
+        self.assertTrue(os.path.exists(os.path.join(
+            self.dir, bs.ACCEPT_ONE_FILE)))
         self.assertEqual(self.governor_releases, [])
 
     def test_governor_slot_is_retained_for_unknown_entry_outcome(self):
@@ -291,6 +295,41 @@ class BasisSupervisorTests(unittest.TestCase):
         self.assertEqual(self.position()["state"], bp.ST_UNKNOWN)
         self.assertEqual(len(self.governor_jobs), 1)
         self.assertEqual(self.governor_releases, [])
+
+    def test_reconciled_unknown_releases_persisted_governor_slot(self):
+        unknown_spec = happy_spec()
+        unknown_spec["legs"]["enter_spot"] = {
+            "submit": ("unclear", {"http": 504}),
+            "query": [lambda _params: ("unclear", {})],
+        }
+        code, output = self.run_tick(ScriptedTransport(unknown_spec))
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        with open(self.claim_path(), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["governor_token"],
+                             "basis-governor-token")
+        unknown_client = next(iter(self.position()["client_ids"]))
+        resolved_base = ScriptedTransport(happy_spec())
+
+        def resolving_transport(method, base_url, path, params=None,
+                                signed=False):
+            if method == "GET" and path.endswith("/order") \
+                    and (params or {}).get(
+                        "origClientOrderId") == unknown_client:
+                resolved_base.calls.append(
+                    (method, base_url, path, dict(params or {}), signed))
+                return MISSING
+            return resolved_base(method, base_url, path, params, signed)
+
+        with mock.patch.object(
+                bs, "_release_recovered_governor",
+                return_value=True) as recovered_release:
+            code, output = self.run_tick(resolving_transport)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        recovered_release.assert_called_once_with(
+            "basis-governor-token", self.dir)
+        with open(self.claim_path(), encoding="utf-8") as handle:
+            self.assertNotIn("governor_token", json.load(handle))
 
     def test_first_trade_clamp_is_an_in_memory_proposal_view(self):
         proposal_path = self.write_proposal()

@@ -4,6 +4,7 @@ set -u
 umask 077
 
 RECEIPT_ROOT=/home/ssm-user/quant_receipts
+DEPLOY_ROOT=/home/ssm-user/quant-run/wave2-validate-h2
 START_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 printf 'LIVEPULL BEGIN %s\n' "$START_UTC"
 
@@ -45,7 +46,8 @@ emit_path() {
             ;;
     esac
 
-    SOURCE_FILE=$RECEIPT_ROOT/$REL_PATH
+    SRC_ROOT=${3:-$RECEIPT_ROOT}
+    SOURCE_FILE=$SRC_ROOT/$REL_PATH
     if [ ! -e "$SOURCE_FILE" ]; then
         printf 'ABSENT %s\n' "$REL_PATH"
         return
@@ -101,6 +103,7 @@ emit_path decisions.jsonl full
 emit_path jobs/results.jsonl full
 emit_path stream_state.json full
 emit_path stream_log.jsonl tail
+emit_path jobs.log tail "$DEPLOY_ROOT"
 
 if [ -d "$RECEIPT_ROOT/proposals" ]; then
     find "$RECEIPT_ROOT/proposals" -maxdepth 1 -type f -name '*.json' \

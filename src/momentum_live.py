@@ -15,6 +15,8 @@ issuing another.
 
 ``--manage-only`` suppresses every new OPEN intent while preserving runner
 reconciliation and standing-position HOLD/EXIT management.
+``--decision-only`` evaluates every symbol but marks and withholds runner jobs.
+With both flags, ``--manage-only`` governs the standing position; ``--decision-only`` governs the rest.
 """
 
 from __future__ import annotations
@@ -371,7 +373,7 @@ def _index_decision(index: _DecisionIndex, row: Mapping[str, Any]) -> None:
                 and snapshot.get("phase") == lifecycle.PHASE_WATCH \
                 and snapshot.get("ignition_utc") is None:
             index.ignition_by_symbol.pop(symbol, None)
-    if copied.get("action") in {
+    if copied.get("decision_only") is not True and copied.get("action") in {
         lifecycle.ACTION_ENTER_SMALL, lifecycle.ACTION_EXIT
     } and copied.get("job_eligible") is True:
         index.job_rows.append(copied)
@@ -788,6 +790,8 @@ def _ignitions(rows: Iterable[Mapping[str, Any]]) -> Dict[str, str]:
 
 
 def _job_from_ledger_row(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    if row.get("decision_only") is True:
+        return None
     action = row.get("action")
     if action not in {lifecycle.ACTION_ENTER_SMALL, lifecycle.ACTION_EXIT} \
             or row.get("job_eligible") is not True:
@@ -1076,6 +1080,7 @@ def _decision_row(
     max_job_notional: Decimal,
     requested_by: str,
     job_ttl: timedelta,
+    decision_only: bool = False,
 ) -> Dict[str, Any]:
     evidence = _signal_evidence(record)
     eligible, job_reason, requested = _job_eligibility(
@@ -1136,6 +1141,8 @@ def _decision_row(
         "job_reason": job_reason,
         "job": job,
     }
+    if decision_only and job is not None:
+        row["decision_only"] = True
     return row
 
 
@@ -1239,10 +1246,13 @@ def run_tick(
         Callable[[Path, Mapping[str, Any]], bool]
     ] = None,
     manage_only: bool = False,
+    decision_only: bool = False,
 ) -> TickResult:
     """Process one snapshot, reconcile runner truth, and publish job intents."""
     if not isinstance(manage_only, bool):
         raise MomentumLiveError("manage_only must be a bool")
+    if not isinstance(decision_only, bool):
+        raise MomentumLiveError("decision_only must be a bool")
     maximum = _validate_runtime_config(
         max_job_notional, requested_by, job_ttl
     )
@@ -1273,28 +1283,33 @@ def run_tick(
         )
         if payload is not None
     }
-    unlogged_jobs = _recover_unlogged_entries(
-        state,
-        records,
-        Path(receipt_path),
-        Path(decisions_path),
-        issued_job_ids,
-        ignition_by_symbol,
-        maximum,
-        requested_by,
-        job_ttl,
-        now_fn,
-        allowed_ops={JOB_EXIT_OP} if manage_only else JOB_OPS,
-    )
+    runner_management = not decision_only or manage_only
+    unlogged_jobs: Tuple[Dict[str, Any], ...] = ()
+    if runner_management:
+        unlogged_jobs = _recover_unlogged_entries(
+            state,
+            records,
+            Path(receipt_path),
+            Path(decisions_path),
+            issued_job_ids,
+            ignition_by_symbol,
+            maximum,
+            requested_by,
+            job_ttl,
+            now_fn,
+            allowed_ops={JOB_EXIT_OP} if manage_only else JOB_OPS,
+        )
     _bind_ledger_jobs(state, prior_job_rows)
-    runner_position = read_runner_position(resolved_position_path)
-    result_rows = read_results_ledger(resolved_results_path)
-    reconcile_runner_truth(
-        state,
-        runner_position,
-        result_rows,
-        resolved_config,
-    )
+    runner_position: Optional[RunnerPosition] = None
+    if runner_management:
+        runner_position = read_runner_position(resolved_position_path)
+        result_rows = read_results_ledger(resolved_results_path)
+        reconcile_runner_truth(
+            state,
+            runner_position,
+            result_rows,
+            resolved_config,
+        )
     rows: List[Dict[str, Any]] = []
     pending_jobs: List[Dict[str, Any]] = []
     standing_symbol = (
@@ -1304,8 +1319,16 @@ def run_tick(
         else None
     )
 
+    discarded_receipts = None
+    action_receipt_path = Path(receipt_path)
+    if decision_only:
+        discarded_receipts = tempfile.TemporaryDirectory(
+            prefix="momentum-decision-only-"
+        )
+        action_receipt_path = Path(discarded_receipts.name) / "receipts.jsonl"
+
     symbols = sorted(set(state.tokens).union(records))
-    if manage_only:
+    if manage_only and not decision_only:
         refused_symbols = set()
         with tempfile.TemporaryDirectory(
             prefix="momentum-manage-only-"
@@ -1375,16 +1398,24 @@ def run_tick(
             rows.append(row)
 
     for symbol in symbols:
-        if manage_only and symbol != standing_symbol:
+        if manage_only and not decision_only and symbol != standing_symbol:
             continue
+        symbol_decision_only = decision_only and (
+            not manage_only or symbol != standing_symbol
+        )
+        symbol_receipt_path = (
+            action_receipt_path
+            if symbol_decision_only
+            else Path(receipt_path)
+        )
         record = records.get(symbol)
         if record is None:
             decision = lifecycle.process_missing_token(
-                state, symbol, resolved_config, Path(receipt_path), now_fn
+                state, symbol, resolved_config, symbol_receipt_path, now_fn
             )
         else:
             decision = lifecycle.process_record(
-                state, record, resolved_config, Path(receipt_path), now_fn
+                state, record, resolved_config, symbol_receipt_path, now_fn
             )
         token = state.tokens[symbol]
         ignition_utc = token.get("ignition_utc") or ignition_by_symbol.get(symbol)
@@ -1401,6 +1432,7 @@ def run_tick(
             maximum,
             requested_by,
             job_ttl,
+            symbol_decision_only,
         )
         job = row["job"]
         if job is not None:
@@ -1410,7 +1442,7 @@ def run_tick(
             row["lifecycle_state"] = _state_snapshot(token)
         append_decision(Path(decisions_path), row)
         rows.append(row)
-        if job is not None:
+        if job is not None and not symbol_decision_only:
             pending_jobs.append(job)
 
         snapshot = row["lifecycle_state"]
@@ -1419,7 +1451,16 @@ def run_tick(
                 and snapshot.get("ignition_utc") is None:
             ignition_by_symbol.pop(symbol, None)
 
+    if discarded_receipts is not None:
+        discarded_receipts.cleanup()
     lifecycle.save_state(Path(state_path), state, now_fn)
+    if decision_only and not manage_only:
+        return TickResult(
+            decisions=tuple(rows),
+            replayed_receipts=replayed,
+            recovered_job_ids=(),
+            written_job_ids=(),
+        )
     recovery_rows = (
         prior_job_rows
         if not manage_only
@@ -1478,6 +1519,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="refuse new OPEN publication while managing standing exposure",
     )
+    parser.add_argument(
+        "--decision-only",
+        action="store_true",
+        help="evaluate and persist decisions without runner interaction",
+    )
     return parser
 
 
@@ -1498,6 +1544,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             requested_by=args.requested_by,
             job_ttl=args.job_ttl_seconds,
             manage_only=args.manage_only,
+            decision_only=args.decision_only,
         )
     except (MomentumLiveError, lifecycle.MomentumLifecycleError, OSError) as exc:
         print(f"momentum_live_error={exc}", file=sys.stderr)

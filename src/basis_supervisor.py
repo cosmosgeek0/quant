@@ -69,6 +69,7 @@ from job_runner import (
     _entry_ticket_refusal,
     _paths,
     _release_governor,
+    _release_recovered_governor,
     _touch_stop,
 )
 
@@ -310,9 +311,8 @@ def _basis_entry_job(candidate: ProposalCandidate, claimant: str,
                      cap: Optional[Decimal]) -> Job:
     requested = candidate.requested_notional
     effective = min(requested, cap) if cap is not None else requested
-    job_id = candidate.proposal_id
-    if JOB_ID_RE.fullmatch(job_id) is None:
-        job_id = "basis-" + candidate.digest[:58]
+    job_id = _basis_entry_job_id(
+        candidate.proposal_id, candidate.digest)
     return Job(
         job_id=job_id,
         op="BASIS_ROUNDTRIP",
@@ -325,6 +325,12 @@ def _basis_entry_job(candidate: ProposalCandidate, claimant: str,
             candidate.expires_ms / 1000, timezone.utc),
         requested_by=_text(claimant, 128),
     )
+
+
+def _basis_entry_job_id(proposal_id: str, digest: str) -> str:
+    if JOB_ID_RE.fullmatch(proposal_id) is not None:
+        return proposal_id
+    return "basis-" + digest[:58]
 
 
 def _runner_entry_outcome(open_code: int, opened: Optional[dict],
@@ -517,6 +523,76 @@ def _claim(candidate: ProposalCandidate, cfg: PositionConfig, claimant: str,
     return True
 
 
+def _claim_governor_token(cfg: PositionConfig,
+                          proposal_id: str) -> str:
+    if not isinstance(proposal_id, str) \
+            or PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
+        return ""
+    path = os.path.join(cfg.receipt_dir, PROPOSAL_DIR,
+                        "proposal-%s.claim" % proposal_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return ""
+    token = payload.get("governor_token") \
+        if isinstance(payload, dict) else None
+    return token if isinstance(token, str) else ""
+
+
+def _write_claim_governor_token(cfg: PositionConfig, proposal_id: str,
+                                claimant: Optional[str], token: str) -> bool:
+    """Persist or clear the recovery token inside the owned proposal claim."""
+    if not isinstance(proposal_id, str) \
+            or PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
+        return False
+    path = os.path.join(cfg.receipt_dir, PROPOSAL_DIR,
+                        "proposal-%s.claim" % proposal_id)
+    temporary = ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or (
+                claimant is not None
+                and payload.get("claimant") != _text(claimant, 160)):
+            return False
+        if token:
+            payload["governor_token"] = token
+        else:
+            payload.pop("governor_token", None)
+        encoded = (json.dumps(
+            payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        temporary = "%s.tmp-governor-%s-%s" % (
+            path, os.getpid(), threading.get_ident())
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("claim write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+        directory = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return True
+    except (OSError, TypeError, ValueError, UnicodeError):
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        return False
+
+
 def _load_after(action: str, cfg: PositionConfig) -> Optional[dict]:
     try:
         return load_position(cfg.receipt_dir)
@@ -651,6 +727,45 @@ def _tick(cfg: PositionConfig, request, *,
                  "reconciliation is the only action; state/lock ownership "
                  "is inconsistent")
             return EXIT_FROZEN
+        proposal_id = position.get("proposal_id")
+        recovered_token = _claim_governor_token(cfg, proposal_id) \
+            if isinstance(proposal_id, str) else ""
+        if recovered_token:
+            acceptance_claimed = True
+            entry = position.get("entry")
+            if state in (ST_OPEN, ST_CLOSED) and isinstance(entry, dict):
+                digest = position.get("proposal_digest")
+                if not isinstance(digest, str):
+                    acceptance_claimed = False
+                else:
+                    job_id = _basis_entry_job_id(proposal_id, digest)
+                    accept_path = os.path.join(
+                        cfg.receipt_dir, ACCEPT_ONE_FILE)
+                    claimed_path = accept_path + ".claimed-" + job_id
+                    already_claimed = os.path.isfile(claimed_path) \
+                        and not os.path.islink(claimed_path)
+                    acceptance_claimed = already_claimed \
+                        or _consume_accept_one(accept_path, job_id)
+                if not acceptance_claimed:
+                    _touch_stop(os.path.join(
+                        cfg.receipt_dir, RUNNER_STOP_FILE))
+                    _count_reject(rejects, "accept_one_claim_failed")
+                    _row("ENTRY", "FROZEN", "ACCEPT_ONE_CLAIM_FAILED")
+            if acceptance_claimed and _release_recovered_governor(
+                    recovered_token, cfg.receipt_dir):
+                if not _write_claim_governor_token(
+                        cfg, proposal_id, None, ""):
+                    _touch_stop(os.path.join(
+                        cfg.receipt_dir, RUNNER_STOP_FILE))
+                    _count_reject(rejects, "governor_token_clear_failed")
+                    _row("GOVERNOR", "HELD",
+                         "recovered release cleared account lock but not "
+                         "claim token; STOP-JOBS written")
+            elif acceptance_claimed:
+                _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+                _count_reject(rejects, "governor_release_failed")
+                _row("GOVERNOR", "HELD",
+                     "recovered release failed; STOP-JOBS written")
 
     if position is not None and position.get("state") == ST_OPEN:
         try:
@@ -754,6 +869,21 @@ def _tick(cfg: PositionConfig, request, *,
              % candidate.proposal_id)
         return EXIT_FROZEN
 
+    recovered_token = _claim_governor_token(cfg, candidate.proposal_id)
+    if recovered_token:
+        released = _release_recovered_governor(
+            recovered_token, cfg.receipt_dir)
+        cleared = released and _write_claim_governor_token(
+            cfg, candidate.proposal_id, claimant, "")
+        if not released or not cleared:
+            _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+            reason = "governor_release_failed" if not released \
+                else "governor_token_clear_failed"
+            _count_reject(rejects, reason)
+            _row("GOVERNOR", "HELD",
+                 "unstarted claim recovery failed; STOP-JOBS written")
+            return EXIT_FROZEN
+
     notional_cap = _entry_notional_cap(cfg.receipt_dir)
     entry_job = _basis_entry_job(claimed_candidate, claimant, notional_cap)
     ticket_refusal = _entry_ticket_refusal(
@@ -771,6 +901,15 @@ def _tick(cfg: PositionConfig, request, *,
         _count_reject(rejects, "governor_refused")
         _row("ENTRY", "HELD", governor_refusal)
         return EXIT_HELD
+    if not _write_claim_governor_token(
+            cfg, candidate.proposal_id, claimant, governor_token):
+        released = _release_governor(
+            release_governor, governor_token, cfg.receipt_dir)
+        if not released:
+            _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+        _count_reject(rejects, "governor_token_persist_failed")
+        _row("ENTRY", "FROZEN", "GOVERNOR_TOKEN_PERSIST_FAILED")
+        return EXIT_FROZEN
 
     proposal_cfg = dataclasses.replace(
         cfg, symbol=claimed_candidate.symbol)
@@ -797,13 +936,19 @@ def _tick(cfg: PositionConfig, request, *,
         _count_reject(rejects, "open_refused")
     if not accept_claim_failed and governor_token \
             and runner_outcome is not None \
-            and _entry_outcome_terminal(runner_outcome) \
-            and not _release_governor(
+            and _entry_outcome_terminal(runner_outcome):
+        if not _release_governor(
                 release_governor, governor_token, cfg.receipt_dir):
-        _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
-        _count_reject(rejects, "governor_release_failed")
-        _row("GOVERNOR", "HELD",
-             "release failed; STOP-JOBS entry seal written")
+            _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+            _count_reject(rejects, "governor_release_failed")
+            _row("GOVERNOR", "HELD",
+                 "release failed; STOP-JOBS entry seal written")
+        elif not _write_claim_governor_token(
+                cfg, candidate.proposal_id, claimant, ""):
+            _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+            _count_reject(rejects, "governor_token_clear_failed")
+            _row("GOVERNOR", "HELD",
+                 "released but claim token clear failed; STOP-JOBS written")
     if accept_claim_failed:
         return EXIT_FROZEN
     if opened is not None and opened_state in FREEZE_STATES:
