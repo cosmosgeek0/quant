@@ -7,6 +7,16 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+ACCEPTANCE PHYSICS WAVE 2026-08-14 | 15 codex lanes + 2 Opus attack rounds | 865 tests green (Lead-run, twice) | push gated on attack round 2
+defect | acceptance flow on 7dcfd195 verified defective 4/4 by the Lead's own reads (ticket spent on attempt; inert when armed; reseal strands the position it opened; basis path bypasses every gate at 32/leg) | acceptance BLOCKED on that release
+built | universal ACCEPT-ONE entry ticket both modes, consumed on FILL, atomic rename per job | OPERATOR token on every entry (a rewound seat cannot write money) | seal-on-flat | first-trade clamp 8->32 lifted ONLY by a clean strategy close | basis entries through the same governor+ticket
+built | fee-aware max-adverse stop: 2% REALIZED including 0.30 measured round-trip fees, runs under seals, never short-circuits the exit/job loop, UNKNOWN positions seal visibly instead of idling | typed refusal rows for every stop refusal
+built | observation product: under STOP the machine still watches and refuses — basis_watch --observe-only (zero proposal artifacts), momentum --decision-only (inert marked decisions, zero runner interaction), manage-only for standing positions | STOP semantics unchanged: entries sealed, exits sacred
+monitor | Opus attack round 1: 6 findings, 4 confirmed defects (exit starvation, UNKNOWN inertness, stop-out cap-lift, invisible refusals) ALL repaired + parse_float=Decimal hardening | what held under attack: reduce-only reuse, clamp on every caller, write-once markers, sign correctness | round 2 running against the full wave diff
+ui | host->Mac mirror built+tested offline (printer framed base64+sha256, atomic mirror, manifest-last); printer sha-verified on host; pull loop starts from canonical after push | e2e harness now provisions tickets (14/14)
+laws | RAIL RULE + WAITING LAW folded into CLAUDE.md (owner order) | lane logs gitignored after one oversized commit was caught and amended pre-push
+next | attack-round-2 verdict -> push -> deploy with RAW host transcript to evidence/ -> acceptance honorable | first trade at 8 (Lead decision), 32 only after one clean autonomous close
+
 ACCEPTANCE FLOW MEASURED DEFECTIVE 2026-08-14 | codex read of release 7dcfd195, load-bearing claims spot-verified by the Lead's own reads | machine confirmed SEALED — nothing can fire
 verdict | NO operator sequence yields the recorded "one natural <=8 entry, hold, strategy exit, auto-seal" — generation and one-shot gating are incompatible (runtime_tick.sh:173-208, job_runner.py:1797-1841)
 sealed path | with both STOPs present, no natural entry can ever be generated (STOP skips fresh stages, STOP-JOBS skips the publisher); ACCEPT-ONE only unlocks ALREADY-published jobs and spends on ATTEMPT, not on fill
