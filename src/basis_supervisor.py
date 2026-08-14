@@ -15,17 +15,21 @@ import dataclasses
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Dict, List, Optional
 
+import basis_position
 from basis_position import (
     EMERGENCY_FILE,
     EXIT_CODE as POSITION_EXIT_CODE,
+    FEE_BUFFER,
     FREEZE_NEW_ACTIONS,
     LOCK_FILE,
+    MARGIN_QUANTUM,
     PROPOSAL_DIR,
     PROPOSAL_ID_RE,
     REQUEST_EMERGENCY_UNWIND,
@@ -53,6 +57,26 @@ from basis_position import (
     load_position,
     supervise,
 )
+from job_runner import (
+    FIRST_AUTONOMOUS_CLOSE_MARKER,
+    JOB_ID_RE,
+    Job,
+    Outcome as RunnerOutcome,
+    _acquire_governor,
+    _consume_accept_one,
+    _entry_outcome_succeeded,
+    _entry_outcome_terminal,
+    _entry_ticket_refusal,
+    _paths,
+    _release_governor,
+    _touch_stop,
+)
+
+try:
+    from limits import FIRST_TRADE_CAP_USDT
+except ImportError:
+    # TODO: remove this fallback after the sibling limits.py lane merges.
+    FIRST_TRADE_CAP_USDT = Decimal("8")
 
 
 EXIT_ACTED = 0
@@ -65,8 +89,11 @@ CLOSE_DECISIONS = frozenset((REQUEST_EXIT, REQUEST_EMERGENCY_UNWIND))
 PROPOSAL_NAME_RE = re.compile(r"proposal-(.+)\.json")
 HEALTH_FILE_NAME = "health.jsonl"
 WATCH_STATE_PATH = os.path.join("watch", "basis_watch_state.json")
+ACCEPT_ONE_FILE = "ACCEPT-ONE"
+RUNNER_STOP_FILE = "STOP-JOBS"
 POSITION_STATES = (ST_NONE, ST_OPENING, ST_ONE_LEG, ST_OPEN, ST_CLOSING,
                    ST_CLOSED, ST_UNKNOWN)
+_ENTRY_OPEN_LOCK = threading.Lock()
 
 # Public identity for callers which need the complete pure ladder.  Runtime
 # market checks stay in cmd_check: the supervisor must not reproduce its
@@ -79,7 +106,9 @@ class ProposalCandidate:
     proposal_id: str
     symbol: str
     created_ms: int
+    expires_ms: int
     net_edge_pct: Decimal
+    requested_notional: Decimal
     digest: str
 
 
@@ -181,11 +210,147 @@ def _append_tick_health(cfg: PositionConfig, now_ms: int,
     return _append_health_jsonl(cfg.receipt_dir, payload)
 
 
-def _created_ms(payload: dict) -> int:
-    text = payload["created_utc"]
+def _proposal_ms(payload: dict, field: str) -> int:
+    text = payload[field]
     parsed = datetime.fromisoformat(
         text[:-1] + "+00:00" if text.endswith("Z") else text)
     return int(parsed.timestamp() * 1000)
+
+
+def _positive_decimal(value: Any, label: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise PositionError("proposal %s is not a positive decimal" % label)
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise PositionError(
+            "proposal %s is not a positive decimal" % label) from None
+    if not parsed.is_finite() or parsed <= 0:
+        raise PositionError("proposal %s is not a positive decimal" % label)
+    return parsed
+
+
+def _accepted_notionals(accepted: Any) -> tuple[Decimal, Decimal]:
+    """Return the exact proposal-plan notionals without guessing missing data."""
+    payload = accepted.payload
+    quantity = _positive_decimal(accepted.quantity, "quantity")
+    spot_raw = payload.get("spot_quote_cap")
+    if spot_raw is None:
+        spot_ask = _positive_decimal(payload.get("spot_ask"), "spot_ask")
+        spot_notional = (
+            quantity * spot_ask * (Decimal(1) + FEE_BUFFER)
+        ).quantize(MARGIN_QUANTUM)
+    else:
+        spot_notional = _positive_decimal(spot_raw, "spot_quote_cap")
+    short_raw = payload.get("short_notional")
+    if short_raw is None:
+        perp_bid = _positive_decimal(payload.get("perp_bid"), "perp_bid")
+        short_notional = (quantity * perp_bid).quantize(MARGIN_QUANTUM)
+    else:
+        short_notional = _positive_decimal(short_raw, "short_notional")
+    if spot_notional <= 0 or short_notional <= 0:
+        raise PositionError("proposal execution notionals must be positive")
+    return spot_notional, short_notional
+
+
+def _clamp_accepted_proposal(accepted: Any, cap: Decimal) -> Any:
+    """Derive a capped execution view while preserving source bytes/digest."""
+    if not isinstance(cap, Decimal) or not cap.is_finite() or cap <= 0:
+        raise PositionError("first-trade notional cap is invalid")
+    spot_notional, short_notional = _accepted_notionals(accepted)
+    largest = max(spot_notional, short_notional)
+    if largest <= cap:
+        return accepted
+    scale = cap / largest
+    capped_spot = (spot_notional * scale).quantize(
+        MARGIN_QUANTUM, rounding=ROUND_DOWN)
+    capped_short = (short_notional * scale).quantize(
+        MARGIN_QUANTUM, rounding=ROUND_DOWN)
+    if capped_spot <= 0 or capped_short <= 0:
+        raise PositionError("first-trade notional cap is below executable size")
+    payload = dict(accepted.payload)
+    payload["spot_quote_cap"] = format(capped_spot, "f")
+    payload["short_notional"] = format(capped_short, "f")
+    return dataclasses.replace(accepted, payload=payload)
+
+
+def _entry_notional_cap(receipt_dir: str) -> Optional[Decimal]:
+    marker = os.path.join(receipt_dir, FIRST_AUTONOMOUS_CLOSE_MARKER)
+    return None if os.path.isfile(marker) else FIRST_TRADE_CAP_USDT
+
+
+def _call_capped_open(cfg: PositionConfig, request, sleep, now_ms,
+                      proposal_id: str,
+                      cap: Optional[Decimal]) -> int:
+    """Call cmd_open with a per-call accepted-proposal view capped in memory."""
+    if cap is None:
+        return cmd_open(
+            cfg, request, sleep=sleep, now_ms=now_ms,
+            proposal_id=proposal_id)
+    # cmd_open has no notional argument.  Serialize the narrow dependency swap
+    # so its loader sees a capped copy; the immutable proposal and digest stay
+    # unchanged, and the original loader is restored on every outcome.
+    with _ENTRY_OPEN_LOCK:
+        original_loader = basis_position.load_entry_proposal
+
+        def capped_loader(*args, **kwargs):
+            accepted = original_loader(*args, **kwargs)
+            return _clamp_accepted_proposal(accepted, cap)
+
+        basis_position.load_entry_proposal = capped_loader
+        try:
+            return cmd_open(
+                cfg, request, sleep=sleep, now_ms=now_ms,
+                proposal_id=proposal_id)
+        finally:
+            basis_position.load_entry_proposal = original_loader
+
+
+def _basis_entry_job(candidate: ProposalCandidate, claimant: str,
+                     cap: Optional[Decimal]) -> Job:
+    requested = candidate.requested_notional
+    effective = min(requested, cap) if cap is not None else requested
+    job_id = candidate.proposal_id
+    if JOB_ID_RE.fullmatch(job_id) is None:
+        job_id = "basis-" + candidate.digest[:58]
+    return Job(
+        job_id=job_id,
+        op="BASIS_ROUNDTRIP",
+        symbol=candidate.symbol,
+        requested_max_notional=requested,
+        effective_notional=effective,
+        created_utc=datetime.fromtimestamp(
+            candidate.created_ms / 1000, timezone.utc),
+        expires_utc=datetime.fromtimestamp(
+            candidate.expires_ms / 1000, timezone.utc),
+        requested_by=_text(claimant, 128),
+    )
+
+
+def _runner_entry_outcome(open_code: int, opened: Optional[dict],
+                          cfg: PositionConfig) -> Optional[RunnerOutcome]:
+    """Translate position truth to the runner's shared terminal vocabulary."""
+    if opened is not None:
+        state = opened.get("state")
+        if state == ST_OPEN:
+            verdict = "OPEN"
+        elif state == ST_ONE_LEG:
+            verdict = "OPEN_EXPOSURE"
+        elif state in (ST_OPENING, ST_CLOSING, ST_UNKNOWN):
+            verdict = "UNKNOWN"
+        elif state in (ST_NONE, ST_CLOSED):
+            verdict = "REFUSED"
+        else:
+            return None
+        return RunnerOutcome(verdict, open_code, "")
+    if _position_file_exists(cfg):
+        return None
+    if open_code in {
+            POSITION_EXIT_CODE["REFUSED"],
+            POSITION_EXIT_CODE["BLOCKED"],
+            POSITION_EXIT_CODE["PREFLIGHT_REFUSED"]}:
+        return RunnerOutcome("REFUSED", open_code, "")
+    return None
 
 
 def _load_candidate(cfg: PositionConfig, proposal_id: str,
@@ -209,11 +374,14 @@ def _load_candidate(cfg: PositionConfig, proposal_id: str,
         raise PositionError("proposal symbol is invalid")
     accepted = load_entry_proposal(
         cfg.receipt_dir, proposal_id, symbol, cfg.sha, tick_ms)
+    spot_notional, short_notional = _accepted_notionals(accepted)
     return ProposalCandidate(
         proposal_id=proposal_id,
         symbol=accepted.payload["symbol"],
-        created_ms=_created_ms(accepted.payload),
+        created_ms=_proposal_ms(accepted.payload, "created_utc"),
+        expires_ms=_proposal_ms(accepted.payload, "expires_utc"),
         net_edge_pct=accepted.net_edge_pct,
+        requested_notional=max(spot_notional, short_notional),
         digest=accepted.digest)
 
 
@@ -585,18 +753,59 @@ def _tick(cfg: PositionConfig, request, *,
         _row("CLAIM", "FROZEN", "proposal %s escaped symbol whitelist"
              % candidate.proposal_id)
         return EXIT_FROZEN
+
+    notional_cap = _entry_notional_cap(cfg.receipt_dir)
+    entry_job = _basis_entry_job(claimed_candidate, claimant, notional_cap)
+    ticket_refusal = _entry_ticket_refusal(
+        entry_job, _paths(cfg.receipt_dir),
+        datetime.fromtimestamp(tick_ms / 1000, timezone.utc))
+    if ticket_refusal:
+        reason_key = ticket_refusal.lower()
+        _count_reject(rejects, reason_key)
+        _row("ENTRY", "HELD", ticket_refusal)
+        return EXIT_HELD
+
+    governor_token, release_governor, governor_refusal = \
+        _acquire_governor(entry_job, cfg.receipt_dir)
+    if governor_refusal:
+        _count_reject(rejects, "governor_refused")
+        _row("ENTRY", "HELD", governor_refusal)
+        return EXIT_HELD
+
     proposal_cfg = dataclasses.replace(
         cfg, symbol=claimed_candidate.symbol)
-    open_code = cmd_open(
-        proposal_cfg, request, sleep=sleep, now_ms=now_ms,
-        proposal_id=candidate.proposal_id)
+    open_code = _call_capped_open(
+        proposal_cfg, request, sleep, now_ms, candidate.proposal_id,
+        notional_cap)
     opened = _load_after("OPEN", proposal_cfg)
     opened_state = opened.get("state") if opened else ST_NONE
+    runner_outcome = _runner_entry_outcome(
+        open_code, opened, proposal_cfg)
+    accept_claim_failed = False
+    if runner_outcome is not None and _entry_outcome_succeeded(runner_outcome):
+        accept_path = os.path.join(cfg.receipt_dir, ACCEPT_ONE_FILE)
+        accept_claim_failed = not _consume_accept_one(
+            accept_path, entry_job.job_id)
+        if accept_claim_failed:
+            _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+            _count_reject(rejects, "accept_one_claim_failed")
+            _row("ENTRY", "FROZEN", "ACCEPT_ONE_CLAIM_FAILED")
     _row("OPEN", "DONE" if open_code == 0 else "HELD",
          "proposal %s position command exit %s state %s"
          % (candidate.proposal_id, open_code, opened_state))
     if open_code != 0:
         _count_reject(rejects, "open_refused")
+    if not accept_claim_failed and governor_token \
+            and runner_outcome is not None \
+            and _entry_outcome_terminal(runner_outcome) \
+            and not _release_governor(
+                release_governor, governor_token, cfg.receipt_dir):
+        _touch_stop(os.path.join(cfg.receipt_dir, RUNNER_STOP_FILE))
+        _count_reject(rejects, "governor_release_failed")
+        _row("GOVERNOR", "HELD",
+             "release failed; STOP-JOBS entry seal written")
+    if accept_claim_failed:
+        return EXIT_FROZEN
     if opened is not None and opened_state in FREEZE_STATES:
         return EXIT_FROZEN
     return EXIT_ACTED

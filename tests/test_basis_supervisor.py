@@ -9,7 +9,8 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from unittest import mock
@@ -92,7 +93,17 @@ class BasisSupervisorTests(unittest.TestCase):
             max_hold_ms=86400000,
             min_remaining_edge_pct=Decimal("0.01"),
             max_adverse_move_pct=Decimal("0.5"))
+        self.governor_jobs = []
+        self.governor_releases = []
         self.write_proposal()
+
+    def acquire_governor(self, job, receipt_dir):
+        self.governor_jobs.append((job, receipt_dir))
+
+        def release(token, released_dir):
+            self.governor_releases.append((token, released_dir))
+
+        return "basis-governor-token", release, ""
 
     def cfg_for(self, symbol):
         return dataclasses.replace(self.cfg, symbol=symbol)
@@ -141,9 +152,46 @@ class BasisSupervisorTests(unittest.TestCase):
     def position(self):
         return bp.load_position(self.dir)
 
-    def run_tick(self, transport, claimant="test-supervisor"):
+    def write_accept_one(self, operator="test-supervisor"):
+        created = datetime.fromtimestamp(
+            T_OPEN / 1000, timezone.utc).replace(microsecond=0)
+        expires = created + timedelta(minutes=10)
+        payload = {
+            "operator": operator,
+            "created_utc": created.isoformat().replace("+00:00", "Z"),
+            "expires_utc": expires.isoformat().replace("+00:00", "Z"),
+            "max_notional": "32",
+        }
+        with open(os.path.join(self.dir, bs.ACCEPT_ONE_FILE), "w",
+                  encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+        with open(os.path.join(self.dir, "OPERATOR"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"operator": operator}, handle, sort_keys=True)
+
+    def run_tick(self, transport, claimant="test-supervisor", *,
+                 accept_result=True, governor_result=None,
+                 patch_entry_gates=True):
         output = io.StringIO()
-        with redirect_stdout(output):
+        with ExitStack() as stack:
+            stack.enter_context(redirect_stdout(output))
+            if patch_entry_gates:
+                if accept_result is not None:
+                    stack.enter_context(mock.patch.object(
+                        bs, "_entry_ticket_refusal",
+                        return_value="" if accept_result else
+                        "ENTRY_BLOCKED_NOT_ACCEPTED"))
+                    stack.enter_context(mock.patch.object(
+                        bs, "_consume_accept_one",
+                        return_value=accept_result))
+                if governor_result is None:
+                    stack.enter_context(mock.patch.object(
+                        bs, "_acquire_governor",
+                        side_effect=self.acquire_governor))
+                else:
+                    stack.enter_context(mock.patch.object(
+                        bs, "_acquire_governor",
+                        return_value=governor_result))
             code = bs.tick(
                 self.cfg, transport, sleep=lambda _seconds: None,
                 now_ms=lambda: T_OPEN, claimant=claimant)
@@ -175,6 +223,120 @@ class BasisSupervisorTests(unittest.TestCase):
         self.assertTrue(claim["utc"].endswith("Z"))
         self.assertLess(output.index("SUPERVISOR | CLAIM | CREATED"),
                         output.index("SUPERVISOR | OPEN | DONE"))
+
+    def test_entry_without_accept_one_is_held_before_governor_or_open(self):
+        transport = ScriptedTransport(happy_spec())
+        with mock.patch.object(bs, "cmd_open") as open_call, \
+                mock.patch.object(bs, "_acquire_governor") as acquire:
+            code, output = self.run_tick(
+                transport, patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertIn(
+            "SUPERVISOR | ENTRY | HELD | ENTRY_BLOCKED_NOT_ACCEPTED",
+            output)
+        self.assertEqual(transport.calls, [])
+        open_call.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_accept_one_is_consumed_and_entry_proceeds(self):
+        self.write_accept_one()
+        transport = ScriptedTransport(happy_spec())
+
+        code, output = self.run_tick(transport, accept_result=None)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.dir, bs.ACCEPT_ONE_FILE)))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.dir, bs.ACCEPT_ONE_FILE + ".claimed-" + PROPOSAL_ID)))
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+        spot_entry = transport.posts[0][1]
+        self.assertLessEqual(
+            Decimal(spot_entry["quoteOrderQty"]),
+            bs.FIRST_TRADE_CAP_USDT)
+        self.assertEqual(len(self.governor_jobs), 1)
+        job, receipt_dir = self.governor_jobs[0]
+        self.assertEqual((job.op, job.symbol, receipt_dir),
+                         ("BASIS_ROUNDTRIP", SYMBOL, self.dir))
+        self.assertEqual(job.effective_notional,
+                         bs.FIRST_TRADE_CAP_USDT)
+        self.assertEqual(self.governor_releases,
+                         [("basis-governor-token", self.dir)])
+
+    def test_governor_refusal_holds_without_calling_open(self):
+        transport = ScriptedTransport(happy_spec())
+        with mock.patch.object(bs, "cmd_open") as open_call:
+            code, output = self.run_tick(
+                transport,
+                governor_result=("", None, "ACCOUNT_FROZEN"))
+
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertIn("SUPERVISOR | ENTRY | HELD | ACCOUNT_FROZEN", output)
+        self.assertEqual(transport.calls, [])
+        open_call.assert_not_called()
+        self.assertEqual(self.governor_releases, [])
+
+    def test_governor_slot_is_retained_for_unknown_entry_outcome(self):
+        unknown_spec = happy_spec()
+        unknown_spec["legs"]["enter_spot"] = {
+            "submit": ("unclear", {"http": 504}),
+            "query": [lambda _params: ("unclear", {})],
+        }
+
+        code, output = self.run_tick(ScriptedTransport(unknown_spec))
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertEqual(self.position()["state"], bp.ST_UNKNOWN)
+        self.assertEqual(len(self.governor_jobs), 1)
+        self.assertEqual(self.governor_releases, [])
+
+    def test_first_trade_clamp_is_an_in_memory_proposal_view(self):
+        proposal_path = self.write_proposal()
+        with open(proposal_path, "rb") as handle:
+            original = handle.read()
+        observed = []
+
+        def inspect_open(cfg, _request, sleep, now_ms, proposal_id):
+            accepted = bp.load_entry_proposal(
+                cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha, now_ms())
+            observed.append(bs._accepted_notionals(accepted))
+            return bp.EXIT_CODE["REFUSED"]
+
+        with mock.patch.object(bs, "cmd_open", side_effect=inspect_open):
+            code, output = self.run_tick(ScriptedTransport(happy_spec()))
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(max(observed[0]), bs.FIRST_TRADE_CAP_USDT)
+        self.assertTrue(all(value <= bs.FIRST_TRADE_CAP_USDT
+                            for value in observed[0]))
+        with open(proposal_path, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertEqual(self.governor_jobs[0][0].effective_notional,
+                         bs.FIRST_TRADE_CAP_USDT)
+        self.assertEqual(self.governor_releases,
+                         [("basis-governor-token", self.dir)])
+
+    def test_first_trade_clamp_is_lifted_after_close_marker(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        observed = []
+
+        def inspect_open(cfg, _request, sleep, now_ms, proposal_id):
+            accepted = bp.load_entry_proposal(
+                cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha, now_ms())
+            observed.append(bs._accepted_notionals(accepted))
+            return bp.EXIT_CODE["REFUSED"]
+
+        with mock.patch.object(bs, "cmd_open", side_effect=inspect_open):
+            code, output = self.run_tick(ScriptedTransport(happy_spec()))
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertEqual(len(observed), 1)
+        self.assertGreater(max(observed[0]), bs.FIRST_TRADE_CAP_USDT)
+        job = self.governor_jobs[0][0]
+        self.assertEqual(job.effective_notional, job.requested_max_notional)
 
     def test_stream_watch_builds_and_tick_claims_with_shared_health(self):
         os.unlink(os.path.join(
@@ -325,7 +487,13 @@ class BasisSupervisorTests(unittest.TestCase):
         transport = ScriptedTransport(happy_spec())
         output = io.StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stdout(output), \
+                mock.patch.object(bs, "_entry_ticket_refusal",
+                                  return_value=""), \
+                mock.patch.object(bs, "_consume_accept_one",
+                                  return_value=True), \
+                mock.patch.object(bs, "_acquire_governor",
+                                  side_effect=self.acquire_governor):
             code = bs.tick(
                 cfg, transport, sleep=lambda _seconds: None,
                 now_ms=lambda: T_OPEN, claimant="test-supervisor")
@@ -380,7 +548,17 @@ class BasisSupervisorTests(unittest.TestCase):
             spec, [[{"symbol": SYMBOL, "positionAmt": "-0.098"}],
                    FLAT_POSITION])
 
-        code, output = self.run_tick(transport)
+        with mock.patch.object(
+                bs, "_entry_ticket_refusal",
+                side_effect=AssertionError("exit consulted entry ticket")), \
+                mock.patch.object(
+                bs, "_consume_accept_one",
+                side_effect=AssertionError("exit consulted ACCEPT-ONE")), \
+                mock.patch.object(
+                    bs, "_acquire_governor",
+                    side_effect=AssertionError("exit consulted governor")):
+            code, output = self.run_tick(
+                transport, patch_entry_gates=False)
 
         self.assertEqual(code, bs.EXIT_ACTED, output)
         self.assertEqual(post_stages(transport.base),
@@ -512,7 +690,13 @@ class BasisSupervisorTests(unittest.TestCase):
                 failures.append(error)
 
         output = io.StringIO()
-        with mock.patch.object(bs, "_claim", side_effect=synchronized_claim):
+        with mock.patch.object(bs, "_claim", side_effect=synchronized_claim), \
+                mock.patch.object(bs, "_entry_ticket_refusal",
+                                  return_value=""), \
+                mock.patch.object(bs, "_consume_accept_one",
+                                  return_value=True), \
+                mock.patch.object(bs, "_acquire_governor",
+                                  side_effect=self.acquire_governor):
             with redirect_stdout(output):
                 threads = [threading.Thread(target=worker, args=(index,))
                            for index in range(2)]
