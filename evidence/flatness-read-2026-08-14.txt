@@ -1,0 +1,9 @@
+SIGNED FLATNESS READ (GET-only, host-side, secret via Secrets Manager precedent; audit item 5 cure)
+read_utc=2026-08-14T07:27:48Z at frozen release 51520655951f8ff99baca37bca9bcdbbff607919
+FLAT | positions_nonzero=0
+FLAT | usdm_open_orders=0
+FLAT | spot_open_orders=0
+FLAT | usdm | USDT | balance=10.98664568 available=10.98664568
+FLAT | spot | USDT | free=84.31725120
+FLAT | spot dust (receipted history): BNB 0.00094187, BTC 0.00000985, TST 1.0
+FLAT | pre-existing holdings untouched by program (never-sell-preexisting law): LDUSDT 883.79246931, HYPER 0.0341
