@@ -11,12 +11,16 @@
 - DEPLOYED PAUSED 2026-08-14 (release 26b5a8d2, superseded same day by
   7dcfd195 with the commander tracks): unified cron live, RELEASE identity
   valid, both STOP interlocks verified, ticks green and honest.
-- ACCEPTANCE BLOCKED ON 7dcfd195 (defect verified 4/4 by the Lead's own
-  reads, defect record in LOGS): ticket spent on attempt, inert when armed,
-  reseal-strand, basis bypass at 32. The acceptance-physics wave repairing
-  all four is BUILT and green (865); push+deploy pending the second Opus
-  attack verdict. Do NOT accept, do NOT arm, until the repaired release is
-  deployed with its raw transcript.
+- ACCEPTANCE HONORABLE since 2026-08-14T06:10Z: release a9352d3 deployed
+  with raw transcript (evidence/deploy-transcript-2026-08-14-a9352d3.txt),
+  three Opus attack rounds survived (round 3: all eight repairs HOLD, zero
+  money-severity), 904 tests green pre-push. The machine observes under
+  both seals on the new release (656 symbols, honest refusals, zero jobs).
+  The ONE remaining act is the owner's acceptance word -> Lead writes
+  OPERATOR + ACCEPT-ONE -> one natural entry <= 8 USDT at 1x, managed
+  exits, reconcile flat, auto-reseal. Minor queue: round-3 F1-F3
+  (fail-closed liveness nits), feed same-host clock-skew lane in flight,
+  host hygiene apply pending.
 - THEN: the runner — not a human, not a pasted job — takes ONE naturally
   generated capped live trade (first trade at 8 by Lead decision, cap 32
   only after one clean strategy close), holds it across ticks, exits from
