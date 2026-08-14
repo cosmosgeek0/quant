@@ -21,10 +21,10 @@
   are the current build.
 
 ## Truth (measured 2026-08-14)
-- Runtime ALIVE-PAUSED on host: cron fires the supervisor every 2 min, STOP
-  seals entry, first tick measured honest IDLE. Deployed modules sha-verified
-  host == local 4/4 (code state as of commit 4433830).
-- Built and green (696 tests): token stream (TRADING+PERPETUAL universe,
+- Runtime ALIVE-PAUSED on host: release 26b5a8d2 deployed, 11 files
+  sha-verified host == local, cron unified (runner 1m + runtime chain 3m),
+  RELEASE identity valid, both STOP interlocks present, ticks honest IDLE.
+- Built and green (789 tests): token stream (TRADING+PERPETUAL universe,
   measured live 132 spot-only / 167 perp-only / 357 both = 656), momentum
   lifecycle (APRUSDT fixture passes), stream-fed basis, six live-truth UI
   endpoints, proposal-only entry, full-equation net edge, supervisor with

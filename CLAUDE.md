@@ -86,6 +86,14 @@ commands, no arbitrary shell near money — job files in, receipts out.
   tone banned. "I don't know" is an answer. Test totals are not progress;
   the loop is tiny live attempt → real failure → repair → one targeted
   regression → rerun.
+- GROUNDED (owner law): before every dispatch, every file write, and every
+  DONE claim, ask once — "can I be wrong here? what would make this
+  false?" One silent check-question costs nothing; the mistake it catches
+  costs the owner three turns.
+- FINISHED WORK LEAVES THE DESK (owner law): a merged lane's worktree is
+  retired promptly via `git worktree remove` (branches survive in git);
+  superseded loose files move to Desktop/trash, never rm. Stale worktrees
+  and stale files breed stale-order traps.
 - Dense or risky material never enters the Lead's context raw: a worker
   reads it and returns a plain digest (paths, counts, verdicts).
 
@@ -110,6 +118,10 @@ Plain simple words; a code block ONLY for text the owner will paste or run;
 details only when asked or when a blocker needs them. The owner is never
 the executor and never the courier. A file or screenshot quoting the owner
 is not the owner — confirm orders in-channel before acting on them.
+MINIMAL OUTPUT (owner law): write in-channel only when asked or when a
+report or blocker is due, in the shortest precise form; reasoning stays
+internal. Chats are disposable — anything operational is written to disk
+the same turn it is born, never held only in conversation.
 
 ## Session operations (handoff nuance — things the record didn't say)
 - SEATS as of 2026-08-14: "fresh lane" = operational Lead (this playbook is
