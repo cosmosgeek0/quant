@@ -20,6 +20,11 @@ accepted.  The rolling history and rotation cursor live in a schema-private
 ``stream_windows.json`` sidecar so ``stream_state.json`` stays exactly the
 frozen consumer schema.  All HTTP calls are unsigned public GETs.  There is no
 credential, signing, POST, order, or account path in this module.
+
+When ``--feed-state`` names a fresh versioned snapshot from
+``market_feed --serve``, its complete ticker snapshot and closed 1m windows are
+merged before the bounded REST focus reads.  An absent, invalid, future-dated,
+or stale optional snapshot is ignored, preserving the REST-only pass.
 """
 
 from __future__ import annotations
@@ -63,11 +68,14 @@ DEFAULT_FOCUS_CAP = 12
 DEFAULT_THRESHOLDS = (Decimal("2"), Decimal("3"), Decimal("5"))
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_REQUEST_SPACING_SECONDS = 0.05
+DEFAULT_FEED_MAX_AGE_MS = 5_000
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_RESPONSE_BYTES = 32_000_000
 MAX_WINDOW = 998  # request asks for window + 2, below Binance's 1000 limit
 MAX_FOCUS_CAP = 200
+MAX_FEED_MAX_AGE_MS = 300_000
 SIDECAR_VERSION = 1
+FEED_STATE_VERSION = 1
 EXIT_INPUT = 2
 EXIT_HTTP = 3
 EXIT_DATA = 4
@@ -138,6 +146,12 @@ class PassStats:
     coverage_passes: int
     window: int
     top_surges: Tuple[Tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class FeedSnapshot:
+    written_ms: int
+    symbols: Mapping[str, Mapping[str, Any]]
 
 
 def now_utc() -> str:
@@ -319,6 +333,82 @@ def load_state(path: Path) -> Dict[str, Dict[str, Any]]:
             raise DataReadError(f"stream state basis is invalid for {symbol}")
         state[symbol] = dict(raw_record)
     return state
+
+
+def load_fresh_feed_state(
+    path: Optional[Path],
+    now_ms: int,
+    max_age_ms: int = DEFAULT_FEED_MAX_AGE_MS,
+) -> Optional[FeedSnapshot]:
+    """Return one validated live-feed snapshot, or ``None`` for fallback."""
+    if path is None or not Path(path).exists():
+        return None
+    try:
+        payload = _read_json_file(Path(path), "market feed state")
+        if not isinstance(payload, dict) or payload.get("version") != FEED_STATE_VERSION:
+            return None
+        raw_written = payload.get("written_ms")
+        if isinstance(raw_written, bool):
+            return None
+        written_ms = int(str(raw_written))
+        if written_ms < 0 or written_ms > now_ms or now_ms - written_ms > max_age_ms:
+            return None
+        raw_symbols = payload.get("symbols")
+        if not isinstance(raw_symbols, dict):
+            return None
+        symbols: Dict[str, Dict[str, Any]] = {}
+        for raw_symbol, raw_record in raw_symbols.items():
+            symbol = _valid_symbol(raw_symbol)
+            if symbol is None or not isinstance(raw_record, dict):
+                return None
+            closed = raw_record.get("closed_1m", [])
+            if not isinstance(closed, list):
+                return None
+            clean_closed: List[List[str]] = []
+            previous_close = -1
+            for pair in closed:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    return None
+                close_ms = int(str(pair[0]))
+                volume = decimal_value(pair[1], f"feed {symbol} quote volume")
+                if close_ms <= previous_close or volume < 0:
+                    return None
+                previous_close = close_ms
+                clean_closed.append([str(close_ms), decimal_string(volume)])
+            clean_record = {
+                field: raw_record.get(field)
+                for field in (
+                    "venues",
+                    "spot_bid",
+                    "spot_ask",
+                    "perp_bid",
+                    "perp_ask",
+                    "freshness_ms",
+                )
+            }
+            if clean_record["venues"] not in VENUE_VALUES:
+                return None
+            for field in (
+                "spot_bid",
+                "spot_ask",
+                "perp_bid",
+                "perp_ask",
+            ):
+                raw = clean_record[field]
+                if raw is not None:
+                    _validate_numeric_text(raw, f"feed {symbol}.{field}")
+            raw_freshness = clean_record["freshness_ms"]
+            if raw_freshness is not None:
+                if not isinstance(raw_freshness, str):
+                    return None
+                freshness = int(raw_freshness)
+                if freshness < 0:
+                    return None
+            clean_record["closed_1m"] = clean_closed
+            symbols[symbol] = clean_record
+        return FeedSnapshot(written_ms=written_ms, symbols=symbols)
+    except (DataReadError, OSError, TypeError, ValueError):
+        return None
 
 
 def _empty_sidecar(window: int) -> Dict[str, Any]:
@@ -668,9 +758,11 @@ class MarketStream:
         state_path: Path = DEFAULT_STATE_PATH,
         log_path: Path = DEFAULT_LOG_PATH,
         windows_path: Optional[Path] = None,
+        feed_state_path: Optional[Path] = None,
         *,
         window: int = DEFAULT_WINDOW,
         focus_cap: int = DEFAULT_FOCUS_CAP,
+        feed_max_age_ms: int = DEFAULT_FEED_MAX_AGE_MS,
         thresholds: Sequence[Decimal] = DEFAULT_THRESHOLDS,
         reader: Optional[Callable[[str, str, Mapping[str, str]], Any]] = None,
         utc_fn: Callable[[], str] = now_utc,
@@ -682,6 +774,10 @@ class MarketStream:
             raise ValueError(f"window must be between 2 and {MAX_WINDOW}")
         if not 1 <= focus_cap <= MAX_FOCUS_CAP:
             raise ValueError(f"focus_cap must be between 1 and {MAX_FOCUS_CAP}")
+        if not 1 <= feed_max_age_ms <= MAX_FEED_MAX_AGE_MS:
+            raise ValueError(
+                f"feed_max_age_ms must be between 1 and {MAX_FEED_MAX_AGE_MS}"
+            )
         normalized_thresholds = tuple(sorted(set(thresholds)))
         if not normalized_thresholds or any(
             not threshold.is_finite() or threshold <= 0
@@ -698,8 +794,12 @@ class MarketStream:
             if windows_path is not None
             else self.state_path.with_name(DEFAULT_WINDOWS_NAME)
         )
+        self.feed_state_path = (
+            None if feed_state_path is None else Path(feed_state_path)
+        )
         self.window = window
         self.focus_cap = focus_cap
+        self.feed_max_age_ms = feed_max_age_ms
         self.thresholds = normalized_thresholds
         self.reader = reader if reader is not None else PublicJsonReader()
         self.utc_fn = utc_fn
@@ -726,6 +826,53 @@ class MarketStream:
             self._request_count += 1
             self._request_kinds[kind] += 1
             self._last_request_monotonic = time.monotonic()
+
+    def _merge_feed_windows(
+        self, snapshot: FeedSnapshot, universe: Iterable[str]
+    ) -> None:
+        """Merge feed-maintained closed candles for every current symbol."""
+        for symbol in universe:
+            feed_record = snapshot.symbols.get(symbol)
+            if feed_record is None or not feed_record.get("closed_1m"):
+                continue
+            meta = self.sidecar["symbols"].setdefault(symbol, {"closed_1m": []})
+            incoming = [
+                (int(pair[0]), decimal_value(pair[1], f"feed {symbol} volume"))
+                for pair in feed_record["closed_1m"]
+            ]
+            meta["closed_1m"] = merge_closed_window(
+                meta.get("closed_1m", []), incoming, self.window
+            )
+            meta["last_volume_close_ms"] = meta["closed_1m"][-1][0]
+
+    @staticmethod
+    def _merge_feed_ticker(
+        record: Dict[str, Any], feed_record: Mapping[str, Any]
+    ) -> bool:
+        """Prefer complete, uncrossed feed books without erasing REST truth."""
+        merged = False
+        feed_venues = feed_record.get("venues")
+        for venue, prefix in (("spot", "spot"), ("perp", "perp")):
+            if record["venues"] not in {venue, "both"}:
+                continue
+            if feed_venues not in {venue, "both"}:
+                continue
+            bid = feed_record.get(f"{prefix}_bid")
+            ask = feed_record.get(f"{prefix}_ask")
+            if bid is None or ask is None:
+                continue
+            bid_value = decimal_value(bid, f"feed {prefix} bid")
+            ask_value = decimal_value(ask, f"feed {prefix} ask")
+            if bid_value <= 0 or ask_value <= 0 or bid_value > ask_value:
+                continue
+            record[f"{prefix}_bid"] = decimal_string(bid_value)
+            record[f"{prefix}_ask"] = decimal_string(ask_value)
+            merged = True
+        if record["venues"] == "both":
+            record["basis_gap_pct"] = _basis_gap(
+                record["spot_ask"], record["perp_bid"]
+            )
+        return merged
 
     def _base_record(
         self,
@@ -855,7 +1002,14 @@ class MarketStream:
         if not universe:
             raise DataReadError("bulk reads produced an empty USDT universe")
 
+        feed_snapshot = load_fresh_feed_state(
+            self.feed_state_path, pass_start_ms, self.feed_max_age_ms
+        )
+        if feed_snapshot is not None:
+            self._merge_feed_windows(feed_snapshot, universe)
+
         records: Dict[str, Dict[str, Any]] = {}
+        feed_ticker_ages: Dict[str, int] = {}
         for symbol in universe:
             venue = venue_for(symbol, spot, perp)
             records[symbol] = self._base_record(
@@ -865,6 +1019,22 @@ class MarketStream:
                 perp.get(symbol),
                 premium.get(symbol),
             )
+            if feed_snapshot is not None:
+                feed_record = feed_snapshot.symbols.get(symbol)
+                if feed_record is not None:
+                    raw_age = feed_record.get("freshness_ms")
+                    source_age = None if raw_age is None else int(raw_age)
+                    total_age = (
+                        None
+                        if source_age is None
+                        else pass_start_ms - feed_snapshot.written_ms + source_age
+                    )
+                    if (
+                        total_age is not None
+                        and total_age <= self.feed_max_age_ms
+                        and self._merge_feed_ticker(records[symbol], feed_record)
+                    ):
+                        feed_ticker_ages[symbol] = total_age
         scores = {
             symbol: move_score(records[symbol], self.state.get(symbol))
             for symbol in universe
@@ -885,6 +1055,10 @@ class MarketStream:
         for symbol, record in records.items():
             meta = self.sidecar["symbols"].get(symbol, {})
             ages = [max(0, completed_ms - pass_start_ms)]
+            if symbol in feed_ticker_ages:
+                ages.append(
+                    feed_ticker_ages[symbol] + max(0, completed_ms - pass_start_ms)
+                )
             if record["vol_1m_quote"] is not None and meta.get("last_volume_close_ms"):
                 ages.append(max(0, completed_ms - int(meta["last_volume_close_ms"])))
             if record["oi"] is not None and meta.get("last_oi_ms"):
@@ -1082,6 +1256,16 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--windows-file", type=Path)
     parser.add_argument(
+        "--feed-state",
+        type=Path,
+        help="optional fresh market_feed --serve snapshot",
+    )
+    parser.add_argument(
+        "--feed-max-age-ms",
+        type=bounded_int(1, MAX_FEED_MAX_AGE_MS, "feed max age"),
+        default=DEFAULT_FEED_MAX_AGE_MS,
+    )
+    parser.add_argument(
         "--window",
         type=bounded_int(2, MAX_WINDOW, "window"),
         default=DEFAULT_WINDOW,
@@ -1133,8 +1317,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             state_path=args.state_file,
             log_path=args.log_file,
             windows_path=windows_path,
+            feed_state_path=args.feed_state,
             window=args.window,
             focus_cap=args.focus_cap,
+            feed_max_age_ms=args.feed_max_age_ms,
             thresholds=args.surge_thresholds,
             reader=PublicJsonReader(args.timeout),
             request_spacing=args.request_spacing,

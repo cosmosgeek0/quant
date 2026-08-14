@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for momentum decisions-to-runner-job routing."""
+"""Offline end-to-end tests for momentum OPEN, HOLD, and EXIT routing."""
 
 import io
 import json
@@ -9,19 +9,16 @@ import tempfile
 import unittest
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
 
-SRC = Path(__file__).resolve().parents[1] / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import momentum_lifecycle as lifecycle  # noqa: E402
-import momentum_live as live  # noqa: E402
-import job_runner as runner  # noqa: E402
+import momentum_lifecycle as lifecycle
+import momentum_live as live
 
 
 FIXED_NOW = "2026-08-14T12:00:00.000Z"
@@ -46,8 +43,8 @@ def stream_payload(
     price = Decimal(str(price))
     spread = Decimal(str(spread_pct))
     half = spread / Decimal("2")
-    spot_bid = price * (Decimal("1") - half)
-    spot_ask = price * (Decimal("1") + half)
+    bid = price * (Decimal("1") - half)
+    ask = price * (Decimal("1") + half)
     perp_mid = price * Decimal("1.001")
     perp_bid = perp_mid * (Decimal("1") - half)
     perp_ask = perp_mid * (Decimal("1") + half)
@@ -58,8 +55,8 @@ def stream_payload(
     return {
         "utc": f"2026-08-14T10:{minute:02d}:00.000Z",
         "venues": venues,
-        "spot_bid": text(spot_bid) if venues in {"spot", "both"} else None,
-        "spot_ask": text(spot_ask) if venues in {"spot", "both"} else None,
+        "spot_bid": text(bid) if venues in {"spot", "both"} else None,
+        "spot_ask": text(ask) if venues in {"spot", "both"} else None,
         "perp_bid": text(perp_bid) if venues in {"perp", "both"} else None,
         "perp_ask": text(perp_ask) if venues in {"perp", "both"} else None,
         "mark": text(perp_mid) if venues in {"perp", "both"} else text(price),
@@ -69,9 +66,7 @@ def stream_payload(
         "oi": text(oi),
         "oi_change_pct": text(oi_change_pct),
         "funding_rate": "0.0001" if venues in {"perp", "both"} else None,
-        "next_funding_ms": (
-            "1786636800000" if venues in {"perp", "both"} else None
-        ),
+        "next_funding_ms": "1786636800000" if venues in {"perp", "both"} else None,
         "basis_gap_pct": "0.1",
         "freshness_ms": text(freshness_ms),
     }
@@ -83,8 +78,8 @@ def test_config(initial_notional=Decimal("8")):
         persistence_surge_ratio=Decimal("8"),
         persistence_passes=2,
         initial_notional=initial_notional,
-        add_notional=Decimal("4"),
-        max_total_notional=Decimal("24"),
+        add_notional=Decimal("2"),
+        max_total_notional=Decimal("16"),
         max_adds=4,
         min_volume_growth_pct=Decimal("0.05"),
         min_surge_growth_pct=Decimal("0.02"),
@@ -118,7 +113,10 @@ class MomentumLiveTests(unittest.TestCase):
         self.state = self.root / "momentum_state.json"
         self.receipts = self.root / "momentum_receipts.jsonl"
         self.decisions = self.root / "decisions.jsonl"
-        self.jobs = self.root / "runner" / "jobs"
+        self.runner = self.root / "runner"
+        self.jobs = self.runner / "jobs"
+        self.position = self.runner / "momentum-position.json"
+        self.results = self.jobs / "results.jsonl"
         self.config = test_config()
 
         def deny(*_args, **_kwargs):
@@ -142,6 +140,8 @@ class MomentumLiveTests(unittest.TestCase):
             "receipt_path": self.receipts,
             "decisions_path": self.decisions,
             "jobs_dir": self.jobs,
+            "position_path": self.position,
+            "results_path": self.results,
             "config": self.config,
             "now_fn": fixed_now,
         }
@@ -160,224 +160,286 @@ class MomentumLiveTests(unittest.TestCase):
     def job_paths(self):
         return sorted(self.jobs.glob("job-*.json")) if self.jobs.exists() else []
 
-    def enter(self, *, venues="both", job_writer=live.write_job_record):
+    def jobs_by_op(self):
+        result = {}
+        for path in self.job_paths():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            result[payload["op"]] = payload
+        return result
+
+    def signal(self, *, job_writer=live.write_job_record, venues="both"):
         results = [
             self.tick(stream_payload(0, "100", "2", "100", "1000", venues=venues)),
+            self.tick(stream_payload(1, "105", "70", "7000", "1050", spread_pct="0.008", venues=venues)),
             self.tick(
-                stream_payload(
-                    1, "105", "70", "7000", "1050",
-                    spread_pct="0.008", venues=venues,
-                )
-            ),
-            self.tick(
-                stream_payload(
-                    2, "108", "75", "7600", "1070",
-                    spread_pct="0.007", venues=venues,
-                ),
+                stream_payload(2, "108", "75", "7600", "1070", spread_pct="0.007", venues=venues),
                 job_writer=job_writer,
             ),
         ]
         return results
 
-    def test_full_lifecycle_is_persisted_and_every_decision_has_evidence(self):
-        results = self.enter()
-        results.append(
-            self.tick(
-                stream_payload(
-                    3, "120", "90", "9000", "1100",
-                    spread_pct="0.006", oi_change_pct="3",
-                )
-            )
+    def inject_open(self, job, *, qty="0.071", price="112.5"):
+        self.position.parent.mkdir(parents=True, exist_ok=True)
+        fill = {
+            "trade_id": "91", "order_id": "1101", "price": price,
+            "qty": qty, "realized_pnl": "0", "commission": "0.003",
+            "commission_asset": "USDT",
+        }
+        self.position.write_text(
+            json.dumps({
+                "version": 1,
+                "revision": 2,
+                "state": "OPEN",
+                "symbol": "AAAUSDT",
+                "job_id": job["job_id"],
+                "measured_qty": qty,
+                "entry": {"qty": qty, "price": price, "fills": [fill]},
+            }),
+            encoding="utf-8",
         )
-        results.append(
-            self.tick(
-                stream_payload(
-                    4, "121", "90", "9000", "1100",
-                    spread_pct="0.006", oi_change_pct="1",
-                )
-            )
-        )
-        results.append(
-            self.tick(
-                stream_payload(
-                    5, "116", "50", "5000", "1000",
-                    spread_pct="0.009", oi_change_pct="-6",
-                )
-            )
-        )
-        results.append(
-            self.tick(
-                stream_payload(
-                    6, "90", "30", "3000", "900",
-                    spread_pct="0.009", oi_change_pct="-8",
-                )
-            )
+        self.results.parent.mkdir(parents=True, exist_ok=True)
+        receipt = self.jobs / "receipts" / f"job-{job['job_id']}.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({
+            "job_id": job["job_id"], "op": live.JOB_OPEN_OP,
+            "symbol": "AAAUSDT", "verdict": "OPEN", "reason": "",
+            "utc": FIXED_NOW, "fills": [fill], "fees": [], "realized": {},
+        }), encoding="utf-8")
+        self.results.write_text(
+            json.dumps({
+                "job_id": job["job_id"],
+                "op": live.JOB_OPEN_OP,
+                "symbol": "AAAUSDT",
+                "verdict": "OPEN",
+                "exit_code": 0,
+                "receipt_path": str(receipt),
+                "utc": FIXED_NOW,
+                "fills": [fill],
+                "fees": [],
+                "realized": {"gross_usdt": "0", "net_usdt": "UNKNOWN"},
+            }) + "\n",
+            encoding="utf-8",
         )
 
-        actions = [result.decisions[0]["action"] for result in results]
+    def inject_closed(self, exit_job):
+        prior = json.loads(self.position.read_text(encoding="utf-8"))
+        self.position.write_text(
+            json.dumps({
+                **prior,
+                "revision": prior["revision"] + 2,
+                "state": "CLOSED",
+                "job_id": exit_job["job_id"],
+                "measured_qty": "0",
+                "exit": {"qty": prior["measured_qty"], "price": "118"},
+            }),
+            encoding="utf-8",
+        )
+        fill = {
+            "trade_id": "92", "order_id": "2202", "price": "118",
+            "qty": prior["measured_qty"], "realized_pnl": "0.2",
+            "commission": "0.002", "commission_asset": "USDT",
+        }
+        receipt = self.jobs / "receipts" / f"job-{exit_job['job_id']}.json"
+        receipt.write_text(json.dumps({
+            "job_id": exit_job["job_id"], "op": live.JOB_EXIT_OP,
+            "symbol": "AAAUSDT", "verdict": "CLOSED", "reason": "",
+            "utc": FIXED_NOW, "fills": [fill], "fees": [], "realized": {},
+        }), encoding="utf-8")
+        with open(self.results, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "job_id": exit_job["job_id"],
+                "op": live.JOB_EXIT_OP,
+                "symbol": "AAAUSDT",
+                "verdict": "CLOSED",
+                "exit_code": 0,
+                "receipt_path": str(receipt),
+                "utc": FIXED_NOW,
+                "fills": [fill],
+                "fees": [],
+                "realized": {"gross_usdt": "0.2", "net_usdt": "0.195"},
+            }) + "\n")
+
+    def test_full_enter_hold_exit_across_ticks_uses_actual_fill(self):
+        signalled = self.signal()
         self.assertEqual(
-            actions,
-            ["WATCH", "WATCH", "ENTER_SMALL", "ADD", "TRAIL",
-             "REDUCE_TRAIL", "EXIT"],
+            [result.decisions[0]["action"] for result in signalled],
+            [lifecycle.ACTION_WATCH, lifecycle.ACTION_WATCH, lifecycle.ACTION_ENTER_SMALL],
         )
-        rows = self.decision_rows()
-        self.assertEqual([row["action"] for row in rows], actions)
-        self.assertEqual(len({row["decision_id"] for row in rows}), len(rows))
-        for index, row in enumerate(rows):
-            self.assertEqual(row["decision_utc"], FIXED_NOW)
-            self.assertEqual(row["stream_utc"], f"2026-08-14T10:{index:02d}:00.000Z")
-            self.assertIsNotNone(row["surge_ratio"])
-            self.assertGreater(Decimal(row["price"]), 0)
-            self.assertGreaterEqual(Decimal(row["vol_1m_quote"]), 0)
-            self.assertGreaterEqual(Decimal(row["oi"]), 0)
-            self.assertIn(row["price_venue"], {"spot", "perp"})
-            self.assertIsInstance(row["lifecycle_state"], dict)
-        self.assertEqual(rows[1]["ignition_utc"], "2026-08-14T10:01:00.000Z")
-        self.assertEqual(rows[-1]["ignition_utc"], "2026-08-14T10:01:00.000Z")
+        jobs = self.jobs_by_op()
+        self.assertEqual(set(jobs), {live.JOB_OPEN_OP})
+        open_job = jobs[live.JOB_OPEN_OP]
+        self.inject_open(open_job, qty="0.071", price="112.5")
 
-        persisted = lifecycle.load_state(self.state)
-        token = persisted.tokens["AAAUSDT"]
-        self.assertEqual(token["phase"], lifecycle.PHASE_WATCH)
+        held = self.tick(
+            stream_payload(3, "150", "90", "9000", "1100", spread_pct="0.006", oi_change_pct="3")
+        )
+        self.assertEqual(held.decisions[0]["action"], lifecycle.ACTION_ADD)
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token["phase"], lifecycle.PHASE_HOLD)
+        self.assertEqual(token["qty"], "0.071")
+        self.assertEqual(token["avg_entry_price"], "112.5")
+        self.assertEqual(token["entry_structure"]["price"], "112.5")
+        self.assertNotEqual(token["entry_structure"]["signal_price"], "112.5")
+
+        exited = self.tick(
+            stream_payload(4, "119", "30", "3000", "900", oi_change_pct="-8")
+        )
+        self.assertEqual(exited.decisions[0]["action"], lifecycle.ACTION_EXIT)
+        jobs = self.jobs_by_op()
+        self.assertEqual(set(jobs), {live.JOB_OPEN_OP, live.JOB_EXIT_OP})
+        exit_job = jobs[live.JOB_EXIT_OP]
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token["phase"], lifecycle.PHASE_EXIT_PENDING)
+        self.assertEqual(token["qty"], "0.071")
+
+        pending = self.tick(
+            stream_payload(5, "118", "25", "2500", "880", oi_change_pct="-8")
+        )
+        self.assertEqual(pending.decisions[0]["action"], lifecycle.ACTION_HOLD)
+        self.assertEqual(len(self.job_paths()), 2)
+
+        self.inject_closed(exit_job)
+        closed = self.tick(stream_payload(6, "117", "2", "100", "800"))
+        self.assertEqual(closed.decisions[0]["action"], lifecycle.ACTION_WATCH)
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token["position_status"], "FLAT")
         self.assertEqual(token["qty"], "0")
-        self.assertTrue(token["rearm_required"])
+        self.assertEqual(len(self.job_paths()), 2)
 
-        paths = self.job_paths()
-        self.assertEqual(len(paths), 1)
-        job = json.loads(paths[0].read_text(encoding="utf-8"))
-        self.assertEqual(set(job), set(live.JOB_FIELDS))
-        self.assertEqual(job["op"], "MOMENTUM_ROUNDTRIP")
-        self.assertEqual(job["symbol"], "AAAUSDT")
-        self.assertEqual(job["max_notional"], 8)
-        self.assertEqual(job["requested_by"], "momentum_live")
-        self.assertEqual(
-            job["job_id"],
-            live.deterministic_job_id(
-                "AAAUSDT", "2026-08-14T10:01:00.000Z"
-            ),
-        )
-        self.assertEqual(job["created_utc"], FIXED_NOW)
-        self.assertEqual(job["expires_utc"], "2026-08-14T12:10:00.000Z")
-        accepted = runner._validate_job(
-            runner._load_job(str(paths[0])),
-            job["job_id"],
-            datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
-        )
-        self.assertEqual(accepted.op, "MOMENTUM_ROUNDTRIP")
-        self.assertEqual(accepted.effective_notional, Decimal("8"))
-
-    def test_spot_only_enter_is_recorded_but_never_queued(self):
-        results = self.enter(venues="spot")
-
-        entry = results[-1].decisions[0]
-        self.assertEqual(entry["action"], "ENTER_SMALL")
-        self.assertFalse(entry["job_eligible"])
-        self.assertEqual(entry["job_reason"], "token has no perpetual venue")
-        self.assertIsNone(entry["job"])
-        self.assertEqual(self.job_paths(), [])
-
-    def test_entry_above_eight_is_recorded_but_never_queued(self):
-        self.config = test_config(initial_notional=Decimal("9"))
-        results = self.enter(venues="perp")
-
-        entry = results[-1].decisions[0]
-        self.assertEqual(entry["action"], "ENTER_SMALL")
-        self.assertFalse(entry["job_eligible"])
-        self.assertEqual(
-            entry["job_reason"], "entry notional exceeds the runner cap"
-        )
-        self.assertEqual(self.job_paths(), [])
-
-    def test_restart_after_enter_decision_recovers_exactly_one_job(self):
-        self.tick(stream_payload(0, "100", "2", "100", "1000", venues="perp"))
+    def test_open_and_exit_ids_are_deterministic_per_ignition(self):
+        self.signal()
+        jobs = self.jobs_by_op()
         ignition = "2026-08-14T10:01:00.000Z"
-        self.tick(
-            stream_payload(
-                1, "105", "70", "7000", "1050",
-                spread_pct="0.008", venues="perp",
-            )
+        self.assertEqual(
+            jobs[live.JOB_OPEN_OP]["job_id"],
+            live.deterministic_job_id("AAAUSDT", ignition, live.JOB_OPEN_OP),
+        )
+        self.inject_open(jobs[live.JOB_OPEN_OP])
+        self.tick(stream_payload(3, "80", "0.5", "50", "900", oi_change_pct="-8"))
+        jobs = self.jobs_by_op()
+        self.assertEqual(
+            jobs[live.JOB_EXIT_OP]["job_id"],
+            live.deterministic_job_id("AAAUSDT", ignition, live.JOB_EXIT_OP),
+        )
+        self.assertNotEqual(
+            jobs[live.JOB_OPEN_OP]["job_id"], jobs[live.JOB_EXIT_OP]["job_id"]
         )
 
-        def killed_between_decision_and_job(_jobs_dir, _payload):
-            raise SimulatedKill("killed before runner job publication")
+    def test_crash_after_open_decision_recovers_exactly_one_job(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(stream_payload(1, "105", "70", "7000", "1050", spread_pct="0.008"))
 
-        entry_payload = stream_payload(
-            2, "108", "75", "7600", "1070",
-            spread_pct="0.007", venues="perp",
-        )
+        def killed(_jobs_dir, _payload):
+            raise SimulatedKill("killed before job publication")
+
+        payload = stream_payload(2, "108", "75", "7600", "1070", spread_pct="0.007")
         with self.assertRaises(SimulatedKill):
-            self.tick(entry_payload, job_writer=killed_between_decision_and_job)
-
+            self.tick(payload, job_writer=killed)
         self.assertEqual(self.job_paths(), [])
-        entry_rows = [
-            row for row in self.decision_rows()
-            if row["action"] == lifecycle.ACTION_ENTER_SMALL
-        ]
-        self.assertEqual(len(entry_rows), 1)
-        expected_id = live.deterministic_job_id("AAAUSDT", ignition)
-        self.assertEqual(entry_rows[0]["job"]["job_id"], expected_id)
 
-        recovered = self.tick(entry_payload)
-        self.assertEqual(recovered.replayed_receipts, 1)
-        self.assertEqual(recovered.recovered_job_ids, (expected_id,))
-        self.assertEqual(recovered.decisions[0]["action"], "DUPLICATE")
-        self.assertEqual(len(self.job_paths()), 1)
-
-        replay = self.tick(
-            entry_payload,
-            now_fn=lambda: "2026-08-14T12:01:00.000Z",
+        recovered = self.tick(payload)
+        expected = live.deterministic_job_id(
+            "AAAUSDT", "2026-08-14T10:01:00.000Z", live.JOB_OPEN_OP
         )
+        self.assertEqual(recovered.recovered_job_ids, (expected,))
+        self.assertEqual(len(self.job_paths()), 1)
+        replay = self.tick(payload)
         self.assertEqual(replay.recovered_job_ids, ())
         self.assertEqual(replay.written_job_ids, ())
         self.assertEqual(len(self.job_paths()), 1)
-        job = json.loads(self.job_paths()[0].read_text(encoding="utf-8"))
-        self.assertEqual(job["job_id"], expected_id)
 
-    def test_restart_recovers_if_killed_before_decision_append(self):
-        self.tick(stream_payload(0, "100", "2", "100", "1000", venues="perp"))
-        ignition = "2026-08-14T10:01:00.000Z"
-        self.tick(
-            stream_payload(
-                1, "105", "70", "7000", "1050",
-                spread_pct="0.008", venues="perp",
-            )
-        )
-        entry_payload = stream_payload(
-            2, "108", "75", "7600", "1070",
-            spread_pct="0.007", venues="perp",
-        )
+    def test_crash_before_open_decision_append_recovers_receipt_and_job(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(stream_payload(1, "105", "70", "7000", "1050", spread_pct="0.008"))
+        payload = stream_payload(2, "108", "75", "7600", "1070", spread_pct="0.007")
         with mock.patch.object(
-            live,
-            "append_decision",
-            side_effect=SimulatedKill("killed after lifecycle decision"),
+            live, "append_decision", side_effect=SimulatedKill("after lifecycle receipt")
         ):
             with self.assertRaises(SimulatedKill):
-                self.tick(entry_payload)
-
+                self.tick(payload)
         self.assertEqual(self.job_paths(), [])
-        self.assertNotIn(
-            lifecycle.ACTION_ENTER_SMALL,
-            [row["action"] for row in self.decision_rows()],
-        )
 
-        expected_id = live.deterministic_job_id("AAAUSDT", ignition)
-        recovered = self.tick(entry_payload)
-        self.assertEqual(recovered.replayed_receipts, 1)
-        self.assertEqual(recovered.recovered_job_ids, (expected_id,))
-        self.assertEqual(recovered.decisions[0]["action"], "DUPLICATE")
+        recovered = self.tick(payload)
+        self.assertEqual(len(recovered.recovered_job_ids), 1)
         self.assertEqual(len(self.job_paths()), 1)
-        entry_rows = [
+        enter_rows = [
             row for row in self.decision_rows()
             if row["action"] == lifecycle.ACTION_ENTER_SMALL
         ]
-        self.assertEqual(len(entry_rows), 1)
-        self.assertEqual(entry_rows[0]["job"]["job_id"], expected_id)
+        self.assertEqual(len(enter_rows), 1)
+
+    def test_crash_after_exit_decision_recovers_exactly_one_exit_job(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        self.inject_open(open_job)
+        self.tick(
+            stream_payload(3, "150", "90", "9000", "1100", spread_pct="0.006", oi_change_pct="3")
+        )
+
+        def killed_on_exit(jobs_dir, payload):
+            if payload["op"] == live.JOB_EXIT_OP:
+                raise SimulatedKill("killed before EXIT publication")
+            return live.write_job_record(jobs_dir, payload)
+
+        exit_payload = stream_payload(
+            4, "119", "30", "3000", "900", oi_change_pct="-8"
+        )
+        with self.assertRaises(SimulatedKill):
+            self.tick(exit_payload, job_writer=killed_on_exit)
+        self.assertEqual(set(self.jobs_by_op()), {live.JOB_OPEN_OP})
+
+        recovered = self.tick(exit_payload)
+        expected = live.deterministic_job_id(
+            "AAAUSDT", "2026-08-14T10:01:00.000Z", live.JOB_EXIT_OP
+        )
+        self.assertEqual(recovered.recovered_job_ids, (expected,))
+        self.assertEqual(set(self.jobs_by_op()), {live.JOB_OPEN_OP, live.JOB_EXIT_OP})
+        replay = self.tick(exit_payload)
+        self.assertEqual(replay.recovered_job_ids, ())
+        self.assertEqual(len(self.job_paths()), 2)
+
+    def test_freshness_loss_queues_one_exit_and_keeps_position(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        self.inject_open(open_job)
+        stale_payload = stream_payload(
+            3, "115", "80", "8000", "1080", freshness_ms="5001"
+        )
+        first = self.tick(stale_payload)
+        self.assertEqual(first.decisions[0]["action"], lifecycle.ACTION_EXIT)
+        second = self.tick(stale_payload)
+        self.assertIn(
+            second.decisions[0]["action"],
+            {lifecycle.ACTION_DUPLICATE, lifecycle.ACTION_HOLD},
+        )
+        self.assertEqual(len(self.job_paths()), 2)
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(token["qty"], "0.071")
+        self.assertEqual(token["position_status"], "EXIT_PENDING")
+
+    def test_position_without_matching_result_fails_closed(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        self.position.parent.mkdir(parents=True, exist_ok=True)
+        self.position.write_text(json.dumps({
+            "version": 1,
+            "revision": 2,
+            "state": "OPEN",
+            "symbol": "AAAUSDT",
+            "job_id": open_job["job_id"],
+            "measured_qty": "0.071",
+            "entry": {"qty": "0.071", "price": "112.5"},
+        }), encoding="utf-8")
+        with self.assertRaises(live.MomentumLiveError):
+            self.tick(stream_payload(3, "120", "90", "9000", "1100"))
 
     def test_conflicting_deterministic_job_is_fail_closed(self):
-        ignition = "2026-08-14T10:01:00.000Z"
-        job_id = live.deterministic_job_id("AAAUSDT", ignition)
+        job_id = live.deterministic_job_id(
+            "AAAUSDT", "2026-08-14T10:01:00.000Z", live.JOB_OPEN_OP
+        )
         payload = {
             "job_id": job_id,
-            "op": live.JOB_OP,
+            "op": live.JOB_OPEN_OP,
             "symbol": "AAAUSDT",
             "max_notional": Decimal("8"),
             "created_utc": FIXED_NOW,
@@ -385,68 +447,52 @@ class MomentumLiveTests(unittest.TestCase):
             "requested_by": live.REQUESTED_BY,
         }
         self.assertTrue(live.write_job_record(self.jobs, payload))
-        conflict = dict(payload, requested_by="different")
         with self.assertRaises(live.MomentumLiveError):
-            live.write_job_record(self.jobs, conflict)
+            live.write_job_record(self.jobs, dict(payload, requested_by="other"))
         self.assertEqual(len(self.job_paths()), 1)
 
-    def test_cli_writes_only_artifacts_and_reports_counts(self):
-        self.config = test_config()
+    def test_cli_accepts_injected_runner_paths_and_reports_open(self):
         self.tick(stream_payload(0, "100", "2", "100", "1000"))
-        self.tick(
-            stream_payload(
-                1, "105", "70", "7000", "1050", spread_pct="0.008"
-            )
-        )
-        self.stream.write_text(
-            json.dumps(
-                {
-                    "AAAUSDT": stream_payload(
-                        2, "108", "75", "7600", "1070", spread_pct="0.007"
-                    )
-                }
-            ),
-            encoding="utf-8",
-        )
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        self.tick(stream_payload(1, "105", "70", "7000", "1050", spread_pct="0.008"))
+        self.stream.write_text(json.dumps({
+            "AAAUSDT": stream_payload(2, "108", "75", "7600", "1070", spread_pct="0.007")
+        }), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
         args = [
             "--tick", str(self.stream),
             "--state", str(self.state),
             "--receipts", str(self.receipts),
             "--decisions", str(self.decisions),
             "--jobs-dir", str(self.jobs),
+            "--position", str(self.position),
+            "--results", str(self.results),
             "--initial-notional", "8",
         ]
         with redirect_stdout(stdout), redirect_stderr(stderr):
             code = live.main(args)
-
         self.assertEqual(code, 0, stderr.getvalue())
         summary = json.loads(stdout.getvalue().splitlines()[0])
-        self.assertEqual(summary["decisions"], 1)
         self.assertEqual(summary["jobs_written"], 1)
-        self.assertEqual(len(self.job_paths()), 1)
+        self.assertEqual(self.jobs_by_op()[live.JOB_OPEN_OP]["op"], live.JOB_OPEN_OP)
 
-    def test_runtime_caps_reject_non_decimal_or_oversize_values(self):
+    def test_runtime_caps_remain_decimal_only(self):
         self.stream.write_text("{}", encoding="utf-8")
         common = {
             "state_path": self.state,
             "receipt_path": self.receipts,
             "decisions_path": self.decisions,
             "jobs_dir": self.jobs,
+            "position_path": self.position,
+            "results_path": self.results,
             "now_fn": fixed_now,
         }
         for value in (Decimal("8.01"), Decimal("0"), None, True, 8, "8"):
             with self.subTest(value=value):
                 with self.assertRaises(live.MomentumLiveError):
-                    live.run_tick(
-                        self.stream, max_job_notional=value, **common
-                    )
+                    live.run_tick(self.stream, max_job_notional=value, **common)
         with self.assertRaises(live.MomentumLiveError):
             live.run_tick(
-                self.stream,
-                job_ttl=timedelta(minutes=16),
-                **common,
+                self.stream, job_ttl=timedelta(minutes=16), **common
             )
 
 

@@ -309,6 +309,117 @@ class RecordMergeTests(unittest.TestCase):
         self.assertIsNone(self.state["AAAUSDT"]["spot_ask"])
 
 
+class RollingWindowTests(unittest.TestCase):
+    def setUp(self):
+        spot = mf.parse_exchange_metadata(
+            {"symbols": [spot_info("AAAUSDT"), spot_info("SPOTUSDT")]}, "spot"
+        )
+        perp = mf.parse_exchange_metadata(
+            {"symbols": [perp_info("AAAUSDT")]}, "perp"
+        )
+        self.state = mf.merge_metadata({}, spot, perp, FIXED_UTC)
+
+    @staticmethod
+    def kline(symbol, close_ms, volume, closed=True):
+        return {
+            "s": symbol,
+            "k": {
+                "s": symbol,
+                "i": "1m",
+                "T": close_ms,
+                "q": str(volume),
+                "x": closed,
+            },
+        }
+
+    def test_closed_kline_windows_are_exact_bounded_and_prefer_perp(self):
+        windows = {}
+        ignored = mf.merge_kline_rows(
+            self.state,
+            "spot",
+            "aaausdt@kline_1m",
+            [self.kline("AAAUSDT", 1_000_000, "99")],
+            windows,
+            3,
+        )
+        self.assertEqual(ignored, set())
+        for index, volume in enumerate(("10", "20", "30", "90")):
+            changed = mf.merge_kline_rows(
+                self.state,
+                "perp",
+                "aaausdt@kline_1m",
+                [self.kline("AAAUSDT", 1_000_000 + index * 60_000, volume)],
+                windows,
+                3,
+            )
+            self.assertEqual(changed, {"AAAUSDT"})
+        mf.merge_kline_rows(
+            self.state,
+            "perp",
+            "aaausdt@kline_1m",
+            [self.kline("AAAUSDT", 1_240_000, "999", closed=False)],
+            windows,
+            3,
+        )
+        self.assertEqual(
+            windows["AAAUSDT"]["closed_1m"],
+            [["1060000", "20"], ["1120000", "30"], ["1180000", "90"]],
+        )
+
+    def test_serve_snapshot_round_trips_windows_and_whole_universe_urls(self):
+        self.state["AAAUSDT"].update(
+            {
+                "spot_bid": "10",
+                "spot_ask": "11",
+                "perp_bid": "12",
+                "perp_ask": "13",
+                "freshness_ms": "0",
+            }
+        )
+        windows = {
+            "AAAUSDT": {
+                "closed_1m": [
+                    ["1000000", "10"],
+                    ["1060000", "20"],
+                    ["1120000", "90"],
+                ]
+            }
+        }
+        payload = mf.feed_snapshot_payload(self.state, windows, 3, FIXED_MS)
+        self.assertEqual(payload["symbols"]["AAAUSDT"]["surge_ratio"], "4.5")
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "feed.json"
+            mf.atomic_write_json(path, payload)
+            self.assertEqual(
+                mf.load_feed_windows(path, 3)["AAAUSDT"]["closed_1m"],
+                windows["AAAUSDT"]["closed_1m"],
+            )
+            self.assertEqual(
+                mf.load_feed_state(path)["AAAUSDT"]["venues"], "both"
+            )
+            restarted = mf.MarketFeed(
+                path, Path(raw) / "STOP", serve=True, window=3
+            )
+            self.assertIsNone(restarted.state["AAAUSDT"]["spot_bid"])
+            self.assertEqual(
+                restarted.windows["AAAUSDT"]["closed_1m"],
+                windows["AAAUSDT"]["closed_1m"],
+            )
+        urls = mf.websocket_urls(self.state)
+        self.assertIn("/aaausdt@kline_1m", urls["perp"])
+        self.assertNotIn("/aaausdt@kline_1m", urls["spot"])
+        self.assertIn("/spotusdt@kline_1m", urls["spot"])
+        self.assertTrue(mf.argument_parser().parse_args(["--serve"]).serve)
+
+    def test_combined_closed_kline_message_is_parsed(self):
+        data = self.kline("AAAUSDT", 1_000_000, "10")
+        stream, rows = mf.parse_combined_message(
+            json.dumps({"stream": "aaausdt@kline_1m", "data": data})
+        )
+        self.assertEqual(stream, "aaausdt@kline_1m")
+        self.assertEqual(rows, [data])
+
+
 class RestartTests(unittest.TestCase):
     def test_extended_state_round_trips_and_base_state_is_upgraded(self):
         with tempfile.TemporaryDirectory() as raw:

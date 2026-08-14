@@ -2,15 +2,17 @@
 """Continuous public Binance Spot + USD-M USDT market feed.
 
 Two combined WebSocket connections consume Binance's all-market ``!ticker``
-and ``!miniTicker`` arrays.  There is no symbol rotation and there are no
-per-symbol HTTP reads.  Unsigned ``exchangeInfo`` GETs provide the tradable
-universe and venue-specific order-size constraints.
+arrays plus exact closed ``@kline_1m`` candles for the complete current
+universe.  There is no symbol rotation and there are no per-symbol HTTP reads.
+Unsigned ``exchangeInfo`` GETs provide the tradable universe and venue-specific
+order-size constraints.
 
-The public state keeps every field from :mod:`market_stream`.  Fields that
-cannot be proved from these ticker streams (mark, funding, open interest, and
-one-minute volume analytics) remain null.  Additional flat Decimal-string
-fields carry Spot and perpetual LOT_SIZE/minNotional data.  No credential,
-signed request, POST, account read, or order path exists in this module.
+The legacy flat state keeps every field from :mod:`market_stream`; unsupported
+mark, funding, and open-interest fields remain null.  ``--serve`` writes a
+versioned envelope with atomic write freshness, all-symbol ticker state, and
+rolling closed 1m quote-volume windows.  Additional flat Decimal-string fields
+carry Spot and perpetual LOT_SIZE/minNotional data.  No credential, signed
+request, POST, account read, or order path exists in this module.
 """
 
 from __future__ import annotations
@@ -35,7 +37,10 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from urllib.parse import urlsplit
 
 from market_stream import (
+    DEFAULT_WINDOW,
     DataReadError,
+    FEED_STATE_VERSION,
+    MAX_WINDOW,
     MarketStreamError,
     NUMERIC_FIELDS,
     PublicJsonReader,
@@ -45,7 +50,9 @@ from market_stream import (
     atomic_write_json,
     decimal_string,
     decimal_value,
+    merge_closed_window,
     optional_decimal_string,
+    volume_metrics,
 )
 
 
@@ -95,6 +102,7 @@ UNSUPPORTED_STREAM_FIELDS = (
     "next_funding_ms",
 )
 STREAM_NAMES = frozenset({"!ticker@arr", "!miniticker@arr"})
+KLINE_STREAM_SUFFIX = "@kline_1m"
 
 
 class WebSocketError(MarketStreamError):
@@ -562,6 +570,11 @@ def load_feed_state(path: Path) -> Dict[str, Dict[str, Any]]:
         raise DataReadError(f"stream state is unreadable: {path}") from None
     if not isinstance(payload, dict):
         raise DataReadError("stream state is not a symbol mapping")
+    envelope = payload.get("version") == FEED_STATE_VERSION and "symbols" in payload
+    if envelope:
+        payload = payload.get("symbols")
+        if not isinstance(payload, dict):
+            raise DataReadError("feed state symbols is not a mapping")
     state: Dict[str, Dict[str, Any]] = {}
     allowed = set(FEED_FIELDS)
     required = set(STATE_FIELDS)
@@ -569,7 +582,10 @@ def load_feed_state(path: Path) -> Dict[str, Dict[str, Any]]:
         symbol = valid_symbol(raw_symbol)
         if symbol is None or not isinstance(raw_record, dict):
             raise DataReadError("stream state has an invalid symbol record")
-        if not required.issubset(raw_record) or not set(raw_record).issubset(allowed):
+        record_fields = set(raw_record)
+        if envelope:
+            record_fields.discard("closed_1m")
+        if not required.issubset(raw_record) or not record_fields.issubset(allowed):
             raise DataReadError(f"stream state schema mismatch for {symbol}")
         if not isinstance(raw_record.get("utc"), str):
             raise DataReadError(f"stream state utc is invalid for {symbol}")
@@ -591,6 +607,78 @@ def load_feed_state(path: Path) -> Dict[str, Dict[str, Any]]:
     return state
 
 
+def load_feed_windows(path: Path, window: int) -> Dict[str, Dict[str, Any]]:
+    """Load closed one-minute windows from a served snapshot."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise DataReadError(f"stream state is unreadable: {path}") from None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != FEED_STATE_VERSION
+        or not isinstance(payload.get("symbols"), dict)
+    ):
+        return {}
+    windows: Dict[str, Dict[str, Any]] = {}
+    for raw_symbol, raw_record in payload["symbols"].items():
+        symbol = valid_symbol(raw_symbol)
+        if symbol is None or not isinstance(raw_record, dict):
+            raise DataReadError("feed state has an invalid symbol window")
+        raw_closed = raw_record.get("closed_1m", [])
+        if not isinstance(raw_closed, list):
+            raise DataReadError(f"feed state closed_1m is invalid for {symbol}")
+        incoming: List[Tuple[int, Decimal]] = []
+        previous_close = -1
+        for pair in raw_closed:
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise DataReadError(f"feed state candle is invalid for {symbol}")
+            try:
+                close_ms = int(str(pair[0]))
+            except (TypeError, ValueError):
+                raise DataReadError(
+                    f"feed state candle time is invalid for {symbol}"
+                ) from None
+            volume = decimal_value(pair[1], f"feed state {symbol} volume")
+            if close_ms <= previous_close or volume < 0:
+                raise DataReadError(f"feed state candle is invalid for {symbol}")
+            previous_close = close_ms
+            incoming.append((close_ms, volume))
+        closed = merge_closed_window([], incoming, window)
+        windows[symbol] = {"closed_1m": closed}
+        if closed:
+            windows[symbol]["last_volume_close_ms"] = closed[-1][0]
+    return windows
+
+
+def feed_snapshot_payload(
+    state: Mapping[str, Mapping[str, Any]],
+    windows: Mapping[str, Mapping[str, Any]],
+    window: int,
+    written_ms: int,
+) -> Dict[str, Any]:
+    """Build the atomic serve contract consumed by market_stream."""
+    symbols: Dict[str, Dict[str, Any]] = {}
+    for symbol in sorted(state):
+        record = {field: state[symbol].get(field) for field in FEED_FIELDS}
+        closed = list(windows.get(symbol, {}).get("closed_1m", []))[-window:]
+        vol, med, surge = volume_metrics(closed, window)
+        record["vol_1m_quote"] = vol
+        record["vol_med_1m"] = med
+        record["surge_ratio"] = surge
+        record["closed_1m"] = closed
+        symbols[symbol] = record
+    return {
+        "version": FEED_STATE_VERSION,
+        "written_ms": str(written_ms),
+        "window": window,
+        "symbols": symbols,
+    }
+
+
 def parse_combined_message(text: str) -> Tuple[str, List[Mapping[str, Any]]]:
     try:
         payload = json.loads(text)
@@ -599,12 +687,16 @@ def parse_combined_message(text: str) -> Tuple[str, List[Mapping[str, Any]]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("stream"), str):
         raise DataReadError("WebSocket message is not a combined stream object")
     stream_name = payload["stream"].lower()
-    if stream_name not in STREAM_NAMES:
-        raise DataReadError("WebSocket message has an unexpected stream")
     rows = payload.get("data")
-    if not isinstance(rows, list):
-        raise DataReadError("WebSocket all-market payload is not a list")
-    return stream_name, [row for row in rows if isinstance(row, dict)]
+    if stream_name in STREAM_NAMES:
+        if not isinstance(rows, list):
+            raise DataReadError("WebSocket all-market payload is not a list")
+        return stream_name, [row for row in rows if isinstance(row, dict)]
+    if stream_name.endswith(KLINE_STREAM_SUFFIX):
+        symbol = valid_symbol(stream_name[: -len(KLINE_STREAM_SUFFIX)].upper())
+        if symbol is not None and isinstance(rows, dict):
+            return stream_name, [rows]
+    raise DataReadError("WebSocket message has an unexpected stream")
 
 
 def merge_ticker_rows(
@@ -655,6 +747,82 @@ def merge_ticker_rows(
         _set_freshness(record, symbol, received_ms, seen_ms)
         updated.add(symbol)
     return updated
+
+
+def merge_kline_rows(
+    state: Mapping[str, Mapping[str, Any]],
+    venue: str,
+    stream_name: str,
+    rows: Iterable[Mapping[str, Any]],
+    windows: Dict[str, Dict[str, Any]],
+    window: int,
+) -> set[str]:
+    """Merge exact, closed one-minute quote-volume candles."""
+    if venue not in {"spot", "perp"}:
+        raise ValueError("venue must be spot or perp")
+    normalized = stream_name.lower()
+    if not normalized.endswith(KLINE_STREAM_SUFFIX):
+        raise DataReadError("unexpected Binance kline stream name")
+    stream_symbol = valid_symbol(
+        normalized[: -len(KLINE_STREAM_SUFFIX)].upper()
+    )
+    if stream_symbol is None:
+        raise DataReadError("invalid Binance kline stream symbol")
+    changed: set[str] = set()
+    for row in rows:
+        raw_kline = row.get("k")
+        if not isinstance(raw_kline, dict):
+            continue
+        symbol = valid_symbol(raw_kline.get("s", row.get("s")))
+        record = state.get(symbol) if symbol is not None else None
+        if symbol != stream_symbol or record is None:
+            continue
+        preferred_venue = (
+            "perp" if record.get("venues") in {"perp", "both"} else "spot"
+        )
+        if venue != preferred_venue:
+            continue
+        if raw_kline.get("i") != "1m" or raw_kline.get("x") is not True:
+            continue
+        try:
+            close_ms = int(str(raw_kline.get("T")))
+            quote_volume = decimal_value(
+                raw_kline.get("q"), f"{venue} {symbol} closed 1m quote volume"
+            )
+        except (TypeError, ValueError, DataReadError):
+            continue
+        if close_ms < 0 or quote_volume < 0:
+            continue
+        meta = windows.setdefault(symbol, {"closed_1m": []})
+        meta["closed_1m"] = merge_closed_window(
+            meta.get("closed_1m", []), [(close_ms, quote_volume)], window
+        )
+        meta["last_volume_close_ms"] = meta["closed_1m"][-1][0]
+        changed.add(symbol)
+    return changed
+
+
+def websocket_urls(state: Mapping[str, Mapping[str, Any]]) -> Dict[str, str]:
+    """Build one ticker-plus-kline combined URL for each preferred venue."""
+    spot_symbols = sorted(
+        symbol for symbol, record in state.items() if record.get("venues") == "spot"
+    )
+    perp_symbols = sorted(
+        symbol
+        for symbol, record in state.items()
+        if record.get("venues") in {"perp", "both"}
+    )
+
+    def with_klines(base: str, symbols: Sequence[str]) -> str:
+        suffix = "".join(
+            f"/{symbol.lower()}{KLINE_STREAM_SUFFIX}" for symbol in symbols
+        )
+        return base + suffix
+
+    return {
+        "spot": with_klines(SPOT_WS_URL, spot_symbols),
+        "perp": with_klines(FAPI_WS_URL, perp_symbols),
+    }
 
 
 def _set_freshness(
@@ -736,6 +904,8 @@ class MarketFeed:
         state_path: Path = DEFAULT_STATE_PATH,
         stop_path: Path = DEFAULT_STOP_PATH,
         *,
+        serve: bool = False,
+        window: int = DEFAULT_WINDOW,
         metadata_minutes: float = DEFAULT_METADATA_MINUTES,
         flush_seconds: float = DEFAULT_FLUSH_SECONDS,
         reader: Optional[Callable[[str, str, Mapping[str, str]], Any]] = None,
@@ -746,8 +916,12 @@ class MarketFeed:
     ):
         if metadata_minutes <= 0 or flush_seconds <= 0:
             raise ValueError("metadata and flush intervals must be positive")
+        if not 2 <= window <= MAX_WINDOW:
+            raise ValueError(f"window must be between 2 and {MAX_WINDOW}")
         self.state_path = Path(state_path)
         self.stop_path = Path(stop_path)
+        self.serve = serve
+        self.window = window
         self.metadata_seconds = metadata_minutes * 60
         self.flush_seconds = flush_seconds
         self.reader = PublicJsonReader() if reader is None else reader
@@ -756,6 +930,15 @@ class MarketFeed:
         self.ms_fn = ms_fn
         self.monotonic_fn = monotonic_fn
         self.state = load_feed_state(self.state_path)
+        self.windows = (
+            load_feed_windows(self.state_path, self.window) if self.serve else {}
+        )
+        if self.serve:
+            for record in self.state.values():
+                for field in ("spot_bid", "spot_ask", "perp_bid", "perp_ask"):
+                    record[field] = None
+                record["basis_gap_pct"] = None
+                record["freshness_ms"] = None
         self.seen_ms: Dict[str, Dict[str, int]] = {}
         self.events: queue.Queue[Tuple[str, str, Optional[str]]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -793,6 +976,19 @@ class MarketFeed:
         self.seen_ms = {
             symbol: stamps for symbol, stamps in self.seen_ms.items() if symbol in active
         }
+        self.windows = {
+            symbol: meta for symbol, meta in self.windows.items() if symbol in active
+        }
+
+    def _write_state(self) -> None:
+        payload: Any
+        if self.serve:
+            payload = feed_snapshot_payload(
+                self.state, self.windows, self.window, self.ms_fn()
+            )
+        else:
+            payload = self.state
+        atomic_write_json(self.state_path, payload)
 
     def run(self, duration_seconds: Optional[float] = None) -> FeedStats:
         if duration_seconds is not None and duration_seconds <= 0:
@@ -805,10 +1001,11 @@ class MarketFeed:
             )
         self._refresh_metadata()
         metadata_refreshes = 1
-        atomic_write_json(self.state_path, self.state)
+        self._write_state()
         next_metadata = self.monotonic_fn() + self.metadata_seconds
         next_flush = self.monotonic_fn() + self.flush_seconds
         deadline = None if duration_seconds is None else started + duration_seconds
+        urls = websocket_urls(self.state)
         workers = [
             threading.Thread(
                 target=self._worker,
@@ -816,7 +1013,7 @@ class MarketFeed:
                 name=f"market-feed-{venue}",
                 daemon=True,
             )
-            for venue, url in (("spot", SPOT_WS_URL), ("perp", FAPI_WS_URL))
+            for venue, url in (("spot", urls["spot"]), ("perp", urls["perp"]))
         ]
         for worker in workers:
             worker.start()
@@ -855,34 +1052,47 @@ class MarketFeed:
                     websocket_messages += 1
                     try:
                         stream_name, rows = parse_combined_message(text)
-                        changed = merge_ticker_rows(
-                            self.state,
-                            venue,
-                            stream_name,
-                            rows,
-                            self.utc_fn(),
-                            self.ms_fn(),
-                            self.seen_ms,
-                        )
+                        if stream_name.endswith(KLINE_STREAM_SUFFIX):
+                            changed = merge_kline_rows(
+                                self.state,
+                                venue,
+                                stream_name,
+                                rows,
+                                self.windows,
+                                self.window,
+                            )
+                            ticker_changed = False
+                        else:
+                            changed = merge_ticker_rows(
+                                self.state,
+                                venue,
+                                stream_name,
+                                rows,
+                                self.utc_fn(),
+                                self.ms_fn(),
+                                self.seen_ms,
+                            )
+                            ticker_changed = True
                     except MarketStreamError:
                         invalid_messages += 1
                     else:
                         if changed:
                             updated_symbols.update(changed)
-                            ticker_updates += len(changed)
+                            if ticker_changed:
+                                ticker_updates += len(changed)
                             dirty = True
                 now = self.monotonic_fn()
                 if now >= next_flush:
                     if dirty:
                         refresh_freshness(self.state, self.seen_ms, self.ms_fn())
-                        atomic_write_json(self.state_path, self.state)
+                        self._write_state()
                         dirty = False
                     next_flush = now + self.flush_seconds
         finally:
             self.stop_event.set()
             if dirty:
                 refresh_freshness(self.state, self.seen_ms, self.ms_fn())
-                atomic_write_json(self.state_path, self.state)
+                self._write_state()
             for worker in workers:
                 worker.join(timeout=DEFAULT_SOCKET_TIMEOUT + 1.0)
         ended = self.monotonic_fn()
@@ -911,12 +1121,30 @@ def positive_float(raw: str) -> float:
     return value
 
 
+def window_size(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("window must be an integer") from None
+    if not 2 <= value <= MAX_WINDOW:
+        raise argparse.ArgumentTypeError(
+            f"window must be between 2 and {MAX_WINDOW}"
+        )
+    return value
+
+
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Maintain a continuous all-USDT Binance market feed."
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="write a versioned live snapshot with rolling closed 1m windows",
+    )
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--stop-file", type=Path, default=DEFAULT_STOP_PATH)
+    parser.add_argument("--window", type=window_size, default=DEFAULT_WINDOW)
     parser.add_argument(
         "--metadata-minutes", type=positive_float, default=DEFAULT_METADATA_MINUTES
     )
@@ -956,6 +1184,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stats = MarketFeed(
             state_path=args.state_file,
             stop_path=args.stop_file,
+            serve=args.serve,
+            window=args.window,
             metadata_minutes=args.metadata_minutes,
             flush_seconds=args.flush_seconds,
         ).run(args.duration)

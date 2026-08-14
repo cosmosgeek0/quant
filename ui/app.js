@@ -178,9 +178,12 @@ if (typeof document !== "undefined") {
   }
 
   function couldNotLoad(id, url, error) {
-    var root = clearTo(id);
-    root.appendChild(el("p", "empty",
-      "could not load " + url + " (" + error.message + ")"));
+    var ids = Array.isArray(id) ? id : [id];
+    ids.forEach(function (targetId) {
+      var root = clearTo(targetId);
+      root.appendChild(el("p", "empty",
+        "could not load " + url + " (" + error.message + ")"));
+    });
   }
 
   function getJson(url, render, targetId) {
@@ -379,35 +382,55 @@ if (typeof document !== "undefined") {
   }
 
   function renderMomentum(payload) {
-    var root = clearTo("momentum");
     var state = payload.state;
-    root.appendChild(sourceMeta(state.source, state.present, state.as_of));
-    parseErrorMeta(root, state.parse_errors);
+    var positionRoot = clearTo("momentum-position");
+    positionRoot.appendChild(sourceMeta(
+      state.source, state.present, state.as_of));
+    parseErrorMeta(positionRoot, state.parse_errors);
     if (!state.present || collectionEmpty(state.positions)) {
-      empty(root, "no momentum paper positions");
+      empty(positionRoot, "no position proven open in momentum state");
     } else if (Array.isArray(state.positions)) {
       state.positions.forEach(function (position, index) {
         var box = el("div", "run");
         box.appendChild(el("p", "run-head",
           valueText(position.symbol || ("position " + (index + 1)))));
         box.appendChild(objectTable(position));
-        root.appendChild(box);
+        positionRoot.appendChild(box);
       });
     } else {
       Object.keys(state.positions).sort().forEach(function (symbol) {
         var box = el("div", "run");
         box.appendChild(el("p", "run-head", symbol));
         box.appendChild(objectTable(state.positions[symbol]));
-        root.appendChild(box);
+        positionRoot.appendChild(box);
+      });
+    }
+
+    var realized = payload.realized;
+    var realizedRoot = clearTo("momentum-realized");
+    realizedRoot.appendChild(sourceMeta(
+      realized.source, realized.present, realized.as_of));
+    parseErrorMeta(realizedRoot, realized.parse_errors);
+    if (!realized.present || realized.records.length === 0) {
+      empty(realizedRoot, "no momentum runner ledger result recorded");
+    } else {
+      realized.records.slice().reverse().forEach(function (record) {
+        var box = el("div", "run");
+        box.appendChild(el("p", "run-head",
+          valueText(record.utc || record.as_of) + " · " +
+          valueText(record.symbol) + " · " + valueText(record.verdict)));
+        box.appendChild(objectTable(record));
+        realizedRoot.appendChild(box);
       });
     }
 
     var receipts = payload.receipts;
-    root.appendChild(el("p", "run-head", "recent momentum paper receipts"));
-    root.appendChild(sourceMeta(receipts.source, receipts.present, receipts.as_of));
-    parseErrorMeta(root, receipts.parse_errors);
+    var receiptsRoot = clearTo("momentum-receipts");
+    receiptsRoot.appendChild(sourceMeta(
+      receipts.source, receipts.present, receipts.as_of));
+    parseErrorMeta(receiptsRoot, receipts.parse_errors);
     if (!receipts.present || receipts.records.length === 0) {
-      empty(root, "no momentum paper receipts");
+      empty(receiptsRoot, "no momentum lifecycle action receipts");
     } else {
       receipts.records.forEach(function (record) {
         var box = el("div", "run");
@@ -415,7 +438,7 @@ if (typeof document !== "undefined") {
           valueText(record.ts) + " · " + valueText(record.kind) + " · " +
           valueText(record.symbol)));
         box.appendChild(objectTable(record));
-        root.appendChild(box);
+        receiptsRoot.appendChild(box);
       });
     }
   }
@@ -492,7 +515,9 @@ if (typeof document !== "undefined") {
     getJson(STREAM_URL, renderStream, "stream");
     getJson(CANDIDATES_URL, renderCandidates, "candidates");
     getJson(POSITION_URL, renderPosition, "position");
-    getJson(MOMENTUM_URL, renderMomentum, "momentum");
+    getJson(MOMENTUM_URL, renderMomentum, [
+      "momentum-position", "momentum-realized", "momentum-receipts"
+    ]);
     getJson(FEES_URL, renderFees, "fees");
     getJson(PNL_URL, renderPnl, "pnl");
   }

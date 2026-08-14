@@ -7,7 +7,7 @@ the files written beneath RECEIPT_DIR:
   /api/stream      stream_state.json, ranked by surge plus every basis gap
   /api/candidates  complete, structurally valid, unexpired proposal JSON files
   /api/position    the current basis-position.json and its supervision fields
-  /api/momentum    momentum paper state and recent paper receipt records
+  /api/momentum    runner-backed momentum state, receipts, and result ledgers
   /api/fees        commission-rates.json verbatim
   /api/pnl         explicit P&L blocks in CLOSED/reconcile basis receipts
   /api/events      the recorded spot-run fixture, history only
@@ -24,18 +24,77 @@ import argparse
 import json
 import os
 import re
+import stat as stat_module
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 UI_DIR = Path(__file__).resolve().parent
+ROOT_DIR = UI_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+try:
+    from src.runtime_paths import resolve_runtime_paths
+except ModuleNotFoundError as error:
+    if error.name not in {"src", "src.runtime_paths"}:
+        raise
+
+    # Temporary deployment fallback.  These constants mirror
+    # src/runtime_paths.py so a UI-only host copy still reads canonical files.
+    DEFAULT_RECEIPT_DIR = "~/quant_receipts"
+    JOB_RESULTS_NAME = "results.jsonl"
+    PROPOSALS_DIR_NAME = "proposals"
+    WATCH_DIR_NAME = "watch"
+    STREAM_STATE_NAME = "stream_state.json"
+    STREAM_LOG_NAME = "stream_log.jsonl"
+    STREAM_WINDOWS_NAME = "stream_windows.json"
+    BASIS_WATCH_STATE_NAME = "basis_watch_state.json"
+    DECISIONS_NAME = "decisions.jsonl"
+    HEALTH_NAME = "health.jsonl"
+    MOMENTUM_STATE_NAME = "momentum-paper-state.json"
+    MOMENTUM_POSITION_NAME = "momentum-position.json"
+    MOMENTUM_RECEIPTS_NAME = "momentum-paper-receipts.jsonl"
+    STOP_NAME = "STOP"
+    STOP_JOBS_NAME = "STOP-JOBS"
+
+    def resolve_runtime_paths(environ=None):
+        source = os.environ if environ is None else environ
+        receipt_dir = Path(os.path.expanduser(
+            source.get("RECEIPT_DIR", DEFAULT_RECEIPT_DIR)))
+        jobs_dir = receipt_dir / "jobs"
+        watch_dir = receipt_dir / WATCH_DIR_NAME
+        return SimpleNamespace(
+            receipt_dir=receipt_dir,
+            jobs_dir=jobs_dir,
+            job_results=jobs_dir / JOB_RESULTS_NAME,
+            proposals_dir=receipt_dir / PROPOSALS_DIR_NAME,
+            watch_dir=watch_dir,
+            stream_state=receipt_dir / STREAM_STATE_NAME,
+            stream_log=receipt_dir / STREAM_LOG_NAME,
+            stream_windows=receipt_dir / STREAM_WINDOWS_NAME,
+            basis_watch_state=watch_dir / BASIS_WATCH_STATE_NAME,
+            decisions=receipt_dir / DECISIONS_NAME,
+            health=receipt_dir / HEALTH_NAME,
+            momentum_state=receipt_dir / MOMENTUM_STATE_NAME,
+            momentum_position=receipt_dir / MOMENTUM_POSITION_NAME,
+            momentum_receipts=receipt_dir / MOMENTUM_RECEIPTS_NAME,
+            stop=receipt_dir / STOP_NAME,
+            stop_jobs=receipt_dir / STOP_JOBS_NAME,
+        )
+
 BIND_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
 STREAM_TOP_N = 20
 RECENT_MOMENTUM_RECEIPTS = 50
+RECENT_MOMENTUM_RESULTS = 50
+MOMENTUM_RESULT_SCAN_RECORDS = 250
+MOMENTUM_RESULT_OPS = frozenset({
+    "MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT",
+})
 RECENT_HEALTH_RECORDS = 200
 RECENT_JOB_LOG_LINES = 40
 RECENT_DECISIONS = 50
@@ -77,28 +136,27 @@ CONTENT_TYPES = {
 
 
 def default_sources():
-    """Resolve writer paths at call time without importing sibling modules."""
-    receipt_dir = Path(
-        os.path.expanduser(os.environ.get("RECEIPT_DIR", "~/quant_receipts"))
-    )
+    """Resolve the canonical writer paths at call time."""
+    runtime = resolve_runtime_paths()
+    receipt_dir = runtime.receipt_dir
     return {
         "events": UI_DIR / "fixtures" / "events.jsonl",
-        "stream_state": receipt_dir / "stream_state.json",
-        "stream_log": receipt_dir / "stream_log.jsonl",
-        "proposals_dir": receipt_dir / "proposals",
+        "stream_state": runtime.stream_state,
+        "stream_log": runtime.stream_log,
+        "proposals_dir": runtime.proposals_dir,
         "basis_position": receipt_dir / "basis-position.json",
         "basis_receipts_dir": receipt_dir,
         "fees": receipt_dir / "commission-rates.json",
-        "momentum_state": receipt_dir / "momentum-paper-state.json",
-        "momentum_receipts": receipt_dir / "momentum-paper-receipts.jsonl",
-        "health": receipt_dir / "health.jsonl",
+        "momentum_state": runtime.momentum_position,
+        "momentum_receipts": runtime.momentum_receipts,
+        "health": runtime.health,
         "jobs_log": Path(os.path.expanduser(os.environ.get(
-            "JOBS_LOG", str(UI_DIR.parent / "jobs.log")))),
-        "stop": receipt_dir / "STOP",
-        "stop_jobs": receipt_dir / "STOP-JOBS",
-        "momentum_decisions": UI_DIR.parent / "decisions.jsonl",
-        "job_results": receipt_dir / "jobs" / "results.jsonl",
-        "job_receipts_dir": receipt_dir / "jobs" / "receipts",
+            "JOBS_LOG", str(ROOT_DIR / "jobs.log")))),
+        "stop": runtime.stop,
+        "stop_jobs": runtime.stop_jobs,
+        "momentum_decisions": runtime.decisions,
+        "job_results": runtime.job_results,
+        "job_receipts_dir": runtime.jobs_dir / "receipts",
     }
 
 
@@ -449,13 +507,52 @@ def api_position(sources):
     }
 
 
+def _momentum_positions(state):
+    """Return only positions proven open by the persisted runner state."""
+    if not isinstance(state, dict):
+        return {}, 0
+    runner_state = state.get("state")
+    if runner_state in {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}:
+        symbol = state.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            return {"position": state}, 1
+        return {symbol: state}, 0
+    positions = state.get("positions")
+    if isinstance(positions, (dict, list)):
+        return positions, 0
+    position = state.get("position")
+    if isinstance(position, dict):
+        symbol = position.get("symbol")
+        return {str(symbol or "position"): position}, 0
+
+    tokens = state.get("tokens")
+    if not isinstance(tokens, dict):
+        return {}, 0
+    opened = {}
+    parse_errors = 0
+    for symbol, token in tokens.items():
+        if not isinstance(token, dict):
+            parse_errors += 1
+            continue
+        quantity = _finite_decimal(token.get("qty"))
+        if quantity is None:
+            parse_errors += 1
+            continue
+        if quantity != 0:
+            opened[str(symbol)] = token
+    return opened, parse_errors
+
+
 def api_momentum(sources):
     state_path = sources["momentum_state"]
     receipts_path = sources["momentum_receipts"]
+    results_path = sources["job_results"]
     state_present, state, state_errors = _read_json(state_path)
     if state_present and state is not None and not isinstance(state, dict):
         state = None
         state_errors += 1
+    positions, position_errors = _momentum_positions(state)
+    state_errors += position_errors
     receipts_present, raw_records, receipt_errors = _read_jsonl(receipts_path)
     records = []
     for record in raw_records:
@@ -464,13 +561,6 @@ def api_momentum(sources):
         else:
             receipt_errors += 1
 
-    positions = {}
-    if isinstance(state, dict):
-        if isinstance(state.get("positions"), (dict, list)):
-            positions = state["positions"]
-        elif isinstance(state.get("position"), dict):
-            positions = {str(state["position"].get("symbol", "position")):
-                         state["position"]}
     state_as_of = _record_as_of(state, _path_as_of(state_path)) \
         if state_present else None
     receipt_as_of = None
@@ -481,9 +571,36 @@ def api_momentum(sources):
     if receipt_as_of is None and receipts_present:
         receipt_as_of = _path_as_of(receipts_path)
     recent = records[-RECENT_MOMENTUM_RECEIPTS:]
+
+    results_present, raw_results, result_errors, results_truncated = \
+        _read_jsonl_tail(
+            results_path, MOMENTUM_RESULT_SCAN_RECORDS,
+            scan_limit=MOMENTUM_RESULT_SCAN_RECORDS * 2)
+    realized = []
+    for record in raw_results:
+        if not isinstance(record, dict):
+            result_errors += 1
+            continue
+        if record.get("op") not in MOMENTUM_RESULT_OPS:
+            continue
+        if not isinstance(record.get("fills"), list) \
+                or not isinstance(record.get("fees"), list) \
+                or not isinstance(record.get("realized"), dict):
+            result_errors += 1
+            continue
+        realized.append(record)
+    realized = realized[-RECENT_MOMENTUM_RESULTS:]
+    result_as_of = None
+    for record in reversed(realized):
+        result_as_of = _record_as_of(record)
+        if result_as_of is not None:
+            break
+    if result_as_of is None and results_present:
+        result_as_of = _path_as_of(results_path)
     return {
-        "present": state_present or receipts_present,
-        "as_of": _latest_as_of((state_as_of, receipt_as_of)),
+        "present": state_present or receipts_present or results_present,
+        "as_of": _latest_as_of(
+            (state_as_of, receipt_as_of, result_as_of)),
         "state": {
             "source": str(state_path), "present": state_present,
             "as_of": state_as_of, "state": state, "positions": positions,
@@ -495,7 +612,13 @@ def api_momentum(sources):
             "recent_count": len(recent), "records": recent,
             "parse_errors": receipt_errors,
         },
-        "parse_errors": state_errors + receipt_errors,
+        "realized": {
+            "source": str(results_path), "present": results_present,
+            "as_of": result_as_of, "count": len(realized),
+            "records": realized, "parse_errors": result_errors,
+            "tail_truncated": results_truncated,
+        },
+        "parse_errors": state_errors + receipt_errors + result_errors,
     }
 
 
@@ -1090,6 +1213,72 @@ def make_server(sources=None, port=DEFAULT_PORT):
     return ThreadingHTTPServer((BIND_HOST, port), handler)
 
 
+def host_check_sources(endpoint_sources):
+    """Add canonical runtime sidecars that are not HTTP response sources."""
+    runtime = resolve_runtime_paths()
+    sources = dict(endpoint_sources)
+    sources.update({
+        "stream_windows": runtime.stream_windows,
+        "basis_watch_state": runtime.basis_watch_state,
+        "momentum_lifecycle_state": runtime.momentum_state,
+    })
+    return sources
+
+
+def host_check_rows(sources, now=None):
+    """Describe source presence and mtime age without opening or creating it."""
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    checked_at = checked_at.astimezone(timezone.utc)
+    checked_utc = checked_at.isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+    rows = []
+    for name in sorted(sources):
+        path = Path(sources[name])
+        try:
+            facts = path.stat()
+        except FileNotFoundError:
+            exists, kind, age, modified = \
+                False, "missing", None, None
+            status = "absent"
+        except OSError:
+            exists, kind, age, modified = \
+                None, "unknown", None, None
+            status = "unreadable"
+        else:
+            exists, status = True, "present"
+            if stat_module.S_ISREG(facts.st_mode):
+                kind = "file"
+            elif stat_module.S_ISDIR(facts.st_mode):
+                kind = "directory"
+            else:
+                kind = "other"
+            elapsed = checked_at.timestamp() - facts.st_mtime
+            age = round(elapsed, 3) if elapsed >= 0 else None
+            modified = datetime.fromtimestamp(
+                facts.st_mtime, timezone.utc).isoformat(
+                    timespec="milliseconds").replace("+00:00", "Z")
+        rows.append({
+            "source": name,
+            "path": str(path),
+            "checked_utc": checked_utc,
+            "status": status,
+            "exists": exists,
+            "kind": kind,
+            "modified_utc": modified,
+            "age_seconds": age,
+        })
+    return rows
+
+
+def print_host_check(sources, output=None, now=None):
+    """Print stable JSONL suitable for host deployment evidence."""
+    output = output or sys.stdout
+    for row in host_check_rows(sources, now=now):
+        print(json.dumps(row, sort_keys=True), file=output)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
@@ -1111,6 +1300,9 @@ def main(argv=None):
     parser.add_argument("--momentum-decisions", type=Path, default=None)
     parser.add_argument("--job-results", type=Path, default=None)
     parser.add_argument("--job-receipts-dir", type=Path, default=None)
+    parser.add_argument(
+        "--host-check", action="store_true",
+        help="print runtime source existence and mtime ages, then exit")
     args = parser.parse_args(argv)
 
     overrides = {}
@@ -1134,7 +1326,13 @@ def main(argv=None):
         if argument is not None:
             overrides[source] = argument
 
-    server = make_server(overrides, args.port)
+    resolved_sources = dict(default_sources())
+    resolved_sources.update(overrides)
+    if args.host_check:
+        print_host_check(host_check_sources(resolved_sources))
+        return 0
+
+    server = make_server(resolved_sources, args.port)
     host, port = server.server_address[0], server.server_address[1]
     print("serving quant ui (read-only, GET/HEAD only) on http://%s:%d/"
           % (host, port), flush=True)

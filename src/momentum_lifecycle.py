@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Restart-safe, PAPER-ONLY momentum lifecycle over ``stream_state.json``.
+"""Restart-safe momentum signal and HOLD lifecycle over ``stream_state.json``.
 
 The input is the frozen shared-stream mapping documented by the Wave 4
 contract.  This module performs no network I/O and has no live order path.
 It turns each token observation into one explicit lifecycle decision:
 
 * WATCH an ignition edge and require consecutive elevated/price-holding passes.
-* ENTER_SMALL at a fixed paper notional.
-* ADD only when volume, price structure, quoted-spread depth, and OI
-  participation all strengthen.
-* REDUCE_TRAIL on configurable volume/OI/price/depth deterioration.
-* EXIT on a trailing stop, invalidated ignition, missing token, or stale data.
+* Request one small runner OPEN after persistent ignition.
+* Adopt quantity and entry price only from a completed runner fill.
+* HOLD a standing position against every fresh stream observation.
+* Record ADD/REDUCE recommendations as decisions only; they never alter the
+  runner-owned position.
+* Request EXIT on a trailing stop, invalidated ignition, missing token, or
+  stale data, while retaining exposure until runner truth proves it flat.
 
-State is one atomically replaced JSON document.  Sizing actions are appended
-and fsynced to a PAPER receipt ledger before state is saved.  Each receipt
+State is one atomically replaced JSON document.  Strategy actions are appended
+and fsynced to a decision receipt ledger before state is saved.  Each receipt
 contains the complete per-token post-action state, so ``reconcile_receipts``
 can close the append-before-save crash window without inventing an action.
+This module has no exchange or network path.
 """
 
 from __future__ import annotations
@@ -34,33 +37,36 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-STATE_VERSION = 1
-PAPER_NOTE = "paper only; no real order path"
+STATE_VERSION = 2
+DECISION_NOTE = "strategy decision only; runner owns every position mutation"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent / "momentum_state.json"
 DEFAULT_RECEIPT_PATH = (
-    Path(__file__).resolve().parent.parent / "momentum_paper_receipts.jsonl"
+    Path(__file__).resolve().parent.parent / "momentum_decision_receipts.jsonl"
 )
 SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{5,30}")
 QTY_QUANTUM = Decimal("0.00000001")
 
 PHASE_WATCH = "WATCH"
-PHASE_ENTER_SMALL = "ENTER_SMALL"
-PHASE_ADD = "ADD"
-PHASE_REDUCE_TRAIL = "REDUCE_TRAIL"
+PHASE_ENTER_SMALL = "OPEN_PENDING"
+PHASE_HOLD = "HOLD"
+PHASE_ADD = PHASE_HOLD
+PHASE_REDUCE_TRAIL = PHASE_HOLD
+PHASE_EXIT_PENDING = "EXIT_PENDING"
 
 ACTION_WATCH = "WATCH"
 ACTION_ENTER_SMALL = "ENTER_SMALL"
 ACTION_ADD = "ADD"
 ACTION_REDUCE_TRAIL = "REDUCE_TRAIL"
 ACTION_TRAIL = "TRAIL"
+ACTION_HOLD = "HOLD"
 ACTION_EXIT = "EXIT"
 ACTION_DUPLICATE = "DUPLICATE"
 
 RECEIPT_KINDS = {
-    ACTION_ENTER_SMALL: "paper_enter_small",
-    ACTION_ADD: "paper_add",
-    ACTION_REDUCE_TRAIL: "paper_reduce",
-    ACTION_EXIT: "paper_exit",
+    ACTION_ENTER_SMALL: "momentum_open_decision",
+    ACTION_ADD: "momentum_add_decision",
+    ACTION_REDUCE_TRAIL: "momentum_reduce_decision",
+    ACTION_EXIT: "momentum_exit_decision",
 }
 
 NUMERIC_FIELDS = (
@@ -113,7 +119,7 @@ def _decimal_config(value: Any, name: str) -> Decimal:
 
 @dataclass(frozen=True)
 class LifecycleConfig:
-    """All transition and paper-sizing thresholds.
+    """All transition and runner-intent sizing thresholds.
 
     Ratio-growth, trail, fade, spread, and reduce values are fractions (``.05``
     means five percent).  ``oi_change_pct`` and ``basis_gap_pct`` thresholds
@@ -321,7 +327,7 @@ class StreamRecord:
                     return bid, ask, (bid + ask) / Decimal("2"), venue
         if self.mark is not None:
             # Mark is useful structure evidence, but it is not an executable
-            # bid/ask and must never manufacture paper depth or a fill.
+            # bid/ask and must never manufacture executable depth or a fill.
             return None, None, self.mark, "mark"
         return None, None, None, "unknown"
 
@@ -344,17 +350,19 @@ class LifecycleState:
 
 def _zero_token(symbol: str) -> Dict[str, Any]:
     return {
-        "paper": True,
+        "runner_truth": True,
         "symbol": symbol,
         "phase": PHASE_WATCH,
         "candidate": False,
         "persistence_count": 0,
         "pre_ignition_price": None,
+        "ignition_utc": None,
         "entry_structure": None,
         "qty": "0",
         "paper_cost": "0",
         "paper_notional_requested": "0",
         "avg_entry_price": None,
+        "entry_price": None,
         "peak_price": None,
         "trail_stop_price": None,
         "adds": 0,
@@ -376,6 +384,11 @@ def _zero_token(symbol: str) -> Dict[str, Any]:
         "basis_note": "unavailable: no stream pass observed",
         "action_seq": 0,
         "last_receipt_id": None,
+        "open_job_id": None,
+        "exit_job_id": None,
+        "fill_result_id": None,
+        "close_result_id": None,
+        "position_status": "FLAT",
         "rearm_required": False,
     }
 
@@ -396,14 +409,25 @@ def _state_decimal(token: Mapping[str, Any], name: str, symbol: str, *, positive
 def _validate_token(symbol: str, raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise StreamDataError(f"state token {symbol} is not an object")
-    if raw.get("paper") is not True or raw.get("symbol") != symbol:
-        raise StreamDataError(f"state token {symbol} is not marked paper or mismatches symbol")
-    if raw.get("phase") not in {PHASE_WATCH, PHASE_ENTER_SMALL, PHASE_ADD, PHASE_REDUCE_TRAIL}:
+    if raw.get("runner_truth") is not True or raw.get("symbol") != symbol:
+        raise StreamDataError(f"state token {symbol} is not runner-backed or mismatches symbol")
+    if raw.get("phase") not in {
+        PHASE_WATCH, PHASE_ENTER_SMALL, PHASE_HOLD, PHASE_EXIT_PENDING
+    }:
         raise StreamDataError(f"state token {symbol} has invalid phase")
     if not isinstance(raw.get("candidate"), bool) or not isinstance(raw.get("adding_open"), bool):
         raise StreamDataError(f"state token {symbol} has invalid lifecycle flags")
     if not isinstance(raw.get("rearm_required"), bool):
         raise StreamDataError(f"state token {symbol} has invalid rearm flag")
+    if raw.get("position_status") not in {"FLAT", "OPEN", "EXIT_PENDING"}:
+        raise StreamDataError(f"state token {symbol} has invalid position status")
+    for name in (
+        "ignition_utc", "open_job_id", "exit_job_id", "fill_result_id",
+        "close_result_id",
+    ):
+        value = raw.get(name)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise StreamDataError(f"state token {symbol} has invalid {name}")
     for name in ("persistence_count", "adds", "reductions", "action_seq"):
         value = raw.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -423,9 +447,11 @@ def _validate_token(symbol: str, raw: Any) -> Dict[str, Any]:
     if (qty == 0) != (cost == 0):
         raise StreamDataError(f"state token {symbol} has inconsistent qty and paper_cost")
     if qty > 0:
-        if raw.get("phase") == PHASE_WATCH or not isinstance(raw.get("entry_structure"), dict):
+        if raw.get("phase") not in {PHASE_HOLD, PHASE_EXIT_PENDING} \
+                or raw.get("position_status") not in {"OPEN", "EXIT_PENDING"} \
+                or not isinstance(raw.get("entry_structure"), dict):
             raise StreamDataError(f"state token {symbol} has open sizing without entry structure")
-        for name in ("avg_entry_price", "peak_price"):
+        for name in ("avg_entry_price", "entry_price", "peak_price"):
             value = raw.get(name)
             if not isinstance(value, str):
                 raise StreamDataError(f"state token {symbol} has invalid {name}")
@@ -435,6 +461,10 @@ def _validate_token(symbol: str, raw: Any) -> Dict[str, Any]:
                 raise StreamDataError(f"state token {symbol} has invalid {name}") from None
             if not parsed.is_finite() or parsed <= 0:
                 raise StreamDataError(f"state token {symbol} has invalid {name}")
+        if raw.get("entry_price") != raw.get("avg_entry_price"):
+            raise StreamDataError(f"state token {symbol} has conflicting entry price")
+    elif raw.get("position_status") != "FLAT" or raw.get("phase") == PHASE_HOLD:
+        raise StreamDataError(f"state token {symbol} has position status without quantity")
     return dict(raw)
 
 
@@ -449,8 +479,8 @@ def load_state(path: Path) -> LifecycleState:
         raise StreamDataError(f"momentum state unreadable: {path}") from None
     if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
         raise StreamDataError("momentum state has unsupported version")
-    if payload.get("paper") is not True or not isinstance(payload.get("tokens"), dict):
-        raise StreamDataError("momentum state is not a paper token mapping")
+    if payload.get("runner_truth") is not True or not isinstance(payload.get("tokens"), dict):
+        raise StreamDataError("momentum state is not a runner-backed token mapping")
     tokens: Dict[str, Dict[str, Any]] = {}
     for symbol, token in payload["tokens"].items():
         if not isinstance(symbol, str) or not SYMBOL_PATTERN.fullmatch(symbol):
@@ -473,13 +503,13 @@ def _fsync_directory(path: Path) -> None:
 
 
 def save_state(path: Path, state: LifecycleState, now_fn: Callable[[], str] = utc_now) -> None:
-    """Atomically persist the complete per-token paper state."""
+    """Atomically persist the complete per-token runner-backed state."""
     path = Path(path)
     for symbol, token in state.tokens.items():
         _validate_token(symbol, token)
     payload = {
         "version": STATE_VERSION,
-        "paper": True,
+        "runner_truth": True,
         "updated_utc": now_fn(),
         "tokens": state.tokens,
     }
@@ -515,9 +545,9 @@ def _read_receipt_lines(path: Path) -> Iterable[Dict[str, Any]]:
 
 
 def append_receipt(path: Path, receipt: Mapping[str, Any]) -> None:
-    """Durably append one complete PAPER receipt before any state save."""
-    if receipt.get("paper") is not True:
-        raise StreamDataError("refusing to append a non-paper momentum receipt")
+    """Durably append one complete strategy decision before any state save."""
+    if receipt.get("decision_only") is not True:
+        raise StreamDataError("refusing to append a non-decision momentum receipt")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = (json.dumps(dict(receipt), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
@@ -551,8 +581,8 @@ def reconcile_receipts(state: LifecycleState, receipt_path: Path) -> int:
         kind = receipt.get("kind")
         if kind not in set(RECEIPT_KINDS.values()):
             continue
-        if receipt.get("paper") is not True:
-            raise StreamDataError("momentum receipt is not marked paper")
+        if receipt.get("decision_only") is not True:
+            raise StreamDataError("momentum receipt is not marked decision-only")
         symbol = receipt.get("symbol")
         sequence = receipt.get("action_seq")
         receipt_id = receipt.get("receipt_id")
@@ -675,7 +705,7 @@ def add_strength_checks(token: Mapping[str, Any], record: StreamRecord, config: 
 
 
 def deterioration_checks(token: Mapping[str, Any], record: StreamRecord, config: LifecycleConfig) -> Dict[str, bool]:
-    """Explicit soft-deterioration gates that trigger paper reduction/trailing."""
+    """Soft-deterioration gates for decision-only reduction and trailing."""
     _, _, price, _ = record.quote()
     spread = record.spread_pct()
     previous_volume = _optional_decimal(token.get("last_vol_1m_quote"))
@@ -747,13 +777,16 @@ def _commit_observation(token: Dict[str, Any], record: StreamRecord, basis: Tupl
 
 def _decision(token: Mapping[str, Any], action: str, reason: str, *, add_checks: Optional[Dict[str, bool]] = None, fade_checks: Optional[Dict[str, bool]] = None, receipt_id: Optional[str] = None) -> Dict[str, Any]:
     return {
-        "paper": True,
+        "runner_truth": True,
+        "decision_only": action in {ACTION_ADD, ACTION_REDUCE_TRAIL},
         "symbol": token["symbol"],
         "action": action,
         "phase": token["phase"],
         "reason": reason,
         "qty": token["qty"],
         "paper_cost": token["paper_cost"],
+        "position_cost": token["paper_cost"],
+        "entry_price": token["entry_price"],
         "peak_price": token["peak_price"],
         "trail_stop_price": token["trail_stop_price"],
         "basis_available": token["basis_available"],
@@ -771,14 +804,15 @@ def _record_action(token: Dict[str, Any], action: str, receipt_path: Path, now_f
     receipt_id = f"{token['symbol']}:{token['action_seq']}"
     token["last_receipt_id"] = receipt_id
     receipt = {
-        "paper": True,
+        "runner_truth": True,
+        "decision_only": True,
         "kind": RECEIPT_KINDS[action],
         "action": action,
         "action_seq": token["action_seq"],
         "receipt_id": receipt_id,
         "ts": now_fn(),
         "symbol": token["symbol"],
-        "note": PAPER_NOTE,
+        "note": DECISION_NOTE,
         **dict(details),
         "state_after": copy.deepcopy(token),
     }
@@ -793,17 +827,24 @@ def _reset_watch(token: Dict[str, Any], *, rearm_required: bool) -> None:
             "candidate": False,
             "persistence_count": 0,
             "pre_ignition_price": None,
+            "ignition_utc": None,
             "entry_structure": None,
             "qty": "0",
             "paper_cost": "0",
             "paper_notional_requested": "0",
             "avg_entry_price": None,
+            "entry_price": None,
             "peak_price": None,
             "trail_stop_price": None,
             "adds": 0,
             "reductions": 0,
             "adding_open": False,
             "realized_pnl_quote": "0",
+            "open_job_id": None,
+            "exit_job_id": None,
+            "fill_result_id": None,
+            "close_result_id": None,
+            "position_status": "FLAT",
             "rearm_required": rearm_required,
         }
     )
@@ -813,13 +854,9 @@ def _enter_small(token: Dict[str, Any], record: StreamRecord, config: LifecycleC
     bid, ask, price, venue = record.quote()
     if ask is None or bid is None or price is None:
         return False, None
-    qty = paper_quantity(config.initial_notional, ask, config.qty_quantum)
-    if qty <= 0:
+    suggested_qty = paper_quantity(config.initial_notional, ask, config.qty_quantum)
+    if suggested_qty <= 0:
         return False, None
-    with localcontext() as context:
-        context.prec = 50
-        cost = qty * ask
-        stop = trail_stop_price(price, config.trail_pct)
     token.update(
         {
             "phase": PHASE_ENTER_SMALL,
@@ -828,23 +865,32 @@ def _enter_small(token: Dict[str, Any], record: StreamRecord, config: LifecycleC
             "entry_structure": {
                 "utc": record.utc,
                 "venue": venue,
-                "price": fmt(ask),
+                "price": None,
+                "signal_price": fmt(ask),
                 "structure_price": fmt(price),
                 "surge_ratio": None if record.surge_ratio is None else fmt(record.surge_ratio),
                 "oi": None if record.oi is None else fmt(record.oi),
                 "vol_1m_quote": None if record.vol_1m_quote is None else fmt(record.vol_1m_quote),
                 "spread_pct": None if record.spread_pct() is None else fmt(record.spread_pct()),
             },
-            "qty": fmt(qty),
-            "paper_cost": fmt(cost),
+            # The signal cannot manufacture a position.  These stay flat until
+            # ``apply_open_fill`` consumes runner result-ledger truth.
+            "qty": "0",
+            "paper_cost": "0",
             "paper_notional_requested": fmt(config.initial_notional),
-            "avg_entry_price": fmt(ask),
-            "peak_price": fmt(price),
-            "trail_stop_price": fmt(stop),
+            "avg_entry_price": None,
+            "entry_price": None,
+            "peak_price": None,
+            "trail_stop_price": None,
             "adds": 0,
             "reductions": 0,
             "adding_open": True,
             "realized_pnl_quote": "0",
+            "open_job_id": None,
+            "exit_job_id": None,
+            "fill_result_id": None,
+            "close_result_id": None,
+            "position_status": "FLAT",
             "rearm_required": False,
         }
     )
@@ -857,10 +903,9 @@ def _enter_small(token: Dict[str, Any], record: StreamRecord, config: LifecycleC
         {
             "stream_utc": record.utc,
             "side": "BUY",
-            "price": fmt(ask),
-            "qty": fmt(qty),
+            "signal_price": fmt(ask),
+            "suggested_qty": fmt(suggested_qty),
             "paper_notional_requested": fmt(config.initial_notional),
-            "paper_cost": fmt(cost),
             "entry_structure": copy.deepcopy(token["entry_structure"]),
         },
     )
@@ -874,25 +919,14 @@ def _add(token: Dict[str, Any], record: StreamRecord, config: LifecycleConfig, r
     committed = _state_decimal(token, "paper_notional_requested", record.symbol)
     available = max(Decimal("0"), config.max_total_notional - committed)
     requested = min(config.add_notional, available)
-    qty_delta = paper_quantity(requested, ask, config.qty_quantum)
-    if requested <= 0 or qty_delta <= 0:
+    suggested_qty = paper_quantity(requested, ask, config.qty_quantum)
+    if requested <= 0 or suggested_qty <= 0:
         token["adding_open"] = False
         return None
-    old_qty = _state_decimal(token, "qty", record.symbol, positive=True)
-    old_cost = _state_decimal(token, "paper_cost", record.symbol, positive=True)
-    with localcontext() as context:
-        context.prec = 50
-        delta_cost = qty_delta * ask
-        new_qty = old_qty + qty_delta
-        new_cost = old_cost + delta_cost
-        average = new_cost / new_qty
     token.update(
         {
-            "phase": PHASE_ADD,
-            "qty": fmt(new_qty),
-            "paper_cost": fmt(new_cost),
+            "phase": PHASE_HOLD,
             "paper_notional_requested": fmt(committed + requested),
-            "avg_entry_price": fmt(average),
             "adds": token["adds"] + 1,
         }
     )
@@ -904,12 +938,12 @@ def _add(token: Dict[str, Any], record: StreamRecord, config: LifecycleConfig, r
         now_fn,
         {
             "stream_utc": record.utc,
-            "side": "BUY",
-            "price": fmt(ask),
-            "qty": fmt(qty_delta),
-            "qty_after": fmt(new_qty),
+            "execution": "DECISION_ONLY",
+            "side": "BUY_RECOMMENDATION",
+            "reference_price": fmt(ask),
+            "suggested_qty": fmt(suggested_qty),
+            "position_qty_unchanged": token["qty"],
             "paper_notional_requested": fmt(requested),
-            "paper_cost": fmt(delta_cost),
         },
     )
 
@@ -921,28 +955,14 @@ def _reduce(token: Dict[str, Any], record: StreamRecord, config: LifecycleConfig
     if bid is None:
         return None
     old_qty = _state_decimal(token, "qty", record.symbol, positive=True)
-    old_cost = _state_decimal(token, "paper_cost", record.symbol, positive=True)
-    qty_delta = quantize_down(old_qty * config.reduce_fraction, config.qty_quantum)
-    if qty_delta <= 0 or qty_delta >= old_qty:
+    suggested_qty = quantize_down(old_qty * config.reduce_fraction, config.qty_quantum)
+    if suggested_qty <= 0 or suggested_qty >= old_qty:
         return None
-    with localcontext() as context:
-        context.prec = 50
-        cost_removed = old_cost * qty_delta / old_qty
-        proceeds = qty_delta * bid
-        pnl = proceeds - cost_removed
-        new_qty = old_qty - qty_delta
-        new_cost = old_cost - cost_removed
-        realized = _optional_decimal(token.get("realized_pnl_quote")) or Decimal("0")
-        realized += pnl
     token.update(
         {
-            "phase": PHASE_REDUCE_TRAIL,
-            "qty": fmt(max(new_qty, Decimal("0"))),
-            "paper_cost": fmt(max(new_cost, Decimal("0"))),
-            "avg_entry_price": fmt(new_cost / new_qty),
+            "phase": PHASE_HOLD,
             "reductions": token["reductions"] + 1,
             "adding_open": False,
-            "realized_pnl_quote": fmt(realized),
         }
     )
     _commit_observation(token, record, basis_availability(record, config))
@@ -953,13 +973,12 @@ def _reduce(token: Dict[str, Any], record: StreamRecord, config: LifecycleConfig
         now_fn,
         {
             "stream_utc": record.utc,
-            "side": "SELL",
+            "execution": "DECISION_ONLY",
+            "side": "SELL_RECOMMENDATION",
             "reason": reason,
-            "price": fmt(bid),
-            "qty": fmt(qty_delta),
-            "qty_after": fmt(new_qty),
-            "paper_proceeds": fmt(proceeds),
-            "paper_pnl_quote": fmt(pnl),
+            "reference_price": fmt(bid),
+            "suggested_qty": fmt(suggested_qty),
+            "position_qty_unchanged": token["qty"],
         },
     )
 
@@ -967,32 +986,19 @@ def _reduce(token: Dict[str, Any], record: StreamRecord, config: LifecycleConfig
 def _exit(token: Dict[str, Any], record: Optional[StreamRecord], config: LifecycleConfig, receipt_path: Path, now_fn: Callable[[], str], reason: str, basis: Tuple[bool, str]) -> str:
     symbol = token["symbol"]
     qty = _state_decimal(token, "qty", symbol, positive=True)
-    cost = _state_decimal(token, "paper_cost", symbol, positive=True)
     bid: Optional[Decimal] = None
     stream_utc: Optional[str] = None
     if record is not None:
         bid, _, _, _ = record.quote()
         stream_utc = record.utc
-    pricing_basis = "current_bid"
     if bid is None:
         bid = _optional_decimal(token.get("last_bid")) or _optional_decimal(token.get("last_price"))
-        pricing_basis = "last_known_paper_price"
-    if bid is None or bid <= 0:
-        # An entered state always stores a valid last price.  Treat violation as
-        # corrupt state instead of fabricating proceeds.
-        raise StreamDataError(f"open state for {symbol} has no paper exit price")
-    with localcontext() as context:
-        context.prec = 50
-        proceeds = qty * bid
-        exit_pnl = proceeds - cost
-        previous_realized = _optional_decimal(token.get("realized_pnl_quote")) or Decimal("0")
-        total_pnl = previous_realized + exit_pnl
     peak = token.get("peak_price")
     stop = token.get("trail_stop_price")
     entry = copy.deepcopy(token.get("entry_structure"))
-    previous_adds = token["adds"]
-    previous_reductions = token["reductions"]
-    _reset_watch(token, rearm_required=True)
+    token["phase"] = PHASE_EXIT_PENDING
+    token["position_status"] = "EXIT_PENDING"
+    token["adding_open"] = False
     if record is not None:
         _commit_observation(token, record, basis)
     else:
@@ -1011,21 +1017,116 @@ def _exit(token: Dict[str, Any], record: Optional[StreamRecord], config: Lifecyc
         now_fn,
         {
             "stream_utc": stream_utc,
-            "side": "SELL",
+            "side": "SELL_EXIT_INTENT",
             "exit_reason": reason,
-            "pricing_basis": pricing_basis,
-            "price": fmt(bid),
+            "reference_price": None if bid is None else fmt(bid),
             "qty": fmt(qty),
-            "paper_proceeds": fmt(proceeds),
-            "paper_pnl_quote": fmt(exit_pnl),
-            "cumulative_paper_pnl_quote": fmt(total_pnl),
             "peak_price": peak,
             "trail_stop_price": stop,
             "entry_structure": entry,
-            "adds": previous_adds,
-            "reductions": previous_reductions,
+            "adds": token["adds"],
+            "reductions": token["reductions"],
         },
     )
+
+
+def bind_job_id(
+    state: LifecycleState, symbol: str, action: str, job_id: str
+) -> None:
+    """Bind a deterministic runner identity without changing exposure."""
+    token = state.tokens.get(symbol)
+    if token is None:
+        raise StreamDataError(f"runner job for unknown momentum token {symbol}")
+    name = "open_job_id" if action == ACTION_ENTER_SMALL else "exit_job_id"
+    if action not in {ACTION_ENTER_SMALL, ACTION_EXIT}:
+        raise StreamDataError(f"action {action} has no runner job")
+    existing = token.get(name)
+    if existing is not None and existing != job_id:
+        raise StreamDataError(f"state {symbol} has conflicting {name}")
+    token[name] = job_id
+
+
+def apply_open_fill(
+    state: LifecycleState,
+    symbol: str,
+    job_id: str,
+    result_id: str,
+    quantity: Decimal,
+    entry_price: Decimal,
+    config: LifecycleConfig,
+) -> bool:
+    """Adopt one runner-proven OPEN fill; return True iff state changed."""
+    if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
+        raise StreamDataError(f"runner fill for {symbol} has invalid quantity")
+    if not isinstance(entry_price, Decimal) or not entry_price.is_finite() \
+            or entry_price <= 0:
+        raise StreamDataError(f"runner fill for {symbol} has invalid entry price")
+    token = state.tokens.get(symbol)
+    if token is None or token.get("phase") not in {
+        PHASE_ENTER_SMALL, PHASE_HOLD, PHASE_EXIT_PENDING
+    }:
+        raise StreamDataError(f"runner OPEN fill has no pending signal for {symbol}")
+    existing_job = token.get("open_job_id")
+    if existing_job is not None and existing_job != job_id:
+        raise StreamDataError(f"runner OPEN fill job conflicts for {symbol}")
+    if token.get("fill_result_id") is not None:
+        same = (
+            token.get("fill_result_id") == result_id
+            and token.get("qty") == fmt(quantity)
+            and token.get("avg_entry_price") == fmt(entry_price)
+        )
+        if not same:
+            raise StreamDataError(f"runner OPEN fill conflicts for {symbol}")
+        return False
+    if token.get("phase") != PHASE_ENTER_SMALL:
+        raise StreamDataError(f"runner OPEN fill arrived after lifecycle advanced for {symbol}")
+    entry = token.get("entry_structure")
+    if not isinstance(entry, dict):
+        raise StreamDataError(f"runner OPEN fill lacks signal structure for {symbol}")
+    with localcontext() as context:
+        context.prec = 50
+        cost = quantity * entry_price
+        stop = trail_stop_price(entry_price, config.trail_pct)
+    entry["price"] = fmt(entry_price)
+    entry["fill_price"] = fmt(entry_price)
+    entry["fill_qty"] = fmt(quantity)
+    entry["fill_result_id"] = result_id
+    token.update(
+        {
+            "phase": PHASE_HOLD,
+            "qty": fmt(quantity),
+            "paper_cost": fmt(cost),
+            "avg_entry_price": fmt(entry_price),
+            "entry_price": fmt(entry_price),
+            "peak_price": fmt(entry_price),
+            "trail_stop_price": fmt(stop),
+            "open_job_id": job_id,
+            "fill_result_id": result_id,
+            "position_status": "OPEN",
+        }
+    )
+    return True
+
+
+def confirm_position_flat(
+    state: LifecycleState, symbol: str, job_id: str, result_id: str
+) -> bool:
+    """Clear exposure only after matching EXIT result and runner-flat truth."""
+    token = state.tokens.get(symbol)
+    if token is None:
+        raise StreamDataError(f"runner EXIT result for unknown token {symbol}")
+    if token.get("close_result_id") is not None:
+        if token.get("close_result_id") != result_id:
+            raise StreamDataError(f"runner EXIT result conflicts for {symbol}")
+        return False
+    if token.get("phase") != PHASE_EXIT_PENDING:
+        raise StreamDataError(f"runner flat truth has no pending EXIT for {symbol}")
+    existing_job = token.get("exit_job_id")
+    if existing_job is not None and existing_job != job_id:
+        raise StreamDataError(f"runner EXIT job conflicts for {symbol}")
+    _reset_watch(token, rearm_required=True)
+    token["close_result_id"] = result_id
+    return True
 
 
 def _ignition_invalidated(token: Mapping[str, Any], record: StreamRecord, price: Decimal, config: LifecycleConfig) -> bool:
@@ -1044,13 +1145,25 @@ def _ignition_invalidated(token: Mapping[str, Any], record: StreamRecord, price:
 
 
 def process_record(state: LifecycleState, record: StreamRecord, config: LifecycleConfig, receipt_path: Path, now_fn: Callable[[], str] = utc_now) -> Dict[str, Any]:
-    """Apply one token observation and return its factual paper decision."""
+    """Apply one token observation and return its factual strategy decision."""
     token = state.tokens.setdefault(record.symbol, _zero_token(record.symbol))
     basis = basis_availability(record, config)
     if token.get("last_observation_id") == record.observation_id:
         token["basis_available"], token["basis_note"] = basis
         token["basis_gap_pct"] = None if record.basis_gap_pct is None else fmt(record.basis_gap_pct)
         return _decision(token, ACTION_DUPLICATE, "observation already processed")
+
+    # A queued EXIT is single-shot.  Runner truth, not another signal pass,
+    # decides when the position can be cleared.
+    if token.get("phase") == PHASE_EXIT_PENDING:
+        _commit_observation(token, record, basis)
+        return _decision(token, ACTION_HOLD, "runner EXIT pending; position still stands")
+
+    # Likewise, a signal is not a fill.  Do not re-enter or start HOLD until a
+    # matching result-ledger fill and OPEN position have been reconciled.
+    if token.get("phase") == PHASE_ENTER_SMALL:
+        _commit_observation(token, record, basis)
+        return _decision(token, ACTION_HOLD, "runner OPEN pending; no fill adopted")
 
     previous_utc = token.get("last_stream_utc")
     out_of_order = previous_utc is not None and record.utc_value < _parse_utc(previous_utc, f"state {record.symbol}")
@@ -1097,6 +1210,7 @@ def process_record(state: LifecycleState, record: StreamRecord, config: Lifecycl
             )
             if crossed:
                 token["candidate"] = True
+                token["ignition_utc"] = record.utc
                 token["pre_ignition_price"] = fmt(previous_price if previous_price is not None else price)
                 token["persistence_count"] = 0
                 just_ignited = True
@@ -1122,7 +1236,7 @@ def process_record(state: LifecycleState, record: StreamRecord, config: Lifecycl
                 token["candidate"] = False
                 token["persistence_count"] = 0
                 _commit_observation(token, record, basis)
-                return _decision(token, ACTION_WATCH, "initial paper sizing rounded to zero")
+                return _decision(token, ACTION_WATCH, "initial runner sizing rounded to zero")
             _commit_observation(token, record, basis)
             reason = "ignition edge observed; persistence started" if just_ignited else "candidate persistence pending"
             return _decision(token, ACTION_WATCH, reason)
@@ -1160,15 +1274,19 @@ def process_record(state: LifecycleState, record: StreamRecord, config: Lifecycl
         receipt_id = _reduce(token, record, config, receipt_path, now_fn, reasons)
         if receipt_id is not None:
             return _decision(token, ACTION_REDUCE_TRAIL, "structure deteriorated; reduced and trailing", add_checks=add_checks, fade_checks=fade_checks, receipt_id=receipt_id)
-    token["phase"] = PHASE_REDUCE_TRAIL
+    token["phase"] = PHASE_HOLD
     _commit_observation(token, record, basis)
-    return _decision(token, ACTION_TRAIL, "acceleration weakened; add window closed", add_checks=add_checks, fade_checks=fade_checks)
+    return _decision(token, ACTION_HOLD, "position held; add window closed", add_checks=add_checks, fade_checks=fade_checks)
 
 
 def process_missing_token(state: LifecycleState, symbol: str, config: LifecycleConfig, receipt_path: Path, now_fn: Callable[[], str] = utc_now) -> Dict[str, Any]:
     token = state.tokens[symbol]
     qty = _state_decimal(token, "qty", symbol)
     basis = (False, "unavailable: token absent from stream pass")
+    if token.get("phase") == PHASE_EXIT_PENDING:
+        return _decision(token, ACTION_HOLD, "runner EXIT pending; position still stands")
+    if token.get("phase") == PHASE_ENTER_SMALL:
+        return _decision(token, ACTION_HOLD, "runner OPEN pending; token missing")
     if qty > 0:
         receipt_id = _exit(token, None, config, receipt_path, now_fn, "freshness_lost_missing_token", basis)
         return _decision(token, ACTION_EXIT, "token missing from stream; fail-closed exit", receipt_id=receipt_id)
@@ -1239,7 +1357,7 @@ def _decimal_argument(raw: str) -> Decimal:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PAPER-only dynamic momentum lifecycle")
+    parser = argparse.ArgumentParser(description="runner-backed dynamic momentum lifecycle")
     parser.add_argument("--tick", required=True, type=Path, metavar="STREAM_STATE", help="process one frozen-schema stream_state JSON file")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--receipts", type=Path, default=DEFAULT_RECEIPT_PATH)
@@ -1314,7 +1432,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (MomentumLifecycleError, OSError) as exc:
         print(f"momentum_lifecycle_error={exc}", file=sys.stderr)
         return 2
-    print(json.dumps({"paper": True, "replayed_receipts": replayed}, sort_keys=True))
+    print(json.dumps({"runner_truth": True, "replayed_receipts": replayed}, sort_keys=True))
     for decision in decisions:
         print(json.dumps(decision, sort_keys=True))
     return 0

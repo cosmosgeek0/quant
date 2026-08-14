@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Route persisted momentum ENTER decisions to the deterministic job runner.
+"""Route persisted momentum OPEN/HOLD/EXIT decisions to the job runner.
 
 This adapter performs no exchange, credential, or network operation.  It uses
-``momentum_lifecycle`` as the only signal/state machine and publishes an exact
-``MOMENTUM_ROUNDTRIP`` job record when an ENTER_SMALL decision is both
-perpetual-capable and within the compiled runner cap.
+``momentum_lifecycle`` as the only signal/state machine.  It publishes one
+``MOMENTUM_OPEN`` per ignition, adopts only runner-ledger fills while the
+runner position stands, and publishes one ``MOMENTUM_EXIT`` when HOLD logic
+fails closed.  ADD and REDUCE remain durable decisions only.
 
 The decision ledger is durable before job publication.  Job ids are derived
 only from symbol plus the ignition stream timestamp, and publication is an
@@ -36,7 +37,11 @@ HARD_MAX_NOTIONAL = Decimal("8")
 DEFAULT_JOB_TTL = timedelta(minutes=10)
 MAX_JOB_TTL = timedelta(minutes=15)
 REQUESTED_BY = "momentum_live"
-JOB_OP = "MOMENTUM_ROUNDTRIP"
+JOB_OPEN_OP = "MOMENTUM_OPEN"
+JOB_EXIT_OP = "MOMENTUM_EXIT"
+JOB_OPS = frozenset((JOB_OPEN_OP, JOB_EXIT_OP))
+# Kept as the entry-operation alias for callers that used ``JOB_OP``.
+JOB_OP = JOB_OPEN_OP
 RUNNER_SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
 RUNNER_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 RUNNER_UTC_RE = re.compile(
@@ -67,11 +72,29 @@ class TickResult:
     written_job_ids: Tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class RunnerPosition:
+    state: str
+    symbol: Optional[str]
+    open_job_id: Optional[str]
+    exit_job_id: Optional[str]
+    quantity: Optional[Decimal]
+    entry_price: Optional[Decimal]
+
+
 def default_jobs_dir() -> Path:
     receipt_dir = Path(
         os.path.expanduser(os.environ.get("RECEIPT_DIR", "~/quant_receipts"))
     )
     return receipt_dir / "jobs"
+
+
+def default_position_path(jobs_dir: Path) -> Path:
+    return Path(jobs_dir).parent / "momentum-position.json"
+
+
+def default_results_path(jobs_dir: Path) -> Path:
+    return Path(jobs_dir) / "results.jsonl"
 
 
 def default_lifecycle_config() -> lifecycle.LifecycleConfig:
@@ -112,15 +135,20 @@ def _utc_text(value: datetime) -> str:
     ).replace("+00:00", "Z")
 
 
-def deterministic_job_id(symbol: str, ignition_utc: str) -> str:
-    """Return the sole runner identity for one token ignition."""
+def deterministic_job_id(
+    symbol: str, ignition_utc: str, op: str = JOB_OPEN_OP
+) -> str:
+    """Return the sole OPEN or EXIT runner identity for one ignition."""
     if not isinstance(symbol, str) or RUNNER_SYMBOL_RE.fullmatch(symbol) is None:
         raise MomentumLiveError("symbol does not fit the runner schema")
     _parse_utc(ignition_utc, "ignition_utc")
+    if op not in JOB_OPS:
+        raise MomentumLiveError("momentum job op is invalid")
     digest = hashlib.sha256(
-        (symbol + "\0" + ignition_utc).encode("utf-8")
-    ).hexdigest()[:20]
-    job_id = f"mom-{symbol.lower()}-{digest}"
+        "\0".join((symbol, ignition_utc, op)).encode("utf-8")
+    ).hexdigest()[:18]
+    kind = "open" if op == JOB_OPEN_OP else "exit"
+    job_id = f"mom-{kind}-{symbol.lower()}-{digest}"
     if RUNNER_JOB_ID_RE.fullmatch(job_id) is None:
         raise MomentumLiveError("derived job id does not fit the runner schema")
     return job_id
@@ -157,8 +185,8 @@ def _validate_job_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         raise MomentumLiveError("job_id does not fit the runner schema")
     if RUNNER_SYMBOL_RE.fullmatch(symbol) is None:
         raise MomentumLiveError("symbol does not fit the runner schema")
-    if payload["op"] != JOB_OP:
-        raise MomentumLiveError("job op is not MOMENTUM_ROUNDTRIP")
+    if payload["op"] not in JOB_OPS:
+        raise MomentumLiveError("job op is not a momentum OPEN or EXIT")
     requester = payload["requested_by"]
     if not requester.strip() or len(requester) > 128:
         raise MomentumLiveError("requested_by does not fit the runner schema")
@@ -270,6 +298,285 @@ def _read_decisions(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _data_decimal(raw: Any, name: str) -> Optional[Decimal]:
+    """Parse a runner-owned Decimal string; null stays unknown."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise MomentumLiveError(f"{name} must be a Decimal string or null")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        raise MomentumLiveError(f"{name} must be a finite Decimal string") from None
+    if not value.is_finite():
+        raise MomentumLiveError(f"{name} must be a finite Decimal string")
+    return value
+
+
+def _first(raw: Mapping[str, Any], names: Iterable[str]) -> Any:
+    for name in names:
+        if name in raw:
+            return raw[name]
+    return None
+
+
+def read_runner_position(path: Path) -> Optional[RunnerPosition]:
+    """Read the runner's single momentum-position state without inference."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        raise MomentumLiveError(f"momentum position state is unreadable: {path}") from None
+    if not isinstance(raw, dict):
+        raise MomentumLiveError("momentum position state is not an object")
+    nested = raw.get("position")
+    if isinstance(nested, dict):
+        raw = nested
+    state = _first(raw, ("state", "status", "position_state"))
+    if not isinstance(state, str):
+        raise MomentumLiveError("momentum position state has no status")
+    runner_state = state.upper()
+    aliases = {
+        "NONE": "FLAT", "CLOSED": "FLAT", "OPENED": "OPEN",
+        "CLOSING": "EXIT_PENDING",
+    }
+    state = aliases.get(runner_state, runner_state)
+    if state not in {"FLAT", "OPEN", "EXIT_PENDING", "OPEN_PENDING", "UNKNOWN"}:
+        raise MomentumLiveError("momentum position state has invalid status")
+    symbol = raw.get("symbol")
+    if symbol is not None and (
+        not isinstance(symbol, str) or RUNNER_SYMBOL_RE.fullmatch(symbol) is None
+    ):
+        raise MomentumLiveError("momentum position state has invalid symbol")
+    job_id = raw.get("job_id")
+    open_job_id = _first(raw, ("open_job_id", "entry_job_id"))
+    exit_job_id = _first(raw, ("exit_job_id", "close_job_id"))
+    if open_job_id is None and runner_state in {"OPENING", "OPEN"}:
+        open_job_id = job_id
+    if exit_job_id is None and runner_state in {"CLOSING", "CLOSED"}:
+        exit_job_id = job_id
+    for name, value in (("open_job_id", open_job_id), ("exit_job_id", exit_job_id)):
+        if value is not None and (
+            not isinstance(value, str) or RUNNER_JOB_ID_RE.fullmatch(value) is None
+        ):
+            raise MomentumLiveError(f"momentum position state has invalid {name}")
+    entry = raw.get("entry") if isinstance(raw.get("entry"), dict) else {}
+    quantity_raw = _first(
+        raw, ("measured_qty", "qty", "quantity", "position_qty", "executed_qty")
+    )
+    if quantity_raw is None and state in {"OPEN", "EXIT_PENDING"}:
+        quantity_raw = _first(entry, ("qty", "quantity", "executed_qty"))
+    quantity = _data_decimal(
+        quantity_raw,
+        "momentum position quantity",
+    )
+    entry_price_raw = _first(
+        raw, ("entry_price", "avg_entry_price", "fill_price")
+    )
+    if entry_price_raw is None:
+        entry_price_raw = _first(entry, ("price", "entry_price", "avg_fill_price"))
+    entry_price = _data_decimal(
+        entry_price_raw,
+        "momentum position entry_price",
+    )
+    if state in {"OPEN", "EXIT_PENDING"}:
+        identity = open_job_id if state == "OPEN" else exit_job_id
+        if symbol is None or identity is None or quantity is None or quantity <= 0:
+            raise MomentumLiveError("standing momentum position lacks proven identity or quantity")
+    elif quantity is not None and quantity != 0:
+        raise MomentumLiveError("non-open momentum position has non-zero quantity")
+    return RunnerPosition(
+        state, symbol, open_job_id, exit_job_id, quantity, entry_price
+    )
+
+
+def read_results_ledger(path: Path) -> List[Dict[str, Any]]:
+    """Read complete result rows, ignoring only a torn final append."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        raise MomentumLiveError(f"runner results ledger is unreadable: {path}") from None
+    rows: List[Dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line, parse_float=Decimal, parse_int=Decimal)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                continue
+            raise MomentumLiveError("runner results ledger has a torn interior row") from None
+        if not isinstance(row, dict):
+            raise MomentumLiveError("runner results ledger row is not an object")
+        rows.append(row)
+    return rows
+
+
+def _result_for_job(
+    rows: Iterable[Mapping[str, Any]], job_id: str, op: str, symbol: str
+) -> Optional[Mapping[str, Any]]:
+    matches = [row for row in rows if row.get("job_id") == job_id]
+    if not matches:
+        return None
+    canonical = {
+        json.dumps(dict(row), sort_keys=True, separators=(",", ":"), default=str)
+        for row in matches
+    }
+    if len(canonical) != 1:
+        raise MomentumLiveError(f"runner results conflict for job {job_id}")
+    row = matches[-1]
+    if row.get("op") != op or row.get("symbol") != symbol:
+        raise MomentumLiveError(f"runner result identity conflicts for job {job_id}")
+    return row
+
+
+def _fill_values(raw: Mapping[str, Any], source: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    containers: List[Mapping[str, Any]] = [raw]
+    for name in ("fill", "open", "position"):
+        nested = raw.get(name)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    quantity: Optional[Decimal] = None
+    price: Optional[Decimal] = None
+    quote: Optional[Decimal] = None
+    fills = raw.get("fills")
+    if fills is not None:
+        if not isinstance(fills, list) or not fills:
+            raise MomentumLiveError(f"{source} fills do not prove an execution")
+        fill_qty = Decimal("0")
+        fill_quote = Decimal("0")
+        for index, fill in enumerate(fills):
+            if not isinstance(fill, dict):
+                raise MomentumLiveError(f"{source} fill {index} is not an object")
+            part_qty = _data_decimal(fill.get("qty"), f"{source} fill {index} qty")
+            part_price = _data_decimal(
+                fill.get("price"), f"{source} fill {index} price"
+            )
+            if part_qty is None or part_price is None \
+                    or part_qty <= 0 or part_price <= 0:
+                raise MomentumLiveError(f"{source} fill {index} is not positive")
+            with localcontext() as context:
+                context.prec = 50
+                fill_qty += part_qty
+                fill_quote += part_qty * part_price
+        quantity = fill_qty
+        with localcontext() as context:
+            context.prec = 50
+            price = fill_quote / fill_qty
+    for container in containers:
+        candidate_qty = _first(
+            container, ("filled_qty", "executed_qty", "executedQty", "qty", "quantity")
+        )
+        candidate_price = _first(
+            container, ("entry_price", "avg_fill_price", "fill_price", "avgPrice")
+        )
+        candidate_quote = _first(container, ("cum_quote", "cumQuote", "quote_qty"))
+        if candidate_qty is not None:
+            parsed_qty = _data_decimal(candidate_qty, f"{source} fill quantity")
+            if quantity is not None and parsed_qty != quantity:
+                raise MomentumLiveError(f"{source} fill quantities conflict")
+            quantity = parsed_qty
+        if candidate_price is not None:
+            parsed_price = _data_decimal(candidate_price, f"{source} fill price")
+            if price is not None and parsed_price != price:
+                raise MomentumLiveError(f"{source} fill prices conflict")
+            price = parsed_price
+        if quote is None and candidate_quote is not None:
+            quote = _data_decimal(candidate_quote, f"{source} cumulative quote")
+    if price is None and quantity is not None and quote is not None and quantity > 0:
+        with localcontext() as context:
+            context.prec = 50
+            price = quote / quantity
+    return quantity, price
+
+
+def _open_fill_from_result(row: Mapping[str, Any]) -> Tuple[Decimal, Decimal]:
+    if row.get("verdict") not in {"OPEN", "OPEN_EXPOSURE"}:
+        raise MomentumLiveError("momentum OPEN result does not prove standing exposure")
+    quantity, price = _fill_values(row, "runner result")
+    if quantity is None or price is None or quantity <= 0 or price <= 0:
+        raise MomentumLiveError("momentum OPEN result lacks a positive actual fill")
+    return quantity, price
+
+
+def reconcile_runner_truth(
+    state: lifecycle.LifecycleState,
+    position: Optional[RunnerPosition],
+    results: Iterable[Mapping[str, Any]],
+    config: lifecycle.LifecycleConfig,
+) -> int:
+    """Reconcile OPEN fills and confirmed EXITs into lifecycle state."""
+    changes = 0
+    result_rows = list(results)
+    if position is not None and position.state in {"OPEN", "EXIT_PENDING"}:
+        assert position.symbol is not None
+        token = state.tokens.get(position.symbol)
+        if token is None:
+            raise MomentumLiveError("runner position stands without lifecycle state")
+        expected_open = token.get("open_job_id")
+        if not isinstance(expected_open, str):
+            raise MomentumLiveError("lifecycle position has no deterministic OPEN identity")
+        if position.open_job_id is not None and expected_open != position.open_job_id:
+            raise MomentumLiveError("runner position OPEN identity does not match ignition")
+        result = _result_for_job(
+            result_rows, expected_open, JOB_OPEN_OP, position.symbol
+        )
+        if result is None:
+            raise MomentumLiveError("runner position stands without an OPEN ledger result")
+        quantity, price = _open_fill_from_result(result)
+        if position.quantity != quantity:
+            raise MomentumLiveError("runner position and OPEN ledger quantity conflict")
+        if position.entry_price is not None and position.entry_price != price:
+            raise MomentumLiveError("runner position and OPEN ledger entry price conflict")
+        if lifecycle.apply_open_fill(
+            state,
+            position.symbol,
+            expected_open,
+            expected_open,
+            quantity,
+            price,
+            config,
+        ):
+            changes += 1
+
+    for symbol, token in sorted(state.tokens.items()):
+        qty = _decimal(token.get("qty"), f"state {symbol} qty")
+        if qty <= 0:
+            continue
+        if position is None:
+            raise MomentumLiveError("standing lifecycle position has no runner position state")
+        if position.state in {"OPEN", "EXIT_PENDING"}:
+            if position.symbol != symbol:
+                raise MomentumLiveError("runner position symbol conflicts with lifecycle exposure")
+            if position.state == "EXIT_PENDING" and position.exit_job_id \
+                    != token.get("exit_job_id"):
+                raise MomentumLiveError("runner CLOSING identity conflicts with lifecycle EXIT")
+            continue
+        if position.state in {"UNKNOWN", "OPEN_PENDING"}:
+            raise MomentumLiveError("runner position state is not terminally known")
+        if token.get("phase") != lifecycle.PHASE_EXIT_PENDING:
+            raise MomentumLiveError("runner reports flat before lifecycle requested EXIT")
+        exit_job_id = token.get("exit_job_id")
+        if not isinstance(exit_job_id, str):
+            raise MomentumLiveError("pending lifecycle EXIT has no deterministic job id")
+        if position.exit_job_id is not None and position.exit_job_id != exit_job_id:
+            raise MomentumLiveError("runner CLOSED identity conflicts with lifecycle EXIT")
+        result = _result_for_job(result_rows, exit_job_id, JOB_EXIT_OP, symbol)
+        if result is None or result.get("verdict") not in {"CLOSED", "FLAT"}:
+            raise MomentumLiveError("runner flat state lacks a terminal EXIT ledger result")
+        if lifecycle.confirm_position_flat(
+            state, symbol, exit_job_id, exit_job_id
+        ):
+            changes += 1
+    return changes
+
+
 def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
     """Durably append a decision once by its deterministic decision id."""
     decision_id = row.get("decision_id")
@@ -315,31 +622,33 @@ def _ignitions(rows: Iterable[Mapping[str, Any]]) -> Dict[str, str]:
         if not isinstance(symbol, str):
             continue
         snapshot = row.get("lifecycle_state")
-        if row.get("action") == lifecycle.ACTION_EXIT:
-            active.pop(symbol, None)
-            continue
         ignition_utc = row.get("ignition_utc")
         if isinstance(ignition_utc, str):
             active[symbol] = ignition_utc
-        if isinstance(snapshot, dict) and snapshot.get("qty") == "0" \
-                and snapshot.get("candidate") is False:
+        if isinstance(snapshot, dict) and snapshot.get("position_status") == "FLAT" \
+                and snapshot.get("phase") == lifecycle.PHASE_WATCH \
+                and snapshot.get("ignition_utc") is None:
             active.pop(symbol, None)
     return active
 
 
 def _job_from_ledger_row(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    if row.get("action") != lifecycle.ACTION_ENTER_SMALL \
+    action = row.get("action")
+    if action not in {lifecycle.ACTION_ENTER_SMALL, lifecycle.ACTION_EXIT} \
             or row.get("job_eligible") is not True:
         return None
     raw = row.get("job")
     if not isinstance(raw, dict):
-        raise MomentumLiveError("eligible ENTER decision has no job intent")
+        raise MomentumLiveError("eligible momentum decision has no job intent")
     payload = _validate_job_payload(raw)
     symbol = row.get("symbol")
     ignition_utc = row.get("ignition_utc")
+    expected_op = (
+        JOB_OPEN_OP if action == lifecycle.ACTION_ENTER_SMALL else JOB_EXIT_OP
+    )
     if payload["symbol"] != symbol or payload["job_id"] != deterministic_job_id(
-        symbol, ignition_utc
-    ):
+        symbol, ignition_utc, expected_op
+    ) or payload["op"] != expected_op:
         raise MomentumLiveError("decision job identity is inconsistent")
     return payload
 
@@ -361,16 +670,30 @@ def _recover_jobs(
     return tuple(recovered)
 
 
-def _entry_receipt_times(receipt_path: Path) -> Dict[str, str]:
-    result: Dict[str, str] = {}
+def _bind_ledger_jobs(
+    state: lifecycle.LifecycleState, rows: Iterable[Mapping[str, Any]]
+) -> None:
+    for row in rows:
+        payload = _job_from_ledger_row(row)
+        if payload is None:
+            continue
+        lifecycle.bind_job_id(
+            state, payload["symbol"], str(row.get("action")), payload["job_id"]
+        )
+
+
+def _action_receipts(receipt_path: Path) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
     for receipt in lifecycle._read_receipt_lines(Path(receipt_path)):
-        if receipt.get("action") != lifecycle.ACTION_ENTER_SMALL:
+        if receipt.get("action") not in {
+            lifecycle.ACTION_ENTER_SMALL, lifecycle.ACTION_EXIT
+        }:
             continue
         receipt_id = receipt.get("receipt_id")
         timestamp = receipt.get("ts")
         if isinstance(receipt_id, str) and isinstance(timestamp, str):
-            _parse_utc(timestamp, "entry receipt ts")
-            result[receipt_id] = timestamp
+            _parse_utc(timestamp, "action receipt ts")
+            result[receipt_id] = receipt
     return result
 
 
@@ -388,50 +711,55 @@ def _recover_unlogged_entries(
     now_fn: Callable[[], str],
     job_writer: Callable[[Path, Mapping[str, Any]], bool],
 ) -> Tuple[str, ...]:
-    """Recover an ENTER receipt created just before its decision-ledger row."""
+    """Recover an OPEN/EXIT receipt created before its decision-ledger row."""
     issued = {
         payload["job_id"]
         for payload in (_job_from_ledger_row(row) for row in prior_rows)
         if payload is not None
     }
-    receipt_times = _entry_receipt_times(receipt_path)
+    action_receipts = _action_receipts(receipt_path)
     recovered: List[str] = []
     for symbol in sorted(state.tokens):
         token = state.tokens[symbol]
         record = records.get(symbol)
-        entry = token.get("entry_structure")
         receipt_id = token.get("last_receipt_id")
-        is_unlogged_entry_window = (
-            token.get("phase") == lifecycle.PHASE_ENTER_SMALL
-            and token.get("adds") == 0
-            and token.get("reductions") == 0
-            and token.get("qty") != "0"
-            and isinstance(entry, dict)
-            and isinstance(receipt_id, str)
-            and record is not None
-            and token.get("last_observation_id") == record.observation_id
-        )
-        if not is_unlogged_entry_window:
+        if not isinstance(receipt_id, str):
             continue
-        ignition_utc = ignition_by_symbol.get(symbol)
-        if ignition_utc is None and isinstance(entry.get("utc"), str):
-            ignition_utc = entry["utc"]
-            ignition_by_symbol[symbol] = ignition_utc
+        receipt = action_receipts.get(receipt_id)
+        if receipt is None:
+            continue
+        action = receipt.get("action")
+        expected_phase = (
+            lifecycle.PHASE_ENTER_SMALL
+            if action == lifecycle.ACTION_ENTER_SMALL
+            else lifecycle.PHASE_EXIT_PENDING
+        )
+        if action not in {lifecycle.ACTION_ENTER_SMALL, lifecycle.ACTION_EXIT} \
+                or token.get("phase") != expected_phase:
+            continue
+        ignition_utc = token.get("ignition_utc") \
+            or ignition_by_symbol.get(symbol)
         if ignition_utc is None:
             continue
-        job_id = deterministic_job_id(symbol, ignition_utc)
+        ignition_by_symbol[symbol] = ignition_utc
+        op = JOB_OPEN_OP if action == lifecycle.ACTION_ENTER_SMALL else JOB_EXIT_OP
+        job_id = deterministic_job_id(symbol, ignition_utc, op)
         if job_id in issued:
             continue
         decision = {
-            "action": lifecycle.ACTION_ENTER_SMALL,
+            "action": action,
             "phase": token["phase"],
-            "reason": "configured persistence satisfied",
+            "reason": (
+                "configured persistence satisfied"
+                if action == lifecycle.ACTION_ENTER_SMALL
+                else str(receipt.get("exit_reason") or "strategy exit")
+            ),
             "receipt_id": receipt_id,
             "add_checks": None,
             "deterioration_checks": None,
         }
-        decision_utc = receipt_times.get(receipt_id)
-        if decision_utc is None:
+        decision_utc = receipt.get("ts")
+        if not isinstance(decision_utc, str):
             decision_utc = now_fn()
         row = _decision_row(
             decision,
@@ -447,6 +775,7 @@ def _recover_unlogged_entries(
         prior_rows.append(row)
         payload = row["job"]
         if payload is not None:
+            lifecycle.bind_job_id(state, symbol, action, payload["job_id"])
             issued.add(payload["job_id"])
             if job_writer(jobs_dir, payload):
                 recovered.append(payload["job_id"])
@@ -456,6 +785,8 @@ def _recover_unlogged_entries(
 def _state_snapshot(token: Mapping[str, Any]) -> Dict[str, Any]:
     names = (
         "phase",
+        "position_status",
+        "ignition_utc",
         "candidate",
         "persistence_count",
         "qty",
@@ -465,6 +796,11 @@ def _state_snapshot(token: Mapping[str, Any]) -> Dict[str, Any]:
         "adding_open",
         "peak_price",
         "trail_stop_price",
+        "avg_entry_price",
+        "entry_price",
+        "open_job_id",
+        "exit_job_id",
+        "fill_result_id",
         "last_stream_utc",
     )
     return {name: token.get(name) for name in names}
@@ -524,14 +860,29 @@ def _signal_evidence(
     }
 
 
-def _entry_eligibility(
+def _job_eligibility(
     decision: Mapping[str, Any],
     token: Mapping[str, Any],
     record: Optional[lifecycle.StreamRecord],
     max_job_notional: Decimal,
 ) -> Tuple[bool, str, Optional[Decimal]]:
-    if decision.get("action") != lifecycle.ACTION_ENTER_SMALL:
-        return False, "lifecycle action is not ENTER_SMALL", None
+    action = decision.get("action")
+    if action == lifecycle.ACTION_EXIT:
+        if RUNNER_SYMBOL_RE.fullmatch(str(token.get("symbol", ""))) is None:
+            return False, "symbol does not fit the runner schema", None
+        qty = _decimal(token.get("qty"), "position qty")
+        if qty <= 0 or token.get("phase") != lifecycle.PHASE_EXIT_PENDING:
+            return False, "no standing position is pending EXIT", None
+        requested = _decimal(
+            token.get("paper_notional_requested"), "paper_notional_requested"
+        )
+        if requested <= 0:
+            requested = max_job_notional
+        return True, "standing position requires runner EXIT", min(
+            requested, max_job_notional, HARD_MAX_NOTIONAL
+        )
+    if action != lifecycle.ACTION_ENTER_SMALL:
+        return False, "lifecycle action has no runner job", None
     if record is None or record.venues not in {"perp", "both"}:
         return False, "token has no perpetual venue", None
     if record.perp_bid is None or record.perp_ask is None:
@@ -573,17 +924,22 @@ def _decision_row(
     job_ttl: timedelta,
 ) -> Dict[str, Any]:
     evidence = _signal_evidence(record)
-    eligible, job_reason, requested = _entry_eligibility(
+    eligible, job_reason, requested = _job_eligibility(
         decision, token, record, max_job_notional
     )
     job: Optional[Dict[str, Any]] = None
     if eligible:
         if ignition_utc is None:
-            raise MomentumLiveError("ENTER decision has no proven ignition timestamp")
+            raise MomentumLiveError("job decision has no proven ignition timestamp")
+        op = (
+            JOB_OPEN_OP
+            if decision.get("action") == lifecycle.ACTION_ENTER_SMALL
+            else JOB_EXIT_OP
+        )
         created = _parse_utc(decision_utc, "decision_utc")
         job = {
-            "job_id": deterministic_job_id(token["symbol"], ignition_utc),
-            "op": JOB_OP,
+            "job_id": deterministic_job_id(token["symbol"], ignition_utc, op),
+            "op": op,
             "symbol": token["symbol"],
             "max_notional": lifecycle.fmt(requested),
             "created_utc": _utc_text(created),
@@ -652,6 +1008,8 @@ def run_tick(
     receipt_path: Path = lifecycle.DEFAULT_RECEIPT_PATH,
     decisions_path: Path = DEFAULT_DECISIONS_PATH,
     jobs_dir: Optional[Path] = None,
+    position_path: Optional[Path] = None,
+    results_path: Optional[Path] = None,
     config: Optional[lifecycle.LifecycleConfig] = None,
     now_fn: Callable[[], str] = lifecycle.utc_now,
     max_job_notional: Decimal = HARD_MAX_NOTIONAL,
@@ -661,7 +1019,7 @@ def run_tick(
         Callable[[Path, Mapping[str, Any]], bool]
     ] = None,
 ) -> TickResult:
-    """Process one frozen stream snapshot and publish eligible ENTER jobs."""
+    """Process one snapshot, reconcile runner truth, and publish job intents."""
     maximum = _validate_runtime_config(
         max_job_notional, requested_by, job_ttl
     )
@@ -671,6 +1029,16 @@ def run_tick(
     replayed = lifecycle.reconcile_receipts(state, Path(receipt_path))
     prior_rows = _read_decisions(Path(decisions_path))
     resolved_jobs_dir = Path(jobs_dir) if jobs_dir is not None else default_jobs_dir()
+    resolved_position_path = (
+        Path(position_path)
+        if position_path is not None
+        else default_position_path(resolved_jobs_dir)
+    )
+    resolved_results_path = (
+        Path(results_path)
+        if results_path is not None
+        else default_results_path(resolved_jobs_dir)
+    )
     resolved_job_writer = job_writer or write_job_record
 
     ignition_by_symbol = _ignitions(prior_rows)
@@ -693,6 +1061,13 @@ def run_tick(
             resolved_job_writer,
         )
     )
+    _bind_ledger_jobs(state, prior_rows)
+    reconcile_runner_truth(
+        state,
+        read_runner_position(resolved_position_path),
+        read_results_ledger(resolved_results_path),
+        resolved_config,
+    )
     written: List[str] = []
     rows: List[Dict[str, Any]] = []
 
@@ -707,16 +1082,9 @@ def run_tick(
                 state, record, resolved_config, Path(receipt_path), now_fn
             )
         token = state.tokens[symbol]
-        if decision.get("reason") == "ignition edge observed; persistence started" \
-                and record is not None:
-            ignition_by_symbol[symbol] = record.utc
-        ignition_utc = ignition_by_symbol.get(symbol)
-        if decision.get("action") == lifecycle.ACTION_ENTER_SMALL \
-                and ignition_utc is None:
-            entry = token.get("entry_structure")
-            if isinstance(entry, dict) and isinstance(entry.get("utc"), str):
-                ignition_utc = entry["utc"]
-                ignition_by_symbol[symbol] = ignition_utc
+        ignition_utc = token.get("ignition_utc") or ignition_by_symbol.get(symbol)
+        if isinstance(ignition_utc, str):
+            ignition_by_symbol[symbol] = ignition_utc
 
         decision_utc = now_fn()
         row = _decision_row(
@@ -729,15 +1097,21 @@ def run_tick(
             requested_by,
             job_ttl,
         )
+        job = row["job"]
+        if job is not None:
+            lifecycle.bind_job_id(
+                state, symbol, str(decision.get("action")), job["job_id"]
+            )
+            row["lifecycle_state"] = _state_snapshot(token)
         append_decision(Path(decisions_path), row)
         rows.append(row)
-        job = row["job"]
         if job is not None and resolved_job_writer(resolved_jobs_dir, job):
             written.append(job["job_id"])
 
         snapshot = row["lifecycle_state"]
-        if decision.get("action") == lifecycle.ACTION_EXIT \
-                or (snapshot.get("qty") == "0" and snapshot.get("candidate") is False):
+        if snapshot.get("position_status") == "FLAT" \
+                and snapshot.get("phase") == lifecycle.PHASE_WATCH \
+                and snapshot.get("ignition_utc") is None:
             ignition_by_symbol.pop(symbol, None)
 
     lifecycle.save_state(Path(state_path), state, now_fn)
@@ -762,10 +1136,12 @@ def _positive_seconds(raw: str) -> timedelta:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = lifecycle.build_parser()
-    parser.description = "route momentum lifecycle ENTER decisions to runner jobs"
+    parser.description = "route momentum OPEN/HOLD/EXIT decisions to runner jobs"
     parser.set_defaults(initial_notional=HARD_MAX_NOTIONAL)
     parser.add_argument("--decisions", type=Path, default=DEFAULT_DECISIONS_PATH)
     parser.add_argument("--jobs-dir", type=Path, default=None)
+    parser.add_argument("--position", type=Path, default=None)
+    parser.add_argument("--results", type=Path, default=None)
     parser.add_argument(
         "--max-job-notional",
         type=lifecycle._decimal_argument,
@@ -787,6 +1163,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             receipt_path=args.receipts,
             decisions_path=args.decisions,
             jobs_dir=args.jobs_dir,
+            position_path=args.position,
+            results_path=args.results,
             config=lifecycle._config_from_args(args),
             max_job_notional=args.max_job_notional,
             requested_by=args.requested_by,

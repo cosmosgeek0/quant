@@ -1,6 +1,7 @@
 """Loopback HTTP evidence for ui/serve.py's read-only runtime truth view."""
 
 import http.client
+import io
 import json
 import os
 import sys
@@ -9,6 +10,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -156,7 +158,8 @@ class TestStaticServing(ServerHarness):
                                       b"History &mdash; recorded spot runs")),
                 ("/index.html", "text/html",
                  (b'id="refresh-runtime"', b'id="health"', b'id="decisions"',
-                  b'id="failures"', b"momentum paper positions")),
+                  b'id="failures"', b'id="momentum-position"',
+                  b'id="momentum-realized"', b"realized ledger")),
                 ("/app.js", "text/javascript",
                  (b'"/api/health"', b'"/api/decisions"', b'"/api/failures"',
                   b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"')),
@@ -371,46 +374,82 @@ class TestPositionEndpoint(ServerHarness):
 
 class TestMomentumEndpoint(ServerHarness):
 
-    def test_paper_positions_and_recent_receipts_are_real_file_rows(self):
+    def test_open_position_receipts_and_runner_ledgers_are_file_rows(self):
         root = self.tempdir()
-        state_path = root / "momentum-paper-state.json"
+        state_path = root / "momentum-position.json"
         state = {
-            "version": 1,
-            "paper": True,
+            "version": 1, "revision": 3,
             "updated_utc": "2026-08-13T10:02:00.000Z",
-            "positions": {
-                "APRUSDT": {
-                    "paper": True, "phase": "HOLDING",
-                    "qty": "110.00000000", "entry_price": "0.04510",
-                    "peak_price": "0.04620", "adds": 1,
-                }
+            "state": "OPEN", "symbol": "APRUSDT", "job_id": "open1",
+            "pending_intent": None, "measured_qty": "110.00000000",
+            "entry": {
+                "qty": "110.00000000", "price": "0.04510",
+                "quote": "4.961", "fees": [],
             },
         }
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        receipts_path = root / "momentum-paper-receipts.jsonl"
+        receipts_path = root / "momentum_paper_receipts.jsonl"
         receipts = [
-            {"ts": "2026-08-13T10:01:10.000Z", "kind": "paper_entry",
-             "paper": True, "symbol": "APRUSDT", "qty": "55.00000000",
+            {"ts": "2026-08-13T10:01:10.000Z",
+             "kind": "momentum_open_decision", "runner_truth": True,
+             "decision_only": True, "symbol": "APRUSDT",
+             "qty": "55.00000000",
              "price": "0.04510"},
-            {"ts": "2026-08-13T10:01:40.000Z", "kind": "paper_add",
-             "paper": True, "symbol": "APRUSDT", "qty": "55.00000000",
+            {"ts": "2026-08-13T10:01:40.000Z",
+             "kind": "momentum_add_decision", "runner_truth": True,
+             "decision_only": True, "symbol": "APRUSDT",
+             "qty": "55.00000000",
              "price": "0.04550", "surge_ratio": "6.20"},
         ]
         receipts_path.write_text(
             "\n".join(json.dumps(row) for row in receipts) + "\nnot json\n",
             encoding="utf-8")
+        results_path = root / "results.jsonl"
+        opened = {
+            "job_id": "momentum-open1", "op": "MOMENTUM_OPEN",
+            "symbol": "APRUSDT", "verdict": "OPEN", "exit_code": 0,
+            "receipt_path": "/receipts/job-momentum-open1.json",
+            "utc": "2026-08-13T10:02:05.000Z",
+            "fills": [{"side": "BUY", "qty": "110.00000000"}],
+            "fees": [],
+            "realized": {"gross_usdt": "UNKNOWN", "net_usdt": "UNKNOWN"},
+        }
+        closed = {
+            "job_id": "momentum-exit1", "op": "MOMENTUM_EXIT",
+            "symbol": "APRUSDT", "verdict": "CLOSED", "exit_code": 0,
+            "receipt_path": "/receipts/job-momentum-exit1.json",
+            "utc": "2026-08-13T10:02:10.000Z",
+            "fills": [{"side": "SELL", "qty": "110.00000000"}],
+            "fees": [{"asset": "USDT", "amount": "0.001"}],
+            "realized": {"gross_usdt": "0.120", "net_usdt": "0.119"},
+        }
+        results_path.write_text(
+            json.dumps({
+                "job_id": "basis1", "op": "BASIS_ROUNDTRIP",
+                "symbol": "BTCUSDT", "verdict": "CLOSED",
+                "utc": "2026-08-13T10:02:01.000Z",
+            }) + "\n" + json.dumps(opened) + "\n" + json.dumps(closed) +
+            "\n" + json.dumps({
+                "job_id": "momentum-bad", "op": "MOMENTUM_OPEN",
+                "symbol": "ETHUSDT", "verdict": "UNKNOWN",
+                "utc": "2026-08-13T10:02:15.000Z",
+            }) + "\n[]\n{torn\n", encoding="utf-8")
         sources = self.empty_sources(root / "missing")
         sources.update({"momentum_state": state_path,
-                        "momentum_receipts": receipts_path})
+                        "momentum_receipts": receipts_path,
+                        "job_results": results_path})
         payload = self.get_json(self.start(sources), "/api/momentum")
         self.assertTrue(payload["present"])
         self.assertEqual(payload["state"]["state"], state)
         self.assertEqual(
-            payload["state"]["positions"]["APRUSDT"]["phase"], "HOLDING")
+            payload["state"]["positions"]["APRUSDT"]["state"], "OPEN")
         self.assertEqual(payload["receipts"]["count"], 2)
         self.assertEqual(payload["receipts"]["records"], receipts)
         self.assertEqual(payload["receipts"]["parse_errors"], 1)
-        self.assertEqual(payload["as_of"], state["updated_utc"])
+        self.assertEqual(payload["realized"]["records"], [opened, closed])
+        self.assertEqual(payload["realized"]["count"], 2)
+        self.assertEqual(payload["realized"]["parse_errors"], 3)
+        self.assertEqual(payload["as_of"], closed["utc"])
 
     def test_absent_momentum_sources_are_honest_empty(self):
         root = self.tempdir()
@@ -421,6 +460,8 @@ class TestMomentumEndpoint(ServerHarness):
         self.assertEqual(payload["state"]["positions"], {})
         self.assertFalse(payload["receipts"]["present"])
         self.assertEqual(payload["receipts"]["records"], [])
+        self.assertFalse(payload["realized"]["present"])
+        self.assertEqual(payload["realized"]["records"], [])
         self.assertIsNone(payload["as_of"])
 
 
@@ -781,9 +822,73 @@ class TestReadOnlyGuarantees(ServerHarness):
                          "GETs must never create a runtime source")
 
 
+class TestHostCheck(unittest.TestCase):
+
+    def test_rows_report_file_directory_absence_and_measured_age(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            present_file = root / "state.json"
+            present_file.write_text("{}\n", encoding="utf-8")
+            stamp = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+            os.utime(present_file, (stamp.timestamp(), stamp.timestamp()))
+            directory = root / "jobs"
+            directory.mkdir()
+            rows = serve.host_check_rows({
+                "present_file": present_file,
+                "directory": directory,
+                "missing": root / "missing.json",
+            }, now=stamp + timedelta(seconds=12.345))
+        by_source = {row["source"]: row for row in rows}
+        self.assertEqual(by_source["present_file"]["status"], "present")
+        self.assertEqual(by_source["present_file"]["kind"], "file")
+        self.assertEqual(by_source["present_file"]["age_seconds"], 12.345)
+        self.assertEqual(by_source["present_file"]["modified_utc"],
+                         "2026-08-14T10:00:00.000Z")
+        self.assertEqual(by_source["present_file"]["checked_utc"],
+                         "2026-08-14T10:00:12.345Z")
+        self.assertTrue(by_source["directory"]["exists"])
+        self.assertEqual(by_source["directory"]["kind"], "directory")
+        self.assertFalse(by_source["missing"]["exists"])
+        self.assertIsNone(by_source["missing"]["age_seconds"])
+
+    def test_host_check_flag_prints_jsonl_and_does_not_bind(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "stream_state.json"
+            path.write_text("{}\n", encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.object(
+                    serve, "default_sources",
+                    return_value={"stream_state": Path(temporary) / "missing"}), \
+                    mock.patch.object(serve, "make_server") as make_server, \
+                    redirect_stdout(output):
+                code = serve.main([
+                    "--host-check", "--stream-state", str(path)])
+        self.assertEqual(code, 0)
+        make_server.assert_not_called()
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        row = next(item for item in rows
+                   if item["source"] == "stream_state")
+        self.assertEqual(row["source"], "stream_state")
+        self.assertEqual(row["path"], str(path))
+        self.assertTrue(row["exists"])
+        self.assertEqual(row["kind"], "file")
+        self.assertIsInstance(row["age_seconds"], float)
+        self.assertEqual({
+            item["source"] for item in rows
+            if item["source"] in {
+                "stream_windows", "basis_watch_state",
+                "momentum_lifecycle_state",
+            }}, {
+                "stream_windows", "basis_watch_state",
+                "momentum_lifecycle_state",
+            })
+
+
 class TestDefaultSources(unittest.TestCase):
 
-    def test_defaults_use_receipt_dir_path_conventions_only(self):
+    def test_defaults_use_shared_runtime_path_contract(self):
+        self.assertEqual(serve.resolve_runtime_paths.__module__,
+                         "src.runtime_paths")
         old = os.environ.get("RECEIPT_DIR")
         old_jobs_log = os.environ.get("JOBS_LOG")
         try:
@@ -791,6 +896,18 @@ class TestDefaultSources(unittest.TestCase):
             os.environ.pop("JOBS_LOG", None)
             sources = serve.default_sources()
             receipt_dir = Path("/tmp-example/quant-receipts")
+            runtime = serve.resolve_runtime_paths()
+            self.assertEqual(sources["stream_state"], runtime.stream_state)
+            self.assertEqual(sources["stream_log"], runtime.stream_log)
+            self.assertEqual(sources["proposals_dir"], runtime.proposals_dir)
+            self.assertEqual(sources["momentum_state"],
+                             runtime.momentum_position)
+            self.assertEqual(sources["momentum_receipts"],
+                             runtime.momentum_receipts)
+            self.assertEqual(sources["health"], runtime.health)
+            self.assertEqual(sources["momentum_decisions"],
+                             runtime.decisions)
+            self.assertEqual(sources["job_results"], runtime.job_results)
             self.assertEqual(sources["stream_state"],
                              receipt_dir / "stream_state.json")
             self.assertEqual(sources["stream_log"],
@@ -803,7 +920,7 @@ class TestDefaultSources(unittest.TestCase):
             self.assertEqual(sources["fees"],
                              receipt_dir / "commission-rates.json")
             self.assertEqual(sources["momentum_state"],
-                             receipt_dir / "momentum-paper-state.json")
+                             receipt_dir / "momentum-position.json")
             self.assertEqual(sources["momentum_receipts"],
                              receipt_dir / "momentum-paper-receipts.jsonl")
             self.assertEqual(sources["health"],
@@ -814,7 +931,7 @@ class TestDefaultSources(unittest.TestCase):
             self.assertEqual(sources["stop_jobs"],
                              receipt_dir / "STOP-JOBS")
             self.assertEqual(sources["momentum_decisions"],
-                             UI_DIR.parent / "decisions.jsonl")
+                             receipt_dir / "decisions.jsonl")
             self.assertEqual(sources["job_results"],
                              receipt_dir / "jobs" / "results.jsonl")
             self.assertEqual(sources["job_receipts_dir"],

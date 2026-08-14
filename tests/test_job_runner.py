@@ -8,7 +8,9 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
@@ -60,6 +62,11 @@ class JobRunnerTests(unittest.TestCase):
         self.hand_verdict = "CLOSED"
         self.hand_exit = 0
         self.leverage = LeverageTransport(self.events)
+        self.momentum_intents = []
+        self.momentum_plan_caps = []
+        self.momentum_measurements = []
+        self.momentum_query_state = "terminal"
+        self.open_quote_override = None
 
         env = mock.patch.dict(os.environ, {
             "RECEIPT_DIR": self.receipt_dir,
@@ -158,6 +165,93 @@ class JobRunnerTests(unittest.TestCase):
     def reason(self, row):
         with open(row["receipt_path"], encoding="utf-8") as handle:
             return json.load(handle)["reason"]
+
+    def momentum_markers(self):
+        Path(os.path.join(
+            self.jobs_dir, "futures_proof_passed"
+        )).touch()
+        Path(os.path.join(
+            self.jobs_dir, "basis_proof_passed"
+        )).touch()
+
+    def fake_momentum_plan(self, effective):
+        self.momentum_plan_caps.append(effective)
+        return {
+            "quantity": effective / Decimal("200"),
+            "limit_price": Decimal("200"),
+            "current_leverage": 1,
+        }
+
+    def fake_momentum_measure(self, symbol):
+        self.assertEqual(symbol, "TSTUSDT")
+        if not self.momentum_measurements:
+            raise AssertionError("unexpected momentum position measurement")
+        quantity = Decimal(self.momentum_measurements.pop(0))
+        return {"qty": quantity, "open_orders": 0, "leverage": 1}
+
+    def fake_momentum_submit(self, intent):
+        self.momentum_intents.append(dict(intent))
+        if self.momentum_query_state != "terminal":
+            return self.momentum_query_state, None, [], "unclear"
+        close = str(intent["reduceOnly"]).lower() == "true"
+        quantity = Decimal(intent["quantity"])
+        price = Decimal("205") if close else Decimal("200")
+        quote = quantity * price
+        if not close and self.open_quote_override is not None:
+            quote = Decimal(self.open_quote_override)
+        order_id = "2202" if close else "1101"
+        commission = Decimal("0.002") if close else Decimal("0.003")
+        realized = Decimal("0.25") if close else Decimal("0")
+        order = {
+            "status": "FILLED",
+            "clientOrderId": intent["newClientOrderId"],
+            "orderId": order_id,
+            "executedQty": str(quantity),
+            "cumQuote": str(quote),
+            "avgPrice": str(price),
+            "reduceOnly": close,
+        }
+        fills = [{
+            "id": "92" if close else "91",
+            "orderId": order_id,
+            "qty": str(quantity),
+            "price": str(price),
+            "commission": str(commission),
+            "commissionAsset": "USDT",
+            "realizedPnl": str(realized),
+        }]
+        return "terminal", order, fills, "ok"
+
+    @contextmanager
+    def momentum_runtime(self):
+        with mock.patch.object(
+                jr, "_momentum_open_plan",
+                side_effect=self.fake_momentum_plan), \
+                mock.patch.object(
+                    jr, "_momentum_measure",
+                    side_effect=self.fake_momentum_measure), \
+                mock.patch.object(
+                    jr, "_momentum_submit",
+                    side_effect=self.fake_momentum_submit):
+            yield
+
+    def momentum_state(self):
+        with open(os.path.join(
+                self.receipt_dir, "momentum-position.json"
+        ), encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def open_momentum(self, job_id="open", max_notional=6):
+        self.momentum_markers()
+        effective = min(Decimal(str(max_notional)), Decimal("8"))
+        self.momentum_measurements = [str(effective / Decimal("200"))]
+        self.job(
+            job_id, op="MOMENTUM_OPEN", max_notional=max_notional
+        )
+        with self.momentum_runtime():
+            code = self.tick()
+        self.assertEqual(code, 0)
+        return effective / Decimal("200")
 
     def test_unknown_field_is_recorded_and_never_executed(self):
         self.job("unknown", extra="not allowed")
@@ -386,6 +480,206 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(len(self.hand_calls), 1)
         self.assertEqual(
             [row["job_id"] for row in self.results()], ["momentum-a"]
+        )
+
+    def test_momentum_open_is_capped_atomic_and_records_exchange_fill(self):
+        quantity = self.open_momentum("position-open", max_notional=800)
+
+        self.assertEqual(self.momentum_plan_caps, [Decimal("8")])
+        self.assertEqual(quantity, Decimal("0.04"))
+        self.assertEqual(len(self.momentum_intents), 1)
+        intent = self.momentum_intents[0]
+        self.assertEqual(intent["side"], "BUY")
+        self.assertEqual(intent["reduceOnly"], "false")
+        self.assertEqual(intent["quantity"], "0.04")
+
+        state = self.momentum_state()
+        self.assertEqual(state["state"], "OPEN")
+        self.assertEqual(state["measured_qty"], "0.04")
+        self.assertEqual(state["entry"]["qty"], "0.04")
+        self.assertEqual(state["entry"]["price"], "200")
+        self.assertEqual(state["entry"]["order_id"], "1101")
+        self.assertEqual(
+            state["entry"]["client_id"], intent["newClientOrderId"]
+        )
+        self.assertEqual(state["entry"]["fills"][0]["commission"], "0.003")
+        self.assertEqual(list(Path(self.receipt_dir).glob(
+            "momentum-position.json.tmp-*"
+        )), [])
+
+        row = self.results()[0]
+        self.assertEqual(row["verdict"], "OPEN")
+        self.assertEqual(row["fills"][0]["qty"], "0.04")
+        self.assertEqual(row["fees"][0]["commission_asset"], "USDT")
+        self.assertEqual(row["realized"]["net_usdt"], "UNKNOWN")
+
+    def test_momentum_open_and_roundtrip_refuse_while_position_stands(self):
+        self.open_momentum("first-open")
+        before_intents = len(self.momentum_intents)
+        before_leverage = len(self.leverage.calls)
+        self.job("second-open", op="MOMENTUM_OPEN")
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 2)
+        self.assertEqual(len(self.momentum_intents), before_intents)
+        self.assertEqual(len(self.leverage.calls), before_leverage)
+        self.assertEqual(
+            self.reason(self.results()[-1]),
+            "MOMENTUM_POSITION_ALREADY_STANDS",
+        )
+
+        self.job("standing-roundtrip", op="MOMENTUM_ROUNDTRIP")
+        self.assertEqual(self.tick(), 2)
+        self.assertEqual(self.hand_calls, [])
+        self.assertEqual(
+            self.reason(self.results()[-1]),
+            "MOMENTUM_POSITION_ALREADY_STANDS",
+        )
+
+    def test_momentum_exit_refuses_when_none_without_exchange_action(self):
+        self.job("exit-none", op="MOMENTUM_EXIT")
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 2)
+        self.assertEqual(self.momentum_intents, [])
+        self.assertEqual(self.momentum_measurements, [])
+        self.assertEqual(self.leverage.calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]), "NO_MOMENTUM_POSITION"
+        )
+
+    def test_momentum_exit_uses_measured_qty_and_records_realized_fees(self):
+        quantity = self.open_momentum("fee-open")
+        self.job(
+            "fee-exit", op="MOMENTUM_EXIT", max_notional=0.5
+        )
+        self.momentum_measurements = [str(quantity), "0"]
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 0)
+
+        close = self.momentum_intents[-1]
+        self.assertEqual(close["side"], "SELL")
+        self.assertEqual(close["reduceOnly"], "true")
+        self.assertEqual(close["quantity"], "0.03")
+        self.assertNotEqual(close["quantity"], "0.5")
+        state = self.momentum_state()
+        self.assertEqual(state["state"], "CLOSED")
+        self.assertEqual(state["measured_qty"], "0")
+        self.assertTrue(state["exit"]["reduce_only"])
+
+        row = self.results()[-1]
+        self.assertEqual(row["verdict"], "CLOSED")
+        self.assertEqual(row["fills"][0]["realized_pnl"], "0.25")
+        self.assertEqual(row["fees"], [{
+            "trade_id": "92",
+            "order_id": "2202",
+            "commission": "0.002",
+            "commission_asset": "USDT",
+        }])
+        self.assertEqual(row["realized"]["gross_usdt"], "0.25")
+        self.assertEqual(row["realized"]["net_usdt"], "0.245")
+        self.assertEqual(
+            row["realized"]["commission_by_asset"], {"USDT": "0.005"}
+        )
+
+    def test_momentum_exit_refuses_unmeasured_quantity(self):
+        quantity = self.open_momentum("measure-open")
+        before_intents = len(self.momentum_intents)
+        self.job("measure-exit", op="MOMENTUM_EXIT")
+        self.momentum_measurements = [str(quantity / 2)]
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 4)
+
+        self.assertEqual(len(self.momentum_intents), before_intents)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertEqual(
+            self.reason(self.results()[-1]),
+            "MOMENTUM_POSITION_MEASUREMENT_MISMATCH",
+        )
+
+    def test_momentum_exit_does_not_claim_closed_until_measured_flat(self):
+        quantity = self.open_momentum("not-flat-open")
+        self.job("not-flat-exit", op="MOMENTUM_EXIT")
+        self.momentum_measurements = [str(quantity), "0.001"]
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.results()[-1]["verdict"], "OPEN_EXPOSURE")
+        self.assertEqual(
+            self.reason(self.results()[-1]), "MOMENTUM_EXIT_NOT_FLAT"
+        )
+        self.assertEqual(self.momentum_state()["state"], "UNKNOWN")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_unknown_momentum_open_persists_intent_and_freezes(self):
+        self.momentum_markers()
+        self.job("pending-open", op="MOMENTUM_OPEN")
+        self.momentum_query_state = "pending"
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 4)
+
+        state = self.momentum_state()
+        self.assertEqual(state["state"], "UNKNOWN")
+        self.assertEqual(state["pending_intent"]["action"], "OPEN")
+        self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
+        self.job("after-unknown", op="MOMENTUM_OPEN")
+        self.assertEqual(self.tick(), 0)
+        self.assertEqual(len(self.momentum_intents), 1)
+
+    def test_momentum_open_exchange_cap_breach_freezes(self):
+        self.momentum_markers()
+        self.job("cap-breach", op="MOMENTUM_OPEN", max_notional=6)
+        self.open_quote_override = "6.0001"
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 3)
+        self.assertEqual(self.results()[0]["verdict"], "OPEN_EXPOSURE")
+        self.assertEqual(
+            self.reason(self.results()[0]), "MOMENTUM_OPEN_HARD_CAP_BREACH"
+        )
+        self.assertEqual(self.momentum_state()["state"], "UNKNOWN")
+
+    def test_crash_after_intent_before_post_recovers_query_only(self):
+        self.momentum_markers()
+        self.job("crash-open", op="MOMENTUM_OPEN")
+        with mock.patch.object(
+                jr, "_momentum_open_plan",
+                side_effect=self.fake_momentum_plan), \
+                mock.patch.object(
+                    jr, "_momentum_submit",
+                    side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+
+        pending = self.momentum_state()
+        self.assertEqual(pending["state"], "OPENING")
+        client_id = pending["pending_intent"]["client_id"]
+        self.assertEqual(self.results(), [])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+        queried = []
+
+        def query_only(value):
+            queried.append(value)
+            return "not_found", None
+
+        self.momentum_measurements = ["0"]
+        with mock.patch.object(
+                jr, "_momentum_query", side_effect=query_only), \
+                mock.patch.object(
+                    jr, "_momentum_measure",
+                    side_effect=self.fake_momentum_measure), \
+                mock.patch.object(jr, "_momentum_submit") as no_post:
+            self.assertEqual(self.tick(), 2)
+        no_post.assert_not_called()
+        self.assertEqual(queried, [client_id])
+        self.assertEqual(self.momentum_state()["state"], "NONE")
+        self.assertEqual(self.results()[0]["verdict"], "REFUSED")
+        self.assertEqual(
+            self.reason(self.results()[0]), "MOMENTUM_OPEN_NOT_ACCEPTED"
         )
 
     def test_closed_futures_writes_proof_marker(self):

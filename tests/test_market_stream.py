@@ -76,6 +76,22 @@ def klines(volumes, first_close=1_000_000):
     return rows
 
 
+def feed_row(venues, bid, ask, closed=()):
+    row = {
+        "venues": venues,
+        "spot_bid": None,
+        "spot_ask": None,
+        "perp_bid": None,
+        "perp_ask": None,
+        "freshness_ms": "4",
+        "closed_1m": [[str(close_ms), str(volume)] for close_ms, volume in closed],
+    }
+    prefix = "perp" if venues == "perp" else "spot"
+    row[f"{prefix}_bid"] = str(bid)
+    row[f"{prefix}_ask"] = str(ask)
+    return row
+
+
 class FixtureReader:
     """Injected endpoint reader; it has no network implementation."""
 
@@ -149,6 +165,7 @@ class OfflineCase(unittest.TestCase):
         self.state_path = self.root / "stream_state.json"
         self.log_path = self.root / "stream_log.jsonl"
         self.windows_path = self.root / "stream_windows.json"
+        self.feed_path = self.root / "market_feed.json"
 
     def stream(self, reader, **kwargs):
         defaults = {
@@ -174,6 +191,19 @@ class OfflineCase(unittest.TestCase):
             return []
         with open(self.log_path, encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
+
+    def write_feed(self, symbols, written_ms=FIXED_MS):
+        self.feed_path.write_text(
+            json.dumps(
+                {
+                    "version": ms.FEED_STATE_VERSION,
+                    "written_ms": str(written_ms),
+                    "window": 3,
+                    "symbols": symbols,
+                }
+            ),
+            encoding="utf-8",
+        )
 
 
 class SchemaCompletenessTests(OfflineCase):
@@ -280,6 +310,104 @@ class SurgeMathTests(OfflineCase):
             ms.volume_metrics([["1", "0"], ["2", "0"], ["3", "4"]], 3),
             ("4", "0", None),
         )
+
+
+class LiveFeedMergeTests(OfflineCase):
+    def test_fresh_feed_tickers_merge_for_the_complete_rest_universe(self):
+        parsed = ms.argument_parser().parse_args(
+            ["--once", "--feed-state", str(self.feed_path)]
+        )
+        self.assertEqual(parsed.feed_state, self.feed_path)
+        self.write_feed(
+            {
+                "AAAUSDT": feed_row("spot", "10", "11"),
+                "BBBUSDT": feed_row("spot", "20", "21"),
+                "CCCUSDT": feed_row("spot", "30", "31"),
+            }
+        )
+        reader = FixtureReader(
+            spot=[
+                book("AAAUSDT", "1", "2"),
+                book("BBBUSDT", "2", "3"),
+                book("CCCUSDT", "3", "4"),
+            ],
+            kline_batches={"AAAUSDT": [klines(("1", "2", "3"))]},
+        )
+        self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        ).run_once()
+        state = self.read_state()
+        self.assertEqual(
+            [state[symbol]["spot_bid"] for symbol in sorted(state)],
+            ["10", "20", "30"],
+        )
+        kline_symbols = [
+            params["symbol"]
+            for _, path, params in reader.calls
+            if path == ms.SPOT_KLINES_PATH
+        ]
+        self.assertEqual(kline_symbols, ["AAAUSDT"])
+
+    def test_feed_windows_compute_surges_outside_the_focus_set(self):
+        closes = (1_000_000, 1_060_000, 1_120_000)
+        self.write_feed(
+            {
+                "AAAUSDT": feed_row("spot", "10", "11"),
+                "BBBUSDT": feed_row(
+                    "spot", "20", "21", zip(closes, ("10", "20", "90"))
+                ),
+                "CCCUSDT": feed_row(
+                    "spot", "30", "31", zip(closes, ("2", "2", "10"))
+                ),
+            }
+        )
+        reader = FixtureReader(
+            spot=[
+                book("AAAUSDT", "1", "2"),
+                book("BBBUSDT", "2", "3"),
+                book("CCCUSDT", "3", "4"),
+            ],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+        )
+        self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        ).run_once()
+        state = self.read_state()
+        self.assertEqual(state["BBBUSDT"]["surge_ratio"], "4.5")
+        self.assertEqual(state["CCCUSDT"]["surge_ratio"], "5")
+        with open(self.windows_path, encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        self.assertEqual(set(sidecar["symbols"]), {"AAAUSDT", "BBBUSDT", "CCCUSDT"})
+
+    def test_stale_feed_falls_back_without_merging_tickers_or_windows(self):
+        self.write_feed(
+            {
+                "AAAUSDT": feed_row(
+                    "spot",
+                    "99",
+                    "100",
+                    ((1_000_000, "10"), (1_060_000, "20"), (1_120_000, "90")),
+                ),
+                "BBBUSDT": feed_row(
+                    "spot",
+                    "88",
+                    "89",
+                    ((1_000_000, "10"), (1_060_000, "20"), (1_120_000, "90")),
+                ),
+            },
+            written_ms=FIXED_MS - ms.DEFAULT_FEED_MAX_AGE_MS - 1,
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
+            kline_batches={"AAAUSDT": [klines(("1", "2", "3"))]},
+        )
+        self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        ).run_once()
+        state = self.read_state()
+        self.assertEqual(state["AAAUSDT"]["spot_bid"], "1")
+        self.assertEqual(state["BBBUSDT"]["spot_bid"], "3")
+        self.assertIsNone(state["BBBUSDT"]["surge_ratio"])
 
 
 class RotationCoverageTests(OfflineCase):
