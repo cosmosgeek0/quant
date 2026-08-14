@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+AUDITOR READY 2026-08-14 | frozen SHA 51520655951f8ff99baca37bca9bcdbbff607919 | both auditors independent, read-only, git-pinned
+review lane | FINAL VERDICT: READY, zero blockers | all five commander checks PASS | verdict binds to this SHA exactly — any other SHA on the host voids it | flatness verified against the committed file with its own eyes
+standby lane | independent READY | item 5 satisfied by its own read of f2e31f2 | its earlier running-task inference corrected and struck
+flatness | signed GET-only at the frozen release 07:27:48Z: positions 0, open orders 0 both venues | USD-M 10.98664568 | spot USDT 84.31725120 | pre-existing LDUSDT/HYPER untouched per law
+dust ledger reconciled | measured 1.0 TST = 0.9 receipted residue of the REJECTED_BEFORE_ENTRY attempt's one-leg unwind (BUY 695.9 / step-floored SELL 695, receipt 6a7d3b6a) + 0.1 from the CLOSED cycle (568.1 in / 568 out) | ~1.4 cents, recorded not lost
+law | WORD-TIME FLATNESS adopted (2a01d88): fresh signed flat read immediately before any ACCEPT-ONE, every time
+standing | the machine is formally cleared for its first self-chosen trade | sequence on the owner's ACCEPT ONE: flat read -> OPERATOR + ACCEPT-ONE (max 8, 1x) -> one natural entry, HOLD >= 1 tick, strategy/safety exit, reconcile flat, auto-reseal | nothing armed until that word
+
 ACCEPTANCE PHYSICS WAVE 2026-08-14 | 15 codex lanes + 2 Opus attack rounds | 865 tests green (Lead-run, twice) | push gated on attack round 2
 defect | acceptance flow on 7dcfd195 verified defective 4/4 by the Lead's own reads (ticket spent on attempt; inert when armed; reseal strands the position it opened; basis path bypasses every gate at 32/leg) | acceptance BLOCKED on that release
 built | universal ACCEPT-ONE entry ticket both modes, consumed on FILL, atomic rename per job | OPERATOR token on every entry (a rewound seat cannot write money) | seal-on-flat | first-trade clamp 8->32 lifted ONLY by a clean strategy close | basis entries through the same governor+ticket
