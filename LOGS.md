@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+COMMANDER TRACKS LANDED + RAW-EVIDENCE DEPLOY 2026-08-14 | release 7dcfd195645390b6903627d144d2a13cbcb13f88 | 815 tests green (Lead-measured)
+money control | STOP blocks NEW ENTRIES ONLY — exits and reconciliation are sacred and run under both interlocks | save-before-publish crash window closed | account governor: ONE entry lock across basis+momentum, daily budgets (5 entries, 1.00 USDT realized-loss+fees), fail-closed if absent | ACCEPT-ONE mode: exactly one natural entry then auto-seal
+feed/basis | runtime supervises market_feed --serve (pidfile, restart, health) and consumes its state | stream records carry step/min-notional metadata | stream-fed basis proposals sized executable, missing metadata skipped counted
+deploy | 8 files sha-verified (hashes match local, in transcript) | RELEASE updated | manual tick honest under STOP | RAW host transcript committed at evidence/host-transcript-2026-08-14.txt — the commander's evidence gap closed with a transcript, not prose
+standing | remaining moment: the owner's acceptance word places ACCEPT-ONE; then the runner alone opens one natural <=8 trade, holds through ticks, exits by strategy, reconciles flat, auto-seals
+
 LEAD BOOT VERIFY 2026-08-14 | fresh Lead lane first pass | read-only, no mutation anywhere
 local | canonical main 5a583fe == origin, clean, worktrees intact | suite re-run: 789 green in 4.1s (MEASURED)
 host | GET-only SSM read 02:46Z | cron runner 1m + runtime chain 3m | BOTH STOPs PRESENT | supervisor honest IDLE every 3 min | RELEASE byte-matches 26b5a8d2 | no jobs since the three CLOSED proofs

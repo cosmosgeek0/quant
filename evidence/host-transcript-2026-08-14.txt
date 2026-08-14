@@ -1,0 +1,12 @@
+RAW HOST TRANSCRIPT — deploy proof for release 7dcfd195645390b6903627d144d2a13cbcb13f88 (sanitized: no secrets are ever printed by these scripts)
+
+== RELEASE =="; cat $D/RELEASE
+echo "== CRON =="; crontab -l | grep -E 'tick'
+echo "== INTERLOCKS =="; ls /home/ssm-user/quant_receipts/STOP /home/ssm-user/quant_receipts/STOP-JOBS 2>&1
+echo "== MODULE HASHES =="; for F in job_runner momentum_live account_governor market_stream basis_watch runtime_paths; do printf "%s %s\n" "$F" "$(sha256sum $D/src/$F.py | cut -c1-12)"; done
+echo "== SCRIPT HASHES =="; for S in runtime_tick runtime_control job_tick; do printf "%s %s\n" "$S" "$(sha256sum $D/$S.sh | cut -c1-12)"; done
+echo "== MANUAL TICK =="; bash $D/runtime_tick.sh 2>&1 | tail -4; echo "tick exit $?"
+echo "== HEALTH TAIL =="; tail -3 /home/ssm-user/quant_receipts/health.jsonl
+echo "== PROCESSES =="; pgrep -af 'market_feed|basis_|momentum_|job_runner' | grep -v pgrep || echo none
+
+echo 
