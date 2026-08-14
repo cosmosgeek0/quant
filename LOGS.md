@@ -7,6 +7,15 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+ACCEPTANCE FLOW MEASURED DEFECTIVE 2026-08-14 | codex read of release 7dcfd195, load-bearing claims spot-verified by the Lead's own reads | machine confirmed SEALED — nothing can fire
+verdict | NO operator sequence yields the recorded "one natural <=8 entry, hold, strategy exit, auto-seal" — generation and one-shot gating are incompatible (runtime_tick.sh:173-208, job_runner.py:1797-1841)
+sealed path | with both STOPs present, no natural entry can ever be generated (STOP skips fresh stages, STOP-JOBS skips the publisher); ACCEPT-ONE only unlocks ALREADY-published jobs and spends on ATTEMPT, not on fill
+armed path | start ARM clears both seals -> no halt marker -> ACCEPT-ONE inert; entries bounded only by governor (entry lock + 5/day) — NOT one-shot
+stranding | an accepted entry under seals auto-seals in the same tick; the resealed seals then block the momentum ticks that HOLD/EXIT — open position left unmanaged
+bypass | basis_supervisor:590 calls cmd_open directly — no runner, no ACCEPT-ONE, no governor; compiled cap limits.py PER_LEG_CAP_USDT = 32 (Lead-read), not <=8 — recorded "caps bind regardless" is FALSE for this path
+safety now | host verified sealed 03:44Z, no ACCEPT-ONE anywhere | DO NOT arm, DO NOT place ACCEPT-ONE — the acceptance word is BLOCKED until repair lands and redeploys
+next | repair build dispatched: acceptance = one natural FILLED entry, managed HOLD/EXIT under seals, seal-on-flat, basis through the same governor + 8-cap
+
 UI SESSION PREP 2026-08-14 | owner order: prepare only, build NOTHING, show NOTHING until the owner's word
 serve rail | ui/serve.py smoke-passed on 127.0.0.1:8899 then stopped clean | index 200 | 10 live routes: /api/ health decisions failures events stream candidates position momentum fees pnl | absent sources render honest present:false, never fabricated
 show rail | when the owner says go: start serve.py, open http://127.0.0.1:8899 in Chrome (owner's browser or in-app pane) | nothing opened yet

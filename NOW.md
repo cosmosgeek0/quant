@@ -33,8 +33,13 @@
   lock across strategies, daily budgets 5 entries / 1.00 USDT loss+fees,
   fail-closed), ACCEPT-ONE one-shot entry override consumed atomically by
   the runner then resealed, feed supervised into the runtime, executable
-  sizing metadata. Exact acceptance-moment sequence: being pinned from code
-  by a codex read — do not accept until it is on record here.
+  sizing metadata.
+- ACCEPTANCE BLOCKED (measured 2026-08-14, codex read + Lead spot-verify):
+  release 7dcfd195 cannot honor the acceptance word — sealed, no natural
+  entry can generate; armed, ACCEPT-ONE is inert and basis bypasses
+  governor/cap (limits.py = 32/leg). Repair build in flight; the owner's
+  acceptance stays refused until the repaired release is deployed and
+  verified. Full defect rows in LOGS 2026-08-14.
 - Built and green: token stream (TRADING+PERPETUAL universe,
   measured live 132 spot-only / 167 perp-only / 357 both = 656), momentum
   lifecycle (APRUSDT fixture passes), stream-fed basis, six live-truth UI
