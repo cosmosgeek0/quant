@@ -32,8 +32,13 @@ from typing import Dict, List, Optional
 
 from basis_read import BasisReadRow, build_basis_read_row
 
+try:
+    from limits import PER_LEG_CAP_USDT as MAX_CYCLE_QUOTE
+except ImportError:
+    # TODO: remove this fallback after the sibling src/limits.py lane merges.
+    MAX_CYCLE_QUOTE = Decimal("32")
+
 CYCLE_PREFIX = "bc-"          # disjoint from spot (…b/…s) and l2fs- lanes
-MAX_CYCLE_QUOTE = Decimal("10")   # per-leg ceiling, USDT; compiled, not config
 FEE_BUFFER = Decimal("0.002")     # spot base-fee headroom; net must cover qty
 TARGET_LEVERAGE = 1               # owner law caps at 2x; the cycle runs 1x
 QTY_QUANTUM = Decimal("0.00000001")

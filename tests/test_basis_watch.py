@@ -1246,10 +1246,10 @@ class ProposalFileTests(PipelineCase):
     def test_exit_slippage_uses_bid_ask_sides_and_quantity_uses_both_steps(self):
         now = T0 + 2000
         bundle = scenario_bundle(now, rate="0.02")
-        bundle["spot_depth"]["bids"] = [["100", "0.05"], ["99", "1"]]
+        bundle["spot_depth"]["bids"] = [["100", "0.16"], ["99", "3.2"]]
         perp_touch = D(bundle["perp_depth"]["asks"][0][0])
         bundle["perp_depth"]["asks"] = [
-            [str(perp_touch), "0.05"], [str(perp_touch + 1), "1"]]
+            [str(perp_touch), "0.16"], [str(perp_touch + 1), "3.2"]]
         reads = FakeReads(
             [universe_row("TESTUSDT", spot_step="0.003", perp_step="0.002")],
             {"TESTUSDT": bundle})
@@ -1258,9 +1258,10 @@ class ProposalFileTests(PipelineCase):
         with open(self.paths()[0], encoding="utf-8") as handle:
             proposal = json.load(handle)
         expected = _walk_slippage_pct(
-            [(D("100"), D("0.05")), (D("99"), D(1))], D(10)) \
+            [(D("100"), D("0.16")), (D("99"), D("3.2"))], D(32)) \
             + _walk_slippage_pct(
-                [(perp_touch, D("0.05")), (perp_touch + 1, D(1))], D(10))
+                [(perp_touch, D("0.16")),
+                 (perp_touch + 1, D("3.2"))], D(32))
         self.assertClose(D(proposal["exit_slippage_pct"]), expected)
         self.assertEqual(D(proposal["entry_slippage_pct"]), D(0))
         quantity = D(proposal["quantity"])
@@ -1299,14 +1300,14 @@ class ProposalFileTests(PipelineCase):
         direct_reads = FakeReads([
             universe_row(
                 "TESTUSDT", spot_step="0.003", perp_step="0.002",
-                spot_min_notional="9.5", perp_min_notional="9.5",
+                spot_min_notional="30.4", perp_min_notional="30.4",
             )
         ], {"TESTUSDT": scenario_bundle(now, rate="0.01")})
         direct_row = direct.run_pass(direct_reads, now)[0]
 
         record = stream_record(
             "0.78", spot_step="0.003", perp_step="0.002",
-            spot_min_notional="9.5", perp_min_notional="9.5",
+            spot_min_notional="30.4", perp_min_notional="30.4",
         )
         stream_path = os.path.join(self.tmp.name, "stream-enriched.json")
         with open(stream_path, "w", encoding="utf-8") as handle:
@@ -1330,12 +1331,12 @@ class ProposalFileTests(PipelineCase):
         with open(stream_proposal_path, encoding="utf-8") as handle:
             stream_proposal = json.load(handle)
         self.assertEqual(direct_proposal["quantity"], stream_proposal["quantity"])
-        self.assertEqual(D(stream_proposal["quantity"]), D("0.096"))
+        self.assertEqual(D(stream_proposal["quantity"]), D("0.312"))
 
     def test_stream_min_notional_that_cannot_fit_is_skipped(self):
         now = T0 + 2000
         record = stream_record(
-            "0.78", spot_min_notional="10", perp_min_notional="10"
+            "0.78", spot_min_notional="32", perp_min_notional="32"
         )
         path = os.path.join(self.tmp.name, "stream-too-small.json")
         with open(path, "w", encoding="utf-8") as handle:
@@ -1785,6 +1786,7 @@ class ReuseTests(unittest.TestCase):
 
     def test_notional_defaults_to_the_compiled_cap(self):
         self.assertEqual(watch_config()["notional_usd"], basis_scan.CAP_USDT)
+        self.assertEqual(watch_config()["notional_usd"], D("32"))
 
 
 if __name__ == "__main__":

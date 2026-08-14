@@ -69,20 +69,23 @@ class RowTests(unittest.TestCase):
 
     def test_min_valid_notional_is_the_stricter_venue(self):
         rows = build_rows(
-            {"AUSDT": meta(min_notional="5")},
-            {"AUSDT": meta(step="1", min_notional="20")},
-            {"AUSDT": books("5.99", "6.00")},
-            {"AUSDT": books("6.02", "6.03")}, {})
-        self.assertEqual(rows[0]["min_valid_notional"], Decimal("20"))
+            {"AUSDT": meta(min_notional="16")},
+            {"AUSDT": meta(step="1", min_notional="64")},
+            {"AUSDT": books("19.168", "19.20")},
+            {"AUSDT": books("19.264", "19.296")}, {})
+        self.assertEqual(rows[0]["min_valid_notional"], Decimal("64"))
         self.assertFalse(rows[0]["fits_10_cap"])
 
     def test_cap_feasibility_uses_the_coarser_step(self):
-        # price ~6: one whole contract (futures step 1) costs ~6 USDT — fits.
-        self.assertTrue(cap_feasible(Decimal("6.00"), Decimal("6.02"),
+        # price ~19: one contract (futures step 1) fits the 32 USDT cap.
+        self.assertTrue(cap_feasible(Decimal("19.20"), Decimal("19.264"),
                                      meta(step="0.01"), meta(step="1")))
-        # price ~15: one whole contract exceeds the 10 USDT cap — no quantity.
-        self.assertFalse(cap_feasible(Decimal("15.0"), Decimal("15.1"),
+        # price ~48: one whole contract exceeds the cap — no quantity.
+        self.assertFalse(cap_feasible(Decimal("48.0"), Decimal("48.32"),
                                       meta(step="0.01"), meta(step="1")))
+
+    def test_cap_uses_the_shared_limit(self):
+        self.assertEqual(basis_scan.CAP_USDT, Decimal("32"))
 
     def test_module_main_is_the_only_fetch_site(self):
         source = Path(basis_scan.__file__).read_text(encoding="utf-8")

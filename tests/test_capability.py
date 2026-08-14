@@ -23,13 +23,13 @@ if BASE_DIR not in sys.path:
 from tests.test_futures_short import (  # noqa: E402
     BOOK,
     BPS10,
+    CAP,
     CLOSE_FILL,
     FakeTransport,
     MARK,
     OPEN_FILL_UNDER_CAP,
     OfflineCase,
     ShortExecuteTransport,
-    TEN,
     fh,
     symbol_info,
 )
@@ -67,7 +67,7 @@ class PreflightCase(OfflineCase):
                 mock.patch.object(fh, "API_SECRET", "offline-test-secret"), \
                 mock.patch.object(fh, "http", transport), \
                 contextlib.redirect_stdout(out):
-            plan = fh.preflight(TEN, BPS10, "SELL")
+            plan = fh.preflight(CAP, BPS10, "SELL")
         return transport, plan
 
     def run_preflight_expecting(self, exception, overrides=None):
@@ -78,7 +78,7 @@ class PreflightCase(OfflineCase):
                 mock.patch.object(fh, "http", transport), \
                 contextlib.redirect_stdout(out):
             with self.assertRaises(exception) as caught:
-                fh.preflight(TEN, BPS10, "SELL")
+                fh.preflight(CAP, BPS10, "SELL")
         return transport, caught.exception
 
     @staticmethod

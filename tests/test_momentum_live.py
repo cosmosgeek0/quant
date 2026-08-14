@@ -721,7 +721,7 @@ class MomentumLiveTests(unittest.TestCase):
             "results_path": self.results,
             "now_fn": fixed_now,
         }
-        for value in (Decimal("8.01"), Decimal("0"), None, True, 8, "8"):
+        for value in (Decimal("32.01"), Decimal("0"), None, True, 8, "8"):
             with self.subTest(value=value):
                 with self.assertRaises(live.MomentumLiveError):
                     live.run_tick(self.stream, max_job_notional=value, **common)
@@ -729,6 +729,11 @@ class MomentumLiveTests(unittest.TestCase):
             live.run_tick(
                 self.stream, job_ttl=timedelta(minutes=16), **common
             )
+
+    def test_max_job_notional_defaults_to_the_compiled_cap(self):
+        args = live.build_parser().parse_args(["--tick", str(self.stream)])
+        self.assertEqual(args.max_job_notional, Decimal("32"))
+        self.assertEqual(live.HARD_MAX_NOTIONAL, Decimal("32"))
 
 
 if __name__ == "__main__":

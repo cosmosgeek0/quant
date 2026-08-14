@@ -103,8 +103,12 @@ from math import gcd
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+try:
+    from limits import PER_LEG_CAP_USDT
+except ImportError:
+    PER_LEG_CAP_USDT = Decimal("32")
+
 from basis_scan import (
-    CAP_USDT,
     FEE_BUFFER,
     SPOT_BASE,
     USDM_BASE,
@@ -185,8 +189,8 @@ DEFAULTS: Dict[str, Any] = {
     "priority_momentum_weight": Decimal("0.25"),
     "min_quote_volume_24h_usd": Decimal("3000000"),
     # spec REJECTs the old toy suggestedNotionalUsd; the intended notional is
-    # an input, defaulting to this program's real compiled 10 USDT per-leg cap.
-    "notional_usd": CAP_USDT,
+    # an input, defaulting to this program's real compiled per-leg cap.
+    "notional_usd": PER_LEG_CAP_USDT,
     "proposal_ttl_seconds": 120,
     "spot_maker_fee_pct": Decimal("0.1"),
     "spot_taker_fee_pct": Decimal("0.1"),
@@ -1212,7 +1216,7 @@ class StreamStateReads:
                 self._skip(STREAM_SKIP_METADATA)
                 continue
             sized = proposal_quantity(
-                CAP_USDT, spot_ask, perp_bid, spot_step, perp_step,
+                PER_LEG_CAP_USDT, spot_ask, perp_bid, spot_step, perp_step,
                 spot_min, perp_min)
             if sized is None:
                 self._skip(STREAM_SKIP_NOT_EXECUTABLE)
@@ -1913,7 +1917,7 @@ def main(argv: Optional[List[str]] = None, reads: Any = None) -> int:
                         help="cap-fitting best-gap finalist bound")
     parser.add_argument("--notional-usd", default=None,
                         help="intended notional for depth math (default %s)"
-                             % CAP_USDT)
+                             % PER_LEG_CAP_USDT)
     args = parser.parse_args(argv)
     if args.loop is not None and args.loop <= 0:
         parser.error("--loop SECONDS must be > 0")

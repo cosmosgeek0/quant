@@ -347,7 +347,7 @@ class JobRunnerTests(unittest.TestCase):
 
     def open_momentum(self, job_id="open", max_notional=6):
         self.momentum_markers()
-        effective = min(Decimal(str(max_notional)), Decimal("8"))
+        effective = min(Decimal(str(max_notional)), Decimal("32"))
         self.queue_momentum_measurement(effective / Decimal("200"))
         self.job(
             job_id, op="MOMENTUM_OPEN", max_notional=max_notional
@@ -376,15 +376,15 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.hand_calls, [])
         self.assertEqual(self.reason(self.results()[0]), "BAD_OP")
 
-    def test_oversize_notional_is_clamped_to_eight(self):
+    def test_oversize_notional_is_clamped_to_thirty_two(self):
         self.job("clamped", max_notional=800)
         self.assertEqual(self.tick(), 0)
         self.assertEqual(len(self.hand_calls), 1)
         self.assertEqual(self.hand_calls[0]["argv"], [
             "futures_hand.py", "--short", "--execute"
         ])
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["max_notional"], "32")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "32")
         self.assertEqual(self.hand_calls[0]["sha"], SHA)
         self.assertEqual(len(self.leverage.calls), 2)
 
@@ -592,8 +592,8 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.tick(), 0)
         self.assertEqual(len(self.basis_calls), 1)
         self.assertEqual(self.basis_calls[0]["argv"], ["--execute"])
-        self.assertEqual(self.basis_calls[0]["executor_cap"], "8")
-        self.assertEqual(self.basis_calls[0]["cycle_cap"], "8")
+        self.assertEqual(self.basis_calls[0]["executor_cap"], "32")
+        self.assertEqual(self.basis_calls[0]["cycle_cap"], "32")
         self.assertTrue(os.path.isfile(os.path.join(
             self.jobs_dir, "basis_proof_passed"
         )))
@@ -655,8 +655,8 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.hand_calls[0]["argv"], [
             "futures_hand.py", "--execute"
         ])
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["max_notional"], "32")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "32")
         self.assertEqual(self.leverage.calls[1], (
             "POST", "/fapi/v1/leverage",
             {"symbol": "TSTUSDT", "leverage": "1"}, True,
@@ -690,8 +690,8 @@ class JobRunnerTests(unittest.TestCase):
     def test_momentum_open_is_capped_atomic_and_records_exchange_fill(self):
         quantity = self.open_momentum("position-open", max_notional=800)
 
-        self.assertEqual(self.momentum_plan_caps, [Decimal("8")])
-        self.assertEqual(quantity, Decimal("0.04"))
+        self.assertEqual(self.momentum_plan_caps, [Decimal("32")])
+        self.assertEqual(quantity, Decimal("0.16"))
         self.assertEqual(self.momentum_reads.calls, [
             ("GET", "/fapi/v3/positionRisk",
              {"symbol": "TSTUSDT"}, True),
@@ -705,12 +705,12 @@ class JobRunnerTests(unittest.TestCase):
         intent = self.momentum_intents[0]
         self.assertEqual(intent["side"], "BUY")
         self.assertEqual(intent["reduceOnly"], "false")
-        self.assertEqual(intent["quantity"], "0.04")
+        self.assertEqual(intent["quantity"], "0.16")
 
         state = self.momentum_state()
         self.assertEqual(state["state"], "OPEN")
-        self.assertEqual(state["measured_qty"], "0.04")
-        self.assertEqual(state["entry"]["qty"], "0.04")
+        self.assertEqual(state["measured_qty"], "0.16")
+        self.assertEqual(state["entry"]["qty"], "0.16")
         self.assertEqual(state["entry"]["price"], "200")
         self.assertEqual(state["entry"]["order_id"], "1101")
         self.assertEqual(
@@ -723,7 +723,7 @@ class JobRunnerTests(unittest.TestCase):
 
         row = self.results()[0]
         self.assertEqual(row["verdict"], "OPEN")
-        self.assertEqual(row["fills"][0]["qty"], "0.04")
+        self.assertEqual(row["fills"][0]["qty"], "0.16")
         self.assertEqual(row["fees"][0]["commission_asset"], "USDT")
         self.assertEqual(row["realized"]["net_usdt"], "UNKNOWN")
 

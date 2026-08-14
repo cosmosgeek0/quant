@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import basis_cycle
 import basis_executor
 import futures_hand
+import limits
 import set_leverage_1x
 
 
@@ -50,7 +51,6 @@ OPS = {
 ENTRY_OPS = OPS - {"MOMENTUM_EXIT"}
 MOMENTUM_OPS = {"MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT"}
 MOMENTUM_STANDING = {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}
-HARD_MAX_NOTIONAL = Decimal("8")
 MAX_JOB_AGE = timedelta(minutes=15)
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -209,7 +209,7 @@ def _validate_job(raw: Dict[str, Any], filename_id: str,
         op=raw["op"],
         symbol=raw["symbol"],
         requested_max_notional=requested,
-        effective_notional=min(requested, HARD_MAX_NOTIONAL),
+        effective_notional=min(requested, limits.PER_LEG_CAP_USDT),
         created_utc=created,
         expires_utc=expires,
         requested_by=raw["requested_by"],
@@ -1215,7 +1215,7 @@ def _resolve_momentum_open(paths: Dict[str, str],
     planned = _momentum_decimal(
         position.get("planned_qty"), "persisted planned quantity"
     )
-    if cap > HARD_MAX_NOTIONAL or facts["qty"] > planned \
+    if cap > limits.PER_LEG_CAP_USDT or facts["qty"] > planned \
             or facts["quote"] > cap:
         position["observed_order"] = {
             key: _decimal_text(value) if isinstance(value, Decimal) else value

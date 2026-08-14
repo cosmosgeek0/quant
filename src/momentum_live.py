@@ -31,11 +31,17 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import momentum_lifecycle as lifecycle
 
+try:
+    from limits import PER_LEG_CAP_USDT
+except ImportError:
+    PER_LEG_CAP_USDT = Decimal("32")
+
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DECISIONS_PATH = ROOT / "decisions.jsonl"
 DECISIONS_ROTATE_BYTES = 4 * 1024 * 1024
-HARD_MAX_NOTIONAL = Decimal("8")
+HARD_MAX_NOTIONAL = PER_LEG_CAP_USDT
+DEFAULT_INITIAL_NOTIONAL = Decimal("8")
 DEFAULT_JOB_TTL = timedelta(minutes=10)
 MAX_JOB_TTL = timedelta(minutes=15)
 REQUESTED_BY = "momentum_live"
@@ -112,7 +118,7 @@ def default_results_path(jobs_dir: Path) -> Path:
 
 def default_lifecycle_config() -> lifecycle.LifecycleConfig:
     """Use the existing brain with an entry request that fits the runner."""
-    return lifecycle.LifecycleConfig(initial_notional=HARD_MAX_NOTIONAL)
+    return lifecycle.LifecycleConfig(initial_notional=DEFAULT_INITIAL_NOTIONAL)
 
 
 def _decimal(raw: Any, name: str) -> Decimal:
@@ -1129,7 +1135,9 @@ def _validate_runtime_config(
         raise MomentumLiveError("max_job_notional must be a Decimal")
     maximum = _decimal(max_job_notional, "max_job_notional")
     if maximum <= 0 or maximum > HARD_MAX_NOTIONAL:
-        raise MomentumLiveError("max_job_notional must be in (0, 8]")
+        raise MomentumLiveError(
+            f"max_job_notional must be in (0, {HARD_MAX_NOTIONAL}]"
+        )
     if not isinstance(requested_by, str) or not requested_by.strip() \
             or len(requested_by) > 128:
         raise MomentumLiveError("requested_by must be 1-128 visible characters")
@@ -1285,7 +1293,7 @@ def _positive_seconds(raw: str) -> timedelta:
 def build_parser() -> argparse.ArgumentParser:
     parser = lifecycle.build_parser()
     parser.description = "route momentum OPEN/HOLD/EXIT decisions to runner jobs"
-    parser.set_defaults(initial_notional=HARD_MAX_NOTIONAL)
+    parser.set_defaults(initial_notional=DEFAULT_INITIAL_NOTIONAL)
     parser.add_argument("--decisions", type=Path, default=DEFAULT_DECISIONS_PATH)
     parser.add_argument("--jobs-dir", type=Path, default=None)
     parser.add_argument("--position", type=Path, default=None)

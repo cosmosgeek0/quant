@@ -10,7 +10,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from unittest import mock
 
@@ -210,7 +210,13 @@ class BasisSupervisorTests(unittest.TestCase):
             "proposal-%s.json" % proposal_id)
         with open(proposal_path, encoding="utf-8") as handle:
             proposal = json.load(handle)
-        self.assertEqual(Decimal(proposal["quantity"]), Decimal("0.099"))
+        spot_ask = Decimal("100.02")
+        perp_bid = spot_ask * (1 + Decimal("0.78") / 100)
+        expected_qty = min(
+            bw.PER_LEG_CAP_USDT / (1 + bw.FEE_BUFFER) / spot_ask,
+            bw.PER_LEG_CAP_USDT / perp_bid,
+        ).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+        self.assertEqual(Decimal(proposal["quantity"]), expected_qty)
 
         open_spec = happy_spec()
         open_spec["spot_book"] = {

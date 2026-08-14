@@ -4,7 +4,7 @@ Every symbol that trades on BOTH Binance Spot (USDT quote) and USD-M
 perpetuals gets one row: executable entry gap (futures bid minus spot ask),
 executable exit gap (futures ask minus spot bid), funding, the minimum valid
 notional on the stricter venue, and whether a cycle fits under the compiled
-10 USDT per-leg cap. Rows rank by entry gap. Decimal only.
+per-leg cap. Rows rank by entry gap. Decimal only.
 
 Five unsigned public GETs total (two exchangeInfo, two all-symbol book
 tickers, one all-symbol premiumIndex). No credentials, no POST, no account
@@ -21,11 +21,16 @@ import urllib.request
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_EVEN, localcontext
 from typing import Any, Dict, List, Optional
 
+try:
+    from limits import PER_LEG_CAP_USDT
+except ImportError:
+    PER_LEG_CAP_USDT = Decimal("32")
+
 SPOT_BASE = "https://api.binance.com"
 USDM_BASE = "https://fapi.binance.com"
 MAX_BYTES = 8_000_000
 TIMEOUT = 30.0
-CAP_USDT = Decimal("10")
+CAP_USDT = PER_LEG_CAP_USDT
 FEE_BUFFER = Decimal("0.002")   # mirrors basis_cycle: spot fee headroom
 BPS_Q = Decimal("0.0001")
 EST_SPOT_TAKER_BPS = Decimal("10")   # ESTIMATED default, per side
@@ -122,7 +127,7 @@ def funding_map(payload: Any) -> Dict[str, Decimal]:
 def cap_feasible(spot_ask: Decimal, fut_bid: Decimal,
                  spot_meta: Dict[str, Decimal],
                  fut_meta: Dict[str, Decimal]) -> bool:
-    """Could one hedged pair fit under the 10 USDT per-leg cap right now?
+    """Could one hedged pair fit under the compiled per-leg cap right now?
 
     Fee-aware, mirroring basis_cycle: the cap must also cover the spot
     base-fee headroom, or the net acquired floors below one futures lot
@@ -200,15 +205,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     positive = [row for row in rows if row["entry_gap_bps"] > 0]
     qualifying = [row for row in positive if row["fits_10_cap"]]
     print("SCAN | spot USDT symbols %d | USDT perpetuals %d | common with "
-          "books %d | positive entry gap %d | positive AND fits 10 USDT cap "
+          "books %d | positive entry gap %d | positive AND fits %s USDT cap "
           "%d" % (len(spot_meta), len(fut_meta), len(rows), len(positive),
-                  len(qualifying)))
+                  CAP_USDT, len(qualifying)))
     print("SCAN | costs are ESTIMATED defaults: spot taker %s bps + USD-M "
           "taker %s bps per side = %s bps round trip; real account rates "
           "unread" % (EST_SPOT_TAKER_BPS, EST_USDM_TAKER_BPS,
                       EST_ROUNDTRIP_COST_BPS))
     header = ("rank | symbol | entry bps | exit bps | funding bps | "
-              "min notional | fits 10 cap")
+              "min notional | fits %s cap" % CAP_USDT)
     print(header)
     for index, row in enumerate(rows[:max(args.top, 0)], start=1):
         print("%d | %s | %s | %s | %s | %s | %s" % (

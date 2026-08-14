@@ -7,12 +7,14 @@ baseline, not a schema error.
 
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import limits  # noqa: E402
 import wallet  # noqa: E402
 
 
@@ -26,6 +28,15 @@ def client_with(pages):
 
 
 class TransferHistoryShapeTests(unittest.TestCase):
+    def test_transfer_ceiling_uses_per_leg_cap(self):
+        self.assertIs(wallet.TRANSFER_HARD_CEILING, limits.PER_LEG_CAP_USDT)
+        self.assertEqual(wallet.TRANSFER_HARD_CEILING, Decimal("32"))
+        self.assertEqual(
+            wallet.validated_transfer_amount("USDT", "32"), Decimal("32")
+        )
+        with self.assertRaisesRegex(ValueError, "32 USDT transfer ceiling"):
+            wallet.validated_transfer_amount("USDT", "32.00000001")
+
     def test_total_only_empty_window_is_a_valid_empty_baseline(self):
         client = client_with([("ok", {"total": 0})])
         kind, rows = client.transfer_history("MAIN_UMFUTURE", 0, 1)

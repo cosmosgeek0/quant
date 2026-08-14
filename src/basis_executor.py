@@ -377,9 +377,9 @@ def market_context(state: RunState) -> Dict[str, Any]:
     if shared_step <= 0 or spot_step <= 0:
         raise Refusal("shared quantity step is not positive")
     # Worst-case futures price band for a market order: the exchange reserves
-    # margin at roughly notional x the up-multiplier (measured live 2026-08-13:
-    # -2019 at 9.92 notional vs 10.00 available with band 1.15). Missing band
-    # data falls back to a conservative 1.5.
+    # margin at roughly notional x the up-multiplier. Missing band data falls
+    # back to a conservative 1.5; the notional itself comes from the shared
+    # cycle cap through plan_cycle.
     band = usdm_filters.get("PERCENT_PRICE", {})
     band_by_side = usdm_filters.get("PERCENT_PRICE_BY_SIDE", {})
     ups = []

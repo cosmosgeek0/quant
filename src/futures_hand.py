@@ -6,7 +6,7 @@ change leverage or reach ``POST /fapi/v1/order``. Before an order, the executor
 reads the symbol configuration and sets initial leverage to the compiled 1x
 target once when needed, then re-reads it. The default hand is long: the
 opening order is BUY LIMIT IOC so its price and quantity can be bounded by the
-compiled 10 USDT lane ceiling; the closing order is SELL MARKET with
+shared per-leg lane ceiling; the closing order is SELL MARKET with
 ``reduceOnly=true`` for exactly the opened quantity.
 
 ``--short`` runs the mirrored short hand: the opening order is SELL LIMIT IOC,
@@ -46,6 +46,11 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 
 getcontext().prec = 28
 
+try:
+    from limits import PER_LEG_CAP_USDT
+except ImportError:
+    from src.limits import PER_LEG_CAP_USDT
+
 BASE_URL = "https://fapi.binance.com"
 API_KEY = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
@@ -65,7 +70,7 @@ HANDS = {
     "short": {"prefix": SHORT_LANE_PREFIX, "open_side": "SELL",
               "close_side": "BUY"},
 }
-LANE_HARD_CEILING = Decimal("10")  # USDT; never configurable upward
+LANE_HARD_CEILING = PER_LEG_CAP_USDT  # USDT; never configurable upward
 TARGET_LEVERAGE = 1
 MAX_ALLOWED_LEVERAGE = 2  # Owner law: anything above 2x needs a new order.
 CLOSE_PRICE_FLOOR = Decimal("0.99")  # require 1% room above close MIN_NOTIONAL
@@ -754,7 +759,10 @@ def config():
     if not max_notional.is_finite() or max_notional <= 0:
         raise PreflightError("MAX_NOTIONAL must be positive and finite")
     if max_notional > LANE_HARD_CEILING:
-        raise PreflightError("MAX_NOTIONAL exceeds the compiled 10 USDT lane ceiling")
+        raise PreflightError(
+            "MAX_NOTIONAL exceeds the compiled %s USDT lane ceiling"
+            % fmt(LANE_HARD_CEILING)
+        )
     if not slippage_bps.is_finite() or not (0 <= slippage_bps <= 100):
         raise PreflightError("MAX_SLIPPAGE_BPS must be between 0 and 100")
     return max_notional, slippage_bps

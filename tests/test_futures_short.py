@@ -26,7 +26,7 @@ fh = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fh)
 
 SHA40 = "1aa1e018740ae9dc012c1ebc58c4cf81a518df62"
-TEN = Decimal("10")
+CAP = Decimal("32")
 BPS10 = Decimal("10")
 BOOK = {"bidPrice": "99.90", "askPrice": "100.00"}
 MARK = {"markPrice": "99.95"}
@@ -67,7 +67,7 @@ def set_filter(info, filter_type, **values):
 FLAT_EXTRA = {
     "/fapi/v3/positionRisk": ("ok", [{"symbol": "BTCUSDT",
                                       "positionSide": "BOTH",
-                                      "positionAmt": "-0.099"}]),
+                                      "positionAmt": "-0.319"}]),
     "/fapi/v1/openOrders": ("ok", []),
     "/fapi/v1/symbolConfig": ("ok", [{"symbol": "BTCUSDT", "leverage": "1"}]),
 }
@@ -114,7 +114,7 @@ class OfflineCase(unittest.TestCase):
         values = {
             "SYMBOL": "BTCUSDT",
             "QUANT_SHA": SHA40,
-            "MAX_NOTIONAL_RAW": "10",
+            "MAX_NOTIONAL_RAW": "32",
             "MAX_SLIPPAGE_BPS_RAW": "10",
             "API_KEY": "",
             "API_SECRET": "",
@@ -144,76 +144,76 @@ class OfflineCase(unittest.TestCase):
 
     @staticmethod
     def short_plan():
-        return fh.plan_short_open(symbol_info(), BOOK, MARK, TEN, BPS10)
+        return fh.plan_short_open(symbol_info(), BOOK, MARK, CAP, BPS10)
 
 
 class TestShortPlan(OfflineCase):
     def test_short_plan_sizes_worst_case_notional_at_cap(self):
         plan = self.short_plan()
         self.assertEqual(plan["open_side"], "SELL")
-        self.assertEqual(plan["quantity"], Decimal("0.099"))
+        self.assertEqual(plan["quantity"], Decimal("0.319"))
         self.assertEqual(plan["limit_price"], Decimal("99.8"))
-        self.assertEqual(plan["max_fill_notional"], Decimal("9.9099"))
+        self.assertEqual(plan["max_fill_notional"], Decimal("31.9319"))
         self.assertLessEqual(plan["max_fill_notional"], fh.LANE_HARD_CEILING)
         self.assertLessEqual(plan["limit_price"], plan["bid"])
 
     def test_short_plan_refuses_above_hard_ceiling(self):
         with self.assertRaisesRegex(fh.PreflightError, "hard ceiling"):
-            fh.plan_short_open(symbol_info(), BOOK, MARK, Decimal("10.5"),
+            fh.plan_short_open(symbol_info(), BOOK, MARK, Decimal("32.5"),
                                BPS10)
 
     def test_short_plan_refuses_below_min_notional(self):
-        info = set_filter(symbol_info(), "MIN_NOTIONAL", notional="20")
+        info = set_filter(symbol_info(), "MIN_NOTIONAL", notional="40")
         with self.assertRaisesRegex(fh.PreflightError, "MIN_NOTIONAL"):
-            fh.plan_short_open(info, BOOK, MARK, TEN, BPS10)
+            fh.plan_short_open(info, BOOK, MARK, CAP, BPS10)
 
     def test_short_plan_refuses_percent_price_floor(self):
         info = set_filter(symbol_info(), "PERCENT_PRICE",
                           multiplierDown="0.999")
         with self.assertRaisesRegex(fh.PreflightError, "PERCENT_PRICE"):
-            fh.plan_short_open(info, BOOK, MARK, TEN, BPS10)
+            fh.plan_short_open(info, BOOK, MARK, CAP, BPS10)
 
     def test_short_plan_refuses_non_trading_symbol(self):
         with self.assertRaisesRegex(fh.PreflightError, "TRADING"):
-            fh.plan_short_open(symbol_info(status="BREAK"), BOOK, MARK, TEN,
+            fh.plan_short_open(symbol_info(status="BREAK"), BOOK, MARK, CAP,
                                BPS10)
 
     def test_short_plan_refuses_non_perpetual(self):
         info = symbol_info(contractType="CURRENT_QUARTER")
         with self.assertRaisesRegex(fh.PreflightError, "PERPETUAL"):
-            fh.plan_short_open(info, BOOK, MARK, TEN, BPS10)
+            fh.plan_short_open(info, BOOK, MARK, CAP, BPS10)
 
     def test_short_plan_refuses_non_usdt_symbol(self):
         with self.assertRaisesRegex(fh.PreflightError, "USDT"):
             fh.plan_short_open(symbol_info(quoteAsset="USDC"), BOOK, MARK,
-                               TEN, BPS10)
+                               CAP, BPS10)
 
     def test_short_plan_refuses_missing_ioc(self):
         info = symbol_info(timeInForce=["GTC"])
         with self.assertRaisesRegex(fh.PreflightError, "IOC"):
-            fh.plan_short_open(info, BOOK, MARK, TEN, BPS10)
+            fh.plan_short_open(info, BOOK, MARK, CAP, BPS10)
 
     def test_short_plan_refuses_non_positive_bid(self):
         book = {"bidPrice": "0", "askPrice": "100.00"}
         with self.assertRaisesRegex(fh.PreflightError, "non-positive"):
-            fh.plan_short_open(symbol_info(), book, MARK, TEN, BPS10)
+            fh.plan_short_open(symbol_info(), book, MARK, CAP, BPS10)
 
     def test_short_plan_refuses_zero_floored_sell_limit(self):
         book = {"bidPrice": "0.05", "askPrice": "100.00"}
         with self.assertRaisesRegex(fh.PreflightError, "not positive"):
-            fh.plan_short_open(symbol_info(), book, MARK, TEN, BPS10)
+            fh.plan_short_open(symbol_info(), book, MARK, CAP, BPS10)
 
     def test_plan_open_refuses_invalid_side(self):
         with self.assertRaisesRegex(fh.PreflightError, "BUY or SELL"):
-            fh.plan_open(symbol_info(), BOOK, MARK, TEN, BPS10,
+            fh.plan_open(symbol_info(), BOOK, MARK, CAP, BPS10,
                          open_side="HOLD")
 
     def test_long_plan_math_is_unchanged(self):
-        plan = fh.plan_open(symbol_info(), BOOK, MARK, TEN, BPS10)
+        plan = fh.plan_open(symbol_info(), BOOK, MARK, CAP, BPS10)
         self.assertEqual(plan["open_side"], "BUY")
-        self.assertEqual(plan["quantity"], Decimal("0.099"))
+        self.assertEqual(plan["quantity"], Decimal("0.319"))
         self.assertEqual(plan["limit_price"], Decimal("100.1"))
-        self.assertEqual(plan["max_fill_notional"], Decimal("9.9099"))
+        self.assertEqual(plan["max_fill_notional"], Decimal("31.9319"))
 
 
 class TestIntents(OfflineCase):
@@ -224,31 +224,31 @@ class TestIntents(OfflineCase):
         self.assertEqual(params["type"], "LIMIT")
         self.assertEqual(params["timeInForce"], "IOC")
         self.assertEqual(params["reduceOnly"], "false")
-        self.assertEqual(params["quantity"], "0.099")
+        self.assertEqual(params["quantity"], "0.319")
         self.assertEqual(params["price"], "99.80")
         self.assertEqual(params["newClientOrderId"], client_id)
         self.assertTrue(params["newClientOrderId"].startswith("l2fs-"))
 
     def test_reduce_only_buy_close_intent_shape(self):
         client_id = fh.SHORT_LANE_PREFIX + "run1-c"
-        params = fh.short_close_intent(Decimal("0.099"), client_id)
+        params = fh.short_close_intent(Decimal("0.319"), client_id)
         self.assertEqual(params["side"], "BUY")
         self.assertEqual(params["type"], "MARKET")
         self.assertEqual(params["reduceOnly"], "true")
-        self.assertEqual(params["quantity"], "0.099")
+        self.assertEqual(params["quantity"], "0.319")
         self.assertEqual(params["newClientOrderId"], client_id)
         self.assertTrue(params["newClientOrderId"].startswith("l2fs-"))
 
     def test_close_intent_is_reduce_only_for_both_hands(self):
         for side in ("BUY", "SELL"):
-            params = fh.close_intent(side, Decimal("0.099"), "x-c")
+            params = fh.close_intent(side, Decimal("0.319"), "x-c")
             self.assertEqual(params["reduceOnly"], "true")
 
     def test_intents_refuse_invalid_side_or_quantity(self):
         with self.assertRaisesRegex(fh.PreflightError, "BUY or SELL"):
             fh.open_intent("HOLD", self.short_plan(), "x-o")
         with self.assertRaisesRegex(fh.PreflightError, "BUY or SELL"):
-            fh.close_intent("HOLD", Decimal("0.099"), "x-c")
+            fh.close_intent("HOLD", Decimal("0.319"), "x-c")
         with self.assertRaisesRegex(fh.PreflightError, "positive"):
             fh.close_intent("BUY", Decimal("0"), "x-c")
 
@@ -268,14 +268,14 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
             order_results=[
                 ("ok", {"status": "NEW", "clientOrderId": client_id}),
                 ("ok", {"status": "FILLED", "clientOrderId": client_id,
-                        "orderId": 4321, "executedQty": "0.099",
-                        "cumQuote": "9.88"}),
+                        "orderId": 4321, "executedQty": "0.319",
+                        "cumQuote": "31.88"}),
             ],
         )
         with mock.patch.object(fh, "http", transport):
             order = fh.submit_once(
                 "OPEN", fh.short_open_intent(self.short_plan(), client_id),
-                "up to 9.9099 USDT",
+                "up to 31.9319 USDT",
             )
         self.assertEqual(order["status"], "FILLED")
         self.assertEqual(len(transport.posts()), 1)
@@ -301,7 +301,7 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
                 fh.submit_once(
                     "OPEN",
                     fh.short_open_intent(self.short_plan(), client_id),
-                    "up to 9.9099 USDT",
+                    "up to 31.9319 USDT",
                 )
         self.assertEqual(caught.exception.code, 4)
         self.assertEqual(fh.receipt["verdict"], "UNKNOWN")
@@ -323,7 +323,7 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
                 fh.submit_once(
                     "OPEN",
                     fh.short_open_intent(self.short_plan(), client_id),
-                    "up to 9.9099 USDT",
+                    "up to 31.9319 USDT",
                 )
         self.assertEqual(caught.exception.code, 4)
         self.assertEqual(fh.receipt["verdict"], "UNKNOWN")
@@ -346,7 +346,7 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
                 fh.submit_once(
                     "OPEN",
                     fh.short_open_intent(self.short_plan(), client_id),
-                    "up to 9.9099 USDT",
+                    "up to 31.9319 USDT",
                 )
         self.assertEqual(caught.exception.code, 2)
         self.assertEqual(fh.receipt["verdict"], "REJECTED_BEFORE_OPEN")
@@ -369,8 +369,8 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
             with self.assertRaises(SystemExit) as caught:
                 fh.submit_once(
                     "CLOSE",
-                    fh.short_close_intent(Decimal("0.099"), client_id),
-                    "0.099 BTCUSDT",
+                    fh.short_close_intent(Decimal("0.319"), client_id),
+                    "0.319 BTCUSDT",
                 )
         self.assertEqual(caught.exception.code, 3)
         self.assertEqual(fh.receipt["verdict"], "OPEN_EXPOSURE")
@@ -391,7 +391,7 @@ class TestSubmitQueryBeforeRetry(OfflineCase):
                 fh.submit_once(
                     "OPEN",
                     fh.short_open_intent(self.short_plan(), client_id),
-                    "up to 9.9099 USDT",
+                    "up to 31.9319 USDT",
                 )
         self.assertEqual(caught.exception.code, 4)
         self.assertEqual(fh.receipt["verdict"], "UNKNOWN")
@@ -452,11 +452,11 @@ class ShortExecuteTransport:
 
 
 OPEN_FILL_BREACH = {"status": "FILLED", "orderId": 111,
-                    "executedQty": "0.099", "cumQuote": "10.098"}
+                    "executedQty": "0.319", "cumQuote": "32.538"}
 OPEN_FILL_UNDER_CAP = {"status": "FILLED", "orderId": 111,
-                       "executedQty": "0.099", "cumQuote": "9.88"}
-CLOSE_FILL = {"status": "FILLED", "orderId": 222, "executedQty": "0.099",
-              "cumQuote": "10.10", "reduceOnly": True}
+                       "executedQty": "0.319", "cumQuote": "31.88"}
+CLOSE_FILL = {"status": "FILLED", "orderId": 222, "executedQty": "0.319",
+              "cumQuote": "32.10", "reduceOnly": True}
 
 
 class TestShortNotionalBreachContainment(OfflineCase):
@@ -481,7 +481,7 @@ class TestShortNotionalBreachContainment(OfflineCase):
         self.assertEqual(fh.receipt["verdict"], "CEILING_BREACH_CONTAINED")
         self.assertEqual(fh.receipt["first_failure"]["where"], "hard_ceiling")
         self.assertIn("flattened", fh.receipt["verdict_note"])
-        self.assertIn("10.098", fh.receipt["verdict_note"])
+        self.assertIn("32.538", fh.receipt["verdict_note"])
         posts = transport.order_posts()
         self.assertEqual(len(posts), 2)
         open_post, close_post = posts[0][2], posts[1][2]
@@ -490,7 +490,7 @@ class TestShortNotionalBreachContainment(OfflineCase):
         self.assertEqual(close_post["side"], "BUY")
         self.assertEqual(close_post["type"], "MARKET")
         self.assertEqual(close_post["reduceOnly"], "true")
-        self.assertEqual(close_post["quantity"], "0.099")
+        self.assertEqual(close_post["quantity"], "0.319")
         self.assertTrue(close_post["newClientOrderId"].startswith("l2fs-"))
         self.assertIn("VERDICT: CEILING_BREACH_CONTAINED", text)
         self.assertEqual(fh.receipt["final_state"]["position_amount"],
@@ -507,7 +507,7 @@ class TestShortNotionalBreachContainment(OfflineCase):
         self.assertFalse(os.path.exists(fh.LOCK_PATH))
 
     def test_breach_with_partial_close_reports_exposure_not_containment(self):
-        partial_close = dict(CLOSE_FILL, executedQty="0.050")
+        partial_close = dict(CLOSE_FILL, executedQty="0.160")
         transport, text, code = self.run_short_execute(OPEN_FILL_BREACH,
                                                        partial_close)
         self.assertEqual(code, 3)
@@ -518,11 +518,11 @@ class TestShortNotionalBreachContainment(OfflineCase):
 
 class TestConfigRefusals(OfflineCase):
     def test_config_accepts_capped_notional(self):
-        self.assertEqual(fh.config(), (Decimal("10"), Decimal("10")))
+        self.assertEqual(fh.config(), (Decimal("32"), Decimal("10")))
 
     def test_config_refuses_notional_above_ceiling(self):
-        with mock.patch.object(fh, "MAX_NOTIONAL_RAW", "10.01"):
-            with self.assertRaisesRegex(fh.PreflightError, "10 USDT"):
+        with mock.patch.object(fh, "MAX_NOTIONAL_RAW", "32.01"):
+            with self.assertRaisesRegex(fh.PreflightError, "32 USDT"):
                 fh.config()
 
     def test_config_refuses_invalid_symbol(self):

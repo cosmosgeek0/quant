@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import basis_executor  # noqa: E402
+import basis_cycle  # noqa: E402
 import events  # noqa: E402
 from basis_executor import ExecutorConfig  # noqa: E402
 
@@ -27,6 +28,36 @@ SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 RID = "cafe01"
 SPOT_URL = basis_executor.SPOT.base_url
 USDM_URL = basis_executor.USDM.base_url
+
+MAX_CYCLE_QUOTE = basis_cycle.MAX_CYCLE_QUOTE
+SPOT_ASK = Decimal("100.0")
+SPOT_BID = Decimal("99.9")
+USDM_BID = Decimal("100.2")
+SHARED_STEP = Decimal("0.001")
+BASE_FEE_RATE = Decimal("0.001")
+WIRE_QUANTUM = Decimal("0.00000001")
+HAPPY_PLAN_QTY = basis_cycle.quantize_down(
+    min(MAX_CYCLE_QUOTE / (Decimal(1) + basis_cycle.FEE_BUFFER) / SPOT_ASK,
+        MAX_CYCLE_QUOTE / USDM_BID),
+    SHARED_STEP,
+)
+HAPPY_SPOT_QUOTE_CAP = (
+    HAPPY_PLAN_QTY * SPOT_ASK * (Decimal(1) + basis_cycle.FEE_BUFFER)
+).quantize(WIRE_QUANTUM)
+HAPPY_SHORT_NOTIONAL = (HAPPY_PLAN_QTY * USDM_BID).quantize(WIRE_QUANTUM)
+HAPPY_BASE_FEE = HAPPY_PLAN_QTY * BASE_FEE_RATE
+HAPPY_NET_BASE = HAPPY_PLAN_QTY - HAPPY_BASE_FEE
+HAPPY_HEDGE_QTY = basis_cycle.quantize_down(HAPPY_NET_BASE, SHARED_STEP)
+HAPPY_RESIDUAL = HAPPY_NET_BASE - HAPPY_HEDGE_QTY
+HAPPY_BUY_QUOTE = HAPPY_PLAN_QTY * SPOT_ASK
+HAPPY_SHORT_QUOTE = HAPPY_HEDGE_QTY * USDM_BID
+HAPPY_SELL_QUOTE = HAPPY_HEDGE_QTY * SPOT_BID
+HAPPY_SELL_FEE = HAPPY_SELL_QUOTE * BASE_FEE_RATE
+
+
+def wire(value):
+    return format(value.quantize(WIRE_QUANTUM), "f")
+
 
 _real_getaddrinfo = socket.getaddrinfo
 
@@ -62,8 +93,7 @@ MISSING = ("api_error", {"code": -2013, "msg": "Order does not exist."})
 
 
 def happy_spec():
-    """Full-cycle fixture: buy 0.099, fee 0.000099 BTC, hedge 0.098, close and
-    sell it all back; residual 0.000901 stays below the 0.001 shared step."""
+    """Full-cycle fixture sized from the shared cap, including fee headroom."""
     return {
         "spot_info": {"symbols": [{
             "symbol": SYMBOL, "status": "TRADING", "isSpotTradingAllowed": True,
@@ -99,32 +129,37 @@ def happy_spec():
         "legs": {
             "enter_spot": {
                 "submit": ("ok", {"fills": [
-                    {"qty": "0.09900000", "commission": "0.00009900",
+                    {"qty": wire(HAPPY_PLAN_QTY),
+                     "commission": wire(HAPPY_BASE_FEE),
                      "commissionAsset": "BTC"}]}),
-                "query": [term_spot("FILLED", "0.09900000", "9.90000000",
-                                    111222)],
+                "query": [term_spot("FILLED", wire(HAPPY_PLAN_QTY),
+                                    wire(HAPPY_BUY_QUOTE), 111222)],
             },
             "enter_short": {
                 "submit": ("ok", {}),
-                "query": [term_usdm("FILLED", "0.098", "9.81960000", 444555)],
+                "query": [term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
+                                    wire(HAPPY_SHORT_QUOTE), 444555)],
             },
             "exit_short": {
                 "submit": ("ok", {}),
-                "query": [term_usdm("FILLED", "0.098", "9.82000000", 444556)],
+                "query": [term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
+                                    wire(HAPPY_SHORT_QUOTE), 444556)],
             },
             "exit_spot": {
                 "submit": ("ok", {"fills": [
-                    {"qty": "0.09800000", "commission": "0.00979000",
+                    {"qty": wire(HAPPY_HEDGE_QTY),
+                     "commission": wire(HAPPY_SELL_FEE),
                      "commissionAsset": "USDT"}]}),
-                "query": [term_spot("FILLED", "0.09800000", "9.79020000",
-                                    111223)],
+                "query": [term_spot("FILLED", wire(HAPPY_HEDGE_QTY),
+                                    wire(HAPPY_SELL_QUOTE), 111223)],
             },
             "unwind_spot": {
                 "submit": ("ok", {"fills": [
-                    {"qty": "0.09800000", "commission": "0.00979000",
+                    {"qty": wire(HAPPY_HEDGE_QTY),
+                     "commission": wire(HAPPY_SELL_FEE),
                      "commissionAsset": "USDT"}]}),
-                "query": [term_spot("FILLED", "0.09800000", "9.79020000",
-                                    111224)],
+                "query": [term_spot("FILLED", wire(HAPPY_HEDGE_QTY),
+                                    wire(HAPPY_SELL_QUOTE), 111224)],
             },
         },
     }
@@ -312,18 +347,19 @@ class HappyPathTests(ExecutorCase):
         code, transport, _ = self.run_once(happy_spec())
         self.assertEqual(code, 0)
         acquired = self.receipt()["acquired"]
-        self.assertEqual(Decimal(acquired["executed_qty"]), Decimal("0.099"))
-        self.assertEqual(Decimal(acquired["base_fee"]), Decimal("0.000099"))
-        self.assertEqual(Decimal(acquired["net_base"]), Decimal("0.098901"))
-        self.assertEqual(Decimal(acquired["hedge_quantity"]), Decimal("0.098"))
+        self.assertEqual(Decimal(acquired["executed_qty"]), HAPPY_PLAN_QTY)
+        self.assertEqual(Decimal(acquired["base_fee"]), HAPPY_BASE_FEE)
+        self.assertEqual(Decimal(acquired["net_base"]), HAPPY_NET_BASE)
+        self.assertEqual(Decimal(acquired["hedge_quantity"]),
+                         HAPPY_HEDGE_QTY)
         for stage in ("enter_short", "exit_short", "exit_spot"):
             index = post_stages(transport).index(stage)
             self.assertEqual(
                 Decimal(transport.posts[index][1]["quantity"]),
-                Decimal("0.098"))
-        # the plan estimate (0.099) is never an order size
+                HAPPY_HEDGE_QTY)
+        # The plan estimate is never a dependent-leg order size.
         estimate = self.receipt()["plan"]["estimated_quantity"]
-        self.assertEqual(Decimal(estimate), Decimal("0.099"))
+        self.assertEqual(Decimal(estimate), HAPPY_PLAN_QTY)
 
     def test_wire_shapes_per_leg(self):
         _, transport, _ = self.run_once(happy_spec())
@@ -332,7 +368,8 @@ class HappyPathTests(ExecutorCase):
         buy = by_stage["enter_spot"]
         self.assertEqual(buy["side"], "BUY")
         # fee-aware: the cap now carries the 0.2% base-fee headroom
-        self.assertEqual(buy["quoteOrderQty"], "9.91980000")
+        self.assertEqual(Decimal(buy["quoteOrderQty"]),
+                         HAPPY_SPOT_QUOTE_CAP)
         self.assertNotIn("quantity", buy)
         self.assertEqual(buy["newOrderRespType"], "FULL")
         self.assertNotIn("market", buy)
@@ -373,19 +410,22 @@ class HappyPathTests(ExecutorCase):
             self.assertEqual(event["symbol"], SYMBOL)
         verdict = listed[-1]
         self.assertEqual(verdict["verdict"], "CLOSED")
-        self.assertEqual(Decimal(verdict["residual"]), Decimal("0.000901"))
+        self.assertEqual(Decimal(verdict["residual"]), HAPPY_RESIDUAL)
         buy_terminal = listed[3]
         self.assertEqual(buy_terminal["side"], "BUY")
         self.assertEqual(buy_terminal["client_id_last4"], "spot")
-        self.assertEqual(Decimal(buy_terminal["executed"]), Decimal("0.099"))
-        self.assertEqual(buy_terminal["fees"], {"BTC": "0.00009900"})
+        self.assertEqual(Decimal(buy_terminal["executed"]), HAPPY_PLAN_QTY)
+        self.assertEqual(buy_terminal["fees"],
+                         {"BTC": wire(HAPPY_BASE_FEE)})
 
     def test_receipt_records_result_and_final_position(self):
         self.run_once(happy_spec())
         receipt = self.receipt()
         self.assertEqual(
             Decimal(receipt["result"]["residual_base_from_this_run"]),
-            Decimal("0.000901"))
+            HAPPY_RESIDUAL)
+        self.assertEqual(Decimal(receipt["hard_ceiling_usdt"]),
+                         MAX_CYCLE_QUOTE)
         self.assertEqual(Decimal(receipt["final_futures_position"]),
                          Decimal("0"))
         self.assertEqual(receipt["outcomes"], {
@@ -436,11 +476,11 @@ class PartialFillTests(ExecutorCase):
         by_stage = {params["newClientOrderId"].split("-", 2)[2]: params
                     for _, params in transport.posts}
         self.assertEqual(Decimal(by_stage["enter_short"]["quantity"]),
-                         Decimal("0.098"))
+                         HAPPY_HEDGE_QTY)
         self.assertEqual(Decimal(by_stage["exit_short"]["quantity"]),
                          Decimal("0.060"))
         self.assertEqual(Decimal(by_stage["exit_spot"]["quantity"]),
-                         Decimal("0.098"))
+                         HAPPY_HEDGE_QTY)
         receipt = self.receipt()
         self.assertEqual(receipt["verdict"], "CLOSED")
         self.assertEqual(receipt["first_failure"]["where"], "enter_short")
@@ -456,7 +496,7 @@ class PartialFillTests(ExecutorCase):
         receipt = self.receipt()
         self.assertEqual(receipt["verdict"], "OPEN_EXPOSURE")
         self.assertIn("0.030", receipt["exposure"])
-        self.assertIn("0.098", receipt["exposure"])
+        self.assertIn(format(HAPPY_HEDGE_QTY, "f"), receipt["exposure"])
         self.assertTrue(self.lock_exists())
 
     def test_partial_exit_sell_reports_residual_exposure(self):
@@ -474,9 +514,10 @@ class PartialFillTests(ExecutorCase):
         self.assertEqual(receipt["verdict"], "OPEN_EXPOSURE")
         self.assertEqual(
             Decimal(receipt["result"]["residual_base_from_this_run"]),
-            Decimal("0.048901"))
+            HAPPY_NET_BASE - Decimal("0.05"))
         verdict = self.events_list()[-1]
-        self.assertEqual(Decimal(verdict["residual"]), Decimal("0.048901"))
+        self.assertEqual(Decimal(verdict["residual"]),
+                         HAPPY_NET_BASE - Decimal("0.05"))
 
 
 def coarse_step_spec():
@@ -616,7 +657,7 @@ class ShortRejectionTests(ExecutorCase):
                          ["enter_spot", "enter_short", "unwind_spot"])
         self.assertEqual(transport.posts[-1][0], SPOT_URL)
         self.assertEqual(Decimal(transport.posts[-1][1]["quantity"]),
-                         Decimal("0.098"))
+                         HAPPY_HEDGE_QTY)
         self.assertEqual(transport.posts[-1][1]["side"], "SELL")
         receipt = self.receipt()
         self.assertEqual(receipt["verdict"], "REJECTED_BEFORE_ENTRY")
@@ -662,7 +703,7 @@ class ShortRejectionTests(ExecutorCase):
         self.assertEqual(receipt["verdict"], "OPEN_EXPOSURE")
         self.assertEqual(
             Decimal(receipt["result"]["residual_base_from_this_run"]),
-            Decimal("0.048901"))
+            HAPPY_NET_BASE - Decimal("0.05"))
 
 
 class UnknownLegTests(ExecutorCase):
@@ -674,10 +715,12 @@ class UnknownLegTests(ExecutorCase):
         spec["legs"]["enter_spot"] = {
             "submit": ("unclear", {}),
             "query": [NEW_ORDER,
-                      term_spot("FILLED", "0.09900000", "9.90000000", 111222)],
+                      term_spot("FILLED", wire(HAPPY_PLAN_QTY),
+                                wire(HAPPY_BUY_QUOTE), 111222)],
         }
         spec["my_trades"]["111222"] = [
-            {"qty": "0.09900000", "commission": "0.00009900",
+            {"qty": wire(HAPPY_PLAN_QTY),
+             "commission": wire(HAPPY_BASE_FEE),
              "commissionAsset": "BTC"}]
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 0)
@@ -705,7 +748,8 @@ class UnknownLegTests(ExecutorCase):
         spec["legs"]["enter_short"] = {
             "submit": ("unclear", {}),
             "query": [NEW_ORDER,
-                      term_usdm("FILLED", "0.098", "9.81960000", 444555)],
+                      term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
+                                wire(HAPPY_SHORT_QUOTE), 444555)],
         }
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 0)
@@ -730,7 +774,8 @@ class UnknownLegTests(ExecutorCase):
         spec["legs"]["exit_short"] = {
             "submit": ("unclear", {}),
             "query": [NEW_ORDER,
-                      term_usdm("FILLED", "0.098", "9.82000000", 444556)],
+                      term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
+                                wire(HAPPY_SHORT_QUOTE), 444556)],
         }
         code, _, _ = self.run_once(spec)
         self.assertEqual(code, 0)
@@ -752,10 +797,12 @@ class UnknownLegTests(ExecutorCase):
         spec["legs"]["exit_spot"] = {
             "submit": ("unclear", {}),
             "query": [NEW_ORDER,
-                      term_spot("FILLED", "0.09800000", "9.79020000", 111223)],
+                      term_spot("FILLED", wire(HAPPY_HEDGE_QTY),
+                                wire(HAPPY_SELL_QUOTE), 111223)],
         }
         spec["my_trades"]["111223"] = [
-            {"qty": "0.09800000", "commission": "0.00979000",
+            {"qty": wire(HAPPY_HEDGE_QTY),
+             "commission": wire(HAPPY_SELL_FEE),
              "commissionAsset": "USDT"}]
         code, _, _ = self.run_once(spec)
         self.assertEqual(code, 0)
@@ -835,8 +882,8 @@ class SpotBuyEdgeTests(ExecutorCase):
         spec = happy_spec()
         spec["legs"]["enter_spot"] = {
             "submit": ("ok", {}),
-            "query": [term_spot("FILLED", "0.09900000", "9.90000000",
-                                111222)],
+            "query": [term_spot("FILLED", wire(HAPPY_PLAN_QTY),
+                                wire(HAPPY_BUY_QUOTE), 111222)],
         }
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 3)
@@ -959,11 +1006,10 @@ class SignedPreflightTests(ExecutorCase):
         self.assert_preflight_refused(spec, "Spot account canTrade")
 
     def test_margin_short_refuses(self):
-        # plan short notional is 0.099 * 100.2 = 9.9198 USDT at 1x
         spec = happy_spec()
         spec["usdm_account"] = {"availableBalance": "5"}
         receipt = self.assert_preflight_refused(spec, "short margin")
-        self.assertIn("9.9198", receipt["verdict_note"])
+        self.assertIn(wire(HAPPY_SHORT_NOTIONAL), receipt["verdict_note"])
 
     def test_existing_position_refuses(self):
         spec = happy_spec()
@@ -1004,8 +1050,10 @@ class ShortCeilingTests(ExecutorCase):
 
     def test_cum_quote_breach_is_recorded_and_contained(self):
         spec = happy_spec()
+        breach_quote = MAX_CYCLE_QUOTE + Decimal("0.5")
         spec["legs"]["enter_short"]["query"] = [
-            term_usdm("FILLED", "0.098", "10.50000000", 444555)]
+            term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
+                      wire(breach_quote), 444555)]
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 0)
         self.assertEqual(post_stages(transport),
@@ -1016,13 +1064,14 @@ class ShortCeilingTests(ExecutorCase):
         short_leg = [leg for leg in receipt["legs"]
                      if leg["stage"] == "ENTER_SHORT"][0]
         self.assertEqual(Decimal(short_leg["ceiling_breach"]["cum_quote"]),
-                         Decimal("10.5"))
+                         breach_quote)
         self.assertEqual(
             Decimal(short_leg["ceiling_breach"]["hard_ceiling_usdt"]),
-            Decimal("10"))
+            MAX_CYCLE_QUOTE)
         self.assertEqual(receipt["first_failure"]["where"],
                          "enter_short_ceiling")
-        self.assertIn("10.50000000", receipt["first_failure"]["detail"])
+        self.assertIn(wire(breach_quote),
+                      receipt["first_failure"]["detail"])
 
     def test_no_breach_records_nothing(self):
         code, _, _ = self.run_once(happy_spec())
@@ -1280,8 +1329,7 @@ class LiveTransportOfflineTests(unittest.TestCase):
 
 class MarginBandTests(ExecutorCase):
     """The margin proof must cover notional x the futures price band —
-    the exchange reserves worst-case market-order margin (live -2019,
-    2026-08-13: 9.92 notional refused against 10.00 available, band 1.15)."""
+    the exchange reserves worst-case market-order margin."""
 
     def with_band(self, spec, multiplier_up, available):
         spec["usdm_info"]["symbols"][0]["filters"].append(
@@ -1290,26 +1338,36 @@ class MarginBandTests(ExecutorCase):
         spec["usdm_account"] = {"availableBalance": available}
         return spec
 
-    def test_banded_margin_refuses_the_exact_live_case(self):
-        spec = self.with_band(happy_spec(), "1.15", "10")
+    def test_banded_margin_refuses_at_the_unbanded_cap(self):
+        spec = self.with_band(happy_spec(), "1.15",
+                              format(MAX_CYCLE_QUOTE, "f"))
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 5)
         self.assertEqual(transport.posts, [])
         receipt = self.receipt()
         self.assertEqual(receipt["verdict"], "PREFLIGHT_REFUSED")
         self.assertIn("banded short margin", receipt["verdict_note"])
+        expected = (HAPPY_SHORT_NOTIONAL * Decimal("1.15")).quantize(
+            WIRE_QUANTUM)
+        self.assertIn(wire(expected), receipt["verdict_note"])
 
     def test_banded_margin_passes_with_headroom(self):
-        spec = self.with_band(happy_spec(), "1.15", "12")
+        required = (HAPPY_SHORT_NOTIONAL * Decimal("1.15")).quantize(
+            WIRE_QUANTUM)
+        spec = self.with_band(happy_spec(), "1.15",
+                              format(required + Decimal("0.01"), "f"))
         code, _, _ = self.run_once(spec)
         self.assertEqual(code, 0)
-        self.assertEqual(self.receipt()["preflight"]["margin_band_up"],
-                         "1.15")
+        preflight = self.receipt()["preflight"]
+        self.assertEqual(preflight["margin_band_up"], "1.15")
+        self.assertEqual(Decimal(preflight["required_short_margin_1x"]),
+                         required)
 
     def test_missing_band_uses_conservative_default(self):
         spec = happy_spec()
-        spec["usdm_account"] = {"availableBalance": "12"}
-        code, transport, _ = self.run_once(spec)   # 9.9 x 1.5 = 14.85 > 12
+        spec["usdm_account"] = {
+            "availableBalance": format(MAX_CYCLE_QUOTE, "f")}
+        code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 5)
         self.assertEqual(transport.posts, [])
         self.assertIn("1.5", self.receipt()["verdict_note"])
@@ -1401,10 +1459,14 @@ class ValidateOnlyTests(ExecutorCase):
     def test_plan_refusal_still_runs_full_signed_preflight(self):
         cfg = ExecutorConfig(symbol=SYMBOL, sha=SHA, receipt_dir=self.dir,
                              run_id=RID, min_entry_bps=Decimal("1000000"))
-        code, transport, out = self.validate(happy_spec(), cfg=cfg)
+        spec = happy_spec()
+        spec["usdm_account"] = {
+            "availableBalance": format(MAX_CYCLE_QUOTE, "f")}
+        code, transport, out = self.validate(spec, cfg=cfg)
         self.assertEqual(code, 2)
         self.assertIn("PLAN_REFUSED", out)
         self.assertIn("PREFLIGHT_OK", out)
+        self.assertIn("required %s USDT" % wire(MAX_CYCLE_QUOTE), out)
         seen = {path for _m, _b, path, _p, signed in transport.calls if signed}
         self.assertEqual(seen, set(PREFLIGHT_PATHS))
         self.assertEqual(transport.posts, [])

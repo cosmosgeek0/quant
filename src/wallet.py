@@ -29,6 +29,11 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation
 
+try:
+    from limits import PER_LEG_CAP_USDT as TRANSFER_HARD_CEILING
+except ImportError:
+    TRANSFER_HARD_CEILING = Decimal("32")
+
 
 SPOT_BASE = os.environ.get("BINANCE_BASE_URL", "https://api.binance.com")
 FUTURES_BASE = os.environ.get(
@@ -46,7 +51,6 @@ HISTORY_LOOKBACK_MS = 60_000
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGE_LIMIT = 20
 TRANSFER_ASSET = "USDT"
-TRANSFER_HARD_CEILING = Decimal("10")
 
 DIRECTIONS = {
     "spot-to-usdm": "MAIN_UMFUTURE",
@@ -91,7 +95,10 @@ def validated_transfer_amount(asset, raw_amount):
     if amount <= 0:
         raise ValueError("amount must be positive")
     if amount > TRANSFER_HARD_CEILING:
-        raise ValueError("amount exceeds the compiled 10 USDT transfer ceiling")
+        raise ValueError(
+            "amount exceeds the compiled %s USDT transfer ceiling"
+            % decimal_text(TRANSFER_HARD_CEILING)
+        )
     return amount
 
 

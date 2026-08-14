@@ -24,7 +24,7 @@ from basis_cycle import (  # noqa: E402
 )
 from basis_read import build_basis_read_row  # noqa: E402
 
-ACQUIRED = Decimal("0.09970")  # exchange-truth net base: fee-deducted, floored
+ACQUIRED = Decimal("0.31904")  # exchange-truth net base: fee-deducted, floored
 
 
 def fixture_row(spot_bid="99.9", spot_ask="100.0", usdm_bid="100.2",
@@ -55,8 +55,8 @@ class PlanCycleTests(unittest.TestCase):
     def test_plan_holds_both_legs_under_ceiling(self):
         plan = full_plan()
         self.assertIsNotNone(plan)
-        self.assertLessEqual(plan.spot_quote_cap, Decimal("10"))
-        self.assertLessEqual(plan.short_notional, Decimal("10"))
+        self.assertLessEqual(plan.spot_quote_cap, Decimal("32"))
+        self.assertLessEqual(plan.short_notional, Decimal("32"))
         self.assertEqual(plan.spot_quantity, plan.short_quantity)
         self.assertEqual(plan.leverage, 1)
 
@@ -69,7 +69,7 @@ class PlanCycleTests(unittest.TestCase):
     def test_refuses_when_below_min_notional(self):
         row = fixture_row()
         self.assertIsNone(plan_cycle(row, Decimal("1"), Decimal("0.00001"),
-                                     Decimal("11")))
+                                     Decimal("33")))
 
     def test_rejects_non_decimal_inputs(self):
         row = fixture_row()
@@ -170,7 +170,7 @@ class RunCycleTests(unittest.TestCase):
 
     def test_acquired_base_must_be_positive_decimal(self):
         with self.assertRaises(BasisCycleError):
-            self.drive(acquired=0.0997, ENTER_SPOT="FILLED",
+            self.drive(acquired=0.31904, ENTER_SPOT="FILLED",
                        ENTER_SHORT="FILLED")
 
     def test_short_entry_unknown_freezes_without_unwind(self):
