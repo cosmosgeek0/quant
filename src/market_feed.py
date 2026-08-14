@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Continuous public Binance Spot + USD-M USDT market feed.
 
-Two combined WebSocket connections consume Binance's all-market ``!ticker``
+Sharded combined WebSocket connections consume Binance's all-market ``!ticker``
 arrays plus exact closed ``@kline_1m`` candles for the complete current
 universe.  There is no symbol rotation and there are no per-symbol HTTP reads.
 Unsigned ``exchangeInfo`` GETs provide the tradable universe and venue-specific
@@ -54,6 +54,7 @@ from market_stream import (
     optional_decimal_string,
     volume_metrics,
 )
+from runtime_paths import PATHS as RUNTIME_PATHS
 
 
 SPOT_BASE_URL = "https://api.binance.com"
@@ -71,7 +72,7 @@ FAPI_WS_URL = (
 )
 
 DEFAULT_STATE_PATH = Path("stream_state.json")
-DEFAULT_STOP_PATH = Path("STOP")
+DEFAULT_STOP_PATH = RUNTIME_PATHS.stop
 DEFAULT_METADATA_MINUTES = 30.0
 DEFAULT_FLUSH_SECONDS = 1.0
 DEFAULT_CONNECT_TIMEOUT = 10.0
@@ -80,6 +81,8 @@ DEFAULT_BACKOFF_INITIAL = 1.0
 DEFAULT_BACKOFF_MAX = 30.0
 MAX_FRAME_BYTES = 32_000_000
 MAX_HANDSHAKE_BYTES = 64_000
+MAX_STREAMS_PER_CONNECTION = 200
+KLINE_INTERVAL_MS = 60_000
 RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 METADATA_FIELDS = (
@@ -101,8 +104,15 @@ UNSUPPORTED_STREAM_FIELDS = (
     "funding_rate",
     "next_funding_ms",
 )
-STREAM_NAMES = frozenset({"!ticker@arr", "!miniticker@arr"})
+TICKER_STREAM_NAMES = ("!ticker@arr", "!miniTicker@arr")
+STREAM_NAMES = frozenset(name.lower() for name in TICKER_STREAM_NAMES)
 KLINE_STREAM_SUFFIX = "@kline_1m"
+MAX_KLINES_PER_CONNECTION = MAX_STREAMS_PER_CONNECTION - len(TICKER_STREAM_NAMES)
+WINDOW_SNAPSHOT_FIELDS = (
+    "window_venue",
+    "window_oldest_ms",
+    "window_newest_ms",
+)
 
 
 class WebSocketError(MarketStreamError):
@@ -137,6 +147,8 @@ class FeedStats:
     metadata_refreshes: int
     reconnects: int
     invalid_messages: int
+    handshake_failures: int = 0
+    broken_venues: Tuple[str, ...] = ()
 
     @property
     def update_rate(self) -> float:
@@ -585,6 +597,7 @@ def load_feed_state(path: Path) -> Dict[str, Dict[str, Any]]:
         record_fields = set(raw_record)
         if envelope:
             record_fields.discard("closed_1m")
+            record_fields.difference_update(WINDOW_SNAPSHOT_FIELDS)
         if not required.issubset(raw_record) or not record_fields.issubset(allowed):
             raise DataReadError(f"stream state schema mismatch for {symbol}")
         if not isinstance(raw_record.get("utc"), str):
@@ -607,11 +620,19 @@ def load_feed_state(path: Path) -> Dict[str, Dict[str, Any]]:
     return state
 
 
-def load_feed_windows(path: Path, window: int) -> Dict[str, Dict[str, Any]]:
-    """Load closed one-minute windows from a served snapshot."""
+def load_feed_windows(
+    path: Path,
+    window: int,
+    now_ms: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Load only window-horizon candles from a served snapshot."""
     path = Path(path)
     if not path.exists():
         return {}
+    restored_at_ms = epoch_ms() if now_ms is None else now_ms
+    if isinstance(restored_at_ms, bool) or restored_at_ms < 0:
+        raise ValueError("window restore time must be a non-negative integer")
+    oldest_allowed_ms = max(0, restored_at_ms - window * KLINE_INTERVAL_MS)
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -631,6 +652,17 @@ def load_feed_windows(path: Path, window: int) -> Dict[str, Dict[str, Any]]:
         raw_closed = raw_record.get("closed_1m", [])
         if not isinstance(raw_closed, list):
             raise DataReadError(f"feed state closed_1m is invalid for {symbol}")
+        venues = raw_record.get("venues")
+        if venues not in VENUE_VALUES:
+            raise DataReadError(f"feed state venues is invalid for {symbol}")
+        preferred_venue = "perp" if venues in {"perp", "both"} else "spot"
+        window_venue = raw_record.get("window_venue")
+        if window_venue is None:
+            window_venue = preferred_venue
+        if window_venue not in {"spot", "perp"}:
+            raise DataReadError(f"feed state window venue is invalid for {symbol}")
+        if window_venue != preferred_venue:
+            raise DataReadError(f"feed state window venue is stale for {symbol}")
         incoming: List[Tuple[int, Decimal]] = []
         previous_close = -1
         for pair in raw_closed:
@@ -646,11 +678,15 @@ def load_feed_windows(path: Path, window: int) -> Dict[str, Dict[str, Any]]:
             if close_ms <= previous_close or volume < 0:
                 raise DataReadError(f"feed state candle is invalid for {symbol}")
             previous_close = close_ms
-            incoming.append((close_ms, volume))
+            if oldest_allowed_ms <= close_ms <= restored_at_ms:
+                incoming.append((close_ms, volume))
         closed = merge_closed_window([], incoming, window)
-        windows[symbol] = {"closed_1m": closed}
         if closed:
-            windows[symbol]["last_volume_close_ms"] = closed[-1][0]
+            windows[symbol] = {
+                "closed_1m": closed,
+                "last_volume_close_ms": closed[-1][0],
+                "venue": window_venue,
+            }
     return windows
 
 
@@ -659,22 +695,52 @@ def feed_snapshot_payload(
     windows: Mapping[str, Mapping[str, Any]],
     window: int,
     written_ms: int,
+    connections: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build the atomic serve contract consumed by market_stream."""
     symbols: Dict[str, Dict[str, Any]] = {}
+    all_closes: List[int] = []
     for symbol in sorted(state):
         record = {field: state[symbol].get(field) for field in FEED_FIELDS}
-        closed = list(windows.get(symbol, {}).get("closed_1m", []))[-window:]
+        meta = windows.get(symbol, {})
+        preferred_venue = (
+            "perp"
+            if state[symbol].get("venues") in {"perp", "both"}
+            else "spot"
+        )
+        window_venue = meta.get("venue")
+        if window_venue not in {"spot", "perp"}:
+            window_venue = preferred_venue
+        closed = (
+            list(meta.get("closed_1m", []))[-window:]
+            if window_venue == preferred_venue
+            else []
+        )
         vol, med, surge = volume_metrics(closed, window)
         record["vol_1m_quote"] = vol
         record["vol_med_1m"] = med
         record["surge_ratio"] = surge
         record["closed_1m"] = closed
+        closes = [int(pair[0]) for pair in closed]
+        record["window_venue"] = window_venue if closes else None
+        record["window_oldest_ms"] = str(closes[0]) if closes else None
+        record["window_newest_ms"] = str(closes[-1]) if closes else None
+        all_closes.extend(closes)
         symbols[symbol] = record
+    connection_payload = {
+        venue: {
+            key: ([dict(item) for item in value] if key == "shards" else value)
+            for key, value in venue_state.items()
+        }
+        for venue, venue_state in (connections or {}).items()
+    }
     return {
         "version": FEED_STATE_VERSION,
         "written_ms": str(written_ms),
+        "window_oldest_ms": str(min(all_closes)) if all_closes else None,
+        "window_newest_ms": str(max(all_closes)) if all_closes else None,
         "window": window,
+        "connections": connection_payload,
         "symbols": symbols,
     }
 
@@ -793,7 +859,12 @@ def merge_kline_rows(
             continue
         if close_ms < 0 or quote_volume < 0:
             continue
-        meta = windows.setdefault(symbol, {"closed_1m": []})
+        meta = windows.get(symbol)
+        if meta is None or meta.get("venue") not in {None, venue}:
+            meta = {"closed_1m": [], "venue": venue}
+            windows[symbol] = meta
+        else:
+            meta["venue"] = venue
         meta["closed_1m"] = merge_closed_window(
             meta.get("closed_1m", []), [(close_ms, quote_volume)], window
         )
@@ -802,8 +873,8 @@ def merge_kline_rows(
     return changed
 
 
-def websocket_urls(state: Mapping[str, Mapping[str, Any]]) -> Dict[str, str]:
-    """Build one ticker-plus-kline combined URL for each preferred venue."""
+def websocket_urls(state: Mapping[str, Mapping[str, Any]]) -> Dict[str, List[str]]:
+    """Build ticker-plus-kline shards that stay at Binance's stream cap."""
     spot_symbols = sorted(
         symbol for symbol, record in state.items() if record.get("venues") == "spot"
     )
@@ -813,11 +884,15 @@ def websocket_urls(state: Mapping[str, Mapping[str, Any]]) -> Dict[str, str]:
         if record.get("venues") in {"perp", "both"}
     )
 
-    def with_klines(base: str, symbols: Sequence[str]) -> str:
-        suffix = "".join(
-            f"/{symbol.lower()}{KLINE_STREAM_SUFFIX}" for symbol in symbols
-        )
-        return base + suffix
+    def with_klines(base: str, symbols: Sequence[str]) -> List[str]:
+        shards: List[str] = []
+        for offset in range(0, max(1, len(symbols)), MAX_KLINES_PER_CONNECTION):
+            chunk = symbols[offset : offset + MAX_KLINES_PER_CONNECTION]
+            suffix = "".join(
+                f"/{symbol.lower()}{KLINE_STREAM_SUFFIX}" for symbol in chunk
+            )
+            shards.append(base + suffix)
+        return shards
 
     return {
         "spot": with_klines(SPOT_WS_URL, spot_symbols),
@@ -856,7 +931,9 @@ def run_reconnect_loop(
     connector: Callable[[str], Any],
     stop_requested: Callable[[], bool],
     wait_fn: Callable[[float], bool],
+    on_attempt: Optional[Callable[[], None]] = None,
     on_connect: Optional[Callable[[], None]] = None,
+    on_connect_failure: Optional[Callable[[], None]] = None,
     on_disconnect: Optional[Callable[[], None]] = None,
     initial_backoff: float = DEFAULT_BACKOFF_INITIAL,
     maximum_backoff: float = DEFAULT_BACKOFF_MAX,
@@ -867,6 +944,8 @@ def run_reconnect_loop(
         client: Any = None
         received = False
         try:
+            if on_attempt is not None:
+                on_attempt()
             client = connector(url)
             if on_connect is not None:
                 on_connect()
@@ -879,7 +958,8 @@ def run_reconnect_loop(
                 received = True
                 delay = initial_backoff
         except (OSError, WebSocketError):
-            pass
+            if client is None and on_connect_failure is not None:
+                on_connect_failure()
         finally:
             if client is not None:
                 try:
@@ -888,7 +968,7 @@ def run_reconnect_loop(
                     pass
         if stop_requested():
             break
-        if on_disconnect is not None:
+        if client is not None and on_disconnect is not None:
             on_disconnect()
         if wait_fn(delay):
             break
@@ -897,7 +977,7 @@ def run_reconnect_loop(
 
 
 class MarketFeed:
-    """Coordinate metadata refresh, two reconnecting sockets, and state writes."""
+    """Coordinate metadata refresh, sharded sockets, and state writes."""
 
     def __init__(
         self,
@@ -931,7 +1011,9 @@ class MarketFeed:
         self.monotonic_fn = monotonic_fn
         self.state = load_feed_state(self.state_path)
         self.windows = (
-            load_feed_windows(self.state_path, self.window) if self.serve else {}
+            load_feed_windows(self.state_path, self.window, self.ms_fn())
+            if self.serve
+            else {}
         )
         if self.serve:
             for record in self.state.values():
@@ -940,51 +1022,176 @@ class MarketFeed:
                 record["basis_gap_pct"] = None
                 record["freshness_ms"] = None
         self.seen_ms: Dict[str, Dict[str, int]] = {}
-        self.events: queue.Queue[Tuple[str, str, Optional[str]]] = queue.Queue()
+        self.connections: Dict[str, Dict[str, Any]] = {}
+        self.events: queue.Queue[
+            Tuple[str, str, int, int, Optional[str]]
+        ] = queue.Queue()
         self.stop_event = threading.Event()
 
     def _stopped(self) -> bool:
         return self.stop_event.is_set() or self.stop_path.exists()
 
-    def _wait(self, delay: float) -> bool:
+    def _wait(
+        self, delay: float, worker_stop: Optional[threading.Event] = None
+    ) -> bool:
         deadline = self.monotonic_fn() + delay
-        while not self._stopped():
+        while not self._stopped() and not (
+            worker_stop is not None and worker_stop.is_set()
+        ):
             remaining = deadline - self.monotonic_fn()
             if remaining <= 0:
                 return False
             self.stop_event.wait(min(remaining, 0.25))
         return True
 
-    def _worker(self, venue: str, url: str) -> None:
+    def _worker(
+        self,
+        venue: str,
+        shard: int,
+        url: str,
+        generation: int,
+        worker_stop: threading.Event,
+    ) -> None:
+        def emit(kind: str, text: Optional[str] = None) -> None:
+            self.events.put((kind, venue, shard, generation, text))
+
         run_reconnect_loop(
             url,
-            lambda text: self.events.put(("text", venue, text)),
+            lambda text: emit("text", text),
             connector=self.connector,
-            stop_requested=self._stopped,
-            wait_fn=self._wait,
-            on_connect=lambda: self.events.put(("connected", venue, None)),
-            on_disconnect=lambda: self.events.put(("disconnected", venue, None)),
+            stop_requested=lambda: worker_stop.is_set() or self._stopped(),
+            wait_fn=lambda delay: self._wait(delay, worker_stop),
+            on_attempt=lambda: emit("attempt"),
+            on_connect=lambda: emit("connected"),
+            on_connect_failure=lambda: emit("handshake_failed"),
+            on_disconnect=lambda: emit("disconnected"),
         )
 
-    def _refresh_metadata(self) -> None:
+    def _refresh_metadata(self) -> bool:
+        """Refresh metadata and report whether socket shards must restart."""
+        old_urls = websocket_urls(self.state)
+        old_venues = {
+            symbol: record.get("venues") for symbol, record in self.state.items()
+        }
         spot_payload = self.reader(SPOT_BASE_URL, SPOT_EXCHANGE_INFO_PATH, {})
         perp_payload = self.reader(FAPI_BASE_URL, FAPI_EXCHANGE_INFO_PATH, {})
         spot = parse_exchange_metadata(spot_payload, "spot")
         perp = parse_exchange_metadata(perp_payload, "perp")
         self.state = merge_metadata(self.state, spot, perp, self.utc_fn())
         active = set(self.state)
+        venue_changed = {
+            symbol
+            for symbol, record in self.state.items()
+            if symbol in old_venues and old_venues[symbol] != record.get("venues")
+        }
         self.seen_ms = {
-            symbol: stamps for symbol, stamps in self.seen_ms.items() if symbol in active
+            symbol: stamps
+            for symbol, stamps in self.seen_ms.items()
+            if symbol in active and symbol not in venue_changed
         }
         self.windows = {
-            symbol: meta for symbol, meta in self.windows.items() if symbol in active
+            symbol: meta
+            for symbol, meta in self.windows.items()
+            if symbol in active and symbol not in venue_changed
         }
+        return old_urls != websocket_urls(self.state)
+
+    def _reset_connections(self, urls: Mapping[str, Sequence[str]]) -> None:
+        self.connections = {}
+        for venue in ("spot", "perp"):
+            shards = []
+            for index, url in enumerate(urls.get(venue, ())):
+                stream_count = len(url.split("?streams=", 1)[-1].split("/"))
+                shards.append(
+                    {
+                        "connection": index,
+                        "stream_count": stream_count,
+                        "attempts": 0,
+                        "successful_handshakes": 0,
+                        "handshake_failures": 0,
+                        "reconnects": 0,
+                        "connected": False,
+                        "status": "broken",
+                    }
+                )
+            self.connections[venue] = {
+                "status": "broken",
+                "expected_connections": len(shards),
+                "successful_handshakes": 0,
+                "handshake_failures": 0,
+                "reconnects": 0,
+                "shards": shards,
+            }
+
+    def _record_connection_event(self, kind: str, venue: str, shard: int) -> None:
+        venue_state = self.connections.get(venue)
+        if venue_state is None:
+            return
+        shards = venue_state.get("shards", [])
+        if not 0 <= shard < len(shards):
+            return
+        connection = shards[shard]
+        if kind == "attempt":
+            connection["attempts"] += 1
+            connection["reconnects"] = max(0, connection["attempts"] - 1)
+        elif kind == "connected":
+            connection["successful_handshakes"] += 1
+            connection["connected"] = True
+        elif kind == "handshake_failed":
+            connection["handshake_failures"] += 1
+            connection["connected"] = False
+        elif kind == "disconnected":
+            connection["connected"] = False
+        else:
+            return
+        if connection["connected"]:
+            connection["status"] = "healthy"
+        elif connection["successful_handshakes"] == 0:
+            connection["status"] = "broken"
+        else:
+            connection["status"] = "disconnected"
+        successes = sum(row["successful_handshakes"] for row in shards)
+        venue_state["successful_handshakes"] = successes
+        venue_state["handshake_failures"] = sum(
+            row["handshake_failures"] for row in shards
+        )
+        venue_state["reconnects"] = sum(row["reconnects"] for row in shards)
+        if successes == 0:
+            venue_state["status"] = "broken"
+        elif all(row["connected"] for row in shards):
+            venue_state["status"] = "healthy"
+        else:
+            venue_state["status"] = "degraded"
+
+    def _start_workers(
+        self,
+        urls: Mapping[str, Sequence[str]],
+        generation: int,
+        worker_stop: threading.Event,
+    ) -> List[threading.Thread]:
+        workers = [
+            threading.Thread(
+                target=self._worker,
+                args=(venue, shard, url, generation, worker_stop),
+                name=f"market-feed-{venue}-{shard}",
+                daemon=True,
+            )
+            for venue in ("spot", "perp")
+            for shard, url in enumerate(urls.get(venue, ()))
+        ]
+        for worker in workers:
+            worker.start()
+        return workers
 
     def _write_state(self) -> None:
         payload: Any
         if self.serve:
             payload = feed_snapshot_payload(
-                self.state, self.windows, self.window, self.ms_fn()
+                self.state,
+                self.windows,
+                self.window,
+                self.ms_fn(),
+                self.connections,
             )
         else:
             payload = self.state
@@ -1001,28 +1208,88 @@ class MarketFeed:
             )
         self._refresh_metadata()
         metadata_refreshes = 1
+        urls = websocket_urls(self.state)
+        generation = 1
+        worker_stop = threading.Event()
+        self._reset_connections(urls)
         self._write_state()
         next_metadata = self.monotonic_fn() + self.metadata_seconds
         next_flush = self.monotonic_fn() + self.flush_seconds
         deadline = None if duration_seconds is None else started + duration_seconds
-        urls = websocket_urls(self.state)
-        workers = [
-            threading.Thread(
-                target=self._worker,
-                args=(venue, url),
-                name=f"market-feed-{venue}",
-                daemon=True,
-            )
-            for venue, url in (("spot", urls["spot"]), ("perp", urls["perp"]))
-        ]
-        for worker in workers:
-            worker.start()
+        workers = self._start_workers(urls, generation, worker_stop)
         updated_symbols: set[str] = set()
         ticker_updates = 0
         websocket_messages = 0
         invalid_messages = 0
-        connection_counts = {"spot": 0, "perp": 0}
+        handshake_failures = 0
+        reconnects = 0
+        attempt_counts: Dict[Tuple[int, str, int], int] = {}
         dirty = False
+
+        def handle_event(
+            event: Tuple[str, str, int, int, Optional[str]]
+        ) -> None:
+            nonlocal dirty
+            nonlocal handshake_failures
+            nonlocal invalid_messages
+            nonlocal reconnects
+            nonlocal ticker_updates
+            nonlocal websocket_messages
+            kind, venue, shard, event_generation, text = event
+            connection_key = (event_generation, venue, shard)
+            if kind == "attempt":
+                prior_attempts = attempt_counts.get(connection_key, 0)
+                attempt_counts[connection_key] = prior_attempts + 1
+                if prior_attempts:
+                    reconnects += 1
+            elif kind == "handshake_failed":
+                handshake_failures += 1
+            if event_generation != generation:
+                return
+            if kind in {
+                "attempt",
+                "connected",
+                "handshake_failed",
+                "disconnected",
+            }:
+                self._record_connection_event(kind, venue, shard)
+                dirty = True
+                return
+            if kind != "text" or text is None:
+                return
+            websocket_messages += 1
+            try:
+                stream_name, rows = parse_combined_message(text)
+                if stream_name.endswith(KLINE_STREAM_SUFFIX):
+                    changed = merge_kline_rows(
+                        self.state,
+                        venue,
+                        stream_name,
+                        rows,
+                        self.windows,
+                        self.window,
+                    )
+                    ticker_changed = False
+                else:
+                    changed = merge_ticker_rows(
+                        self.state,
+                        venue,
+                        stream_name,
+                        rows,
+                        self.utc_fn(),
+                        self.ms_fn(),
+                        self.seen_ms,
+                    )
+                    ticker_changed = True
+            except MarketStreamError:
+                invalid_messages += 1
+            else:
+                if changed:
+                    updated_symbols.update(changed)
+                    if ticker_changed:
+                        ticker_updates += len(changed)
+                    dirty = True
+
         try:
             while not self._stopped():
                 now = self.monotonic_fn()
@@ -1030,57 +1297,35 @@ class MarketFeed:
                     break
                 if now >= next_metadata:
                     try:
-                        self._refresh_metadata()
+                        subscriptions_changed = self._refresh_metadata()
                     except MarketStreamError:
                         invalid_messages += 1
                     else:
                         metadata_refreshes += 1
                         dirty = True
+                        if subscriptions_changed:
+                            worker_stop.set()
+                            for worker in workers:
+                                worker.join(timeout=DEFAULT_SOCKET_TIMEOUT + 1.0)
+                            generation += 1
+                            urls = websocket_urls(self.state)
+                            worker_stop = threading.Event()
+                            self._reset_connections(urls)
+                            self._write_state()
+                            dirty = False
+                            workers = self._start_workers(
+                                urls, generation, worker_stop
+                            )
                     next_metadata = now + self.metadata_seconds
                 timeout = min(0.25, max(0.0, next_flush - now))
                 if deadline is not None:
                     timeout = min(timeout, max(0.0, deadline - now))
                 try:
-                    kind, venue, text = self.events.get(timeout=timeout)
+                    event = self.events.get(timeout=timeout)
                 except queue.Empty:
-                    kind = "idle"
-                    venue = ""
-                    text = None
-                if kind == "connected":
-                    connection_counts[venue] += 1
-                elif kind == "text" and text is not None:
-                    websocket_messages += 1
-                    try:
-                        stream_name, rows = parse_combined_message(text)
-                        if stream_name.endswith(KLINE_STREAM_SUFFIX):
-                            changed = merge_kline_rows(
-                                self.state,
-                                venue,
-                                stream_name,
-                                rows,
-                                self.windows,
-                                self.window,
-                            )
-                            ticker_changed = False
-                        else:
-                            changed = merge_ticker_rows(
-                                self.state,
-                                venue,
-                                stream_name,
-                                rows,
-                                self.utc_fn(),
-                                self.ms_fn(),
-                                self.seen_ms,
-                            )
-                            ticker_changed = True
-                    except MarketStreamError:
-                        invalid_messages += 1
-                    else:
-                        if changed:
-                            updated_symbols.update(changed)
-                            if ticker_changed:
-                                ticker_updates += len(changed)
-                            dirty = True
+                    event = None
+                if event is not None:
+                    handle_event(event)
                 now = self.monotonic_fn()
                 if now >= next_flush:
                     if dirty:
@@ -1090,13 +1335,23 @@ class MarketFeed:
                     next_flush = now + self.flush_seconds
         finally:
             self.stop_event.set()
+            worker_stop.set()
+            for worker in workers:
+                worker.join(timeout=DEFAULT_SOCKET_TIMEOUT + 1.0)
+            while True:
+                try:
+                    handle_event(self.events.get_nowait())
+                except queue.Empty:
+                    break
             if dirty:
                 refresh_freshness(self.state, self.seen_ms, self.ms_fn())
                 self._write_state()
-            for worker in workers:
-                worker.join(timeout=DEFAULT_SOCKET_TIMEOUT + 1.0)
         ended = self.monotonic_fn()
-        reconnects = sum(max(0, count - 1) for count in connection_counts.values())
+        broken_venues = tuple(
+            venue
+            for venue in ("spot", "perp")
+            if self.connections.get(venue, {}).get("status") == "broken"
+        )
         return FeedStats(
             started_utc=started_utc,
             ended_utc=self.utc_fn(),
@@ -1108,6 +1363,8 @@ class MarketFeed:
             metadata_refreshes=metadata_refreshes,
             reconnects=reconnects,
             invalid_messages=invalid_messages,
+            handshake_failures=handshake_failures,
+            broken_venues=broken_venues,
         )
 
 
@@ -1174,7 +1431,10 @@ def print_stats(stats: FeedStats) -> None:
     print(
         f"websocket_messages={stats.websocket_messages} "
         f"metadata_refreshes={stats.metadata_refreshes} "
-        f"reconnects={stats.reconnects} invalid_messages={stats.invalid_messages}"
+        f"reconnects={stats.reconnects} "
+        f"handshake_failures={stats.handshake_failures} "
+        f"broken_venues={','.join(stats.broken_venues) or 'none'} "
+        f"invalid_messages={stats.invalid_messages}"
     )
 
 

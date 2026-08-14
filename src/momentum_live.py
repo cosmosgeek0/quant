@@ -33,6 +33,7 @@ import momentum_lifecycle as lifecycle
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DECISIONS_PATH = ROOT / "decisions.jsonl"
+DECISIONS_ROTATE_BYTES = 4 * 1024 * 1024
 HARD_MAX_NOTIONAL = Decimal("8")
 DEFAULT_JOB_TTL = timedelta(minutes=10)
 MAX_JOB_TTL = timedelta(minutes=15)
@@ -80,6 +81,17 @@ class RunnerPosition:
     exit_job_id: Optional[str]
     quantity: Optional[Decimal]
     entry_price: Optional[Decimal]
+
+
+@dataclass
+class _DecisionIndex:
+    signature: Tuple[Any, ...]
+    rows_by_id: Dict[str, Dict[str, Any]]
+    ignition_by_symbol: Dict[str, str]
+    job_rows: List[Dict[str, Any]]
+
+
+_DECISION_INDEXES: Dict[str, _DecisionIndex] = {}
 
 
 def default_jobs_dir() -> Path:
@@ -277,8 +289,28 @@ def write_job_record(jobs_dir: Path, payload: Mapping[str, Any]) -> bool:
             pass
 
 
-def _read_decisions(path: Path) -> List[Dict[str, Any]]:
-    path = Path(path)
+def _decision_backup_path(path: Path) -> Path:
+    return path.with_name(path.name + ".1")
+
+
+def _decision_file_signature(path: Path) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise MomentumLiveError(f"decision ledger is unreadable: {path}") from None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _decision_signature(path: Path) -> Tuple[Any, ...]:
+    return (
+        _decision_file_signature(_decision_backup_path(path)),
+        _decision_file_signature(path),
+    )
+
+
+def _read_decision_file(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     try:
@@ -296,6 +328,82 @@ def _read_decisions(path: Path) -> List[Dict[str, Any]]:
         if isinstance(row, dict):
             rows.append(row)
     return rows
+
+
+def _read_decisions(path: Path) -> List[Dict[str, Any]]:
+    """Read the two bounded decision segments, oldest first."""
+    path = Path(path)
+    return (
+        _read_decision_file(_decision_backup_path(path))
+        + _read_decision_file(path)
+    )
+
+
+def _index_decision(index: _DecisionIndex, row: Mapping[str, Any]) -> None:
+    copied = dict(row)
+    decision_id = copied.get("decision_id")
+    if isinstance(decision_id, str) and decision_id:
+        existing = index.rows_by_id.get(decision_id)
+        if existing is not None:
+            if existing != copied:
+                raise MomentumLiveError(f"decision id conflict: {decision_id}")
+            return
+        index.rows_by_id[decision_id] = copied
+    symbol = copied.get("symbol")
+    if isinstance(symbol, str):
+        ignition_utc = copied.get("ignition_utc")
+        if isinstance(ignition_utc, str):
+            index.ignition_by_symbol[symbol] = ignition_utc
+        snapshot = copied.get("lifecycle_state")
+        if isinstance(snapshot, dict) \
+                and snapshot.get("position_status") == "FLAT" \
+                and snapshot.get("phase") == lifecycle.PHASE_WATCH \
+                and snapshot.get("ignition_utc") is None:
+            index.ignition_by_symbol.pop(symbol, None)
+    if copied.get("action") in {
+        lifecycle.ACTION_ENTER_SMALL, lifecycle.ACTION_EXIT
+    } and copied.get("job_eligible") is True:
+        index.job_rows.append(copied)
+
+
+def _decision_cache_key(path: Path) -> str:
+    return os.path.abspath(str(path))
+
+
+def _decision_index(path: Path) -> _DecisionIndex:
+    """Return a cached O(1)-lookup index, rebuilding only after file changes."""
+    path = Path(path)
+    key = _decision_cache_key(path)
+    signature = _decision_signature(path)
+    cached = _DECISION_INDEXES.get(key)
+    if cached is not None and cached.signature == signature:
+        return cached
+    index = _DecisionIndex(signature, {}, {}, [])
+    for row in _read_decisions(path):
+        _index_decision(index, row)
+    index.signature = _decision_signature(path)
+    _DECISION_INDEXES[key] = index
+    return index
+
+
+def _rotate_decisions(path: Path, incoming_bytes: int) -> bool:
+    if DECISIONS_ROTATE_BYTES <= 0:
+        raise MomentumLiveError("decision rotation threshold must be positive")
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise MomentumLiveError(f"decision ledger is unreadable: {path}") from None
+    if size == 0 or size + incoming_bytes <= DECISIONS_ROTATE_BYTES:
+        return False
+    try:
+        os.replace(path, _decision_backup_path(path))
+        _fsync_directory(path.parent)
+    except OSError:
+        raise MomentumLiveError(f"decision ledger rotation failed: {path}") from None
+    _DECISION_INDEXES.pop(_decision_cache_key(path), None)
+    return True
 
 
 def _data_decimal(raw: Any, name: str) -> Optional[Decimal]:
@@ -436,7 +544,25 @@ def _result_for_job(
     return row
 
 
-def _fill_values(raw: Mapping[str, Any], source: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+def _observed_price_quantum(value: Decimal) -> Decimal:
+    """Infer the finest visible exchange price unit without trailing zeroes."""
+    exponent = min(value.normalize().as_tuple().exponent, 0)
+    return Decimal(1).scaleb(exponent)
+
+
+def _within_fill_rounding(
+    reported: Decimal, computed: Decimal, fill_prices: Iterable[Decimal]
+) -> bool:
+    """Allow at most half the finest price unit visible in exchange facts."""
+    quantum = _observed_price_quantum(reported)
+    for fill_price in fill_prices:
+        quantum = min(quantum, _observed_price_quantum(fill_price))
+    return abs(reported - computed) <= quantum / Decimal("2")
+
+
+def _fill_values(
+    raw: Mapping[str, Any], source: str
+) -> Tuple[Optional[Decimal], Optional[Decimal], Tuple[Decimal, ...]]:
     containers: List[Mapping[str, Any]] = [raw]
     for name in ("fill", "open", "position"):
         nested = raw.get(name)
@@ -445,6 +571,7 @@ def _fill_values(raw: Mapping[str, Any], source: str) -> Tuple[Optional[Decimal]
     quantity: Optional[Decimal] = None
     price: Optional[Decimal] = None
     quote: Optional[Decimal] = None
+    fill_prices: List[Decimal] = []
     fills = raw.get("fills")
     if fills is not None:
         if not isinstance(fills, list) or not fills:
@@ -461,6 +588,7 @@ def _fill_values(raw: Mapping[str, Any], source: str) -> Tuple[Optional[Decimal]
             if part_qty is None or part_price is None \
                     or part_qty <= 0 or part_price <= 0:
                 raise MomentumLiveError(f"{source} fill {index} is not positive")
+            fill_prices.append(part_price)
             with localcontext() as context:
                 context.prec = 50
                 fill_qty += part_qty
@@ -484,7 +612,10 @@ def _fill_values(raw: Mapping[str, Any], source: str) -> Tuple[Optional[Decimal]
             quantity = parsed_qty
         if candidate_price is not None:
             parsed_price = _data_decimal(candidate_price, f"{source} fill price")
-            if price is not None and parsed_price != price:
+            if price is not None and parsed_price is not None \
+                    and not _within_fill_rounding(
+                        parsed_price, price, fill_prices
+                    ):
                 raise MomentumLiveError(f"{source} fill prices conflict")
             price = parsed_price
         if quote is None and candidate_quote is not None:
@@ -493,16 +624,18 @@ def _fill_values(raw: Mapping[str, Any], source: str) -> Tuple[Optional[Decimal]
         with localcontext() as context:
             context.prec = 50
             price = quote / quantity
-    return quantity, price
+    return quantity, price, tuple(fill_prices)
 
 
-def _open_fill_from_result(row: Mapping[str, Any]) -> Tuple[Decimal, Decimal]:
+def _open_fill_from_result(
+    row: Mapping[str, Any]
+) -> Tuple[Decimal, Decimal, Tuple[Decimal, ...]]:
     if row.get("verdict") not in {"OPEN", "OPEN_EXPOSURE"}:
         raise MomentumLiveError("momentum OPEN result does not prove standing exposure")
-    quantity, price = _fill_values(row, "runner result")
+    quantity, price, fill_prices = _fill_values(row, "runner result")
     if quantity is None or price is None or quantity <= 0 or price <= 0:
         raise MomentumLiveError("momentum OPEN result lacks a positive actual fill")
-    return quantity, price
+    return quantity, price, fill_prices
 
 
 def reconcile_runner_truth(
@@ -529,11 +662,17 @@ def reconcile_runner_truth(
         )
         if result is None:
             raise MomentumLiveError("runner position stands without an OPEN ledger result")
-        quantity, price = _open_fill_from_result(result)
+        quantity, price, fill_prices = _open_fill_from_result(result)
         if position.quantity != quantity:
             raise MomentumLiveError("runner position and OPEN ledger quantity conflict")
-        if position.entry_price is not None and position.entry_price != price:
-            raise MomentumLiveError("runner position and OPEN ledger entry price conflict")
+        if position.entry_price is not None:
+            if not _within_fill_rounding(
+                position.entry_price, price, fill_prices
+            ):
+                raise MomentumLiveError(
+                    "runner position and OPEN ledger entry price conflict"
+                )
+            price = position.entry_price
         if lifecycle.apply_open_fill(
             state,
             position.symbol,
@@ -582,22 +721,25 @@ def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
     decision_id = row.get("decision_id")
     if not isinstance(decision_id, str) or not decision_id:
         raise MomentumLiveError("decision has no deterministic id")
-    for existing in _read_decisions(Path(path)):
-        if existing.get("decision_id") != decision_id:
-            continue
+    path = Path(path)
+    index = _decision_index(path)
+    existing = index.rows_by_id.get(decision_id)
+    if existing is not None:
         if existing != dict(row):
             raise MomentumLiveError(f"decision id conflict: {decision_id}")
         return False
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(dict(row), sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
     needs_separator = False
     if path.exists() and path.stat().st_size:
         with open(path, "rb") as check:
             check.seek(-1, os.SEEK_END)
             needs_separator = check.read(1) != b"\n"
-    encoded = (
-        json.dumps(dict(row), sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    if _rotate_decisions(path, len(encoded) + int(needs_separator)):
+        index = _decision_index(path)
+        needs_separator = False
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
     descriptor = os.open(str(path), flags, 0o600)
     try:
@@ -612,6 +754,8 @@ def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    _index_decision(index, json.loads(encoded))
+    index.signature = _decision_signature(path)
     return True
 
 
@@ -702,7 +846,7 @@ def _recover_unlogged_entries(
     records: Mapping[str, lifecycle.StreamRecord],
     receipt_path: Path,
     decisions_path: Path,
-    prior_rows: List[Dict[str, Any]],
+    issued_job_ids: Iterable[str],
     ignition_by_symbol: Dict[str, str],
     jobs_dir: Path,
     maximum: Decimal,
@@ -712,11 +856,7 @@ def _recover_unlogged_entries(
     job_writer: Callable[[Path, Mapping[str, Any]], bool],
 ) -> Tuple[str, ...]:
     """Recover an OPEN/EXIT receipt created before its decision-ledger row."""
-    issued = {
-        payload["job_id"]
-        for payload in (_job_from_ledger_row(row) for row in prior_rows)
-        if payload is not None
-    }
+    issued = set(issued_job_ids)
     action_receipts = _action_receipts(receipt_path)
     recovered: List[str] = []
     for symbol in sorted(state.tokens):
@@ -772,7 +912,6 @@ def _recover_unlogged_entries(
             job_ttl,
         )
         append_decision(decisions_path, row)
-        prior_rows.append(row)
         payload = row["job"]
         if payload is not None:
             lifecycle.bind_job_id(state, symbol, action, payload["job_id"])
@@ -1027,7 +1166,8 @@ def run_tick(
     records = lifecycle.read_stream_state(Path(stream_state_path))
     state = lifecycle.load_state(Path(state_path))
     replayed = lifecycle.reconcile_receipts(state, Path(receipt_path))
-    prior_rows = _read_decisions(Path(decisions_path))
+    decision_index = _decision_index(Path(decisions_path))
+    prior_job_rows = tuple(decision_index.job_rows)
     resolved_jobs_dir = Path(jobs_dir) if jobs_dir is not None else default_jobs_dir()
     resolved_position_path = (
         Path(position_path)
@@ -1041,17 +1181,24 @@ def run_tick(
     )
     resolved_job_writer = job_writer or write_job_record
 
-    ignition_by_symbol = _ignitions(prior_rows)
+    ignition_by_symbol = dict(decision_index.ignition_by_symbol)
     recovered = list(
-        _recover_jobs(prior_rows, resolved_jobs_dir, resolved_job_writer)
+        _recover_jobs(prior_job_rows, resolved_jobs_dir, resolved_job_writer)
     )
+    issued_job_ids = {
+        payload["job_id"]
+        for payload in (
+            _job_from_ledger_row(row) for row in prior_job_rows
+        )
+        if payload is not None
+    }
     recovered.extend(
         _recover_unlogged_entries(
             state,
             records,
             Path(receipt_path),
             Path(decisions_path),
-            prior_rows,
+            issued_job_ids,
             ignition_by_symbol,
             resolved_jobs_dir,
             maximum,
@@ -1061,7 +1208,7 @@ def run_tick(
             resolved_job_writer,
         )
     )
-    _bind_ledger_jobs(state, prior_rows)
+    _bind_ledger_jobs(state, prior_job_rows)
     reconcile_runner_truth(
         state,
         read_runner_position(resolved_position_path),

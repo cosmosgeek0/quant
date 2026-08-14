@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -26,6 +26,19 @@ FIXED_NOW = "2026-08-14T12:00:00.000Z"
 
 def fixed_now():
     return FIXED_NOW
+
+
+class AdvancingClock:
+    def __init__(self, value=FIXED_NOW):
+        self.value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    def __call__(self):
+        return self.value.isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+
+    def advance(self, minutes=1):
+        self.value += timedelta(minutes=minutes)
 
 
 def stream_payload(
@@ -178,13 +191,14 @@ class MomentumLiveTests(unittest.TestCase):
         ]
         return results
 
-    def inject_open(self, job, *, qty="0.071", price="112.5"):
+    def inject_open(self, job, *, qty="0.071", price="112.5", fills=None):
         self.position.parent.mkdir(parents=True, exist_ok=True)
-        fill = {
-            "trade_id": "91", "order_id": "1101", "price": price,
-            "qty": qty, "realized_pnl": "0", "commission": "0.003",
-            "commission_asset": "USDT",
-        }
+        if fills is None:
+            fills = [{
+                "trade_id": "91", "order_id": "1101", "price": price,
+                "qty": qty, "realized_pnl": "0", "commission": "0.003",
+                "commission_asset": "USDT",
+            }]
         self.position.write_text(
             json.dumps({
                 "version": 1,
@@ -193,7 +207,7 @@ class MomentumLiveTests(unittest.TestCase):
                 "symbol": "AAAUSDT",
                 "job_id": job["job_id"],
                 "measured_qty": qty,
-                "entry": {"qty": qty, "price": price, "fills": [fill]},
+                "entry": {"qty": qty, "price": price, "fills": fills},
             }),
             encoding="utf-8",
         )
@@ -203,7 +217,7 @@ class MomentumLiveTests(unittest.TestCase):
         receipt.write_text(json.dumps({
             "job_id": job["job_id"], "op": live.JOB_OPEN_OP,
             "symbol": "AAAUSDT", "verdict": "OPEN", "reason": "",
-            "utc": FIXED_NOW, "fills": [fill], "fees": [], "realized": {},
+            "utc": FIXED_NOW, "fills": fills, "fees": [], "realized": {},
         }), encoding="utf-8")
         self.results.write_text(
             json.dumps({
@@ -214,7 +228,7 @@ class MomentumLiveTests(unittest.TestCase):
                 "exit_code": 0,
                 "receipt_path": str(receipt),
                 "utc": FIXED_NOW,
-                "fills": [fill],
+                "fills": fills,
                 "fees": [],
                 "realized": {"gross_usdt": "0", "net_usdt": "UNKNOWN"},
             }) + "\n",
@@ -306,6 +320,56 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertEqual(token["qty"], "0")
         self.assertEqual(len(self.job_paths()), 2)
 
+    def test_multilevel_fill_accepts_exchange_rounded_entry_price(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        fills = [
+            {
+                "trade_id": "91", "order_id": "1101", "price": "100.01",
+                "qty": "0.5", "realized_pnl": "0", "commission": "0.001",
+                "commission_asset": "USDT",
+            },
+            {
+                "trade_id": "92", "order_id": "1101", "price": "100.02",
+                "qty": "0.5", "realized_pnl": "0", "commission": "0.001",
+                "commission_asset": "USDT",
+            },
+        ]
+        self.inject_open(open_job, qty="1", price="100.01", fills=fills)
+
+        held = self.tick(
+            stream_payload(
+                3, "150", "90", "9000", "1100",
+                spread_pct="0.006", oi_change_pct="3",
+            )
+        )
+        self.assertEqual(held.decisions[0]["action"], lifecycle.ACTION_ADD)
+        token = lifecycle.load_state(self.state).tokens["AAAUSDT"]
+        self.assertEqual(Decimal(token["qty"]), Decimal("1"))
+        self.assertEqual(token["avg_entry_price"], "100.01")
+
+    def test_multilevel_fill_entry_price_beyond_tick_fails_closed(self):
+        self.signal()
+        open_job = self.jobs_by_op()[live.JOB_OPEN_OP]
+        fills = [
+            {
+                "trade_id": "91", "order_id": "1101", "price": "100.01",
+                "qty": "0.5", "realized_pnl": "0", "commission": "0.001",
+                "commission_asset": "USDT",
+            },
+            {
+                "trade_id": "92", "order_id": "1101", "price": "100.02",
+                "qty": "0.5", "realized_pnl": "0", "commission": "0.001",
+                "commission_asset": "USDT",
+            },
+        ]
+        self.inject_open(open_job, qty="1", price="100.03", fills=fills)
+
+        with self.assertRaisesRegex(
+            live.MomentumLiveError, "entry price conflict"
+        ):
+            self.tick(stream_payload(3, "150", "90", "9000", "1100"))
+
     def test_open_and_exit_ids_are_deterministic_per_ignition(self):
         self.signal()
         jobs = self.jobs_by_op()
@@ -347,6 +411,45 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertEqual(replay.recovered_job_ids, ())
         self.assertEqual(replay.written_job_ids, ())
         self.assertEqual(len(self.job_paths()), 1)
+
+    def test_crash_after_job_publication_before_save_state_is_idempotent(self):
+        clock = AdvancingClock()
+        self.tick(
+            stream_payload(0, "100", "2", "100", "1000"), now_fn=clock
+        )
+        clock.advance()
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            ),
+            now_fn=clock,
+        )
+        clock.advance()
+        payload = stream_payload(
+            2, "108", "75", "7600", "1070", spread_pct="0.007"
+        )
+
+        def killed_after_publication(*_args, **_kwargs):
+            self.assertEqual(len(self.job_paths()), 1)
+            raise SimulatedKill("killed after job publication")
+
+        with mock.patch.object(
+            live.lifecycle, "save_state", side_effect=killed_after_publication
+        ):
+            with self.assertRaises(SimulatedKill):
+                self.tick(payload, now_fn=clock)
+        self.assertEqual(len(self.job_paths()), 1)
+
+        clock.advance()
+        replay = self.tick(payload, now_fn=clock)
+        self.assertEqual(replay.recovered_job_ids, ())
+        self.assertEqual(replay.written_job_ids, ())
+        self.assertEqual(len(self.job_paths()), 1)
+        enter_rows = [
+            row for row in self.decision_rows()
+            if row["action"] == lifecycle.ACTION_ENTER_SMALL
+        ]
+        self.assertEqual(len(enter_rows), 1)
 
     def test_crash_before_open_decision_append_recovers_receipt_and_job(self):
         self.tick(stream_payload(0, "100", "2", "100", "1000"))
@@ -474,6 +577,55 @@ class MomentumLiveTests(unittest.TestCase):
         summary = json.loads(stdout.getvalue().splitlines()[0])
         self.assertEqual(summary["jobs_written"], 1)
         self.assertEqual(self.jobs_by_op()[live.JOB_OPEN_OP]["op"], live.JOB_OPEN_OP)
+
+    def test_300_symbol_tick_decision_work_stays_bounded_across_history(self):
+        symbols = [f"S{index:03d}USDT" for index in range(300)]
+        clock = AdvancingClock()
+        read_counts = []
+        decision_times = []
+        original_read = live._read_decisions
+        threshold = 64 * 1024
+        common = {
+            "state_path": self.state,
+            "receipt_path": self.receipts,
+            "decisions_path": self.decisions,
+            "jobs_dir": self.jobs,
+            "position_path": self.position,
+            "results_path": self.results,
+            "config": self.config,
+            "now_fn": clock,
+        }
+        with mock.patch.object(
+            live, "DECISIONS_ROTATE_BYTES", threshold
+        ), mock.patch.object(
+            live, "_read_decisions", wraps=original_read
+        ) as reads, mock.patch.object(
+            live.os, "fsync", return_value=None
+        ), mock.patch.object(
+            live, "_fsync_directory", return_value=None
+        ):
+            for minute in range(12):
+                payload = {
+                    symbol: stream_payload(
+                        minute, "100", "2", "100", "1000"
+                    )
+                    for symbol in symbols
+                }
+                self.stream.write_text(json.dumps(payload), encoding="utf-8")
+                before = reads.call_count
+                result = live.run_tick(self.stream, **common)
+                read_counts.append(reads.call_count - before)
+                decision_times.append(result.decisions[0]["decision_utc"])
+                clock.advance()
+
+        backup = self.decisions.with_name(self.decisions.name + ".1")
+        self.assertTrue(backup.exists())
+        self.assertLessEqual(self.decisions.stat().st_size, threshold)
+        self.assertLessEqual(backup.stat().st_size, threshold)
+        self.assertLess(max(read_counts), 20)
+        self.assertLessEqual(max(read_counts[2:]) - min(read_counts[2:]), 2)
+        self.assertEqual(len(set(decision_times)), 12)
+        self.assertLess(len(live._decision_index(self.decisions).rows_by_id), 600)
 
     def test_runtime_caps_remain_decimal_only(self):
         self.stream.write_text("{}", encoding="utf-8")

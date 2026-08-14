@@ -234,6 +234,7 @@ def _paths(receipt_dir: str) -> Dict[str, str]:
         "momentum_position": os.path.join(
             receipt_dir, "momentum-position.json"
         ),
+        "bare_stop": os.path.join(receipt_dir, "STOP"),
         "stop": os.path.join(receipt_dir, "STOP-JOBS"),
         "tick_lock": os.path.join(jobs_dir, ".job-runner-active"),
     }
@@ -248,6 +249,13 @@ def _touch_stop(path: str) -> None:
     descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
     os.close(descriptor)
     os.chmod(path, 0o600)
+
+
+def _halt_marker(paths: Dict[str, str]) -> str:
+    for name in ("bare_stop", "stop"):
+        if os.path.exists(paths[name]):
+            return os.path.basename(paths[name])
+    return ""
 
 
 def _acquire_tick_lock(path: str, now: datetime) -> Tuple[str, bool]:
@@ -641,19 +649,23 @@ def _one_way_position(rows: Any, symbol: str, label: str) -> Decimal:
             not isinstance(row, dict) for row in rows):
         raise MomentumStateError("%s is not a position list" % label)
     matches = [row for row in rows if row.get("symbol") == symbol]
-    if len(matches) != 1:
-        raise MomentumStateError(
-            "%s did not return exactly one symbol row" % label
+    nonzero = []
+    for row in matches:
+        if row.get("positionSide", "BOTH") != "BOTH":
+            raise MomentumStateError("%s reported hedge-side state" % label)
+        amount = _momentum_decimal(
+            row.get("positionAmt"), label + " positionAmt",
+            allow_zero=True, allow_negative=True,
         )
-    row = matches[0]
-    if row.get("positionSide", "BOTH") != "BOTH":
-        raise MomentumStateError("%s reported hedge-side state" % label)
-    amount = _momentum_decimal(
-        row.get("positionAmt"), label + " positionAmt", allow_zero=True
-    )
-    if amount < 0:
-        raise MomentumStateError("%s reported a short position" % label)
-    return amount
+        if amount < 0:
+            raise MomentumStateError("%s reported a short position" % label)
+        if amount != 0:
+            nonzero.append(amount)
+    if len(nonzero) > 1:
+        raise MomentumStateError(
+            "%s returned more than one nonzero symbol row" % label
+        )
+    return nonzero[0] if nonzero else Decimal(0)
 
 
 def _momentum_measure(symbol: str) -> Dict[str, Any]:
@@ -1523,8 +1535,9 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
     now = now.astimezone(timezone.utc)
     paths = _paths(receipt_dir)
     _make_dirs(paths)
-    if os.path.exists(paths["stop"]):
-        print("JOB-RUNNER | HALTED | STOP-JOBS present")
+    halt_marker = _halt_marker(paths)
+    if halt_marker:
+        print("JOB-RUNNER | HALTED | %s present" % halt_marker)
         return 0
 
     token, stale = _acquire_tick_lock(paths["tick_lock"], now)
@@ -1536,8 +1549,9 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
         print("JOB-RUNNER | BUSY | another tick is active")
         return 0
     try:
-        if os.path.exists(paths["stop"]):
-            print("JOB-RUNNER | HALTED | STOP-JOBS present")
+        halt_marker = _halt_marker(paths)
+        if halt_marker:
+            print("JOB-RUNNER | HALTED | %s present" % halt_marker)
             return 0
         result_ids, bad_results, unresolved_result = _result_ids(paths["results"])
         if bad_results or unresolved_result \

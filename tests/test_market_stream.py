@@ -297,27 +297,69 @@ class SchemaCompletenessTests(OfflineCase):
 class SurgeMathTests(OfflineCase):
     def test_short_window_is_null_then_median_and_ratio_are_decimal_text(self):
         self.assertEqual(
-            ms.volume_metrics([["1", "10"], ["2", "20"]], 3),
+            ms.volume_metrics([["1000000", "10"], ["1060000", "20"]], 3),
             ("20", None, None),
         )
         self.assertEqual(
-            ms.volume_metrics([["1", "10"], ["2", "20"], ["3", "90"]], 3),
+            ms.volume_metrics(
+                [["1000000", "10"], ["1060000", "20"], ["1120000", "90"]],
+                3,
+            ),
             ("90", "20", "4.5"),
         )
 
     def test_zero_median_keeps_ratio_unknown(self):
         self.assertEqual(
-            ms.volume_metrics([["1", "0"], ["2", "0"], ["3", "4"]], 3),
+            ms.volume_metrics(
+                [["1000000", "0"], ["1060000", "0"], ["1120000", "4"]],
+                3,
+            ),
             ("4", "0", None),
+        )
+
+    def test_configured_span_coverage_and_per_candle_gap_both_fail_closed(self):
+        compressed = [
+            ["1000000", "1"],
+            ["1055000", "1"],
+            ["1110000", "1"],
+            ["1165000", "100"],
+        ]
+        self.assertEqual(
+            ms.volume_metrics(compressed, 4, Decimal("90")),
+            ("100", "1", "100"),
+        )
+        self.assertEqual(
+            ms.volume_metrics(compressed, 4, Decimal("95")),
+            ("100", None, None),
+        )
+        sparse = [
+            [str(FIXED_MS - (12 * 60 * 60 * 1000) - 3_000), "1"],
+            [str(FIXED_MS - 123_000), "1"],
+            [str(FIXED_MS - 63_000), "1"],
+            [str(FIXED_MS - 3_000), "100"],
+        ]
+        self.assertEqual(
+            ms.volume_metrics(sparse, 4),
+            ("100", None, None),
         )
 
 
 class LiveFeedMergeTests(OfflineCase):
     def test_fresh_feed_tickers_merge_for_the_complete_rest_universe(self):
         parsed = ms.argument_parser().parse_args(
-            ["--once", "--feed-state", str(self.feed_path)]
+            [
+                "--once",
+                "--feed-state",
+                str(self.feed_path),
+                "--window-min-coverage-pct",
+                "95",
+                "--basis-max-skew-ms",
+                "25",
+            ]
         )
         self.assertEqual(parsed.feed_state, self.feed_path)
+        self.assertEqual(parsed.window_min_coverage_pct, Decimal("95"))
+        self.assertEqual(parsed.basis_max_skew_ms, 25)
         self.write_feed(
             {
                 "AAAUSDT": feed_row("spot", "10", "11"),
@@ -333,7 +375,7 @@ class LiveFeedMergeTests(OfflineCase):
             ],
             kline_batches={"AAAUSDT": [klines(("1", "2", "3"))]},
         )
-        self.stream(
+        stats = self.stream(
             reader, focus_cap=1, feed_state_path=self.feed_path
         ).run_once()
         state = self.read_state()
@@ -347,6 +389,8 @@ class LiveFeedMergeTests(OfflineCase):
             if path == ms.SPOT_KLINES_PATH
         ]
         self.assertEqual(kline_symbols, ["AAAUSDT"])
+        self.assertTrue(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "accepted")
 
     def test_feed_windows_compute_surges_outside_the_focus_set(self):
         closes = (1_000_000, 1_060_000, 1_120_000)
@@ -401,13 +445,261 @@ class LiveFeedMergeTests(OfflineCase):
             spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
             kline_batches={"AAAUSDT": [klines(("1", "2", "3"))]},
         )
-        self.stream(
+        stats = self.stream(
             reader, focus_cap=1, feed_state_path=self.feed_path
         ).run_once()
         state = self.read_state()
         self.assertEqual(state["AAAUSDT"]["spot_bid"], "1")
         self.assertEqual(state["BBBUSDT"]["spot_bid"], "3")
         self.assertIsNone(state["BBBUSDT"]["surge_ratio"])
+        self.assertFalse(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "snapshot_stale")
+        with patch("builtins.print") as printer:
+            ms.print_stats(stats)
+        printer.assert_any_call("feed_used=no reason=snapshot_stale")
+
+    def test_sparse_four_candle_feed_repro_keeps_surge_unknown(self):
+        latest_close = FIXED_MS - 3_000
+        sparse_closes = (
+            latest_close - (12 * 60 * 60 * 1000),
+            latest_close - 120_000,
+            latest_close - 60_000,
+            latest_close,
+        )
+        self.write_feed(
+            {
+                "AAAUSDT": feed_row("spot", "10", "11"),
+                "BBBUSDT": feed_row(
+                    "spot",
+                    "20",
+                    "21",
+                    zip(sparse_closes, ("1", "1", "1", "100")),
+                ),
+            }
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1", "1"))]},
+        )
+        self.stream(
+            reader,
+            window=4,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+        ).run_once()
+        record = self.read_state()["BBBUSDT"]
+        self.assertEqual(record["vol_1m_quote"], "100")
+        self.assertIsNone(record["vol_med_1m"])
+        self.assertIsNone(record["surge_ratio"])
+        self.assertEqual(record["freshness_ms"], "3000")
+
+    def test_feed_spot_and_rest_perp_repro_never_splice_basis(self):
+        self.write_feed({"AAAUSDT": feed_row("spot", "89", "90")})
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        self.assertEqual(record["spot_ask"], "90")
+        self.assertEqual(record["perp_bid"], "100")
+        self.assertEqual(
+            ms._basis_gap(record["spot_ask"], record["perp_bid"]),
+            "11.111111111111111111111111111111111111111111111111",
+        )
+        self.assertIsNone(record["basis_gap_pct"])
+
+    def test_two_fresh_feed_legs_from_one_snapshot_can_compute_basis(self):
+        both = feed_row("spot", "89", "90")
+        both.update(
+            {
+                "venues": "both",
+                "perp_bid": "90",
+                "perp_ask": "91",
+            }
+        )
+        self.write_feed({"AAAUSDT": both})
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        self.assertEqual((record["spot_ask"], record["perp_bid"]), ("90", "90"))
+        self.assertEqual(record["basis_gap_pct"], "0")
+
+    def test_feed_leg_age_uncertainty_over_skew_bound_keeps_basis_unknown(self):
+        both = feed_row("spot", "89", "90")
+        both.update(
+            {
+                "venues": "both",
+                "perp_bid": "90",
+                "perp_ask": "91",
+                "freshness_ms": str(ms.DEFAULT_BASIS_MAX_SKEW_MS + 1),
+            }
+        )
+        self.write_feed({"AAAUSDT": both})
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        self.stream(
+            reader, focus_cap=1, feed_state_path=self.feed_path
+        ).run_once()
+        self.assertIsNone(self.read_state()["AAAUSDT"]["basis_gap_pct"])
+
+    def test_same_rest_source_over_skew_bound_keeps_basis_unknown(self):
+        clock = iter(
+            (
+                FIXED_MS,
+                FIXED_MS,
+                FIXED_MS + ms.DEFAULT_BASIS_MAX_SKEW_MS + 1,
+                FIXED_MS + ms.DEFAULT_BASIS_MAX_SKEW_MS + 1,
+                FIXED_MS + ms.DEFAULT_BASIS_MAX_SKEW_MS + 1,
+                FIXED_MS + ms.DEFAULT_BASIS_MAX_SKEW_MS + 1,
+            )
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        self.stream(reader, focus_cap=1, ms_fn=lambda: next(clock)).run_once()
+        self.assertIsNone(self.read_state()["AAAUSDT"]["basis_gap_pct"])
+
+
+class FeedDispositionTests(OfflineCase):
+    def test_every_feed_rejection_path_has_a_stable_reason(self):
+        self.assertEqual(
+            ms.load_fresh_feed_state(None, FIXED_MS).reason,
+            "not_configured",
+        )
+        self.assertEqual(
+            ms.load_fresh_feed_state(self.feed_path, FIXED_MS).reason,
+            "path_missing",
+        )
+        self.feed_path.write_text("{", encoding="utf-8")
+        self.assertEqual(
+            ms.load_fresh_feed_state(self.feed_path, FIXED_MS).reason,
+            "unreadable",
+        )
+
+        valid = {
+            "version": ms.FEED_STATE_VERSION,
+            "written_ms": str(FIXED_MS),
+            "symbols": {
+                "AAAUSDT": feed_row(
+                    "spot", "1", "2", ((1_000_000, "1"),)
+                )
+            },
+        }
+
+        def changed(*path_and_value):
+            payload = json.loads(json.dumps(valid))
+            *path, value = path_and_value
+            target = payload
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            return payload
+
+        cases = (
+            ("payload_not_mapping", []),
+            ("unsupported_version", changed("version", 2)),
+            ("written_ms_boolean", changed("written_ms", True)),
+            ("written_ms_invalid", changed("written_ms", "bad")),
+            ("written_ms_negative", changed("written_ms", "-1")),
+            ("written_ms_future", changed("written_ms", str(FIXED_MS + 1))),
+            (
+                "snapshot_stale",
+                changed(
+                    "written_ms",
+                    str(FIXED_MS - ms.DEFAULT_FEED_MAX_AGE_MS - 1),
+                ),
+            ),
+            ("symbols_not_mapping", changed("symbols", [])),
+            (
+                "symbol_invalid",
+                changed("symbols", {"bad": valid["symbols"]["AAAUSDT"]}),
+            ),
+            ("symbol_record_not_mapping", changed("symbols", {"AAAUSDT": []})),
+            (
+                "closed_1m_not_list",
+                changed("symbols", "AAAUSDT", "closed_1m", {}),
+            ),
+            (
+                "candle_shape_invalid",
+                changed("symbols", "AAAUSDT", "closed_1m", [["1"]]),
+            ),
+            (
+                "candle_time_invalid",
+                changed("symbols", "AAAUSDT", "closed_1m", [[True, "1"]]),
+            ),
+            (
+                "candle_time_negative",
+                changed("symbols", "AAAUSDT", "closed_1m", [["-1", "1"]]),
+            ),
+            (
+                "candle_time_not_increasing",
+                changed(
+                    "symbols",
+                    "AAAUSDT",
+                    "closed_1m",
+                    [["1", "1"], ["1", "2"]],
+                ),
+            ),
+            (
+                "candle_volume_invalid",
+                changed("symbols", "AAAUSDT", "closed_1m", [["1", "bad"]]),
+            ),
+            (
+                "candle_volume_negative",
+                changed("symbols", "AAAUSDT", "closed_1m", [["1", "-1"]]),
+            ),
+            ("venues_invalid", changed("symbols", "AAAUSDT", "venues", "bad")),
+            (
+                "spot_bid_invalid",
+                changed("symbols", "AAAUSDT", "spot_bid", "NaN"),
+            ),
+            (
+                "freshness_not_string",
+                changed("symbols", "AAAUSDT", "freshness_ms", 1),
+            ),
+            (
+                "freshness_invalid",
+                changed("symbols", "AAAUSDT", "freshness_ms", "bad"),
+            ),
+            (
+                "freshness_negative",
+                changed("symbols", "AAAUSDT", "freshness_ms", "-1"),
+            ),
+        )
+        for reason, payload in cases:
+            with self.subTest(reason=reason):
+                self.feed_path.write_text(json.dumps(payload), encoding="utf-8")
+                result = ms.load_fresh_feed_state(self.feed_path, FIXED_MS)
+                self.assertIsNone(result.snapshot)
+                self.assertEqual(result.reason, reason)
+
+        self.feed_path.write_text(json.dumps(valid), encoding="utf-8")
+        accepted = ms.load_fresh_feed_state(self.feed_path, FIXED_MS)
+        self.assertIsNotNone(accepted.snapshot)
+        self.assertEqual(accepted.reason, "accepted")
 
 
 class RotationCoverageTests(OfflineCase):

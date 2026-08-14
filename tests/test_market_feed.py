@@ -234,6 +234,87 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(merged["AAAUSDT"]["spot_step_size"], "0.001")
         self.assertEqual(set(merged["AAAUSDT"]), set(mf.FEED_FIELDS))
 
+    def test_venue_change_drops_windows_and_requires_new_subscription_plan(self):
+        phase = {"perp": False}
+
+        def reader(base_url, path, params):
+            self.assertEqual(params, {})
+            if base_url == mf.SPOT_BASE_URL:
+                self.assertEqual(path, mf.SPOT_EXCHANGE_INFO_PATH)
+                return {"symbols": [spot_info("AAAUSDT")]}
+            self.assertEqual((base_url, path), (mf.FAPI_BASE_URL, mf.FAPI_EXCHANGE_INFO_PATH))
+            return {
+                "symbols": [perp_info("AAAUSDT")] if phase["perp"] else []
+            }
+
+        with tempfile.TemporaryDirectory() as raw:
+            feed = mf.MarketFeed(
+                Path(raw) / "feed.json",
+                Path(raw) / "STOP",
+                serve=True,
+                window=3,
+                reader=reader,
+                ms_fn=lambda: FIXED_MS,
+            )
+            self.assertTrue(feed._refresh_metadata())
+            feed.windows["AAAUSDT"] = {
+                "closed_1m": [[str(FIXED_MS - 60_000), "10"]],
+                "venue": "spot",
+            }
+            old_urls = mf.websocket_urls(feed.state)
+            self.assertTrue(any("aaausdt@kline_1m" in url for url in old_urls["spot"]))
+
+            phase["perp"] = True
+            self.assertTrue(feed._refresh_metadata())
+            self.assertEqual(feed.state["AAAUSDT"]["venues"], "both")
+            self.assertNotIn("AAAUSDT", feed.windows)
+            new_urls = mf.websocket_urls(feed.state)
+            self.assertFalse(any("aaausdt@kline_1m" in url for url in new_urls["spot"]))
+            self.assertTrue(any("aaausdt@kline_1m" in url for url in new_urls["perp"]))
+
+            stale_spot = {
+                "s": "AAAUSDT",
+                "k": {
+                    "s": "AAAUSDT",
+                    "i": "1m",
+                    "T": FIXED_MS,
+                    "q": "99",
+                    "x": True,
+                },
+            }
+            self.assertEqual(
+                mf.merge_kline_rows(
+                    feed.state,
+                    "spot",
+                    "aaausdt@kline_1m",
+                    [stale_spot],
+                    feed.windows,
+                    3,
+                ),
+                set(),
+            )
+            new_perp = json.loads(json.dumps(stale_spot))
+            new_perp["k"]["q"] = "20"
+            self.assertEqual(
+                mf.merge_kline_rows(
+                    feed.state,
+                    "perp",
+                    "aaausdt@kline_1m",
+                    [new_perp],
+                    feed.windows,
+                    3,
+                ),
+                {"AAAUSDT"},
+            )
+            self.assertEqual(
+                feed.windows["AAAUSDT"],
+                {
+                    "closed_1m": [[str(FIXED_MS), "20"]],
+                    "venue": "perp",
+                    "last_volume_close_ms": str(FIXED_MS),
+                },
+            )
+
 
 class RecordMergeTests(unittest.TestCase):
     def setUp(self):
@@ -309,6 +390,30 @@ class RecordMergeTests(unittest.TestCase):
         self.assertIsNone(self.state["AAAUSDT"]["spot_ask"])
 
 
+class SubscriptionTests(unittest.TestCase):
+    def test_large_futures_universe_is_sharded_below_stream_cap(self):
+        symbols = [f"S{index:04d}USDT" for index in range(500)]
+        state = {
+            symbol: mf.empty_record(FIXED_UTC, "both") for symbol in symbols
+        }
+        urls = mf.websocket_urls(state)
+        self.assertEqual(len(urls["spot"]), 1)
+        self.assertEqual(len(urls["perp"]), 3)
+        subscribed_klines = []
+        for url in urls["perp"]:
+            streams = url.split("?streams=", 1)[1].split("/")
+            self.assertLessEqual(len(streams), mf.MAX_STREAMS_PER_CONNECTION)
+            subscribed_klines.extend(
+                stream
+                for stream in streams
+                if stream.endswith(mf.KLINE_STREAM_SUFFIX)
+            )
+        self.assertEqual(
+            subscribed_klines,
+            [f"{symbol.lower()}@kline_1m" for symbol in symbols],
+        )
+
+
 class RollingWindowTests(unittest.TestCase):
     def setUp(self):
         spot = mf.parse_exchange_metadata(
@@ -379,26 +484,36 @@ class RollingWindowTests(unittest.TestCase):
         windows = {
             "AAAUSDT": {
                 "closed_1m": [
-                    ["1000000", "10"],
-                    ["1060000", "20"],
-                    ["1120000", "90"],
-                ]
+                    [str(FIXED_MS - 120_000), "10"],
+                    [str(FIXED_MS - 60_000), "20"],
+                    [str(FIXED_MS), "90"],
+                ],
+                "venue": "perp",
             }
         }
         payload = mf.feed_snapshot_payload(self.state, windows, 3, FIXED_MS)
         self.assertEqual(payload["symbols"]["AAAUSDT"]["surge_ratio"], "4.5")
+        self.assertEqual(payload["window_oldest_ms"], str(FIXED_MS - 120_000))
+        self.assertEqual(payload["window_newest_ms"], str(FIXED_MS))
+        self.assertEqual(
+            payload["symbols"]["AAAUSDT"]["window_venue"], "perp"
+        )
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "feed.json"
             mf.atomic_write_json(path, payload)
             self.assertEqual(
-                mf.load_feed_windows(path, 3)["AAAUSDT"]["closed_1m"],
+                mf.load_feed_windows(path, 3, FIXED_MS)["AAAUSDT"]["closed_1m"],
                 windows["AAAUSDT"]["closed_1m"],
             )
             self.assertEqual(
                 mf.load_feed_state(path)["AAAUSDT"]["venues"], "both"
             )
             restarted = mf.MarketFeed(
-                path, Path(raw) / "STOP", serve=True, window=3
+                path,
+                Path(raw) / "STOP",
+                serve=True,
+                window=3,
+                ms_fn=lambda: FIXED_MS,
             )
             self.assertIsNone(restarted.state["AAAUSDT"]["spot_bid"])
             self.assertEqual(
@@ -406,10 +521,53 @@ class RollingWindowTests(unittest.TestCase):
                 windows["AAAUSDT"]["closed_1m"],
             )
         urls = mf.websocket_urls(self.state)
-        self.assertIn("/aaausdt@kline_1m", urls["perp"])
-        self.assertNotIn("/aaausdt@kline_1m", urls["spot"])
-        self.assertIn("/spotusdt@kline_1m", urls["spot"])
+        self.assertTrue(any("/aaausdt@kline_1m" in url for url in urls["perp"]))
+        self.assertFalse(any("/aaausdt@kline_1m" in url for url in urls["spot"]))
+        self.assertTrue(any("/spotusdt@kline_1m" in url for url in urls["spot"]))
         self.assertTrue(mf.argument_parser().parse_args(["--serve"]).serve)
+
+    def test_restart_filters_stale_windows_and_snapshot_reports_window_age(self):
+        windows = {
+            "AAAUSDT": {
+                "closed_1m": [
+                    [str(FIXED_MS - 180_001), "1"],
+                    [str(FIXED_MS - 120_000), "2"],
+                    [str(FIXED_MS - 60_000), "3"],
+                ],
+                "venue": "perp",
+            },
+            "SPOTUSDT": {
+                "closed_1m": [[str(FIXED_MS - 180_001), "4"]],
+                "venue": "spot",
+            },
+        }
+        payload = mf.feed_snapshot_payload(self.state, windows, 3, FIXED_MS - 1)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "feed.json"
+            mf.atomic_write_json(path, payload)
+            restored = mf.load_feed_windows(path, 3, FIXED_MS)
+        self.assertEqual(
+            restored["AAAUSDT"]["closed_1m"],
+            [
+                [str(FIXED_MS - 120_000), "2"],
+                [str(FIXED_MS - 60_000), "3"],
+            ],
+        )
+        self.assertNotIn("SPOTUSDT", restored)
+        fresh = mf.feed_snapshot_payload(
+            self.state, restored, 3, FIXED_MS
+        )
+        self.assertEqual(fresh["written_ms"], str(FIXED_MS))
+        self.assertEqual(fresh["window_oldest_ms"], str(FIXED_MS - 120_000))
+        self.assertEqual(fresh["window_newest_ms"], str(FIXED_MS - 60_000))
+        self.assertEqual(
+            fresh["symbols"]["AAAUSDT"]["window_oldest_ms"],
+            str(FIXED_MS - 120_000),
+        )
+        self.assertEqual(
+            fresh["symbols"]["AAAUSDT"]["window_newest_ms"],
+            str(FIXED_MS - 60_000),
+        )
 
     def test_combined_closed_kline_message_is_parsed(self):
         data = self.kline("AAAUSDT", 1_000_000, "10")
@@ -421,6 +579,11 @@ class RollingWindowTests(unittest.TestCase):
 
 
 class RestartTests(unittest.TestCase):
+    def test_default_stop_path_is_runtime_receipt_stop(self):
+        expected = mf.RUNTIME_PATHS.receipt_dir / "STOP"
+        self.assertEqual(mf.DEFAULT_STOP_PATH, expected)
+        self.assertEqual(mf.argument_parser().parse_args([]).stop_file, expected)
+
     def test_extended_state_round_trips_and_base_state_is_upgraded(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "stream_state.json"
@@ -463,6 +626,8 @@ class ReconnectTests(unittest.TestCase):
         stopped = {"value": False}
         waits = []
         connects = []
+        attempts = []
+        failures = []
 
         class ClosingClient:
             def __init__(self, message=None):
@@ -499,13 +664,64 @@ class ReconnectTests(unittest.TestCase):
             connector=connector,
             stop_requested=lambda: stopped["value"],
             wait_fn=lambda delay: waits.append(delay) or False,
+            on_attempt=lambda: attempts.append(True),
+            on_connect_failure=lambda: failures.append(True),
             initial_backoff=1,
             maximum_backoff=8,
         )
         self.assertEqual(len(connects), 3)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(failures), 1)
         self.assertEqual(waits, [1, 2])
         self.assertTrue(closing.closed)
         self.assertTrue(final.closed)
+
+    def test_never_connected_shard_counts_failures_and_stays_broken(self):
+        with tempfile.TemporaryDirectory() as raw:
+            feed = mf.MarketFeed(
+                Path(raw) / "feed.json",
+                Path(raw) / "STOP",
+                serve=True,
+                window=3,
+                ms_fn=lambda: FIXED_MS,
+            )
+            urls = {"spot": [mf.SPOT_WS_URL], "perp": [mf.FAPI_WS_URL]}
+            feed._reset_connections(urls)
+
+            stopped = {"value": False}
+
+            def on_attempt():
+                feed._record_connection_event("attempt", "perp", 0)
+
+            def on_failure():
+                feed._record_connection_event("handshake_failed", "perp", 0)
+                if feed.connections["perp"]["handshake_failures"] == 3:
+                    stopped["value"] = True
+
+            def fail_connect(url):
+                self.assertEqual(url, mf.FAPI_WS_URL)
+                raise OSError("injected handshake failure")
+
+            mf.run_reconnect_loop(
+                mf.FAPI_WS_URL,
+                lambda text: None,
+                connector=fail_connect,
+                stop_requested=lambda: stopped["value"],
+                wait_fn=lambda delay: False,
+                on_attempt=on_attempt,
+                on_connect_failure=on_failure,
+            )
+            payload = mf.feed_snapshot_payload(
+                {}, {}, 3, FIXED_MS, feed.connections
+            )
+        venue = payload["connections"]["perp"]
+        shard = venue["shards"][0]
+        self.assertEqual(venue["status"], "broken")
+        self.assertEqual(venue["successful_handshakes"], 0)
+        self.assertEqual(venue["handshake_failures"], 3)
+        self.assertEqual(venue["reconnects"], 2)
+        self.assertEqual(shard["handshake_failures"], 3)
+        self.assertEqual(shard["reconnects"], 2)
 
     def test_socket_timeout_checks_stop_without_reconnect(self):
         stopped = {"value": False}

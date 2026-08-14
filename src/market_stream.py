@@ -69,11 +69,15 @@ DEFAULT_THRESHOLDS = (Decimal("2"), Decimal("3"), Decimal("5"))
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_REQUEST_SPACING_SECONDS = 0.05
 DEFAULT_FEED_MAX_AGE_MS = 5_000
+DEFAULT_WINDOW_MIN_COVERAGE_PCT = Decimal("90")
+DEFAULT_BASIS_MAX_SKEW_MS = 1_000
+CANDLE_INTERVAL_MS = 60_000
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_RESPONSE_BYTES = 32_000_000
 MAX_WINDOW = 998  # request asks for window + 2, below Binance's 1000 limit
 MAX_FOCUS_CAP = 200
 MAX_FEED_MAX_AGE_MS = 300_000
+MAX_BASIS_MAX_SKEW_MS = 60_000
 SIDECAR_VERSION = 1
 FEED_STATE_VERSION = 1
 EXIT_INPUT = 2
@@ -145,6 +149,9 @@ class PassStats:
     rotation_slots: int
     coverage_passes: int
     window: int
+    window_min_coverage_pct: str
+    feed_used: bool
+    feed_reason: str
     top_surges: Tuple[Tuple[str, str], ...]
 
 
@@ -152,6 +159,12 @@ class PassStats:
 class FeedSnapshot:
     written_ms: int
     symbols: Mapping[str, Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class FeedLoadResult:
+    snapshot: Optional[FeedSnapshot]
+    reason: str
 
 
 def now_utc() -> str:
@@ -339,76 +352,110 @@ def load_fresh_feed_state(
     path: Optional[Path],
     now_ms: int,
     max_age_ms: int = DEFAULT_FEED_MAX_AGE_MS,
-) -> Optional[FeedSnapshot]:
-    """Return one validated live-feed snapshot, or ``None`` for fallback."""
-    if path is None or not Path(path).exists():
-        return None
+) -> FeedLoadResult:
+    """Return one validated live-feed snapshot plus one factual disposition."""
+    if path is None:
+        return FeedLoadResult(None, "not_configured")
+    if not Path(path).exists():
+        return FeedLoadResult(None, "path_missing")
     try:
         payload = _read_json_file(Path(path), "market feed state")
-        if not isinstance(payload, dict) or payload.get("version") != FEED_STATE_VERSION:
-            return None
-        raw_written = payload.get("written_ms")
-        if isinstance(raw_written, bool):
-            return None
+    except DataReadError:
+        return FeedLoadResult(None, "unreadable")
+    if not isinstance(payload, dict):
+        return FeedLoadResult(None, "payload_not_mapping")
+    if payload.get("version") != FEED_STATE_VERSION:
+        return FeedLoadResult(None, "unsupported_version")
+    raw_written = payload.get("written_ms")
+    if isinstance(raw_written, bool):
+        return FeedLoadResult(None, "written_ms_boolean")
+    try:
         written_ms = int(str(raw_written))
-        if written_ms < 0 or written_ms > now_ms or now_ms - written_ms > max_age_ms:
-            return None
-        raw_symbols = payload.get("symbols")
-        if not isinstance(raw_symbols, dict):
-            return None
-        symbols: Dict[str, Dict[str, Any]] = {}
-        for raw_symbol, raw_record in raw_symbols.items():
-            symbol = _valid_symbol(raw_symbol)
-            if symbol is None or not isinstance(raw_record, dict):
-                return None
-            closed = raw_record.get("closed_1m", [])
-            if not isinstance(closed, list):
-                return None
-            clean_closed: List[List[str]] = []
-            previous_close = -1
-            for pair in closed:
-                if not isinstance(pair, list) or len(pair) != 2:
-                    return None
+    except (TypeError, ValueError):
+        return FeedLoadResult(None, "written_ms_invalid")
+    if written_ms < 0:
+        return FeedLoadResult(None, "written_ms_negative")
+    if written_ms > now_ms:
+        return FeedLoadResult(None, "written_ms_future")
+    if now_ms - written_ms > max_age_ms:
+        return FeedLoadResult(None, "snapshot_stale")
+    raw_symbols = payload.get("symbols")
+    if not isinstance(raw_symbols, dict):
+        return FeedLoadResult(None, "symbols_not_mapping")
+    symbols: Dict[str, Dict[str, Any]] = {}
+    for raw_symbol, raw_record in raw_symbols.items():
+        symbol = _valid_symbol(raw_symbol)
+        if symbol is None:
+            return FeedLoadResult(None, "symbol_invalid")
+        if not isinstance(raw_record, dict):
+            return FeedLoadResult(None, "symbol_record_not_mapping")
+        closed = raw_record.get("closed_1m", [])
+        if not isinstance(closed, list):
+            return FeedLoadResult(None, "closed_1m_not_list")
+        clean_closed: List[List[str]] = []
+        previous_close = -1
+        for pair in closed:
+            if not isinstance(pair, list) or len(pair) != 2:
+                return FeedLoadResult(None, "candle_shape_invalid")
+            raw_close = pair[0]
+            if isinstance(raw_close, bool):
+                return FeedLoadResult(None, "candle_time_invalid")
+            try:
                 close_ms = int(str(pair[0]))
+            except (TypeError, ValueError):
+                return FeedLoadResult(None, "candle_time_invalid")
+            try:
                 volume = decimal_value(pair[1], f"feed {symbol} quote volume")
-                if close_ms <= previous_close or volume < 0:
-                    return None
-                previous_close = close_ms
-                clean_closed.append([str(close_ms), decimal_string(volume)])
-            clean_record = {
-                field: raw_record.get(field)
-                for field in (
-                    "venues",
-                    "spot_bid",
-                    "spot_ask",
-                    "perp_bid",
-                    "perp_ask",
-                    "freshness_ms",
-                )
-            }
-            if clean_record["venues"] not in VENUE_VALUES:
-                return None
+            except DataReadError:
+                return FeedLoadResult(None, "candle_volume_invalid")
+            if close_ms < 0:
+                return FeedLoadResult(None, "candle_time_negative")
+            if close_ms <= previous_close:
+                return FeedLoadResult(None, "candle_time_not_increasing")
+            if volume < 0:
+                return FeedLoadResult(None, "candle_volume_negative")
+            previous_close = close_ms
+            clean_closed.append([str(close_ms), decimal_string(volume)])
+        clean_record = {
+            field: raw_record.get(field)
             for field in (
+                "venues",
                 "spot_bid",
                 "spot_ask",
                 "perp_bid",
                 "perp_ask",
-            ):
-                raw = clean_record[field]
-                if raw is not None:
+                "freshness_ms",
+            )
+        }
+        if clean_record["venues"] not in VENUE_VALUES:
+            return FeedLoadResult(None, "venues_invalid")
+        for field in (
+            "spot_bid",
+            "spot_ask",
+            "perp_bid",
+            "perp_ask",
+        ):
+            raw = clean_record[field]
+            if raw is not None:
+                try:
                     _validate_numeric_text(raw, f"feed {symbol}.{field}")
-            raw_freshness = clean_record["freshness_ms"]
-            if raw_freshness is not None:
-                if not isinstance(raw_freshness, str):
-                    return None
+                except DataReadError:
+                    return FeedLoadResult(None, f"{field}_invalid")
+        raw_freshness = clean_record["freshness_ms"]
+        if raw_freshness is not None:
+            if not isinstance(raw_freshness, str):
+                return FeedLoadResult(None, "freshness_not_string")
+            try:
                 freshness = int(raw_freshness)
-                if freshness < 0:
-                    return None
-            clean_record["closed_1m"] = clean_closed
-            symbols[symbol] = clean_record
-        return FeedSnapshot(written_ms=written_ms, symbols=symbols)
-    except (DataReadError, OSError, TypeError, ValueError):
-        return None
+            except ValueError:
+                return FeedLoadResult(None, "freshness_invalid")
+            if freshness < 0:
+                return FeedLoadResult(None, "freshness_negative")
+        clean_record["closed_1m"] = clean_closed
+        symbols[symbol] = clean_record
+    return FeedLoadResult(
+        FeedSnapshot(written_ms=written_ms, symbols=symbols), "accepted"
+    )
 
 
 def _empty_sidecar(window: int) -> Dict[str, Any]:
@@ -630,15 +677,38 @@ def merge_closed_window(
 
 
 def volume_metrics(
-    closed: Sequence[Sequence[Any]], window: int
+    closed: Sequence[Sequence[Any]],
+    window: int,
+    min_coverage_pct: Decimal = DEFAULT_WINDOW_MIN_COVERAGE_PCT,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     if not closed:
         return None, None, None
+    coverage_pct = decimal_value(min_coverage_pct, "window minimum coverage")
+    if coverage_pct <= 0 or coverage_pct > 100:
+        raise DataReadError("window minimum coverage must be in (0, 100]")
     volumes = [decimal_value(pair[1], "rolling quote volume") for pair in closed]
     latest = volumes[-1]
     if len(volumes) < window:
         return decimal_string(latest), None, None
+    sample_pairs = closed[-window:]
     sample = volumes[-window:]
+    try:
+        close_times = [int(str(pair[0])) for pair in sample_pairs]
+    except (IndexError, TypeError, ValueError):
+        return decimal_string(latest), None, None
+    gaps = [
+        current - previous
+        for previous, current in zip(close_times, close_times[1:])
+    ]
+    observed_span_ms = close_times[-1] - close_times[0] + CANDLE_INTERVAL_MS
+    nominal_span_ms = window * CANDLE_INTERVAL_MS
+    span_is_covered = (
+        Decimal(observed_span_ms) * Decimal(100)
+        >= Decimal(nominal_span_ms) * coverage_pct
+    )
+    gaps_are_contiguous = all(0 < gap <= CANDLE_INTERVAL_MS for gap in gaps)
+    if not span_is_covered or not gaps_are_contiguous:
+        return decimal_string(latest), None, None
     med = median(sample)
     if med == 0:
         ratio = None
@@ -688,6 +758,40 @@ def _basis_gap(spot_ask: Optional[str], perp_bid: Optional[str]) -> Optional[str
     with localcontext() as context:
         context.prec = 50
         return decimal_string((bid - ask) / ask * Decimal(100))
+
+
+def _coherent_basis_gap(
+    record: Mapping[str, Any],
+    observations: Mapping[str, Tuple[str, int, int]],
+    now_ms: int,
+    max_age_ms: int,
+    max_skew_ms: int,
+) -> Optional[str]:
+    """Compute basis only from fresh legs observed by one source near in time."""
+    if record.get("venues") != "both":
+        return None
+    spot_observation = observations.get("spot")
+    perp_observation = observations.get("perp")
+    if spot_observation is None or perp_observation is None:
+        return None
+    spot_source, spot_earliest_ms, spot_latest_ms = spot_observation
+    perp_source, perp_earliest_ms, perp_latest_ms = perp_observation
+    if spot_source != perp_source:
+        return None
+    max_possible_skew_ms = max(
+        spot_latest_ms - perp_earliest_ms,
+        perp_latest_ms - spot_earliest_ms,
+    )
+    if max_possible_skew_ms > max_skew_ms:
+        return None
+    if (
+        not 0 <= now_ms - spot_latest_ms
+        or now_ms - spot_earliest_ms > max_age_ms
+        or not 0 <= now_ms - perp_latest_ms
+        or now_ms - perp_earliest_ms > max_age_ms
+    ):
+        return None
+    return _basis_gap(record.get("spot_ask"), record.get("perp_bid"))
 
 
 def _oi_value(payload: Any, symbol: str) -> str:
@@ -763,6 +867,8 @@ class MarketStream:
         window: int = DEFAULT_WINDOW,
         focus_cap: int = DEFAULT_FOCUS_CAP,
         feed_max_age_ms: int = DEFAULT_FEED_MAX_AGE_MS,
+        window_min_coverage_pct: Decimal = DEFAULT_WINDOW_MIN_COVERAGE_PCT,
+        basis_max_skew_ms: int = DEFAULT_BASIS_MAX_SKEW_MS,
         thresholds: Sequence[Decimal] = DEFAULT_THRESHOLDS,
         reader: Optional[Callable[[str, str, Mapping[str, str]], Any]] = None,
         utc_fn: Callable[[], str] = now_utc,
@@ -777,6 +883,23 @@ class MarketStream:
         if not 1 <= feed_max_age_ms <= MAX_FEED_MAX_AGE_MS:
             raise ValueError(
                 f"feed_max_age_ms must be between 1 and {MAX_FEED_MAX_AGE_MS}"
+            )
+        try:
+            normalized_coverage_pct = decimal_value(
+                window_min_coverage_pct, "window minimum coverage"
+            )
+        except DataReadError:
+            raise ValueError("window_min_coverage_pct must be a decimal") from None
+        if not 0 < normalized_coverage_pct <= 100:
+            raise ValueError("window_min_coverage_pct must be in (0, 100]")
+        if (
+            isinstance(basis_max_skew_ms, bool)
+            or not isinstance(basis_max_skew_ms, int)
+            or not 0 <= basis_max_skew_ms <= MAX_BASIS_MAX_SKEW_MS
+        ):
+            raise ValueError(
+                "basis_max_skew_ms must be between 0 and "
+                f"{MAX_BASIS_MAX_SKEW_MS}"
             )
         normalized_thresholds = tuple(sorted(set(thresholds)))
         if not normalized_thresholds or any(
@@ -800,6 +923,8 @@ class MarketStream:
         self.window = window
         self.focus_cap = focus_cap
         self.feed_max_age_ms = feed_max_age_ms
+        self.window_min_coverage_pct = normalized_coverage_pct
+        self.basis_max_skew_ms = basis_max_skew_ms
         self.thresholds = normalized_thresholds
         self.reader = reader if reader is not None else PublicJsonReader()
         self.utc_fn = utc_fn
@@ -848,9 +973,9 @@ class MarketStream:
     @staticmethod
     def _merge_feed_ticker(
         record: Dict[str, Any], feed_record: Mapping[str, Any]
-    ) -> bool:
+    ) -> frozenset[str]:
         """Prefer complete, uncrossed feed books without erasing REST truth."""
-        merged = False
+        merged_venues = set()
         feed_venues = feed_record.get("venues")
         for venue, prefix in (("spot", "spot"), ("perp", "perp")):
             if record["venues"] not in {venue, "both"}:
@@ -867,12 +992,8 @@ class MarketStream:
                 continue
             record[f"{prefix}_bid"] = decimal_string(bid_value)
             record[f"{prefix}_ask"] = decimal_string(ask_value)
-            merged = True
-        if record["venues"] == "both":
-            record["basis_gap_pct"] = _basis_gap(
-                record["spot_ask"], record["perp_bid"]
-            )
-        return merged
+            merged_venues.add(venue)
+        return frozenset(merged_venues)
 
     def _base_record(
         self,
@@ -898,7 +1019,11 @@ class MarketStream:
                 premium_row, "nextFundingTime", f"USD-M premium {symbol}"
             )
         meta = self.sidecar["symbols"].get(symbol, {})
-        vol, vol_med, surge = volume_metrics(meta.get("closed_1m", []), self.window)
+        vol, vol_med, surge = volume_metrics(
+            meta.get("closed_1m", []),
+            self.window,
+            self.window_min_coverage_pct,
+        )
         previous = self.state.get(symbol, {})
         previous_oi = previous.get("oi") if venue in {"perp", "both"} else None
         return {
@@ -916,7 +1041,7 @@ class MarketStream:
             "oi_change_pct": None,
             "funding_rate": funding_rate,
             "next_funding_ms": next_funding_ms,
-            "basis_gap_pct": _basis_gap(spot_ask, perp_bid) if venue == "both" else None,
+            "basis_gap_pct": None,
             "freshness_ms": "0",
         }
 
@@ -944,7 +1069,9 @@ class MarketStream:
                 meta.get("closed_1m", []), closed, self.window
             )
             meta["last_volume_close_ms"] = str(int(meta["closed_1m"][-1][0]))
-            vol, vol_med, surge = volume_metrics(meta["closed_1m"], self.window)
+            vol, vol_med, surge = volume_metrics(
+                meta["closed_1m"], self.window, self.window_min_coverage_pct
+            )
             record["vol_1m_quote"] = vol
             record["vol_med_1m"] = vol_med
             record["surge_ratio"] = surge
@@ -981,8 +1108,11 @@ class MarketStream:
             "bulk", FAPI_BASE_URL, FAPI_EXCHANGE_INFO_PATH, {}
         )
         spot_payload = self._read("bulk", SPOT_BASE_URL, SPOT_BOOK_PATH, {})
+        spot_book_ms = self.ms_fn()
         perp_payload = self._read("bulk", FAPI_BASE_URL, FAPI_BOOK_PATH, {})
+        perp_book_ms = self.ms_fn()
         premium_payload = self._read("bulk", FAPI_BASE_URL, FAPI_PREMIUM_PATH, {})
+        basis_now_ms = self.ms_fn()
         spot_universe = trading_symbols(spot_info_payload, "Spot")
         perp_universe = trading_symbols(
             perp_info_payload, "USD-M", perpetual_only=True
@@ -1002,9 +1132,10 @@ class MarketStream:
         if not universe:
             raise DataReadError("bulk reads produced an empty USDT universe")
 
-        feed_snapshot = load_fresh_feed_state(
+        feed_load = load_fresh_feed_state(
             self.feed_state_path, pass_start_ms, self.feed_max_age_ms
         )
+        feed_snapshot = feed_load.snapshot
         if feed_snapshot is not None:
             self._merge_feed_windows(feed_snapshot, universe)
 
@@ -1019,6 +1150,11 @@ class MarketStream:
                 perp.get(symbol),
                 premium.get(symbol),
             )
+            observations: Dict[str, Tuple[str, int, int]] = {}
+            if records[symbol]["spot_ask"] is not None:
+                observations["spot"] = ("rest", spot_book_ms, spot_book_ms)
+            if records[symbol]["perp_bid"] is not None:
+                observations["perp"] = ("rest", perp_book_ms, perp_book_ms)
             if feed_snapshot is not None:
                 feed_record = feed_snapshot.symbols.get(symbol)
                 if feed_record is not None:
@@ -1032,9 +1168,26 @@ class MarketStream:
                     if (
                         total_age is not None
                         and total_age <= self.feed_max_age_ms
-                        and self._merge_feed_ticker(records[symbol], feed_record)
                     ):
-                        feed_ticker_ages[symbol] = total_age
+                        merged_venues = self._merge_feed_ticker(
+                            records[symbol], feed_record
+                        )
+                        if merged_venues:
+                            feed_ticker_ages[symbol] = total_age
+                            earliest_ms = feed_snapshot.written_ms - source_age
+                            for merged_venue in merged_venues:
+                                observations[merged_venue] = (
+                                    "feed",
+                                    earliest_ms,
+                                    feed_snapshot.written_ms,
+                                )
+            records[symbol]["basis_gap_pct"] = _coherent_basis_gap(
+                records[symbol],
+                observations,
+                basis_now_ms,
+                self.feed_max_age_ms,
+                self.basis_max_skew_ms,
+            )
         scores = {
             symbol: move_score(records[symbol], self.state.get(symbol))
             for symbol in universe
@@ -1141,6 +1294,11 @@ class MarketStream:
             rotation_slots=selection.rotation_slots,
             coverage_passes=selection.coverage_passes,
             window=self.window,
+            window_min_coverage_pct=decimal_string(
+                self.window_min_coverage_pct
+            ),
+            feed_used=feed_snapshot is not None,
+            feed_reason=feed_load.reason,
             top_surges=tuple(ranked_surges[:5]),
         )
 
@@ -1166,7 +1324,13 @@ def print_stats(stats: PassStats) -> None:
     )
     print(
         f"volume window_closed_1m={stats.window} "
+        f"min_span_coverage_pct={stats.window_min_coverage_pct} "
+        f"max_candle_gap_ms={CANDLE_INTERVAL_MS} "
         "source=perp_when_available_else_spot"
+    )
+    print(
+        f"feed_used={'yes' if stats.feed_used else 'no'} "
+        f"reason={stats.feed_reason}"
     )
     if stats.top_surges:
         rendered = ",".join(f"{symbol}:{ratio}" for symbol, ratio in stats.top_surges)
@@ -1224,6 +1388,16 @@ def bounded_int(low: int, high: int, label: str) -> Callable[[str], int]:
     return parse
 
 
+def percentage_decimal(raw: str) -> Decimal:
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        raise argparse.ArgumentTypeError("percentage must be a decimal") from None
+    if not value.is_finite() or not 0 < value <= 100:
+        raise argparse.ArgumentTypeError("percentage must be in (0, 100]")
+    return value
+
+
 def threshold_list(raw: str) -> Tuple[Decimal, ...]:
     values: List[Decimal] = []
     for part in raw.split(","):
@@ -1269,6 +1443,18 @@ def argument_parser() -> argparse.ArgumentParser:
         "--window",
         type=bounded_int(2, MAX_WINDOW, "window"),
         default=DEFAULT_WINDOW,
+    )
+    parser.add_argument(
+        "--window-min-coverage-pct",
+        type=percentage_decimal,
+        default=DEFAULT_WINDOW_MIN_COVERAGE_PCT,
+        help="minimum time-span coverage for a complete 1m volume window",
+    )
+    parser.add_argument(
+        "--basis-max-skew-ms",
+        type=bounded_int(0, MAX_BASIS_MAX_SKEW_MS, "basis max skew"),
+        default=DEFAULT_BASIS_MAX_SKEW_MS,
+        help="maximum observation-time skew between basis legs",
     )
     parser.add_argument(
         "--focus-cap",
@@ -1321,6 +1507,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             window=args.window,
             focus_cap=args.focus_cap,
             feed_max_age_ms=args.feed_max_age_ms,
+            window_min_coverage_pct=args.window_min_coverage_pct,
+            basis_max_skew_ms=args.basis_max_skew_ms,
             thresholds=args.surge_thresholds,
             reader=PublicJsonReader(args.timeout),
             request_spacing=args.request_spacing,

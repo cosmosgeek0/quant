@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import unittest
 from dataclasses import asdict
@@ -15,6 +16,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import runtime_paths  # noqa: E402
+
+
+SCRIPTS = ROOT / "scripts"
+JOB_TICK = SCRIPTS / "job_tick.sh"
+RUNTIME_CONTROL = SCRIPTS / "runtime_control.sh"
+RUNTIME_TICK = SCRIPTS / "runtime_tick.sh"
 
 
 class RuntimePathsTests(unittest.TestCase):
@@ -93,6 +100,48 @@ class RuntimePathsTests(unittest.TestCase):
             with self.subTest(raw=repr(raw)):
                 with self.assertRaises(ValueError):
                     runtime_paths.resolve_runtime_paths({"RECEIPT_DIR": raw})
+
+
+class RuntimeShellContractTests(unittest.TestCase):
+    def test_runtime_shells_are_valid_bash(self):
+        for script in (JOB_TICK, RUNTIME_CONTROL, RUNTIME_TICK):
+            with self.subTest(script=script.name):
+                checked = subprocess.run(
+                    ["bash", "-n", str(script)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_job_cron_uses_deploy_script_without_stale_pins(self):
+        installed_patterns = (
+            'JOB_TICK_TARGET="$DEPLOY_DIR/scripts/job_tick.sh"',
+            'JOB_CRON="* * * * * $JOB_TICK_TARGET"',
+        )
+        for pattern in installed_patterns:
+            installed = subprocess.run(
+                ["grep", "-F", pattern, str(RUNTIME_CONTROL)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        checked_scripts = (str(JOB_TICK), str(RUNTIME_CONTROL))
+        forbidden = (
+            "/home/ssm-user/quant-run/wave2-validate-h2",
+            "fd1bd00269bd1e6bd45dcb47ba52a44ea01bde04",
+        )
+        for literal in forbidden:
+            with self.subTest(literal=literal):
+                found = subprocess.run(
+                    ["grep", "-Fn", "--", literal, *checked_scripts],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(found.returncode, 1, found.stdout)
 
 
 if __name__ == "__main__":

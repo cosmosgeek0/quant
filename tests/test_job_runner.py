@@ -49,6 +49,49 @@ class LeverageTransport:
         raise AssertionError("unexpected leverage transport call")
 
 
+class MomentumReadTransport:
+    """Serve complete signed momentum snapshots at the HTTP boundary."""
+
+    def __init__(self, events):
+        self.calls = []
+        self.events = events
+        self.snapshots = []
+        self.active = None
+
+    def queue(self, risks, positions, orders=(), leverage=1):
+        self.snapshots.append({
+            "/fapi/v3/positionRisk": [dict(row) for row in risks],
+            "/fapi/v3/account": {
+                "positions": [dict(row) for row in positions],
+            },
+            "/fapi/v1/openOrders": [dict(row) for row in orders],
+            "/fapi/v1/symbolConfig": [{
+                "symbol": "TSTUSDT",
+                "leverage": str(leverage),
+            }],
+        })
+
+    def __call__(self, method, path, params=None, signed=False):
+        call = (method, path, dict(params or {}), signed)
+        self.calls.append(call)
+        self.events.append(("momentum-read", call))
+        if method != "GET" or not signed:
+            raise AssertionError("momentum truth read was not a signed GET")
+        if path == "/fapi/v3/positionRisk":
+            if self.active is not None or not self.snapshots:
+                raise AssertionError("unexpected momentum snapshot start")
+            self.active = self.snapshots.pop(0)
+        if self.active is None or path not in self.active:
+            raise AssertionError("unexpected momentum truth read: " + path)
+        payload = self.active[path]
+        if path == "/fapi/v1/symbolConfig":
+            self.active = None
+        return "ok", payload
+
+
+_SAME_POSITION = object()
+
+
 class JobRunnerTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -62,9 +105,9 @@ class JobRunnerTests(unittest.TestCase):
         self.hand_verdict = "CLOSED"
         self.hand_exit = 0
         self.leverage = LeverageTransport(self.events)
+        self.momentum_reads = MomentumReadTransport(self.events)
         self.momentum_intents = []
         self.momentum_plan_caps = []
-        self.momentum_measurements = []
         self.momentum_query_state = "terminal"
         self.open_quote_override = None
 
@@ -182,12 +225,28 @@ class JobRunnerTests(unittest.TestCase):
             "current_leverage": 1,
         }
 
-    def fake_momentum_measure(self, symbol):
-        self.assertEqual(symbol, "TSTUSDT")
-        if not self.momentum_measurements:
-            raise AssertionError("unexpected momentum position measurement")
-        quantity = Decimal(self.momentum_measurements.pop(0))
-        return {"qty": quantity, "open_orders": 0, "leverage": 1}
+    @staticmethod
+    def momentum_row(quantity, position_side="BOTH"):
+        return {
+            "symbol": "TSTUSDT",
+            "positionSide": position_side,
+            "positionAmt": str(quantity),
+        }
+
+    def queue_momentum_measurement(
+            self, risk_quantity, account_quantity=_SAME_POSITION,
+            risk_side="BOTH", account_side="BOTH", leverage=1):
+        risks = [] if risk_quantity is None else [self.momentum_row(
+            risk_quantity, risk_side
+        )]
+        if account_quantity is _SAME_POSITION:
+            account_quantity = risk_quantity
+        positions = [] if account_quantity is None else [self.momentum_row(
+            account_quantity, account_side
+        )]
+        self.momentum_reads.queue(
+            risks, positions, leverage=leverage
+        )
 
     def fake_momentum_submit(self, intent):
         self.momentum_intents.append(dict(intent))
@@ -228,8 +287,7 @@ class JobRunnerTests(unittest.TestCase):
                 jr, "_momentum_open_plan",
                 side_effect=self.fake_momentum_plan), \
                 mock.patch.object(
-                    jr, "_momentum_measure",
-                    side_effect=self.fake_momentum_measure), \
+                    jr.futures_hand, "http", self.momentum_reads), \
                 mock.patch.object(
                     jr, "_momentum_submit",
                     side_effect=self.fake_momentum_submit):
@@ -244,7 +302,7 @@ class JobRunnerTests(unittest.TestCase):
     def open_momentum(self, job_id="open", max_notional=6):
         self.momentum_markers()
         effective = min(Decimal(str(max_notional)), Decimal("8"))
-        self.momentum_measurements = [str(effective / Decimal("200"))]
+        self.queue_momentum_measurement(effective / Decimal("200"))
         self.job(
             job_id, op="MOMENTUM_OPEN", max_notional=max_notional
         )
@@ -333,6 +391,18 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.results(), [])
         self.assertFalse(os.path.exists(os.path.join(
             self.jobs_dir, "claims", "job-stopped.claim"
+        )))
+
+    def test_bare_stop_halts_without_claiming(self):
+        self.job("bare-stopped")
+        Path(os.path.join(self.receipt_dir, "STOP")).touch()
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(self.hand_calls, [])
+        self.assertEqual(self.results(), [])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.jobs_dir, "claims", "job-bare-stopped.claim"
         )))
 
     def test_unknown_touches_stop_and_blocks_next_job(self):
@@ -487,6 +557,15 @@ class JobRunnerTests(unittest.TestCase):
 
         self.assertEqual(self.momentum_plan_caps, [Decimal("8")])
         self.assertEqual(quantity, Decimal("0.04"))
+        self.assertEqual(self.momentum_reads.calls, [
+            ("GET", "/fapi/v3/positionRisk",
+             {"symbol": "TSTUSDT"}, True),
+            ("GET", "/fapi/v3/account", {}, True),
+            ("GET", "/fapi/v1/openOrders",
+             {"symbol": "TSTUSDT"}, True),
+            ("GET", "/fapi/v1/symbolConfig",
+             {"symbol": "TSTUSDT"}, True),
+        ])
         self.assertEqual(len(self.momentum_intents), 1)
         intent = self.momentum_intents[0]
         self.assertEqual(intent["side"], "BUY")
@@ -540,7 +619,7 @@ class JobRunnerTests(unittest.TestCase):
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 2)
         self.assertEqual(self.momentum_intents, [])
-        self.assertEqual(self.momentum_measurements, [])
+        self.assertEqual(self.momentum_reads.calls, [])
         self.assertEqual(self.leverage.calls, [])
         self.assertEqual(
             self.reason(self.results()[0]), "NO_MOMENTUM_POSITION"
@@ -551,7 +630,8 @@ class JobRunnerTests(unittest.TestCase):
         self.job(
             "fee-exit", op="MOMENTUM_EXIT", max_notional=0.5
         )
-        self.momentum_measurements = [str(quantity), "0"]
+        self.queue_momentum_measurement(quantity)
+        self.queue_momentum_measurement(0)
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 0)
 
@@ -580,11 +660,77 @@ class JobRunnerTests(unittest.TestCase):
             row["realized"]["commission_by_asset"], {"USDT": "0.005"}
         )
 
+    def test_momentum_exit_accepts_sparse_account_flat_response(self):
+        quantity = self.open_momentum("sparse-open")
+        self.job("sparse-exit", op="MOMENTUM_EXIT")
+        self.queue_momentum_measurement(quantity)
+        self.queue_momentum_measurement(0, account_quantity=None)
+
+        with self.momentum_runtime():
+            self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(self.results()[-1]["verdict"], "CLOSED")
+        self.assertEqual(self.momentum_state()["state"], "CLOSED")
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_momentum_measure_enforces_exchange_truth_guards(self):
+        cases = [
+            (
+                "disagreement",
+                [self.momentum_row("0.03")],
+                [self.momentum_row("0.02")],
+                1,
+                "independent momentum position reads disagree",
+            ),
+            (
+                "hedge side",
+                [self.momentum_row("0.03", "LONG")],
+                [self.momentum_row("0.03")],
+                1,
+                "position-risk reported hedge-side state",
+            ),
+            (
+                "short",
+                [self.momentum_row("-0.03")],
+                [self.momentum_row("-0.03")],
+                1,
+                "position-risk reported a short position",
+            ),
+            (
+                "duplicate exposure",
+                [self.momentum_row("0.01"), self.momentum_row("0.02")],
+                [self.momentum_row("0.03")],
+                1,
+                "position-risk returned more than one nonzero symbol row",
+            ),
+            (
+                "leverage",
+                [self.momentum_row("0.03")],
+                [self.momentum_row("0.03")],
+                2,
+                "momentum leverage is not proven 1x",
+            ),
+        ]
+        with mock.patch.object(jr.futures_hand, "SYMBOL", "TSTUSDT"), \
+                mock.patch.object(
+                    jr.futures_hand, "http", self.momentum_reads
+                ):
+            for name, risks, positions, leverage, reason in cases:
+                with self.subTest(name=name):
+                    self.momentum_reads.queue(
+                        risks, positions, leverage=leverage
+                    )
+                    with self.assertRaisesRegex(
+                            jr.MomentumStateError, reason):
+                        jr._momentum_measure("TSTUSDT")
+
     def test_momentum_exit_refuses_unmeasured_quantity(self):
         quantity = self.open_momentum("measure-open")
         before_intents = len(self.momentum_intents)
         self.job("measure-exit", op="MOMENTUM_EXIT")
-        self.momentum_measurements = [str(quantity / 2)]
+        self.queue_momentum_measurement(quantity / 2)
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 4)
 
@@ -600,7 +746,8 @@ class JobRunnerTests(unittest.TestCase):
     def test_momentum_exit_does_not_claim_closed_until_measured_flat(self):
         quantity = self.open_momentum("not-flat-open")
         self.job("not-flat-exit", op="MOMENTUM_EXIT")
-        self.momentum_measurements = [str(quantity), "0.001"]
+        self.queue_momentum_measurement(quantity)
+        self.queue_momentum_measurement("0.001")
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 3)
 
@@ -666,12 +813,11 @@ class JobRunnerTests(unittest.TestCase):
             queried.append(value)
             return "not_found", None
 
-        self.momentum_measurements = ["0"]
+        self.queue_momentum_measurement(0)
         with mock.patch.object(
                 jr, "_momentum_query", side_effect=query_only), \
                 mock.patch.object(
-                    jr, "_momentum_measure",
-                    side_effect=self.fake_momentum_measure), \
+                    jr.futures_hand, "http", self.momentum_reads), \
                 mock.patch.object(jr, "_momentum_submit") as no_post:
             self.assertEqual(self.tick(), 2)
         no_post.assert_not_called()
