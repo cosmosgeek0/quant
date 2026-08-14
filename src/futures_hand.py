@@ -178,13 +178,15 @@ def http(method, path, params=None, signed=False):
         request.add_header("X-MBX-APIKEY", API_KEY)
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-            return "ok", json.loads(response.read().decode())
+            return "ok", json.loads(
+                response.read().decode(), parse_float=Decimal
+            )
     except urllib.error.HTTPError as error:
         body = error.read().decode(errors="replace")
         if error.code >= 500 or error.code in (408, 409):
             return "unclear", {"http": error.code}
         try:
-            parsed = json.loads(body)
+            parsed = json.loads(body, parse_float=Decimal)
             if isinstance(parsed, dict) and "code" in parsed:
                 return "api_error", {
                     "code": parsed.get("code"),

@@ -147,6 +147,22 @@ class OfflineCase(unittest.TestCase):
         return fh.plan_short_open(symbol_info(), BOOK, MARK, CAP, BPS10)
 
 
+class TestHttpParsing(OfflineCase):
+    def test_http_decodes_numeric_mark_price_as_decimal(self):
+        raw = io.BytesIO(
+            b'{"markPrice":12345.678901234567890123,"serverTime":1755000000000}'
+        )
+        with mock.patch.object(urllib.request, "urlopen", return_value=raw):
+            kind, payload = fh.http("GET", "/fapi/v1/premiumIndex")
+
+        self.assertEqual(kind, "ok")
+        self.assertEqual(payload["markPrice"],
+                         Decimal("12345.678901234567890123"))
+        self.assertIs(type(payload["markPrice"]), Decimal)
+        self.assertNotIsInstance(payload["markPrice"], float)
+        self.assertIs(type(payload["serverTime"]), int)
+
+
 class TestShortPlan(OfflineCase):
     def test_short_plan_sizes_worst_case_notional_at_cap(self):
         plan = self.short_plan()

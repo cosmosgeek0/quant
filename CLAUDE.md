@@ -162,6 +162,17 @@ by rail — only pointers to disk.
 - STANDING STATE: machine deployed PAUSED behind two interlocks; the one
   remaining program item is owner-activated (runtime_control start ARM):
   the runner's first naturally-generated held trade. Do not activate.
+- RAIL RULE (owner law): the rail is for nudges, disk is for content. Any
+  instruction longer than two lines goes to a file (repo or shared vault);
+  the rail message says "read <path>". Told "read the message" with nothing
+  in context: read the sender's transcript via session tools or ask the
+  owner to paste — never more than one empty wait-round.
+- WAITING LAW (owner law): a turn never blocks on waiting. Any wait past
+  ~30s runs as a BACKGROUND task — end the turn, let the notification wake
+  you. Never drain no-op rounds for an expected rail message. An idle chat
+  is reachable; a busy-waiting chat is deaf. Root cause, third appearance
+  in one week: important content living only in chat plumbing. Files
+  don't race.
 
 ## File map
 NOW.md = current orders + measured truth (rewritten in place, one page).
