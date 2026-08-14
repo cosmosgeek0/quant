@@ -1,5 +1,7 @@
 """Loopback HTTP evidence for ui/serve.py's read-only runtime truth view."""
 
+import gzip
+import hashlib
 import http.client
 import io
 import json
@@ -103,9 +105,11 @@ class ServerHarness(unittest.TestCase):
         self.addCleanup(holder.cleanup)
         return Path(holder.name)
 
-    def get(self, base, path):
+    def get(self, base, path, headers=None):
+        request = urllib.request.Request(
+            base + path, headers=headers or {}, method="GET")
         try:
-            with urllib.request.urlopen(base + path, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=10) as response:
                 return response.status, dict(response.headers), response.read()
         except urllib.error.HTTPError as error:
             return error.code, dict(error.headers), error.read()
@@ -116,15 +120,19 @@ class ServerHarness(unittest.TestCase):
                          "unexpected status for %s: %s" % (path, status))
         return json.loads(body)
 
-    def request(self, method, path, body=None):
+    def request_full(self, method, path, body=None, headers=None):
         connection = http.client.HTTPConnection(
             "127.0.0.1", self.port, timeout=10)
         try:
-            connection.request(method, path, body=body)
+            connection.request(method, path, body=body, headers=headers or {})
             response = connection.getresponse()
-            return response.status, response.read()
+            return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
+
+    def request(self, method, path, body=None):
+        status, _, response_body = self.request_full(method, path, body=body)
+        return status, response_body
 
     def empty_sources(self, missing_root):
         return {
@@ -201,6 +209,260 @@ class TestStaticServing(ServerHarness):
     def test_binds_loopback_only(self):
         self.start({})
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
+
+
+class TestBackendHardening(ServerHarness):
+
+    SECURITY_HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "img-src 'self'; base-uri 'none'; form-action 'none'; "
+            "frame-ancestors 'none'"),
+    }
+
+    def assert_security_headers(self, headers):
+        for name, expected in self.SECURITY_HEADERS.items():
+            self.assertEqual(headers.get(name), expected, name)
+
+    def test_api_and_static_etag_304_round_trips(self):
+        root = self.tempdir()
+        fees = root / "fees.json"
+        fees.write_text('{"maker":"0.01"}\n', encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["fees"] = fees
+        base = self.start(sources)
+
+        api_status, api_headers, api_body = self.get(base, "/api/fees")
+        self.assertEqual(api_status, 200)
+        self.assertTrue(api_body)
+        self.assertRegex(api_headers["ETag"], r'^"[0-9a-f]{64}"$')
+        self.assertEqual(
+            api_headers["ETag"],
+            '"%s"' % hashlib.sha256(api_body).hexdigest())
+        self.assertEqual(api_headers["Cache-Control"], "no-cache")
+        status, headers, body = self.get(
+            base, "/api/fees",
+            headers={"If-None-Match": api_headers["ETag"]})
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(headers["ETag"], api_headers["ETag"])
+        self.assertEqual(headers["Cache-Control"], "no-cache")
+        self.assertEqual(headers["Content-Length"], "0")
+        self.assertNotIn("Content-Encoding", headers)
+
+        static_status, static_headers, static_body = self.get(
+            base, "/style.css")
+        self.assertEqual(static_status, 200)
+        self.assertTrue(static_body)
+        self.assertRegex(static_headers["ETag"], r'^"[0-9a-f]{64}"$')
+        static_facts = (UI_DIR / "style.css").stat()
+        static_prefix = ("static:%d:%d:%d:" % (
+            static_facts.st_mtime_ns, static_facts.st_size,
+            static_facts.st_ino)).encode("ascii")
+        self.assertEqual(
+            static_headers["ETag"],
+            '"%s"' % hashlib.sha256(
+                static_prefix + static_body).hexdigest())
+        self.assertEqual(static_headers["Cache-Control"], "max-age=60")
+        self.assertIn("Last-Modified", static_headers)
+        for conditional in (
+                {"If-None-Match": static_headers["ETag"]},
+                {"If-Modified-Since": static_headers["Last-Modified"]}):
+            status, headers, body = self.get(
+                base, "/style.css", headers=conditional)
+            self.assertEqual(status, 304)
+            self.assertEqual(body, b"")
+            self.assertEqual(headers["ETag"], static_headers["ETag"])
+            self.assertEqual(headers["Cache-Control"], "max-age=60")
+            self.assertEqual(
+                headers["Last-Modified"], static_headers["Last-Modified"])
+            self.assertNotIn("Content-Encoding", headers)
+            self.assert_security_headers(headers)
+
+    def test_source_cache_reuses_then_invalidates_change_and_delete(self):
+        root = self.tempdir()
+        fees = root / "fees.json"
+        fees.write_text('{"maker":"0.01"}\n', encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["fees"] = fees
+        base = self.start(sources)
+
+        with mock.patch("builtins.open", wraps=open) as opened:
+            status, first_headers, first_body = self.get(base, "/api/fees")
+            self.assertEqual(status, 200)
+            status, second_headers, second_body = self.get(base, "/api/fees")
+            self.assertEqual(status, 200)
+            self.assertEqual(second_body, first_body)
+            self.assertEqual(second_headers["ETag"], first_headers["ETag"])
+            source_opens = [
+                call for call in opened.call_args_list
+                if call.args and os.fspath(call.args[0]) == os.fspath(fees)]
+            self.assertEqual(len(source_opens), 1)
+
+            replacement = root / "fees.next"
+            replacement.write_text(
+                '{"maker":"0.0125","taker":"0.02"}\n', encoding="utf-8")
+            os.replace(replacement, fees)
+            status, changed_headers, changed_body = self.get(
+                base, "/api/fees")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(changed_body)["rates"]["maker"],
+                             "0.0125")
+            self.assertNotEqual(changed_headers["ETag"],
+                                first_headers["ETag"])
+            source_opens = [
+                call for call in opened.call_args_list
+                if call.args and os.fspath(call.args[0]) == os.fspath(fees)]
+            self.assertEqual(len(source_opens), 2)
+
+            fees.unlink()
+            status, deleted_headers, deleted_body = self.get(
+                base, "/api/fees")
+            self.assertEqual(status, 200)
+            deleted = json.loads(deleted_body)
+            self.assertFalse(deleted["present"])
+            self.assertIsNone(deleted["rates"])
+            self.assertNotEqual(deleted_headers["ETag"],
+                                changed_headers["ETag"])
+            self.assertNotIn(os.path.abspath(os.fspath(fees)),
+                             serve._SOURCE_PARSE_CACHE)
+
+    def test_gzip_negotiation_vary_and_small_identity_response(self):
+        root = self.tempdir()
+        events = root / "events.jsonl"
+        events.write_text(
+            "".join(json.dumps({
+                "ts": "2026-08-14T10:00:%02dZ" % (index % 60),
+                "kind": "measurement", "value": "x" * 40,
+            }) + "\n" for index in range(40)), encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["events"] = events
+        base = self.start(sources)
+
+        status, identity_headers, identity_body = self.get(
+            base, "/api/events")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Content-Encoding", identity_headers)
+        self.assertEqual(identity_headers["Vary"], "Accept-Encoding")
+        self.assertEqual(int(identity_headers["Content-Length"]),
+                         len(identity_body))
+
+        status, gzip_headers, gzip_body = self.get(
+            base, "/api/events", headers={"Accept-Encoding": "br, gzip"})
+        self.assertEqual(status, 200)
+        self.assertEqual(gzip_headers["Content-Encoding"], "gzip")
+        self.assertEqual(gzip_headers["Vary"], "Accept-Encoding")
+        self.assertEqual(int(gzip_headers["Content-Length"]), len(gzip_body))
+        self.assertEqual(gzip.decompress(gzip_body), identity_body)
+        self.assertNotEqual(gzip_headers["ETag"], identity_headers["ETag"])
+        self.assertEqual(
+            gzip_headers["ETag"],
+            '"%s"' % hashlib.sha256(gzip_body).hexdigest())
+
+        status, disabled_headers, disabled_body = self.get(
+            base, "/api/events", headers={"Accept-Encoding": "gzip;q=0"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("Content-Encoding", disabled_headers)
+        self.assertEqual(disabled_body, identity_body)
+
+        status, small_headers, small_body = self.get(
+            base, "/api/fees", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(status, 200)
+        self.assertLessEqual(len(small_body), serve.GZIP_MIN_BYTES)
+        self.assertNotIn("Content-Encoding", small_headers)
+        self.assertEqual(small_headers["Vary"], "Accept-Encoding")
+
+    def test_security_headers_cover_static_and_api(self):
+        root = self.tempdir()
+        base = self.start(self.empty_sources(root / "missing"))
+        for path in ("/style.css", "/api/fees"):
+            status, headers, _ = self.get(base, path)
+            self.assertEqual(status, 200)
+            self.assert_security_headers(headers)
+            self.assertNotIn("Python", headers["Server"])
+
+    def test_405_allow_and_all_unknown_methods_are_refused(self):
+        self.start({})
+        for method in ("POST", "PROPFIND"):
+            status, headers, body = self.request_full(method, "/api/fees")
+            self.assertEqual(status, 405)
+            self.assertEqual(headers["Allow"], "GET, HEAD")
+            self.assertEqual(int(headers["Content-Length"]), len(body))
+            self.assertIn(b"read-only", body)
+            self.assert_security_headers(headers)
+
+    def test_head_headers_match_get_including_gzip_and_304(self):
+        root = self.tempdir()
+        fees = root / "fees.json"
+        fees.write_text('{"maker":"0.01"}\n', encoding="utf-8")
+        sources = self.empty_sources(root / "missing")
+        sources["fees"] = fees
+        base = self.start(sources)
+        request_headers = {"Accept-Encoding": "gzip"}
+
+        for path in ("/index.html", "/api/fees"):
+            get_status, get_headers, get_body = self.get(
+                base, path, headers=request_headers)
+            head_status, head_headers, head_body = self.request_full(
+                "HEAD", path, headers=request_headers)
+            self.assertEqual((get_status, head_status), (200, 200))
+            self.assertEqual(head_body, b"")
+            self.assertEqual(int(get_headers["Content-Length"]), len(get_body))
+            for name in ("Content-Type", "Content-Length", "Cache-Control",
+                         "ETag", "Vary"):
+                self.assertEqual(head_headers.get(name), get_headers.get(name),
+                                 "%s %s" % (path, name))
+            self.assertEqual(head_headers.get("Content-Encoding"),
+                             get_headers.get("Content-Encoding"))
+
+            conditional = dict(request_headers)
+            conditional["If-None-Match"] = get_headers["ETag"]
+            status, headers, body = self.request_full(
+                "HEAD", path, headers=conditional)
+            self.assertEqual(status, 304)
+            self.assertEqual(body, b"")
+            self.assertEqual(headers["Content-Length"], "0")
+            self.assertEqual(headers["ETag"], get_headers["ETag"])
+            self.assertEqual(headers["Cache-Control"],
+                             get_headers["Cache-Control"])
+            self.assertNotIn("Content-Encoding", headers)
+
+    def test_error_types_lengths_timeout_and_nul_traversal(self):
+        self.start({})
+        for path in ("/api/no-such-route", "/api%2Fno-such-route"):
+            status, headers, body = self.request_full("GET", path)
+            self.assertEqual(status, 404)
+            self.assertIn("application/json", headers["Content-Type"])
+            self.assertEqual(int(headers["Content-Length"]), len(body))
+            self.assertEqual(json.loads(body)["error"], "not found")
+
+        for path in ("/no-such-file", "/%00", "//["):
+            status, headers, body = self.request_full("GET", path)
+            self.assertEqual(status, 404)
+            self.assertIn("text/plain", headers["Content-Type"])
+            self.assertEqual(int(headers["Content-Length"]), len(body))
+        self.assertEqual(
+            self.server.RequestHandlerClass.timeout,
+            serve.REQUEST_TIMEOUT_SECONDS)
+        self.assertTrue(self.server.RequestHandlerClass.quiet)
+
+    def test_cli_quiet_default_and_verbose_opt_in(self):
+        for arguments, expected_quiet in ((["--port", "0"], True),
+                                          (["--port", "0", "--verbose"],
+                                           False)):
+            fake_server = mock.Mock()
+            fake_server.server_address = ("127.0.0.1", 43210)
+            with mock.patch.object(
+                    serve, "make_server", return_value=fake_server) as build, \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(serve.main(arguments), 0)
+            self.assertEqual(build.call_args.kwargs["quiet"], expected_quiet)
+            fake_server.serve_forever.assert_called_once_with()
+            fake_server.server_close.assert_called_once_with()
 
 
 class TestEventsHistoryEndpoint(ServerHarness):

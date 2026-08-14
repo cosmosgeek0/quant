@@ -21,13 +21,18 @@ file and never calls the network.
 """
 
 import argparse
+import gzip
+import hashlib
 import json
 import os
 import re
 import stat as stat_module
 import sys
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,6 +107,9 @@ RECENT_DECISIONS = 50
 RECENT_FAILURES = 50
 FAILURE_SCAN_RECORDS = 250
 TAIL_BYTES = 1024 * 1024
+SOURCE_PARSE_CACHE_ENTRIES = 512
+GZIP_MIN_BYTES = 512
+REQUEST_TIMEOUT_SECONDS = 10
 HEALTH_AMBER_AFTER_SECONDS = 90
 HEALTH_RED_AFTER_SECONDS = 300
 JOB_AMBER_AFTER_SECONDS = 90
@@ -142,6 +150,20 @@ CONTENT_TYPES = {
     ".txt": "text/plain; charset=utf-8",
 }
 
+SECURITY_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Frame-Options", "DENY"),
+    ("Content-Security-Policy",
+     "default-src 'none'; script-src 'self'; "
+     "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+     "img-src 'self'; base-uri 'none'; form-action 'none'; "
+     "frame-ancestors 'none'"),
+)
+
+_SOURCE_PARSE_CACHE = OrderedDict()
+_SOURCE_PARSE_CACHE_LOCK = threading.RLock()
+
 
 def default_sources():
     """Resolve source paths inside the pulled host mirror at ui/live/.
@@ -175,53 +197,114 @@ def default_sources():
     }
 
 
+def _stat_identity(facts):
+    return facts.st_mtime_ns, facts.st_size, facts.st_ino
+
+
+def _source_cache_key(path):
+    return os.path.abspath(os.fspath(path))
+
+
+def _cache_file_value(path, variant, loader, absent):
+    """Return one parsed file value, invalidated by atomic-swap stat facts."""
+    key = _source_cache_key(path)
+    with _SOURCE_PARSE_CACHE_LOCK:
+        try:
+            current_identity = _stat_identity(os.stat(path))
+        except (OSError, ValueError):
+            _SOURCE_PARSE_CACHE.pop(key, None)
+            return absent, None
+
+        entry = _SOURCE_PARSE_CACHE.get(key)
+        if entry is not None and entry["identity"] == current_identity:
+            cached = entry["values"].get(variant)
+            if cached is not None:
+                _SOURCE_PARSE_CACHE.move_to_end(key)
+                return cached, current_identity
+
+        try:
+            value, opened_identity = loader(path)
+        except (OSError, UnicodeError, ValueError):
+            _SOURCE_PARSE_CACHE.pop(key, None)
+            return absent, None
+
+        try:
+            after_identity = _stat_identity(os.stat(path))
+        except (OSError, ValueError):
+            _SOURCE_PARSE_CACHE.pop(key, None)
+        else:
+            if after_identity == opened_identity:
+                entry = _SOURCE_PARSE_CACHE.get(key)
+                if entry is None or entry["identity"] != opened_identity:
+                    entry = {"identity": opened_identity, "values": {}}
+                    _SOURCE_PARSE_CACHE[key] = entry
+                entry["values"][variant] = value
+                _SOURCE_PARSE_CACHE.move_to_end(key)
+                while len(_SOURCE_PARSE_CACHE) > SOURCE_PARSE_CACHE_ENTRIES:
+                    _SOURCE_PARSE_CACHE.popitem(last=False)
+        return value, opened_identity
+
+
+def _load_text(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        identity = _stat_identity(os.fstat(handle.fileno()))
+        text = handle.read()
+    return (True, text), identity
+
+
 def _read_text(path):
     """Return (present, text); absent/unreadable sources are never created."""
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return True, handle.read()
-    except (OSError, UnicodeError):
-        return False, None
+    value, _ = _cache_file_value(
+        path, ("text",), _load_text, (False, None))
+    return value
 
 
 def _read_json(path):
     """Return (present, value, parse_errors)."""
-    present, text = _read_text(path)
-    if not present:
-        return False, None, 0
-    try:
-        return True, json.loads(text), 0
-    except (json.JSONDecodeError, TypeError):
-        return True, None, 1
+    def load_json(source):
+        with open(source, "r", encoding="utf-8") as handle:
+            identity = _stat_identity(os.fstat(handle.fileno()))
+            text = handle.read()
+        try:
+            value = (True, json.loads(text), 0)
+        except (json.JSONDecodeError, TypeError):
+            value = (True, None, 1)
+        return value, identity
+
+    value, _ = _cache_file_value(
+        path, ("json",), load_json, (False, None, 0))
+    return value
 
 
 def _read_jsonl(path):
     """Return (present, records, parse_errors), preserving valid line order."""
-    present, text = _read_text(path)
-    if not present:
-        return False, [], 0
-    records, parse_errors = [], 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            parse_errors += 1
-    return True, records, parse_errors
+    def load_jsonl(source):
+        with open(source, "r", encoding="utf-8") as handle:
+            identity = _stat_identity(os.fstat(handle.fileno()))
+            text = handle.read()
+        records, parse_errors = [], 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                parse_errors += 1
+        return (True, records, parse_errors), identity
+
+    value, _ = _cache_file_value(
+        path, ("jsonl",), load_jsonl, (False, [], 0))
+    return value
 
 
-def _read_tail_lines(path, limit):
-    """Return a bounded tail without treating a partial first line as data."""
-    try:
-        with open(path, "rb") as handle:
-            end = handle.seek(0, os.SEEK_END)
-            start = max(0, end - TAIL_BYTES)
-            handle.seek(start)
-            raw = handle.read()
-    except OSError:
-        return False, [], 0, False
+def _load_tail_lines(path, limit):
+    with open(path, "rb") as handle:
+        identity = _stat_identity(os.fstat(handle.fileno()))
+        end = handle.seek(0, os.SEEK_END)
+        start = max(0, end - TAIL_BYTES)
+        handle.seek(start)
+        raw = handle.read()
     truncated = start > 0
     if truncated:
         boundary = raw.find(b"\n")
@@ -233,25 +316,56 @@ def _read_tail_lines(path, limit):
         text = raw.decode("utf-8", errors="replace")
         encoding_errors = 1
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return True, lines[-limit:], encoding_errors, truncated
+    return (True, lines[-limit:], encoding_errors, truncated), identity
+
+
+def _read_tail_lines(path, limit):
+    """Return a bounded tail without treating a partial first line as data."""
+    value, _ = _cache_file_value(
+        path, ("tail_lines", limit, TAIL_BYTES),
+        lambda source: _load_tail_lines(source, limit),
+        (False, [], 0, False))
+    return value
 
 
 def _read_jsonl_tail(path, limit, scan_limit=None):
     """Return valid objects from a bounded JSONL tail in file order."""
     line_limit = scan_limit or max(limit * 4, limit)
-    present, lines, parse_errors, truncated = _read_tail_lines(
-        path, line_limit)
-    if not present:
-        return False, [], 0, False
-    records = []
-    for line in lines:
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            parse_errors += 1
-            continue
-        records.append(value)
-    return True, records[-limit:], parse_errors, truncated
+
+    def load_jsonl_tail(source):
+        tail, identity = _load_tail_lines(source, line_limit)
+        _, lines, parse_errors, truncated = tail
+        records = []
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                continue
+            records.append(value)
+        return (True, records[-limit:], parse_errors, truncated), identity
+
+    value, _ = _cache_file_value(
+        path, ("jsonl_tail", limit, line_limit, TAIL_BYTES),
+        load_jsonl_tail, (False, [], 0, False))
+    return value
+
+
+def _read_static(path):
+    """Return a cached static-file snapshot and its strong identity facts."""
+    def load_static(source):
+        with open(source, "rb") as handle:
+            facts = os.fstat(handle.fileno())
+            body = handle.read()
+        identity = _stat_identity(facts)
+        return (body, facts.st_mtime), identity
+
+    value, identity = _cache_file_value(
+        path, ("static",), load_static, None)
+    if value is None:
+        return False, None, None, None
+    body, modified = value
+    return True, body, identity, modified
 
 
 def _path_as_of(path):
@@ -1297,7 +1411,10 @@ API_ROUTES = {
 
 def resolve_static(url_path):
     """Map a URL path to a file inside ui/, or None. Traversal is refused."""
-    clean = unquote(urlsplit(url_path).path)
+    try:
+        clean = unquote(urlsplit(url_path).path)
+    except ValueError:
+        return None
     if clean in ("", "/"):
         clean = "/index.html"
     parts = [part for part in clean.split("/") if part]
@@ -1306,7 +1423,7 @@ def resolve_static(url_path):
     candidate = UI_DIR.joinpath(*parts)
     try:
         resolved = candidate.resolve()
-    except OSError:
+    except (OSError, ValueError):
         return None
     if UI_DIR not in resolved.parents and resolved != UI_DIR:
         return None
@@ -1317,35 +1434,173 @@ def resolve_static(url_path):
 
 class ReadOnlyHandler(BaseHTTPRequestHandler):
     server_version = "QuantReadOnlyUI/2"
+    sys_version = ""
     sources = None
+    quiet = True
+    timeout = REQUEST_TIMEOUT_SECONDS
 
-    def _send(self, status, content_type, body, head_only=False):
+    @staticmethod
+    def _compressible(content_type):
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        return media_type in {
+            "application/json", "text/html", "text/css",
+            "text/javascript", "application/javascript",
+        }
+
+    def _accepts_gzip(self):
+        header = self.headers.get("Accept-Encoding", "")
+        qualities = {}
+        for item in header.split(","):
+            fields = [field.strip() for field in item.split(";")]
+            coding = fields[0].lower()
+            if not coding:
+                continue
+            quality = 1.0
+            for parameter in fields[1:]:
+                name, separator, raw_value = parameter.partition("=")
+                if separator and name.strip().lower() == "q":
+                    try:
+                        quality = float(raw_value.strip())
+                    except ValueError:
+                        quality = 0.0
+            qualities[coding] = quality
+        if "gzip" in qualities:
+            return qualities["gzip"] > 0
+        return qualities.get("*", 0) > 0
+
+    @staticmethod
+    def _strong_etag(body, prefix=b""):
+        digest = hashlib.sha256()
+        digest.update(prefix)
+        digest.update(body)
+        return '"%s"' % digest.hexdigest()
+
+    def _etag_matches(self, etag):
+        supplied = self.headers.get("If-None-Match")
+        if supplied is None:
+            return None
+        for candidate in supplied.split(","):
+            candidate = candidate.strip()
+            if candidate == "*":
+                return True
+            if candidate.startswith("W/"):
+                candidate = candidate[2:].strip()
+            if candidate == etag:
+                return True
+        return False
+
+    def _static_not_modified(self, modified):
+        supplied = self.headers.get("If-Modified-Since")
+        if supplied is None:
+            return False
+        try:
+            parsed = parsedate_to_datetime(supplied)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if parsed is None:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        try:
+            return int(modified) <= int(parsed.timestamp())
+        except (OSError, OverflowError, ValueError):
+            return False
+
+    def end_headers(self):
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        super().end_headers()
+
+    def version_string(self):
+        return self.server_version
+
+    def _send(self, status, content_type, body, head_only=False,
+              cache_control="no-cache", etag_prefix=None,
+              last_modified=None, extra_headers=None):
+        compressible = self._compressible(content_type)
+        encoded = body
+        content_encoding = None
+        if compressible and len(body) > GZIP_MIN_BYTES \
+                and self._accepts_gzip():
+            encoded = gzip.compress(body, compresslevel=6, mtime=0)
+            content_encoding = "gzip"
+
+        etag = None
+        if status == 200:
+            etag = self._strong_etag(encoded, etag_prefix or b"")
+            etag_match = self._etag_matches(etag)
+            not_modified = etag_match is True
+            if etag_match is None and last_modified is not None:
+                not_modified = self._static_not_modified(last_modified[1])
+            if not_modified:
+                status = 304
+                encoded = b""
+                content_encoding = None
+
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", cache_control)
+        if etag is not None:
+            self.send_header("ETag", etag)
+        if last_modified is not None:
+            self.send_header("Last-Modified", last_modified[0])
+        if compressible:
+            self.send_header("Vary", "Accept-Encoding")
+        if content_encoding is not None:
+            self.send_header("Content-Encoding", content_encoding)
+        for name, value in (extra_headers or ()):
+            self.send_header(name, value)
         self.end_headers()
-        if not head_only:
-            self.wfile.write(body)
+        if not head_only and status != 304:
+            self.wfile.write(encoded)
 
-    def _send_json(self, status, payload, head_only=False):
+    def _send_json(self, status, payload, head_only=False,
+                   cache_control="no-cache", extra_headers=None):
         body = json.dumps(payload, indent=1).encode("utf-8")
-        self._send(status, "application/json; charset=utf-8", body, head_only)
+        self._send(
+            status, "application/json; charset=utf-8", body, head_only,
+            cache_control=cache_control, etag_prefix=b"",
+            extra_headers=extra_headers)
 
     def _handle(self, head_only):
-        path = urlsplit(self.path).path
+        try:
+            path = unquote(urlsplit(self.path).path)
+        except ValueError:
+            self._send(
+                404, "text/plain; charset=utf-8", b"not found\n",
+                head_only, cache_control="no-cache")
+            return
         route = API_ROUTES.get(path)
         if route is not None:
-            self._send_json(200, route(type(self).sources), head_only)
+            self._send_json(
+                200, route(type(self).sources), head_only,
+                cache_control="no-cache")
+            return
+        if path.startswith("/api/"):
+            self._send_json(
+                404, {"error": "not found", "path": path}, head_only,
+                cache_control="no-cache")
             return
         static = resolve_static(self.path)
         if static is None:
-            self._send_json(404, {"error": "not found", "path": path}, head_only)
+            self._send(
+                404, "text/plain; charset=utf-8", b"not found\n",
+                head_only, cache_control="no-cache")
             return
         content_type = CONTENT_TYPES.get(
             static.suffix, "application/octet-stream")
-        with open(static, "rb") as handle:
-            self._send(200, content_type, handle.read(), head_only)
+        present, body, identity, modified = _read_static(static)
+        if not present:
+            self._send(
+                404, "text/plain; charset=utf-8", b"not found\n",
+                head_only, cache_control="no-cache")
+            return
+        identity_bytes = ("static:%d:%d:%d:" % identity).encode("ascii")
+        self._send(
+            200, content_type, body, head_only,
+            cache_control="max-age=60", etag_prefix=identity_bytes,
+            last_modified=(formatdate(modified, usegmt=True), modified))
 
     def do_GET(self):
         self._handle(head_only=False)
@@ -1358,7 +1613,8 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
             "error": "read-only server: GET and HEAD only; "
                      "no mutating endpoint exists",
             "method": self.command,
-        })
+        }, head_only=self.command == "HEAD",
+                        extra_headers=(("Allow", "GET, HEAD"),))
 
     do_POST = _refuse
     do_PUT = _refuse
@@ -1368,17 +1624,27 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
     do_CONNECT = _refuse
     do_TRACE = _refuse
 
+    def __getattr__(self, name):
+        if name.startswith("do_"):
+            return self._refuse
+        raise AttributeError(name)
+
     def log_message(self, format, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+        if not type(self).quiet:
+            super().log_message(format, *args)
 
 
-def make_server(sources=None, port=DEFAULT_PORT):
+def make_server(sources=None, port=DEFAULT_PORT, quiet=True):
     """Build the loopback-only server; the caller owns its lifecycle."""
     resolved = dict(default_sources())
     if sources:
         resolved.update(sources)
-    handler = type("BoundHandler", (ReadOnlyHandler,), {"sources": resolved})
-    return ThreadingHTTPServer((BIND_HOST, port), handler)
+    handler = type("BoundHandler", (ReadOnlyHandler,), {
+        "sources": resolved, "quiet": quiet,
+    })
+    server = ThreadingHTTPServer((BIND_HOST, port), handler)
+    server.daemon_threads = True
+    return server
 
 
 def host_check_sources(endpoint_sources):
@@ -1471,6 +1737,13 @@ def main(argv=None):
     parser.add_argument(
         "--host-check", action="store_true",
         help="print runtime source existence and mtime ages, then exit")
+    logging_group = parser.add_mutually_exclusive_group()
+    logging_group.add_argument(
+        "--quiet", dest="quiet", action="store_true", default=True,
+        help="suppress per-request access logging (default)")
+    logging_group.add_argument(
+        "--verbose", dest="quiet", action="store_false",
+        help="write per-request access logging to stderr")
     args = parser.parse_args(argv)
 
     overrides = {}
@@ -1500,7 +1773,7 @@ def main(argv=None):
         print_host_check(host_check_sources(resolved_sources))
         return 0
 
-    server = make_server(resolved_sources, args.port)
+    server = make_server(resolved_sources, args.port, quiet=args.quiet)
     host, port = server.server_address[0], server.server_address[1]
     print("serving quant ui (read-only, GET/HEAD only) on http://%s:%d/"
           % (host, port), flush=True)
