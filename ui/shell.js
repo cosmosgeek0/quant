@@ -562,7 +562,18 @@
   var newsCat = "all";
   var newsDay = "all";
   var newsPage = 1;
-  var NEWS_PAGE_SIZE = 25;
+
+  function newsPageSize() {
+    var rows = Math.floor((window.innerHeight - 470) / 41);
+    return Math.max(15, Math.min(45, rows));
+  }
+  var newsResizeTimer = null;
+  window.addEventListener("resize", function () {
+    if (newsResizeTimer) { clearTimeout(newsResizeTimer); }
+    newsResizeTimer = setTimeout(function () {
+      if (newsHost) { renderNews(); }
+    }, 200);
+  });
   var newsQuery = "";
   var newsTimer = null;
   var newsHost = null;
@@ -707,7 +718,7 @@
     t.textContent = "Activity · 24h";
     var lgwrap = document.createElement("span");
     lgwrap.className = "rbox-sub act-h";
-    var defs = [["H", "#e8850c"], ["M", "#3b82f6"], ["L", "#9aa3af"]];
+    var defs = [["H", "#16a34a"], ["M", "#3b82f6"], ["L", "#ca8a04"]];
     for (var li2 = 0; li2 < defs.length; li2++) {
       var lg = document.createElement("span");
       lg.className = "lg";
@@ -753,7 +764,7 @@
       var hourLabel = ((nowHour - (23 - x)) % 24 + 24) % 24;
       var col = svgEl("g", {});
       var y = baseY;
-      var segs = [["l", "#9aa3af"], ["m", "#3b82f6"], ["h", "#e8850c"]];
+      var segs = [["l", "#ca8a04"], ["m", "#3b82f6"], ["h", "#16a34a"]];
       for (var s2 = 0; s2 < segs.length; s2++) {
         var n = bkt[segs[s2][0]];
         if (!n) { continue; }
@@ -1199,6 +1210,25 @@
         impbar.appendChild(b);
       })(defs2[fi][0], defs2[fi][1], defs2[fi][2]);
     }
+    var infoTip = document.createElement("span");
+    infoTip.className = "rbtn";
+    infoTip.style.width = "26px";
+    infoTip.style.height = "26px";
+    infoTip.style.color = "var(--faint)";
+    infoTip.setAttribute("data-tip",
+      "Impact engine (ported from the old room): critical events — " +
+      "hacks, halts, insolvency — are High; decisive macro (FOMC, CPI), " +
+      "regulatory actions, listings/delistings, big-money on-chain moves " +
+      "stack points; official and venue sources weigh extra.");
+    var iSvg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    iSvg.setAttribute("style", "width:14px;height:14px;stroke-width:1.8");
+    iSvg.appendChild(svgEl("circle", { cx: 12, cy: 12, r: 10 }));
+    iSvg.appendChild(svgEl("path", { d: "M12 16v-4" }));
+    iSvg.appendChild(svgEl("path", { d: "M12 8h.01" }));
+    infoTip.appendChild(iSvg);
+    impbar.appendChild(infoTip);
     var barRight = document.createElement("span");
     barRight.className = "bar-right";
     var refresh = document.createElement("button");
@@ -1254,10 +1284,11 @@
       if (newsFilter !== "all" && String(lvlF) !== newsFilter) { continue; }
       filtered.push(pool[fi2]);
     }
-    var totalPages = Math.max(1, Math.ceil(filtered.length / NEWS_PAGE_SIZE));
+    var pageSize = newsPageSize();
+    var totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
     if (newsPage > totalPages) { newsPage = totalPages; }
-    var pageStart = (newsPage - 1) * NEWS_PAGE_SIZE;
-    var pageItems = filtered.slice(pageStart, pageStart + NEWS_PAGE_SIZE);
+    var pageStart = (newsPage - 1) * pageSize;
+    var pageItems = filtered.slice(pageStart, pageStart + pageSize);
 
     var seenNow = {};
     var shown = 0;
@@ -1379,7 +1410,7 @@
       var pinfo = document.createElement("span");
       pinfo.className = "pinfo";
       pinfo.textContent = (pageStart + 1) + "–" +
-        Math.min(pageStart + NEWS_PAGE_SIZE, filtered.length) +
+        Math.min(pageStart + pageSize, filtered.length) +
         " of " + filtered.length;
       pager.appendChild(pinfo);
       maincol.appendChild(pager);

@@ -104,7 +104,7 @@ MOMENTUM_RESULT_OPS = frozenset({
 RECENT_HEALTH_RECORDS = 200
 RECENT_JOB_LOG_LINES = 40
 RECENT_DECISIONS = 50
-RECENT_NEWS = 500
+RECENT_NEWS = 800
 RECENT_FAILURES = 50
 FAILURE_SCAN_RECORDS = 250
 TAIL_BYTES = 1024 * 1024
@@ -1142,6 +1142,7 @@ def api_news(sources):
             items.append(record)
         else:
             parse_errors += 1
+    items.reverse()  # file is ascending; serve newest first
     as_of = _path_as_of(path) if present else None
     board_path = sources["news_sources"]
     board = {"present": False, "available": 0, "live": 0, "sources": []}

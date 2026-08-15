@@ -569,12 +569,16 @@ def run_cycle(catalog, quiet):
             })
             all_items.extend(items)
 
-    cutoff = datetime.now(timezone.utc).timestamp() - MAX_AGE_DAYS * 86400
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff = now_ts - MAX_AGE_DAYS * 86400
+    future_gate = now_ts + 900  # event-dated rows belong to Calendar
     fresh = []
     seen = set()
     for item in all_items:
         stamp = parse_rss_time(item["ts"])
         if stamp is None or stamp.timestamp() < cutoff:
+            continue
+        if stamp.timestamp() > future_gate:
             continue
         dedup = item["url"] or (item["source_key"] + "|" + item["id"])
         if dedup in seen:
@@ -583,6 +587,8 @@ def run_cycle(catalog, quiet):
         fresh.append(item)
     fresh.sort(key=lambda entry: entry["ts"], reverse=True)
     fresh = fresh[:MAX_ITEMS]
+    # write ASCENDING so the server's line-tail always holds the newest
+    fresh.reverse()
 
     # merge duplicate catalog rows (same label+domain from multi-endpoint
     # sources) so available/live counts stay honest

@@ -1345,14 +1345,16 @@ class TestNewsEndpoint(ServerHarness):
         self.assertFalse(payload["present"])
         self.assertEqual(payload["count"], 0)
         self.assertFalse(payload["sources_board"]["present"])
+        # file convention: ascending by time; the server returns
+        # newest-first, so the FOMC line (latest) must come back first
         news_path.write_text(
-            '{"id":"1","ts":"2026-08-15T05:00:00Z","source":"Fed",'
-            '"title":"FOMC rate decision","url":"https://example.org",'
-            '"impact":3,"category":"Macro"}\n'
-            'not json\n'
             '{"id":"2","ts":"2026-08-15T05:01:00Z","source":"Wu",'
             '"title":"Listing update","url":"","impact":2,'
-            '"category":"Exchange"}\n',
+            '"category":"Exchange"}\n'
+            'not json\n'
+            '{"id":"1","ts":"2026-08-15T05:02:00Z","source":"Fed",'
+            '"title":"FOMC rate decision","url":"https://example.org",'
+            '"impact":3,"category":"Macro"}\n',
             encoding="utf-8")
         payload = self.get_json(base, "/api/news")
         self.assertTrue(payload["present"])
