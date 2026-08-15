@@ -432,6 +432,49 @@ class JobRunnerTests(unittest.TestCase):
     def result_events(self, kind):
         return [row for row in self.results() if row.get("kind") == kind]
 
+    def write_tick_lock(self, **overrides):
+        paths = jr._paths(self.receipt_dir)
+        jr._make_dirs(paths)
+        value = {
+            "pid": 424242,
+            "process_start": "test-owner-start",
+            "heartbeat_monotonic_ns": 1_000_000_000,
+            "heartbeat_utc": utc(NOW - timedelta(seconds=1)),
+            "created_utc": utc(NOW - timedelta(seconds=1)),
+            "token": "previous-tick-token",
+        }
+        value.update(overrides)
+        with open(paths["tick_lock"], "w", encoding="ascii") as handle:
+            json.dump(value, handle)
+        return paths
+
+    def interrupt_margin_governor_release(self, job_id, measured_sha=SHA):
+        self.margin_job(job_id)
+        lock_path = os.path.join(
+            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+
+        class ReleaseInterrupted(Exception):
+            pass
+
+        def pause_release(_release, token, _receipt_dir):
+            with open(lock_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "version": 1,
+                    "token": token,
+                    "op": "MARGIN_BORROW",
+                    "symbol": "USDT",
+                    "utc": utc(NOW),
+                }, handle)
+            raise ReleaseInterrupted
+
+        with mock.patch.dict(os.environ, {"QUANT_SHA": measured_sha}), \
+                mock.patch.object(
+                    jr, "_release_governor", side_effect=pause_release):
+            with self.assertRaises(ReleaseInterrupted):
+                self.margin_tick()
+        return self.results()[0], lock_path
+
     def momentum_markers(self):
         Path(os.path.join(
             self.jobs_dir, "futures_proof_passed"
@@ -690,52 +733,134 @@ class JobRunnerTests(unittest.TestCase):
         claim = os.path.join(self.jobs_dir, "claims", "job-once.claim")
         self.assertTrue(os.path.isfile(claim))
 
-    def test_dead_tick_lock_after_one_interval_is_recovered(self):
-        paths = jr._paths(self.receipt_dir)
-        jr._make_dirs(paths)
-        old_monotonic = 1_000_000_000
-        current_monotonic = old_monotonic + 61_000_000_000
-        with open(paths["tick_lock"], "w", encoding="ascii") as handle:
-            json.dump({
-                "pid": 424242,
-                "monotonic_ns": old_monotonic,
-                "created_utc": utc(NOW - timedelta(seconds=61)),
-                "token": "previous-tick-token",
-            }, handle)
-
+    def test_dead_tick_lock_is_recovered_without_waiting(self):
+        paths = self.write_tick_lock()
         with mock.patch.object(
                 jr.os, "kill", side_effect=ProcessLookupError), \
                 mock.patch.object(
-                    jr.time, "monotonic_ns", return_value=current_monotonic):
+                    jr.time, "monotonic_ns", return_value=2_000_000_000):
             self.assertEqual(self.tick(), 0)
 
         self.assertFalse(os.path.exists(paths["tick_lock"]))
         events = self.result_events("runner_stale_lock_recovered")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["pid"], "424242")
-        self.assertEqual(events[0]["age_seconds"], "61")
+        self.assertEqual(events[0]["age_seconds"], "1")
         result_ids, bad_results, unresolved = jr._result_ids(paths["results"])
         self.assertEqual(result_ids, set())
         self.assertFalse(bad_results)
         self.assertFalse(unresolved)
 
-    def test_live_tick_lock_is_never_recovered(self):
-        paths = jr._paths(self.receipt_dir)
-        jr._make_dirs(paths)
-        with open(paths["tick_lock"], "w", encoding="ascii") as handle:
-            json.dump({
-                "pid": os.getpid(),
-                "monotonic_ns": 0,
-                "created_utc": utc(NOW - timedelta(hours=1)),
-                "token": "active-tick-token",
-            }, handle)
-
-        with mock.patch.object(
-                jr.time, "monotonic_ns", return_value=3_600_000_000_000):
+    def test_matching_live_tick_owner_is_never_recovered(self):
+        paths = self.write_tick_lock(
+            heartbeat_monotonic_ns=0,
+            heartbeat_utc=utc(NOW - timedelta(hours=1)),
+            created_utc=utc(NOW - timedelta(hours=1)),
+        )
+        with mock.patch.object(jr.os, "kill", return_value=None), \
+                mock.patch.object(
+                    jr, "_process_start_marker",
+                    return_value="test-owner-start"), \
+                mock.patch.object(
+                    jr.time, "monotonic_ns",
+                    return_value=3_600_000_000_000):
             self.assertEqual(self.tick(), 0)
 
         self.assertTrue(os.path.isfile(paths["tick_lock"]))
         self.assertEqual(self.results(), [])
+
+    def test_tick_lock_pid_reuse_is_recovered(self):
+        paths = self.write_tick_lock()
+
+        def process_start(pid):
+            return "replacement-start" if pid == 424242 else "current-start"
+
+        with mock.patch.object(jr.os, "kill", return_value=None), \
+                mock.patch.object(
+                    jr, "_process_start_marker", side_effect=process_start), \
+                mock.patch.object(
+                    jr.time, "monotonic_ns", return_value=2_000_000_000):
+            self.assertEqual(self.tick(), 0)
+
+        self.assertFalse(os.path.exists(paths["tick_lock"]))
+        events = self.result_events("runner_stale_lock_recovered")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["pid"], "424242")
+
+    def test_unconfirmed_live_lock_uses_three_interval_boundary(self):
+        threshold_ns = int(
+            jr.TICK_INTERVAL_SECONDS
+            * jr.TICK_LOCK_HEARTBEAT_INTERVALS
+            * 1_000_000_000
+        )
+        paths = self.write_tick_lock(
+            heartbeat_utc=utc(NOW - timedelta(seconds=180)),
+            created_utc=utc(NOW - timedelta(seconds=180)),
+        )
+
+        def process_start(pid):
+            return None if pid == 424242 else "current-start"
+
+        with mock.patch.object(jr.os, "kill", return_value=None), \
+                mock.patch.object(
+                    jr, "_process_start_marker", side_effect=process_start), \
+                mock.patch.object(
+                    jr.time, "monotonic_ns",
+                    return_value=1_000_000_000 + threshold_ns):
+            self.assertEqual(self.tick(), 0)
+        self.assertTrue(os.path.isfile(paths["tick_lock"]))
+
+        os.unlink(paths["tick_lock"])
+        self.write_tick_lock(
+            heartbeat_utc=utc(NOW - timedelta(seconds=180)),
+            created_utc=utc(NOW - timedelta(seconds=180)),
+        )
+        with mock.patch.object(jr.os, "kill", return_value=None), \
+                mock.patch.object(
+                    jr, "_process_start_marker", side_effect=process_start), \
+                mock.patch.object(
+                    jr.time, "monotonic_ns",
+                    return_value=1_000_000_001 + threshold_ns):
+            self.assertEqual(self.tick(), 0)
+        self.assertFalse(os.path.exists(paths["tick_lock"]))
+        self.assertEqual(
+            self.result_events("runner_stale_lock_recovered")[0][
+                "age_seconds"
+            ],
+            "180.000000001",
+        )
+
+    def test_monotonic_reset_uses_utc_heartbeat_for_reclaim(self):
+        paths = self.write_tick_lock(
+            heartbeat_monotonic_ns=10_000_000_000,
+            heartbeat_utc=utc(NOW - timedelta(seconds=181)),
+            created_utc=utc(NOW - timedelta(seconds=181)),
+        )
+
+        def process_start(pid):
+            return None if pid == 424242 else "current-start"
+
+        with mock.patch.object(jr.os, "kill", return_value=None), \
+                mock.patch.object(
+                    jr, "_process_start_marker", side_effect=process_start), \
+                mock.patch.object(
+                    jr.time, "monotonic_ns", return_value=1_000_000_000):
+            self.assertEqual(self.tick(), 0)
+
+        self.assertFalse(os.path.exists(paths["tick_lock"]))
+        self.assertEqual(
+            self.result_events("runner_stale_lock_recovered")[0][
+                "age_seconds"
+            ],
+            "181",
+        )
+
+    def test_tick_refreshes_its_owned_lock_heartbeat(self):
+        with mock.patch.object(
+                jr, "_refresh_tick_lock",
+                wraps=jr._refresh_tick_lock) as refresh:
+            self.assertEqual(self.tick(), 0)
+        self.assertEqual(refresh.call_count, 1)
 
     def test_tick_consumes_at_most_one_due_job(self):
         self.job("a")
@@ -1191,6 +1316,9 @@ class JobRunnerTests(unittest.TestCase):
     def test_confirmed_margin_borrow_posts_once_and_claims_ticket(self):
         job_path = self.margin_job("margin-borrow")
         expected_authority = {
+            "ready_params": jr._json_authority_digest({
+                "asset": "USDT", "amount": "3", "type": "BORROW",
+            }),
             "job_file": hashlib.sha256(Path(job_path).read_bytes()).hexdigest(),
             "accept_one": hashlib.sha256(Path(os.path.join(
                 self.receipt_dir, "ACCEPT-ONE"
@@ -1225,6 +1353,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(source["authority_checked_utc"], utc(NOW))
         self.assertFalse(source["authority_stop_jobs_present"])
         self.assertEqual(source["authority_digests"], expected_authority)
+        self.assertEqual(runner["authority_digests"], expected_authority)
         self.assertTrue(all(
             re.fullmatch(r"[0-9a-f]{64}", digest)
             for digest in source["authority_digests"].values()
@@ -1280,6 +1409,75 @@ class JobRunnerTests(unittest.TestCase):
         self.assertIs(runner["sha_valid"], False)
         self.assertNotIn("sha", runner)
         self.assertEqual(self.margin.calls, [])
+
+    def test_pre_intent_refusal_leaves_intent_available_for_one_reissue(self):
+        intent_id = "mrgintent-" + ("c" * 24)
+        self.margin_job(
+            "margin-intent-refusal-a", intent_id=intent_id,
+            expires_utc=utc(NOW + timedelta(minutes=9)),
+        )
+        with mock.patch.dict(os.environ, {"QUANT_SHA": "not-a-full-sha"}):
+            self.assertEqual(self.margin_tick(), 2)
+
+        paths = jr._paths(self.receipt_dir)
+        intent_path = jr._margin_intent_claim_path(paths, intent_id)
+        self.assertFalse(os.path.exists(intent_path))
+        self.margin_job(
+            "margin-intent-refusal-b", intent_id=intent_id,
+            expires_utc=utc(NOW + timedelta(minutes=10)),
+        )
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        self.assertEqual(
+            [row["verdict"] for row in self.results()],
+            ["REFUSED", "OPEN"],
+        )
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
+        with open(intent_path, encoding="utf-8") as handle:
+            self.assertEqual(
+                json.load(handle)["job_id"], "margin-intent-refusal-b"
+            )
+
+    def test_early_margin_refusals_publish_receipt_backed_result_rows(self):
+        missing = self.margin_job("receipt-early-a")
+        with open(missing, encoding="utf-8") as handle:
+            missing_job = json.load(handle)
+        missing_job.pop("intent_id")
+        with open(missing, "w", encoding="utf-8") as handle:
+            json.dump(missing_job, handle)
+        self.assertEqual(self.margin_tick(), 2)
+
+        self.margin_job("receipt-early-b", asset="BTC")
+        self.assertEqual(self.margin_tick(), 2)
+
+        self.margin_job("receipt-early-c")
+        with mock.patch.dict(os.environ, {"QUANT_SHA": "short-sha"}):
+            self.assertEqual(self.margin_tick(), 2)
+
+        self.governor_acquire_refusal = "ACCOUNT_FROZEN"
+        self.margin_job("receipt-early-d")
+        self.assertEqual(self.margin_tick(), 2)
+
+        rows = self.results()
+        self.assertEqual(
+            [self.reason(row) for row in rows],
+            [
+                "MISSING_FIELD", "ASSET_NOT_ALLOWED", "BAD_QUANT_SHA",
+                "ACCOUNT_FROZEN",
+            ],
+        )
+        for row in rows:
+            with self.subTest(job_id=row["job_id"]):
+                self.assertTrue(row["receipt_path"])
+                self.assertTrue(os.path.isfile(row["receipt_path"]))
+                with open(row["receipt_path"], encoding="utf-8") as handle:
+                    receipt = json.load(handle)
+                self.assertEqual(receipt["job_id"], row["job_id"])
+                self.assertEqual(receipt["verdict"], "REFUSED")
 
     def test_claim_and_receipt_paths_fsync_their_parent_directories(self):
         paths = jr._paths(self.receipt_dir)
@@ -1541,10 +1739,46 @@ class JobRunnerTests(unittest.TestCase):
             "tranId": 7301, "txId": "7301"
         }), "7301")
         self.assertEqual(jr._margin_transaction_id({
+            "tranId": 7301,
+            "detail": {"events": [{"txId": "7301"}]},
+        }), "7301")
+        self.assertEqual(jr._margin_transaction_id({
             "tranId": 7301, "detail": {"txId": "8301"}
         }), "")
         self.assertEqual(jr._margin_transaction_id({"tranId": 7301.0}), "")
         self.assertEqual(jr._margin_transaction_id({"tranId": True}), "")
+
+    def test_margin_identity_scan_enforces_node_and_byte_bounds(self):
+        within_nodes = {
+            "tranId": "7301",
+            "items": [None] * (jr.MARGIN_IDENTITY_MAX_NODES - 3),
+        }
+        over_nodes = {
+            "tranId": "7301",
+            "items": [None] * (jr.MARGIN_IDENTITY_MAX_NODES - 2),
+        }
+        self.assertEqual(
+            jr._margin_identity_aliases(within_nodes), ["7301"]
+        )
+        self.assertIsNone(jr._margin_identity_aliases(over_nodes))
+
+        empty = {"tranId": "7301", "padding": ""}
+        overhead = len(json.dumps(
+            empty, ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8"))
+        exact_bytes = dict(
+            empty,
+            padding="x" * (
+                jr.MARGIN_IDENTITY_MAX_RESPONSE_BYTES - overhead
+            ),
+        )
+        over_bytes = dict(
+            exact_bytes, padding=exact_bytes["padding"] + "x"
+        )
+        self.assertEqual(
+            jr._margin_identity_aliases(exact_bytes), ["7301"]
+        )
+        self.assertIsNone(jr._margin_identity_aliases(over_bytes))
 
     def test_margin_history_requires_the_exact_type_field(self):
         expected = {
@@ -1701,6 +1935,60 @@ class JobRunnerTests(unittest.TestCase):
             1,
         )
 
+    def test_sourceless_final_refusal_recovers_owned_governor_release(self):
+        job_id = "margin-sourceless-recovery"
+        row, lock_path = self.interrupt_margin_governor_release(
+            job_id, measured_sha="invalid-sha"
+        )
+        source_path = os.path.join(
+            self.receipt_dir, "jobs", "receipts", "margin-%s.json" % job_id
+        )
+        self.assertEqual(row["verdict"], "REFUSED")
+        self.assertFalse(os.path.exists(source_path))
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            before = json.load(handle)
+        token = before["governor_token"]
+        self.assertEqual(before["governor_release"], "PENDING")
+        self.assertEqual(
+            set(before["authority_digests"]), {"job_file"}
+        )
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(
+            self.governor_releases, [(token, self.receipt_dir)]
+        )
+        self.assertFalse(os.path.exists(lock_path))
+        events = self.result_events("margin_governor_release_recovered")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            events[0]["recovery_shape"], "RUNNER_ONLY_FINAL_REFUSAL"
+        )
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["governor_release"], "RECOVERED")
+
+    def test_sourceless_recovery_refuses_one_job_digest_disagreement(self):
+        job_id = "margin-sourceless-disagreement"
+        row, lock_path = self.interrupt_margin_governor_release(
+            job_id, measured_sha="invalid-sha"
+        )
+        job_path = os.path.join(self.jobs_dir, "job-%s.json" % job_id)
+        with open(job_path, "a", encoding="utf-8") as handle:
+            handle.write("\n")
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        refusals = self.result_events("margin_governor_recovery_refused")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["job_id"], job_id)
+        self.assertEqual(
+            refusals[0]["reason"], "DURABLE_OWNERSHIP_MISMATCH"
+        )
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["governor_release"], "PENDING")
+
     def test_margin_final_result_recovers_interrupted_governor_release(self):
         self.margin_job("margin-release-recovery")
         lock_path = os.path.join(
@@ -1745,6 +2033,7 @@ class JobRunnerTests(unittest.TestCase):
         events = self.result_events("margin_governor_release_recovered")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["job_id"], "margin-release-recovery")
+        self.assertEqual(events[0]["recovery_shape"], "SOURCE_BACKED_FINAL")
         with open(first["receipt_path"], encoding="utf-8") as handle:
             after = json.load(handle)
         self.assertEqual(after["governor_release"], "RECOVERED")
@@ -1756,6 +2045,47 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(result_ids, {"margin-release-recovery"})
         self.assertFalse(bad_results)
         self.assertFalse(unresolved)
+
+    def test_margin_recovery_attests_durable_job_file_digest(self):
+        job_id = "margin-recovery-job-digest"
+        _row, lock_path = self.interrupt_margin_governor_release(job_id)
+        job_path = os.path.join(self.jobs_dir, "job-%s.json" % job_id)
+        with open(job_path, "a", encoding="utf-8") as handle:
+            handle.write("\n")
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        self.assertEqual(
+            self.result_events("margin_governor_recovery_refused")[0][
+                "reason"
+            ],
+            "DURABLE_OWNERSHIP_MISMATCH",
+        )
+
+    def test_margin_recovery_attests_source_ready_params_digest(self):
+        job_id = "margin-recovery-ready-digest"
+        row, lock_path = self.interrupt_margin_governor_release(job_id)
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        source_path = runner["source_receipt_path"]
+        with open(source_path, encoding="utf-8") as handle:
+            source = json.load(handle)
+        source["ready"]["params"]["amount"] = "2"
+        with open(source_path, "w", encoding="utf-8") as handle:
+            json.dump(source, handle)
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        self.assertEqual(
+            self.result_events("margin_governor_recovery_refused")[0][
+                "reason"
+            ],
+            "DURABLE_OWNERSHIP_MISMATCH",
+        )
 
     def test_margin_governor_recovery_refuses_ownership_disagreement(self):
         job_id = "margin-recovery-cross-check"

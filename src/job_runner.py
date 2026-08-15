@@ -11,6 +11,7 @@ proofs.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import glob
 import hashlib
 import json
@@ -66,13 +67,21 @@ MOMENTUM_RESULT_FIELDS = RESULT_FIELDS | MOMENTUM_LEDGER_FIELDS
 ADVERSE_STOP_REFUSAL_FIELDS = {"kind", "error", "symbol", "utc"}
 ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
 MARGIN_GOVERNOR_RECOVERY_FIELDS = {
-    "kind", "job_id", "op", "symbol", "verdict", "utc",
+    "kind", "job_id", "op", "symbol", "verdict", "recovery_shape",
+    "utc",
 }
+MARGIN_GOVERNOR_RECOVERY_LEGACY_FIELDS = (
+    MARGIN_GOVERNOR_RECOVERY_FIELDS - {"recovery_shape"}
+)
 MARGIN_GOVERNOR_RECOVERY_REFUSAL_FIELDS = {
     "kind", "job_id", "op", "symbol", "reason", "utc",
 }
 TICK_LOCK_RECOVERY_FIELDS = {
     "kind", "pid", "age_seconds", "utc",
+}
+TICK_LOCK_FIELDS = {
+    "pid", "process_start", "heartbeat_monotonic_ns", "heartbeat_utc",
+    "created_utc", "token",
 }
 TRADING_OPS = {
     "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
@@ -89,8 +98,10 @@ MOMENTUM_STANDING = {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}
 MAX_JOB_AGE = timedelta(minutes=15)
 # Acceptance clocks may differ by no more than two minutes.
 ACCEPT_ONE_FORWARD_SKEW = timedelta(seconds=120)
-# The runner is scheduled once per minute; a dead lock gets one full interval.
+# The runner is scheduled once per minute.
 TICK_INTERVAL_SECONDS = 60.0
+# An owner whose OS identity cannot be confirmed gets three heartbeat intervals.
+TICK_LOCK_HEARTBEAT_INTERVALS = 3
 MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
 MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
 MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
@@ -100,6 +111,10 @@ MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 MARGIN_IDENTITY_KEY_RE = re.compile(
     r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$"
 )
+# Identity evidence is ambiguous once a response walk exceeds this node budget.
+MARGIN_IDENTITY_MAX_NODES = 4096
+# Bound the encoded response material examined by one identity walk to 1 MiB.
+MARGIN_IDENTITY_MAX_RESPONSE_BYTES = 1024 * 1024
 ACCOUNT_GOVERNOR_LOCK_FILE = "account-governor.lock"
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -768,11 +783,93 @@ def _decode_tick_lock(encoded: bytes) -> Dict[str, Any]:
     return owner
 
 
+def _process_start_marker(pid: int) -> Optional[str]:
+    """Read one stable process-start marker from the local operating system."""
+    if type(pid) is not int or pid <= 0:
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            encoded = _read_file_bytes("/proc/%s/stat" % pid)
+            text = encoded.decode("ascii")
+            closing = text.rfind(")")
+            fields = text[closing + 2:].split() if closing >= 0 else []
+            start_ticks = fields[19]
+            if not start_ticks.isdigit():
+                return None
+            return "linux:" + start_ticks
+        except (IndexError, OSError, UnicodeError):
+            return None
+    if sys.platform == "darwin":
+        class _ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        try:
+            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            info = _ProcBsdInfo()
+            size = ctypes.sizeof(info)
+            read_size = library.proc_pidinfo(
+                pid, 3, 0, ctypes.byref(info), size
+            )
+        except (AttributeError, OSError):
+            return None
+        if read_size != size or info.pbi_pid != pid \
+                or info.pbi_start_tvsec <= 0:
+            return None
+        return "darwin:%s:%s" % (
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        )
+    return None
+
+
+def _valid_tick_lock(owner: Dict[str, Any]) -> bool:
+    return set(owner) == TICK_LOCK_FIELDS \
+        and type(owner.get("pid")) is int \
+        and owner["pid"] > 0 \
+        and type(owner.get("process_start")) is str \
+        and bool(owner["process_start"]) \
+        and len(owner["process_start"]) <= 128 \
+        and type(owner.get("heartbeat_monotonic_ns")) is int \
+        and owner["heartbeat_monotonic_ns"] >= 0 \
+        and type(owner.get("heartbeat_utc")) is str \
+        and type(owner.get("created_utc")) is str \
+        and type(owner.get("token")) is str \
+        and bool(owner["token"])
+
+
 def _create_tick_lock(path: str, now: datetime) -> str:
     token = secrets.token_hex(16)
+    pid = os.getpid()
+    process_start = _process_start_marker(pid)
+    if process_start is None:
+        raise OSError("runner process start is unavailable")
     payload = {
-        "pid": os.getpid(),
-        "monotonic_ns": time.monotonic_ns(),
+        "pid": pid,
+        "process_start": process_start,
+        "heartbeat_monotonic_ns": time.monotonic_ns(),
+        "heartbeat_utc": _utc_text(now),
         "created_utc": _utc_text(now),
         "token": token,
     }
@@ -791,6 +888,25 @@ def _create_tick_lock(path: str, now: datetime) -> str:
     return token
 
 
+def _refresh_tick_lock(path: str, token: str, now: datetime) -> bool:
+    """Refresh the heartbeat only while this process still owns the lock."""
+    try:
+        owner = _decode_tick_lock(_read_file_bytes(path))
+        process_start = _process_start_marker(os.getpid())
+        if not _valid_tick_lock(owner) \
+                or owner.get("token") != token \
+                or owner.get("pid") != os.getpid() \
+                or process_start is None \
+                or owner.get("process_start") != process_start:
+            return False
+        owner["heartbeat_monotonic_ns"] = time.monotonic_ns()
+        owner["heartbeat_utc"] = _utc_text(now)
+        _persist_json_receipt(path, owner)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _acquire_tick_lock(path: str, now: datetime) \
         -> Tuple[str, bool, Optional[Dict[str, str]]]:
     recovered = None
@@ -803,42 +919,43 @@ def _acquire_tick_lock(path: str, now: datetime) \
         try:
             encoded = _read_file_bytes(path)
             owner = _decode_tick_lock(encoded)
-            if set(owner) != {
-                    "pid", "monotonic_ns", "created_utc", "token"} \
-                    or type(owner.get("pid")) is not int \
-                    or owner["pid"] <= 0 \
-                    or type(owner.get("monotonic_ns")) is not int \
-                    or owner["monotonic_ns"] < 0 \
-                    or type(owner.get("created_utc")) is not str \
-                    or type(owner.get("token")) is not str \
-                    or not owner["token"]:
+            if not _valid_tick_lock(owner):
                 return "", True, None
             created = _timestamp(owner["created_utc"])
+            heartbeat = _timestamp(owner["heartbeat_utc"])
         except FileNotFoundError:
             continue
         except (JobRefusal, OSError, ValueError):
             return "", True, None
+
+        current_monotonic = time.monotonic_ns()
+        if current_monotonic >= owner["heartbeat_monotonic_ns"]:
+            age = Decimal(
+                current_monotonic - owner["heartbeat_monotonic_ns"]
+            ) / Decimal("1000000000")
+        else:
+            age = Decimal(str((now - heartbeat).total_seconds()))
+        if created > heartbeat or age < 0:
+            return "", True, None
+
+        pid_alive = True
         try:
             os.kill(owner["pid"], 0)
         except PermissionError:
-            return "", False, None
-        except ProcessLookupError:
             pass
+        except ProcessLookupError:
+            pid_alive = False
         except OSError:
             return "", True, None
-        else:
-            return "", False, None
-
-        current_monotonic = time.monotonic_ns()
-        if current_monotonic >= owner["monotonic_ns"]:
-            age = Decimal(current_monotonic - owner["monotonic_ns"]) \
-                / Decimal("1000000000")
-        else:
-            age = Decimal(str((now - created).total_seconds()))
-        if age < 0:
-            return "", True, None
-        if age <= Decimal(str(TICK_INTERVAL_SECONDS)):
-            return "", False, None
+        if pid_alive:
+            current_start = _process_start_marker(owner["pid"])
+            if current_start == owner["process_start"]:
+                return "", False, None
+            if current_start is None:
+                stale_after = Decimal(str(TICK_INTERVAL_SECONDS)) \
+                    * TICK_LOCK_HEARTBEAT_INTERVALS
+                if age <= stale_after:
+                    return "", False, None
         try:
             if _read_file_bytes(path) != encoded:
                 return "", False, None
@@ -905,7 +1022,9 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                             ) is None:
                         return set(), True, False
                     continue
-                if fields == MARGIN_GOVERNOR_RECOVERY_FIELDS:
+                if fields in (
+                        MARGIN_GOVERNOR_RECOVERY_FIELDS,
+                        MARGIN_GOVERNOR_RECOVERY_LEGACY_FIELDS):
                     job_id = row.get("job_id")
                     if row.get("kind") != "margin_governor_release_recovered" \
                             or row.get("op") != margin_ops.MARGIN_BORROW \
@@ -916,7 +1035,12 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                             or row.get("verdict") in FREEZE_VERDICTS \
                             or any(type(row.get(name)) is not str for name in (
                                 "symbol", "verdict", "utc"
-                            )):
+                            )) \
+                            or fields == MARGIN_GOVERNOR_RECOVERY_FIELDS \
+                            and row.get("recovery_shape") not in {
+                                "SOURCE_BACKED_FINAL",
+                                "RUNNER_ONLY_FINAL_REFUSAL",
+                            }:
                         return set(), True, False
                     margin_recovery_ids.add(job_id)
                     continue
@@ -1059,6 +1183,30 @@ def _claim_margin_intent(paths: Dict[str, str], intent_id: str,
     return True
 
 
+def _runner_authority_digests(paths: Dict[str, str], job_id: str,
+                              source_path: str) -> Dict[str, str]:
+    digests: Dict[str, str] = {}
+    if source_path:
+        source = _load_plain_receipt(source_path)
+        recorded = source.get("authority_digests") \
+            if isinstance(source, dict) else None
+        if isinstance(recorded, dict) and all(
+                type(name) is str
+                and type(value) is str
+                and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+                for name, value in recorded.items()):
+            digests.update(recorded)
+    if "job_file" not in digests:
+        job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
+        try:
+            digests["job_file"] = _authority_digest(
+                _read_file_bytes(job_path)
+            )
+        except OSError:
+            pass
+    return digests
+
+
 def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
                           symbol: str, verdict: str, reason: str,
                           now: datetime, source_path: str = "",
@@ -1080,6 +1228,11 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
     if source_path:
         payload["source_receipt_path"] = source_path
     if op in MARGIN_OPS:
+        authority_digests = _runner_authority_digests(
+            paths, job_id, source_path
+        )
+        if authority_digests:
+            payload["authority_digests"] = authority_digests
         if sha_valid:
             payload["sha"] = measured_sha.lower()
         if governor_token:
@@ -3167,45 +3320,124 @@ def _persist_margin_source(path: str, payload: Dict[str, Any],
     _persist_json_receipt(path, payload, create=create)
 
 
+def _margin_identity_scalar_size(value: Any, maximum: int) -> Optional[int]:
+    if maximum < 0:
+        return maximum + 1
+    if type(value) is str:
+        size = 2
+        for character in value:
+            codepoint = ord(character)
+            if character in {'"', "\\"} \
+                    or character in {"\b", "\t", "\n", "\f", "\r"}:
+                size += 2
+            elif codepoint < 0x20 or codepoint > 0x7f:
+                size += 6 if codepoint <= 0xffff else 12
+            else:
+                size += 1
+            if size > maximum:
+                return maximum + 1
+        return size
+    if value is None:
+        return 4
+    if type(value) is bool:
+        return 4 if value else 5
+    if type(value) is int:
+        if value.bit_length() * 30103 // 100000 + 2 > maximum:
+            return maximum + 1
+        try:
+            return len(str(value))
+        except ValueError:
+            return None
+    if type(value) is not float:
+        return None
+    try:
+        encoded = json.dumps(
+            value, allow_nan=False, separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return len(encoded)
+
+
 def _margin_identity_aliases(payload: Any) -> Optional[List[str]]:
     if not isinstance(payload, dict):
         return None
     values: List[str] = []
     stack = [(payload, True)]
     visited = set()
+    scheduled_nodes = 1
+    visited_nodes = 0
+    response_bytes = 0
     while stack:
         current, top_level = stack.pop()
+        visited_nodes += 1
+        if visited_nodes > MARGIN_IDENTITY_MAX_NODES:
+            return None
         if isinstance(current, dict):
             identity = id(current)
             if identity in visited:
                 continue
             visited.add(identity)
+            response_bytes += 2 + max(0, len(current) - 1)
+            children = []
             for name, value in current.items():
-                if type(name) is str:
-                    normalized = unicodedata.normalize("NFKC", name).casefold()
-                    if MARGIN_IDENTITY_KEY_RE.fullmatch(normalized) is not None:
-                        if not top_level or name not in {"tranId", "txId"}:
-                            return None
-                        if type(value) not in (int, str):
-                            return None
+                if type(name) is not str:
+                    return None
+                remaining = MARGIN_IDENTITY_MAX_RESPONSE_BYTES \
+                    - response_bytes
+                name_size = _margin_identity_scalar_size(name, remaining)
+                if name_size is None or name_size > remaining:
+                    return None
+                response_bytes += name_size + 1
+                if response_bytes > MARGIN_IDENTITY_MAX_RESPONSE_BYTES:
+                    return None
+                normalized = unicodedata.normalize("NFKC", name).casefold()
+                if MARGIN_IDENTITY_KEY_RE.fullmatch(normalized) is not None:
+                    if top_level and name not in {"tranId", "txId"}:
+                        return None
+                    if type(value) not in (int, str):
+                        return None
+                    if type(value) is int and value.bit_length() > 430:
+                        return None
+                    try:
                         text = str(value)
-                        if not text or len(text) > 128:
-                            return None
+                    except ValueError:
+                        return None
+                    if not text or len(text) > 128:
+                        return None
+                    if top_level:
                         values.append(text)
-                if isinstance(value, (dict, list, tuple)):
-                    stack.append((value, False))
+                        if len(set(values)) > 1:
+                            return None
+                    else:
+                        # Providers may repeat the confirmed top-level id in
+                        # nested evidence; exact canonical equality adds no
+                        # competing ownership claim.
+                        if not values or text != values[0]:
+                            return None
+                children.append((value, False))
+            if scheduled_nodes + len(children) > MARGIN_IDENTITY_MAX_NODES:
+                return None
+            scheduled_nodes += len(children)
+            stack.extend(reversed(children))
         elif isinstance(current, (list, tuple)):
             identity = id(current)
             if identity in visited:
                 continue
             visited.add(identity)
-            for value in current:
-                if isinstance(value, (dict, list, tuple)):
-                    stack.append((value, False))
-    # Exact top-level aliases may mix int and str only when both render to
-    # the identical canonical text.
-    if len(set(values)) > 1:
-        return None
+            response_bytes += 2 + max(0, len(current) - 1)
+            if scheduled_nodes + len(current) > MARGIN_IDENTITY_MAX_NODES:
+                return None
+            scheduled_nodes += len(current)
+            stack.extend((value, False) for value in reversed(current))
+        else:
+            remaining = MARGIN_IDENTITY_MAX_RESPONSE_BYTES - response_bytes
+            scalar_size = _margin_identity_scalar_size(current, remaining)
+            if scalar_size is None or scalar_size > remaining:
+                return None
+            response_bytes += scalar_size
+        if response_bytes > MARGIN_IDENTITY_MAX_RESPONSE_BYTES:
+            return None
     return values
 
 
@@ -3334,11 +3566,27 @@ def _authority_digest(encoded: Optional[bytes]) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def _json_authority_digest(value: Any) -> Optional[str]:
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _margin_post_authority(
         job: Job, paths: Dict[str, str], operation: Dict[str, Any],
         post_params: Dict[str, Any]) \
         -> Tuple[str, datetime, Dict[str, str], bool]:
-    digests: Dict[str, str] = {}
+    ready_params_digest = _json_authority_digest(post_params)
+    if ready_params_digest is None:
+        ready_params_digest = _authority_digest(None)
+    digests: Dict[str, str] = {
+        "ready_params": ready_params_digest,
+    }
     job_encoded = None
     accept_encoded = None
     operator_encoded = None
@@ -3859,6 +4107,7 @@ def _recover_final_margin_governor(
         lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
         runner = _load_plain_receipt(runner_path)
         source = _load_plain_receipt(source_path)
+        source_exists = os.path.exists(source_path)
         pending = (
             isinstance(runner, dict)
             and runner.get("governor_release") == "PENDING"
@@ -3876,46 +4125,100 @@ def _recover_final_margin_governor(
         params = ready.get("params") if isinstance(ready, dict) else None
         measured_sha = runner.get("measured_sha") \
             if isinstance(runner, dict) else None
-        ownership_agrees = (
+        authority_digests = runner.get("authority_digests") \
+            if isinstance(runner, dict) else None
+        try:
+            job_digest = _authority_digest(_read_file_bytes(job_path))
+        except OSError:
+            job_digest = None
+        job_attested = (
+            isinstance(authority_digests, dict)
+            and type(authority_digests.get("job_file")) is str
+            and job_digest is not None
+            and authority_digests.get("job_file") == job_digest
+        )
+        sha_flag = runner.get("sha_valid") \
+            if isinstance(runner, dict) else None
+        sha_valid = sha_flag is True
+        sha_agrees = (
+            type(measured_sha) is str
+            and type(sha_flag) is bool
+            and (
+                sha_valid
+                and SHA_RE.fullmatch(measured_sha.lower()) is not None
+                and runner.get("sha") == measured_sha.lower()
+                or not sha_valid
+                and SHA_RE.fullmatch(measured_sha.lower()) is None
+                and "sha" not in runner
+            )
+        )
+        common_agrees = (
             os.path.abspath(str(row.get("receipt_path", "")))
             == os.path.abspath(runner_path)
             and isinstance(runner, dict)
-            and isinstance(source, dict)
             and isinstance(lock, dict)
             and isinstance(job, dict)
             and runner.get("job_id") == job_id
             and runner.get("op") == margin_ops.MARGIN_BORROW
             and runner.get("symbol") == row.get("symbol")
             and runner.get("verdict") == row.get("verdict")
-            and runner.get("source_receipt_path") == source_path
             and runner.get("governor_release") == "PENDING"
             and type(governor_token) is str
             and bool(governor_token)
-            and source.get("kind") == "margin_operation"
-            and source.get("job_id") == job_id
-            and source.get("verdict") == row.get("verdict")
-            and source.get("governor_release") == "PENDING"
-            and source.get("governor_token") == governor_token
-            and source.get("sha") == runner.get("sha")
-            and SHA_RE.fullmatch(str(runner.get("sha", ""))) is not None
-            and runner.get("sha_valid") is True
-            and type(measured_sha) is str
-            and measured_sha.lower() == runner.get("sha")
             and set(lock) == {"version", "token", "op", "symbol", "utc"}
+            and type(lock.get("version")) is int
             and lock.get("version") == 1
             and lock.get("token") == governor_token
             and lock.get("op") == margin_ops.MARGIN_BORROW
             and lock.get("symbol") == row.get("symbol")
-            and isinstance(ready, dict)
-            and ready.get("op") == margin_ops.MARGIN_BORROW
-            and isinstance(params, dict)
-            and params.get("asset") == row.get("symbol")
             and job.get("job_id") == job_id
             and job.get("op") == margin_ops.MARGIN_BORROW
             and job.get("asset") == row.get("symbol")
-            and job.get("intent_id") == ready.get("intent_id")
-            and job.get("client_tag") == ready.get("client_tag")
+            and job_attested
+            and sha_agrees
         )
+        source_backed = source_exists \
+            or isinstance(runner, dict) \
+            and "source_receipt_path" in runner
+        if source_backed:
+            ready_params_digest = _json_authority_digest(params) \
+                if isinstance(params, dict) else None
+            ownership_agrees = (
+                common_agrees
+                and isinstance(source, dict)
+                and runner.get("source_receipt_path") == source_path
+                and source.get("kind") == "margin_operation"
+                and source.get("job_id") == job_id
+                and source.get("verdict") == row.get("verdict")
+                and source.get("governor_release") == "PENDING"
+                and source.get("governor_token") == governor_token
+                and sha_valid
+                and source.get("sha") == runner.get("sha")
+                and source.get("authority_digests") == authority_digests
+                and ready_params_digest is not None
+                and authority_digests.get("ready_params")
+                == ready_params_digest
+                and isinstance(ready, dict)
+                and ready.get("op") == margin_ops.MARGIN_BORROW
+                and params.get("asset") == row.get("symbol")
+                and job.get("intent_id") == ready.get("intent_id")
+                and job.get("client_tag") == ready.get("client_tag")
+            )
+            recovery_shape = "SOURCE_BACKED_FINAL"
+            release_source_path = source_path
+        else:
+            ownership_agrees = (
+                common_agrees
+                and row.get("verdict") == "REFUSED"
+                and row.get("exit_code") == 2
+                and runner.get("verdict") == "REFUSED"
+                and type(runner.get("reason")) is str
+                and bool(runner.get("reason"))
+                and "source_receipt_path" not in runner
+                and set(authority_digests) == {"job_file"}
+            )
+            recovery_shape = "RUNNER_ONLY_FINAL_REFUSAL"
+            release_source_path = ""
         if not ownership_agrees:
             return _refuse_margin_governor_recovery(
                 paths, row, now, job_id in refused_ids
@@ -3925,7 +4228,8 @@ def _recover_final_margin_governor(
         if os.path.exists(lock_path):
             return False
         if not _mark_margin_governor_released(
-                paths, job_id, source_path, governor_token, now, "RECOVERED"):
+                paths, job_id, release_source_path, governor_token, now,
+                "RECOVERED"):
             return False
         if job_id not in recovered_ids:
             event = {
@@ -3934,6 +4238,7 @@ def _recover_final_margin_governor(
                 "op": margin_ops.MARGIN_BORROW,
                 "symbol": row["symbol"],
                 "verdict": row["verdict"],
+                "recovery_shape": recovery_shape,
                 "utc": _utc_text(now),
             }
             try:
@@ -4193,6 +4498,10 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
         print("JOB-RUNNER | BUSY | another tick is active")
         return 0
     try:
+        if not _refresh_tick_lock(paths["tick_lock"], token, now):
+            _touch_stop(paths["stop"])
+            print("JOB-RUNNER | HALTED | runner heartbeat unavailable")
+            return 3
         if stale_recovery is not None:
             try:
                 _append_results_row(paths, stale_recovery)
