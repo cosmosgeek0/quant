@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+BRAIN OUTAGE + CURE 2026-08-15 | 17h blind (10:06Z-03:00Z) + 20min relapse | zero exposure throughout, fail-closed every tick
+root | decisions-ledger rotation at 10:06:14Z tore mid-write during symbol AAOIBUSDT's ENTER_SMALL publish — decision row landed, job file did not; every later tick rebuilt the orphan with fresh timestamps -> deterministic id conflict -> exit 2 | the round-2 audit finding triaged "minor, deferred" fired at full scale
+stolen | AAOIBUSDT was the machine's SECOND genuine ignition (10:04:11Z) and a valid ticket stood — the race ate a live entry, not just uptime | BLUAI (09:45Z) was the first: refused on the Lead's expired ticket, guard correct
+whackamole | three single-artifact purges failed — the poisoned pair (BLUAI+AAOIB) persisted in receipts + ledger + state and any survivor regenerated the rest | cure = one atomic three-store quarantine (all copies archived, nothing deleted) | proof: three consecutive clean passes (WATCH then honest DUPLICATEs)
+watch | mtime is a liar under crash-loop (partial writes refresh it) — staleness detection moved to typed health rows + host cron watchdog (aliveness.sh */2, ALARM-brain-stale >15min) per SILENCE IS AN ALARM law
+next | RX lane builds the code fix (rotation-atomic remainder, torn-row tolerance, terminal-aware recovery replay) -> new SHA + tests + delta re-audit before deploy | machine armed and hunting NOW with auto-refreshing ticket
+
 AUDITOR READY 2026-08-14 | frozen SHA 51520655951f8ff99baca37bca9bcdbbff607919 | both auditors independent, read-only, git-pinned
 review lane | FINAL VERDICT: READY, zero blockers | all five commander checks PASS | verdict binds to this SHA exactly — any other SHA on the host voids it | flatness verified against the committed file with its own eyes
 standby lane | independent READY | item 5 satisfied by its own read of f2e31f2 | its earlier running-task inference corrected and struck
