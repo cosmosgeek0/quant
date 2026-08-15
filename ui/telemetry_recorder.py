@@ -24,6 +24,21 @@ import urllib.request
 
 BASE = Path(__file__).resolve().parent
 OUT_PATH = BASE / "live" / "telemetry.jsonl"
+POLL_CONFIG_PATH = BASE / "live" / "poll_config.json"
+ALLOWED_INTERVALS = (5, 10, 15, 30, 60, 120)
+DEFAULT_INTERVAL = 15
+METRIC_FIELDS = {
+    "server": ("rtt_ms", "machine"),
+    "mirror": ("mirror_s",),
+    "market": ("market_s",),
+    "supervisor": ("supervisor_s", "supervisor_status"),
+    "newsloop": ("news_s",),
+    "basiswatch": ("basis_watch_s",),
+    "basissup": ("basis_sup_s",),
+    "jobrunner": ("jobs_s",),
+}
+STRIP_METRICS = ("server", "mirror", "market", "supervisor")
+HEALTH_METRICS = ("basiswatch", "basissup", "jobrunner")
 NEWS_SOURCES_PATH = BASE / "live" / "news_sources.json"
 STRIP_URL = "http://127.0.0.1:8899/api/strip"
 HEALTH_URL = "http://127.0.0.1:8899/api/health"
@@ -154,29 +169,81 @@ def read_news_as_of(path=NEWS_SOURCES_PATH):
     return payload.get("as_of")
 
 
+def load_poll_config(path=POLL_CONFIG_PATH):
+    """Per-metric sample intervals, owner-set through /api/poll_config."""
+    intervals = {}
+    default = DEFAULT_INTERVAL
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        payload = {}
+    if isinstance(payload, dict):
+        candidate = payload.get("default_s")
+        if candidate in ALLOWED_INTERVALS:
+            default = candidate
+        metrics = payload.get("metrics")
+        if isinstance(metrics, dict):
+            for key in METRIC_FIELDS:
+                value = metrics.get(key)
+                if value in ALLOWED_INTERVALS:
+                    intervals[key] = value
+    for key in METRIC_FIELDS:
+        intervals.setdefault(key, default)
+    return intervals
+
+
+def prune_row(row, due_metrics):
+    """Keep ts plus only the fields whose metrics were due this cycle."""
+    kept = {"ts": row["ts"]}
+    for metric in due_metrics:
+        for field in METRIC_FIELDS[metric]:
+            kept[field] = row.get(field)
+    return kept
+
+
 def collect_sample(fetcher=None, news_path=NEWS_SOURCES_PATH,
-                   now_fn=None, clock=None):
-    """Fetch both endpoints and return (row, both_fetches_failed)."""
+                   now_fn=None, clock=None, due_metrics=None):
+    """Fetch what the due metrics need and return (row, all_fetches_failed)."""
     fetcher = fetcher or fetch_json
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
     clock = clock or time.monotonic
+    if due_metrics is None:
+        due_metrics = tuple(METRIC_FIELDS)
 
-    started = clock()
-    strip, strip_ok = _safe_fetch(fetcher, STRIP_URL)
-    elapsed_ms = (clock() - started) * 1000.0
-    rtt_ms = round(elapsed_ms) if strip_ok and finite_float(
-        elapsed_ms) is not None and elapsed_ms >= 0 else None
+    need_strip = any(m in due_metrics for m in STRIP_METRICS)
+    need_health = any(m in due_metrics for m in HEALTH_METRICS)
+    need_news = "newsloop" in due_metrics
 
-    health, health_ok = _safe_fetch(fetcher, HEALTH_URL)
+    strip, strip_ok = ({}, True)
+    rtt_ms = None
+    if need_strip:
+        started = clock()
+        strip, strip_ok = _safe_fetch(fetcher, STRIP_URL)
+        elapsed_ms = (clock() - started) * 1000.0
+        rtt_ms = round(elapsed_ms) if strip_ok and finite_float(
+            elapsed_ms) is not None and elapsed_ms >= 0 else None
+
+    health, health_ok = ({}, True)
+    if need_health:
+        health, health_ok = _safe_fetch(fetcher, HEALTH_URL)
+
     now = now_fn()
     row = build_row(
         strip,
         health,
         rtt_ms,
-        news_as_of=read_news_as_of(news_path),
+        news_as_of=read_news_as_of(news_path) if need_news else None,
         now=now,
     )
-    return row, not strip_ok and not health_ok
+    row = prune_row(row, due_metrics)
+    attempted_failures = []
+    if need_strip:
+        attempted_failures.append(strip_ok)
+    if need_health:
+        attempted_failures.append(health_ok)
+    all_failed = (bool(attempted_failures)
+                  and not any(attempted_failures))
+    return row, all_failed
 
 
 def trim_file(path, max_lines=TRIM_AT_LINES, keep_lines=KEEP_LINES):
@@ -225,10 +292,11 @@ def append_row(row, path=OUT_PATH):
 
 
 def is_double_failure_row(row):
-    """Identify a persisted row with no strip or health observations."""
-    return (isinstance(row, dict)
-            and all(field in row and row[field] is None
-                    for field in DOUBLE_FAILURE_FIELDS))
+    """A row whose attempted strip/health observations all came back empty."""
+    if not isinstance(row, dict):
+        return False
+    attempted = [field for field in DOUBLE_FAILURE_FIELDS if field in row]
+    return bool(attempted) and all(row[field] is None for field in attempted)
 
 
 def last_row_was_double_failure(path=OUT_PATH):
@@ -252,8 +320,8 @@ def should_write_sample(both_fetches_failed, previous_double_failure):
     return not (both_fetches_failed and previous_double_failure)
 
 
-def run_cycle(previous_double_failure, quiet=False):
-    row, both_fetches_failed = collect_sample()
+def run_cycle(previous_double_failure, quiet=False, due_metrics=None):
+    row, both_fetches_failed = collect_sample(due_metrics=due_metrics)
     if should_write_sample(both_fetches_failed, previous_double_failure):
         append_row(row)
         previous_double_failure = both_fetches_failed
@@ -279,19 +347,33 @@ def main():
             return 1
         return 0
 
-    interval = args.loop
+    # --loop N keeps its meaning as the scheduler floor; each metric
+    # samples on its own owner-set interval from poll_config.json.
+    floor_tick = max(1, args.loop)
+    next_due = {}
     try:
         while True:
-            started = time.monotonic()
-            try:
-                previous_double_failure = run_cycle(
-                    previous_double_failure, args.quiet)
-            except Exception as error:  # keep the loop alive
-                print("telemetry_recorder: sample failed: %s" % error,
-                      file=sys.stderr)
-            remaining = interval - (time.monotonic() - started)
+            intervals = load_poll_config()
+            now = time.monotonic()
+            due = [m for m in METRIC_FIELDS
+                   if next_due.get(m, 0) <= now]
+            if due:
+                try:
+                    previous_double_failure = run_cycle(
+                        previous_double_failure, args.quiet,
+                        due_metrics=tuple(due))
+                except Exception as error:  # keep the loop alive
+                    print("telemetry_recorder: sample failed: %s" % error,
+                          file=sys.stderr)
+                after = time.monotonic()
+                for m in due:
+                    next_due[m] = after + max(
+                        intervals[m], floor_tick)
+            wake = min(next_due.values()) if next_due else (
+                time.monotonic() + floor_tick)
+            remaining = wake - time.monotonic()
             if remaining > 0:
-                time.sleep(remaining)
+                time.sleep(min(remaining, 120))
     except KeyboardInterrupt:
         return 0
 

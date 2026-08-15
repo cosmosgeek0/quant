@@ -29,6 +29,7 @@ import os
 import re
 import stat as stat_module
 import sys
+import tempfile
 import threading
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -191,6 +192,7 @@ def default_sources():
         "momentum_state": LIVE_DIR / "momentum-position.json",
         "momentum_receipts": LIVE_DIR / "momentum-paper-receipts.jsonl",
         "health": LIVE_DIR / "health.jsonl",
+        "poll_config": LIVE_DIR / "poll_config.json",
         "jobs_log": Path(os.path.expanduser(os.environ.get(
             "JOBS_LOG", str(LIVE_DIR / "jobs.log")))),
         "stop": LIVE_DIR / "STOP",
@@ -1520,6 +1522,89 @@ def api_strip(sources, now=None):
     }
 
 
+POLL_METRICS = ("server", "mirror", "market", "supervisor", "newsloop",
+                "basiswatch", "basissup", "jobrunner")
+POLL_ALLOWED = (5, 10, 15, 30, 60, 120)
+POLL_DEFAULT = 15
+
+
+def _read_poll_config(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}, False
+    return (payload if isinstance(payload, dict) else {}), True
+
+
+def _resolve_poll_config(payload):
+    default = payload.get("default_s")
+    if default not in POLL_ALLOWED:
+        default = POLL_DEFAULT
+    metrics_in = payload.get("metrics")
+    metrics_in = metrics_in if isinstance(metrics_in, dict) else {}
+    metrics = {}
+    for key in POLL_METRICS:
+        value = metrics_in.get(key)
+        metrics[key] = value if value in POLL_ALLOWED else default
+    return {"default_s": default, "metrics": metrics}
+
+
+def api_poll_config(sources, now=None):
+    payload, present = _read_poll_config(sources["poll_config"])
+    resolved = _resolve_poll_config(payload)
+    return {
+        "ok": True,
+        "present": present,
+        "default_s": resolved["default_s"],
+        "metrics": resolved["metrics"],
+        "allowed": list(POLL_ALLOWED),
+    }
+
+
+def write_poll_config(sources, body):
+    """Validate and atomically write the recorder's poll config.
+
+    The ONLY mutation this server performs: a UI-local preferences file
+    (ui/live/poll_config.json) that the telemetry recorder reads. It can
+    not reach the host, the machine, or any money path.
+    """
+    if not isinstance(body, dict):
+        return None, "body must be a JSON object"
+    current, _ = _read_poll_config(sources["poll_config"])
+    resolved = _resolve_poll_config(current)
+    default = body.get("default_s", resolved["default_s"])
+    if default not in POLL_ALLOWED:
+        return None, "default_s must be one of %s" % (list(POLL_ALLOWED),)
+    metrics_in = body.get("metrics", {})
+    if not isinstance(metrics_in, dict):
+        return None, "metrics must be an object"
+    merged = dict(resolved["metrics"])
+    for key, value in metrics_in.items():
+        if key not in POLL_METRICS:
+            return None, "unknown metric %r" % (key,)
+        if value not in POLL_ALLOWED:
+            return None, "interval for %r must be one of %s" % (
+                key, list(POLL_ALLOWED))
+        merged[key] = value
+    output = {"default_s": default, "metrics": merged}
+    target = Path(sources["poll_config"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".%s-" % target.name, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+            json.dump(output, tmp, ensure_ascii=False, separators=(",", ":"))
+            tmp.flush()
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return output, None
+
+
 API_ROUTES = {
     "/api/strip": api_strip,
     "/api/health": api_health,
@@ -1534,6 +1619,7 @@ API_ROUTES = {
     "/api/pnl": api_pnl,
     "/api/news": api_news,
     "/api/telemetry": api_telemetry,
+    "/api/poll_config": api_poll_config,
 }
 
 
@@ -1755,7 +1841,36 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
         }, head_only=self.command == "HEAD",
                         extra_headers=(("Allow", "GET, HEAD"),))
 
-    do_POST = _refuse
+    def do_POST(self):
+        """One narrow write: the page's own recorder poll config."""
+        clean = urlsplit(self.path).path
+        if clean != "/api/poll_config":
+            self._refuse()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > 4096:
+            self._send_json(400, {"ok": False,
+                                  "error": "body must be 0-4096 bytes"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, UnicodeError):
+            self._send_json(400, {"ok": False,
+                                  "error": "body must be valid JSON"})
+            return
+        try:
+            saved, error = write_poll_config(type(self).sources, body)
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        if error:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        self._send_json(200, {"ok": True, "saved": saved})
+
     do_PUT = _refuse
     do_DELETE = _refuse
     do_PATCH = _refuse

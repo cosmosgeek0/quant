@@ -1177,8 +1177,8 @@ class TestReadOnlyGuarantees(ServerHarness):
             "governor_dir", "governor_lock", "health", "job_receipts_dir",
             "job_results", "jobs_log", "manifest", "momentum_decisions",
             "momentum_receipts", "momentum_state", "news", "news_sources",
-            "proposals_dir", "stop", "stop_jobs", "stream_log",
-            "stream_state",
+            "poll_config", "proposals_dir", "stop", "stop_jobs",
+            "stream_log", "stream_state",
         ])
 
     def test_head_matches_status_and_has_empty_body(self):
@@ -1465,6 +1465,58 @@ class TestTelemetryEndpoint(ServerHarness):
 
         self.assertEqual(payload["range"], "1h")
         self.assertEqual([row["value"] for row in payload["points"]], [2])
+
+
+class TestPollConfigEndpoint(ServerHarness):
+    """The server's one write: the recorder's per-metric poll config."""
+
+    def poll_sources(self, root):
+        return {"poll_config": root / "poll_config.json",
+                "telemetry": root / "telemetry.jsonl"}
+
+    def test_get_defaults_when_absent(self):
+        root = self.tempdir()
+        payload = self.get_json(
+            self.start(self.poll_sources(root)), "/api/poll_config")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["default_s"], 15)
+        self.assertEqual(payload["metrics"]["server"], 15)
+        self.assertIn(5, payload["allowed"])
+
+    def test_post_roundtrip(self):
+        root = self.tempdir()
+        base = self.start(self.poll_sources(root))
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"server": 5, "mirror": 60}}))
+        self.assertEqual(status, 200)
+        saved = json.loads(body)["saved"]
+        self.assertEqual(saved["metrics"]["server"], 5)
+        self.assertEqual(saved["metrics"]["mirror"], 60)
+        payload = self.get_json(base, "/api/poll_config")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["metrics"]["server"], 5)
+        self.assertEqual(payload["metrics"]["mirror"], 60)
+        self.assertEqual(payload["metrics"]["market"], 15)
+
+    def test_post_rejects_bad_values(self):
+        root = self.tempdir()
+        self.start(self.poll_sources(root))
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"server": 7}}))
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(body)["ok"])
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"nope": 5}}))
+        self.assertEqual(status, 400)
+
+    def test_post_other_paths_still_refused(self):
+        root = self.tempdir()
+        self.start(self.poll_sources(root))
+        status, _ = self.request("POST", "/api/strip", body="{}")
+        self.assertEqual(status, 405)
 
 
 if __name__ == "__main__":

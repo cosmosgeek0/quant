@@ -631,159 +631,159 @@
     return (Math.round(pct * 100) / 100).toFixed(2) + "% uptime";
   }
 
-  function cadenceText(def) {
-    if (def.id === "server") { return pollCfg.strip + "s poll"; }
-    if (def.id === "newsloop") { return "120s fixed"; }
-    if (def.id === "mirror") {
-      var iv = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
-      return (typeof iv === "number" && iv > 0)
-        ? Math.round(iv / 1000) + "s pull" : null;
-    }
-    if (def.id === "jobrunner") { return "1m cron"; }
-    return null;
+  /* ---- per-loop poll config: the page's ONE write, backed by the
+     recorder (ui/live/poll_config.json). Selects are real. ---- */
+  var pollConf = { default_s: 15, metrics: {}, allowed: [5, 10, 15, 30,
+    60, 120] };
+
+  function fetchPollConfig(done) {
+    fetch("/api/poll_config", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (d && d.ok) {
+          pollConf.default_s = d.default_s;
+          pollConf.metrics = d.metrics || {};
+          if (d.allowed && d.allowed.length) { pollConf.allowed = d.allowed; }
+        }
+        if (done) { done(); }
+      })
+      .catch(function () { if (done) { done(); } });
   }
 
-  var expandCharts = {};
-
-  function closeExpandChart(id) {
-    if (expandCharts[id]) {
-      expandCharts[id].destroy();
-      delete expandCharts[id];
-    }
+  function postPollConfig(patch, done) {
+    fetch("/api/poll_config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch)
+    })
+      .then(function (r) { return r.json().catch(function () { return null; }); })
+      .then(function (d) {
+        if (d && d.ok && d.saved) {
+          pollConf.default_s = d.saved.default_s;
+          pollConf.metrics = d.saved.metrics || pollConf.metrics;
+        }
+        if (done) { done(d && d.ok); }
+      })
+      .catch(function () { if (done) { done(false); } });
   }
 
-  function fillExpand(def, row) {
-    var body = row.querySelector(".st-expand");
-    if (!body) { return; }
-    body.textContent = "";
-    var st = rowStatus(def);
-    var grid = stEl("div", "st-expand-grid");
-    var kv1 = stEl("div", "st-kv");
-    kv1.appendChild(stEl("span", "st-t-meta", "Source"));
-    kv1.appendChild(stEl("span", "st-t-metamid", def.detail));
-    grid.appendChild(kv1);
-    var kv2 = stEl("div", "st-kv");
-    kv2.appendChild(stEl("span", "st-t-meta", "Current"));
-    var cur = stEl("span", "st-t-datum",
-      st.value == null ? "\u2014" : String(st.value));
-    if (st.statusCls === "warn" || st.statusCls === "bad") {
-      cur.className += " " + st.statusCls;
-    }
-    kv2.appendChild(cur);
-    grid.appendChild(kv2);
-    var kv3 = stEl("div", "st-kv");
-    kv3.appendChild(stEl("span", "st-t-meta", "State"));
-    var sw = stEl("span", "st-word" +
-      (st.statusCls === "bad" ? " bad"
-        : st.statusCls === "warn" ? " warn" : ""),
-      st.statusText || "Measuring");
-    sw.style.fontSize = "12px";
-    kv3.appendChild(sw);
-    grid.appendChild(kv3);
-    var cad = cadenceText(def);
-    if (cad) {
-      var kv4 = stEl("div", "st-kv");
-      kv4.appendChild(stEl("span", "st-t-meta", "Cadence"));
-      kv4.appendChild(stEl("span", "st-t-metamid", cad));
-      grid.appendChild(kv4);
-    }
-    body.appendChild(grid);
-    var m = netMetric(def.id);
-    if (m) {
-      var host = stEl("div", "st-expand-chart");
-      body.appendChild(host);
-      var series = telemSeries(m.field);
-      if (series[0].length >= 2 && window.QNet && QNet.chart) {
-        closeExpandChart(def.id);
-        expandCharts[def.id] = QNet.chart.mount(host, {
-          points: series,
-          unit: m.unit,
-          height: 120,
-          thresholds: thrFor(def.id) || { warn: null, bad: null }
-        });
-      } else {
-        host.appendChild(stEl("div", "st-t-meta",
-          "History still filling for this loop."));
+  function pollIntervalFor(key) {
+    var v = pollConf.metrics[key];
+    return typeof v === "number" ? v : pollConf.default_s;
+  }
+
+  /* centered moving average; nulls stay null so real gaps stay gaps */
+  function movAvg(values, w) {
+    if (w <= 1) { return values; }
+    var half = Math.floor(w / 2);
+    var out = [];
+    for (var i = 0; i < values.length; i += 1) {
+      if (values[i] == null) { out.push(null); continue; }
+      var sum = 0;
+      var n = 0;
+      for (var j = Math.max(0, i - half);
+           j <= Math.min(values.length - 1, i + half); j += 1) {
+        if (values[j] != null) { sum += values[j]; n += 1; }
       }
+      out.push(n ? sum / n : null);
     }
-    var canRefresh = def.id === "server" || def.id === "newsloop" ||
-      def.live === "health";
-    if (canRefresh) {
-      var act = stEl("div", "st-expand-actions");
-      var rb = stEl("button", "st-ctl-btn", "Refresh reading");
-      rb.setAttribute("type", "button");
-      rb.addEventListener("click", function (ev) {
-        ev.stopPropagation();
-        if (def.id === "server") { pollStrip(); }
-        else if (def.id === "newsloop") { fetchNews(true); }
-        else { fetchNetHealth(); }
-      });
-      act.appendChild(rb);
-      body.appendChild(act);
-    }
+    return out;
   }
 
-  function toggleRow(def, row) {
-    var open = row.classList.toggle("open");
-    var chev = row.querySelector(".st-chev");
-    if (chev) { chev.textContent = open ? "\u25b2" : "\u25bc"; }
-    if (open) { fillExpand(def, row); }
-    else { closeExpandChart(def.id); }
-  }
+  var panelCharts = {};
 
-  function buildStatusRow(def) {
-    var row = stEl("div", "st-row");
-    row.id = "strow-" + def.id;
-    var gated = def.group === "boundary";
-    var line = stEl("button", "st-rowline-btn");
-    line.setAttribute("type", "button");
+  /* theme flips repaint tokens instantly but canvases keep their
+     mount-time colors — remount the page's charts on the flip */
+  (function watchTheme() {
+    if (!window.MutationObserver) { return; }
+    new MutationObserver(function () {
+      if ((location.hash || "").slice(1) !== "network") { return; }
+      if (netOverview) { netOverview.destroy(); netOverview = null; }
+      var keys = Object.keys(panelCharts);
+      for (var i = 0; i < keys.length; i += 1) {
+        panelCharts[keys[i]].destroy();
+      }
+      panelCharts = {};
+      renderTelemetry();
+    }).observe(document.documentElement,
+      { attributes: true, attributeFilter: ["data-theme"] });
+  })();
+
+  function buildPanel(def, idx) {
+    var panel = stEl("div", "st-card st-panel");
+    panel.id = "strow-" + def.id;
+    var head = stEl("div", "st-panel-head");
     var icon = stEl("span", "st-check");
-    icon.appendChild(stIcon(gated ? 3 : 0));
-    line.appendChild(icon);
-    line.appendChild(stEl("span", "st-t-name", def.name));
-    line.appendChild(stEl("span", "st-spacer"));
-    if (gated) {
-      line.appendChild(stEl("span", "st-word off", "Owner gated"));
-      line.disabled = true;
-    } else {
-      var up = stEl("span", "st-uptime", "\u2014");
-      up.setAttribute("data-uptime", def.id);
-      line.appendChild(up);
-      line.appendChild(stEl("span", "st-chev", "\u25bc"));
-      line.addEventListener("click", function () {
-        toggleRow(def, row);
+    icon.appendChild(stIcon(0));
+    head.appendChild(icon);
+    head.appendChild(stEl("span", "st-t-name", def.name));
+    head.appendChild(stEl("span", "st-spacer"));
+    var up = stEl("span", "st-uptime", "\u2014");
+    up.setAttribute("data-uptime", def.id);
+    head.appendChild(up);
+    panel.appendChild(head);
+    var bars = stEl("div", "st-bars");
+    bars.setAttribute("data-bars", def.id);
+    panel.appendChild(bars);
+    var graph = stEl("div", "st-panel-graph");
+    graph.setAttribute("data-graph", def.id);
+    panel.appendChild(graph);
+    var foot = stEl("div", "st-panel-foot");
+    var sel = stEl("select", "st-select");
+    for (var ai = 0; ai < pollConf.allowed.length; ai += 1) {
+      var o = stEl("option", "", pollConf.allowed[ai] + "s");
+      o.value = String(pollConf.allowed[ai]);
+      if (pollIntervalFor(def.id) === pollConf.allowed[ai]) {
+        o.selected = true;
+      }
+      sel.appendChild(o);
+    }
+    sel.setAttribute("data-poll", def.id);
+    sel.addEventListener("change", function () {
+      var patch = { metrics: {} };
+      patch.metrics[def.id] = parseInt(sel.value, 10);
+      postPollConfig(patch, function (ok) {
+        if (!ok) {
+          sel.value = String(pollIntervalFor(def.id));
+        }
       });
-    }
-    row.appendChild(line);
-    if (!gated) {
-      var bars = stEl("div", "st-bars");
-      bars.setAttribute("data-bars", def.id);
-      row.appendChild(bars);
-      row.appendChild(stEl("div", "st-expand"));
-    }
-    return row;
+    });
+    foot.appendChild(sel);
+    foot.appendChild(stEl("span", "st-spacer"));
+    foot.appendChild(mkSwitch(connState[def.id] !== false, function (on) {
+      connState[def.id] = on;
+      if (def.id === "server") {
+        pollCfg.paused = !on;
+        savePollCfg();
+      }
+      if (def.id === "newsloop") { setMaster(on); }
+      renderSigAll();
+      syncOverviewShow();
+    }));
+    panel.appendChild(foot);
+    return panel;
   }
 
-  function updateStatusRows() {
+  function updatePanels() {
     for (var i = 0; i < CONNECTIONS.length; i += 1) {
       var def = CONNECTIONS[i];
-      var row = document.getElementById("strow-" + def.id);
-      if (!row) { continue; }
       if (def.group === "boundary") { continue; }
+      var panel = document.getElementById("strow-" + def.id);
+      if (!panel) { continue; }
       var st = rowStatus(def);
       var off = !connState[def.id];
       var state = off ? 3
         : st.statusCls === "bad" ? 2
         : st.statusCls === "warn" ? 1 : 0;
-      var icon = row.querySelector(".st-check");
+      var icon = panel.querySelector(".st-check");
       if (icon && icon.getAttribute("data-state") !== String(state)) {
         icon.setAttribute("data-state", String(state));
         icon.textContent = "";
         icon.appendChild(stIcon(state));
       }
-      var up = row.querySelector("[data-uptime]");
+      var up = panel.querySelector("[data-uptime]");
       if (up) { up.textContent = off ? "Off" : uptimeText(def.id); }
-      var bars = row.querySelector("[data-bars]");
+      var bars = panel.querySelector("[data-bars]");
       if (bars && window.QNet && QNet.bars) {
         var fit = Math.max(12, Math.floor((bars.clientWidth + 2) / 7));
         var samples = statusSamples(def.id, Math.min(fit, 90));
@@ -791,7 +791,6 @@
           QNet.bars.render(bars, samples);
         } else { bars.textContent = ""; }
       }
-      if (row.classList.contains("open")) { fillExpand(def, row); }
     }
   }
 
@@ -873,6 +872,34 @@
       if (!isFinite(t)) { continue; }
       ts.push(Math.round(t / 1000));
       vs.push(telNum(pts[i][field]));
+    }
+    return [ts, vs];
+  }
+
+  /* per-metric series on the shared grid: carry the last measured
+     value within its own poll tolerance; AGE fields extrapolate by
+     elapsed time (physics: age grows while unsampled). Beyond
+     tolerance the line honestly breaks. */
+  function seriesFilled(field, key) {
+    var pts = telemPoints();
+    var tol = pollIntervalFor(key) * 1.6 + 10;
+    var isAge = field !== "rtt_ms";
+    var ts = [];
+    var vs = [];
+    var lastT = null;
+    var lastV = null;
+    for (var i = 0; i < pts.length; i += 1) {
+      var t = Date.parse(pts[i].ts);
+      if (!isFinite(t)) { continue; }
+      t = Math.round(t / 1000);
+      var raw = telNum(pts[i][field]);
+      if (raw != null) { lastT = t; lastV = raw; }
+      ts.push(t);
+      if (lastT == null || t - lastT > tol) {
+        vs.push(null);
+      } else {
+        vs.push(isAge && t > lastT ? lastV + (t - lastT) : lastV);
+      }
     }
     return [ts, vs];
   }
@@ -974,7 +1001,7 @@
     if (!m) { return null; }
     var t = thrFor(compKey);
     if (!t) { return null; }
-    var vs = telemSeries(m.field)[1];
+    var vs = seriesFilled(m.field, compKey)[1];
     var meas = 0;
     var okc = 0;
     for (var i = 0; i < vs.length; i++) {
@@ -989,7 +1016,7 @@
   function statusSamples(compKey, maxN) {
     var m = netMetric(compKey);
     if (!m) { return null; }
-    var vs = telemSeries(m.field)[1];
+    var vs = seriesFilled(m.field, compKey)[1];
     if (!vs.length) { return null; }
     /* grade each sample against cadence thresholds AND the window's
        own median — real spikes (a slow pull, an RTT jump) appear as
@@ -1020,8 +1047,10 @@
     var d = netTelem.data;
     var host = document.getElementById("net-overview");
     var capEl = document.getElementById("net-chart-cap");
+    var pts = telemPoints();
+    var rootCs = getComputedStyle(document.documentElement);
+    var mi;
     if (host) {
-      var pts = telemPoints();
       if (!d || !d.present || pts.length < 2) {
         if (netOverview) { netOverview.destroy(); netOverview = null; }
         host.textContent = "";
@@ -1031,47 +1060,71 @@
         emptyMsg.style.padding = "8px";
         host.appendChild(emptyMsg);
       } else if (window.QNet && QNet.chart && QNet.chart.mountMulti) {
-        var times = [];
-        var cols = [];
-        var mi;
-        for (mi = 0; mi < NET_METRICS.length; mi += 1) { cols.push([]); }
-        for (var pi = 0; pi < pts.length; pi += 1) {
-          var tt = Date.parse(pts[pi].ts);
-          if (!isFinite(tt)) { continue; }
-          times.push(Math.round(tt / 1000));
-          for (mi = 0; mi < NET_METRICS.length; mi += 1) {
-            cols[mi].push(telNum(pts[pi][NET_METRICS[mi].field]));
-          }
-        }
-        var rootCs = getComputedStyle(document.documentElement);
+        /* overview: the seven age loops, one unit (seconds),
+           smoothed for reading — RTT lives in its own panel */
+        var times = null;
         var defs = [];
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
+          var m = NET_METRICS[mi];
+          if (m.unit !== "s") { continue; }
+          var sf = seriesFilled(m.field, m.key);
+          if (!times) { times = sf[0]; }
           defs.push({
-            label: NET_METRICS[mi].label,
-            unit: NET_METRICS[mi].unit,
+            label: m.label,
+            unit: "s",
             color: rootCs.getPropertyValue("--st-s" + (mi + 1))
               .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-            values: cols[mi]
+            values: movAvg(sf[1], 5)
           });
         }
-        if (!netOverview) {
-          host.textContent = "";
-          netOverview = QNet.chart.mountMulti(host,
-            { times: times, series: defs, height: 260 });
-        } else {
-          netOverview.setData(times, defs);
+        if (times && times.length >= 2) {
+          if (!netOverview) {
+            host.textContent = "";
+            netOverview = QNet.chart.mountMulti(host,
+              { times: times, series: defs, height: 400 });
+          } else {
+            netOverview.setData(times, defs);
+          }
+          syncOverviewShow();
         }
-        syncOverviewShow();
       }
     }
     if (capEl) {
       var n = d && d.present ? (d.count || 0) : 0;
       capEl.textContent = n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples \u00b7 " +
-          netTelem.range + " window \u00b7 UTC"
+          netTelem.range + " window \u00b7 5-sample smoothed \u00b7 UTC"
         : "History arrives from the telemetry recorder.";
     }
-    updateStatusRows();
+    /* panel graphs: each loop's own line in its own color */
+    if (pts.length >= 2 && window.QNet && QNet.chart &&
+        QNet.chart.mountMulti) {
+      for (mi = 0; mi < NET_METRICS.length; mi += 1) {
+        var pm = NET_METRICS[mi];
+        var pHost = document.querySelector(
+          "[data-graph=\"" + pm.key + "\"]");
+        if (!pHost) { continue; }
+        var psf = seriesFilled(pm.field, pm.key);
+        var pdef = [{
+          label: pm.label,
+          unit: pm.unit,
+          color: rootCs.getPropertyValue("--st-s" + (mi + 1))
+            .replace(/^\s+|\s+$/g, "") || "#3b82f6",
+          values: movAvg(psf[1], 3)
+        }];
+        if (psf[0].length >= 2) {
+          if (panelCharts[pm.key]) {
+            panelCharts[pm.key].setData(psf[0], pdef);
+          } else {
+            pHost.textContent = "";
+            panelCharts[pm.key] = QNet.chart.mountMulti(pHost, {
+              times: psf[0], series: pdef, height: 150, compact: true
+            });
+          }
+        }
+      }
+    }
+    updatePanels();
     var evHost2 = document.getElementById("net-events");
     if (evHost2 && window.QNet && QNet.events) {
       var evDefs = [];
@@ -1111,17 +1164,15 @@
     container.textContent = "";
     connState.server = !pollCfg.paused;
     connState.newsloop = newsMaster;
-    expandCharts = {};
+    panelCharts = {};
     netOverview = null;
 
     var page = stEl("div", "st-page");
 
-    /* title, written the plain way — nothing else on the line */
     var head = stEl("div", "st-head");
     head.appendChild(stEl("div", "st-t-title", "Network"));
     page.appendChild(head);
 
-    /* banner: the kept OpenAI base — card on its state plate */
     var plate = stEl("div", "st-plate");
     plate.id = "net-plate";
     var banner = stEl("div", "st-card");
@@ -1129,7 +1180,7 @@
     plate.appendChild(banner);
     page.appendChild(plate);
 
-    /* THE graph: every loop overlaid, granular, full width */
+    /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
     var gHead = stEl("div", "st-card-head");
     gHead.appendChild(stEl("div", "st-t-h", "Loop timing"));
@@ -1149,8 +1200,6 @@
             bs[q].classList.toggle("on",
               bs[q].textContent === rg.toUpperCase());
           }
-          var pl = document.getElementById("net-pager-lbl");
-          if (pl) { pl.textContent = rg + " window"; }
           fetchTelemetry();
         });
         seg.appendChild(rb);
@@ -1160,6 +1209,7 @@
     graphCard.appendChild(gHead);
     var chips = stEl("div", "st-chips");
     for (var ci2 = 0; ci2 < NET_METRICS.length; ci2 += 1) {
+      if (NET_METRICS[ci2].unit !== "s") { continue; }
       (function (m, idx) {
         var chip = stEl("button", "st-chip");
         chip.setAttribute("type", "button");
@@ -1186,56 +1236,10 @@
     graphCard.appendChild(cap);
     page.appendChild(graphCard);
 
-    /* below: status base left, controls + changes right */
-    var cols = stEl("div", "st-cols");
-    var colL = stEl("div", "");
-    var colR = stEl("div", "");
-    cols.appendChild(colL);
-    cols.appendChild(colR);
-    page.appendChild(cols);
-
-    var statusCard = stEl("div", "st-card");
-    var sHead = stEl("div", "st-card-head");
-    sHead.appendChild(stEl("div", "st-t-h", "System status"));
-    var pager = stEl("div", "st-pager");
-    var pgPrev = stEl("button", "", "\u2039");
-    pgPrev.setAttribute("type", "button");
-    var pgLbl = stEl("span", "", netTelem.range + " window");
-    pgLbl.id = "net-pager-lbl";
-    var pgNext = stEl("button", "", "\u203a");
-    pgNext.setAttribute("type", "button");
-    var RANGES = ["1h", "6h", "24h"];
-    function cycleRange(dir) {
-      var at = RANGES.indexOf(netTelem.range);
-      var nx = Math.min(RANGES.length - 1, Math.max(0, at + dir));
-      if (RANGES[nx] === netTelem.range) { return; }
-      netTelem.range = RANGES[nx];
-      pgLbl.textContent = netTelem.range + " window";
-      var bs = seg.querySelectorAll("button");
-      for (var q = 0; q < bs.length; q += 1) {
-        bs[q].classList.toggle("on",
-          bs[q].textContent === netTelem.range.toUpperCase());
-      }
-      fetchTelemetry();
-    }
-    pgPrev.addEventListener("click", function () { cycleRange(-1); });
-    pgNext.addEventListener("click", function () { cycleRange(1); });
-    pager.appendChild(pgPrev);
-    pager.appendChild(pgLbl);
-    pager.appendChild(pgNext);
-    sHead.appendChild(pager);
-    sHead.appendChild(stEl("span", "st-spacer"));
-    statusCard.appendChild(sHead);
-    for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
-      statusCard.appendChild(buildStatusRow(CONNECTIONS[ri]));
-    }
-    colL.appendChild(statusCard);
-
-    /* controls: a real switch and a real speed for every loop */
-    var ctl = stEl("div", "st-card");
-    var ctlHead = stEl("div", "st-card-head");
-    ctlHead.appendChild(stEl("div", "st-t-h", "Controls"));
-    ctlHead.appendChild(stEl("span", "st-spacer"));
+    /* section line: one common Defaults that resets everything */
+    var secHead = stEl("div", "st-sec-head");
+    secHead.appendChild(stEl("div", "st-t-h", "System status"));
+    secHead.appendChild(stEl("span", "st-spacer"));
     var dfl = stEl("button", "st-ctl-btn", "Defaults");
     dfl.setAttribute("type", "button");
     dfl.addEventListener("click", function () {
@@ -1243,104 +1247,40 @@
       pollCfg.news = POLL_DEFAULTS.news;
       pollCfg.paused = false;
       savePollCfg();
+      for (var di = 0; di < CONNECTIONS.length; di += 1) {
+        if (CONNECTIONS[di].group !== "boundary") {
+          connState[CONNECTIONS[di].id] = true;
+        }
+      }
+      chipOn = {};
+      setMaster(true);
       restartStripPoll();
       if (newsTimer) { startNewsPoll(); }
-      if ((location.hash || "").slice(1) === "network") {
-        startNetHealthPoll();
-        pageEl.textContent = "";
-        buildNetworkPage(pageEl);
-      }
-    });
-    ctlHead.appendChild(dfl);
-    ctl.appendChild(ctlHead);
-
-    function mkSelect(values, current, onPick) {
-      var sel2 = stEl("select", "st-select");
-      for (var vi = 0; vi < values.length; vi += 1) {
-        var o = stEl("option", "", values[vi] + "s");
-        o.value = String(values[vi]);
-        if (current === values[vi]) { o.selected = true; }
-        sel2.appendChild(o);
-      }
-      sel2.addEventListener("change", function () {
-        onPick(parseInt(sel2.value, 10));
-      });
-      return sel2;
-    }
-
-    function ctlRow(name, rightNodes) {
-      var r = stEl("div", "st-row");
-      var l = stEl("div", "st-row-line");
-      l.appendChild(stEl("span", "st-t-name", name));
-      l.appendChild(stEl("span", "st-spacer"));
-      for (var ni = 0; ni < rightNodes.length; ni += 1) {
-        l.appendChild(rightNodes[ni]);
-      }
-      r.appendChild(l);
-      return r;
-    }
-
-    function watchToggle(id) {
-      return mkSwitch(connState[id] !== false, function (on) {
-        connState[id] = on;
-        renderSigAll();
-        syncOverviewShow();
-      });
-    }
-
-    ctl.appendChild(ctlRow("Web server", [
-      mkSelect([5, 10, 30, 60], pollCfg.strip, function (v) {
-        pollCfg.strip = v;
-        savePollCfg();
-        restartStripPoll();
+      postPollConfig({ default_s: 15, metrics: {
+        server: 15, mirror: 15, market: 15, supervisor: 15,
+        newsloop: 15, basiswatch: 15, basissup: 15, jobrunner: 15
+      } }, function () {
         if ((location.hash || "").slice(1) === "network") {
           startNetHealthPoll();
+          pageEl.textContent = "";
+          buildNetworkPage(pageEl);
         }
-      }),
-      mkSwitch(!pollCfg.paused, function (on) {
-        connState.server = on;
-        pollCfg.paused = !on;
-        savePollCfg();
-        renderSigAll();
-        syncOverviewShow();
-      })
-    ]));
-    ctl.appendChild(ctlRow("News mirror", [
-      mkSelect([10, 20, 60], pollCfg.news, function (v) {
-        pollCfg.news = v;
-        savePollCfg();
-        if (newsTimer) { startNewsPoll(); }
-      }),
-      mkSwitch(newsMaster, function (on) {
-        connState.newsloop = on;
-        setMaster(on);
-        renderSigAll();
-        syncOverviewShow();
-      })
-    ]));
-    ctl.appendChild(ctlRow("Data mirror",
-      [stEl("span", "st-t-metamid", "45s pull"), watchToggle("mirror")]));
-    ctl.appendChild(ctlRow("Market feed",
-      [stEl("span", "st-t-metamid", "host pass"), watchToggle("market")]));
-    ctl.appendChild(ctlRow("Supervisor",
-      [stEl("span", "st-t-metamid", "3m chain"),
-       watchToggle("supervisor")]));
-    ctl.appendChild(ctlRow("Basis watch",
-      [stEl("span", "st-t-metamid", "3m chain"),
-       watchToggle("basiswatch")]));
-    ctl.appendChild(ctlRow("Basis supervisor",
-      [stEl("span", "st-t-metamid", "3m chain"),
-       watchToggle("basissup")]));
-    ctl.appendChild(ctlRow("Job runner",
-      [stEl("span", "st-t-metamid", "1m cron"),
-       watchToggle("jobrunner")]));
-    var ctlFoot = stEl("div", "st-card-foot st-t-meta",
-      "Switches control this page\u2019s watching \u00b7 host loops " +
-      "run on the host.");
-    ctl.appendChild(ctlFoot);
-    colR.appendChild(ctl);
+      });
+    });
+    secHead.appendChild(dfl);
+    page.appendChild(secHead);
 
-    /* state changes: the honest history, right column */
+    /* 4 panels left, 4 panels right — each with its own graph,
+       its own real poll rate, its own switch */
+    var grid = stEl("div", "st-grid");
+    for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
+      if (CONNECTIONS[ri].group === "boundary") { continue; }
+      grid.appendChild(buildPanel(CONNECTIONS[ri], ri));
+    }
+    page.appendChild(grid);
+
+    /* bottom: honest history + the owner-gated boundaries */
+    var bottom = stEl("div", "st-bottom");
     var evCard = stEl("div", "st-card");
     evCard.id = "net-evcard";
     var evHead = stEl("div", "st-card-head");
@@ -1353,9 +1293,41 @@
     var evHost = stEl("div", "");
     evHost.id = "net-events";
     evCard.appendChild(evHost);
-    colR.appendChild(evCard);
+    bottom.appendChild(evCard);
+
+    var bCard = stEl("div", "st-card");
+    var bHead = stEl("div", "st-card-head");
+    bHead.appendChild(stEl("div", "st-t-h", "Boundaries"));
+    bCard.appendChild(bHead);
+    for (var bi = 0; bi < CONNECTIONS.length; bi += 1) {
+      var bdef = CONNECTIONS[bi];
+      if (bdef.group !== "boundary") { continue; }
+      var brow = stEl("div", "st-row");
+      var bline = stEl("div", "st-row-line");
+      var bicon = stEl("span", "st-check");
+      bicon.appendChild(stIcon(3));
+      bline.appendChild(bicon);
+      bline.appendChild(stEl("span", "st-t-name", bdef.name));
+      bline.appendChild(stEl("span", "st-spacer"));
+      bline.appendChild(stEl("span", "st-word off", "Owner gated"));
+      brow.appendChild(bline);
+      bCard.appendChild(brow);
+    }
+    var bFoot = stEl("div", "st-card-foot st-t-meta",
+      "Poll selects set the recorder\u2019s sampling \u00b7 host " +
+      "loops run on the host.");
+    bCard.appendChild(bFoot);
+    bottom.appendChild(bCard);
+    page.appendChild(bottom);
 
     container.appendChild(page);
+    fetchPollConfig(function () {
+      var sels = page.querySelectorAll("[data-poll]");
+      for (var pi = 0; pi < sels.length; pi += 1) {
+        sels[pi].value = String(
+          pollIntervalFor(sels[pi].getAttribute("data-poll")));
+      }
+    });
     renderSigAll();
     renderTelemetry();
   }
@@ -1363,7 +1335,7 @@
   function renderSigAll() {
     if ((location.hash || "").slice(1) === "network" && sigPage) {
       updateBanner();
-      updateStatusRows();
+      updatePanels();
     }
   }
 

@@ -619,6 +619,37 @@
       tooltip.style.top = Math.max(6, Math.round(y)) + "px";
     }
 
+    var hasS = false;
+    var hasMs = false;
+    for (var ud = 0; ud < defs.length; ud += 1) {
+      if (defs[ud].unit === "ms") { hasMs = true; } else { hasS = true; }
+    }
+    function unitAxis(scaleName, unitText, side) {
+      var axis = {
+        scale: scaleName, stroke: muted, font: axisFont,
+        size: cfg.compact ? 40 : 46,
+        values: function (u, splits) {
+          var out = [];
+          for (var j = 0; j < splits.length; j += 1) {
+            out.push(splits[j] + unitText);
+          }
+          return out;
+        },
+        grid: side ? { show: false }
+          : { show: true, stroke: line, width: 1 },
+        ticks: { show: false }, border: { show: false }
+      };
+      if (side) { axis.side = 1; }
+      return axis;
+    }
+    var axes = [
+      { stroke: muted, font: axisFont, size: cfg.compact ? 26 : 30,
+        grid: { show: true, stroke: line, width: 1 },
+        ticks: { show: false }, border: { show: false } }
+    ];
+    if (hasS) { axes.push(unitAxis("s", "s", false)); }
+    if (hasMs) { axes.push(unitAxis("ms", "ms", hasS)); }
+
     var options = {
       width: width,
       height: height,
@@ -639,31 +670,7 @@
         s: { range: rangeUp },
         ms: { range: rangeUp }
       },
-      axes: [
-        { stroke: muted, font: axisFont, size: 30,
-          grid: { show: true, stroke: line, width: 1 },
-          ticks: { show: false }, border: { show: false } },
-        { scale: "s", stroke: muted, font: axisFont, size: 46,
-          values: function (u, splits) {
-            var out = [];
-            for (var j = 0; j < splits.length; j += 1) {
-              out.push(splits[j] + "s");
-            }
-            return out;
-          },
-          grid: { show: true, stroke: line, width: 1 },
-          ticks: { show: false }, border: { show: false } },
-        { scale: "ms", side: 1, stroke: muted, font: axisFont, size: 52,
-          values: function (u, splits) {
-            var out = [];
-            for (var j = 0; j < splits.length; j += 1) {
-              out.push(splits[j] + "ms");
-            }
-            return out;
-          },
-          grid: { show: false },
-          ticks: { show: false }, border: { show: false } }
-      ],
+      axes: axes,
       series: series,
       hooks: {
         ready: [function (u) {
