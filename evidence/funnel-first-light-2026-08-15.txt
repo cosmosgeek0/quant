@@ -1,0 +1,6 @@
+FUNNEL FIRST LIGHT (release 18b193f, live host tick 05:23:10Z, hash-gated deploy GATE OK x3)
+{"universe":656,"fresh_ok":153,"baseline_ok":76,"ignited":19,"ticket_eligible":0,"entered":0,"starving_stage":"ticket_eligible"}
+reading | the 3x bar ignites 19 symbols in ONE tick — the entry bar was never the constraint
+starving | candidates die at eligibility: persistence gate (2-pass hold), freshness coverage 153/656, baselines warming after today's state resets
+mechanism | knob_tuner cron (hourly, :05) now names the starving stage in health.jsonl; ticket-domain stages are advisory-only by design
+ticket | valid, 524s remaining at capture, auto-refresh armed

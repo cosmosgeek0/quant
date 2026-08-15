@@ -7,6 +7,11 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+FUNNEL + TUNER + STUDY LIVE 2026-08-15 | release 18b193f deployed hash-gated | 940/940 (Lead-run; all four workers died pre-report, disk-verified)
+first light | ONE tick at the 3x bar: universe 656 -> fresh 153 -> baseline 76 -> IGNITED 19 -> eligible 0 -> entered 0 | the bar is not the constraint; candidates die at eligibility (2-pass persistence + freshness coverage + warming baselines)
+built | per-tick funnel rows naming the starving stage | hourly bounded knob tuner (knobs.env, limits clamps, ticket-domain advisory-only) | public-archive tape puller (100-token cohort running on the Mac) | current-detector replay harness with 5/15/60m forward returns
+next | replay answers "would it have caught N yesterday" when the tape lands | delta audit on 18b193f requested | futures-only entry confirmed by Lead grep — spot-only widen is the first post-receipt rung
+
 LOOSENED + CURED + REDEPLOYED 2026-08-15 | release d962ac33 live | 919/919 Lead-run | machine armed, ticket flat-gated, four clean passes proven on host
 owner order | gating variables are KNOBS now: limits.MOMENTUM_IGNITION_SURGE_RATIO 10->3 (env QUANT_IGNITION_SURGE), governor 5/day 1.00 -> 10/day 2.00 USDT (env-overridable, garbage fails closed) | money physics untouched: clamp 8, 1x, reduce-only, consume-on-fill, 2% adverse stop
 brain saga closed | RX rotation immunity (worker died pre-report, Lead-verified from disk) + Lead's fresh-redecision fix: one deterministic id over a NEW observation = benign newest-wins; same-observation mismatch stays fatal | the id-vs-observation collision was the TRUE root of every crash-loop
