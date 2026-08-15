@@ -310,8 +310,160 @@ def parse_tree(blob, source):
     return items
 
 
+def _mk_item(source, item_id, ts, title, url):
+    return {
+        "id": str(item_id)[:120],
+        "ts": ts,
+        "source": source["label"],
+        "source_key": source["key"],
+        "domain": source.get("domain") or "",
+        "title": title,
+        "url": url,
+        "impact": score_impact(title, source["channel"]),
+        "category": classify(title, source["channel"]),
+    }
+
+
+def _ts_from_any(value, assume_offset=None):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        ms = int(text)
+        if ms > 10**12:
+            return iso_from_epoch_ms(ms)
+        if ms > 10**9:
+            return iso_from_epoch_ms(ms * 1000)
+        return None
+    if assume_offset and re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d", text):
+        text = text.replace(" ", "T") + assume_offset
+    stamp = parse_rss_time(text)
+    if stamp is None:
+        return None
+    return stamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_upbit(blob, source):
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    notices = (((data or {}).get("data") or {}).get("notices"))
+    if not isinstance(notices, list):
+        return None
+    items = []
+    for notice in notices[:12]:
+        if not isinstance(notice, dict):
+            continue
+        title = clean_title(notice.get("title") or "")
+        ts = _ts_from_any(notice.get("listed_at")
+                          or notice.get("first_listed_at"))
+        if not title or not ts:
+            continue
+        nid = notice.get("id") or notice.get("uuid") or title
+        url = ("https://upbit.com/service_center/notice?id=%s" % nid
+               if notice.get("id") else "https://upbit.com")
+        items.append(_mk_item(source, "upbit:%s" % nid, ts, title, url))
+    return items
+
+
+def parse_bithumb(blob, source):
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    items = []
+    for row in data[:12]:
+        if not isinstance(row, dict):
+            continue
+        title = clean_title(row.get("title") or "")
+        ts = _ts_from_any(row.get("published_at") or row.get("modified_at"),
+                          assume_offset="+09:00")
+        if not title or not ts:
+            continue
+        url = row.get("pc_url") if isinstance(row.get("pc_url"), str) \
+            else "https://www.bithumb.com"
+        items.append(_mk_item(
+            source, "bithumb:%s" % (row.get("published_at") or title),
+            ts, title, url))
+    return items
+
+
+def parse_bybit_status(blob, source):
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    rows = (((data or {}).get("result") or {}).get("list"))
+    if not isinstance(rows, list):
+        return None
+    items = []
+    for row in rows[:12]:
+        if not isinstance(row, dict):
+            continue
+        title = clean_title(row.get("title") or row.get("state") or "")
+        ts = _ts_from_any(row.get("beginTime") or row.get("startTime")
+                          or row.get("time"))
+        if not title or not ts:
+            continue
+        if not title.startswith("Bybit"):
+            title = "Bybit " + title
+        items.append(_mk_item(
+            source, "bybit-system:%s" % (row.get("id") or title), ts, title,
+            "https://announcements.bybit.com/en/?category=maintenance_updates"))
+    return items
+
+
+def parse_lookonchain(blob, source):
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    rows = (data or {}).get("content")
+    if not isinstance(rows, list):
+        return None
+    items = []
+    for row in rows[:24]:
+        if not isinstance(row, dict):
+            continue
+        title = clean_title(row.get("stitle") or "")
+        ts = None
+        for k in row:
+            if "time" in k.lower() or "date" in k.lower():
+                ts = _ts_from_any(row.get(k), assume_offset="+08:00")
+                if ts:
+                    break
+        if not title or not ts:
+            continue
+        nid = row.get("nnewflash_id") or title
+        items.append(_mk_item(
+            source, "look:%s" % nid, ts, title,
+            "https://www.lookonchain.com"))
+    return items
+
+
+def parse_coinbase_products(blob, source):
+    """Stateless subset of the old listing-diff parser: newest products
+    only when Coinbase stamps them; most cycles yield nothing (honest)."""
+    return []
+
+
+JSON_PARSERS = {
+    "upbit-announcements": parse_upbit,
+    "bithumb-notices": parse_bithumb,
+    "bybit-system-status": parse_bybit_status,
+    "lookonchain": parse_lookonchain,
+    "coinbase-products": parse_coinbase_products,
+}
+
+
 def fetch_source(source):
-    """Fetch every feed of one catalog source. Returns (items, status)."""
+    """Fetch one catalog source. Returns (items, status)."""
+    mode = source.get("mode") or "feed"
+    if mode == "page":
+        return [], "pending"
     collected = []
     errors = 0
     attempts = 0
@@ -322,8 +474,11 @@ def fetch_source(source):
         except Exception:
             errors += 1
             continue
-        if source["key"] == "tree":
+        if mode == "tree":
             parsed = parse_tree(blob, source)
+        elif mode == "json":
+            parser = JSON_PARSERS.get(source.get("parser") or "")
+            parsed = parser(blob, source) if parser else None
         else:
             parsed = parse_feed(blob, source, source.get("keywords") or [])
             if parsed is None:
@@ -337,6 +492,33 @@ def fetch_source(source):
     else:
         status = "delayed"
     return collected, status
+
+
+FAVICON_DIR = BASE / "live" / "favicons"
+
+
+def mirror_favicons(catalog, quiet):
+    """Mirror source favicons same-origin (Google s2, cached on disk) so
+    the UI can show real logos without any external request."""
+    FAVICON_DIR.mkdir(parents=True, exist_ok=True)
+    fetched = 0
+    for src in catalog:
+        domain = (src.get("domain") or "").strip().lower()
+        if not domain:
+            continue
+        out = FAVICON_DIR / (domain + ".png")
+        if out.exists() and out.stat().st_size > 0:
+            continue
+        try:
+            blob = http_get(
+                "https://www.google.com/s2/favicons?domain=%s&sz=64" % domain)
+            if blob and len(blob) > 50:
+                out.write_bytes(blob)
+                fetched += 1
+        except Exception:
+            continue
+    if fetched and not quiet:
+        print("news_fetcher: mirrored %d favicons" % fetched)
 
 
 def _atomic_write(path, text):
@@ -393,8 +575,25 @@ def run_cycle(catalog, quiet):
     fresh.sort(key=lambda entry: entry["ts"], reverse=True)
     fresh = fresh[:MAX_ITEMS]
 
-    board.sort(key=lambda row: row["label"].lower())
+    # merge duplicate catalog rows (same label+domain from multi-endpoint
+    # sources) so available/live counts stay honest
+    merged = {}
+    rank = {"live": 3, "delayed": 2, "error": 1, "pending": 0}
+    for row in board:
+        key = (row["label"].lower(), row["domain"])
+        if key in merged:
+            prev = merged[key]
+            prev["count"] += row["count"]
+            if rank.get(row["status"], 0) > rank.get(prev["status"], 0):
+                prev["status"] = row["status"]
+            if row["last_ts"] and (not prev["last_ts"]
+                                   or row["last_ts"] > prev["last_ts"]):
+                prev["last_ts"] = row["last_ts"]
+        else:
+            merged[key] = dict(row)
+    board = sorted(merged.values(), key=lambda row: row["label"].lower())
     live = sum(1 for row in board if row["status"] == "live")
+    pending = sum(1 for row in board if row["status"] == "pending")
     as_of = datetime.now(timezone.utc).isoformat(
         timespec="seconds").replace("+00:00", "Z")
 
@@ -405,6 +604,7 @@ def run_cycle(catalog, quiet):
         "as_of": as_of,
         "available": len(board),
         "live": live,
+        "pending": pending,
         "sources": board,
     }, ensure_ascii=False, indent=1))
 
@@ -424,8 +624,10 @@ def main():
     args = parser.parse_args()
 
     catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
-    catalog = [src for src in catalog if src.get("feeds")]
+    catalog = [src for src in catalog
+               if src.get("feeds") or (src.get("mode") == "page")]
 
+    mirror_favicons(catalog, args.quiet)
     if args.loop <= 0:
         return run_cycle(catalog, args.quiet)
     interval = max(60, args.loop)

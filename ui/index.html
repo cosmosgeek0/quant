@@ -259,16 +259,13 @@
   .conn-row.off .conn-dot { background: var(--faint); }
   .conn-row.off .conn-val { color: var(--faint); }
 
-  /* News — industry-standard header, old-room pill language
-     (rounded-full, borderless, gray; active = ink-filled), day strip,
-     sources dropdown, activity chart, master switch. */
-  .news-page { max-width: 1480px; margin: 0 auto; padding: 22px 28px 48px; }
+  /* News v4 — decongested top, two-column body: list left, dedicated
+     Sources box + Activity box on the right (owner-sanctioned boxes:
+     functional containers, 1px line, small radius). */
+  .news-page { max-width: 1560px; margin: 0 auto; padding: 22px 28px 48px; }
   .news-head { display: flex; align-items: center; gap: 14px; }
   .news-title { font-size: 20px; font-weight: 600; color: var(--ink); letter-spacing: -0.01em; }
-  .news-live {
-    font-size: 12px; color: var(--muted);
-    font-variant-numeric: tabular-nums lining-nums;
-  }
+  .news-live { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
   .news-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
   .refresh-btn {
     width: 30px; height: 30px;
@@ -283,10 +280,7 @@
   .refresh-btn svg { width: 15px; height: 15px; stroke-width: 1.6; }
   .refresh-btn.busy svg { animation: spin 900ms linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .news-upd {
-    font-size: 12.5px; color: var(--muted);
-    font-variant-numeric: tabular-nums lining-nums;
-  }
+  .news-upd { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
   .news-upd.stale { color: #99640a; }
   .master-wrap { display: flex; align-items: center; gap: 8px; }
   .master-wrap .mlabel { font-size: 12.5px; color: var(--muted); }
@@ -305,10 +299,7 @@
   .day.on { background: var(--pill); border-color: transparent; }
   .day.dim { opacity: 0.45; }
   .day .d1 { display: block; font-size: 12px; font-weight: 600; color: var(--ink); }
-  .day .d2 {
-    display: block; font-size: 10.5px; color: var(--muted);
-    font-variant-numeric: tabular-nums lining-nums;
-  }
+  .day .d2 { display: block; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
   .day .d2 .hh { color: #dc2626; font-weight: 600; }
   .day .d2 .mm { color: #b45309; font-weight: 600; }
 
@@ -326,7 +317,6 @@
   .fpill.on { background: var(--ink); color: var(--bg); }
   .fpill.on .cnt { color: var(--bg); opacity: 0.75; }
   .fpill .cnt { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .fpill .chev { width: 12px; height: 12px; stroke-width: 2; }
 
   .bars { width: 13px; height: 12px; flex: none; }
   .bars rect { fill: var(--faint); }
@@ -335,24 +325,67 @@
   .bars.b1 rect.r1 { fill: #9aa3af; }
   .fpill.on .bars rect { fill: var(--bg); opacity: 0.9; }
 
-  /* activity chart */
-  .actwrap { margin-top: 18px; }
-  .act-h {
-    display: flex; align-items: baseline; gap: 10px;
-    font-size: 10.5px; font-weight: 600;
-    letter-spacing: 0.05em; text-transform: uppercase;
-    color: var(--muted);
+  .news-cols { display: flex; gap: 26px; margin-top: 16px; align-items: flex-start; }
+  .news-maincol { flex: 1; min-width: 0; }
+  .news-rightcol {
+    width: 302px; flex: none;
+    display: flex; flex-direction: column; gap: 16px;
+    position: sticky; top: 16px;
   }
-  .act-h .lg { display: flex; align-items: center; gap: 5px; text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 11.5px; }
-  .act-h .dotc { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
-  .actchart { display: block; width: 100%; height: 56px; margin-top: 6px; }
-  .actchart .bl { stroke: var(--line-2); }
-  .acthour { font-size: 9.5px; fill: var(--muted); }
+  .rbox {
+    border: 1px solid var(--line-2);
+    border-radius: 14px;
+    padding: 12px;
+    background: var(--panel);
+  }
+  .rbox-h { display: flex; align-items: baseline; padding: 2px 2px 10px; }
+  .rbox-title { font-size: 13.5px; font-weight: 600; color: var(--ink); }
+  .rbox-sub { margin-left: auto; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
-  .news-list { margin-top: 12px; }
+  .srcsearch {
+    display: flex; align-items: center; gap: 7px;
+    border: 1px solid var(--line-2);
+    border-radius: 9px;
+    padding: 0 10px;
+    height: 30px;
+  }
+  .srcsearch svg { width: 13px; height: 13px; stroke-width: 1.8; color: var(--muted); flex: none; }
+  .srcsearch input { border: 0; outline: 0; background: none; font: inherit; font-size: 12.5px; color: var(--ink); width: 100%; }
+  .srclist { margin-top: 6px; max-height: 430px; overflow-y: auto; }
+  .src-row { display: flex; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--line); }
+  .src-row:last-child { border-bottom: 0; }
+  .src-name { flex: 1; min-width: 0; font-size: 12.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .src-row.off .src-name { color: var(--faint); }
+  .src-row.off .fav, .src-row.off .badge { opacity: 0.4; }
+  .src-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+  .src-dot.live { background: #2ebd85; }
+  .src-dot.delayed { background: #f59e0b; }
+  .src-dot.error { background: #dc2626; }
+  .src-dot.pending { background: var(--faint); }
+  .src-cnt { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 18px; text-align: right; }
+  .sp-note { margin-top: 9px; font-size: 10.5px; color: var(--faint); line-height: 1.45; }
+
+  .fav { width: 18px; height: 18px; border-radius: 4px; flex: none; display: block; }
+  .badge {
+    width: 18px; height: 18px; flex: none;
+    border-radius: 4px;
+    background: var(--pill);
+    color: var(--muted);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 9.5px; font-weight: 600;
+  }
+
+  .act-h { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .act-h .lg { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+  .act-h .dotc { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
+  .actchart { display: block; width: 100%; height: 72px; margin-top: 8px; }
+  .actchart .bl { stroke: var(--line-2); }
+  .acthour { font-size: 9px; fill: var(--muted); }
+
+  .news-list { margin-top: 2px; }
   .news-hrow, .news-row {
     display: grid;
-    grid-template-columns: 46px 20px 168px 1fr 92px 26px;
+    grid-template-columns: 46px 20px 186px 1fr 92px 24px;
     gap: 12px;
     align-items: center;
   }
@@ -371,17 +404,10 @@
     to { background: transparent; }
   }
   .n-time { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
-  .n-srcwrap { display: flex; align-items: center; gap: 7px; min-width: 0; }
-  .badge {
-    width: 20px; height: 20px; flex: none;
-    border-radius: 50%;
-    background: var(--pill);
-    color: var(--muted);
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 10px; font-weight: 600;
-  }
-  .n-src { font-size: 12.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .n-dom { font-size: 11px; color: var(--faint); white-space: nowrap; }
+  .n-srcwrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .n-srccol { min-width: 0; line-height: 1.25; }
+  .n-src { display: block; font-size: 12.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .n-dom { display: block; font-size: 10.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .n-head { min-width: 0; }
   .n-head a, .n-head span {
     font-size: 13.5px; color: var(--ink);
@@ -397,72 +423,16 @@
   .n-link a:hover { color: var(--ink); }
   .news-empty { margin-top: 22px; font-size: 13px; color: var(--muted); }
 
-  /* sources dropdown */
-  .srcpanel {
-    position: fixed;
-    z-index: 70;
-    width: 340px;
-    background: var(--panel);
-    border: 1px solid var(--line-2);
-    border-radius: 14px;
-    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.13);
-    padding: 12px;
-    opacity: 0;
-    transform: translateY(4px);
-    transition: opacity 130ms ease, transform 130ms ease;
-  }
-  .srcpanel.on { opacity: 1; transform: translateY(0); }
-  .srcpanel .sp-head { display: flex; align-items: baseline; padding: 2px 4px 10px; }
-  .srcpanel .sp-title { font-size: 14px; font-weight: 600; color: var(--ink); }
-  .srcpanel .sp-live {
-    margin-left: auto; font-size: 12px; color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
-  .srcsearch {
-    display: flex; align-items: center; gap: 7px;
-    border: 1px solid var(--line-2);
-    border-radius: 9px;
-    padding: 0 10px;
-    height: 32px;
-  }
-  .srcsearch svg { width: 13px; height: 13px; stroke-width: 1.8; color: var(--muted); flex: none; }
-  .srcsearch input {
-    border: 0; outline: 0; background: none;
-    font: inherit; font-size: 13px; color: var(--ink);
-    width: 100%;
-  }
-  .srclist { margin-top: 8px; max-height: 380px; overflow-y: auto; }
-  .src-row {
-    display: flex; align-items: center; gap: 9px;
-    padding: 7px 4px;
-    border-bottom: 1px solid var(--line);
-  }
-  .src-row:last-child { border-bottom: 0; }
-  .src-name { flex: 1; min-width: 0; font-size: 13px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .src-row.off .src-name, .src-row.off .badge { color: var(--faint); }
-  .src-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
-  .src-dot.live { background: #2ebd85; }
-  .src-dot.delayed { background: #f59e0b; }
-  .src-dot.error { background: #dc2626; }
-  .src-cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 20px; text-align: right; }
-  .sp-note { margin-top: 10px; font-size: 11px; color: var(--faint); line-height: 1.45; }
-
-  /* master-off state */
   .news-page.dead .daystrip,
   .news-page.dead .pillbar,
-  .news-page.dead .actwrap,
-  .news-page.dead .news-list,
+  .news-page.dead .news-cols,
   .news-page.dead .news-empty {
     opacity: 0.35;
     filter: grayscale(1);
     pointer-events: none;
     user-select: none;
   }
-  .news-offnote {
-    margin-top: 14px;
-    font-size: 12.5px;
-    color: var(--muted);
-  }
+  .news-offnote { margin-top: 14px; font-size: 12.5px; color: var(--muted); }
 
   .switch.sm { width: 30px; height: 17px; padding: 2px; }
   .switch.sm .knob { width: 13px; height: 13px; }

@@ -553,8 +553,9 @@
       "No session on this Mac — live on the hosted site");
   }
 
-  /* ---- News page v3: catalog sources, categories, activity chart,
-     sources dropdown, master switch, per-row link + badge ---- */
+  /* ---- News page v4: two-column — list left; Sources box +
+     Activity box right. Real favicons (mirrored same-origin),
+     97-source board with live/delayed/error/pending statuses. ---- */
   var newsBtn = document.getElementById("rb-news");
   var newsData = null;
   var newsFilter = "all";
@@ -565,7 +566,6 @@
   var newsSeen = null;
   var newsSrcOff = {};
   var newsMaster = true;
-  var srcPanelOpen = false;
   var srcSearch = "";
   var NEWS_SRC_KEY = "quant.news.srcoff";
   var NEWS_MASTER_KEY = "quant.news.master";
@@ -628,7 +628,6 @@
     if (newsTimer) { clearInterval(newsTimer); newsTimer = null; }
     newsHost = null;
     newsSeen = null;
-    closeSrcPanel();
   }
 
   function utcDate(ts) {
@@ -665,15 +664,14 @@
     var svg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
       stroke: "currentColor", "stroke-linecap": "round",
       "stroke-linejoin": "round" });
-    var p1 = svgEl("path", { d: "M15 3h6v6" });
-    var p2 = svgEl("path", { d: "M10 14 21 3" });
-    var p3 = svgEl("path", {
-      d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" });
-    svg.appendChild(p1); svg.appendChild(p2); svg.appendChild(p3);
+    svg.appendChild(svgEl("path", { d: "M15 3h6v6" }));
+    svg.appendChild(svgEl("path", { d: "M10 14 21 3" }));
+    svg.appendChild(svgEl("path", {
+      d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }));
     return svg;
   }
 
-  function badgeFor(name) {
+  function letterBadge(name) {
     var b = document.createElement("span");
     b.className = "badge";
     var m = String(name || "?").match(/[A-Za-z0-9]/);
@@ -681,18 +679,32 @@
     return b;
   }
 
-  /* activity chart: 24 hourly buckets, stacked L/M/H, validated palette
-     (H #dc2626, M #f59e0b, L #9aa3af on white); identity also carried by
-     fixed stack order + legend labels + hover tooltip (data-tip). */
-  function activityChart(items) {
-    var wrap = document.createElement("div");
-    wrap.className = "actwrap";
+  function iconFor(name, domain) {
+    if (!domain) { return letterBadge(name); }
+    var img = document.createElement("img");
+    img.className = "fav";
+    img.alt = "";
+    img.src = "live/favicons/" + domain + ".png";
+    img.addEventListener("error", function () {
+      var badge = letterBadge(name);
+      if (img.parentNode) { img.parentNode.replaceChild(badge, img); }
+    });
+    return img;
+  }
+
+  /* activity chart (right box): 24 hourly buckets, stacked L/M/H;
+     dataviz-validated palette H #dc2626 / M #f59e0b / L #9aa3af. */
+  function activityBox(items) {
+    var box = document.createElement("div");
+    box.className = "rbox";
     var head = document.createElement("div");
-    head.className = "act-h";
-    var lab = document.createElement("span");
-    lab.textContent = "Activity · last 24h";
-    head.appendChild(lab);
-    var defs = [["High", "#dc2626"], ["Medium", "#f59e0b"], ["Low", "#9aa3af"]];
+    head.className = "rbox-h";
+    var t = document.createElement("span");
+    t.className = "rbox-title";
+    t.textContent = "Activity · 24h";
+    var lgwrap = document.createElement("span");
+    lgwrap.className = "rbox-sub act-h";
+    var defs = [["H", "#dc2626"], ["M", "#f59e0b"], ["L", "#9aa3af"]];
     for (var li2 = 0; li2 < defs.length; li2++) {
       var lg = document.createElement("span");
       lg.className = "lg";
@@ -701,17 +713,19 @@
       dot.style.background = defs[li2][1];
       lg.appendChild(dot);
       lg.appendChild(document.createTextNode(defs[li2][0]));
-      head.appendChild(lg);
+      lgwrap.appendChild(lg);
     }
-    wrap.appendChild(head);
+    head.appendChild(t);
+    head.appendChild(lgwrap);
+    box.appendChild(head);
 
     var now = Date.now();
     var buckets = [];
     for (var b2 = 0; b2 < 24; b2++) { buckets.push({ h: 0, m: 0, l: 0 }); }
     for (var ii = 0; ii < items.length; ii++) {
-      var t = Date.parse(items[ii].ts);
-      if (!isFinite(t)) { continue; }
-      var ageH = (now - t) / 3600000;
+      var t2 = Date.parse(items[ii].ts);
+      if (!isFinite(t2)) { continue; }
+      var ageH = (now - t2) / 3600000;
       if (ageH < 0 || ageH >= 24) { continue; }
       var idx = 23 - Math.floor(ageH);
       var lvl = newsLevel(items[ii]);
@@ -724,15 +738,14 @@
       var tot = buckets[mb].h + buckets[mb].m + buckets[mb].l;
       if (tot > maxN) { maxN = tot; }
     }
-    var W = 960, H = 56, plotH = 42, baseY = 46;
+    var W = 276, H = 72, plotH = 52, baseY = 58;
     var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H,
-      "class": "actchart", preserveAspectRatio: "none" });
+      "class": "actchart" });
     var slot = W / 24;
-    var bw = Math.max(6, slot - 4);
+    var bw = Math.max(5, slot - 3);
     var nowHour = new Date().getUTCHours();
     for (var x = 0; x < 24; x++) {
       var bkt = buckets[x];
-      var total = bkt.h + bkt.m + bkt.l;
       var x0 = x * slot + (slot - bw) / 2;
       var hourLabel = ((nowHour - (23 - x)) % 24 + 24) % 24;
       var col = svgEl("g", {});
@@ -744,7 +757,7 @@
         var hpx = Math.max(2, (n / maxN) * plotH);
         y -= hpx;
         col.appendChild(svgEl("rect", {
-          x: x0, y: y, width: bw, height: hpx - 1,
+          x: x0, y: y, width: bw, height: Math.max(1, hpx - 1),
           rx: 1.5, fill: segs[s2][1]
         }));
       }
@@ -757,7 +770,7 @@
       col.appendChild(hit);
       svg.appendChild(col);
       if (hourLabel % 6 === 0) {
-        var tx = svgEl("text", { x: x * slot + slot / 2, y: H - 1,
+        var tx = svgEl("text", { x: x * slot + slot / 2, y: H - 2,
           "text-anchor": "middle", "class": "acthour" });
         tx.textContent = ("0" + hourLabel).slice(-2);
         svg.appendChild(tx);
@@ -767,41 +780,28 @@
       x1: 0, y1: baseY + 0.5, x2: W, y2: baseY + 0.5,
       "class": "bl", "stroke-width": 1
     }));
-    wrap.appendChild(svg);
-    return wrap;
+    box.appendChild(svg);
+    return box;
   }
 
-  /* sources dropdown */
-  var srcPanelEl = null;
-
-  function closeSrcPanel() {
-    if (srcPanelEl && srcPanelEl.parentNode) {
-      srcPanelEl.parentNode.removeChild(srcPanelEl);
-    }
-    srcPanelEl = null;
-    srcPanelOpen = false;
-  }
-
-  function buildSrcPanel(anchor) {
-    closeSrcPanel();
-    srcPanelOpen = true;
+  function sourcesBox() {
     var board = (newsData && newsData.sources_board) || {};
     var rows = board.sources || [];
-    var panel = document.createElement("div");
-    panel.className = "srcpanel";
+    var box = document.createElement("div");
+    box.className = "rbox";
     var head = document.createElement("div");
-    head.className = "sp-head";
-    var title = document.createElement("span");
-    title.className = "sp-title";
-    title.textContent = "Sources";
-    var live = document.createElement("span");
-    live.className = "sp-live";
-    live.textContent = board.present
-      ? board.available + " Available · " + board.live + " Live"
-      : "board not mirrored yet";
-    head.appendChild(title);
-    head.appendChild(live);
-    panel.appendChild(head);
+    head.className = "rbox-h";
+    var t = document.createElement("span");
+    t.className = "rbox-title";
+    t.textContent = "Sources";
+    var sub = document.createElement("span");
+    sub.className = "rbox-sub";
+    sub.textContent = board.present
+      ? board.available + " · " + board.live + " live"
+      : "not mirrored yet";
+    head.appendChild(t);
+    head.appendChild(sub);
+    box.appendChild(head);
 
     var search = document.createElement("div");
     search.className = "srcsearch";
@@ -815,119 +815,101 @@
     input.type = "text";
     input.placeholder = "Search sources";
     input.value = srcSearch;
-    input.addEventListener("input", function () {
-      srcSearch = input.value;
-      renderSrcRows(list, rows);
-    });
     search.appendChild(input);
-    panel.appendChild(search);
+    box.appendChild(search);
 
     var list = document.createElement("div");
     list.className = "srclist";
-    renderSrcRows(list, rows);
-    panel.appendChild(list);
+    box.appendChild(list);
+
+    function paint() {
+      list.textContent = "";
+      var needle = srcSearch.trim().toLowerCase();
+      var shown = 0;
+      for (var i = 0; i < rows.length; i++) {
+        var srcRow = rows[i];
+        var label = srcRow.label || srcRow.key;
+        if (needle && label.toLowerCase().indexOf(needle) === -1) { continue; }
+        shown += 1;
+        (function (name, srcRow2) {
+          var row = document.createElement("div");
+          row.className = "src-row" + (newsSrcOff[name] ? " off" : "");
+          row.appendChild(iconFor(name, srcRow2.domain));
+          var nm = document.createElement("span");
+          nm.className = "src-name";
+          nm.textContent = name;
+          nm.title = name + (srcRow2.domain ? " · " + srcRow2.domain : "") +
+            " · " + (srcRow2.status || "unknown");
+          row.appendChild(nm);
+          var dot = document.createElement("span");
+          dot.className = "src-dot " + (srcRow2.status || "");
+          row.appendChild(dot);
+          var cnt = document.createElement("span");
+          cnt.className = "src-cnt";
+          cnt.textContent = srcRow2.status === "pending"
+            ? "–" : String(srcRow2.count || 0);
+          row.appendChild(cnt);
+          var sw = document.createElement("button");
+          sw.className = "switch sm";
+          sw.setAttribute("role", "switch");
+          sw.setAttribute("aria-checked",
+            newsSrcOff[name] ? "false" : "true");
+          sw.setAttribute("aria-label", name + " feed");
+          var knob = document.createElement("span");
+          knob.className = "knob";
+          sw.appendChild(knob);
+          sw.addEventListener("click", function () {
+            if (newsSrcOff[name]) { delete newsSrcOff[name]; }
+            else { newsSrcOff[name] = true; }
+            try {
+              localStorage.setItem(NEWS_SRC_KEY,
+                JSON.stringify(newsSrcOff));
+            } catch (e) { /* private mode */ }
+            renderNews();
+          });
+          row.appendChild(sw);
+          list.appendChild(row);
+        })(label, srcRow);
+      }
+      if (!shown) {
+        var none = document.createElement("div");
+        none.className = "sp-note";
+        none.textContent = "No source matches.";
+        list.appendChild(none);
+      }
+    }
+    input.addEventListener("input", function () {
+      srcSearch = input.value;
+      paint();
+    });
+    paint();
 
     var note = document.createElement("div");
     note.className = "sp-note";
-    note.textContent = "Toggles filter this feed. Upstream per-source " +
-      "shutdown lands with the wiring build.";
-    panel.appendChild(note);
-
-    document.body.appendChild(panel);
-    var r = anchor.getBoundingClientRect();
-    var w = panel.offsetWidth;
-    var left = Math.min(Math.max(12, Math.round(r.left)),
-      window.innerWidth - w - 12);
-    var top = Math.round(r.bottom + 8);
-    panel.style.left = left + "px";
-    panel.style.top = top + "px";
-    requestAnimationFrame(function () { panel.classList.add("on"); });
-    srcPanelEl = panel;
-    setTimeout(function () { input.focus(); }, 60);
+    note.textContent = "Gray = parser pending port. Toggles filter this " +
+      "feed; upstream shutdown lands with the wiring build.";
+    box.appendChild(note);
+    return box;
   }
-
-  function renderSrcRows(list, rows) {
-    list.textContent = "";
-    var needle = srcSearch.trim().toLowerCase();
-    var shown = 0;
-    for (var i = 0; i < rows.length; i++) {
-      var srcRow = rows[i];
-      var label = srcRow.label || srcRow.key;
-      if (needle && label.toLowerCase().indexOf(needle) === -1) { continue; }
-      shown += 1;
-      (function (name) {
-        var row = document.createElement("div");
-        row.className = "src-row" + (newsSrcOff[name] ? " off" : "");
-        row.appendChild(badgeFor(name));
-        var nm = document.createElement("span");
-        nm.className = "src-name";
-        nm.textContent = name;
-        nm.title = name + (srcRow.domain ? " · " + srcRow.domain : "");
-        row.appendChild(nm);
-        var dot = document.createElement("span");
-        dot.className = "src-dot " + (srcRow.status || "");
-        dot.title = srcRow.status || "unknown";
-        row.appendChild(dot);
-        var cnt = document.createElement("span");
-        cnt.className = "src-cnt";
-        cnt.textContent = String(srcRow.count || 0);
-        row.appendChild(cnt);
-        var sw = document.createElement("button");
-        sw.className = "switch sm";
-        sw.setAttribute("role", "switch");
-        sw.setAttribute("aria-checked", newsSrcOff[name] ? "false" : "true");
-        sw.setAttribute("aria-label", name + " feed");
-        var knob = document.createElement("span");
-        knob.className = "knob";
-        sw.appendChild(knob);
-        sw.addEventListener("click", function () {
-          if (newsSrcOff[name]) { delete newsSrcOff[name]; }
-          else { newsSrcOff[name] = true; }
-          try {
-            localStorage.setItem(NEWS_SRC_KEY, JSON.stringify(newsSrcOff));
-          } catch (e) { /* private mode */ }
-          row.classList.toggle("off", !!newsSrcOff[name]);
-          sw.setAttribute("aria-checked",
-            newsSrcOff[name] ? "false" : "true");
-          renderNews(true);
-        });
-        row.appendChild(sw);
-        list.appendChild(row);
-      })(label);
-    }
-    if (!shown) {
-      var none = document.createElement("div");
-      none.className = "sp-note";
-      none.textContent = "No source matches.";
-      list.appendChild(none);
-    }
-  }
-
-  document.addEventListener("mousedown", function (ev) {
-    if (srcPanelEl && !srcPanelEl.contains(ev.target) &&
-        !(ev.target.closest && ev.target.closest("#src-pill"))) {
-      closeSrcPanel();
-    }
-  });
 
   function setMaster(on) {
     newsMaster = on;
     try {
       localStorage.setItem(NEWS_MASTER_KEY, on ? "on" : "off");
     } catch (e) { /* private mode */ }
-    if (on) { fetchNews(true); } else { closeSrcPanel(); renderNews(); }
+    if (on) { fetchNews(true); } else { renderNews(); }
   }
 
-  function renderNews(keepPanel) {
+  function renderNews() {
     if (!newsHost) { return; }
-    if (!keepPanel) { closeSrcPanel(); }
     var prevSeen = newsSeen;
+    var keepSearch = srcSearch;
     newsHost.textContent = "";
     newsHost.classList.toggle("dead", !newsMaster);
+    srcSearch = keepSearch;
 
     var board = (newsData && newsData.sources_board) || {};
 
-    /* header: title · available/live · refresh · updated · master */
     var head = document.createElement("div");
     head.className = "news-head";
     var title = document.createElement("span");
@@ -937,7 +919,9 @@
     var liveLbl = document.createElement("span");
     liveLbl.className = "news-live";
     liveLbl.textContent = board.present
-      ? board.available + " sources · " + board.live + " live" : "";
+      ? board.available + " sources · " + board.live + " live" +
+        (board.pending ? " · " + board.pending + " pending" : "")
+      : "";
     head.appendChild(liveLbl);
     var right = document.createElement("div");
     right.className = "news-right";
@@ -1073,9 +1057,7 @@
     var catPool = [];
     for (var c0 = 0; c0 < dayPool.length; c0++) {
       if (newsCat === "all" ||
-          (dayPool[c0].category || "Crypto") === newsCat ||
-          (newsCat === "On-Chain" &&
-           dayPool[c0].category === "On-Chain")) {
+          (dayPool[c0].category || "Crypto") === newsCat) {
         catPool.push(dayPool[c0]);
       }
     }
@@ -1084,7 +1066,7 @@
       if (!newsSrcOff[catPool[i2].source || "—"]) { pool.push(catPool[i2]); }
     }
 
-    /* category pill row + sources pill */
+    /* category + impact pill rows */
     var catbar = document.createElement("div");
     catbar.className = "pillbar";
     for (var ci2 = 0; ci2 < NEWS_CATS.length; ci2++) {
@@ -1100,27 +1082,8 @@
         catbar.appendChild(b);
       })(NEWS_CATS[ci2]);
     }
-    var srcPill = document.createElement("button");
-    srcPill.className = "fpill";
-    srcPill.id = "src-pill";
-    srcPill.appendChild(document.createTextNode("Sources"));
-    var scnt = document.createElement("span");
-    scnt.className = "cnt";
-    scnt.textContent = board.present ? String(board.available) : "—";
-    srcPill.appendChild(scnt);
-    var chev = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
-      stroke: "currentColor", "stroke-linecap": "round",
-      "stroke-linejoin": "round", "class": "chev" });
-    chev.appendChild(svgEl("path", { d: "m6 9 6 6 6-6" }));
-    srcPill.appendChild(chev);
-    srcPill.addEventListener("click", function () {
-      if (srcPanelOpen) { closeSrcPanel(); }
-      else { buildSrcPanel(srcPill); }
-    });
-    catbar.appendChild(srcPill);
     newsHost.appendChild(catbar);
 
-    /* impact pill row */
     var counts = { 3: 0, 2: 0, 1: 0 };
     for (var cc = 0; cc < pool.length; cc++) { counts[newsLevel(pool[cc])] += 1; }
     var impbar = document.createElement("div");
@@ -1146,10 +1109,14 @@
     }
     newsHost.appendChild(impbar);
 
-    /* activity chart over the day/cat/source pool */
-    newsHost.appendChild(activityChart(pool));
+    /* two columns */
+    var cols = document.createElement("div");
+    cols.className = "news-cols";
+    var maincol = document.createElement("div");
+    maincol.className = "news-maincol";
+    var rightcol = document.createElement("div");
+    rightcol.className = "news-rightcol";
 
-    /* list */
     var list = document.createElement("div");
     list.className = "news-list";
     var hrow = document.createElement("div");
@@ -1181,9 +1148,9 @@
       impCell.appendChild(barsSvg(lvl2));
       var srcWrap = document.createElement("span");
       srcWrap.className = "n-srcwrap";
-      srcWrap.appendChild(badgeFor(it.source));
+      srcWrap.appendChild(iconFor(it.source, it.domain));
       var srcCol = document.createElement("span");
-      srcCol.style.minWidth = "0";
+      srcCol.className = "n-srccol";
       var srcName = document.createElement("span");
       srcName.className = "n-src";
       srcName.textContent = it.source || "—";
@@ -1191,7 +1158,7 @@
       if (it.domain) {
         var dom = document.createElement("span");
         dom.className = "n-dom";
-        dom.textContent = " " + it.domain;
+        dom.textContent = it.domain;
         srcCol.appendChild(dom);
       }
       srcWrap.appendChild(srcCol);
@@ -1231,13 +1198,20 @@
       row.appendChild(lnk);
       list.appendChild(row);
     }
-    newsHost.appendChild(list);
+    maincol.appendChild(list);
     if (!shown) {
       var none = document.createElement("div");
       none.className = "news-empty";
       none.textContent = "Nothing matches these filters in the mirror.";
-      newsHost.appendChild(none);
+      maincol.appendChild(none);
     }
+
+    rightcol.appendChild(sourcesBox());
+    rightcol.appendChild(activityBox(pool));
+
+    cols.appendChild(maincol);
+    cols.appendChild(rightcol);
+    newsHost.appendChild(cols);
     newsSeen = seenNow;
   }
 
