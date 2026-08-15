@@ -164,11 +164,18 @@
     stopNetTelemetry();
     if (netChart) { netChart.destroy(); netChart = null; }
     if (h === "network") {
-      sigPage = pageEl;
-      buildNetworkPage(pageEl);
-      startNetHealthPoll();
-      startNetTelemetry();
-      fetchNews(false);
+      if (window.NetV5 && window.NetV5.build) {
+        /* V5 proposal branch: the module owns its own fetches and
+           timers; the shell only hands over the container */
+        sigPage = null;
+        window.NetV5.build(pageEl);
+      } else {
+        sigPage = pageEl;
+        buildNetworkPage(pageEl);
+        startNetHealthPoll();
+        startNetTelemetry();
+        fetchNews(false);
+      }
     } else if (h === "news") {
       sigPage = null;
       buildNewsPage(pageEl);
