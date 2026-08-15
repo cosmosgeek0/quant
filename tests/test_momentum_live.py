@@ -1228,3 +1228,22 @@ class MomentumLiveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecisionIdempotentReplayTests(unittest.TestCase):
+    def test_same_id_timestamp_drift_is_idempotent_money_drift_fatal(self):
+        base = {"decision_id": "dec-x", "symbol": "AUSDT", "action": "WATCH",
+                "decision_utc": "2026-08-15T00:00:00.000Z",
+                "freshness_ms": "100", "job": None}
+        drifted = dict(base, decision_utc="2026-08-15T00:03:00.000Z",
+                       freshness_ms="900")
+        self.assertTrue(live._decision_rows_equivalent(base, drifted))
+        money = dict(base, job={"op": "MOMENTUM_OPEN"})
+        self.assertFalse(live._decision_rows_equivalent(base, money))
+        index = live._DecisionIndex(
+            signature=(), rows_by_id={}, ignition_by_symbol={}, job_rows=[]
+        )
+        live._index_decision(index, base)
+        live._index_decision(index, drifted)
+        with self.assertRaises(live.MomentumLiveError):
+            live._index_decision(index, money)

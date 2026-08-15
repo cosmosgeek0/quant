@@ -437,13 +437,27 @@ def _read_decisions(
     )
 
 
+# A re-observed pass regenerates the same deterministic decision id with only
+# wall-clock fields moved; that is idempotent repetition, not corruption. Money
+# fields differing under one id remains fatal.
+_DECISION_VOLATILE_FIELDS = frozenset({"decision_utc", "freshness_ms"})
+
+
+def _decision_rows_equivalent(
+    a: Mapping[str, Any], b: Mapping[str, Any]
+) -> bool:
+    strip = _DECISION_VOLATILE_FIELDS
+    return {k: v for k, v in a.items() if k not in strip} == \
+        {k: v for k, v in b.items() if k not in strip}
+
+
 def _index_decision(index: _DecisionIndex, row: Mapping[str, Any]) -> None:
     copied = dict(row)
     decision_id = copied.get("decision_id")
     if isinstance(decision_id, str) and decision_id:
         existing = index.rows_by_id.get(decision_id)
         if existing is not None:
-            if existing != copied:
+            if not _decision_rows_equivalent(existing, copied):
                 raise MomentumLiveError(f"decision id conflict: {decision_id}")
             return
         index.rows_by_id[decision_id] = copied
@@ -906,7 +920,7 @@ def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
     index = _decision_index(path)
     existing = index.rows_by_id.get(decision_id)
     if existing is not None:
-        if existing != dict(row):
+        if not _decision_rows_equivalent(existing, dict(row)):
             raise MomentumLiveError(f"decision id conflict: {decision_id}")
         repaired = False
         if index.backup_repair is not None:
