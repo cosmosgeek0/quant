@@ -199,6 +199,7 @@ def default_sources():
         "governor_lock": LIVE_DIR / "account-governor.lock",
         "manifest": LIVE_DIR / "pull_manifest.json",
         "news": LIVE_DIR / "news.jsonl",
+        "news_sources": LIVE_DIR / "news_sources.json",
     }
 
 
@@ -1142,12 +1143,28 @@ def api_news(sources):
         else:
             parse_errors += 1
     as_of = _path_as_of(path) if present else None
+    board_path = sources["news_sources"]
+    board = {"present": False, "available": 0, "live": 0, "sources": []}
+    try:
+        raw_board = json.loads(board_path.read_text(encoding="utf-8"))
+        if isinstance(raw_board, dict):
+            rows = raw_board.get("sources")
+            board = {
+                "present": True,
+                "as_of": raw_board.get("as_of"),
+                "available": raw_board.get("available", 0),
+                "live": raw_board.get("live", 0),
+                "sources": rows if isinstance(rows, list) else [],
+            }
+    except (OSError, ValueError):
+        pass
     return {
         "source": str(path),
         "present": present,
         "as_of": as_of,
         "count": len(items),
         "items": items,
+        "sources_board": board,
         "parse_errors": parse_errors,
         "tail_truncated": truncated,
     }

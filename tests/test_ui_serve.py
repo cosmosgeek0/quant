@@ -157,6 +157,7 @@ class ServerHarness(unittest.TestCase):
             "governor_lock": missing_root / "account-governor.lock",
             "manifest": missing_root / "pull_manifest.json",
             "news": missing_root / "news.jsonl",
+            "news_sources": missing_root / "news_sources.json",
         }
 
     @staticmethod
@@ -1175,8 +1176,9 @@ class TestReadOnlyGuarantees(ServerHarness):
             "basis_position", "basis_receipts_dir", "events", "fees",
             "governor_dir", "governor_lock", "health", "job_receipts_dir",
             "job_results", "jobs_log", "manifest", "momentum_decisions",
-            "momentum_receipts", "momentum_state", "news", "proposals_dir",
-            "stop", "stop_jobs", "stream_log", "stream_state",
+            "momentum_receipts", "momentum_state", "news", "news_sources",
+            "proposals_dir", "stop", "stop_jobs", "stream_log",
+            "stream_state",
         ])
 
     def test_head_matches_status_and_has_empty_body(self):
@@ -1342,6 +1344,7 @@ class TestNewsEndpoint(ServerHarness):
         payload = self.get_json(base, "/api/news")
         self.assertFalse(payload["present"])
         self.assertEqual(payload["count"], 0)
+        self.assertFalse(payload["sources_board"]["present"])
         news_path.write_text(
             '{"id":"1","ts":"2026-08-15T05:00:00Z","source":"Fed",'
             '"title":"FOMC rate decision","url":"https://example.org",'

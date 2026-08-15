@@ -553,25 +553,34 @@
       "No session on this Mac — live on the hosted site");
   }
 
-  /* ---- News page: wide live layout — day strip, impact bars,
-     sources rail with display toggles, refresh, fresh-row pulse ---- */
+  /* ---- News page v3: catalog sources, categories, activity chart,
+     sources dropdown, master switch, per-row link + badge ---- */
   var newsBtn = document.getElementById("rb-news");
   var newsData = null;
   var newsFilter = "all";
+  var newsCat = "all";
   var newsDay = "all";
   var newsTimer = null;
   var newsHost = null;
   var newsSeen = null;
   var newsSrcOff = {};
+  var newsMaster = true;
+  var srcPanelOpen = false;
+  var srcSearch = "";
   var NEWS_SRC_KEY = "quant.news.srcoff";
+  var NEWS_MASTER_KEY = "quant.news.master";
   try {
     var rawOff = localStorage.getItem(NEWS_SRC_KEY);
     if (rawOff) { newsSrcOff = JSON.parse(rawOff) || {}; }
-  } catch (e) { newsSrcOff = {}; }
+    newsMaster = localStorage.getItem(NEWS_MASTER_KEY) !== "off";
+  } catch (e) { newsSrcOff = {}; newsMaster = true; }
 
   newsBtn.addEventListener("click", function () {
     location.hash = "#news";
   });
+
+  var NEWS_CATS = ["All News", "Crypto", "Macro", "Markets", "Regulation",
+    "Exchange", "On-Chain", "Security"];
 
   function newsAgeText(asOf) {
     if (!asOf) { return "—"; }
@@ -585,6 +594,7 @@
   }
 
   function fetchNews(force) {
+    if (!newsMaster) { return; }
     var btn = newsHost ? newsHost.querySelector(".refresh-btn") : null;
     if (btn) { btn.classList.add("busy"); }
     fetch("/api/news", { cache: "no-store" })
@@ -608,7 +618,7 @@
   }
 
   function startNewsPoll() {
-    fetchNews(true);
+    if (newsMaster) { fetchNews(true); } else { renderNews(); }
     if (!newsTimer) {
       newsTimer = setInterval(function () { fetchNews(false); }, 20000);
     }
@@ -618,49 +628,384 @@
     if (newsTimer) { clearInterval(newsTimer); newsTimer = null; }
     newsHost = null;
     newsSeen = null;
+    closeSrcPanel();
   }
 
   function utcDate(ts) {
     return (typeof ts === "string" && ts.length >= 10) ? ts.slice(0, 10) : "";
   }
 
-  function barsSvg(level) {
-    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("viewBox", "0 0 13 12");
-    svg.setAttribute("class", "bars b" + level);
-    var dims = [[0, 8, 3, 4, "r1"], [5, 5, 3, 7, "r2"], [10, 2, 3, 10, "r3"]];
-    for (var i = 0; i < dims.length; i++) {
-      var r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      r.setAttribute("x", dims[i][0]);
-      r.setAttribute("y", dims[i][1]);
-      r.setAttribute("width", dims[i][2]);
-      r.setAttribute("height", dims[i][3]);
-      r.setAttribute("rx", 1);
-      r.setAttribute("class", dims[i][4]);
-      svg.appendChild(r);
-    }
-    return svg;
-  }
-
   function newsLevel(item) {
     return item.impact === 3 ? 3 : (item.impact === 2 ? 2 : 1);
   }
 
-  function renderNews() {
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) {
+      if (Object.prototype.hasOwnProperty.call(attrs, k)) {
+        el.setAttribute(k, attrs[k]);
+      }
+    }
+    return el;
+  }
+
+  function barsSvg(level) {
+    var svg = svgEl("svg", { viewBox: "0 0 13 12", "class": "bars b" + level });
+    var dims = [[0, 8, 3, 4, "r1"], [5, 5, 3, 7, "r2"], [10, 2, 3, 10, "r3"]];
+    for (var i = 0; i < dims.length; i++) {
+      svg.appendChild(svgEl("rect", {
+        x: dims[i][0], y: dims[i][1], width: dims[i][2],
+        height: dims[i][3], rx: 1, "class": dims[i][4]
+      }));
+    }
+    return svg;
+  }
+
+  function linkSvg() {
+    var svg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    var p1 = svgEl("path", { d: "M15 3h6v6" });
+    var p2 = svgEl("path", { d: "M10 14 21 3" });
+    var p3 = svgEl("path", {
+      d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" });
+    svg.appendChild(p1); svg.appendChild(p2); svg.appendChild(p3);
+    return svg;
+  }
+
+  function badgeFor(name) {
+    var b = document.createElement("span");
+    b.className = "badge";
+    var m = String(name || "?").match(/[A-Za-z0-9]/);
+    b.textContent = m ? m[0].toUpperCase() : "?";
+    return b;
+  }
+
+  /* activity chart: 24 hourly buckets, stacked L/M/H, validated palette
+     (H #dc2626, M #f59e0b, L #9aa3af on white); identity also carried by
+     fixed stack order + legend labels + hover tooltip (data-tip). */
+  function activityChart(items) {
+    var wrap = document.createElement("div");
+    wrap.className = "actwrap";
+    var head = document.createElement("div");
+    head.className = "act-h";
+    var lab = document.createElement("span");
+    lab.textContent = "Activity · last 24h";
+    head.appendChild(lab);
+    var defs = [["High", "#dc2626"], ["Medium", "#f59e0b"], ["Low", "#9aa3af"]];
+    for (var li2 = 0; li2 < defs.length; li2++) {
+      var lg = document.createElement("span");
+      lg.className = "lg";
+      var dot = document.createElement("span");
+      dot.className = "dotc";
+      dot.style.background = defs[li2][1];
+      lg.appendChild(dot);
+      lg.appendChild(document.createTextNode(defs[li2][0]));
+      head.appendChild(lg);
+    }
+    wrap.appendChild(head);
+
+    var now = Date.now();
+    var buckets = [];
+    for (var b2 = 0; b2 < 24; b2++) { buckets.push({ h: 0, m: 0, l: 0 }); }
+    for (var ii = 0; ii < items.length; ii++) {
+      var t = Date.parse(items[ii].ts);
+      if (!isFinite(t)) { continue; }
+      var ageH = (now - t) / 3600000;
+      if (ageH < 0 || ageH >= 24) { continue; }
+      var idx = 23 - Math.floor(ageH);
+      var lvl = newsLevel(items[ii]);
+      if (lvl === 3) { buckets[idx].h += 1; }
+      else if (lvl === 2) { buckets[idx].m += 1; }
+      else { buckets[idx].l += 1; }
+    }
+    var maxN = 1;
+    for (var mb = 0; mb < 24; mb++) {
+      var tot = buckets[mb].h + buckets[mb].m + buckets[mb].l;
+      if (tot > maxN) { maxN = tot; }
+    }
+    var W = 960, H = 56, plotH = 42, baseY = 46;
+    var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H,
+      "class": "actchart", preserveAspectRatio: "none" });
+    var slot = W / 24;
+    var bw = Math.max(6, slot - 4);
+    var nowHour = new Date().getUTCHours();
+    for (var x = 0; x < 24; x++) {
+      var bkt = buckets[x];
+      var total = bkt.h + bkt.m + bkt.l;
+      var x0 = x * slot + (slot - bw) / 2;
+      var hourLabel = ((nowHour - (23 - x)) % 24 + 24) % 24;
+      var col = svgEl("g", {});
+      var y = baseY;
+      var segs = [["l", "#9aa3af"], ["m", "#f59e0b"], ["h", "#dc2626"]];
+      for (var s2 = 0; s2 < segs.length; s2++) {
+        var n = bkt[segs[s2][0]];
+        if (!n) { continue; }
+        var hpx = Math.max(2, (n / maxN) * plotH);
+        y -= hpx;
+        col.appendChild(svgEl("rect", {
+          x: x0, y: y, width: bw, height: hpx - 1,
+          rx: 1.5, fill: segs[s2][1]
+        }));
+      }
+      var hit = svgEl("rect", {
+        x: x * slot, y: 0, width: slot, height: H, fill: "transparent"
+      });
+      hit.setAttribute("data-tip",
+        ("0" + hourLabel).slice(-2) + ":00 · " + bkt.h + "H " +
+        bkt.m + "M " + bkt.l + "L");
+      col.appendChild(hit);
+      svg.appendChild(col);
+      if (hourLabel % 6 === 0) {
+        var tx = svgEl("text", { x: x * slot + slot / 2, y: H - 1,
+          "text-anchor": "middle", "class": "acthour" });
+        tx.textContent = ("0" + hourLabel).slice(-2);
+        svg.appendChild(tx);
+      }
+    }
+    svg.appendChild(svgEl("line", {
+      x1: 0, y1: baseY + 0.5, x2: W, y2: baseY + 0.5,
+      "class": "bl", "stroke-width": 1
+    }));
+    wrap.appendChild(svg);
+    return wrap;
+  }
+
+  /* sources dropdown */
+  var srcPanelEl = null;
+
+  function closeSrcPanel() {
+    if (srcPanelEl && srcPanelEl.parentNode) {
+      srcPanelEl.parentNode.removeChild(srcPanelEl);
+    }
+    srcPanelEl = null;
+    srcPanelOpen = false;
+  }
+
+  function buildSrcPanel(anchor) {
+    closeSrcPanel();
+    srcPanelOpen = true;
+    var board = (newsData && newsData.sources_board) || {};
+    var rows = board.sources || [];
+    var panel = document.createElement("div");
+    panel.className = "srcpanel";
+    var head = document.createElement("div");
+    head.className = "sp-head";
+    var title = document.createElement("span");
+    title.className = "sp-title";
+    title.textContent = "Sources";
+    var live = document.createElement("span");
+    live.className = "sp-live";
+    live.textContent = board.present
+      ? board.available + " Available · " + board.live + " Live"
+      : "board not mirrored yet";
+    head.appendChild(title);
+    head.appendChild(live);
+    panel.appendChild(head);
+
+    var search = document.createElement("div");
+    search.className = "srcsearch";
+    var sicon = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    sicon.appendChild(svgEl("circle", { cx: 11, cy: 11, r: 8 }));
+    sicon.appendChild(svgEl("path", { d: "m21 21-4.3-4.3" }));
+    search.appendChild(sicon);
+    var input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Search sources";
+    input.value = srcSearch;
+    input.addEventListener("input", function () {
+      srcSearch = input.value;
+      renderSrcRows(list, rows);
+    });
+    search.appendChild(input);
+    panel.appendChild(search);
+
+    var list = document.createElement("div");
+    list.className = "srclist";
+    renderSrcRows(list, rows);
+    panel.appendChild(list);
+
+    var note = document.createElement("div");
+    note.className = "sp-note";
+    note.textContent = "Toggles filter this feed. Upstream per-source " +
+      "shutdown lands with the wiring build.";
+    panel.appendChild(note);
+
+    document.body.appendChild(panel);
+    var r = anchor.getBoundingClientRect();
+    var w = panel.offsetWidth;
+    var left = Math.min(Math.max(12, Math.round(r.left)),
+      window.innerWidth - w - 12);
+    var top = Math.round(r.bottom + 8);
+    panel.style.left = left + "px";
+    panel.style.top = top + "px";
+    requestAnimationFrame(function () { panel.classList.add("on"); });
+    srcPanelEl = panel;
+    setTimeout(function () { input.focus(); }, 60);
+  }
+
+  function renderSrcRows(list, rows) {
+    list.textContent = "";
+    var needle = srcSearch.trim().toLowerCase();
+    var shown = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var srcRow = rows[i];
+      var label = srcRow.label || srcRow.key;
+      if (needle && label.toLowerCase().indexOf(needle) === -1) { continue; }
+      shown += 1;
+      (function (name) {
+        var row = document.createElement("div");
+        row.className = "src-row" + (newsSrcOff[name] ? " off" : "");
+        row.appendChild(badgeFor(name));
+        var nm = document.createElement("span");
+        nm.className = "src-name";
+        nm.textContent = name;
+        nm.title = name + (srcRow.domain ? " · " + srcRow.domain : "");
+        row.appendChild(nm);
+        var dot = document.createElement("span");
+        dot.className = "src-dot " + (srcRow.status || "");
+        dot.title = srcRow.status || "unknown";
+        row.appendChild(dot);
+        var cnt = document.createElement("span");
+        cnt.className = "src-cnt";
+        cnt.textContent = String(srcRow.count || 0);
+        row.appendChild(cnt);
+        var sw = document.createElement("button");
+        sw.className = "switch sm";
+        sw.setAttribute("role", "switch");
+        sw.setAttribute("aria-checked", newsSrcOff[name] ? "false" : "true");
+        sw.setAttribute("aria-label", name + " feed");
+        var knob = document.createElement("span");
+        knob.className = "knob";
+        sw.appendChild(knob);
+        sw.addEventListener("click", function () {
+          if (newsSrcOff[name]) { delete newsSrcOff[name]; }
+          else { newsSrcOff[name] = true; }
+          try {
+            localStorage.setItem(NEWS_SRC_KEY, JSON.stringify(newsSrcOff));
+          } catch (e) { /* private mode */ }
+          row.classList.toggle("off", !!newsSrcOff[name]);
+          sw.setAttribute("aria-checked",
+            newsSrcOff[name] ? "false" : "true");
+          renderNews(true);
+        });
+        row.appendChild(sw);
+        list.appendChild(row);
+      })(label);
+    }
+    if (!shown) {
+      var none = document.createElement("div");
+      none.className = "sp-note";
+      none.textContent = "No source matches.";
+      list.appendChild(none);
+    }
+  }
+
+  document.addEventListener("mousedown", function (ev) {
+    if (srcPanelEl && !srcPanelEl.contains(ev.target) &&
+        !(ev.target.closest && ev.target.closest("#src-pill"))) {
+      closeSrcPanel();
+    }
+  });
+
+  function setMaster(on) {
+    newsMaster = on;
+    try {
+      localStorage.setItem(NEWS_MASTER_KEY, on ? "on" : "off");
+    } catch (e) { /* private mode */ }
+    if (on) { fetchNews(true); } else { closeSrcPanel(); renderNews(); }
+  }
+
+  function renderNews(keepPanel) {
     if (!newsHost) { return; }
+    if (!keepPanel) { closeSrcPanel(); }
     var prevSeen = newsSeen;
     newsHost.textContent = "";
+    newsHost.classList.toggle("dead", !newsMaster);
 
-    /* top row: eyebrow · day strip · refresh + age */
-    var top = document.createElement("div");
-    top.className = "news-top";
-    var eyebrow = document.createElement("span");
-    eyebrow.className = "news-eyebrow";
-    eyebrow.textContent = "News";
-    top.appendChild(eyebrow);
+    var board = (newsData && newsData.sources_board) || {};
+
+    /* header: title · available/live · refresh · updated · master */
+    var head = document.createElement("div");
+    head.className = "news-head";
+    var title = document.createElement("span");
+    title.className = "news-title";
+    title.textContent = "News";
+    head.appendChild(title);
+    var liveLbl = document.createElement("span");
+    liveLbl.className = "news-live";
+    liveLbl.textContent = board.present
+      ? board.available + " sources · " + board.live + " live" : "";
+    head.appendChild(liveLbl);
+    var right = document.createElement("div");
+    right.className = "news-right";
+    var refresh = document.createElement("button");
+    refresh.className = "refresh-btn";
+    refresh.setAttribute("aria-label", "Refresh");
+    refresh.setAttribute("data-tip", "Refresh");
+    var rsvg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    rsvg.appendChild(svgEl("path", {
+      d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
+    rsvg.appendChild(svgEl("path", { d: "M3 3v5h5" }));
+    refresh.appendChild(rsvg);
+    refresh.addEventListener("click", function () { fetchNews(true); });
+    var upd = document.createElement("span");
+    upd.className = "news-upd";
+    var masterWrap = document.createElement("span");
+    masterWrap.className = "master-wrap";
+    var mlabel = document.createElement("span");
+    mlabel.className = "mlabel";
+    mlabel.textContent = newsMaster ? "News on" : "News off";
+    var msw = document.createElement("button");
+    msw.className = "switch";
+    msw.setAttribute("role", "switch");
+    msw.setAttribute("aria-checked", newsMaster ? "true" : "false");
+    msw.setAttribute("aria-label", "News master");
+    var mknob = document.createElement("span");
+    mknob.className = "knob";
+    msw.appendChild(mknob);
+    msw.addEventListener("click", function () { setMaster(!newsMaster); });
+    masterWrap.appendChild(mlabel);
+    masterWrap.appendChild(msw);
+    right.appendChild(refresh);
+    right.appendChild(upd);
+    right.appendChild(masterWrap);
+    head.appendChild(right);
+    newsHost.appendChild(head);
+
+    if (!newsMaster) {
+      var offnote = document.createElement("div");
+      offnote.className = "news-offnote";
+      offnote.textContent = "News is turned off — display and polling " +
+        "halted here. Upstream fetch-loop shutdown lands with the wiring " +
+        "build (needs the control endpoint).";
+      newsHost.appendChild(offnote);
+    }
 
     var items = (newsData && newsData.present && newsData.items) || [];
 
+    if (newsMaster && (!newsData || !newsData.present)) {
+      upd.textContent = "—";
+      var empty0 = document.createElement("div");
+      empty0.className = "news-empty";
+      empty0.textContent = newsData
+        ? "No news in the mirror yet — the fetch loop fills ui/live/news.jsonl."
+        : "Server unreachable.";
+      newsHost.appendChild(empty0);
+      newsSeen = null;
+      return;
+    }
+    if (newsData) {
+      upd.textContent = newsAgeText(newsData.as_of);
+      var ageSec = (Date.now() - Date.parse(newsData.as_of)) / 1000;
+      upd.classList.toggle("stale", isFinite(ageSec) && ageSec > 400);
+    }
+
+    /* day strip */
     var strip = document.createElement("div");
     strip.className = "daystrip";
     var dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -673,17 +1018,16 @@
       if (lv === 3) { byDay[dkey].h += 1; }
       if (lv === 2) { byDay[dkey].m += 1; }
     }
-    var now = new Date();
+    var now2 = new Date();
     var dayDefs = [{ key: "all", label: "All", sub: items.length + " items" }];
     for (var dd = 6; dd >= 0; dd--) {
-      var dt = new Date(now.getTime() - dd * 86400000);
+      var dt = new Date(now2.getTime() - dd * 86400000);
       var key = dt.toISOString().slice(0, 10);
-      var stats = byDay[key] || { n: 0, h: 0, m: 0 };
       dayDefs.push({
         key: key,
         label: (dd === 0 ? "Today" :
           dayNames[dt.getUTCDay()] + " " + dt.getUTCDate()),
-        stats: stats
+        stats: byDay[key] || { n: 0, h: 0, m: 0 }
       });
     }
     for (var di = 0; di < dayDefs.length; di++) {
@@ -700,10 +1044,11 @@
           l2.textContent = def.stats.n + " · ";
           var hh = document.createElement("span");
           hh.className = "hh"; hh.textContent = "H" + def.stats.h;
-          var sep = document.createTextNode(" ");
           var mm = document.createElement("span");
           mm.className = "mm"; mm.textContent = "M" + def.stats.m;
-          l2.appendChild(hh); l2.appendChild(sep); l2.appendChild(mm);
+          l2.appendChild(hh);
+          l2.appendChild(document.createTextNode(" "));
+          l2.appendChild(mm);
         } else {
           l2.textContent = def.sub;
         }
@@ -716,75 +1061,73 @@
         strip.appendChild(cell);
       })(dayDefs[di]);
     }
-    top.appendChild(strip);
+    newsHost.appendChild(strip);
 
-    var right = document.createElement("div");
-    right.className = "news-right";
-    var refresh = document.createElement("button");
-    refresh.className = "refresh-btn";
-    refresh.setAttribute("aria-label", "Refresh");
-    refresh.setAttribute("data-tip", "Refresh");
-    var rsvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    rsvg.setAttribute("viewBox", "0 0 24 24");
-    rsvg.setAttribute("fill", "none");
-    rsvg.setAttribute("stroke", "currentColor");
-    rsvg.setAttribute("stroke-linecap", "round");
-    rsvg.setAttribute("stroke-linejoin", "round");
-    var rp1 = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    rp1.setAttribute("d", "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8");
-    var rp2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    rp2.setAttribute("d", "M3 3v5h5");
-    rsvg.appendChild(rp1); rsvg.appendChild(rp2);
-    refresh.appendChild(rsvg);
-    refresh.addEventListener("click", function () { fetchNews(true); });
-    var upd = document.createElement("span");
-    upd.className = "news-upd";
-    right.appendChild(refresh);
-    right.appendChild(upd);
-    top.appendChild(right);
-    newsHost.appendChild(top);
-
-    if (!newsData || !newsData.present) {
-      upd.textContent = "—";
-      var empty = document.createElement("div");
-      empty.className = "news-empty";
-      empty.textContent = newsData
-        ? "No news in the mirror yet — the fetch loop fills ui/live/news.jsonl."
-        : "Server unreachable.";
-      newsHost.appendChild(empty);
-      newsSeen = null;
-      return;
-    }
-
-    upd.textContent = newsAgeText(newsData.as_of);
-    var ageSec = (Date.now() - Date.parse(newsData.as_of)) / 1000;
-    upd.classList.toggle("stale", isFinite(ageSec) && ageSec > 300);
-
-    /* day + source filtered pools */
+    /* pools */
     var dayPool = [];
     for (var i0 = 0; i0 < items.length; i0++) {
       if (newsDay === "all" || utcDate(items[i0].ts) === newsDay) {
         dayPool.push(items[i0]);
       }
     }
-    var srcCounts = {};
-    for (var i1 = 0; i1 < dayPool.length; i1++) {
-      var nm = dayPool[i1].source || "—";
-      srcCounts[nm] = (srcCounts[nm] || 0) + 1;
+    var catPool = [];
+    for (var c0 = 0; c0 < dayPool.length; c0++) {
+      if (newsCat === "all" ||
+          (dayPool[c0].category || "Crypto") === newsCat ||
+          (newsCat === "On-Chain" &&
+           dayPool[c0].category === "On-Chain")) {
+        catPool.push(dayPool[c0]);
+      }
     }
     var pool = [];
-    for (var i2 = 0; i2 < dayPool.length; i2++) {
-      if (!newsSrcOff[dayPool[i2].source || "—"]) { pool.push(dayPool[i2]); }
+    for (var i2 = 0; i2 < catPool.length; i2++) {
+      if (!newsSrcOff[catPool[i2].source || "—"]) { pool.push(catPool[i2]); }
     }
 
-    /* impact pills with counts */
+    /* category pill row + sources pill */
+    var catbar = document.createElement("div");
+    catbar.className = "pillbar";
+    for (var ci2 = 0; ci2 < NEWS_CATS.length; ci2++) {
+      (function (name) {
+        var val = name === "All News" ? "all" : name;
+        var b = document.createElement("button");
+        b.className = "fpill" + (newsCat === val ? " on" : "");
+        b.textContent = name;
+        b.addEventListener("click", function () {
+          newsCat = val;
+          renderNews();
+        });
+        catbar.appendChild(b);
+      })(NEWS_CATS[ci2]);
+    }
+    var srcPill = document.createElement("button");
+    srcPill.className = "fpill";
+    srcPill.id = "src-pill";
+    srcPill.appendChild(document.createTextNode("Sources"));
+    var scnt = document.createElement("span");
+    scnt.className = "cnt";
+    scnt.textContent = board.present ? String(board.available) : "—";
+    srcPill.appendChild(scnt);
+    var chev = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round", "class": "chev" });
+    chev.appendChild(svgEl("path", { d: "m6 9 6 6 6-6" }));
+    srcPill.appendChild(chev);
+    srcPill.addEventListener("click", function () {
+      if (srcPanelOpen) { closeSrcPanel(); }
+      else { buildSrcPanel(srcPill); }
+    });
+    catbar.appendChild(srcPill);
+    newsHost.appendChild(catbar);
+
+    /* impact pill row */
     var counts = { 3: 0, 2: 0, 1: 0 };
-    for (var ci = 0; ci < pool.length; ci++) { counts[newsLevel(pool[ci])] += 1; }
-    var filters = document.createElement("div");
-    filters.className = "news-filters";
-    var defs = [["all", "All", null],
+    for (var cc = 0; cc < pool.length; cc++) { counts[newsLevel(pool[cc])] += 1; }
+    var impbar = document.createElement("div");
+    impbar.className = "pillbar";
+    var defs2 = [["all", "All Impact", null],
       ["3", "High", 3], ["2", "Medium", 2], ["1", "Low", 1]];
-    for (var fi = 0; fi < defs.length; fi++) {
+    for (var fi = 0; fi < defs2.length; fi++) {
       (function (val, label, lvl) {
         var b = document.createElement("button");
         b.className = "fpill" + (newsFilter === val ? " on" : "");
@@ -798,24 +1141,20 @@
           newsFilter = val;
           renderNews();
         });
-        filters.appendChild(b);
-      })(defs[fi][0], defs[fi][1], defs[fi][2]);
+        impbar.appendChild(b);
+      })(defs2[fi][0], defs2[fi][1], defs2[fi][2]);
     }
-    var total = document.createElement("span");
-    total.className = "news-total";
-    total.textContent = "UTC";
-    filters.appendChild(total);
-    newsHost.appendChild(filters);
+    newsHost.appendChild(impbar);
 
-    /* body: list + sources rail */
-    var body = document.createElement("div");
-    body.className = "news-body";
-    var main = document.createElement("div");
-    main.className = "news-main";
+    /* activity chart over the day/cat/source pool */
+    newsHost.appendChild(activityChart(pool));
+
+    /* list */
     var list = document.createElement("div");
+    list.className = "news-list";
     var hrow = document.createElement("div");
     hrow.className = "news-hrow";
-    var labels = ["Time", "", "Source", "Headline", "Category"];
+    var labels = ["Time", "", "Source", "Headline", "Category", ""];
     for (var li = 0; li < labels.length; li++) {
       var hcell = document.createElement("span");
       hcell.textContent = labels[li];
@@ -840,9 +1179,22 @@
         ? it.ts.slice(11, 16) : "—";
       var impCell = document.createElement("span");
       impCell.appendChild(barsSvg(lvl2));
-      var src = document.createElement("span");
-      src.className = "n-src";
-      src.textContent = it.source || "—";
+      var srcWrap = document.createElement("span");
+      srcWrap.className = "n-srcwrap";
+      srcWrap.appendChild(badgeFor(it.source));
+      var srcCol = document.createElement("span");
+      srcCol.style.minWidth = "0";
+      var srcName = document.createElement("span");
+      srcName.className = "n-src";
+      srcName.textContent = it.source || "—";
+      srcCol.appendChild(srcName);
+      if (it.domain) {
+        var dom = document.createElement("span");
+        dom.className = "n-dom";
+        dom.textContent = " " + it.domain;
+        srcCol.appendChild(dom);
+      }
+      srcWrap.appendChild(srcCol);
       var hd = document.createElement("span");
       hd.className = "n-head";
       var link;
@@ -860,73 +1212,32 @@
       var cat = document.createElement("span");
       cat.className = "n-cat";
       cat.textContent = it.category || "—";
+      var lnk = document.createElement("span");
+      lnk.className = "n-link";
+      if (it.url) {
+        var la = document.createElement("a");
+        la.href = it.url;
+        la.target = "_blank";
+        la.rel = "noopener noreferrer";
+        la.setAttribute("aria-label", "Open source article");
+        la.appendChild(linkSvg());
+        lnk.appendChild(la);
+      }
       row.appendChild(tm);
       row.appendChild(impCell);
-      row.appendChild(src);
+      row.appendChild(srcWrap);
       row.appendChild(hd);
       row.appendChild(cat);
+      row.appendChild(lnk);
       list.appendChild(row);
     }
-    main.appendChild(list);
+    newsHost.appendChild(list);
     if (!shown) {
       var none = document.createElement("div");
       none.className = "news-empty";
       none.textContent = "Nothing matches these filters in the mirror.";
-      main.appendChild(none);
+      newsHost.appendChild(none);
     }
-    body.appendChild(main);
-
-    /* sources rail */
-    var side = document.createElement("div");
-    side.className = "news-side";
-    var sh = document.createElement("div");
-    sh.className = "side-h";
-    sh.textContent = "Sources";
-    side.appendChild(sh);
-    var srcNames = Object.keys(srcCounts).sort(function (a, b) {
-      return srcCounts[b] - srcCounts[a];
-    }).slice(0, 14);
-    for (var si = 0; si < srcNames.length; si++) {
-      (function (name) {
-        var rowS = document.createElement("div");
-        rowS.className = "src-row" + (newsSrcOff[name] ? " off" : "");
-        var nm2 = document.createElement("span");
-        nm2.className = "src-name";
-        nm2.textContent = name;
-        nm2.title = name;
-        var cn = document.createElement("span");
-        cn.className = "src-cnt";
-        cn.textContent = String(srcCounts[name]);
-        var sw = document.createElement("button");
-        sw.className = "switch sm";
-        sw.setAttribute("role", "switch");
-        sw.setAttribute("aria-checked", newsSrcOff[name] ? "false" : "true");
-        sw.setAttribute("aria-label", name + " feed");
-        var knob = document.createElement("span");
-        knob.className = "knob";
-        sw.appendChild(knob);
-        sw.addEventListener("click", function () {
-          if (newsSrcOff[name]) { delete newsSrcOff[name]; }
-          else { newsSrcOff[name] = true; }
-          try {
-            localStorage.setItem(NEWS_SRC_KEY, JSON.stringify(newsSrcOff));
-          } catch (e) { /* private mode */ }
-          renderNews();
-        });
-        rowS.appendChild(nm2);
-        rowS.appendChild(cn);
-        rowS.appendChild(sw);
-        side.appendChild(rowS);
-      })(srcNames[si]);
-    }
-    var note = document.createElement("div");
-    note.className = "side-note";
-    note.textContent =
-      "Toggles filter this feed. Upstream shutdown per source lands with the wiring build.";
-    side.appendChild(note);
-    body.appendChild(side);
-    newsHost.appendChild(body);
-
     newsSeen = seenNow;
   }
 

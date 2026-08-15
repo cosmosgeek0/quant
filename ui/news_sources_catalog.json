@@ -1,0 +1,903 @@
+[
+ {
+  "key": "tree",
+  "label": "Tree of Alpha",
+  "domain": "treeofalpha.com",
+  "channel": "firehose",
+  "feeds": [
+   "https://news.treeofalpha.com/api/news?limit=400"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "fed",
+  "label": "Federal Reserve Board",
+  "domain": "federalreserve.gov",
+  "channel": "official",
+  "feeds": [
+   "https://www.federalreserve.gov/feeds/press_all.xml",
+   "https://www.federalreserve.gov/feeds/press_monetary.xml",
+   "https://www.federalreserve.gov/feeds/speeches_and_testimony.xml",
+   "https://www.federalreserve.gov/feeds/bankinginfo-rss.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bls",
+  "label": "BLS",
+  "domain": "bls.gov",
+  "channel": "official",
+  "feeds": [
+   "https://www.bls.gov/feed/empsit.rss",
+   "https://www.bls.gov/feed/jolts.rss",
+   "https://www.bls.gov/feed/cpi.rss",
+   "https://www.bls.gov/feed/ppi.rss",
+   "https://www.bls.gov/feed/ximpim.rss",
+   "https://www.bls.gov/feed/eci.rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bea",
+  "label": "BEA",
+  "domain": "bea.gov",
+  "channel": "official",
+  "feeds": [
+   "https://apps.bea.gov/rss/rss.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "sec",
+  "label": "SEC",
+  "domain": "sec.gov",
+  "channel": "official",
+  "feeds": [
+   "https://www.sec.gov/news/pressreleases.rss",
+   "https://www.sec.gov/news/speeches-statements.rss",
+   "https://www.sec.gov/news/testimony.rss",
+   "https://www.sec.gov/news/statements.rss",
+   "https://www.sec.gov/enforcement-litigation/litigation-releases/rss",
+   "https://www.sec.gov/enforcement-litigation/administrative-proceedings/rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "cftc",
+  "label": "CFTC",
+  "domain": "cftc.gov",
+  "channel": "official",
+  "feeds": [
+   "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
+   "https://www.cftc.gov/RSS/RSSENF/rssenf.xml",
+   "https://www.cftc.gov/RSS/RSSST/rssst.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "treasury",
+  "label": "U.S. Treasury",
+  "domain": "home.treasury.gov",
+  "channel": "official",
+  "feeds": [
+   "https://home.treasury.gov/news/press-releases"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "ofac",
+  "label": "OFAC",
+  "domain": "ofac.treasury.gov",
+  "channel": "official",
+  "feeds": [
+   "https://ofac.treasury.gov/recent-actions"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "ecb",
+  "label": "ECB",
+  "domain": "ecb.europa.eu",
+  "channel": "official",
+  "feeds": [
+   "https://www.ecb.europa.eu/rss/press.html",
+   "https://www.ecb.europa.eu/rss/statpress.html",
+   "https://www.ecb.europa.eu/rss/pub.html",
+   "https://www.ecb.europa.eu/rss/operations.html"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "boe",
+  "label": "Bank of England",
+  "domain": "bankofengland.co.uk",
+  "channel": "official",
+  "feeds": [
+   "https://www.bankofengland.co.uk/rss/news",
+   "https://www.bankofengland.co.uk/rss/publications",
+   "https://www.bankofengland.co.uk/rss/speeches",
+   "https://www.bankofengland.co.uk/rss/statistics"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "boj",
+  "label": "Bank of Japan",
+  "domain": "boj.or.jp",
+  "channel": "official",
+  "feeds": [
+   "https://www.boj.or.jp/en/whatsnew/index.htm"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "japan-mof",
+  "label": "Japan MOF",
+  "domain": "mof.go.jp",
+  "channel": "official",
+  "feeds": [
+   "https://www.mof.go.jp/english/news.rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "china-nbs",
+  "label": "China NBS",
+  "domain": "stats.gov.cn",
+  "channel": "official",
+  "feeds": [
+   "https://www.stats.gov.cn/english/PressRelease/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "pboc",
+  "label": "PBoC",
+  "domain": "pbc.gov.cn",
+  "channel": "official",
+  "feeds": [
+   "https://www.pbc.gov.cn/en/3688006/index.html"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "safe",
+  "label": "SAFE",
+  "domain": "safe.gov.cn",
+  "channel": "official",
+  "feeds": [
+   "https://www.safe.gov.cn/en/SAFENews/index.html"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "coinbase-assets",
+  "label": "Coinbase / Coinbase Assets",
+  "domain": "coinbase.com",
+  "channel": "venue",
+  "feeds": [
+   "https://api.exchange.coinbase.com/products"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "kraken",
+  "label": "Kraken",
+  "domain": "blog.kraken.com",
+  "channel": "venue",
+  "feeds": [
+   "https://blog.kraken.com/category/product/asset-listings/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "okx",
+  "label": "OKX",
+  "domain": "okx.com",
+  "channel": "venue",
+  "feeds": [
+   "https://www.okx.com/help/section/announcements-new-listings"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bybit",
+  "label": "Bybit",
+  "domain": "announcements.bybit.com",
+  "channel": "venue",
+  "feeds": [
+   "https://announcements.bybit.com/en/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "upbit-bithumb",
+  "label": "Upbit / Bithumb",
+  "domain": "upbit.com",
+  "channel": "venue",
+  "feeds": [
+   "https://upbit.com/service_center/notice"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "deribit",
+  "label": "Deribit",
+  "domain": "insights.deribit.com",
+  "channel": "venue",
+  "feeds": [
+   "https://insights.deribit.com/exchange-updates/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "cme-crypto",
+  "label": "CME Group Crypto Notices",
+  "domain": "cmegroup.com",
+  "channel": "venue",
+  "feeds": [
+   "https://feeds.feedburner.com/mediaroom/CMsF"
+  ],
+  "keywords": [
+   "crypto",
+   "cryptocurrency",
+   "bitcoin",
+   "ether",
+   "ethereum",
+   "xrp",
+   "solana",
+   "cardano",
+   "chainlink",
+   "stellar"
+  ]
+ },
+ {
+  "key": "exchange-status",
+  "label": "Exchange Status Pages",
+  "domain": "status.coinbase.com",
+  "channel": "venue",
+  "feeds": [
+   "https://status.coinbase.com/history.rss",
+   "https://status.kraken.com/history.rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "ethereum-foundation",
+  "label": "Ethereum Foundation",
+  "domain": "ethereum.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://blog.ethereum.org/feed.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bitcoin-core",
+  "label": "Bitcoin Core",
+  "domain": "bitcoincore.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/bitcoin/bitcoin/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "geth",
+  "label": "Geth",
+  "domain": "geth.ethereum.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/ethereum/go-ethereum/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "nethermind",
+  "label": "Nethermind",
+  "domain": "nethermind.io",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/NethermindEth/nethermind/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "prysm",
+  "label": "Prysm",
+  "domain": "offchainlabs.com",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/OffchainLabs/prysm/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "lighthouse",
+  "label": "Lighthouse",
+  "domain": "sigmaprime.io",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/sigp/lighthouse/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "solana-agave",
+  "label": "Solana Agave",
+  "domain": "solana.com",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/anza-xyz/agave/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "arbitrum-nitro",
+  "label": "Arbitrum Nitro",
+  "domain": "arbitrum.io",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/OffchainLabs/nitro/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "optimism",
+  "label": "Optimism",
+  "domain": "optimism.io",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/ethereum-optimism/optimism/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "base-status",
+  "label": "Base Status",
+  "domain": "base.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://status.base.org/history.rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "polygon-status",
+  "label": "Polygon Status",
+  "domain": "polygon.technology",
+  "channel": "protocol",
+  "feeds": [
+   "https://status.polygon.technology/history.rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "avalanchego",
+  "label": "AvalancheGo",
+  "domain": "avax.network",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/ava-labs/avalanchego/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "cosmos-gaia",
+  "label": "Cosmos Gaia",
+  "domain": "cosmos.network",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/cosmos/gaia/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "celestia-node",
+  "label": "Celestia Node",
+  "domain": "celestia.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/celestiaorg/celestia-node/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "sui",
+  "label": "Sui",
+  "domain": "sui.io",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/MystenLabs/sui/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "aptos-core",
+  "label": "Aptos Core",
+  "domain": "aptosfoundation.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/aptos-labs/aptos-core/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "chainlink",
+  "label": "Chainlink",
+  "domain": "chain.link",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/smartcontractkit/chainlink/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "uniswap-v4",
+  "label": "Uniswap v4",
+  "domain": "uniswap.org",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/Uniswap/v4-core/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "aave-v3",
+  "label": "Aave v3",
+  "domain": "aave.com",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/aave/aave-v3-core/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "lido",
+  "label": "Lido",
+  "domain": "lido.fi",
+  "channel": "protocol",
+  "feeds": [
+   "https://blog.lido.fi/rss/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "eigenlayer",
+  "label": "EigenLayer",
+  "domain": "eigenlayer.xyz",
+  "channel": "protocol",
+  "feeds": [
+   "https://blog.eigenlayer.xyz/rss/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "sky-forum",
+  "label": "Sky / Maker Forum",
+  "domain": "forum.sky.money",
+  "channel": "protocol",
+  "feeds": [
+   "https://forum.sky.money/latest.rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "curve",
+  "label": "Curve Protocol",
+  "domain": "curve.fi",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/curvefi/curve-contract/releases.atom",
+   "https://github.com/curvefi/curve-dao-contracts/releases.atom",
+   "https://github.com/curvefi/curve-stablecoin/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "dydx",
+  "label": "dYdX",
+  "domain": "dydx.exchange",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/dydxprotocol/v4-chain/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "jito-solana",
+  "label": "Jito Solana",
+  "domain": "jito.network",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/jito-foundation/jito-solana/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "jupiter-cpi",
+  "label": "Jupiter",
+  "domain": "jup.ag",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/jup-ag/jupiter-cpi/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "wormhole",
+  "label": "Wormhole",
+  "domain": "wormhole.com",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/wormhole-foundation/wormhole/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "layerzero-v2",
+  "label": "LayerZero v2",
+  "domain": "layerzero.network",
+  "channel": "protocol",
+  "feeds": [
+   "https://github.com/LayerZero-Labs/LayerZero-v2/releases.atom"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "tether",
+  "label": "Tether",
+  "domain": "tether.io",
+  "channel": "issuer",
+  "feeds": [
+   "https://tether.io/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "paypal-usd",
+  "label": "PayPal USD",
+  "domain": "paypal.com",
+  "channel": "issuer",
+  "feeds": [
+   "https://newsroom.paypal-corp.com/news?pagetemplate=rss"
+  ],
+  "keywords": [
+   "pyusd",
+   "paypal usd",
+   "stablecoin",
+   "stable coin",
+   "crypto",
+   "cryptocurrency",
+   "digital asset",
+   "blockchain"
+  ]
+ },
+ {
+  "key": "fidelity-digital-assets",
+  "label": "Fidelity Digital Assets",
+  "domain": "fidelitydigitalassets.com",
+  "channel": "issuer",
+  "feeds": [
+   "https://www.fidelitydigitalassets.com/rss.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "circle",
+  "label": "Circle",
+  "domain": "circle.com",
+  "channel": "issuer",
+  "feeds": [
+   "https://www.circle.com/blog"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "paxos",
+  "label": "Paxos",
+  "domain": "paxos.com",
+  "channel": "issuer",
+  "feeds": [
+   "https://www.paxos.com/blog"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bitwise",
+  "label": "Bitwise",
+  "domain": "bitwiseinvestments.com",
+  "channel": "issuer",
+  "feeds": [
+   "https://bitwiseinvestments.com/crypto-market-insights"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "21shares",
+  "label": "21Shares",
+  "domain": "21shares.com",
+  "channel": "issuer",
+  "feeds": [
+   "https://www.21shares.com/en-us/insights"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bis-press",
+  "label": "BIS Press Releases",
+  "domain": "bis.org",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.bis.org/doclist/all_pressrels.rss"
+  ],
+  "keywords": [
+   "crypto",
+   "token",
+   "stablecoin",
+   "market",
+   "monetary",
+   "rate",
+   "inflation",
+   "central bank",
+   "liquidity",
+   "capital",
+   "banking",
+   "financial"
+  ]
+ },
+ {
+  "key": "bis-speeches",
+  "label": "BIS Central Bank Speeches",
+  "domain": "bis.org",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.bis.org/doclist/cbspeeches.rss"
+  ],
+  "keywords": [
+   "crypto",
+   "token",
+   "stablecoin",
+   "market",
+   "monetary",
+   "rate",
+   "inflation",
+   "central bank",
+   "liquidity",
+   "capital",
+   "banking",
+   "financial"
+  ]
+ },
+ {
+  "key": "bis-statistics",
+  "label": "BIS Statistics",
+  "domain": "bis.org",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.bis.org/doclist/all_statistics.rss"
+  ],
+  "keywords": [
+   "crypto",
+   "market",
+   "fund",
+   "asset",
+   "trading",
+   "stablecoin",
+   "investment",
+   "financial",
+   "enforcement"
+  ]
+ },
+ {
+  "key": "esma",
+  "label": "ESMA",
+  "domain": "esma.europa.eu",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.esma.europa.eu/rss.xml"
+  ],
+  "keywords": [
+   "crypto",
+   "market",
+   "fund",
+   "asset",
+   "trading",
+   "stablecoin",
+   "investment",
+   "financial",
+   "enforcement"
+  ]
+ },
+ {
+  "key": "crypto-news",
+  "label": "Crypto.news",
+  "domain": "crypto.news",
+  "channel": "editorial",
+  "feeds": [
+   "https://crypto.news/feed/"
+  ],
+  "keywords": [
+   "fed",
+   "ecb",
+   "boj",
+   "rate",
+   "inflation",
+   "cpi",
+   "ppi",
+   "payroll",
+   "jobs",
+   "gdp",
+   "treasury",
+   "bond"
+  ]
+ },
+ {
+  "key": "wsj-markets",
+  "label": "WSJ Markets RSS",
+  "domain": "wsj.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"
+  ],
+  "keywords": [
+   "market",
+   "markets",
+   "stock",
+   "stocks",
+   "shares",
+   "nasdaq",
+   "dow",
+   "s&p",
+   "earnings",
+   "fed",
+   "rates",
+   "inflation"
+  ]
+ },
+ {
+  "key": "marketwatch",
+  "label": "MarketWatch",
+  "domain": "marketwatch.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+  ],
+  "keywords": [
+   "market",
+   "markets",
+   "stock",
+   "stocks",
+   "shares",
+   "investor",
+   "investors",
+   "oil",
+   "energy",
+   "dollar",
+   "treasury",
+   "bond"
+  ]
+ },
+ {
+  "key": "yahoo-finance",
+  "label": "Yahoo Finance",
+  "domain": "finance.yahoo.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://finance.yahoo.com/news/rss"
+  ],
+  "keywords": [
+   "market",
+   "stock",
+   "stocks",
+   "shares",
+   "nasdaq",
+   "s&p",
+   "dow",
+   "fed",
+   "rates",
+   "inflation",
+   "economy",
+   "economic"
+  ]
+ },
+ {
+  "key": "nasdaq-news",
+  "label": "Nasdaq News / Market Activity",
+  "domain": "nasdaq.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.nasdaq.com/feed/rssoutbound?category=Market%20Activity"
+  ],
+  "keywords": [
+   "market",
+   "nasdaq",
+   "s&p",
+   "dow",
+   "fed",
+   "rate",
+   "inflation",
+   "treasury",
+   "bond",
+   "oil",
+   "gold",
+   "dollar"
+  ]
+ },
+ {
+  "key": "ap-business",
+  "label": "AP Business",
+  "domain": "apnews.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://apnews.com/business"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "coindesk",
+  "label": "CoinDesk",
+  "domain": "coindesk.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.coindesk.com/arc/outboundfeeds/rss/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "unchained",
+  "label": "Unchained",
+  "domain": "unchainedcrypto.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://unchainedcrypto.com/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "bankless",
+  "label": "Bankless",
+  "domain": "bankless.com",
+  "channel": "editorial",
+  "feeds": [
+   "https://www.bankless.com/rss/feed"
+  ],
+  "keywords": [
+   "market",
+   "fed",
+   "rate",
+   "inflation",
+   "treasury",
+   "bond",
+   "yield",
+   "oil",
+   "gold",
+   "dollar",
+   "bitcoin",
+   "ethereum"
+  ]
+ },
+ {
+  "key": "watcherguru",
+  "label": "WatcherGuru",
+  "domain": "watcher.guru",
+  "channel": "editorial",
+  "feeds": [
+   "https://watcher.guru/news/feed"
+  ],
+  "keywords": [
+   "bitcoin",
+   "ethereum",
+   "crypto",
+   "blockchain",
+   "stablecoin",
+   "exchange",
+   "binance",
+   "coinbase",
+   "sec",
+   "etf",
+   "fed",
+   "market"
+  ]
+ }
+]
