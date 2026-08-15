@@ -750,16 +750,6 @@
           c.moveTo(u.bbox.left, y);
           c.lineTo(u.bbox.left + u.bbox.width, y);
           c.stroke();
-          if (cfg.guideLabel) {
-            var dpr = root.devicePixelRatio || 1;
-            c.setLineDash([]);
-            c.font = (10 * dpr) + "px " + sans;
-            c.fillStyle = alphaColor(muted, 0.85);
-            c.textAlign = "left";
-            var ty = y - 5 * dpr;
-            if (ty - 10 * dpr < u.bbox.top) { ty = y + 13 * dpr; }
-            c.fillText(cfg.guideLabel, u.bbox.left + 6 * dpr, ty);
-          }
           c.restore();
         }],
         ready: [function (u) {
@@ -823,10 +813,9 @@
       setShow: function (idx, on) {
         plot.setSeries(idx + 1, { show: !!on });
       },
-      setGuide: function (v, label) {
+      setGuide: function (v) {
         /* applied on the next draw (setData always follows) */
         cfg.guide = v;
-        cfg.guideLabel = label;
       },
       setFocus: function (idx) {
         /* audit F: uPlot keys focus off the series INDEX whenever a

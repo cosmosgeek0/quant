@@ -1219,7 +1219,6 @@
     host.appendChild(statTile("Freshest sample", newestAge2));
     host.appendChild(statTile("State changes", String(netEvCount)));
     updateHero();
-    updateChipVals();
   }
 
   /* ---- Trading-path hero: SEE = feed truth, DECIDE = brain loops,
@@ -1321,17 +1320,6 @@
     }
   }
 
-  function updateChipVals() {
-    for (var i = 0; i < NET_METRICS.length; i += 1) {
-      var m = NET_METRICS[i];
-      if (m.unit !== "s") { continue; }
-      var el = document.querySelector(
-        "[data-chipval=\"" + m.key + "\"]");
-      if (!el) { continue; }
-      var v = currentVal(m.key);
-      el.textContent = v == null ? "" : ageText2(v);
-    }
-  }
 
   function renderTelemetry() {
     var d = netTelem.data;
@@ -1396,16 +1384,15 @@
           values: gridSeries(pm, pgrid)
         }];
         var pGuide = pm.unit === "s" ? cadenceEst(pm.field) : null;
-        var pGuideLbl = pGuide ? "rhythm " + ageText2(pGuide) : null;
         if (pgrid.times.length >= 2) {
           if (panelCharts[pm.key]) {
-            panelCharts[pm.key].setGuide(pGuide, pGuideLbl);
+            panelCharts[pm.key].setGuide(pGuide);
             panelCharts[pm.key].setData(pgrid.times, pdef);
           } else {
             pHost.textContent = "";
             panelCharts[pm.key] = QNet.chart.mountMulti(pHost, {
               times: pgrid.times, series: pdef, height: 150,
-              compact: true, guide: pGuide, guideLabel: pGuideLbl
+              compact: true, guide: pGuide
             });
           }
         }
@@ -1556,9 +1543,6 @@
         key.style.background = "var(--st-s" + (idx + 1) + ")";
         chip.appendChild(key);
         chip.appendChild(stEl("span", "st-chip-lbl", m.label));
-        var chipVal = stEl("span", "st-chip-val", "");
-        chipVal.setAttribute("data-chipval", m.key);
-        chip.appendChild(chipVal);
         chip.addEventListener("click", function () {
           /* owner order: click a name = SEE that loop alone; click
              it again = everything back */

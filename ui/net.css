@@ -317,15 +317,6 @@ html[data-theme="dark"] {
   margin-left: 2px;
 }
 
-.st-chip-val {
-  color: var(--st-mid);
-  font-family: var(--mono, "JBMono", monospace);
-  font-variant-numeric: tabular-nums;
-  font-size: 11.5px;
-  margin-left: 5px;
-}
-.st-chip.off .st-chip-val { opacity: 0.4; }
-
 .st-chips {
   display: flex; flex-wrap: wrap; gap: 4px 4px;
   padding: 0 0 2px;
