@@ -618,9 +618,19 @@
         newsData = d;
         if (newsHost && (force || !prev || !d || prev !== d.as_of)) {
           renderNews();
-        } else if (newsHost) {
-          var upd = newsHost.querySelector(".news-upd");
-          if (upd && d) { upd.textContent = newsAgeText(d.as_of); }
+        } else if (newsHost && d && d.as_of) {
+          var lbl = newsHost.querySelector(".livelabel");
+          var dot = newsHost.querySelector(".livedot");
+          if (lbl && dot) {
+            var a2 = (Date.now() - Date.parse(d.as_of)) / 1000;
+            if (a2 < 300) {
+              dot.className = "livedot";
+              lbl.textContent = "Live";
+            } else {
+              dot.className = "livedot stale";
+              lbl.textContent = Math.round(a2 / 60) + "m";
+            }
+          }
         }
         if (btn) { btn.classList.remove("busy"); }
       })
@@ -1004,6 +1014,32 @@
     head.appendChild(title);
     var right = document.createElement("div");
     right.className = "news-right";
+    var refresh = document.createElement("button");
+    refresh.className = "refresh-btn";
+    refresh.setAttribute("aria-label", "Refresh");
+    refresh.setAttribute("data-tip", "Refresh");
+    var rsvg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    rsvg.appendChild(svgEl("path", {
+      d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
+    rsvg.appendChild(svgEl("path", { d: "M3 3v5h5" }));
+    refresh.appendChild(rsvg);
+    refresh.addEventListener("click", function () {
+      refresh.classList.add("kick");
+      setTimeout(function () { refresh.classList.remove("kick"); }, 650);
+      fetchNews(true);
+    });
+    var livewrap = document.createElement("span");
+    livewrap.className = "livewrap";
+    var livedot = document.createElement("span");
+    livedot.className = "livedot";
+    var livelabel = document.createElement("span");
+    livelabel.className = "livelabel";
+    livewrap.appendChild(livedot);
+    livewrap.appendChild(livelabel);
+    right.appendChild(refresh);
+    right.appendChild(livewrap);
     var masterWrap = document.createElement("span");
     masterWrap.className = "master-wrap";
     var mlabel = document.createElement("span");
@@ -1024,7 +1060,25 @@
     head.appendChild(right);
     newsHost.appendChild(head);
 
+    if (newsData && newsData.as_of) {
+      var liveAge = (Date.now() - Date.parse(newsData.as_of)) / 1000;
+      if (!isFinite(liveAge)) {
+        livedot.className = "livedot dead";
+        livelabel.textContent = "offline";
+      } else if (liveAge < 300) {
+        livedot.className = "livedot";
+        livelabel.textContent = "Live";
+      } else {
+        livedot.className = "livedot stale";
+        livelabel.textContent = Math.round(liveAge / 60) + "m";
+      }
+    } else {
+      livedot.className = "livedot dead";
+      livelabel.textContent = newsData ? "no data" : "offline";
+    }
     if (!newsMaster) {
+      livedot.className = "livedot dead";
+      livelabel.textContent = "off";
       var offnote = document.createElement("div");
       offnote.className = "news-offnote";
       offnote.textContent = "News is turned off — display and polling " +
@@ -1170,19 +1224,40 @@
     nsearch.appendChild(nsIcon);
     var nsInput = document.createElement("input");
     nsInput.type = "text";
-    nsInput.placeholder = "Search news";
+    nsInput.placeholder = "Search news…";
     nsInput.value = newsQuery;
-    nsInput.addEventListener("input", function () {
-      newsQuery = nsInput.value;
+    if (newsQuery) { nsearch.classList.add("hasq"); }
+    function commitQuery(value) {
+      newsQuery = value;
       newsPage = 1;
       renderNews();
       var again = newsHost.querySelector(".newsearch input");
-      if (again) {
+      if (again && value) {
         again.focus();
         again.setSelectionRange(again.value.length, again.value.length);
       }
+    }
+    nsInput.addEventListener("input", function () {
+      commitQuery(nsInput.value);
+    });
+    nsInput.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && nsInput.value) {
+        ev.stopPropagation();
+        commitQuery("");
+      }
     });
     nsearch.appendChild(nsInput);
+    var nclear = document.createElement("button");
+    nclear.className = "nclear";
+    nclear.setAttribute("aria-label", "Clear search");
+    var xs = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    xs.appendChild(svgEl("path", { d: "M18 6 6 18" }));
+    xs.appendChild(svgEl("path", { d: "m6 6 12 12" }));
+    nclear.appendChild(xs);
+    nclear.addEventListener("click", function () { commitQuery(""); });
+    nsearch.appendChild(nclear);
     searchWrap.appendChild(nsearch);
     catbar.appendChild(searchWrap);
     newsHost.appendChild(catbar);
@@ -1230,33 +1305,6 @@
     iSvg.appendChild(svgEl("path", { d: "M12 8h.01" }));
     infoTip.appendChild(iSvg);
     impbar.appendChild(infoTip);
-    var barRight = document.createElement("span");
-    barRight.className = "bar-right";
-    var refresh = document.createElement("button");
-    refresh.className = "refresh-btn";
-    refresh.setAttribute("aria-label", "Refresh");
-    refresh.setAttribute("data-tip", "Refresh");
-    var rsvg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
-      stroke: "currentColor", "stroke-linecap": "round",
-      "stroke-linejoin": "round" });
-    rsvg.appendChild(svgEl("path", {
-      d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
-    rsvg.appendChild(svgEl("path", { d: "M3 3v5h5" }));
-    refresh.appendChild(rsvg);
-    refresh.addEventListener("click", function () { fetchNews(true); });
-    var upd = document.createElement("span");
-    upd.className = "news-upd";
-    upd.title = "Age of the last mirror write";
-    barRight.appendChild(refresh);
-    barRight.appendChild(upd);
-    if (newsData) {
-      upd.textContent = newsAgeText(newsData.as_of);
-      var ageSec2 = (Date.now() - Date.parse(newsData.as_of)) / 1000;
-      upd.classList.toggle("stale", isFinite(ageSec2) && ageSec2 > 400);
-    } else {
-      upd.textContent = "—";
-    }
-    impbar.appendChild(barRight);
     newsHost.appendChild(impbar);
 
     /* two columns */
