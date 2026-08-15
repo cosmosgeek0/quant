@@ -944,6 +944,18 @@
   var netChart = null;
   var netOverview = null;
   var chipOn = {};
+  var netScaleMode = "expand";
+  var netSmooth = "soft";
+
+  function remountCharts() {
+    if (netOverview) { netOverview.destroy(); netOverview = null; }
+    var keys = Object.keys(panelCharts);
+    for (var ki = 0; ki < keys.length; ki += 1) {
+      panelCharts[keys[ki]].destroy();
+    }
+    panelCharts = {};
+    renderTelemetry();
+  }
 
   function syncOverviewShow() {
     if (!netOverview) { return; }
@@ -1057,6 +1069,9 @@
       var raw = telNum(pts[i][m.field]);
       if (raw != null) { samples.push([Math.round(t / 1000), raw]); }
     }
+    if (netSmooth === "raw") {
+      /* fall through: no averaging at all in raw mode */
+    }
     if (samples.length >= 3) {
       /* eras sampled slower than today's setting must not tear into
          holes: learn the metric's median spacing and widen tolerance
@@ -1089,12 +1104,14 @@
     /* soften each loop against its OWN rhythm (~0.7 of a tooth):
        fast loops keep fine detail, slow loops roll like the owner's
        reference — waves, never razors, never flat lines */
+    if (netSmooth === "raw") { return out; }
     var cad = cadenceEst(m.field);
     var w = 3;
     if (cad) {
-      w = Math.round((cad * 0.7) / grid.span);
+      var factor = netSmooth === "silk" ? 1.8 : 0.7;
+      w = Math.round((cad * factor) / grid.span);
       if (w % 2 === 0) { w += 1; }
-      w = Math.max(3, Math.min(31, w));
+      w = Math.max(3, Math.min(61, w));
     }
     return movAvg(out, w);
   }
@@ -1275,7 +1292,8 @@
           if (!netOverview) {
             host.textContent = "";
             netOverview = QNet.chart.mountMulti(host,
-              { times: times, series: defs, height: 400 });
+              { times: times, series: defs, height: 400,
+                linearScale: netScaleMode === "linear" });
           } else {
             netOverview.setData(times, defs);
           }
@@ -1326,7 +1344,8 @@
           } else {
             pHost.textContent = "";
             panelCharts[pm.key] = QNet.chart.mountMulti(pHost, {
-              times: pgrid.times, series: pdef, height: 150, compact: true
+              times: pgrid.times, series: pdef, height: 150,
+              compact: true, linearScale: netScaleMode === "linear"
             });
           }
         }
@@ -1415,6 +1434,31 @@
       })(rdefs[si]);
     }
     gHead.appendChild(seg);
+    function miniSeg(defs2, current, onPick) {
+      var wrap = stEl("div", "st-seg");
+      for (var di2 = 0; di2 < defs2.length; di2 += 1) {
+        (function (d2) {
+          var b2 = stEl("button", current === d2[0] ? "on" : "",
+            d2[1]);
+          b2.setAttribute("type", "button");
+          b2.addEventListener("click", function () {
+            var bs2 = wrap.querySelectorAll("button");
+            for (var q2 = 0; q2 < bs2.length; q2 += 1) {
+              bs2[q2].classList.toggle("on", bs2[q2] === b2);
+            }
+            onPick(d2[0]);
+          });
+          wrap.appendChild(b2);
+        })(defs2[di2]);
+      }
+      return wrap;
+    }
+    gHead.appendChild(miniSeg(
+      [["expand", "Expand"], ["linear", "Linear"]], netScaleMode,
+      function (v) { netScaleMode = v; remountCharts(); }));
+    gHead.appendChild(miniSeg(
+      [["raw", "Raw"], ["soft", "Soft"], ["silk", "Silk"]], netSmooth,
+      function (v) { netSmooth = v; remountCharts(); }));
     graphCard.appendChild(gHead);
     var chips = stEl("div", "st-chips");
     for (var ci2 = 0; ci2 < NET_METRICS.length; ci2 += 1) {
@@ -1511,17 +1555,21 @@
     secHead.appendChild(dfl);
     page.appendChild(secHead);
 
-    /* 4 panels left, 4 panels right — each with its own graph,
-       its own real poll rate, its own switch */
+    /* panels 2-wide on the left; the network log rides the right
+       column so no wall of white space survives */
+    var cols = stEl("div", "st-cols");
+    var colL = stEl("div", "");
+    var colR = stEl("div", "st-logcol");
+    cols.appendChild(colL);
+    cols.appendChild(colR);
     var grid = stEl("div", "st-grid");
     for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
       if (CONNECTIONS[ri].group === "boundary") { continue; }
       grid.appendChild(buildPanel(CONNECTIONS[ri], ri));
     }
-    page.appendChild(grid);
+    colL.appendChild(grid);
 
-    /* bottom: honest history + the owner-gated boundaries */
-    var bottom = stEl("div", "st-bottom");
+    var bottom = colR;
     var evCard = stEl("div", "st-card");
     evCard.id = "net-evcard";
     var evHead = stEl("div", "st-card-head");
@@ -1559,7 +1607,7 @@
       "loops run on the host.");
     bCard.appendChild(bFoot);
     bottom.appendChild(bCard);
-    page.appendChild(bottom);
+    page.appendChild(cols);
 
     container.appendChild(page);
     fetchPollConfig(function () {

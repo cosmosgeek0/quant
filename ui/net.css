@@ -62,12 +62,9 @@ html[data-theme="dark"] {
 }
 .st-cols {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 400px;
+  grid-template-columns: minmax(0, 1fr) 360px;
   gap: 0 16px;
   align-items: start;
-}
-@media (max-width: 1040px) {
-  .st-cols { grid-template-columns: minmax(0, 1fr); }
 }
 .st-page * { letter-spacing: normal; }
 
@@ -255,13 +252,10 @@ html[data-theme="dark"] {
 }
 .st-panel-foot .st-spacer { flex: 1; }
 .st-panel-foot .st-t-meta { white-space: nowrap; }
-.st-bottom {
-  display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-  gap: 0 16px;
-}
-@media (max-width: 1000px) {
-  .st-bottom { grid-template-columns: minmax(0, 1fr); }
+.st-logcol { position: sticky; top: 72px; }
+@media (max-width: 1200px) {
+  .st-cols { grid-template-columns: minmax(0, 1fr); }
+  .st-logcol { position: static; }
 }
 
 /* ---- overview graph: chips legend + granular overlay + readout ---- */

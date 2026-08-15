@@ -554,11 +554,14 @@
         fill: shadeFill(defs[d].color, defs.length === 1),
         width: defs.length === 1 ? 1.8 : 1.4,
         scale: defs[d].unit === "ms" ? "ms" : "s",
-        spanGaps: false,
+        /* bridge sampling holes so the ribbon reads continuous —
+           outages still show in the bars, the banner and the log */
+        spanGaps: true,
         points: { show: false }
       });
     }
 
+    var pinned = false;
     var tooltip = document.createElement("div");
     tooltip.className = "st-graph-tip";
     tooltip.style.display = "none";
@@ -573,6 +576,7 @@
     }
 
     function renderTip(u) {
+      if (pinned) { return; }
       var idx = u.cursor.idx;
       if (idx == null || idx < 0 || idx >= data[0].length) {
         tooltip.style.display = "none";
@@ -658,9 +662,12 @@
         size: 52,
         space: cfg.compact ? 34 : 40,
         values: function (u, splits) {
+          /* asinh scales pad the splits list with nulls for minor
+             divisions — those render as blanks, never "null" */
           var out = [];
           for (var j = 0; j < splits.length; j += 1) {
-            out.push(splits[j] + unitText);
+            out.push(splits[j] == null ? ""
+              : numberLabel(splits[j]) + unitText);
           }
           return out;
         },
@@ -703,8 +710,15 @@
       },
       scales: {
         x: { time: true },
-        s: { range: rangeUp },
-        ms: { range: rangeUp }
+        /* expand mode (default): asinh distribution — the band where
+           lines live gets the room, a runaway spike compresses
+           instead of crushing everything (uPlot distr 4) */
+        s: cfg.linearScale
+          ? { range: rangeUp }
+          : { distr: 4, asinh: 60, range: rangeUp },
+        ms: cfg.linearScale
+          ? { range: rangeUp }
+          : { distr: 4, asinh: 8, range: rangeUp }
       },
       axes: axes,
       series: series,
@@ -713,7 +727,13 @@
           u.over.parentNode.appendChild(tooltip);
           u.over.addEventListener("dblclick", resetXRange);
           u.over.addEventListener("mouseleave", function () {
-            tooltip.style.display = "none";
+            if (!pinned) { tooltip.style.display = "none"; }
+          });
+          u.over.addEventListener("click", function () {
+            /* a plain click pins the readout; drag-zoom is a drag,
+               not a click, so both coexist */
+            pinned = !pinned;
+            if (!pinned) { tooltip.style.display = "none"; }
           });
         }],
         setCursor: [renderTip]
