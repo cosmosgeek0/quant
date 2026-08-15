@@ -662,10 +662,10 @@
     var panel = stEl("div", "st-card st-panel");
     panel.id = "strow-" + def.id;
     var head = stEl("div", "st-panel-head");
+    head.appendChild(stEl("span", "st-t-name", def.name));
     var icon = stEl("span", "st-check");
     icon.appendChild(stIcon(0));
     head.appendChild(icon);
-    head.appendChild(stEl("span", "st-t-name", def.name));
     head.appendChild(stEl("span", "st-spacer"));
     var cur = stEl("span", "st-t-datum st-val", "\u2014");
     cur.setAttribute("data-current", def.id);
@@ -1450,10 +1450,8 @@
     graphCard.appendChild(gHost);
 
 
-    /* section line: one common Defaults that resets everything */
-    var secHead = stEl("div", "st-sec-head");
-    secHead.appendChild(stEl("div", "st-t-h", "System status"));
-    secHead.appendChild(stEl("span", "st-spacer"));
+    /* one common Defaults that resets everything (rides the
+       Latency row — the System status word is retired) */
     var dfl = stEl("button", "st-ctl-btn", "Defaults");
     dfl.setAttribute("type", "button");
     dfl.addEventListener("click", function () {
@@ -1481,12 +1479,11 @@
         }
       });
     });
-    secHead.appendChild(dfl);
+    gHead.appendChild(dfl);
 
     page.appendChild(graphCard);
 
     /* panels: full width, 4 by 2, under the graph row */
-    page.appendChild(secHead);
     var grid = stEl("div", "st-grid st-grid-wide");
     for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
       if (CONNECTIONS[ri].group === "boundary") { continue; }

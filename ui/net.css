@@ -89,8 +89,8 @@ html[data-theme="dark"] {
   letter-spacing: -0.39px; line-height: 39px; color: var(--st-ink); }
 .st-t-h { font-size: 16px; font-weight: 500; letter-spacing: -0.2px;
   line-height: 24px; color: var(--st-ink); }
-.st-t-name { font-size: 15px; font-weight: 600; letter-spacing: -0.1px;
-  line-height: 21px; color: var(--st-ink); }
+.st-t-name { font-size: 13.5px; font-weight: 550;
+  letter-spacing: -0.05px; line-height: 19px; color: var(--st-ink); }
 .st-t-body { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
   line-height: 20px; color: var(--st-ink); }
 .st-t-mid { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
@@ -108,7 +108,7 @@ html[data-theme="dark"] {
 .st-head {
   display: flex; align-items: baseline; gap: 12px;
   /* flush with the News page: one left line for everything */
-  padding: 0 0 12px;
+  padding: 0 0 4px;
 }
 .st-head .st-spacer { flex: 1; }
 .st-authority { font-size: 12px; font-weight: 400; line-height: 16px;
@@ -128,7 +128,7 @@ html[data-theme="dark"] {
 }
 .st-card-head {
   display: flex; align-items: center; gap: 14px;
-  padding: 10px 0 12px 0;
+  padding: 4px 0 10px 0;
 }
 .st-card-head .st-spacer { flex: 1; }
 
@@ -226,10 +226,9 @@ html[data-theme="dark"] {
   display: flex; align-items: center; gap: 10px;
   padding: 24px 0 2px 0;
 }
-.st-sec-head .st-t-h,
 .st-card-head .st-t-h {
-  font-size: 16px; font-weight: 650; letter-spacing: -0.2px;
-  line-height: 22px;
+  font-size: 18px; font-weight: 650; letter-spacing: -0.25px;
+  line-height: 24px;
 }
 .st-sec-head .st-spacer { flex: 1; }
 .st-grid {

@@ -527,6 +527,36 @@
     var data = [cfg.times || []];
     for (var i = 0; i < defs.length; i += 1) { data.push(defs[i].values); }
 
+    var bandMins = [];
+    function computeBandMins() {
+      bandMins = [];
+      var globalMax = 0;
+      var di2;
+      var v2;
+      for (di2 = 1; di2 < data.length; di2 += 1) {
+        for (var p2 = 0; p2 < data[di2].length; p2 += 1) {
+          v2 = data[di2][p2];
+          if (v2 != null && v2 > globalMax) { globalMax = v2; }
+        }
+      }
+      var pad = globalMax * 0.05;
+      for (di2 = 0; di2 < defs.length; di2 += 1) {
+        var mn = null;
+        for (var p3 = 0; p3 < data[di2 + 1].length; p3 += 1) {
+          v2 = data[di2 + 1][p3];
+          if (v2 != null && (mn == null || v2 < mn)) { mn = v2; }
+        }
+        bandMins.push(mn == null ? 0 : Math.max(0, mn - pad));
+      }
+    }
+    computeBandMins();
+
+    function bandFloor(seriesIdx) {
+      return function () {
+        return bandMins[seriesIdx] || 0;
+      };
+    }
+
     function rangeUp(u, dataMin, dataMax) {
       var hi = (typeof dataMax === "number" && isFinite(dataMax) &&
         dataMax > 0) ? dataMax * 1.12 : 1;
@@ -551,12 +581,14 @@
       series.push({
         label: defs[d].label,
         stroke: defs[d].color,
-        /* many translucent fills all painting down to zero stack
-           into grey mud — the multi chart draws crisp colored LINES
-           (the LayerZero grammar); single-series panels keep the
-           rich gradient (the owner's reference graph) */
+        /* colour without mud: single-series panels shade to zero
+           (the reference-graph look); the multi chart shades a
+           SHALLOW band hugging each line via fillTo, so shades stay
+           in their own colour instead of stacking into grey */
         fill: defs.length === 1
-          ? shadeFill(defs[d].color, true) : null,
+          ? shadeFill(defs[d].color, true)
+          : alphaColor(defs[d].color, 0.14),
+        fillTo: defs.length === 1 ? undefined : bandFloor(d),
         width: defs.length === 1 ? 1.8 : 1.6,
         scale: defs[d].unit === "ms" ? "ms" : "s",
         /* bridge sampling holes so the ribbon reads continuous —
@@ -772,6 +804,7 @@
         for (var q = 0; q < defsNext.length; q += 1) {
           data.push(defsNext[q].values);
         }
+        computeBandMins();
         /* audit F: a pinned readout must never describe replaced
            data — refresh releases the pin */
         pinned = false;
