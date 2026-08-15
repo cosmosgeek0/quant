@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+RESEARCH VERDICT 2026-08-15 | bench day complete, zero live spend | full rows in evidence/research-verdict-2026-08-15.txt
+surge | best possible cell measured: 1h + ladder + maker fees = net -0.029% (3bps under) | tail toxic (24h med -1.07%) — dumps confirmed | fee levers remain: BNB float (owner word) + spot/maker rung (built, audit-ready)
+absorption | tool live, honest refusal on short tape — needs its 21-day baseline | 30-day x 300 tape pulling overnight (klines + aggTrades)
+recorder | basis_history.jsonl live: 524 symbols/pass, every 3 min, under seals — irreplaceable funding/gap/OI history accumulating from today
+standing | sealed + flat + advisory tuner | re-arm only on a fee-clearing replay config, smallest cap same hour
+
 FILTER v1 SCORED 2026-08-15 | bench, zero live impact | kept 84/day of 413, 5m med +0.02% win 51.8% — right direction, still under fees
 built+verified | adaptive per-token baselines (tape regimes) + noise filter v1 (serial-igniter, one-print, baseline-relative features) + spot-venue entry rung OFFLINE (every gate identical, deploys only after audit) | 948/948 Lead-run; both workers died pre-report, disk-verified
 mandate | v2 features per the vision: sustained-tape confirmation, entry-ladder timing, funding/spread context | iteration stays replay-scored on the bench until kept-trades clear fees

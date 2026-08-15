@@ -1,0 +1,20 @@
+RESEARCH VERDICT — end of day 2026-08-15 (all bench, zero live spend)
+SURGE PATH (fully measured, 3-day 100-token tape):
+  raw: 413 ign/day, coin flip, dead under fees at every bar
+  filter v1 kept 84/day: 5m med +0.02% win 51.8% — direction right, under fees
+  horizon grid (kept cohort): BEST CELL = 1h + exit ladder + maker fees:
+    med +0.066% | win 55.7% | net -0.029% — three basis points under water
+  tail is TOXIC, measured: 6h simple med -0.14%, 24h simple med -1.07% —
+  surge tokens dump; the edge does NOT live in the tail; the ladder is what
+  rescues the 1h cell. "Buys the top, eats the dump" confirmed by data.
+FEE LEVERS (the 3bps gap):
+  maker exits: modeled in-grid (0.3% -> 0.2%) — already counted in the best cell
+  BNB fee discount: NOT modeled live; needs owner word (buying BNB = live act)
+  spot venue rung: built offline, audit-ready; spot economics pair with maker exits
+ABSORPTION (the vision's pre-ignition thesis): tool built + tested; refused to
+  score on 3 days of tape — demands the 21-day multi-week-lows baseline it is
+  designed around. 30-day x 300-token pull (klines + aggTrades) running overnight.
+BASIS RECORDER: live on host since 05:5xZ, 524 symbols/pass, funding+gap+OI history
+  accumulating every 3 minutes under seals — the dataset the basis scanner learns from.
+POSTURE: machine sealed, flat, receipt banked; tuner advisory; re-arm criterion
+  standing: a config must clear fees+slippage on replay with margin, then smallest cap.
