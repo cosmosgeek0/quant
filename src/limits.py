@@ -30,10 +30,13 @@ def _positive_int_env(name, default):
     return value
 
 
-MOMENTUM_IGNITION_SURGE_RATIO = _positive_decimal_env(
-    "QUANT_IGNITION_SURGE", "3"
+# Env knobs clamp to sane ceilings: a host env typo must never lift the
+# budgets by orders of magnitude (auditor hardening, 2026-08-15).
+MOMENTUM_IGNITION_SURGE_RATIO = min(
+    max(_positive_decimal_env("QUANT_IGNITION_SURGE", "3"), Decimal("1")),
+    Decimal("100"),
 )
-MAX_ENTRIES_PER_UTC_DAY = _positive_int_env("QUANT_MAX_ENTRIES_DAY", "10")
-DAILY_LOSS_PLUS_FEES_USDT = _positive_decimal_env(
-    "QUANT_DAILY_LOSS_CAP", "2.00"
+MAX_ENTRIES_PER_UTC_DAY = min(_positive_int_env("QUANT_MAX_ENTRIES_DAY", "10"), 24)
+DAILY_LOSS_PLUS_FEES_USDT = min(
+    _positive_decimal_env("QUANT_DAILY_LOSS_CAP", "2.00"), Decimal("10.00")
 )

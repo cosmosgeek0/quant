@@ -1,0 +1,17 @@
+RAW HOST TRANSCRIPT — release d962ac3 deploy evidence (auditor record condition)
+== d962ac3 DEPLOY EVIDENCE 2026-08-15T04:48:48Z ==
+RELEASE: d962ac336a58c0cc5bddb285f779352986f02d3b
+sha256 first16, host (== local at d962ac3, gate-verified at each transfer):
+  090c9af79bb5f38a src/momentum_live.py
+  de8b9cbb82d1b3d9 src/momentum_lifecycle.py
+  4e85287c631aac80 src/limits.py
+  2b559a27042c77b9 src/account_governor.py
+CLEAN-PASSES: 0 0 0 0   (four consecutive momentum passes, exit codes)
+watchdog-cron rows: 1 (aliveness.sh */2)
+aliveness-last: {"stage":"aliveness","ok":true,"decisions_age_s":108,"feed_age_s":111,"utc":"2026-08-15T04:48:01Z"}
+label correction (auditor finding 1): the phrase "terminal-aware recovery" in an earlier
+rail claim and commit message names no code mechanism; the delivered property is
+exactly-once replay + newest-wins redecision + the unchanged claim-once wall.
+sequence note (auditor coherence line): the owner's standing hunt word ordered deploy
+before the delta re-audit; the audit followed and returned READY. The record sequence
+bent to the owner's word, as designed.

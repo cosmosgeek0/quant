@@ -130,3 +130,23 @@ class LimitsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KnobCeilingTests(unittest.TestCase):
+    def test_env_knobs_clamp_to_ceilings(self):
+        import json, os, subprocess, sys
+        env = dict(os.environ, QUANT_IGNITION_SURGE="5000",
+                   QUANT_MAX_ENTRIES_DAY="500", QUANT_DAILY_LOSS_CAP="9999")
+        src = os.path.join(os.path.dirname(__file__), os.pardir, "src")
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import limits, json; print(json.dumps(["
+             "str(limits.MOMENTUM_IGNITION_SURGE_RATIO),"
+             "limits.MAX_ENTRIES_PER_UTC_DAY,"
+             "str(limits.DAILY_LOSS_PLUS_FEES_USDT)]))"],
+            cwd=src, env=env, capture_output=True, text=True, check=True,
+        )
+        surge, entries, loss = json.loads(out.stdout)
+        self.assertEqual(surge, "100")
+        self.assertEqual(entries, 24)
+        self.assertEqual(loss, "10.00")
