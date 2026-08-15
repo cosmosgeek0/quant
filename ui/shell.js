@@ -117,7 +117,8 @@
     momentum: ["Momentum", "Not built yet — it arrives when you order it."],
     machine: ["Machine", "Not built yet — it arrives when you order it."],
     journal: ["Journal", "Not built yet — it arrives when you order it."],
-    settings: ["Settings", "Not built yet — it arrives when you order it."]
+    settings: ["Settings", "Not built yet — it arrives when you order it."],
+    signal: ["Signal", ""]
   };
 
   function route() {
@@ -129,11 +130,30 @@
       if (on) { rows[i].setAttribute("aria-current", "page"); }
       else { rows[i].removeAttribute("aria-current"); }
     }
+    pageEl.textContent = "";
     var b = document.createElement("b");
     b.textContent = PAGES[h][0] + ".";
-    pageEl.textContent = "";
     pageEl.appendChild(b);
-    pageEl.appendChild(document.createTextNode(" " + PAGES[h][1]));
+    if (h === "signal") {
+      var holder = document.createElement("div");
+      holder.style.maxWidth = "520px";
+      holder.style.marginTop = "14px";
+      pageEl.appendChild(document.createTextNode(
+        " Live readings from the machine's mirror."));
+      pageEl.appendChild(holder);
+      sigPage = holder;
+      if (typeof buildSigRows === "function" && lastStrip !== undefined) {
+        buildSigRows(holder);
+      }
+      var note = document.createElement("div");
+      note.style.marginTop = "14px";
+      note.textContent =
+        "Full watchdog detail lands under Settings when you order it.";
+      pageEl.appendChild(note);
+    } else {
+      sigPage = null;
+      pageEl.appendChild(document.createTextNode(" " + PAGES[h][1]));
+    }
     closePop();
   }
 
@@ -205,25 +225,30 @@
     if (cls) { sigBtn.classList.add(cls); }
   }
 
+  var lastRtt = null;
+
   function pollStrip() {
+    var t0 = performance.now();
     fetch("/api/strip", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
+        lastRtt = Math.round(performance.now() - t0);
         lastStrip = d;
         setOnline(!!d);
-        if (!d) { sigClass("sig-bad"); renderSignal(); return; }
+        if (!d) { sigClass("sig-bad"); renderSigAll(); return; }
         var age = d.pull && d.pull.age_seconds;
         if (age == null || !isFinite(age)) { sigClass("sig-bad"); }
         else if (age > 120) { sigClass("sig-bad"); }
         else if (age > 45) { sigClass("sig-stale"); }
         else { sigClass("sig-ok"); }
-        renderSignal();
+        renderSigAll();
       })
       .catch(function () {
+        lastRtt = null;
         lastStrip = null;
         setOnline(false);
         sigClass("sig-bad");
-        renderSignal();
+        renderSigAll();
       });
   }
   pollStrip();
@@ -245,6 +270,10 @@
     calendar: ["Calendar",
       "No source wired yet — arrives with a data contract."]
   };
+
+  var sigPop = document.getElementById("sigpop");
+  var sigRowsEl = document.getElementById("sigpop-rows");
+  var sigAsOf = document.getElementById("sig-asof");
 
   function ageText2(sec) {
     if (sec == null || !isFinite(sec)) { return "—"; }
@@ -271,32 +300,50 @@
     return row;
   }
 
-  function renderSignal() {
-    if (rOpen !== "signal") { return; }
-    rbody.textContent = "";
+  function buildSigRows(target) {
+    target.textContent = "";
     if (!lastStrip) {
-      rbody.appendChild(sigRow("Server", "unreachable", "v bad"));
+      target.appendChild(sigRow("Server", "unreachable", "v bad"));
+      target.appendChild(sigRow("Round trip", "—", "v bad"));
       return;
     }
     var d = lastStrip;
-    rbody.appendChild(sigRow("Server", "answering", "v ok"));
+    target.appendChild(sigRow("Server", "answering", "v ok"));
+    target.appendChild(sigRow("Round trip",
+      lastRtt == null ? "—" : lastRtt + " ms",
+      lastRtt != null && lastRtt < 100 ? "v ok" : "v warn"));
     var pl = d.pull || {};
-    rbody.appendChild(sigRow("Mirror age",
+    target.appendChild(sigRow("Mirror age",
       ageText2(pl.age_seconds), ageCls(pl.age_seconds, 45, 120)));
     var mp = d.market_pass || {};
-    rbody.appendChild(sigRow("Market pass",
+    target.appendChild(sigRow("Market pass",
       ageText2(mp.age_seconds), ageCls(mp.age_seconds, 45, 120)));
     var sv = d.supervisor || {};
-    rbody.appendChild(sigRow("Supervisor",
+    target.appendChild(sigRow("Supervisor",
       ageText2(sv.age_seconds), ageCls(sv.age_seconds, 240, 600)));
+    target.appendChild(sigRow("Machine status",
+      sv.reported_status || "—",
+      sv.reported_status ? "v" : "v bad"));
+    var gv = d.governor || {};
+    target.appendChild(sigRow("Entries today",
+      (gv.entries_used == null ? "—" : gv.entries_used) + " / " +
+      (gv.entries_cap == null ? "—" : gv.entries_cap),
+      "v"));
+    target.appendChild(sigRow("Loss budget left",
+      gv.loss_fees_remaining_usdt == null
+        ? "—" : gv.loss_fees_remaining_usdt + " USDT",
+      "v"));
+    if (sigAsOf) { sigAsOf.textContent = d.as_of || "—"; }
+  }
+
+  function renderSigAll() {
+    if (!sigPop.hidden) { buildSigRows(sigRowsEl); }
+    if ((location.hash || "").slice(1) === "signal" && sigPage) {
+      buildSigRows(sigPage);
+    }
   }
 
   function renderPanel(key) {
-    if (key === "signal") {
-      rtitle.textContent = "Signal";
-      renderSignal();
-      return;
-    }
     var def = RPANELS[key];
     rtitle.textContent = def[0];
     rbody.textContent = "";
@@ -332,10 +379,55 @@
 
   var rSaved = null;
   try { rSaved = localStorage.getItem(RKEY); } catch (e) { rSaved = null; }
-  if (rSaved && (rSaved === "signal" ||
-      Object.prototype.hasOwnProperty.call(RPANELS, rSaved))) {
+  if (rSaved && Object.prototype.hasOwnProperty.call(RPANELS, rSaved)) {
     setRPanel(rSaved);
   }
+
+  /* ---- signal popup (hover) + dedicated page (click) ---- */
+  var sigPage = null;
+  var sigTimer = null;
+
+  function openSigPop() {
+    if (sigTimer) { clearTimeout(sigTimer); sigTimer = null; }
+    if (!sigPop.hidden) { return; }
+    sigPop.hidden = false;
+    buildSigRows(sigRowsEl);
+    var r = sigBtn.getBoundingClientRect();
+    var w = sigPop.offsetWidth;
+    var h = sigPop.offsetHeight;
+    var left = Math.max(8, Math.round(r.left - w - 10));
+    var top = Math.min(
+      Math.max(8, Math.round(r.top + r.height / 2 - h / 2)),
+      window.innerHeight - h - 8);
+    sigPop.style.left = left + "px";
+    sigPop.style.top = top + "px";
+    sigBtn.setAttribute("aria-expanded", "true");
+    requestAnimationFrame(function () { sigPop.classList.add("on"); });
+  }
+
+  function closeSigPop() {
+    if (sigTimer) { clearTimeout(sigTimer); sigTimer = null; }
+    if (sigPop.hidden) { return; }
+    sigPop.classList.remove("on");
+    sigBtn.setAttribute("aria-expanded", "false");
+    sigPop.hidden = true;
+  }
+
+  function scheduleSigClose() {
+    if (sigTimer) { clearTimeout(sigTimer); }
+    sigTimer = setTimeout(closeSigPop, 250);
+  }
+
+  sigBtn.addEventListener("mouseenter", openSigPop);
+  sigBtn.addEventListener("mouseleave", scheduleSigClose);
+  sigPop.addEventListener("mouseenter", function () {
+    if (sigTimer) { clearTimeout(sigTimer); sigTimer = null; }
+  });
+  sigPop.addEventListener("mouseleave", scheduleSigClose);
+  sigBtn.addEventListener("click", function () {
+    closeSigPop();
+    location.hash = "#signal";
+  });
 
   /* log out: real endpoint on the hosted site only.
      OWNER NOTE 2026-08-15 (verify at next deploy): on
