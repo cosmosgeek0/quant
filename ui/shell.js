@@ -455,9 +455,9 @@
       return { cls: hcls, val: ageText2(hage) + hstatus };
     }
     if (id === "newsloop") {
-      if (newsData && newsData.as_of) {
-        var na = (Date.now() - Date.parse(newsData.as_of)) / 1000;
-        return { cls: na < 300 ? "ok" : "warn", val: ageText2(na) };
+      var nAge = currentVal("newsloop");
+      if (nAge != null) {
+        return { cls: thrCls("newsloop", nAge), val: ageText2(nAge) };
       }
       return { cls: "", val: "no mirror read yet" };
     }
@@ -638,8 +638,7 @@
       (sv0.reported_status || "—"),
       thrCls("supervisor", telNum(sv0.age_seconds)),
       "heartbeat " + ageText2(sv0.age_seconds) + " ago"));
-    var newsAgeTile = (newsData && newsData.as_of)
-      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
+    var newsAgeTile = currentVal("newsloop");
     tiles.appendChild(tile("News loop",
       newsAgeTile == null ? "no read yet" : ageText2(newsAgeTile),
       newsAgeTile == null ? "" : thrCls("newsloop", newsAgeTile),
@@ -780,6 +779,19 @@
       return telNum(d.supervisor && d.supervisor.age_seconds);
     }
     if (compKey === "newsloop") {
+      /* disk truth first: the recorder measures the mirror's real age
+         every 15s. The browser's own as_of goes stale while the user
+         camps on this page (no news refetch here) and once invented a
+         20m OUTAGE the disk never saw. Telemetry sample + elapsed time
+         = an honest upper bound; browser as_of is only the fallback. */
+      var tp2 = telemPoints();
+      var lastP = tp2.length ? tp2[tp2.length - 1] : null;
+      if (lastP && lastP.news_s != null) {
+        var pAge = (Date.now() - Date.parse(lastP.ts)) / 1000;
+        if (isFinite(pAge) && pAge >= 0 && pAge < 90) {
+          return lastP.news_s + pAge;
+        }
+      }
       return (newsData && newsData.as_of)
         ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
     }
