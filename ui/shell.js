@@ -1314,8 +1314,6 @@
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
     var gHead = stEl("div", "st-card-head");
-    gHead.appendChild(stEl("div", "st-t-h", "Latency"));
-    gHead.appendChild(stEl("span", "st-spacer"));
     var seg = stEl("div", "st-seg");
     var rdefs = ["1h", "6h", "24h"];
     for (var si = 0; si < rdefs.length; si += 1) {
@@ -1336,7 +1334,6 @@
         seg.appendChild(rb);
       })(rdefs[si]);
     }
-    gHead.appendChild(seg);
     graphCard.appendChild(gHead);
 
     var gRefresh = stEl("button", "st-iconbtn");
@@ -1441,7 +1438,9 @@
       syncOverviewShow();
     });
     chips.appendChild(allChip);
-    graphCard.appendChild(chips);
+    gHead.appendChild(chips);
+    gHead.appendChild(stEl("span", "st-spacer"));
+    gHead.appendChild(seg);
     var stats = stEl("div", "st-stats");
     stats.id = "net-stats";
     graphCard.appendChild(stats);

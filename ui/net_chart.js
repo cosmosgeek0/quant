@@ -527,34 +527,25 @@
     var data = [cfg.times || []];
     for (var i = 0; i < defs.length; i += 1) { data.push(defs[i].values); }
 
-    var bandMins = [];
-    function computeBandMins() {
-      bandMins = [];
-      var globalMax = 0;
-      var di2;
-      var v2;
-      for (di2 = 1; di2 < data.length; di2 += 1) {
-        for (var p2 = 0; p2 < data[di2].length; p2 += 1) {
-          v2 = data[di2][p2];
-          if (v2 != null && v2 > globalMax) { globalMax = v2; }
+    function levelBands() {
+      /* order series by mean level; each fills down to the next */
+      if (defs.length < 2) { return []; }
+      var means = [];
+      for (var di2 = 0; di2 < defs.length; di2 += 1) {
+        var sum = 0;
+        var n2 = 0;
+        for (var p2 = 0; p2 < data[di2 + 1].length; p2 += 1) {
+          var v2 = data[di2 + 1][p2];
+          if (v2 != null) { sum += v2; n2 += 1; }
         }
+        means.push({ idx: di2 + 1, mean: n2 ? sum / n2 : 0 });
       }
-      var pad = globalMax * 0.05;
-      for (di2 = 0; di2 < defs.length; di2 += 1) {
-        var mn = null;
-        for (var p3 = 0; p3 < data[di2 + 1].length; p3 += 1) {
-          v2 = data[di2 + 1][p3];
-          if (v2 != null && (mn == null || v2 < mn)) { mn = v2; }
-        }
-        bandMins.push(mn == null ? 0 : Math.max(0, mn - pad));
+      means.sort(function (a, b) { return b.mean - a.mean; });
+      var out = [];
+      for (var b2 = 0; b2 + 1 < means.length; b2 += 1) {
+        out.push({ series: [means[b2].idx, means[b2 + 1].idx] });
       }
-    }
-    computeBandMins();
-
-    function bandFloor(seriesIdx) {
-      return function () {
-        return bandMins[seriesIdx] || 0;
-      };
+      return out;
     }
 
     function rangeUp(u, dataMin, dataMax) {
@@ -581,14 +572,10 @@
       series.push({
         label: defs[d].label,
         stroke: defs[d].color,
-        /* colour without mud: single-series panels shade to zero
-           (the reference-graph look); the multi chart shades a
-           SHALLOW band hugging each line via fillTo, so shades stay
-           in their own colour instead of stacking into grey */
-        fill: defs.length === 1
-          ? shadeFill(defs[d].color, true)
-          : alphaColor(defs[d].color, 0.14),
-        fillTo: defs.length === 1 ? undefined : bandFloor(d),
+        /* the reference grammar: every gap between adjacent lines
+           pours the UPPER line's colour as a gradient (uPlot bands,
+           built below); the lowest line pours to zero */
+        fill: shadeFill(defs[d].color, defs.length === 1),
         width: defs.length === 1 ? 1.8 : 1.6,
         scale: defs[d].unit === "ms" ? "ms" : "s",
         /* bridge sampling holes so the ribbon reads continuous —
@@ -699,14 +686,15 @@
     for (var ud = 0; ud < defs.length; ud += 1) {
       if (defs[ud].unit === "ms") { hasMs = true; } else { hasS = true; }
     }
-    function unitAxis(scaleName, unitText, side) {
+    function unitAxis(scaleName, unitText, gridOn) {
+      /* value labels ride the RIGHT side so every plot's LEFT edge
+         sits on the page's flush text line (owner alignment law) */
       var axis = {
         scale: scaleName, stroke: muted, font: axisFont,
         size: 52,
+        side: 1,
         space: cfg.compact ? 34 : 40,
         values: function (u, splits) {
-          /* asinh scales pad the splits list with nulls for minor
-             divisions — those render as blanks, never "null" */
           var out = [];
           for (var j = 0; j < splits.length; j += 1) {
             out.push(splits[j] == null ? ""
@@ -714,11 +702,10 @@
           }
           return out;
         },
-        grid: side ? { show: false }
-          : { show: true, stroke: line, width: 1 },
+        grid: gridOn ? { show: true, stroke: line, width: 1 }
+          : { show: false },
         ticks: { show: false }, border: { show: false }
       };
-      if (side) { axis.side = 1; }
       return axis;
     }
     var axes = [
@@ -735,13 +722,13 @@
         grid: { show: true, stroke: line, width: 1 },
         ticks: { show: false }, border: { show: false } }
     ];
-    if (hasS) { axes.push(unitAxis("s", "s", false)); }
-    if (hasMs) { axes.push(unitAxis("ms", "ms", hasS)); }
+    if (hasS) { axes.push(unitAxis("s", "s", true)); }
+    if (hasMs) { axes.push(unitAxis("ms", "ms", !hasS)); }
 
     var options = {
       width: width,
       height: height,
-      padding: [10, 14, 0, 0],
+      padding: [10, 2, 0, 0],
       legend: { show: false },
       focus: { alpha: 0.25 },
       tzDate: function (timestamp) {
@@ -763,6 +750,7 @@
         ms: { range: rangeUp }
       },
       axes: axes,
+      bands: levelBands(),
       series: series,
       hooks: {
         ready: [function (u) {
@@ -804,7 +792,9 @@
         for (var q = 0; q < defsNext.length; q += 1) {
           data.push(defsNext[q].values);
         }
-        computeBandMins();
+        var nb = levelBands();
+        if (plot.setBands) { plot.setBands(nb); }
+        else { plot.bands = nb; }
         /* audit F: a pinned readout must never describe replaced
            data — refresh releases the pin */
         pinned = false;
