@@ -475,6 +475,18 @@ class JobRunnerTests(unittest.TestCase):
                 self.margin_tick()
         return self.results()[0], lock_path
 
+    @staticmethod
+    def margin_halt_row(job_id, token, verdict, source_exists):
+        return {
+            "kind": "margin_governor_release_halted", "job_id": job_id,
+            "lock_exists": True, "lock_token": token,
+            "lock_op": "MARGIN_BORROW", "lock_symbol": "USDT",
+            "runner_receipt_exists": True, "runner_verdict": verdict,
+            "source_receipt_exists": source_exists,
+            "source_verdict": verdict if source_exists else "ABSENT",
+            "utc": utc(NOW),
+        }
+
     def momentum_markers(self):
         Path(os.path.join(
             self.jobs_dir, "futures_proof_passed"
@@ -750,6 +762,18 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(result_ids, set())
         self.assertFalse(bad_results)
         self.assertFalse(unresolved)
+
+    def test_zero_byte_tick_lock_is_reclaimed_as_dead_evidence(self):
+        paths = jr._paths(self.receipt_dir)
+        Path(paths["tick_lock"]).touch()
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertFalse(os.path.exists(paths["tick_lock"]))
+        self.assertEqual(self.result_events("runner_stale_lock_recovered"), [{
+            "kind": "runner_stale_lock_recovered", "pid": "UNKNOWN",
+            "age_seconds": "UNKNOWN", "utc": utc(NOW),
+        }])
 
     def test_matching_live_tick_owner_is_never_recovered(self):
         paths = self.write_tick_lock(
@@ -1950,303 +1974,185 @@ class JobRunnerTests(unittest.TestCase):
             1,
         )
 
-    def test_sourceless_final_refusal_recovers_owned_governor_release(self):
+    def test_sourceless_final_refusal_halts_with_exact_durable_facts(self):
         job_id = "margin-sourceless-recovery"
         row, lock_path = self.interrupt_margin_governor_release(
             job_id, measured_sha="invalid-sha"
         )
-        source_path = os.path.join(
-            self.receipt_dir, "jobs", "receipts", "margin-%s.json" % job_id
-        )
-        self.assertEqual(row["verdict"], "REFUSED")
-        self.assertFalse(os.path.exists(source_path))
         with open(row["receipt_path"], encoding="utf-8") as handle:
             before = json.load(handle)
         token = before["governor_token"]
-        self.assertEqual(before["governor_release"], "PENDING")
-        self.assertEqual(
-            set(before["authority_digests"]), {"job_file"}
-        )
-        self.assertEqual(before["mutation_attempts"], 0)
-        self.assertNotIn("submission", before)
-        self.assertNotIn("transaction_id", before)
-
-        self.assertEqual(self.tick(), 0)
-
-        self.assertEqual(
-            self.governor_releases, [(token, self.receipt_dir)]
-        )
-        self.assertFalse(os.path.exists(lock_path))
-        events = self.result_events("margin_governor_release_recovered")
-        self.assertEqual(len(events), 1)
-        self.assertEqual(
-            events[0]["recovery_shape"], "RUNNER_ONLY_FINAL_REFUSAL"
-        )
-        with open(row["receipt_path"], encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["governor_release"], "RECOVERED")
-
-    def test_runner_only_recovery_refuses_unknown_mutation_fields(self):
-        job_id = "margin-runner-only-fields"
-        row, lock_path = self.interrupt_margin_governor_release(
-            job_id, measured_sha="invalid-sha"
-        )
-        with open(row["receipt_path"], encoding="utf-8") as handle:
-            runner = json.load(handle)
-        runner["mutation_attempts"] = 1
-        runner["submission"] = {
-            "kind": "ok",
-            "transaction_id": "7301",
-        }
-        with open(row["receipt_path"], "w", encoding="utf-8") as handle:
-            json.dump(runner, handle)
 
         self.assertEqual(self.tick(), 3)
 
         self.assertEqual(self.governor_releases, [])
         self.assertTrue(os.path.isfile(lock_path))
-        refusals = self.result_events("margin_governor_recovery_refused")
-        self.assertEqual(len(refusals), 1)
-        self.assertEqual(refusals[0]["job_id"], job_id)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
         self.assertEqual(
-            refusals[0]["reason"], "DURABLE_OWNERSHIP_MISMATCH"
-        )
-
-    def test_pre_receipt_job_replacement_is_caught_by_validated_digest(self):
-        job_id = "margin-pre-receipt-replacement"
-        job_path = self.margin_job(job_id)
-        validated_digest = hashlib.sha256(
-            Path(job_path).read_bytes()
-        ).hexdigest()
-        lock_path = os.path.join(
-            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
-        )
-        write_runner_receipt = jr._write_runner_receipt
-
-        class ReleaseInterrupted(Exception):
-            pass
-
-        def replace_before_receipt(*args, **kwargs):
-            with open(job_path, encoding="utf-8") as handle:
-                replacement = json.load(handle)
-            replacement["principal"] = "999"
-            with open(job_path, "w", encoding="utf-8") as handle:
-                json.dump(replacement, handle)
-            return write_runner_receipt(*args, **kwargs)
-
-        def pause_release(_release, token, _receipt_dir):
-            with open(lock_path, "w", encoding="utf-8") as handle:
-                json.dump({
-                    "version": 1,
-                    "token": token,
-                    "op": "MARGIN_BORROW",
-                    "symbol": "USDT",
-                    "utc": utc(NOW),
-                }, handle)
-            raise ReleaseInterrupted
-
-        with mock.patch.dict(os.environ, {"QUANT_SHA": "invalid-sha"}), \
-                mock.patch.object(
-                    jr, "_write_runner_receipt",
-                    side_effect=replace_before_receipt), \
-                mock.patch.object(
-                    jr, "_release_governor", side_effect=pause_release):
-            with self.assertRaises(ReleaseInterrupted):
-                self.margin_tick()
-
-        row = self.results()[0]
-        with open(row["receipt_path"], encoding="utf-8") as handle:
-            runner = json.load(handle)
-        replacement_digest = hashlib.sha256(
-            Path(job_path).read_bytes()
-        ).hexdigest()
-        self.assertEqual(
-            runner["authority_digests"]["job_file"], validated_digest
-        )
-        self.assertNotEqual(validated_digest, replacement_digest)
-
-        self.assertEqual(self.tick(), 3)
-
-        self.assertEqual(self.governor_releases, [])
-        self.assertTrue(os.path.isfile(lock_path))
-        refusals = self.result_events("margin_governor_recovery_refused")
-        self.assertEqual(len(refusals), 1)
-        self.assertEqual(refusals[0]["job_id"], job_id)
-
-    def test_sourceless_recovery_refuses_one_job_digest_disagreement(self):
-        job_id = "margin-sourceless-disagreement"
-        row, lock_path = self.interrupt_margin_governor_release(
-            job_id, measured_sha="invalid-sha"
-        )
-        job_path = os.path.join(self.jobs_dir, "job-%s.json" % job_id)
-        with open(job_path, "a", encoding="utf-8") as handle:
-            handle.write("\n")
-
-        self.assertEqual(self.tick(), 3)
-
-        self.assertEqual(self.governor_releases, [])
-        self.assertTrue(os.path.isfile(lock_path))
-        refusals = self.result_events("margin_governor_recovery_refused")
-        self.assertEqual(len(refusals), 1)
-        self.assertEqual(refusals[0]["job_id"], job_id)
-        self.assertEqual(
-            refusals[0]["reason"], "DURABLE_OWNERSHIP_MISMATCH"
+            self.result_events("margin_governor_release_halted"),
+            [self.margin_halt_row(job_id, token, "REFUSED", False)],
         )
         with open(row["receipt_path"], encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["governor_release"], "PENDING")
 
-    def test_margin_final_result_recovers_interrupted_governor_release(self):
-        self.margin_job("margin-release-recovery")
-        lock_path = os.path.join(
-            self.receipt_dir, "account-governor.lock"
+    def test_manual_release_refuses_duplicate_receipt_names(self):
+        job_id = "margin-runner-duplicate"
+        row, lock_path = self.interrupt_margin_governor_release(
+            job_id, measured_sha="invalid-sha"
+        )
+        raw = Path(row["receipt_path"]).read_text(encoding="utf-8")
+        Path(row["receipt_path"]).write_text(
+            raw.rstrip()[:-1] + ',"mutation_attempts":0}\n',
+            encoding="utf-8",
         )
 
-        class ReleaseInterrupted(Exception):
-            pass
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.release_stuck_lock(
+                job_id, True, self.receipt_dir, NOW
+            ), 3)
 
-        def pause_release(_release, token, _receipt_dir):
-            with open(lock_path, "w", encoding="utf-8") as handle:
-                json.dump({
-                    "version": 1,
-                    "token": token,
-                    "op": "MARGIN_BORROW",
-                    "symbol": "USDT",
-                    "utc": utc(NOW),
-                }, handle)
-            raise ReleaseInterrupted
-
-        with mock.patch.object(
-                jr, "_release_governor", side_effect=pause_release):
-            with self.assertRaises(ReleaseInterrupted):
-                self.margin_tick()
-
-        first = self.results()[0]
-        self.assertEqual(first["verdict"], "OPEN")
-        with open(first["receipt_path"], encoding="utf-8") as handle:
-            before = json.load(handle)
-        governor_token = before["governor_token"]
-        self.assertEqual(before["governor_release"], "PENDING")
-        self.assertTrue(os.path.isfile(lock_path))
         self.assertEqual(self.governor_releases, [])
-
-        self.assertEqual(self.tick(), 0)
-
-        self.assertEqual(
-            self.governor_releases,
-            [(governor_token, self.receipt_dir)],
+        self.assertTrue(os.path.isfile(lock_path))
+        output.assert_called_once_with(
+            "JOB-RUNNER | RELEASE REFUSED | "
+            "RUNNER_RECEIPT_DUPLICATE_FIELD"
         )
-        self.assertFalse(os.path.exists(lock_path))
-        events = self.result_events("margin_governor_release_recovered")
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["job_id"], "margin-release-recovery")
-        self.assertEqual(events[0]["recovery_shape"], "SOURCE_BACKED_FINAL")
-        with open(first["receipt_path"], encoding="utf-8") as handle:
-            after = json.load(handle)
-        self.assertEqual(after["governor_release"], "RECOVERED")
-        source = self.margin_source(first)
-        self.assertEqual(source["governor_release"], "RECOVERED")
-        result_ids, bad_results, unresolved = jr._result_ids(
-            jr._paths(self.receipt_dir)["results"]
-        )
-        self.assertEqual(result_ids, {"margin-release-recovery"})
-        self.assertFalse(bad_results)
-        self.assertFalse(unresolved)
 
-    def test_margin_recovery_attests_durable_job_file_digest(self):
-        job_id = "margin-recovery-job-digest"
-        _row, lock_path = self.interrupt_margin_governor_release(job_id)
+    def test_manual_release_uses_the_validated_job_digest_binding(self):
+        job_id = "margin-job-digest"
+        _row, lock_path = self.interrupt_margin_governor_release(
+            job_id, measured_sha="invalid-sha"
+        )
         job_path = os.path.join(self.jobs_dir, "job-%s.json" % job_id)
         with open(job_path, "a", encoding="utf-8") as handle:
             handle.write("\n")
 
-        self.assertEqual(self.tick(), 3)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.release_stuck_lock(
+                job_id, True, self.receipt_dir, NOW
+            ), 3)
 
         self.assertEqual(self.governor_releases, [])
         self.assertTrue(os.path.isfile(lock_path))
-        self.assertEqual(
-            self.result_events("margin_governor_recovery_refused")[0][
-                "reason"
-            ],
-            "DURABLE_OWNERSHIP_MISMATCH",
+        output.assert_called_once_with(
+            "JOB-RUNNER | RELEASE REFUSED | JOB_DIGEST_MISMATCH"
         )
 
-    def test_margin_recovery_attests_source_ready_params_digest(self):
-        job_id = "margin-recovery-ready-digest"
+    def test_source_backed_final_halts_idempotently_without_manual_call(self):
+        job_id = "margin-release-halt"
         row, lock_path = self.interrupt_margin_governor_release(job_id)
         with open(row["receipt_path"], encoding="utf-8") as handle:
             runner = json.load(handle)
+        token = runner["governor_token"]
+
+        with mock.patch.object(jr, "release_stuck_lock") as manual:
+            self.assertEqual(self.tick(), 3)
+            self.assertEqual(self.tick(), 3)
+
+        manual.assert_not_called()
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertEqual(
+            self.result_events("margin_governor_release_halted"),
+            [self.margin_halt_row(job_id, token, "OPEN", True)],
+        )
         source_path = runner["source_receipt_path"]
         with open(source_path, encoding="utf-8") as handle:
             source = json.load(handle)
-        source["ready"]["params"]["amount"] = "2"
-        with open(source_path, "w", encoding="utf-8") as handle:
-            json.dump(source, handle)
+        source["verdict"] = "REFUSED"
+        Path(source_path).write_text(json.dumps(source), encoding="utf-8")
 
         self.assertEqual(self.tick(), 3)
 
-        self.assertEqual(self.governor_releases, [])
+        changed = self.result_events("margin_governor_release_halted")
+        self.assertEqual(len(changed), 2)
+        self.assertEqual(changed[1]["source_verdict"], "REFUSED")
+
+    def test_manual_release_cli_requires_confirmation_and_attests_source(self):
+        job_id = "margin-manual-source"
+        row, lock_path = self.interrupt_margin_governor_release(job_id)
+        self.assertEqual(self.tick(), 3)
+        with mock.patch("sys.stderr"), \
+                self.assertRaises(SystemExit) as refused:
+            jr.main(["release-stuck-lock", "--job-id", job_id])
+        self.assertEqual(refused.exception.code, 2)
         self.assertTrue(os.path.isfile(lock_path))
-        self.assertEqual(
-            self.result_events("margin_governor_recovery_refused")[0][
-                "reason"
-            ],
-            "DURABLE_OWNERSHIP_MISMATCH",
-        )
 
-    def test_margin_governor_recovery_refuses_ownership_disagreement(self):
-        job_id = "margin-recovery-cross-check"
-        self.margin_job(job_id)
-        lock_path = os.path.join(
-            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
-        )
+        self.assertEqual(jr.main([
+            "release-stuck-lock", "--job-id", job_id, "--confirm-release",
+        ]), 0)
 
-        class ReleaseInterrupted(Exception):
-            pass
-
-        def pause_release(_release, token, _receipt_dir):
-            with open(lock_path, "w", encoding="utf-8") as handle:
-                json.dump({
-                    "version": 1,
-                    "token": token,
-                    "op": "MARGIN_BORROW",
-                    "symbol": "USDT",
-                    "utc": utc(NOW),
-                }, handle)
-            raise ReleaseInterrupted
-
-        with mock.patch.object(
-                jr, "_release_governor", side_effect=pause_release):
-            with self.assertRaises(ReleaseInterrupted):
-                self.margin_tick()
-
-        row = self.results()[0]
+        self.assertFalse(os.path.exists(lock_path))
         with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        self.assertEqual(runner["governor_release"], "RELEASED")
+        self.assertEqual(self.margin_source(row)["governor_release"], "RELEASED")
+
+    def test_manual_release_attests_runner_only_refusal(self):
+        job_id = "margin-manual-runner"
+        row, lock_path = self.interrupt_margin_governor_release(
+            job_id, measured_sha="invalid-sha"
+        )
+        self.assertEqual(jr.release_stuck_lock(
+            job_id, True, self.receipt_dir, NOW
+        ), 0)
+
+        self.assertFalse(os.path.exists(lock_path))
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["governor_release"], "RELEASED")
+
+    def test_manual_release_names_each_cross_artifact_disagreement(self):
+        job_id = "margin-manual-disagreements"
+        row, lock_path = self.interrupt_margin_governor_release(job_id)
+        runner_path = row["receipt_path"]
+        with open(runner_path, encoding="utf-8") as handle:
             runner = json.load(handle)
         source_path = runner["source_receipt_path"]
         with open(source_path, encoding="utf-8") as handle:
             source = json.load(handle)
-        runner["governor_token"] = "runner-token-disagreement"
-        source["governor_token"] = "source-token-disagreement"
-        with open(row["receipt_path"], "w", encoding="utf-8") as handle:
-            json.dump(runner, handle)
-        with open(source_path, "w", encoding="utf-8") as handle:
-            json.dump(source, handle)
+        with open(lock_path, encoding="utf-8") as handle:
+            lock = json.load(handle)
+        results_path = jr._paths(self.receipt_dir)["results"]
+        result = json.loads(Path(results_path).read_text(encoding="utf-8"))
 
-        self.assertEqual(self.tick(), 3)
+        def refuses(reason):
+            with mock.patch("builtins.print") as output:
+                self.assertEqual(jr.release_stuck_lock(
+                    job_id, True, self.receipt_dir, NOW
+                ), 3)
+            output.assert_called_once_with(
+                "JOB-RUNNER | RELEASE REFUSED | " + reason
+            )
+            self.assertEqual(self.governor_releases, [])
+            self.assertTrue(os.path.isfile(lock_path))
 
-        self.assertEqual(self.governor_releases, [])
-        self.assertTrue(os.path.isfile(lock_path))
-        refusals = self.result_events("margin_governor_recovery_refused")
-        self.assertEqual(len(refusals), 1)
-        self.assertEqual(refusals[0]["job_id"], job_id)
-        self.assertEqual(
-            refusals[0]["reason"], "DURABLE_OWNERSHIP_MISMATCH"
+        cases = (
+            (results_path, result, ("symbol",), "BTC", "RESULT_SYMBOL_MISMATCH"),
+            (results_path, result, ("exit_code",), False, "RESULT_OUTCOME_MISMATCH"),
+            (runner_path, runner, ("verdict",), "REFUSED", "RUNNER_VERDICT_MISMATCH"),
+            (source_path, source, ("ready", "params", "amount"), "999", "SOURCE_READY_MISMATCH"),
+            (source_path, source, ("ready", "params", "type"), "REPAY", "SOURCE_READY_MISMATCH"),
+            (source_path, source, ("ready", "endpoint_path"), "/wrong", "SOURCE_READY_MISMATCH"),
+            (source_path, source, ("mutation_attempts",), True,
+             "SOURCE_MUTATION_ATTEMPTS_MISMATCH"),
+            (source_path, source, ("governor_token",), "other", "SOURCE_GOVERNOR_TOKEN_MISMATCH"),
+            (lock_path, lock, ("token",), "other", "LOCK_TOKEN_MISMATCH"),
         )
-        result_ids, bad_results, unresolved = jr._result_ids(
-            jr._paths(self.receipt_dir)["results"]
-        )
-        self.assertEqual(result_ids, {job_id})
-        self.assertFalse(bad_results)
-        self.assertFalse(unresolved)
+        for path, original, names, value, reason in cases:
+            with self.subTest(reason=reason, names=names):
+                changed = json.loads(json.dumps(original))
+                target = changed
+                for name in names[:-1]:
+                    target = target[name]
+                target[names[-1]] = value
+                Path(path).write_text(json.dumps(changed), encoding="utf-8")
+                refuses(reason)
+                Path(path).write_text(json.dumps(original), encoding="utf-8")
 
     def test_unknown_touches_stop_and_blocks_next_job(self):
         self.job("a")

@@ -66,33 +66,11 @@ MOMENTUM_LEDGER_FIELDS = {"fills", "fees", "realized"}
 MOMENTUM_RESULT_FIELDS = RESULT_FIELDS | MOMENTUM_LEDGER_FIELDS
 ADVERSE_STOP_REFUSAL_FIELDS = {"kind", "error", "symbol", "utc"}
 ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
-MARGIN_GOVERNOR_RECOVERY_FIELDS = {
-    "kind", "job_id", "op", "symbol", "verdict", "recovery_shape",
-    "utc",
+MARGIN_GOVERNOR_HALT_FIELDS = {
+    "kind", "job_id", "lock_exists", "lock_token", "lock_op",
+    "lock_symbol", "runner_receipt_exists", "runner_verdict",
+    "source_receipt_exists", "source_verdict", "utc",
 }
-MARGIN_GOVERNOR_RECOVERY_LEGACY_FIELDS = (
-    MARGIN_GOVERNOR_RECOVERY_FIELDS - {"recovery_shape"}
-)
-MARGIN_GOVERNOR_RECOVERY_REFUSAL_FIELDS = {
-    "kind", "job_id", "op", "symbol", "reason", "utc",
-}
-MARGIN_RECOVERY_RUNNER_FIELDS = {
-    "job_id", "op", "symbol", "verdict", "reason", "utc",
-    "measured_sha", "sha_valid", "authority_digests", "governor_token",
-    "governor_release",
-}
-MARGIN_SOURCE_BACKED_RUNNER_FIELDS = MARGIN_RECOVERY_RUNNER_FIELDS | {
-    "sha", "source_receipt_path",
-}
-MARGIN_RUNNER_ONLY_REFUSAL_FIELDS = MARGIN_RECOVERY_RUNNER_FIELDS | {
-    "mutation_attempts",
-}
-MARGIN_RUNNER_ONLY_REFUSAL_VERDICTS = frozenset(("REFUSED",))
-MARGIN_SOURCE_AUTHORITY_DIGEST_FIELDS = {
-    "ready_params", "job_file", "accept_one", "operator", "stop_jobs",
-    "operator_token", "job_expiry",
-}
-MARGIN_RUNNER_ONLY_AUTHORITY_DIGEST_FIELDS = {"job_file"}
 TICK_LOCK_RECOVERY_FIELDS = {
     "kind", "pid", "age_seconds", "utc",
 }
@@ -238,14 +216,16 @@ def _strict_object(pairs):
     return result
 
 
-def _decode_strict_object(encoded: bytes) -> Dict[str, Any]:
+def _decode_strict_object(encoded: bytes,
+                          decimal_numbers: bool = True) -> Dict[str, Any]:
+    number_types = {"parse_float": Decimal, "parse_int": Decimal} \
+        if decimal_numbers else {}
     try:
         value = json.loads(
             encoded.decode("utf-8"),
-            parse_float=Decimal,
-            parse_int=Decimal,
             parse_constant=_reject_constant,
             object_pairs_hook=_strict_object,
+            **number_types,
         )
     except JobRefusal:
         raise
@@ -254,6 +234,10 @@ def _decode_strict_object(encoded: bytes) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("JSON value is not an object")
     return value
+
+
+def _decode_strict_plain_object(encoded: bytes) -> Dict[str, Any]:
+    return _decode_strict_object(encoded, decimal_numbers=False)
 
 
 def _read_file_bytes(path: str) -> bytes:
@@ -790,13 +774,10 @@ def _release_governor(release: Optional[Callable[..., Any]], token: str,
 
 def _decode_tick_lock(encoded: bytes) -> Dict[str, Any]:
     try:
-        owner = json.loads(
-            encoded.decode("ascii"), object_pairs_hook=_strict_object
-        )
+        encoded.decode("ascii")
+        owner = _decode_strict_plain_object(encoded)
     except (JobRefusal, UnicodeError, ValueError, json.JSONDecodeError):
         raise ValueError("runner lock is invalid") from None
-    if not isinstance(owner, dict):
-        raise ValueError("runner lock is invalid")
     return owner
 
 
@@ -947,15 +928,33 @@ def _acquire_tick_lock(path: str, now: datetime) \
                 return "", False, None
         try:
             encoded = _read_file_bytes(path)
-            owner = _decode_tick_lock(encoded)
-            if not _valid_tick_lock(owner):
-                return "", True, None
-            created = _timestamp(owner["created_utc"])
-            heartbeat = _timestamp(owner["heartbeat_utc"])
         except FileNotFoundError:
             continue
-        except (JobRefusal, OSError, ValueError):
+        except OSError:
             return "", True, None
+        try:
+            owner = _decode_tick_lock(encoded)
+            if not _valid_tick_lock(owner):
+                raise ValueError("runner lock is invalid")
+            created = _timestamp(owner["created_utc"])
+            heartbeat = _timestamp(owner["heartbeat_utc"])
+        except (JobRefusal, ValueError):
+            try:
+                if _read_file_bytes(path) != encoded:
+                    return "", False, None
+                os.unlink(path)
+                _fsync_parent_directory(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return "", True, None
+            recovered = {
+                "kind": "runner_stale_lock_recovered",
+                "pid": "UNKNOWN",
+                "age_seconds": "UNKNOWN",
+                "utc": _utc_text(now),
+            }
+            continue
 
         current_monotonic = time.monotonic_ns()
         if current_monotonic >= owner["heartbeat_monotonic_ns"]:
@@ -1019,17 +1018,13 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
     if not os.path.exists(path):
         return set(), False, False
     identifiers = set()
-    margin_recovery_ids = set()
-    margin_recovery_refusal_ids = set()
     unresolved = False
     try:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     return set(), True, False
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    return set(), True, False
+                row = _decode_strict_plain_object(line.encode("utf-8"))
                 fields = set(row)
                 if fields == ADVERSE_STOP_REFUSAL_FIELDS:
                     if row["kind"] != "adverse_stop_refusal" or any(
@@ -1045,49 +1040,29 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                     if row.get("kind") != "runner_stale_lock_recovered" \
                             or any(type(row.get(name)) is not str
                                    for name in fields) \
-                            or not row["pid"].isdigit() \
-                            or _margin_decimal_text(
-                                row["age_seconds"]
-                            ) is None:
+                            or not (
+                                row["pid"] == "UNKNOWN"
+                                and row["age_seconds"] == "UNKNOWN"
+                                or row["pid"].isdigit()
+                                and _margin_decimal_text(
+                                    row["age_seconds"]
+                                ) is not None
+                            ):
                         return set(), True, False
                     continue
-                if fields in (
-                        MARGIN_GOVERNOR_RECOVERY_FIELDS,
-                        MARGIN_GOVERNOR_RECOVERY_LEGACY_FIELDS):
-                    job_id = row.get("job_id")
-                    if row.get("kind") != "margin_governor_release_recovered" \
-                            or row.get("op") != margin_ops.MARGIN_BORROW \
-                            or type(job_id) is not str \
-                            or job_id not in identifiers \
-                            or job_id in margin_recovery_ids \
-                            or job_id in margin_recovery_refusal_ids \
-                            or row.get("verdict") in FREEZE_VERDICTS \
-                            or any(type(row.get(name)) is not str for name in (
-                                "symbol", "verdict", "utc"
-                            )) \
-                            or fields == MARGIN_GOVERNOR_RECOVERY_FIELDS \
-                            and row.get("recovery_shape") not in {
-                                "SOURCE_BACKED_FINAL",
-                                "RUNNER_ONLY_FINAL_REFUSAL",
-                            }:
-                        return set(), True, False
-                    margin_recovery_ids.add(job_id)
-                    continue
-                if fields == MARGIN_GOVERNOR_RECOVERY_REFUSAL_FIELDS:
-                    job_id = row.get("job_id")
+                if fields == MARGIN_GOVERNOR_HALT_FIELDS:
                     if row.get("kind") \
-                            != "margin_governor_recovery_refused" \
-                            or row.get("op") != margin_ops.MARGIN_BORROW \
-                            or type(job_id) is not str \
-                            or job_id not in identifiers \
-                            or job_id in margin_recovery_refusal_ids \
-                            or job_id in margin_recovery_ids \
-                            or any(type(row.get(name)) is not str for name in (
-                                "symbol", "reason", "utc"
+                            != "margin_governor_release_halted" \
+                            or type(row.get("job_id")) is not str \
+                            or any(type(row.get(name)) is not bool for name in (
+                                "lock_exists", "runner_receipt_exists",
+                                "source_receipt_exists",
                             )) \
-                            or not row["reason"]:
+                            or any(type(row.get(name)) is not str for name in (
+                                "lock_token", "lock_op", "lock_symbol",
+                                "runner_verdict", "source_verdict", "utc",
+                            )):
                         return set(), True, False
-                    margin_recovery_refusal_ids.add(job_id)
                     continue
                 if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
                     return set(), True, False
@@ -1109,16 +1084,17 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                 if not receipt_path or not os.path.isfile(receipt_path):
                     return set(), True, False
                 try:
-                    with open(receipt_path, encoding="utf-8") as receipt_handle:
-                        receipt = json.load(receipt_handle)
-                except (OSError, ValueError, UnicodeError):
+                    receipt = _decode_strict_plain_object(
+                        _read_file_bytes(receipt_path)
+                    )
+                except (JobRefusal, OSError, ValueError, UnicodeError):
                     return set(), True, False
                 if not isinstance(receipt, dict) \
                         or receipt.get("verdict") != row["verdict"]:
                     return set(), True, False
                 unresolved = unresolved or _receipt_is_unresolved(receipt_path)
                 identifiers.add(row["job_id"])
-    except (OSError, ValueError, UnicodeError):
+    except (JobRefusal, OSError, ValueError, UnicodeError):
         return set(), True, False
     return identifiers, False, unresolved
 
@@ -1133,11 +1109,7 @@ def _claims_are_resolved(paths: Dict[str, str], result_ids: set) -> bool:
 
 
 def _receipt_is_unresolved(path: str) -> bool:
-    try:
-        with open(path, encoding="utf-8") as handle:
-            receipt = json.load(handle)
-    except (OSError, ValueError, UnicodeError):
-        return True
+    receipt = _load_plain_receipt(path)
     if not isinstance(receipt, dict) or type(receipt.get("verdict")) is not str:
         return True
     verdict = receipt["verdict"]
@@ -4046,68 +4018,11 @@ def _release_recovered_governor(token: str, receipt_dir: str) -> bool:
 
 def _load_plain_receipt(path: str) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        payload = _decode_strict_plain_object(_read_file_bytes(path))
+    except (JobRefusal, OSError, UnicodeError, ValueError,
+            json.JSONDecodeError):
         return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _exact_authority_digests(value: Any, fields: set) -> bool:
-    return isinstance(value, dict) \
-        and set(value) == fields \
-        and all(
-            type(digest) is str
-            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
-            for digest in value.values()
-        )
-
-
-def _runner_sha_fields_cohere(runner: Dict[str, Any]) -> bool:
-    measured_sha = runner.get("measured_sha")
-    sha_flag = runner.get("sha_valid")
-    return type(measured_sha) is str \
-        and type(sha_flag) is bool \
-        and (
-            sha_flag
-            and SHA_RE.fullmatch(measured_sha.lower()) is not None
-            and runner.get("sha") == measured_sha.lower()
-            or not sha_flag
-            and SHA_RE.fullmatch(measured_sha.lower()) is None
-            and "sha" not in runner
-        )
-
-
-def _margin_recovery_runner_has_exact_shape(
-        runner: Any, source_backed: bool) -> bool:
-    if not isinstance(runner, dict):
-        return False
-    if source_backed:
-        expected_fields = MARGIN_SOURCE_BACKED_RUNNER_FIELDS
-        digest_fields = MARGIN_SOURCE_AUTHORITY_DIGEST_FIELDS
-    else:
-        expected_fields = MARGIN_RUNNER_ONLY_REFUSAL_FIELDS
-        if runner.get("sha_valid") is True:
-            expected_fields = expected_fields | {"sha"}
-        digest_fields = MARGIN_RUNNER_ONLY_AUTHORITY_DIGEST_FIELDS
-    if set(runner) != expected_fields:
-        return False
-    string_fields = expected_fields - {
-        "authority_digests", "mutation_attempts", "sha_valid",
-    }
-    if any(type(runner.get(name)) is not str for name in string_fields):
-        return False
-    if not _runner_sha_fields_cohere(runner) \
-            or not _exact_authority_digests(
-                runner.get("authority_digests"), digest_fields
-            ):
-        return False
-    if source_backed:
-        return runner.get("sha_valid") is True
-    return runner.get("verdict") in MARGIN_RUNNER_ONLY_REFUSAL_VERDICTS \
-        and type(runner.get("mutation_attempts")) is int \
-        and runner.get("mutation_attempts") == 0 \
-        and bool(runner.get("reason"))
+    return payload
 
 
 def _mark_margin_governor_released(
@@ -4135,62 +4050,46 @@ def _mark_margin_governor_released(
     return True
 
 
-def _margin_governor_recovery_rows(paths: Dict[str, str]) \
-        -> Tuple[Dict[str, Dict[str, Any]], set, set]:
+def _margin_governor_halt_rows(paths: Dict[str, str]) \
+        -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     final_rows: Dict[str, Dict[str, Any]] = {}
-    recovered_ids = set()
-    refused_ids = set()
+    halt_rows: Dict[str, Dict[str, Any]] = {}
     try:
-        with open(paths["results"], encoding="utf-8") as handle:
-            for line in handle:
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    return {}, set(), set()
-                if row.get("kind") == "margin_governor_release_recovered":
-                    job_id = row.get("job_id")
-                    if type(job_id) is str:
-                        recovered_ids.add(job_id)
-                    continue
-                if row.get("kind") == "margin_governor_recovery_refused":
-                    job_id = row.get("job_id")
-                    if type(job_id) is str:
-                        refused_ids.add(job_id)
-                    continue
-                if row.get("op") == margin_ops.MARGIN_BORROW \
-                        and row.get("verdict") not in FREEZE_VERDICTS \
-                        and type(row.get("job_id")) is str:
+        encoded = _read_file_bytes(paths["results"])
+        for line in encoded.splitlines():
+            row = _decode_strict_plain_object(line)
+            if set(row) == MARGIN_GOVERNOR_HALT_FIELDS \
+                    and row.get("kind") == "margin_governor_release_halted" \
+                    and type(row.get("job_id")) is str:
+                halt_rows[row["job_id"]] = row
+            elif set(row) == RESULT_FIELDS \
+                    and row.get("op") == margin_ops.MARGIN_BORROW \
+                    and row.get("verdict") not in FREEZE_VERDICTS \
+                    and type(row.get("job_id")) is str:
                     final_rows[row["job_id"]] = row
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        return {}, set(), set()
-    return final_rows, recovered_ids, refused_ids
+    except (FileNotFoundError, JobRefusal, OSError, UnicodeError, ValueError,
+            json.JSONDecodeError):
+        return {}, {}
+    return final_rows, halt_rows
 
 
-def _refuse_margin_governor_recovery(
-        paths: Dict[str, str], row: Dict[str, Any], now: datetime,
-        already_refused: bool) -> bool:
-    if already_refused:
-        return False
-    event = {
-        "kind": "margin_governor_recovery_refused",
-        "job_id": str(row.get("job_id", "")),
-        "op": margin_ops.MARGIN_BORROW,
-        "symbol": str(row.get("symbol", "")),
-        "reason": "DURABLE_OWNERSHIP_MISMATCH",
-        "utc": _utc_text(now),
-    }
-    try:
-        _append_results_row(paths, event)
-    except Exception:
-        return False
-    print(json.dumps(event, separators=(",", ":")))
-    return False
+def _margin_receipt_fact(path: str) \
+        -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    exists = os.path.exists(path)
+    payload = _load_plain_receipt(path) if exists else None
+    verdict = payload.get("verdict") if isinstance(payload, dict) else None
+    return exists, verdict if type(verdict) is str else (
+        "UNKNOWN" if exists else "ABSENT"
+    ), payload
 
 
-def _recover_final_margin_governor(
+def _halt_interrupted_margin_governor(
         paths: Dict[str, str], receipt_dir: str, now: datetime) \
         -> Optional[bool]:
-    final_rows, recovered_ids, refused_ids = \
-        _margin_governor_recovery_rows(paths)
+    final_rows, prior_halts = _margin_governor_halt_rows(paths)
+    lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
+    lock_exists = os.path.exists(lock_path)
+    lock = _load_plain_receipt(lock_path) if lock_exists else None
     for job_id in sorted(final_rows):
         row = final_rows[job_id]
         runner_path = os.path.join(
@@ -4199,12 +4098,12 @@ def _recover_final_margin_governor(
         source_path = os.path.join(
             paths["receipts"], "margin-%s.json" % job_id
         )
-        job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
-        lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
-        runner = _load_plain_receipt(runner_path)
-        source = _load_plain_receipt(source_path)
-        source_exists = os.path.exists(source_path)
-        lock = _load_plain_receipt(lock_path)
+        runner_exists, runner_verdict, runner = _margin_receipt_fact(
+            runner_path
+        )
+        source_exists, source_verdict, source = _margin_receipt_fact(
+            source_path
+        )
         pending = (
             isinstance(runner, dict)
             and runner.get("governor_release") == "PENDING"
@@ -4212,124 +4111,49 @@ def _recover_final_margin_governor(
             isinstance(source, dict)
             and source.get("governor_release") == "PENDING"
         )
-        receipt_tokens = {
+        tokens = {
             payload.get("governor_token")
             for payload in (runner, source)
             if isinstance(payload, dict)
             and type(payload.get("governor_token")) is str
             and payload.get("governor_token")
         }
-        owned_lock_evidence = isinstance(lock, dict) \
-            and lock.get("token") in receipt_tokens
-        if not pending and not owned_lock_evidence:
-            continue
-        job = _load_plain_receipt(job_path)
-        governor_token = runner.get("governor_token") \
-            if isinstance(runner, dict) else None
-        ready = source.get("ready") if isinstance(source, dict) else None
-        params = ready.get("params") if isinstance(ready, dict) else None
-        authority_digests = runner.get("authority_digests") \
-            if isinstance(runner, dict) else None
-        try:
-            job_digest = _authority_digest(_read_file_bytes(job_path))
-        except OSError:
-            job_digest = None
-        job_attested = (
-            isinstance(authority_digests, dict)
-            and type(authority_digests.get("job_file")) is str
-            and job_digest is not None
-            and authority_digests.get("job_file") == job_digest
-        )
-        sha_valid = isinstance(runner, dict) \
-            and runner.get("sha_valid") is True
-        source_backed = source_exists \
-            or isinstance(runner, dict) \
-            and "source_receipt_path" in runner
-        runner_shape_agrees = _margin_recovery_runner_has_exact_shape(
-            runner, source_backed
-        )
-        common_agrees = (
-            os.path.abspath(str(row.get("receipt_path", "")))
+        lock_owned = isinstance(lock, dict) and lock.get("token") in tokens
+        result_names_runner = os.path.abspath(str(row.get("receipt_path", ""))) \
             == os.path.abspath(runner_path)
-            and isinstance(runner, dict)
-            and runner_shape_agrees
-            and isinstance(lock, dict)
-            and isinstance(job, dict)
-            and runner.get("job_id") == job_id
-            and runner.get("op") == margin_ops.MARGIN_BORROW
-            and runner.get("symbol") == row.get("symbol")
-            and runner.get("verdict") == row.get("verdict")
-            and runner.get("governor_release") == "PENDING"
-            and type(governor_token) is str
-            and bool(governor_token)
-            and set(lock) == {"version", "token", "op", "symbol", "utc"}
-            and type(lock.get("version")) is int
-            and lock.get("version") == 1
-            and lock.get("token") == governor_token
-            and lock.get("op") == margin_ops.MARGIN_BORROW
-            and lock.get("symbol") == row.get("symbol")
-            and job.get("job_id") == job_id
-            and job.get("op") == margin_ops.MARGIN_BORROW
-            and job.get("asset") == row.get("symbol")
-            and job_attested
+        unreadable_evidence = lock_exists and result_names_runner and (
+            runner_exists and runner is None
+            or source_exists and source is None
+            or lock is None
         )
-        if source_backed:
-            ready_params_digest = _json_authority_digest(params) \
-                if isinstance(params, dict) else None
-            ownership_agrees = (
-                common_agrees
-                and isinstance(source, dict)
-                and runner.get("source_receipt_path") == source_path
-                and source.get("kind") == "margin_operation"
-                and source.get("job_id") == job_id
-                and source.get("verdict") == row.get("verdict")
-                and source.get("governor_release") == "PENDING"
-                and source.get("governor_token") == governor_token
-                and sha_valid
-                and source.get("sha") == runner.get("sha")
-                and source.get("authority_digests") == authority_digests
-                and ready_params_digest is not None
-                and authority_digests.get("ready_params")
-                == ready_params_digest
-                and isinstance(ready, dict)
-                and ready.get("op") == margin_ops.MARGIN_BORROW
-                and params.get("asset") == row.get("symbol")
-                and job.get("intent_id") == ready.get("intent_id")
-                and job.get("client_tag") == ready.get("client_tag")
-            )
-            recovery_shape = "SOURCE_BACKED_FINAL"
-            release_source_path = source_path
-        else:
-            ownership_agrees = (
-                common_agrees
-                and row.get("verdict")
-                in MARGIN_RUNNER_ONLY_REFUSAL_VERDICTS
-                and row.get("exit_code") == 2
-            )
-            recovery_shape = "RUNNER_ONLY_FINAL_REFUSAL"
-            release_source_path = ""
-        if not ownership_agrees:
-            return _refuse_margin_governor_recovery(
-                paths, row, now, job_id in refused_ids
-            )
-        if not _release_recovered_governor(governor_token, receipt_dir):
-            return False
-        if os.path.exists(lock_path):
-            return False
-        if not _mark_margin_governor_released(
-                paths, job_id, release_source_path, governor_token, now,
-                "RECOVERED"):
-            return False
-        if job_id not in recovered_ids:
-            event = {
-                "kind": "margin_governor_release_recovered",
-                "job_id": job_id,
-                "op": margin_ops.MARGIN_BORROW,
-                "symbol": row["symbol"],
-                "verdict": row["verdict"],
-                "recovery_shape": recovery_shape,
-                "utc": _utc_text(now),
-            }
+        if not pending and not lock_owned and not unreadable_evidence:
+            continue
+        absent = "ABSENT" if not lock_exists else "UNKNOWN"
+        event = {
+            "kind": "margin_governor_release_halted",
+            "job_id": job_id,
+            "lock_exists": lock_exists,
+            "lock_token": lock.get("token")
+            if isinstance(lock, dict) and type(lock.get("token")) is str
+            else absent,
+            "lock_op": lock.get("op")
+            if isinstance(lock, dict) and type(lock.get("op")) is str
+            else absent,
+            "lock_symbol": lock.get("symbol")
+            if isinstance(lock, dict) and type(lock.get("symbol")) is str
+            else absent,
+            "runner_receipt_exists": runner_exists,
+            "runner_verdict": runner_verdict,
+            "source_receipt_exists": source_exists,
+            "source_verdict": source_verdict,
+            "utc": _utc_text(now),
+        }
+        prior = prior_halts.get(job_id, {})
+        facts = {name: value for name, value in event.items() if name != "utc"}
+        prior_facts = {
+            name: value for name, value in prior.items() if name != "utc"
+        }
+        if facts != prior_facts:
             try:
                 _append_results_row(paths, event)
             except Exception:
@@ -4337,6 +4161,252 @@ def _recover_final_margin_governor(
             print(json.dumps(event, separators=(",", ":")))
         return True
     return None
+
+
+def _release_artifact(path: str, label: str) \
+        -> Tuple[Dict[str, Any], bytes]:
+    try:
+        encoded = _read_file_bytes(path)
+        return _decode_strict_plain_object(encoded), encoded
+    except FileNotFoundError:
+        reason = label + "_MISSING"
+    except JobRefusal:
+        reason = label + "_DUPLICATE_FIELD"
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        reason = label + "_INVALID_JSON"
+    raise JobRefusal(reason) from None
+
+
+def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
+    try:
+        lines = _read_file_bytes(paths["results"]).splitlines()
+        if any(not line for line in lines):
+            raise ValueError
+        rows = [_decode_strict_plain_object(line) for line in lines]
+    except FileNotFoundError:
+        raise JobRefusal("RESULT_MISSING") from None
+    except JobRefusal:
+        raise JobRefusal("RESULTS_DUPLICATE_FIELD") from None
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        raise JobRefusal("RESULTS_INVALID_JSON") from None
+    matches = [row for row in rows
+               if set(row) == RESULT_FIELDS and row.get("job_id") == job_id]
+    if len(matches) != 1:
+        raise JobRefusal("RESULT_MISSING" if not matches else "RESULT_DUPLICATE")
+    return matches[0]
+
+
+def _release_require(condition: bool, reason: str) -> None:
+    if not condition:
+        raise JobRefusal(reason)
+
+
+def _release_compare(label: str, actual: Dict[str, Any],
+                     expected: Dict[str, Any]) -> None:
+    for name, value in expected.items():
+        _release_require(actual.get(name) == value,
+                         "%s_%s_MISMATCH" % (label, name.upper()))
+
+
+def _attest_stuck_margin_lock(
+        paths: Dict[str, str], receipt_dir: str, job_id: str) \
+        -> Tuple[str, str]:
+    _release_require(type(job_id) is str and JOB_ID_RE.fullmatch(job_id),
+                     "BAD_JOB_ID")
+    runner_path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
+    source_path = os.path.join(paths["receipts"], "margin-%s.json" % job_id)
+    job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
+    lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
+    result = _release_result(paths, job_id)
+    runner, _encoded = _release_artifact(runner_path, "RUNNER_RECEIPT")
+    source_exists = os.path.exists(source_path)
+    _release_require(source_exists == ("source_receipt_path" in runner),
+                     "SOURCE_RECEIPT_PRESENCE_MISMATCH")
+    source = _release_artifact(source_path, "SOURCE_RECEIPT")[0] \
+        if source_exists else None
+    job, job_encoded = _release_artifact(job_path, "JOB_FILE")
+
+    _release_require(result.get("op") == margin_ops.MARGIN_BORROW,
+                     "RESULT_OP_MISMATCH")
+    _release_require(type(result.get("exit_code")) is int
+                     and (result.get("verdict"), result["exit_code"])
+                     in {("OPEN", 0), ("REFUSED", 2)},
+                     "RESULT_OUTCOME_MISMATCH")
+    _release_require(result.get("symbol") == job.get("asset"),
+                     "RESULT_SYMBOL_MISMATCH")
+    _release_require(os.path.abspath(str(result.get("receipt_path", "")))
+                     == os.path.abspath(runner_path),
+                     "RESULT_RECEIPT_PATH_MISMATCH")
+    runner_fields = {
+        "job_id", "op", "symbol", "verdict", "reason", "utc",
+        "measured_sha", "sha_valid", "authority_digests", "governor_token",
+        "governor_release",
+    } | ({"sha", "source_receipt_path"} if source_exists
+         else {"mutation_attempts"})
+    if runner.get("sha_valid") is True:
+        runner_fields.add("sha")
+    _release_require(set(runner) == runner_fields,
+                     "RUNNER_RECEIPT_SHAPE_MISMATCH")
+    _release_compare("RUNNER", runner, {
+        "job_id": job_id, "op": margin_ops.MARGIN_BORROW,
+        "symbol": job.get("asset"), "verdict": result["verdict"],
+        "utc": result["utc"], "governor_release": "PENDING",
+    })
+    token = runner.get("governor_token")
+    _release_require(type(token) is str and bool(token), "RUNNER_TOKEN_INVALID")
+    measured_sha = runner.get("measured_sha")
+    sha_valid = runner.get("sha_valid")
+    _release_require(type(measured_sha) is str and type(sha_valid) is bool
+                     and (sha_valid
+                          and SHA_RE.fullmatch(measured_sha.lower()) is not None
+                          and runner.get("sha") == measured_sha.lower()
+                          or not sha_valid
+                          and SHA_RE.fullmatch(measured_sha.lower()) is None
+                          and "sha" not in runner), "RUNNER_SHA_MISMATCH")
+    digests = runner.get("authority_digests")
+    _release_require(isinstance(digests, dict), "RUNNER_DIGESTS_INVALID")
+    _release_require(digests.get("job_file")
+                     == hashlib.sha256(job_encoded).hexdigest(),
+                     "JOB_DIGEST_MISMATCH")
+    try:
+        validated = _validate_margin_job(
+            job, job_id, _timestamp(job.get("created_utc"))
+        )
+    except (JobRefusal, TypeError):
+        raise JobRefusal("JOB_FILE_INVALID") from None
+
+    if source is None:
+        _release_require(set(digests) == {"job_file"},
+                         "RUNNER_DIGESTS_SHAPE_MISMATCH")
+        _release_require(result["verdict"] == "REFUSED"
+                         and type(runner.get("mutation_attempts")) is int
+                         and runner["mutation_attempts"] == 0
+                         and type(runner.get("reason")) is str
+                         and bool(runner["reason"]),
+                         "RUNNER_ONLY_OUTCOME_MISMATCH")
+    else:
+        source_fields = {
+            "kind", "job_id", "sha", "ready", "mutation_attempts",
+            "verdict", "reason", "started_utc", "finished_utc",
+            "governor_token", "governor_release", "authority_checked_utc",
+            "authority_digests", "authority_stop_jobs_present",
+        }
+        if result["verdict"] == "OPEN":
+            source_fields |= {
+                "mutation_started_utc", "submission", "ledger_confirmation",
+                "account_liability",
+            }
+        _release_require(set(source) == source_fields,
+                         "SOURCE_RECEIPT_SHAPE_MISMATCH")
+        _release_compare("SOURCE", source, {
+            "kind": "margin_operation", "job_id": job_id,
+            "sha": runner.get("sha"), "ready": validated.margin_operation,
+            "verdict": result["verdict"], "reason": runner.get("reason"),
+            "governor_token": token, "governor_release": "PENDING",
+            "authority_digests": digests,
+        })
+        _release_require(runner.get("source_receipt_path") == source_path,
+                         "SOURCE_RECEIPT_PATH_MISMATCH")
+        digest_fields = {
+            "ready_params", "job_file", "accept_one", "operator",
+            "stop_jobs", "operator_token", "job_expiry",
+        }
+        _release_require(set(digests) == digest_fields and all(
+            type(value) is str
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            for value in digests.values()
+        ), "SOURCE_DIGESTS_SHAPE_MISMATCH")
+        _release_require(source.get("authority_stop_jobs_present") is
+                         (digests.get("stop_jobs") != _authority_digest(None)),
+                         "SOURCE_STOP_JOBS_DIGEST_MISMATCH")
+        ready = source["ready"]
+        _release_compare("SOURCE_DIGEST", digests, {
+            "ready_params": _json_authority_digest(ready.get("params")),
+            "operator_token": _authority_digest(
+                job["operator_token"].encode("utf-8")
+            ),
+            "job_expiry": _authority_digest(
+                job["expires_utc"].encode("utf-8")
+            ),
+        })
+        if result["verdict"] == "OPEN":
+            principal = _canonical_decimal_text(validated.requested_max_notional)
+            submission = source.get("submission")
+            _release_require(runner.get("reason")
+                             == ready["expected_ledger_confirmation"]["status"],
+                             "RUNNER_REASON_MISMATCH")
+            _release_require(type(source.get("mutation_attempts")) is int,
+                             "SOURCE_MUTATION_ATTEMPTS_MISMATCH")
+            _release_compare("SOURCE", source, {
+                "mutation_attempts": 1,
+                "ledger_confirmation": ready["expected_ledger_confirmation"],
+                "account_liability": {
+                    "asset": validated.symbol, "borrowed": principal,
+                    "interest": "0", "total_liability": principal,
+                },
+            })
+            _release_require(
+                isinstance(submission, dict)
+                and set(submission) == {"kind", "transaction_id"}
+                and submission.get("kind") == "ok"
+                and type(submission.get("transaction_id")) is str
+                and bool(submission["transaction_id"]),
+                "SOURCE_SUBMISSION_MISMATCH",
+            )
+        else:
+            _release_require(type(source.get("mutation_attempts")) is int
+                             and source["mutation_attempts"] == 0
+                             and type(source.get("reason")) is str
+                             and bool(source["reason"]),
+                             "SOURCE_REFUSAL_MISMATCH")
+
+    lock = _release_artifact(lock_path, "LOCK")[0]
+    _release_require(set(lock) == {"version", "token", "op", "symbol", "utc"}
+                     and type(lock.get("version")) is int
+                     and lock.get("version") == 1, "LOCK_SHAPE_MISMATCH")
+    _release_compare("LOCK", lock, {
+        "token": token, "op": margin_ops.MARGIN_BORROW,
+        "symbol": validated.symbol,
+    })
+    try:
+        _timestamp(lock.get("utc"))
+    except (JobRefusal, TypeError):
+        raise JobRefusal("LOCK_UTC_INVALID") from None
+    return token, source_path if source_exists else ""
+
+
+def release_stuck_lock(job_id: str, confirm_release: bool,
+                       receipt_dir: Optional[str] = None,
+                       now: Optional[datetime] = None) -> int:
+    if confirm_release is not True:
+        print("JOB-RUNNER | RELEASE REFUSED | CONFIRM_RELEASE_REQUIRED")
+        return 3
+    receipt_dir = os.path.abspath(os.path.expanduser(
+        receipt_dir or os.environ.get("RECEIPT_DIR", "~/quant_receipts")
+    ))
+    paths = _paths(receipt_dir)
+    now = now or _utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    try:
+        token, source_path = _attest_stuck_margin_lock(
+            paths, receipt_dir, job_id
+        )
+    except JobRefusal as refusal:
+        print("JOB-RUNNER | RELEASE REFUSED | " + refusal.reason)
+        return 3
+    if not _release_recovered_governor(token, receipt_dir):
+        reason = "GOVERNOR_RELEASE_FAILED"
+    elif os.path.exists(os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)):
+        reason = "LOCK_RELEASE_UNCONFIRMED"
+    elif not _mark_margin_governor_released(
+            paths, job_id, source_path, token, now, "RELEASED"):
+        reason = "RECEIPT_MARKING_FAILED"
+    else:
+        print("JOB-RUNNER | RELEASED | " + job_id)
+        return 0
+    print("JOB-RUNNER | RELEASE REFUSED | " + reason)
+    return 3
 
 
 def _realized_close_values(outcome: Outcome) \
@@ -4606,20 +4676,23 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 print("JOB-RUNNER | HALTED | stale lock evidence unavailable")
                 return 3
             print(json.dumps(stale_recovery, separators=(",", ":")))
+        # Automatic governor release is forbidden.  Review the durable halt
+        # row, then use release-stuck-lock with the job id and confirmation.
+        margin_governor_halt = _halt_interrupted_margin_governor(
+            paths, receipt_dir, now
+        )
+        if margin_governor_halt is not None:
+            _touch_stop(paths["stop"])
+            if not margin_governor_halt:
+                print("JOB-RUNNER | HALTED | governor evidence unavailable")
+            else:
+                print("JOB-RUNNER | HALTED | governor release is pending")
+            return 3
         result_ids, bad_results, unresolved_result = _result_ids(paths["results"])
         if bad_results:
             _touch_stop(paths["stop"])
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
             return 3
-        margin_governor_recovery = _recover_final_margin_governor(
-            paths, receipt_dir, now
-        )
-        if margin_governor_recovery is not None:
-            if not margin_governor_recovery:
-                _touch_stop(paths["stop"])
-                print("JOB-RUNNER | HALTED | governor recovery incomplete")
-                return 3
-            return 0
         if unresolved_result or _unresolved_account_state(receipt_dir):
             _touch_stop(paths["stop"])
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
@@ -4767,10 +4840,23 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--tick", action="store_true",
                         help="consume at most one due job")
+    commands = parser.add_subparsers(dest="command")
+    release = commands.add_parser(
+        "release-stuck-lock",
+        help="manually release one fully attested governor lock",
+    )
+    release.add_argument("--job-id", required=True)
+    release.add_argument(
+        "--confirm-release", action="store_true", required=True
+    )
     args = parser.parse_args(argv)
-    if not args.tick:
-        parser.error("--tick is required")
-    return tick()
+    if args.command == "release-stuck-lock":
+        if args.tick:
+            parser.error("choose either --tick or release-stuck-lock")
+        return release_stuck_lock(args.job_id, args.confirm_release)
+    if args.tick:
+        return tick()
+    parser.error("--tick or release-stuck-lock is required")
 
 
 if __name__ == "__main__":
