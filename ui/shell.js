@@ -118,7 +118,8 @@
     machine: ["Machine", "Not built yet — it arrives when you order it."],
     journal: ["Journal", "Not built yet — it arrives when you order it."],
     settings: ["Settings", "Not built yet — it arrives when you order it."],
-    connections: ["Connections", ""]
+    connections: ["Connections", ""],
+    news: ["News", ""]
   };
 
   function route() {
@@ -131,10 +132,16 @@
       else { rows[i].removeAttribute("aria-current"); }
     }
     pageEl.textContent = "";
+    stopNewsPoll();
     if (h === "connections") {
       pageEl.style.padding = "0";
       sigPage = pageEl;
       buildConnectionsPage(pageEl);
+    } else if (h === "news") {
+      pageEl.style.padding = "0";
+      sigPage = null;
+      buildNewsPage(pageEl);
+      startNewsPoll();
     } else {
       pageEl.style.padding = "";
       sigPage = null;
@@ -248,8 +255,6 @@
   var RPANELS = {
     watchlist: ["Watchlist",
       "Empty — tokens arrive when you order them."],
-    news: ["News",
-      "No source wired yet — arrives with a data contract."],
     calendar: ["Calendar",
       "No source wired yet — arrives with a data contract."]
   };
@@ -546,6 +551,193 @@
     logoutRow.removeAttribute("href");
     logoutRow.setAttribute("title",
       "No session on this Mac — live on the hosted site");
+  }
+
+  /* ---- News page: /api/news, filter pills, dense list ---- */
+  var newsBtn = document.getElementById("rb-news");
+  var newsData = null;
+  var newsFilter = "all";
+  var newsTimer = null;
+  var newsHost = null;
+
+  newsBtn.addEventListener("click", function () {
+    location.hash = "#news";
+  });
+
+  function newsAgeText(asOf) {
+    if (!asOf) { return "—"; }
+    var then = Date.parse(asOf);
+    if (!isFinite(then)) { return "—"; }
+    var sec = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (sec < 90) { return "Updated " + sec + "s ago"; }
+    var min = Math.round(sec / 60);
+    if (min < 90) { return "Updated " + min + "m ago"; }
+    return "Updated " + Math.round(min / 60) + "h ago";
+  }
+
+  function fetchNews() {
+    fetch("/api/news", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var prev = newsData && newsData.as_of;
+        newsData = d;
+        if (newsHost && (!prev || !d || prev !== d.as_of)) {
+          renderNews();
+        } else if (newsHost) {
+          var upd = newsHost.querySelector(".news-upd");
+          if (upd && d) { upd.textContent = newsAgeText(d.as_of); }
+        }
+      })
+      .catch(function () {
+        newsData = null;
+        if (newsHost) { renderNews(); }
+      });
+  }
+
+  function startNewsPoll() {
+    fetchNews();
+    if (!newsTimer) { newsTimer = setInterval(fetchNews, 60000); }
+  }
+
+  function stopNewsPoll() {
+    if (newsTimer) { clearInterval(newsTimer); newsTimer = null; }
+    newsHost = null;
+  }
+
+  function newsCounts(items) {
+    var c = { 3: 0, 2: 0, 1: 0 };
+    for (var i = 0; i < items.length; i++) {
+      var lvl = items[i].impact === 3 ? 3 : (items[i].impact === 2 ? 2 : 1);
+      c[lvl] += 1;
+    }
+    return c;
+  }
+
+  function renderNews() {
+    if (!newsHost) { return; }
+    newsHost.textContent = "";
+    var head = document.createElement("div");
+    head.className = "news-head";
+    var title = document.createElement("span");
+    title.className = "news-title";
+    title.textContent = "News";
+    var upd = document.createElement("span");
+    upd.className = "news-upd";
+    head.appendChild(title);
+    head.appendChild(upd);
+    newsHost.appendChild(head);
+
+    if (!newsData || !newsData.present) {
+      upd.textContent = "—";
+      var empty = document.createElement("div");
+      empty.className = "news-empty";
+      empty.textContent = newsData
+        ? "No news mirrored yet — run ui/news_fetcher.py once; scheduling arrives with the wiring build."
+        : "Server unreachable.";
+      newsHost.appendChild(empty);
+      return;
+    }
+
+    upd.textContent = newsAgeText(newsData.as_of);
+    var ageSec = (Date.now() - Date.parse(newsData.as_of)) / 1000;
+    upd.classList.toggle("stale", isFinite(ageSec) && ageSec > 900);
+
+    var items = newsData.items || [];
+    var counts = newsCounts(items);
+
+    var pills = document.createElement("div");
+    pills.className = "pillrow";
+    var defs = [
+      ["all", "All"], ["3", "High"], ["2", "Medium"], ["1", "Low"]];
+    for (var pi = 0; pi < defs.length; pi++) {
+      (function (val, label) {
+        var b = document.createElement("button");
+        b.className = "fpill" + (newsFilter === val ? " on" : "");
+        b.textContent = label;
+        b.addEventListener("click", function () {
+          newsFilter = val;
+          renderNews();
+        });
+        pills.appendChild(b);
+      })(defs[pi][0], defs[pi][1]);
+    }
+    newsHost.appendChild(pills);
+
+    var sum = document.createElement("div");
+    sum.className = "news-sum";
+    sum.textContent = items.length + " items · " + counts[3] + " High · " +
+      counts[2] + " Medium · " + counts[1] + " Low · UTC";
+    newsHost.appendChild(sum);
+
+    var list = document.createElement("div");
+    list.className = "news-list";
+    var hrow = document.createElement("div");
+    hrow.className = "news-hrow";
+    var labels = ["Time", "Source", "!", "Headline", "Category"];
+    for (var li = 0; li < labels.length; li++) {
+      var hcell = document.createElement("span");
+      hcell.textContent = labels[li];
+      hrow.appendChild(hcell);
+    }
+    list.appendChild(hrow);
+
+    var shown = 0;
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var lvl = it.impact === 3 ? 3 : (it.impact === 2 ? 2 : 1);
+      if (newsFilter !== "all" && String(lvl) !== newsFilter) { continue; }
+      shown += 1;
+      var row = document.createElement("div");
+      row.className = "news-row";
+      var tm = document.createElement("span");
+      tm.className = "n-time";
+      tm.textContent = (typeof it.ts === "string" && it.ts.length >= 16)
+        ? it.ts.slice(11, 16) : "—";
+      var src = document.createElement("span");
+      src.className = "n-src";
+      src.textContent = it.source || "—";
+      var imp = document.createElement("span");
+      imp.className = "n-imp i" + lvl;
+      imp.textContent = lvl === 3 ? "H" : (lvl === 2 ? "M" : "L");
+      var hd = document.createElement("span");
+      hd.className = "n-head";
+      var link;
+      if (it.url) {
+        link = document.createElement("a");
+        link.href = it.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      } else {
+        link = document.createElement("span");
+      }
+      link.textContent = it.title || "—";
+      link.title = it.title || "";
+      hd.appendChild(link);
+      var cat = document.createElement("span");
+      cat.className = "n-cat";
+      cat.textContent = it.category || "—";
+      row.appendChild(tm);
+      row.appendChild(src);
+      row.appendChild(imp);
+      row.appendChild(hd);
+      row.appendChild(cat);
+      list.appendChild(row);
+    }
+    newsHost.appendChild(list);
+    if (!shown) {
+      var none = document.createElement("div");
+      none.className = "news-empty";
+      none.textContent = "Nothing at this impact level in the mirror.";
+      newsHost.appendChild(none);
+    }
+  }
+
+  function buildNewsPage(container) {
+    var page = document.createElement("div");
+    page.className = "news-page";
+    container.appendChild(page);
+    newsHost = page;
+    renderNews();
   }
 
   /* ---- one floating tooltip for every [data-tip] ---- */

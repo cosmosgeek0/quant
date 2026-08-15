@@ -156,6 +156,7 @@ class ServerHarness(unittest.TestCase):
             "governor_dir": missing_root,
             "governor_lock": missing_root / "account-governor.lock",
             "manifest": missing_root / "pull_manifest.json",
+            "news": missing_root / "news.jsonl",
         }
 
     @staticmethod
@@ -1174,8 +1175,8 @@ class TestReadOnlyGuarantees(ServerHarness):
             "basis_position", "basis_receipts_dir", "events", "fees",
             "governor_dir", "governor_lock", "health", "job_receipts_dir",
             "job_results", "jobs_log", "manifest", "momentum_decisions",
-            "momentum_receipts", "momentum_state", "proposals_dir", "stop",
-            "stop_jobs", "stream_log", "stream_state",
+            "momentum_receipts", "momentum_state", "news", "proposals_dir",
+            "stop", "stop_jobs", "stream_log", "stream_state",
         ])
 
     def test_head_matches_status_and_has_empty_body(self):
@@ -1328,6 +1329,34 @@ class TestDefaultSources(unittest.TestCase):
         fixture_sources = [name for name, path in sources.items()
                            if "fixtures" in path.parts]
         self.assertEqual(fixture_sources, ["events"])
+
+
+class TestNewsEndpoint(ServerHarness):
+
+    def test_news_absent_then_present(self):
+        root = self.tempdir()
+        sources = self.empty_sources(root / "missing")
+        news_path = root / "news.jsonl"
+        sources["news"] = news_path
+        base = self.start(sources)
+        payload = self.get_json(base, "/api/news")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["count"], 0)
+        news_path.write_text(
+            '{"id":"1","ts":"2026-08-15T05:00:00Z","source":"Fed",'
+            '"title":"FOMC rate decision","url":"https://example.org",'
+            '"impact":3,"category":"Macro"}\n'
+            'not json\n'
+            '{"id":"2","ts":"2026-08-15T05:01:00Z","source":"Wu",'
+            '"title":"Listing update","url":"","impact":2,'
+            '"category":"Exchange"}\n',
+            encoding="utf-8")
+        payload = self.get_json(base, "/api/news")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["parse_errors"], 1)
+        self.assertEqual(payload["items"][0]["impact"], 3)
+        self.assertIsNotNone(payload["as_of"])
 
 
 if __name__ == "__main__":

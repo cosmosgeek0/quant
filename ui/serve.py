@@ -104,6 +104,7 @@ MOMENTUM_RESULT_OPS = frozenset({
 RECENT_HEALTH_RECORDS = 200
 RECENT_JOB_LOG_LINES = 40
 RECENT_DECISIONS = 50
+RECENT_NEWS = 200
 RECENT_FAILURES = 50
 FAILURE_SCAN_RECORDS = 250
 TAIL_BYTES = 1024 * 1024
@@ -197,6 +198,7 @@ def default_sources():
         "governor_dir": LIVE_DIR,
         "governor_lock": LIVE_DIR / "account-governor.lock",
         "manifest": LIVE_DIR / "pull_manifest.json",
+        "news": LIVE_DIR / "news.jsonl",
     }
 
 
@@ -1129,6 +1131,28 @@ def api_decisions(sources):
     }
 
 
+def api_news(sources):
+    path = sources["news"]
+    present, raw_records, parse_errors, truncated = _read_jsonl_tail(
+        path, RECENT_NEWS)
+    items = []
+    for record in raw_records:
+        if isinstance(record, dict) and isinstance(record.get("title"), str):
+            items.append(record)
+        else:
+            parse_errors += 1
+    as_of = _path_as_of(path) if present else None
+    return {
+        "source": str(path),
+        "present": present,
+        "as_of": as_of,
+        "count": len(items),
+        "items": items,
+        "parse_errors": parse_errors,
+        "tail_truncated": truncated,
+    }
+
+
 def _failure_verdict(record):
     if not isinstance(record, dict):
         return None
@@ -1426,6 +1450,7 @@ API_ROUTES = {
     "/api/momentum": api_momentum,
     "/api/fees": api_fees,
     "/api/pnl": api_pnl,
+    "/api/news": api_news,
 }
 
 
