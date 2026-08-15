@@ -1419,9 +1419,36 @@ class TestTelemetryEndpoint(ServerHarness):
         self.assertTrue(payload["truncated"])
         self.assertEqual(payload["stride"], 2)
         self.assertEqual(payload["count"], total)
-        self.assertEqual(len(payload["points"]), cap // 2 + 1)
-        self.assertEqual(payload["points"][0]["value"], 0)
+        self.assertEqual(len(payload["points"]), (total + 1) // 2)
+        # bucket-merged: each point carries the bucket's last non-null
+        self.assertEqual(payload["points"][0]["value"], 1)
         self.assertEqual(payload["points"][-1]["value"], total - 1)
+
+    def test_downsample_merge_preserves_sparse_fields(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        cap = serve.TELEMETRY_MAX_POINTS
+        total = cap * 2
+        rows = []
+        for index in range(total):
+            row = {"ts": self.utc_text(
+                now - timedelta(seconds=total - 1 - index)),
+                "dense": index}
+            if index % 15 == 0:
+                row["sparse"] = index
+            rows.append(row)
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=6h")
+
+        kept_sparse = sum(1 for p in payload["points"]
+                          if p.get("sparse") is not None)
+        expected = sum(1 for r in rows if "sparse" in r)
+        self.assertEqual(kept_sparse, expected)
 
     def test_malformed_lines_and_unparseable_timestamps_are_counted(self):
         root = self.tempdir()

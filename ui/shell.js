@@ -739,14 +739,18 @@
       var m = NET_METRICS[mi];
       var thr = thrFor(m.key);
       if (!thr) { continue; }
-      var prev = null;
+      var confirmed = null;
+      var pending = null;
+      var pendingTs = null;
       for (var i = 0; i < actData.length; i += 1) {
         var v = telNum(actData[i][m.field]);
         if (v == null) { continue; }
         var cur = v >= thr.bad ? "bad"
           : v >= thr.warn ? "warn" : "ok";
-        if (prev !== null && cur !== prev) {
-          var ts = Date.parse(actData[i].ts);
+        if (confirmed === null) { confirmed = cur; continue; }
+        if (cur === confirmed) { pending = null; continue; }
+        if (pending === cur) {
+          var ts = Date.parse(pendingTs);
           if (isFinite(ts) && ts >= t0) {
             var at = Math.min(23, Math.max(0,
               Math.floor((ts - t0) / 3600000)));
@@ -754,8 +758,12 @@
             else if (cur === "warn") { buckets[at].m += 1; }
             else { buckets[at].l += 1; }
           }
+          confirmed = cur;
+          pending = null;
+        } else {
+          pending = cur;
+          pendingTs = actData[i].ts;
         }
-        prev = cur;
       }
     }
     return buckets;
@@ -983,9 +991,7 @@
         }
       }
     }
-    var evCap3 = document.getElementById("net-events-cap");
-    var changes = evCap3 && /^(\d+)/.test(evCap3.textContent)
-      ? evCap3.textContent.match(/^(\d+)/)[1] : "0";
+    var changes = String(netEvCount);
     host.textContent = "";
     host.appendChild(statTile("Server RTT p50", p50));
     host.appendChild(statTile("Slowest vs rhythm",
@@ -1107,6 +1113,8 @@
   }
 
   var netFetchSeq = 0;
+  var netEvLedger = {};
+  var netEvCount = 0;
 
   function fetchTelemetry() {
     var seq = ++netFetchSeq;
@@ -1529,7 +1537,6 @@
       }
     }
     updatePanels();
-    updateStats();
     var evHost2 = document.getElementById("net-events");
     if (evHost2 && window.QNet && QNet.events) {
       var evDefs = [];
@@ -1540,14 +1547,35 @@
           thr: thrFor(NET_METRICS[ei].key) });
       }
       var evRows = QNet.events.compute(telemPoints(), evDefs);
-      QNet.events.render(evHost2, evRows);
+      /* audit fix: learned thresholds drift as history deepens and
+         can re-grade the past, silently erasing real incidents from
+         the list. Once observed, a transition enters the session
+         ledger and stays — the list shows the ledger, windowed. */
+      for (var eli = 0; eli < evRows.length; eli += 1) {
+        var er = evRows[eli];
+        netEvLedger[er.key + "|" + er.ts + "|" + er.to] = er;
+      }
+      var cutoff = Date.now() - rangeSeconds() * 1000;
+      var ledgerRows = [];
+      var evKeys = Object.keys(netEvLedger);
+      for (var elk = 0; elk < evKeys.length; elk += 1) {
+        var lr = netEvLedger[evKeys[elk]];
+        var lts = Date.parse(lr.ts);
+        if (isFinite(lts) && lts >= cutoff) { ledgerRows.push(lr); }
+      }
+      ledgerRows.sort(function (a, b) {
+        return new Date(b.ts).getTime() - new Date(a.ts).getTime();
+      });
+      netEvCount = ledgerRows.length;
+      QNet.events.render(evHost2, ledgerRows);
       var evCap2 = document.getElementById("net-events-cap");
       if (evCap2) {
-        evCap2.textContent = evRows.length
-          ? evRows.length + " in the " + netTelem.range + " window"
+        evCap2.textContent = ledgerRows.length
+          ? ledgerRows.length + " in the " + netTelem.range + " window"
           : netTelem.range + " window";
       }
     }
+    updateStats();
     updateBanner();
   }
 

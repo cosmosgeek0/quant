@@ -25,30 +25,41 @@
 
     for (i = 0; i < metrics.length; i += 1) {
       var def = metrics[i];
-      var previous = null;
+      var confirmed = null;
+      var pending = null;
+      var pendingTs = null;
 
       for (j = 0; j < samples.length; j += 1) {
         var point = samples[j];
         var current = state(point[def.field], def.thr);
 
         if (current === null) { continue; }
-        if (previous !== null && current !== previous) {
+        if (confirmed === null) { confirmed = current; continue; }
+        if (current === confirmed) { pending = null; continue; }
+        /* audit fix: one-sample flickers are not incidents — a new
+           state must hold for two consecutive samples to count */
+        if (pending === current) {
           rows.push({
-            ts: point.ts,
+            ts: pendingTs,
             key: def.key,
             label: def.label,
-            from: previous,
+            from: confirmed,
             to: current
           });
+          confirmed = current;
+          pending = null;
+        } else {
+          pending = current;
+          pendingTs = point.ts;
         }
-        previous = current;
       }
     }
 
     rows.sort(function (a, b) {
       return new Date(b.ts).getTime() - new Date(a.ts).getTime();
     });
-    return rows.slice(0, 30);
+    /* the CALLER counts the full list; display capping is render's job */
+    return rows;
   }
 
   function utcTime(timestamp) {
@@ -69,6 +80,7 @@
   }
 
   function render(el, rows) {
+    rows = (rows || []).slice(0, 30);
     var events = Array.isArray(rows) ? rows : [];
     var list = document.createElement("div");
     var i;

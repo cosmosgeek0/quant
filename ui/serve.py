@@ -1215,12 +1215,26 @@ def api_telemetry(sources, range_name="1h", now=None):
     truncated = tail_truncated
     stride = None
     if kept_count > TELEMETRY_MAX_POINTS:
+        # Audit fix: whole-row striding aliased sparse per-metric rows
+        # (a 15s field could vanish entirely for a phase). Merge each
+        # bucket instead: the last non-null value per field survives,
+        # so every metric keeps its presence at display resolution.
         stride = (kept_count + TELEMETRY_MAX_POINTS - 1) \
             // TELEMETRY_MAX_POINTS
-        sampled = records[::stride]
-        if (kept_count - 1) % stride:
-            sampled.append(records[-1])
-        records = sampled
+        merged = []
+        for start in range(0, kept_count, stride):
+            chunk = records[start:start + stride]
+            row = {"ts": chunk[-1]["ts"]}
+            for record in chunk:
+                for key, value in record.items():
+                    if key == "ts":
+                        continue
+                    if value is not None:
+                        row[key] = value
+                    elif key not in row:
+                        row[key] = None
+            merged.append(row)
+        records = merged
         truncated = True
 
     payload = {
