@@ -163,6 +163,7 @@
     stopNetHealthPoll();
     stopNetTelemetry();
     if (netChart) { netChart.destroy(); netChart = null; }
+    if (netMulti) { netMulti.destroy(); netMulti = null; }
     netTable = null;
     netTableHasCadence = false;
     if (h === "network") {
@@ -881,6 +882,7 @@
         : "History arrives from the telemetry recorder.";
     }
     if (netTable) { netTable.update(buildTableModel()); }
+    if (netMulti) { netMulti.update(buildMultiModel()); }
     var evHost2 = document.getElementById("net-events");
     if (evHost2 && window.QNet && QNet.events) {
       var evDefs = [];
@@ -915,6 +917,45 @@
       (worst === 2 ? " dead" : (worst === 1 ? " stale" : ""));
     ol.textContent = worst === 2 ? "OUTAGE"
       : (worst === 1 ? "DEGRADED" : "OPERATIONAL");
+  }
+
+  function sparkSeries(field) {
+    /* sawtooth age series at 15s sampling render as fur inside a
+       ~130px panel — stride-downsample to <=48 points so the spark
+       shows shape, not noise. The big chart keeps full resolution. */
+    var full = telemSeries(field);
+    var ts = full[0];
+    var vs = full[1];
+    if (vs.length <= 48) { return full; }
+    var stride = Math.ceil(vs.length / 48);
+    var ots = [];
+    var ovs = [];
+    for (var i = 0; i < vs.length; i += stride) {
+      ots.push(ts[i]);
+      ovs.push(vs[i]);
+    }
+    if ((vs.length - 1) % stride !== 0) {
+      ots.push(ts[vs.length - 1]);
+      ovs.push(vs[vs.length - 1]);
+    }
+    return [ots, ovs];
+  }
+
+  function buildMultiModel() {
+    var mets = [];
+    for (var i = 0; i < NET_METRICS.length; i++) {
+      var m = NET_METRICS[i];
+      mets.push({ key: m.key, label: m.label, unit: m.unit,
+        series: sparkSeries(m.field), thr: thrFor(m.key),
+        current: currentVal(m.key) });
+    }
+    return { metrics: mets, selected: netChartSel,
+      onSelect: function (key) {
+        if (netChartSel === key) { return; }
+        netChartSel = key;
+        if (netChart) { netChart.destroy(); netChart = null; }
+        renderTelemetry();
+      } };
   }
 
   function connOverallWorst() {
@@ -975,26 +1016,6 @@
     chartCard.className = "qnet-chartcard";
     var tools = document.createElement("div");
     tools.className = "qnet-chart-tools";
-    var mwrap = document.createElement("div");
-    mwrap.className = "pillbar qnet-chart-pills";
-    for (var mi2 = 0; mi2 < NET_METRICS.length; mi2++) {
-      (function (m) {
-        var pb = document.createElement("button");
-        pb.className = "fpill" + (netChartSel === m.key ? " on" : "");
-        pb.textContent = m.label;
-        pb.addEventListener("click", function () {
-          netChartSel = m.key;
-          if (netChart) { netChart.destroy(); netChart = null; }
-          var pills = mwrap.querySelectorAll(".fpill");
-          for (var q = 0; q < pills.length; q++) {
-            pills[q].classList.toggle("on",
-              pills[q].textContent === m.label);
-          }
-          renderTelemetry();
-        });
-        mwrap.appendChild(pb);
-      })(NET_METRICS[mi2]);
-    }
     var rwrap = document.createElement("div");
     rwrap.className = "pillbar qnet-chart-ranges";
     var rdefs = ["1h", "6h", "24h"];
@@ -1015,9 +1036,18 @@
         rwrap.appendChild(rb);
       })(rdefs[ri2]);
     }
-    tools.appendChild(mwrap);
     tools.appendChild(rwrap);
     chartCard.appendChild(tools);
+    /* the instrument grid: every metric visible at once — label,
+       current, real sparkline; click = zoom that metric in the chart */
+    var multiHost = document.createElement("div");
+    multiHost.className = "qmulti-host";
+    chartCard.appendChild(multiHost);
+    if (window.QNet && QNet.multi) {
+      netMulti = QNet.multi.mount(multiHost, buildMultiModel());
+    } else {
+      netMulti = null;
+    }
     var chartHost = document.createElement("div");
     chartHost.id = "net-chart";
     chartHost.className = "qnet-chart";
@@ -1145,6 +1175,7 @@
   /* the Network page keeps its live reference for poll refreshes */
   var sigPage = null;
   var netTable = null;
+  var netMulti = null;
   var netTableHasCadence = false;
 
   /* log out: real endpoint on the hosted site only.
