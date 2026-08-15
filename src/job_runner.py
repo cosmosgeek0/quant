@@ -18,6 +18,8 @@ import os
 import re
 import secrets
 import sys
+import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -46,7 +48,7 @@ TRADING_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {
 TRADING_JOB_OPTIONAL_FIELDS = {"venue"}
 TRADING_JOB_FIELDS = TRADING_JOB_REQUIRED_FIELDS | TRADING_JOB_OPTIONAL_FIELDS
 MARGIN_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {
-    "asset", "principal", "client_tag", "operator_token",
+    "asset", "principal", "client_tag", "intent_id", "operator_token",
 }
 MARGIN_JOB_FIELDS = MARGIN_JOB_REQUIRED_FIELDS
 JOB_REQUIRED_FIELDS = TRADING_JOB_REQUIRED_FIELDS
@@ -66,6 +68,12 @@ ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
 MARGIN_GOVERNOR_RECOVERY_FIELDS = {
     "kind", "job_id", "op", "symbol", "verdict", "utc",
 }
+MARGIN_GOVERNOR_RECOVERY_REFUSAL_FIELDS = {
+    "kind", "job_id", "op", "symbol", "reason", "utc",
+}
+TICK_LOCK_RECOVERY_FIELDS = {
+    "kind", "pid", "age_seconds", "utc",
+}
 TRADING_OPS = {
     "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
     "MOMENTUM_OPEN", "MOMENTUM_EXIT",
@@ -79,6 +87,10 @@ ENTRY_OPS = {
 MOMENTUM_OPS = {"MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT"}
 MOMENTUM_STANDING = {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}
 MAX_JOB_AGE = timedelta(minutes=15)
+# Acceptance clocks may differ by no more than two minutes.
+ACCEPT_ONE_FORWARD_SKEW = timedelta(seconds=120)
+# The runner is scheduled once per minute; a dead lock gets one full interval.
+TICK_INTERVAL_SECONDS = 60.0
 MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
 MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
 MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
@@ -86,8 +98,9 @@ MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 MARGIN_IDENTITY_KEY_RE = re.compile(
-    r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$", re.IGNORECASE
+    r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$"
 )
+ACCOUNT_GOVERNOR_LOCK_FILE = "account-governor.lock"
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
@@ -129,6 +142,7 @@ class Job:
     requested_by: str
     venue: str = "futures"
     operator_token: str = ""
+    intent_id: str = ""
     margin_operation: Optional[Dict[str, Any]] = None
 
 
@@ -279,7 +293,7 @@ def _validate_accept_one_object(raw: Dict[str, Any],
             raise ValueError
         if expires <= created or expires - created > MAX_JOB_AGE:
             raise ValueError
-        if now >= expires:
+        if created > now + ACCEPT_ONE_FORWARD_SKEW or now >= expires:
             raise ValueError
     except (JobRefusal, ArithmeticError, ValueError):
         raise JobRefusal("ACCEPT_ONE_INVALID") from None
@@ -319,8 +333,8 @@ def _margin_job_projection(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {
         name: raw[name]
         for name in (
-            "op", "asset", "principal", "client_tag", "expires_utc",
-            "operator_token",
+            "op", "asset", "principal", "client_tag", "intent_id",
+            "expires_utc", "operator_token",
         )
     }
 
@@ -351,6 +365,9 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
         raise JobRefusal("BAD_JOB_ID")
     if raw["op"] not in MARGIN_OPS:
         raise JobRefusal("BAD_OP")
+    if type(raw["intent_id"]) is not str \
+            or margin_ops.INTENT_ID_RE.fullmatch(raw["intent_id"]) is None:
+        raise JobRefusal("BAD_INTENT_ID")
     if not raw["requested_by"].strip() \
             or len(raw["requested_by"]) > 128:
         raise JobRefusal("BAD_REQUESTER")
@@ -397,12 +414,13 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
         "status": request_type + "_CONFIRMED",
     }
     if set(operation) != {
-            "verdict", "op", "client_tag", "expires_utc",
+            "verdict", "op", "client_tag", "intent_id", "expires_utc",
             "endpoint_path", "params", "expected_ledger_confirmation",
             "evidence"} \
             or operation.get("verdict") != "READY" \
             or operation.get("op") != raw["op"] \
             or operation.get("client_tag") != raw["client_tag"] \
+            or operation.get("intent_id") != raw["intent_id"] \
             or operation.get("expires_utc") != _utc_text(expires) \
             or operation.get("endpoint_path") != MARGIN_ENDPOINT_PATH \
             or operation.get("params") != {
@@ -424,6 +442,7 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
         expires_utc=expires,
         requested_by=raw["requested_by"],
         operator_token=raw["operator_token"],
+        intent_id=raw["intent_id"],
         margin_operation=operation,
     )
 
@@ -522,16 +541,20 @@ def _make_dirs(paths: Dict[str, str]) -> None:
         os.makedirs(paths[name], mode=0o700, exist_ok=True)
 
 
-def _fsync_parent_directory(path: str) -> None:
+def _fsync_parent_directory(path: str, best_effort: bool = False) -> None:
     """Make one created or replaced directory entry durable."""
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    descriptor = os.open(os.path.dirname(os.path.abspath(path)), flags)
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        descriptor = os.open(os.path.dirname(os.path.abspath(path)), flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        if not best_effort:
+            raise
 
 
 def _persist_json_receipt(path: str, payload: Dict[str, Any],
@@ -561,16 +584,32 @@ def _persist_json_receipt(path: str, payload: Dict[str, Any],
         os.replace(temporary, path)
         _fsync_parent_directory(path)
     finally:
+        removed = False
         try:
             os.unlink(temporary)
+            removed = True
         except FileNotFoundError:
             pass
+        if removed:
+            _fsync_parent_directory(temporary, best_effort=True)
 
 
 def _touch_stop(path: str) -> None:
-    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(descriptor)
+    created = False
+    try:
+        descriptor = os.open(
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(path, os.O_WRONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     os.chmod(path, 0o600)
+    if created:
+        _fsync_parent_directory(path)
 
 
 def _entry_ticket_refusal(job: Job, paths: Dict[str, str],
@@ -717,35 +756,116 @@ def _release_governor(release: Optional[Callable[..., Any]], token: str,
     return True
 
 
-def _acquire_tick_lock(path: str, now: datetime) -> Tuple[str, bool]:
-    token = "%s %s %s" % (os.getpid(), _utc_text(now), secrets.token_hex(8))
+def _decode_tick_lock(encoded: bytes) -> Dict[str, Any]:
     try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(descriptor, token.encode("ascii"))
+        owner = json.loads(
+            encoded.decode("ascii"), object_pairs_hook=_strict_object
+        )
+    except (JobRefusal, UnicodeError, ValueError, json.JSONDecodeError):
+        raise ValueError("runner lock is invalid") from None
+    if not isinstance(owner, dict):
+        raise ValueError("runner lock is invalid")
+    return owner
+
+
+def _create_tick_lock(path: str, now: datetime) -> str:
+    token = secrets.token_hex(16)
+    payload = {
+        "pid": os.getpid(),
+        "monotonic_ns": time.monotonic_ns(),
+        "created_utc": _utc_text(now),
+        "token": token,
+    }
+    encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
+        "ascii"
+    )
+    descriptor = os.open(
+        path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+    )
+    try:
+        os.write(descriptor, encoded)
         os.fsync(descriptor)
+    finally:
         os.close(descriptor)
-        return token, False
-    except FileExistsError:
+    _fsync_parent_directory(path)
+    return token
+
+
+def _acquire_tick_lock(path: str, now: datetime) \
+        -> Tuple[str, bool, Optional[Dict[str, str]]]:
+    recovered = None
+    for attempt in range(2):
         try:
-            with open(path, encoding="ascii") as handle:
-                pid = int(handle.read().split()[0])
-            os.kill(pid, 0)
-            return "", False
+            return _create_tick_lock(path, now), False, recovered
+        except FileExistsError:
+            if attempt:
+                return "", False, None
+        try:
+            encoded = _read_file_bytes(path)
+            owner = _decode_tick_lock(encoded)
+            if set(owner) != {
+                    "pid", "monotonic_ns", "created_utc", "token"} \
+                    or type(owner.get("pid")) is not int \
+                    or owner["pid"] <= 0 \
+                    or type(owner.get("monotonic_ns")) is not int \
+                    or owner["monotonic_ns"] < 0 \
+                    or type(owner.get("created_utc")) is not str \
+                    or type(owner.get("token")) is not str \
+                    or not owner["token"]:
+                return "", True, None
+            created = _timestamp(owner["created_utc"])
+        except FileNotFoundError:
+            continue
+        except (JobRefusal, OSError, ValueError):
+            return "", True, None
+        try:
+            os.kill(owner["pid"], 0)
         except PermissionError:
-            return "", False
-        except (OSError, ValueError, IndexError):
-            return "", True
+            return "", False, None
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return "", True, None
+        else:
+            return "", False, None
+
+        current_monotonic = time.monotonic_ns()
+        if current_monotonic >= owner["monotonic_ns"]:
+            age = Decimal(current_monotonic - owner["monotonic_ns"]) \
+                / Decimal("1000000000")
+        else:
+            age = Decimal(str((now - created).total_seconds()))
+        if age < 0:
+            return "", True, None
+        if age <= Decimal(str(TICK_INTERVAL_SECONDS)):
+            return "", False, None
+        try:
+            if _read_file_bytes(path) != encoded:
+                return "", False, None
+            os.unlink(path)
+            _fsync_parent_directory(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "", True, None
+        recovered = {
+            "kind": "runner_stale_lock_recovered",
+            "pid": str(owner["pid"]),
+            "age_seconds": _canonical_decimal_text(age),
+            "utc": _utc_text(now),
+        }
+    return "", False, None
 
 
 def _release_tick_lock(path: str, token: str) -> None:
     if not token:
         return
     try:
-        with open(path, encoding="ascii") as handle:
-            current = handle.read()
-        if current == token:
+        current = _decode_tick_lock(_read_file_bytes(path))
+        if current.get("token") == token:
             os.unlink(path)
-    except OSError:
+            _fsync_parent_directory(path, best_effort=True)
+    except (OSError, ValueError):
         pass
 
 
@@ -754,6 +874,7 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
         return set(), False, False
     identifiers = set()
     margin_recovery_ids = set()
+    margin_recovery_refusal_ids = set()
     unresolved = False
     try:
         with open(path, encoding="utf-8") as handle:
@@ -774,6 +895,16 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                             type(row[name]) is not str for name in fields):
                         return set(), True, False
                     continue
+                if fields == TICK_LOCK_RECOVERY_FIELDS:
+                    if row.get("kind") != "runner_stale_lock_recovered" \
+                            or any(type(row.get(name)) is not str
+                                   for name in fields) \
+                            or not row["pid"].isdigit() \
+                            or _margin_decimal_text(
+                                row["age_seconds"]
+                            ) is None:
+                        return set(), True, False
+                    continue
                 if fields == MARGIN_GOVERNOR_RECOVERY_FIELDS:
                     job_id = row.get("job_id")
                     if row.get("kind") != "margin_governor_release_recovered" \
@@ -781,12 +912,29 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                             or type(job_id) is not str \
                             or job_id not in identifiers \
                             or job_id in margin_recovery_ids \
+                            or job_id in margin_recovery_refusal_ids \
                             or row.get("verdict") in FREEZE_VERDICTS \
                             or any(type(row.get(name)) is not str for name in (
                                 "symbol", "verdict", "utc"
                             )):
                         return set(), True, False
                     margin_recovery_ids.add(job_id)
+                    continue
+                if fields == MARGIN_GOVERNOR_RECOVERY_REFUSAL_FIELDS:
+                    job_id = row.get("job_id")
+                    if row.get("kind") \
+                            != "margin_governor_recovery_refused" \
+                            or row.get("op") != margin_ops.MARGIN_BORROW \
+                            or type(job_id) is not str \
+                            or job_id not in identifiers \
+                            or job_id in margin_recovery_refusal_ids \
+                            or job_id in margin_recovery_ids \
+                            or any(type(row.get(name)) is not str for name in (
+                                "symbol", "reason", "utc"
+                            )) \
+                            or not row["reason"]:
+                        return set(), True, False
+                    margin_recovery_refusal_ids.add(job_id)
                     continue
                 if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
                     return set(), True, False
@@ -875,22 +1023,22 @@ def _claim(paths: Dict[str, str], job_id: str, now: datetime) -> bool:
     return True
 
 
-def _margin_tag_claim_path(paths: Dict[str, str], client_tag: str) -> str:
-    return os.path.join(paths["claims"], "tag-%s.claim" % client_tag)
+def _margin_intent_claim_path(paths: Dict[str, str], intent_id: str) -> str:
+    return os.path.join(paths["claims"], "intent-%s.claim" % intent_id)
 
 
-def _margin_tag_is_claimed(paths: Dict[str, str], client_tag: str) -> bool:
-    return type(client_tag) is str \
-        and margin_ops.CLIENT_TAG_RE.fullmatch(client_tag) is not None \
-        and os.path.isfile(_margin_tag_claim_path(paths, client_tag))
+def _margin_intent_is_claimed(paths: Dict[str, str], intent_id: str) -> bool:
+    return type(intent_id) is str \
+        and margin_ops.INTENT_ID_RE.fullmatch(intent_id) is not None \
+        and os.path.isfile(_margin_intent_claim_path(paths, intent_id))
 
 
-def _claim_margin_tag(paths: Dict[str, str], client_tag: str,
-                      job_id: str, now: datetime) -> bool:
-    if type(client_tag) is not str \
-            or margin_ops.CLIENT_TAG_RE.fullmatch(client_tag) is None:
+def _claim_margin_intent(paths: Dict[str, str], intent_id: str,
+                         job_id: str, now: datetime) -> bool:
+    if type(intent_id) is not str \
+            or margin_ops.INTENT_ID_RE.fullmatch(intent_id) is None:
         return False
-    path = _margin_tag_claim_path(paths, client_tag)
+    path = _margin_intent_claim_path(paths, intent_id)
     try:
         descriptor = os.open(
             path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
@@ -898,7 +1046,7 @@ def _claim_margin_tag(paths: Dict[str, str], client_tag: str,
     except FileExistsError:
         return False
     body = json.dumps({
-        "client_tag": client_tag,
+        "intent_id": intent_id,
         "job_id": job_id,
         "claimed_utc": _utc_text(now),
     }, separators=(",", ":")) + "\n"
@@ -917,6 +1065,8 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
                           ledger: Optional[Dict[str, Any]] = None,
                           governor_token: str = "") -> str:
     path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
+    measured_sha = os.environ.get("QUANT_SHA", "")
+    sha_valid = SHA_RE.fullmatch(measured_sha.lower()) is not None
     payload = {
         "job_id": job_id,
         "op": op,
@@ -924,11 +1074,14 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
         "verdict": verdict,
         "reason": reason,
         "utc": _utc_text(now),
+        "measured_sha": measured_sha,
+        "sha_valid": sha_valid,
     }
     if source_path:
         payload["source_receipt_path"] = source_path
     if op in MARGIN_OPS:
-        payload["sha"] = os.environ.get("QUANT_SHA", "").lower()
+        if sha_valid:
+            payload["sha"] = measured_sha.lower()
         if governor_token:
             payload["governor_token"] = governor_token
             payload["governor_release"] = "PENDING"
@@ -944,11 +1097,23 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
 
 def _append_results_row(paths: Dict[str, str], row: Dict[str, Any]) -> None:
     line = json.dumps(row, separators=(",", ":")) + "\n"
-    descriptor = os.open(paths["results"],
-                         os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-    os.write(descriptor, line.encode("utf-8"))
-    os.fsync(descriptor)
-    os.close(descriptor)
+    created = False
+    try:
+        descriptor = os.open(
+            paths["results"],
+            os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_WRONLY,
+            0o600,
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(paths["results"], os.O_APPEND | os.O_WRONLY)
+    try:
+        os.write(descriptor, line.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if created:
+        _fsync_parent_directory(paths["results"])
 
 
 def _append_adverse_stop_event(paths: Dict[str, str], kind: str, symbol: str,
@@ -3002,23 +3167,53 @@ def _persist_margin_source(path: str, payload: Dict[str, Any],
     _persist_json_receipt(path, payload, create=create)
 
 
-def _margin_transaction_id(payload: Any) -> str:
+def _margin_identity_aliases(payload: Any) -> Optional[List[str]]:
     if not isinstance(payload, dict):
+        return None
+    values: List[str] = []
+    stack = [(payload, True)]
+    visited = set()
+    while stack:
+        current, top_level = stack.pop()
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            for name, value in current.items():
+                if type(name) is str:
+                    normalized = unicodedata.normalize("NFKC", name).casefold()
+                    if MARGIN_IDENTITY_KEY_RE.fullmatch(normalized) is not None:
+                        if not top_level or name not in {"tranId", "txId"}:
+                            return None
+                        if type(value) not in (int, str):
+                            return None
+                        text = str(value)
+                        if not text or len(text) > 128:
+                            return None
+                        values.append(text)
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append((value, False))
+        elif isinstance(current, (list, tuple)):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            for value in current:
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append((value, False))
+    # Exact top-level aliases may mix int and str only when both render to
+    # the identical canonical text.
+    if len(set(values)) > 1:
+        return None
+    return values
+
+
+def _margin_transaction_id(payload: Any) -> str:
+    aliases = _margin_identity_aliases(payload)
+    if aliases is None or not aliases:
         return ""
-    values = []
-    for name in ("tranId", "txId"):
-        if name not in payload:
-            continue
-        value = payload[name]
-        if type(value) not in (int, str):
-            return ""
-        text = str(value)
-        if not text or len(text) > 128:
-            return ""
-        values.append(text)
-    if not values or len(set(values)) != 1:
-        return ""
-    return values[0]
+    return aliases[0]
 
 
 def _margin_decimal_text(value: Any) -> Optional[str]:
@@ -3046,26 +3241,10 @@ def _margin_history_confirmation(payload: Any, transaction_id: str,
     for row in payload["rows"]:
         if not isinstance(row, dict):
             continue
-        if any(
-                type(name) is str
-                and MARGIN_IDENTITY_KEY_RE.fullmatch(name) is not None
-                and name not in {"tranId", "txId"}
-                for name in row):
+        aliases = _margin_identity_aliases(row)
+        if aliases is None:
             return None
-        aliases = []
-        for name in ("tranId", "txId"):
-            if name not in row:
-                continue
-            value = row[name]
-            if type(value) not in (int, str):
-                return None
-            text = str(value)
-            if not text or len(text) > 128:
-                return None
-            aliases.append(text)
-        if len(set(aliases)) > 1:
-            return None
-        if _margin_transaction_id(row) == transaction_id:
+        if aliases and aliases[0] == transaction_id:
             matches.append(row)
     if len(matches) != 1:
         return None
@@ -3291,6 +3470,7 @@ def _run_margin_operation(
             job.margin_operation.get("client_tag", "")
             if isinstance(job.margin_operation, dict) else ""
         ),
+        "intent_id": job.intent_id,
         "expires_utc": _utc_text(job.expires_utc),
         "operator_token": job.operator_token,
     }
@@ -3360,20 +3540,20 @@ def _run_margin_operation(
             authority_refusal, authority_now,
         )
 
-    client_tag = operation["client_tag"]
+    intent_id = operation["intent_id"]
     try:
-        tag_claimed = _claim_margin_tag(
-            paths, client_tag, job.job_id, authority_now
+        intent_claimed = _claim_margin_intent(
+            paths, intent_id, job.job_id, authority_now
         )
     except Exception:
         return _finish_margin_before_post(
             receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_TAG_CLAIM_PERSISTENCE_FAILED", authority_now,
+            "MARGIN_INTENT_CLAIM_PERSISTENCE_FAILED", authority_now,
         )
-    if not tag_claimed:
+    if not intent_claimed:
         return _finish_margin_before_post(
             receipt, source_path, "REFUSED", 2,
-            "TAG_ALREADY_CLAIMED", authority_now,
+            "INTENT_ALREADY_CLAIMED", authority_now,
         )
     sealed_repay = job.op == margin_ops.MARGIN_REPAY and stop_present
     if sealed_repay:
@@ -3612,53 +3792,140 @@ def _mark_margin_governor_released(
 
 
 def _margin_governor_recovery_rows(paths: Dict[str, str]) \
-        -> Tuple[Dict[str, Dict[str, Any]], set]:
+        -> Tuple[Dict[str, Dict[str, Any]], set, set]:
     final_rows: Dict[str, Dict[str, Any]] = {}
     recovered_ids = set()
+    refused_ids = set()
     try:
         with open(paths["results"], encoding="utf-8") as handle:
             for line in handle:
                 row = json.loads(line)
                 if not isinstance(row, dict):
-                    return {}, set()
+                    return {}, set(), set()
                 if row.get("kind") == "margin_governor_release_recovered":
                     job_id = row.get("job_id")
                     if type(job_id) is str:
                         recovered_ids.add(job_id)
+                    continue
+                if row.get("kind") == "margin_governor_recovery_refused":
+                    job_id = row.get("job_id")
+                    if type(job_id) is str:
+                        refused_ids.add(job_id)
                     continue
                 if row.get("op") == margin_ops.MARGIN_BORROW \
                         and row.get("verdict") not in FREEZE_VERDICTS \
                         and type(row.get("job_id")) is str:
                     final_rows[row["job_id"]] = row
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        return {}, set()
-    return final_rows, recovered_ids
+        return {}, set(), set()
+    return final_rows, recovered_ids, refused_ids
+
+
+def _refuse_margin_governor_recovery(
+        paths: Dict[str, str], row: Dict[str, Any], now: datetime,
+        already_refused: bool) -> bool:
+    if already_refused:
+        return False
+    event = {
+        "kind": "margin_governor_recovery_refused",
+        "job_id": str(row.get("job_id", "")),
+        "op": margin_ops.MARGIN_BORROW,
+        "symbol": str(row.get("symbol", "")),
+        "reason": "DURABLE_OWNERSHIP_MISMATCH",
+        "utc": _utc_text(now),
+    }
+    try:
+        _append_results_row(paths, event)
+    except Exception:
+        return False
+    print(json.dumps(event, separators=(",", ":")))
+    return False
 
 
 def _recover_final_margin_governor(
         paths: Dict[str, str], receipt_dir: str, now: datetime) \
         -> Optional[bool]:
-    final_rows, recovered_ids = _margin_governor_recovery_rows(paths)
+    final_rows, recovered_ids, refused_ids = \
+        _margin_governor_recovery_rows(paths)
     for job_id in sorted(final_rows):
         row = final_rows[job_id]
         runner_path = os.path.join(
             paths["receipts"], "job-%s.json" % job_id
         )
-        if os.path.abspath(str(row.get("receipt_path", ""))) \
-                != os.path.abspath(runner_path):
-            continue
+        source_path = os.path.join(
+            paths["receipts"], "margin-%s.json" % job_id
+        )
+        job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
+        lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
         runner = _load_plain_receipt(runner_path)
-        if runner is None or runner.get("job_id") != job_id \
-                or runner.get("op") != margin_ops.MARGIN_BORROW \
-                or runner.get("symbol") != row.get("symbol") \
-                or runner.get("verdict") != row.get("verdict") \
-                or runner.get("governor_release") != "PENDING" \
-                or not SHA_RE.fullmatch(str(runner.get("sha", ""))):
+        source = _load_plain_receipt(source_path)
+        pending = (
+            isinstance(runner, dict)
+            and runner.get("governor_release") == "PENDING"
+        ) or (
+            isinstance(source, dict)
+            and source.get("governor_release") == "PENDING"
+        )
+        if not pending:
             continue
-        governor_token = runner.get("governor_token")
-        if type(governor_token) is not str or not governor_token:
-            continue
+        lock = _load_plain_receipt(lock_path)
+        job = _load_plain_receipt(job_path)
+        governor_token = runner.get("governor_token") \
+            if isinstance(runner, dict) else None
+        ready = source.get("ready") if isinstance(source, dict) else None
+        params = ready.get("params") if isinstance(ready, dict) else None
+        measured_sha = runner.get("measured_sha") \
+            if isinstance(runner, dict) else None
+        ownership_agrees = (
+            os.path.abspath(str(row.get("receipt_path", "")))
+            == os.path.abspath(runner_path)
+            and isinstance(runner, dict)
+            and isinstance(source, dict)
+            and isinstance(lock, dict)
+            and isinstance(job, dict)
+            and runner.get("job_id") == job_id
+            and runner.get("op") == margin_ops.MARGIN_BORROW
+            and runner.get("symbol") == row.get("symbol")
+            and runner.get("verdict") == row.get("verdict")
+            and runner.get("source_receipt_path") == source_path
+            and runner.get("governor_release") == "PENDING"
+            and type(governor_token) is str
+            and bool(governor_token)
+            and source.get("kind") == "margin_operation"
+            and source.get("job_id") == job_id
+            and source.get("verdict") == row.get("verdict")
+            and source.get("governor_release") == "PENDING"
+            and source.get("governor_token") == governor_token
+            and source.get("sha") == runner.get("sha")
+            and SHA_RE.fullmatch(str(runner.get("sha", ""))) is not None
+            and runner.get("sha_valid") is True
+            and type(measured_sha) is str
+            and measured_sha.lower() == runner.get("sha")
+            and set(lock) == {"version", "token", "op", "symbol", "utc"}
+            and lock.get("version") == 1
+            and lock.get("token") == governor_token
+            and lock.get("op") == margin_ops.MARGIN_BORROW
+            and lock.get("symbol") == row.get("symbol")
+            and isinstance(ready, dict)
+            and ready.get("op") == margin_ops.MARGIN_BORROW
+            and isinstance(params, dict)
+            and params.get("asset") == row.get("symbol")
+            and job.get("job_id") == job_id
+            and job.get("op") == margin_ops.MARGIN_BORROW
+            and job.get("asset") == row.get("symbol")
+            and job.get("intent_id") == ready.get("intent_id")
+            and job.get("client_tag") == ready.get("client_tag")
+        )
+        if not ownership_agrees:
+            return _refuse_margin_governor_recovery(
+                paths, row, now, job_id in refused_ids
+            )
         if not _release_recovered_governor(governor_token, receipt_dir):
+            return False
+        if os.path.exists(lock_path):
+            return False
+        if not _mark_margin_governor_released(
+                paths, job_id, source_path, governor_token, now, "RECOVERED"):
             return False
         if job_id not in recovered_ids:
             event = {
@@ -3674,10 +3941,6 @@ def _recover_final_margin_governor(
             except Exception:
                 return False
             print(json.dumps(event, separators=(",", ":")))
-        source_path = runner.get("source_receipt_path", "")
-        if type(source_path) is not str or not _mark_margin_governor_released(
-                paths, job_id, source_path, governor_token, now, "RECOVERED"):
-            return False
         return True
     return None
 
@@ -3919,7 +4182,9 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
     paths = _paths(receipt_dir)
     _make_dirs(paths)
 
-    token, stale = _acquire_tick_lock(paths["tick_lock"], now)
+    token, stale, stale_recovery = _acquire_tick_lock(
+        paths["tick_lock"], now
+    )
     if stale:
         _touch_stop(paths["stop"])
         print("JOB-RUNNER | HALTED | unresolved runner lock")
@@ -3928,6 +4193,14 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
         print("JOB-RUNNER | BUSY | another tick is active")
         return 0
     try:
+        if stale_recovery is not None:
+            try:
+                _append_results_row(paths, stale_recovery)
+            except Exception:
+                _touch_stop(paths["stop"])
+                print("JOB-RUNNER | HALTED | stale lock evidence unavailable")
+                return 3
+            print(json.dumps(stale_recovery, separators=(",", ":")))
         result_ids, bad_results, unresolved_result = _result_ids(paths["results"])
         if bad_results:
             _touch_stop(paths["stop"])
@@ -3998,13 +4271,10 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 return _finish_claimed(
                     paths, receipt_dir, filename_id, op, symbol, outcome, now
                 )
-            if job.op in MARGIN_OPS and isinstance(
-                    job.margin_operation, dict) \
-                    and _margin_tag_is_claimed(
-                        paths, job.margin_operation.get("client_tag", "")
-                    ):
+            if job.op in MARGIN_OPS \
+                    and _margin_intent_is_claimed(paths, job.intent_id):
                 outcome = Outcome(
-                    "REFUSED", 2, "", "TAG_ALREADY_CLAIMED"
+                    "REFUSED", 2, "", "INTENT_ALREADY_CLAIMED"
                 )
                 return _finish_claimed(
                     paths, receipt_dir, job.job_id, job.op,

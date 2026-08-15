@@ -19,6 +19,7 @@ import margin_reconcile  # noqa: E402
 NOW = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
 EXPIRY = "2026-08-15T10:10:00Z"
 ASSET = "USDT"
+INTENT_ID = "mrgintent-" + ("a" * 24)
 
 
 def job(op=margin_ops.MARGIN_BORROW, **changes):
@@ -26,6 +27,7 @@ def job(op=margin_ops.MARGIN_BORROW, **changes):
         "op": op,
         "asset": ASSET,
         "principal": "3",
+        "intent_id": INTENT_ID,
         "expires_utc": EXPIRY,
         "operator_token": "owner-approved-token",
     }
@@ -59,6 +61,7 @@ class MarginOperationTests(unittest.TestCase):
             "verdict": "READY",
             "op": "MARGIN_BORROW",
             "client_tag": expected_tag,
+            "intent_id": INTENT_ID,
             "expires_utc": EXPIRY,
             "endpoint_path": "/sapi/v1/margin/borrow-repay",
             "params": {"asset": ASSET, "amount": "3", "type": "BORROW"},
@@ -69,7 +72,8 @@ class MarginOperationTests(unittest.TestCase):
             "evidence": [
                 "job.op", "asset_whitelist.single", "job.asset",
                 "job.principal", "principal_ceiling=3", "job.expires_utc",
-                "job.operator_token.present", "job.client_tag",
+                "job.operator_token.present", "job.intent_id",
+                "job.client_tag",
             ],
         })
         self.assertNotIn("owner-approved-token", repr(row))
@@ -232,6 +236,26 @@ class MarginOperationTests(unittest.TestCase):
         row = margin_ops.build_margin_operation(value, {ASSET}, NOW)
         self.assertEqual((row["verdict"], row["reason"]),
                          ("REFUSED", "CLIENT_TAG_MISMATCH"))
+
+    def test_intent_id_shape_is_explicit_and_strict(self):
+        ready = margin_ops.build_margin_operation(job(), {ASSET}, NOW)
+        self.assertEqual(ready["intent_id"], INTENT_ID)
+        self.assertRegex(INTENT_ID, re.compile(r"^mrgintent-[0-9a-f]{24}$"))
+        malformed = (
+            None,
+            "mrgintent-" + ("A" * 24),
+            "mrgintent-" + ("a" * 23),
+            "intent-" + ("a" * 24),
+        )
+        for value in malformed:
+            with self.subTest(value=value):
+                row = margin_ops.build_margin_operation(
+                    job(intent_id=value), {ASSET}, NOW
+                )
+                self.assertEqual(
+                    (row["verdict"], row["reason"]),
+                    ("REFUSED", "BAD_INTENT_ID"),
+                )
 
     def test_repeated_build_is_identical(self):
         value = job()

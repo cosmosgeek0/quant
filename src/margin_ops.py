@@ -25,10 +25,12 @@ MAX_OPERATOR_TOKEN_LENGTH = 256
 MAX_PRINCIPAL_TEXT_LENGTH = 64
 CLIENT_TAG_PREFIX = "mrg-"
 CLIENT_TAG_HEX_LENGTH = 24
+INTENT_ID_PREFIX = "mrgintent-"
+INTENT_ID_HEX_LENGTH = 24
 
 JOB_FIELDS = frozenset((
-    "op", "asset", "principal", "client_tag", "expires_utc",
-    "operator_token",
+    "op", "asset", "principal", "client_tag", "intent_id",
+    "expires_utc", "operator_token",
 ))
 FORBIDDEN_JOB_FIELDS = frozenset((
     "activationPrice", "callbackRate", "closePosition", "goodTillDate",
@@ -44,6 +46,10 @@ PRINCIPAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 CLIENT_TAG_RE = re.compile(
     r"^" + re.escape(CLIENT_TAG_PREFIX)
     + r"[0-9a-f]{" + str(CLIENT_TAG_HEX_LENGTH) + r"}$"
+)
+INTENT_ID_RE = re.compile(
+    r"^" + re.escape(INTENT_ID_PREFIX)
+    + r"[0-9a-f]{" + str(INTENT_ID_HEX_LENGTH) + r"}$"
 )
 UTC_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
@@ -72,6 +78,7 @@ class MarginOperationReady(TypedDict):
     verdict: Literal["READY"]
     op: MarginOperation
     client_tag: str
+    intent_id: str
     expires_utc: str
     endpoint_path: str
     params: MarginRequestParams
@@ -162,7 +169,7 @@ def _single_asset(value: Any) -> str:
 
 def deterministic_client_tag(op: str, asset: str, principal: str,
                              expires_utc: str) -> str:
-    """Return the stable local identity for one validated operation intent."""
+    """Return the exchange-side identity for validated operation facts."""
     if type(op) is not str or op not in MARGIN_OPERATIONS:
         raise ValueError("operation is not supported")
     if type(asset) is not str or ASSET_RE.fullmatch(asset) is None:
@@ -242,6 +249,12 @@ def _build(job: Any, asset_whitelist: Any, now: Any,
                            evidence)
         evidence.append("job.operator_token.present")
 
+        intent_id = job["intent_id"]
+        if type(intent_id) is not str \
+                or INTENT_ID_RE.fullmatch(intent_id) is None:
+            raise _Problem("BAD_INTENT_ID", ["job.intent_id"], evidence)
+        evidence.append("job.intent_id")
+
         client_tag = job["client_tag"]
         if type(client_tag) is not str \
                 or CLIENT_TAG_RE.fullmatch(client_tag) is None:
@@ -265,6 +278,7 @@ def _build(job: Any, asset_whitelist: Any, now: Any,
             "verdict": "READY",
             "op": op,
             "client_tag": client_tag,
+            "intent_id": intent_id,
             "expires_utc": expires_utc,
             "endpoint_path": MARGIN_ENDPOINT_PATH,
             "params": {

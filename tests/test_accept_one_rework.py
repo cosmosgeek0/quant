@@ -480,6 +480,25 @@ class AcceptOneReworkTests(unittest.TestCase):
         self.assert_no_entry_order()
         self.assertTrue(os.path.isfile(self.accept_path))
 
+    def test_future_acceptance_beyond_clock_allowance_is_invalid(self):
+        self.assertEqual(
+            jr.ACCEPT_ONE_FORWARD_SKEW, timedelta(seconds=120)
+        )
+        self.write_operator()
+        self.valid_acceptance(
+            created_utc=utc(NOW + timedelta(seconds=121)),
+            expires_utc=utc(NOW + timedelta(minutes=10)),
+        )
+        self.job("future-accept")
+
+        self.assertEqual(self.tick(), 2)
+
+        row = self.results()[-1]
+        self.assertEqual(row["verdict"], "REFUSED")
+        self.assertEqual(self.reason(row), "ACCEPT_ONE_INVALID")
+        self.assert_no_entry_order()
+        self.assertTrue(os.path.isfile(self.accept_path))
+
     def test_malformed_acceptance_forms_are_invalid_without_orders(self):
         self.write_operator()
         valid = {
@@ -536,6 +555,7 @@ class AcceptOneReworkTests(unittest.TestCase):
                         client_tag=jr.margin_ops.deterministic_client_tag(
                             op, "USDT", "2", expires,
                         ),
+                        intent_id="mrgintent-" + ("c" * 24),
                         operator_token="lead",
                     )
                     path = os.path.join(

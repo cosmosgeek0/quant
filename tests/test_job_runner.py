@@ -245,6 +245,14 @@ class JobRunnerTests(unittest.TestCase):
 
         def release_entry_slot(token, receipt_dir):
             self.governor_releases.append((token, receipt_dir))
+            lock_path = os.path.join(
+                receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+            )
+            if os.path.isfile(lock_path):
+                with open(lock_path, encoding="utf-8") as handle:
+                    owner = json.load(handle)
+                if owner.get("token") == token:
+                    os.unlink(lock_path)
 
         def record_realized(net_usdt, fees_usdt, receipt_dir):
             self.governor_realized.append(
@@ -316,6 +324,9 @@ class JobRunnerTests(unittest.TestCase):
             "op": op,
             "asset": "USDT",
             "principal": "3",
+            "intent_id": "mrgintent-" + hashlib.sha256(
+                job_id.encode("ascii")
+            ).hexdigest()[:24],
             "created_utc": utc(NOW - timedelta(minutes=1)),
             "expires_utc": utc(NOW + timedelta(minutes=10)),
             "requested_by": "lead",
@@ -679,6 +690,53 @@ class JobRunnerTests(unittest.TestCase):
         claim = os.path.join(self.jobs_dir, "claims", "job-once.claim")
         self.assertTrue(os.path.isfile(claim))
 
+    def test_dead_tick_lock_after_one_interval_is_recovered(self):
+        paths = jr._paths(self.receipt_dir)
+        jr._make_dirs(paths)
+        old_monotonic = 1_000_000_000
+        current_monotonic = old_monotonic + 61_000_000_000
+        with open(paths["tick_lock"], "w", encoding="ascii") as handle:
+            json.dump({
+                "pid": 424242,
+                "monotonic_ns": old_monotonic,
+                "created_utc": utc(NOW - timedelta(seconds=61)),
+                "token": "previous-tick-token",
+            }, handle)
+
+        with mock.patch.object(
+                jr.os, "kill", side_effect=ProcessLookupError), \
+                mock.patch.object(
+                    jr.time, "monotonic_ns", return_value=current_monotonic):
+            self.assertEqual(self.tick(), 0)
+
+        self.assertFalse(os.path.exists(paths["tick_lock"]))
+        events = self.result_events("runner_stale_lock_recovered")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["pid"], "424242")
+        self.assertEqual(events[0]["age_seconds"], "61")
+        result_ids, bad_results, unresolved = jr._result_ids(paths["results"])
+        self.assertEqual(result_ids, set())
+        self.assertFalse(bad_results)
+        self.assertFalse(unresolved)
+
+    def test_live_tick_lock_is_never_recovered(self):
+        paths = jr._paths(self.receipt_dir)
+        jr._make_dirs(paths)
+        with open(paths["tick_lock"], "w", encoding="ascii") as handle:
+            json.dump({
+                "pid": os.getpid(),
+                "monotonic_ns": 0,
+                "created_utc": utc(NOW - timedelta(hours=1)),
+                "token": "active-tick-token",
+            }, handle)
+
+        with mock.patch.object(
+                jr.time, "monotonic_ns", return_value=3_600_000_000_000):
+            self.assertEqual(self.tick(), 0)
+
+        self.assertTrue(os.path.isfile(paths["tick_lock"]))
+        self.assertEqual(self.results(), [])
+
     def test_tick_consumes_at_most_one_due_job(self):
         self.job("a")
         self.job("b")
@@ -872,6 +930,25 @@ class JobRunnerTests(unittest.TestCase):
                 self.assertEqual(job.margin_operation["verdict"], "READY")
                 self.assertEqual(set(raw), jr.MARGIN_JOB_FIELDS)
 
+    def test_margin_runner_requires_one_well_formed_intent_id(self):
+        missing_path = self.margin_job("margin-intent-missing")
+        with open(missing_path, encoding="utf-8") as handle:
+            missing = json.load(handle)
+        missing.pop("intent_id")
+        with open(missing_path, "w", encoding="utf-8") as handle:
+            json.dump(missing, handle)
+
+        self.assertEqual(self.margin_tick(), 2)
+        self.assertEqual(self.reason(self.results()[-1]), "MISSING_FIELD")
+
+        self.margin_job(
+            "margin-intent-malformed",
+            intent_id="mrgintent-" + ("A" * 24),
+        )
+        self.assertEqual(self.margin_tick(), 2)
+        self.assertEqual(self.reason(self.results()[-1]), "BAD_INTENT_ID")
+        self.assertEqual(self.margin.calls, [])
+
     def test_margin_runner_refuses_non_usdt_asset(self):
         self.margin_job("margin-asset", asset="BTC")
 
@@ -904,6 +981,7 @@ class JobRunnerTests(unittest.TestCase):
                 "verdict": "READY",
                 "op": projection["op"],
                 "client_tag": projection["client_tag"],
+                "intent_id": projection["intent_id"],
                 "expires_utc": projection["expires_utc"],
                 "endpoint_path": jr.MARGIN_ENDPOINT_PATH,
                 "params": {
@@ -1111,7 +1189,21 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.governor_budget_calls, [])
 
     def test_confirmed_margin_borrow_posts_once_and_claims_ticket(self):
-        self.margin_job("margin-borrow")
+        job_path = self.margin_job("margin-borrow")
+        expected_authority = {
+            "job_file": hashlib.sha256(Path(job_path).read_bytes()).hexdigest(),
+            "accept_one": hashlib.sha256(Path(os.path.join(
+                self.receipt_dir, "ACCEPT-ONE"
+            )).read_bytes()).hexdigest(),
+            "operator": hashlib.sha256(Path(os.path.join(
+                self.receipt_dir, "OPERATOR"
+            )).read_bytes()).hexdigest(),
+            "operator_token": hashlib.sha256(b"lead").hexdigest(),
+            "job_expiry": hashlib.sha256(
+                utc(NOW + timedelta(minutes=10)).encode("utf-8")
+            ).hexdigest(),
+            "stop_jobs": hashlib.sha256(b"ABSENT").hexdigest(),
+        }
 
         self.assertEqual(self.margin_tick(), 0)
         self.assertEqual(self.margin_tick(), 0)
@@ -1132,10 +1224,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(source["mutation_attempts"], 1)
         self.assertEqual(source["authority_checked_utc"], utc(NOW))
         self.assertFalse(source["authority_stop_jobs_present"])
-        self.assertEqual(set(source["authority_digests"]), {
-            "job_file", "accept_one", "operator", "operator_token",
-            "stop_jobs", "job_expiry",
-        })
+        self.assertEqual(source["authority_digests"], expected_authority)
         self.assertTrue(all(
             re.fullmatch(r"[0-9a-f]{64}", digest)
             for digest in source["authority_digests"].values()
@@ -1148,6 +1237,7 @@ class JobRunnerTests(unittest.TestCase):
             source["authority_digests"]["stop_jobs"],
             hashlib.sha256(b"ABSENT").hexdigest(),
         )
+        self.assertEqual(source["ready"]["params"], posts[0][3])
         self.assertEqual(
             source["ledger_confirmation"],
             source["ready"]["expected_ledger_confirmation"],
@@ -1172,6 +1262,24 @@ class JobRunnerTests(unittest.TestCase):
         for receipt in (source, runner):
             self.assertEqual(receipt["sha"], SHA)
             self.assertRegex(receipt["sha"], r"^[0-9a-f]{40}$")
+        self.assertEqual(runner["measured_sha"], SHA)
+        self.assertIs(runner["sha_valid"], True)
+
+    def test_bad_quant_sha_receipt_keeps_exact_measurement(self):
+        self.margin_job("margin-bad-sha")
+        measured = "Short-Evidence"
+
+        with mock.patch.dict(os.environ, {"QUANT_SHA": measured}):
+            self.assertEqual(self.margin_tick(), 2)
+
+        row = self.results()[0]
+        self.assertEqual(self.reason(row), "BAD_QUANT_SHA")
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        self.assertEqual(runner["measured_sha"], measured)
+        self.assertIs(runner["sha_valid"], False)
+        self.assertNotIn("sha", runner)
+        self.assertEqual(self.margin.calls, [])
 
     def test_claim_and_receipt_paths_fsync_their_parent_directories(self):
         paths = jr._paths(self.receipt_dir)
@@ -1179,14 +1287,18 @@ class JobRunnerTests(unittest.TestCase):
         claim_path = os.path.join(
             paths["claims"], "job-margin-durable.claim"
         )
-        client_tag = "mrg-" + ("a" * 24)
-        tag_path = jr._margin_tag_claim_path(paths, client_tag)
+        intent_id = "mrgintent-" + ("a" * 24)
+        intent_path = jr._margin_intent_claim_path(paths, intent_id)
         source_path = os.path.join(
             paths["receipts"], "margin-margin-durable.json"
+        )
+        cleanup_path = os.path.join(
+            paths["receipts"], "margin-cleanup-check.json"
         )
         runner_path = os.path.join(
             paths["receipts"], "job-margin-durable.json"
         )
+        stop_path = paths["stop"]
         real_fsync = os.fsync
 
         def directory_syncs(action):
@@ -1216,9 +1328,9 @@ class JobRunnerTests(unittest.TestCase):
             ),
         )
         assert_parent_synced(
-            tag_path,
-            lambda: self.assertTrue(jr._claim_margin_tag(
-                paths, client_tag, "margin-durable", NOW
+            intent_path,
+            lambda: self.assertTrue(jr._claim_margin_intent(
+                paths, intent_id, "margin-durable", NOW
             )),
         )
         assert_parent_synced(
@@ -1234,6 +1346,23 @@ class JobRunnerTests(unittest.TestCase):
             ),
             minimum=2,
         )
+
+        def failed_replace_cleanup():
+            with mock.patch.object(
+                    jr.os, "replace", side_effect=OSError(
+                        "replace unavailable"
+                    )):
+                with self.assertRaises(OSError):
+                    jr._persist_margin_source(
+                        cleanup_path, {"state": "READY"}
+                    )
+
+        assert_parent_synced(
+            cleanup_path, failed_replace_cleanup, minimum=2
+        )
+        self.assertEqual(list(Path(paths["receipts"]).glob(
+            "margin-cleanup-check.json.tmp-*"
+        )), [])
         assert_parent_synced(
             runner_path,
             lambda: jr._write_runner_receipt(
@@ -1242,6 +1371,13 @@ class JobRunnerTests(unittest.TestCase):
             ),
             minimum=2,
         )
+        assert_parent_synced(
+            paths["results"],
+            lambda: jr._append_results_row(
+                paths, {"kind": "durability_check"}
+            ),
+        )
+        assert_parent_synced(stop_path, lambda: jr._touch_stop(stop_path))
 
     def test_margin_claim_replay_without_result_id_never_reposts(self):
         self.margin_job("margin-claim-replay")
@@ -1273,15 +1409,21 @@ class JobRunnerTests(unittest.TestCase):
         )
         self.assertEqual(self.results(), [])
 
-    def test_same_margin_tag_with_different_job_id_is_refused_once_claimed(self):
+    def test_same_margin_intent_refuses_across_job_tag_and_expiry_changes(self):
+        intent_id = "mrgintent-" + ("b" * 24)
         first_path = self.margin_job(
-            "margin-intent-a", op="MARGIN_REPAY"
+            "margin-intent-a", op="MARGIN_REPAY", intent_id=intent_id,
+            expires_utc=utc(NOW + timedelta(minutes=9)),
         )
         with open(first_path, encoding="utf-8") as handle:
-            client_tag = json.load(handle)["client_tag"]
-        self.margin_job(
-            "margin-intent-b", op="MARGIN_REPAY", client_tag=client_tag
+            first = json.load(handle)
+        second_path = self.margin_job(
+            "margin-intent-b", op="MARGIN_REPAY", intent_id=intent_id,
+            expires_utc=utc(NOW + timedelta(minutes=10)),
         )
+        with open(second_path, encoding="utf-8") as handle:
+            second = json.load(handle)
+        self.assertNotEqual(first["client_tag"], second["client_tag"])
 
         self.assertEqual(self.margin_tick(), 0)
         self.assertEqual(self.margin_tick(), 2)
@@ -1295,18 +1437,19 @@ class JobRunnerTests(unittest.TestCase):
                 ("margin-intent-b", "REFUSED"),
             ],
         )
-        self.assertEqual(self.reason(rows[1]), "TAG_ALREADY_CLAIMED")
+        self.assertEqual(self.reason(rows[1]), "INTENT_ALREADY_CLAIMED")
         self.assertEqual(
             len([call for call in self.margin.calls if call[0] == "POST"]),
             1,
         )
-        tag_path = jr._margin_tag_claim_path(
-            jr._paths(self.receipt_dir), client_tag
+        intent_path = jr._margin_intent_claim_path(
+            jr._paths(self.receipt_dir), intent_id
         )
-        self.assertTrue(os.path.isfile(tag_path))
-        with open(tag_path, encoding="utf-8") as handle:
-            tag_claim = json.load(handle)
-        self.assertEqual(tag_claim["job_id"], "margin-intent-a")
+        self.assertTrue(os.path.isfile(intent_path))
+        with open(intent_path, encoding="utf-8") as handle:
+            intent_claim = json.load(handle)
+        self.assertEqual(intent_claim["intent_id"], intent_id)
+        self.assertEqual(intent_claim["job_id"], "margin-intent-a")
 
     def test_margin_history_disagreement_freezes_without_repost(self):
         self.margin.history_payload = {"rows": [{
@@ -1383,6 +1526,10 @@ class JobRunnerTests(unittest.TestCase):
             "near_miss": [dict(valid, tranID="7301")],
             "float_shadow": [dict(valid), dict(valid, txId=7301.0)],
             "boolean": [dict(valid, txId=True)],
+            "nested_conflict": [dict(
+                valid, details={"events": [{"tranId": "8301"}]}
+            )],
+            "normalized_key": [dict(valid, **{"ｔｒａｎＩｄ": "8301"})],
         }
         for name, rows in cases.items():
             with self.subTest(name=name):
@@ -1390,6 +1537,12 @@ class JobRunnerTests(unittest.TestCase):
                     {"rows": rows}, "7301", expected, "BORROW"
                 ))
         self.assertEqual(jr._margin_transaction_id({"tranId": 7301}), "7301")
+        self.assertEqual(jr._margin_transaction_id({
+            "tranId": 7301, "txId": "7301"
+        }), "7301")
+        self.assertEqual(jr._margin_transaction_id({
+            "tranId": 7301, "detail": {"txId": "8301"}
+        }), "")
         self.assertEqual(jr._margin_transaction_id({"tranId": 7301.0}), "")
         self.assertEqual(jr._margin_transaction_id({"tranId": True}), "")
 
@@ -1557,8 +1710,15 @@ class JobRunnerTests(unittest.TestCase):
         class ReleaseInterrupted(Exception):
             pass
 
-        def pause_release(_release, _token, _receipt_dir):
-            Path(lock_path).touch()
+        def pause_release(_release, token, _receipt_dir):
+            with open(lock_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "version": 1,
+                    "token": token,
+                    "op": "MARGIN_BORROW",
+                    "symbol": "USDT",
+                    "utc": utc(NOW),
+                }, handle)
             raise ReleaseInterrupted
 
         with mock.patch.object(
@@ -1581,6 +1741,7 @@ class JobRunnerTests(unittest.TestCase):
             self.governor_releases,
             [(governor_token, self.receipt_dir)],
         )
+        self.assertFalse(os.path.exists(lock_path))
         events = self.result_events("margin_governor_release_recovered")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["job_id"], "margin-release-recovery")
@@ -1593,6 +1754,62 @@ class JobRunnerTests(unittest.TestCase):
             jr._paths(self.receipt_dir)["results"]
         )
         self.assertEqual(result_ids, {"margin-release-recovery"})
+        self.assertFalse(bad_results)
+        self.assertFalse(unresolved)
+
+    def test_margin_governor_recovery_refuses_ownership_disagreement(self):
+        job_id = "margin-recovery-cross-check"
+        self.margin_job(job_id)
+        lock_path = os.path.join(
+            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+
+        class ReleaseInterrupted(Exception):
+            pass
+
+        def pause_release(_release, token, _receipt_dir):
+            with open(lock_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "version": 1,
+                    "token": token,
+                    "op": "MARGIN_BORROW",
+                    "symbol": "USDT",
+                    "utc": utc(NOW),
+                }, handle)
+            raise ReleaseInterrupted
+
+        with mock.patch.object(
+                jr, "_release_governor", side_effect=pause_release):
+            with self.assertRaises(ReleaseInterrupted):
+                self.margin_tick()
+
+        row = self.results()[0]
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        source_path = runner["source_receipt_path"]
+        with open(source_path, encoding="utf-8") as handle:
+            source = json.load(handle)
+        runner["governor_token"] = "runner-token-disagreement"
+        source["governor_token"] = "source-token-disagreement"
+        with open(row["receipt_path"], "w", encoding="utf-8") as handle:
+            json.dump(runner, handle)
+        with open(source_path, "w", encoding="utf-8") as handle:
+            json.dump(source, handle)
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        refusals = self.result_events("margin_governor_recovery_refused")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["job_id"], job_id)
+        self.assertEqual(
+            refusals[0]["reason"], "DURABLE_OWNERSHIP_MISMATCH"
+        )
+        result_ids, bad_results, unresolved = jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        )
+        self.assertEqual(result_ids, {job_id})
         self.assertFalse(bad_results)
         self.assertFalse(unresolved)
 
