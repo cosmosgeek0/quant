@@ -722,20 +722,14 @@
       : netTelem.range === "6h" ? 21600 : 3600;
   }
 
-  function smoothWidthFor(field, spanSec) {
-    var cad = cadenceEst(field);
-    if (!cad) { return 3; }
-    var w = Math.ceil((cad / spanSec) * 2) + 1;
-    if (w % 2 === 0) { w += 1; }
-    return Math.max(3, Math.min(15, w));
-  }
-
   function displaySeries(m, targetPoints) {
+    /* small buckets kill the wide-range aliasing; a light 3-point
+       round-off takes the razor edges. The ups and downs survive —
+       smoothing must never flatten a loop into a straight line. */
     var sf = seriesFilled(m.field, m.key);
-    var span = Math.max(60, Math.round(rangeSeconds() / targetPoints));
+    var span = Math.max(20, Math.round(rangeSeconds() / targetPoints));
     var bucketedPair = bucketAvg(sf[0], sf[1], span);
-    return [bucketedPair[0],
-      movAvg(bucketedPair[1], smoothWidthFor(m.field, span))];
+    return [bucketedPair[0], movAvg(bucketedPair[1], 3)];
   }
 
   var panelCharts = {};
@@ -1115,7 +1109,7 @@
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
           var m = NET_METRICS[mi];
           if (m.unit !== "s") { continue; }
-          var ds = displaySeries(m, 240);
+          var ds = displaySeries(m, 360);
           if (!times) { times = ds[0]; }
           defs.push({
             label: m.label,
@@ -1152,7 +1146,7 @@
         var pHost = document.querySelector(
           "[data-graph=\"" + pm.key + "\"]");
         if (!pHost) { continue; }
-        var psf = displaySeries(pm, 140);
+        var psf = displaySeries(pm, 220);
         var pdef = [{
           label: pm.label,
           unit: pm.unit,
