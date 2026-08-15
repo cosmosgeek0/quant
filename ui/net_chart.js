@@ -691,12 +691,10 @@
          sits on the page's flush text line (owner alignment law) */
       var axis = {
         scale: scaleName, stroke: muted, font: axisFont,
-        size: 52,
+        /* a NARROW gutter: the dead space between the page's left
+           lane and the numbers is gone; numbers stay beside the plot */
+        size: 36,
         side: 3,
-        /* numbers START on the page's flush left lane, like every
-           word on the News tab — not right-tucked against the plot */
-        align: 1,
-        gap: 0,
         space: cfg.compact ? 34 : 40,
         values: function (u, splits) {
           var out = [];
