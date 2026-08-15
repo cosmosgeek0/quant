@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 import zipfile
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 
@@ -27,6 +27,14 @@ EVENTS = {
 def prices(symbol, index):
     if symbol == SPIKE and index == 90:
         return "100", "120", "80", "100"
+    if symbol == RUNNER and index >= 90:
+        close = Decimal("100") + Decimal(index - 90)
+        return (
+            baselines.decimal_text(close),
+            baselines.decimal_text(close + Decimal("0.1")),
+            baselines.decimal_text(close - Decimal("0.1")),
+            baselines.decimal_text(close),
+        )
     if index in EVENTS[symbol]:
         return "100", "101.1", "99.9", "101"
     return "100", "100.1", "99.9", "100"
@@ -34,6 +42,8 @@ def prices(symbol, index):
 
 def volume(symbol, index):
     for event in EVENTS[symbol]:
+        if symbol == RUNNER and index in {event - 2, event - 1}:
+            return "80"
         if index == event:
             return "100" if symbol != SPAM else "60"
         if index in {event + 1, event + 2} and symbol != SPIKE:
@@ -93,7 +103,7 @@ def ignition(symbol, index, move):
 
 def write_replay(path):
     rows = [
-        ignition(RUNNER, 90, ("5", "10", "20")),
+        ignition(RUNNER, 90, ("5", "15", "60")),
         ignition(SPIKE, 90, ("-2", "-3", "-5")),
     ]
     rows.extend(
@@ -154,6 +164,9 @@ class AdaptiveNoiseFilterTests(unittest.TestCase):
             Decimal(runner[0]["features"]["followthrough_magnitude"]),
             Decimal("1"),
         )
+        self.assertEqual(runner[0]["features"]["sustained_hot_count"], 3)
+        self.assertEqual(runner[0]["features"]["magnitude_bucket"], "10x_plus")
+        self.assertEqual(spike[0]["features"]["sustained_hot_count"], 1)
         self.assertGreater(
             Decimal(spike[0]["features"]["range_load"]),
             Decimal(spike[0]["features"]["volume_load"]),
@@ -161,18 +174,94 @@ class AdaptiveNoiseFilterTests(unittest.TestCase):
 
         summary = rows[-1]
         self.assertEqual(summary["kind"], "summary")
+        self.assertEqual(summary["filter"], "adaptive-noise-filter-v2")
         self.assertEqual(summary["kept"], 1)
         self.assertEqual(summary["dropped"], 5)
         self.assertEqual(summary["kept_per_day"], "1")
         self.assertEqual(
+            summary["sustained_confirmation"],
+            {
+                "required_hot_minutes": 3,
+                "window_minutes": 4,
+                "baseline": "token_rolling_volume_regimes_1m_hot",
+                "comparison": "strictly_above",
+                "alignment": "trailing_through_threshold_cross",
+            },
+        )
+        self.assertEqual(
             summary["forward_returns"]["kept"]["15m"]["median_pct"],
-            "10",
+            "15",
         )
         disk = [
             json.loads(line)
             for line in output_path.read_text(encoding="utf-8").splitlines()
         ]
         self.assertEqual(list(rows), disk)
+
+    def test_delay_magnitude_grid_uses_each_synthetic_entry_minute(self):
+        rows, output_path = noise_filter.run_filter(
+            self.replay_path, self.baseline_path
+        )
+        summary = rows[-1]
+        grid = {
+            (cell["delay_minutes"], cell["magnitude_bucket"]): cell
+            for cell in summary["delay_magnitude_grid"]
+        }
+
+        self.assertEqual(len(grid), 24)
+        for delay in noise_filter.ENTRY_DELAYS_MINUTES:
+            cell = grid[(delay, "10x_plus")]
+            self.assertEqual(cell["n"], 1)
+            self.assertEqual(cell["kept_per_day"], "1")
+            entry = Decimal("100") + Decimal(delay)
+            for minutes in noise_filter.FORWARD_MINUTES:
+                with localcontext() as context:
+                    context.prec = 50
+                    expected = (
+                        (
+                            (entry + Decimal(minutes)) / entry
+                        ) - Decimal("1")
+                    ) * Decimal("100")
+                stats = cell["forward_returns"][f"{minutes}m"]
+                self.assertEqual(Decimal(stats["median_pct"]), expected)
+                self.assertEqual(stats["win_pct"], "100")
+
+        empty = grid[(0, "1x_to_lt_2x")]
+        self.assertEqual(empty["n"], 0)
+        self.assertEqual(empty["kept_per_day"], "0")
+        self.assertIsNone(
+            empty["forward_returns"]["5m"]["median_pct"]
+        )
+        for minutes in noise_filter.FORWARD_MINUTES:
+            best = summary["best_grid_cells"][f"{minutes}m"]
+            self.assertEqual(best["delay_minutes"], 0)
+            self.assertEqual(best["magnitude_bucket"], "10x_plus")
+
+        rendered = noise_filter.summary_row(summary, output_path)
+        self.assertEqual(len(rendered.splitlines()), 25)
+        self.assertIn(
+            "GRID | delay=5m | magnitude=10x_plus | n=1 | kept/day=1",
+            rendered,
+        )
+
+    def test_magnitude_ladder_boundaries_are_deterministic(self):
+        cases = (
+            ("0.999", None),
+            ("1", "1x_to_lt_2x"),
+            ("1.999", "1x_to_lt_2x"),
+            ("2", "2x_to_lt_5x"),
+            ("4.999", "2x_to_lt_5x"),
+            ("5", "5x_to_lt_10x"),
+            ("9.999", "5x_to_lt_10x"),
+            ("10", "10x_plus"),
+        )
+        self.assertEqual(
+            [
+                noise_filter._magnitude_bucket(Decimal(value))
+                for value, _expected in cases
+            ],
+            [expected for _value, expected in cases],
+        )
 
 
 if __name__ == "__main__":

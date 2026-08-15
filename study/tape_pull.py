@@ -104,6 +104,7 @@ class PullSummary:
     selected: Tuple[str, ...]
     downloaded: int
     skipped: int
+    gaps: Tuple[Tuple[str, date], ...]
     days: Tuple[date, ...]
 
 
@@ -273,8 +274,30 @@ def kline_path(destination: Path, symbol: str, day: Any) -> Path:
     return Path(destination) / "spot" / "daily" / "klines" / symbol / "1m" / filename
 
 
+def agg_trades_url(symbol: str, day: Any) -> str:
+    symbol = _validate_symbol(symbol)
+    day = _coerce_day(day)
+    filename = "%s-aggTrades-%s.zip" % (symbol, day.isoformat())
+    return "%s/data/spot/daily/aggTrades/%s/%s" % (
+        VISION_BASE_URL,
+        symbol,
+        filename,
+    )
+
+
+def agg_trades_path(destination: Path, symbol: str, day: Any) -> Path:
+    symbol = _validate_symbol(symbol)
+    day = _coerce_day(day)
+    filename = "%s-aggTrades-%s.zip" % (symbol, day.isoformat())
+    return Path(destination) / "spot" / "daily" / "aggTrades" / symbol / filename
+
+
 def _expected_member(symbol: str, day: date) -> str:
     return "%s-1m-%s.csv" % (symbol, day.isoformat())
+
+
+def _expected_agg_trades_member(symbol: str, day: date) -> str:
+    return "%s-aggTrades-%s.csv" % (symbol, day.isoformat())
 
 
 def verify_kline_zip(path: Path, symbol: str, day: Any) -> None:
@@ -300,6 +323,33 @@ def verify_kline_zip(path: Path, symbol: str, day: Any) -> None:
         raise
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
         raise ArchiveError("file is not an intact kline ZIP") from error
+
+
+def verify_agg_trades_zip(path: Path, symbol: str, day: Any) -> None:
+    """Verify aggTrades member identity, size, encryption state, and CRC."""
+    path = Path(path)
+    symbol = _validate_symbol(symbol)
+    day = _coerce_day(day)
+    expected = _expected_agg_trades_member(symbol, day)
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            members = [item for item in archive.infolist() if not item.is_dir()]
+            if len(members) != 1 or members[0].filename != expected:
+                raise ArchiveError(
+                    "archive member does not match expected aggTrades CSV"
+                )
+            member = members[0]
+            if member.flag_bits & 0x1:
+                raise ArchiveError("encrypted archive member is not accepted")
+            if member.file_size <= 0 or member.file_size > MAX_MEMBER_BYTES:
+                raise ArchiveError("archive member size is outside bounds")
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise ArchiveError("archive CRC failed")
+    except ArchiveError:
+        raise
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+        raise ArchiveError("file is not an intact aggTrades ZIP") from error
 
 
 def quote_volume_from_zip(path: Path, symbol: str, day: Any) -> Decimal:
@@ -386,6 +436,72 @@ def download_kline(
     except PublicReadError as error:
         if error.status == 404:
             raise ArchiveMissing("daily kline archive is absent", status=404) from error
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def download_agg_trades(
+    symbol: str,
+    day: Any,
+    destination: Path,
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> DownloadResult:
+    """Download one daily aggTrades archive atomically and idempotently."""
+    symbol = _validate_symbol(symbol)
+    day = _coerce_day(day)
+    target = agg_trades_path(Path(destination), symbol, day)
+    if target.exists():
+        verify_agg_trades_zip(target, symbol, day)
+        return DownloadResult("SKIPPED", symbol, day, target, target.stat().st_size)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".%s." % target.name, suffix=".part", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        response = _open_get(
+            agg_trades_url(symbol, day), opener=opener, sleep_fn=sleep_fn
+        )
+        written = 0
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                while True:
+                    chunk = response.read(READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_ARCHIVE_BYTES:
+                        raise ArchiveError("archive response exceeded byte limit")
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            response.close()
+        if written == 0:
+            raise ArchiveError("archive response was empty")
+        verify_agg_trades_zip(temporary, symbol, day)
+        if target.exists():
+            verify_agg_trades_zip(target, symbol, day)
+            return DownloadResult(
+                "SKIPPED", symbol, day, target, target.stat().st_size
+            )
+        os.replace(temporary, target)
+        return DownloadResult("DOWNLOADED", symbol, day, target, written)
+    except PublicReadError as error:
+        if error.status == 404:
+            raise ArchiveMissing(
+                "daily aggTrades archive is absent", status=404
+            ) from error
         raise
     finally:
         if descriptor >= 0:
@@ -521,6 +637,7 @@ def pull_tapes(
     days: int,
     destination: Path,
     *,
+    agg_trades: bool = False,
     now: Optional[datetime] = None,
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -590,6 +707,7 @@ def pull_tapes(
         )
 
         results: List[DownloadResult] = []
+        gaps: List[Tuple[str, date]] = []
         for symbol in selected:
             ranked = ranked_archives[symbol]
             target = kline_path(destination, symbol, ranking_day)
@@ -631,15 +749,48 @@ def pull_tapes(
                 for symbol, day in remaining
             }
             for future in as_completed(futures):
+                symbol, day = futures[future]
+                try:
+                    result = future.result()
+                except ArchiveMissing:
+                    gaps.append((symbol, day))
+                    emit(
+                        "GAP | %s | %s | reason=archive_absent"
+                        % (symbol, day.isoformat())
+                    )
+                    continue
+                results.append(result)
+                emit(format_progress(result))
+
+        if agg_trades:
+            trade_archives = [
+                (symbol, day)
+                for symbol in selected
+                for day in requested_days
+            ]
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(
+                        download_agg_trades,
+                        symbol,
+                        day,
+                        destination,
+                        opener=opener,
+                        sleep_fn=sleep_fn,
+                    ): (symbol, day)
+                    for symbol, day in trade_archives
+            }
+            for future in as_completed(futures):
                 result = future.result()
                 results.append(result)
                 emit(format_progress(result))
 
     downloaded = sum(result.status == "DOWNLOADED" for result in results)
     skipped = sum(result.status == "SKIPPED" for result in results)
+    gaps.sort(key=lambda item: (item[1], item[0]))
     emit(
-        "DONE | symbols=%d | days=%d | downloaded=%d | skipped=%d"
-        % (len(selected), len(requested_days), downloaded, skipped)
+        "DONE | symbols=%d | days=%d | downloaded=%d | skipped=%d | gaps=%d"
+        % (len(selected), len(requested_days), downloaded, skipped, len(gaps))
     )
     return PullSummary(
         candidates=len(candidates),
@@ -647,6 +798,7 @@ def pull_tapes(
         selected=tuple(selected),
         downloaded=downloaded,
         skipped=skipped,
+        gaps=tuple(gaps),
         days=tuple(requested_days),
     )
 
@@ -685,13 +837,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DEST,
         help="archive root (default: study/data/)",
     )
+    parser.add_argument(
+        "--agg-trades",
+        action="store_true",
+        help="also pull verified daily spot aggTrades archives",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
-        pull_tapes(arguments.cohort, arguments.days, arguments.dest)
+        pull_tapes(
+            arguments.cohort,
+            arguments.days,
+            arguments.dest,
+            agg_trades=arguments.agg_trades,
+        )
     except TapePullError as error:
         print("ERROR | %s | %s" % (type(error).__name__, error), file=sys.stderr)
         return 1

@@ -224,6 +224,11 @@ run_stage feed "0" \
 run_stage stream "0" \
   stream_stage
 
+run_stage basis_recorder "0" \
+  python3 "$DEPLOY_DIR/src/basis_recorder.py" \
+    --stream-state "$STREAM_STATE" \
+    --receipt-dir "$RECEIPT_DIR"
+
 if [ -e "$STOP_FILE" ] || [ -e "$STOP_JOBS_FILE" ]; then
   run_stage basis_watch "0" \
     python3 "$DEPLOY_DIR/src/basis_watch.py" --once \
