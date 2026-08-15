@@ -118,7 +118,7 @@
     machine: ["Machine", "Not built yet — it arrives when you order it."],
     journal: ["Journal", "Not built yet — it arrives when you order it."],
     settings: ["Settings", "Not built yet — it arrives when you order it."],
-    signal: ["Signal", ""]
+    connections: ["Connections", ""]
   };
 
   function route() {
@@ -131,34 +131,20 @@
       else { rows[i].removeAttribute("aria-current"); }
     }
     pageEl.textContent = "";
-    var b = document.createElement("b");
-    b.textContent = PAGES[h][0] + ".";
-    pageEl.appendChild(b);
-    if (h === "signal") {
-      var holder = document.createElement("div");
-      holder.style.maxWidth = "520px";
-      holder.style.marginTop = "14px";
-      pageEl.appendChild(document.createTextNode(
-        " Live readings from the machine's mirror."));
-      pageEl.appendChild(holder);
-      sigPage = holder;
-      if (typeof buildSigRows === "function" && lastStrip !== undefined) {
-        buildSigRows(holder);
-      }
-      var note = document.createElement("div");
-      note.style.marginTop = "14px";
-      note.textContent =
-        "Full watchdog detail lands under Settings when you order it.";
-      pageEl.appendChild(note);
+    if (h === "connections") {
+      pageEl.style.padding = "0";
+      sigPage = pageEl;
+      buildConnectionsPage(pageEl);
     } else {
+      pageEl.style.padding = "";
       sigPage = null;
+      var b = document.createElement("b");
+      b.textContent = PAGES[h][0] + ".";
+      pageEl.appendChild(b);
       pageEl.appendChild(document.createTextNode(" " + PAGES[h][1]));
     }
     closePop();
   }
-
-  window.addEventListener("hashchange", route);
-  route();
 
   /* ---- account popup: hover opens, click goes to settings ---- */
   var popTimer = null;
@@ -303,43 +289,165 @@
   function buildSigRows(target) {
     target.textContent = "";
     if (!lastStrip) {
-      target.appendChild(sigRow("Server", "unreachable", "v bad"));
+      target.appendChild(sigRow("Web server", "unreachable", "v bad"));
       target.appendChild(sigRow("Round trip", "—", "v bad"));
       return;
     }
     var d = lastStrip;
-    target.appendChild(sigRow("Server", "answering", "v ok"));
+    target.appendChild(sigRow("Web server", "answering", "v ok"));
     target.appendChild(sigRow("Round trip",
       lastRtt == null ? "—" : lastRtt + " ms",
       lastRtt != null && lastRtt < 100 ? "v ok" : "v warn"));
     var pl = d.pull || {};
-    target.appendChild(sigRow("Mirror age",
+    target.appendChild(sigRow("Data mirror",
       ageText2(pl.age_seconds), ageCls(pl.age_seconds, 45, 120)));
     var mp = d.market_pass || {};
-    target.appendChild(sigRow("Market pass",
+    target.appendChild(sigRow("Market feed",
       ageText2(mp.age_seconds), ageCls(mp.age_seconds, 45, 120)));
     var sv = d.supervisor || {};
     target.appendChild(sigRow("Supervisor",
       ageText2(sv.age_seconds), ageCls(sv.age_seconds, 240, 600)));
-    target.appendChild(sigRow("Machine status",
-      sv.reported_status || "—",
-      sv.reported_status ? "v" : "v bad"));
-    var gv = d.governor || {};
-    target.appendChild(sigRow("Entries today",
-      (gv.entries_used == null ? "—" : gv.entries_used) + " / " +
-      (gv.entries_cap == null ? "—" : gv.entries_cap),
-      "v"));
-    target.appendChild(sigRow("Loss budget left",
-      gv.loss_fees_remaining_usdt == null
-        ? "—" : gv.loss_fees_remaining_usdt + " USDT",
-      "v"));
     if (sigAsOf) { sigAsOf.textContent = d.as_of || "—"; }
+  }
+
+  /* the Connections page: real rows live-tinted; rows the browser
+     cannot measure are honestly "not wired". Toggles are visual until
+     the shutdown wiring lands (separate build, owner-sanctioned). */
+  var CONNECTIONS = [
+    { id: "server", name: "Web server", detail: "dashboard ↔ data plane", live: true },
+    { id: "mirror", name: "Data mirror", detail: "host → this machine", live: true },
+    { id: "market", name: "Market feed", detail: "exchange stream pass", live: true },
+    { id: "supervisor", name: "Supervisor", detail: "machine heartbeat", live: true },
+    { id: "host", name: "EC2 host", detail: "AWS runtime", live: false },
+    { id: "binance", name: "Binance API", detail: "exchange account", live: false },
+    { id: "news", name: "News source", detail: "no source wired", live: false },
+    { id: "calendar", name: "Calendar source", detail: "no source wired", live: false }
+  ];
+  var connState = {};
+  for (var ci = 0; ci < CONNECTIONS.length; ci++) {
+    connState[CONNECTIONS[ci].id] = true;
+  }
+
+  function connLive(id) {
+    if (!lastStrip) {
+      return { cls: "bad", val: id === "server" ? "unreachable" : "—" };
+    }
+    var d = lastStrip;
+    if (id === "server") {
+      return { cls: "ok", val: lastRtt == null ? "answering" : lastRtt + " ms" };
+    }
+    if (id === "mirror") {
+      var a = d.pull && d.pull.age_seconds;
+      return { cls: ageCls(a, 45, 120).replace("v ", ""), val: ageText2(a) };
+    }
+    if (id === "market") {
+      var m = d.market_pass && d.market_pass.age_seconds;
+      return { cls: ageCls(m, 45, 120).replace("v ", ""), val: ageText2(m) };
+    }
+    if (id === "supervisor") {
+      var sv2 = d.supervisor || {};
+      var s2 = sv2.age_seconds;
+      var st = sv2.reported_status ? " · " + sv2.reported_status : "";
+      return { cls: ageCls(s2, 240, 600).replace("v ", ""), val: ageText2(s2) + st };
+    }
+    return { cls: "", val: "not wired" };
+  }
+
+  function refreshConnRows() {
+    if (!sigPage) { return; }
+    var rows2 = sigPage.querySelectorAll(".conn-row");
+    for (var i = 0; i < rows2.length; i++) {
+      var id = rows2[i].getAttribute("data-conn");
+      var def = null;
+      for (var k = 0; k < CONNECTIONS.length; k++) {
+        if (CONNECTIONS[k].id === id) { def = CONNECTIONS[k]; }
+      }
+      var dot = rows2[i].querySelector(".conn-dot");
+      var val = rows2[i].querySelector(".conn-val");
+      var on = connState[id];
+      rows2[i].classList.toggle("off", !on);
+      if (!on) {
+        dot.className = "conn-dot";
+        val.textContent = "off";
+        continue;
+      }
+      if (def && def.live) {
+        var lv = connLive(id);
+        dot.className = "conn-dot" + (lv.cls ? " " + lv.cls : "");
+        val.textContent = lv.val;
+      } else {
+        dot.className = "conn-dot";
+        val.textContent = "not wired";
+      }
+    }
+  }
+
+  function buildConnectionsPage(container) {
+    container.textContent = "";
+    var page = document.createElement("div");
+    page.className = "conn-page";
+    var t = document.createElement("div");
+    t.className = "conn-title";
+    t.textContent = "Connections";
+    var sub = document.createElement("div");
+    sub.className = "conn-sub";
+    sub.textContent =
+      "Every line this product depends on, and its live state.";
+    var note = document.createElement("div");
+    note.className = "conn-note";
+    note.textContent =
+      "Toggles are visual for now — shutdown wiring lands in a separate build.";
+    page.appendChild(t);
+    page.appendChild(sub);
+    page.appendChild(note);
+    var list = document.createElement("div");
+    list.className = "conn-list";
+    for (var i = 0; i < CONNECTIONS.length; i++) {
+      (function (def) {
+        var row = document.createElement("div");
+        row.className = "conn-row";
+        row.setAttribute("data-conn", def.id);
+        var dot = document.createElement("span");
+        dot.className = "conn-dot";
+        var main = document.createElement("div");
+        main.className = "conn-main";
+        var nm = document.createElement("div");
+        nm.className = "conn-name"; nm.textContent = def.name;
+        var dt = document.createElement("div");
+        dt.className = "conn-detail"; dt.textContent = def.detail;
+        main.appendChild(nm); main.appendChild(dt);
+        var val = document.createElement("span");
+        val.className = "conn-val"; val.textContent = "—";
+        var sw = document.createElement("button");
+        sw.className = "switch";
+        sw.setAttribute("role", "switch");
+        sw.setAttribute("aria-checked", connState[def.id] ? "true" : "false");
+        sw.setAttribute("aria-label", def.name + " connection");
+        var knob = document.createElement("span");
+        knob.className = "knob";
+        sw.appendChild(knob);
+        sw.addEventListener("click", function () {
+          connState[def.id] = !connState[def.id];
+          sw.setAttribute("aria-checked",
+            connState[def.id] ? "true" : "false");
+          refreshConnRows();
+        });
+        row.appendChild(dot);
+        row.appendChild(main);
+        row.appendChild(val);
+        row.appendChild(sw);
+        list.appendChild(row);
+      })(CONNECTIONS[i]);
+    }
+    page.appendChild(list);
+    container.appendChild(page);
+    refreshConnRows();
   }
 
   function renderSigAll() {
     if (!sigPop.hidden) { buildSigRows(sigRowsEl); }
-    if ((location.hash || "").slice(1) === "signal" && sigPage) {
-      buildSigRows(sigPage);
+    if ((location.hash || "").slice(1) === "connections" && sigPage) {
+      refreshConnRows();
     }
   }
 
@@ -395,10 +503,10 @@
     var r = sigBtn.getBoundingClientRect();
     var w = sigPop.offsetWidth;
     var h = sigPop.offsetHeight;
-    var left = Math.max(8, Math.round(r.left - w - 10));
+    var left = Math.max(12, Math.round(r.left - w - 12));
     var top = Math.min(
-      Math.max(8, Math.round(r.top + r.height / 2 - h / 2)),
-      window.innerHeight - h - 8);
+      Math.max(12, Math.round(r.top + r.height / 2 - h / 2)),
+      window.innerHeight - h - 12);
     sigPop.style.left = left + "px";
     sigPop.style.top = top + "px";
     sigBtn.setAttribute("aria-expanded", "true");
@@ -426,7 +534,7 @@
   sigPop.addEventListener("mouseleave", scheduleSigClose);
   sigBtn.addEventListener("click", function () {
     closeSigPop();
-    location.hash = "#signal";
+    location.hash = "#connections";
   });
 
   /* log out: real endpoint on the hosted site only.
@@ -487,4 +595,8 @@
     if (el) { hideTip(); }
   });
   document.addEventListener("scroll", hideTip, true);
+
+  /* boot the router last — routes reference structures defined above */
+  window.addEventListener("hashchange", route);
+  route();
 })();

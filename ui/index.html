@@ -226,6 +226,61 @@
   .rpanel-body { padding: 4px 16px 16px; font-size: 13px; color: var(--muted); }
   .rpanel-body b { color: var(--ink); font-weight: 600; }
   .sigpop { width: 264px; }
+
+  /* Connections page — one centered measured column, symmetric
+     padding, hairlines only inside the list. No boxes. */
+  .conn-page { max-width: 720px; margin: 0 auto; padding: 40px 32px 56px; }
+  .conn-title { font-size: 16px; font-weight: 600; color: var(--ink); }
+  .conn-sub { margin-top: 4px; font-size: 13px; color: var(--muted); }
+  .conn-note { margin-top: 2px; font-size: 12.5px; color: var(--faint); }
+  .conn-list { margin-top: 22px; }
+  .conn-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 2px;
+    border-bottom: 1px solid var(--line);
+  }
+  .conn-row:last-child { border-bottom: 0; }
+  .conn-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--faint); flex: none;
+    transition: background var(--t);
+  }
+  .conn-dot.ok { background: #2ebd85; }
+  .conn-dot.warn { background: #99640a; }
+  .conn-dot.bad { background: #cc2f3c; }
+  .conn-main { min-width: 0; }
+  .conn-name { font-size: 14px; font-weight: 500; color: var(--ink); }
+  .conn-detail { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
+  .conn-val {
+    margin-left: auto;
+    font-size: 13px; color: var(--muted);
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+  .conn-row.off .conn-dot { background: var(--faint); }
+  .conn-row.off .conn-val { color: var(--faint); }
+
+  /* toggle switch (Claude/ChatGPT class), from our tokens */
+  .switch {
+    flex: none;
+    width: 36px; height: 20px;
+    border: 0; padding: 2px;
+    border-radius: 999px;
+    background: var(--line-2);
+    cursor: pointer;
+    display: flex; align-items: center;
+    transition: background var(--t);
+  }
+  .switch .knob {
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+    transform: translateX(0);
+    transition: transform 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .switch[aria-checked="true"] { background: var(--focus); }
+  .switch[aria-checked="true"] .knob { transform: translateX(16px); }
+  html[data-theme="dark"] .switch .knob { background: #e8eaef; }
   .sigpop-rows { padding: 0 10px 6px; }
   .sigrow {
     display: flex; align-items: baseline; justify-content: space-between;
