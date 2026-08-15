@@ -259,9 +259,12 @@ def parse_event(row: Mapping[str, Any], line_number: int) -> Event:
     else:
         event_id = raw_id.strip()
 
-    explicit_event = row.get("is_event")
+    # stage_a stamps is_event=True on every labelled row (an "event record"
+    # marker); only an explicit blocks_controls field may widen blocking
+    # beyond GenuineRunner rows. One field, two meanings was seam bug #1.
+    explicit_event = row.get("blocks_controls")
     if explicit_event is not None and not isinstance(explicit_event, bool):
-        raise WindowError(f"{source} is_event is not a boolean")
+        raise WindowError(f"{source} blocks_controls is not a boolean")
     is_runner = RUNNER_LABEL in labels
     blocks_controls = is_runner if explicit_event is None else explicit_event
     if is_runner and not blocks_controls:

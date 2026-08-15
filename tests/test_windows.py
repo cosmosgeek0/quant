@@ -30,7 +30,7 @@ def event(
     volume_percentile,
     *,
     hour=0,
-    is_event=None,
+    blocks_controls=None,
 ):
     timestamp = BASE + timedelta(days=day, hours=hour)
     open_ms = int(timestamp.timestamp()) * 1_000
@@ -45,8 +45,8 @@ def event(
         "dead_regime": dead_regime,
         "pre_state": {"volume_percentile": str(volume_percentile)},
     }
-    if is_event is not None:
-        row["is_event"] = is_event
+    if blocks_controls is not None:
+        row["blocks_controls"] = blocks_controls
     return row
 
 
@@ -131,7 +131,7 @@ class WindowManifestTests(unittest.TestCase):
                 "spot_only",
                 True,
                 "50",
-                is_event=False,
+                blocks_controls=False,
             ),
             event(
                 "nearby-event",
@@ -142,7 +142,7 @@ class WindowManifestTests(unittest.TestCase):
                 True,
                 "50",
                 hour=23,
-                is_event=True,
+                blocks_controls=True,
             ),
         ]
         manifest = windows.build_windows_manifest(parsed(rows))
