@@ -136,6 +136,7 @@
       pageEl.style.padding = "0";
       sigPage = pageEl;
       buildConnectionsPage(pageEl);
+      fetchNews(false);
     } else if (h === "news") {
       pageEl.style.padding = "0";
       sigPage = null;
@@ -206,6 +207,12 @@
   var lastStrip = null;
   var lastStripAt = null;
 
+  function mirrorWarnBad() {
+    var iv = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
+    var sec = (typeof iv === "number" && iv > 0) ? iv / 1000 : 45;
+    return [Math.max(45, sec * 2), Math.max(120, sec * 4)];
+  }
+
   var POLL_DEFAULTS = { strip: 10, news: 20 };
   var pollCfg = { strip: 10, news: 20, paused: false };
   try {
@@ -248,9 +255,10 @@
         setOnline(!!d);
         if (!d) { sigClass("sig-bad"); renderSigAll(); return; }
         var age = d.pull && d.pull.age_seconds;
+        var wb = mirrorWarnBad();
         if (age == null || !isFinite(age)) { sigClass("sig-bad"); }
-        else if (age > 120) { sigClass("sig-bad"); }
-        else if (age > 45) { sigClass("sig-stale"); }
+        else if (age > wb[1]) { sigClass("sig-bad"); }
+        else if (age > wb[0]) { sigClass("sig-stale"); }
         else { sigClass("sig-ok"); }
         renderSigAll();
       })
@@ -319,26 +327,63 @@
 
   function buildSigRows(target) {
     target.textContent = "";
-    if (!lastStrip) {
-      target.appendChild(sigRow("Web server", "unreachable", "v bad"));
-      target.appendChild(sigRow("Round trip", "—", "v bad"));
-      return;
-    }
-    var d = lastStrip;
-    target.appendChild(sigRow("Web server", "answering", "v ok"));
-    target.appendChild(sigRow("Round trip",
-      lastRtt == null ? "—" : lastRtt + " ms",
-      lastRtt != null && lastRtt < 100 ? "v ok" : "v warn"));
+    var d = lastStrip || {};
+    var wb = mirrorWarnBad();
     var pl = d.pull || {};
-    target.appendChild(sigRow("Data mirror",
-      ageText2(pl.age_seconds), ageCls(pl.age_seconds, 45, 120)));
     var mp = d.market_pass || {};
-    target.appendChild(sigRow("Market feed",
-      ageText2(mp.age_seconds), ageCls(mp.age_seconds, 45, 120)));
     var sv = d.supervisor || {};
-    target.appendChild(sigRow("Supervisor",
-      ageText2(sv.age_seconds), ageCls(sv.age_seconds, 240, 600)));
-    if (sigAsOf) { sigAsOf.textContent = d.as_of || "—"; }
+    var newsAge = (newsData && newsData.as_of)
+      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
+
+    function cellCls(chunk) {
+      return chunk.replace("v ", "").replace("v", "").trim();
+    }
+    var cells = [
+      ["Machine", d.machine || "—",
+        d.machine === "ARMED" ? "ok" : (d.machine ? "warn" : "")],
+      ["Server RTT",
+        lastStrip ? (lastRtt == null ? "OK" : lastRtt + " ms") : "DOWN",
+        lastStrip ? "ok" : "bad"],
+      ["Mirror", ageText2(pl.age_seconds),
+        cellCls(ageCls(pl.age_seconds, wb[0], wb[1]))],
+      ["Market", ageText2(mp.age_seconds),
+        cellCls(ageCls(mp.age_seconds, 45, 120))],
+      ["Supervisor",
+        (sv.reported_status || "—") + " · " + ageText2(sv.age_seconds),
+        cellCls(ageCls(sv.age_seconds, 240, 600))],
+      ["News loop", newsAge == null ? "—" : ageText2(newsAge),
+        newsAge == null ? "" : (newsAge < 300 ? "ok" : "warn")]
+    ];
+    var worst = lastStrip ? 0 : 2;
+    for (var ci3 = 0; ci3 < cells.length; ci3++) {
+      if (cells[ci3][2] === "warn" && worst < 1) { worst = 1; }
+      if (cells[ci3][2] === "bad") { worst = 2; }
+      var cell = document.createElement("div");
+      cell.className = "sig-cell";
+      var em = document.createElement("em");
+      em.textContent = cells[ci3][0];
+      var b = document.createElement("b");
+      b.textContent = cells[ci3][1];
+      if (cells[ci3][2]) { b.className = cells[ci3][2]; }
+      cell.appendChild(em);
+      cell.appendChild(b);
+      target.appendChild(cell);
+    }
+    var pulse = sigPop.querySelector(".sp-pulse");
+    if (pulse) {
+      var pd = pulse.querySelector(".livedot");
+      var plb = pulse.querySelector(".plabel");
+      pd.className = "livedot" +
+        (worst === 2 ? " dead" : (worst === 1 ? " stale" : ""));
+      plb.textContent = worst === 2 ? "Down"
+        : (worst === 1 ? "Degraded" : "Live monitor");
+    }
+    if (sigAsOf) {
+      sigAsOf.textContent = lastStripAt
+        ? "assessed " + Math.max(0, Math.round(
+            (Date.now() - lastStripAt) / 1000)) + "s ago"
+        : "connecting";
+    }
   }
 
   /* the Connections page: real rows live-tinted; rows the browser
@@ -391,7 +436,9 @@
     }
     if (id === "mirror") {
       var a = d.pull && d.pull.age_seconds;
-      return { cls: ageCls(a, 45, 120).replace("v ", ""), val: ageText2(a) };
+      var wb2 = mirrorWarnBad();
+      return { cls: ageCls(a, wb2[0], wb2[1]).replace("v ", ""),
+        val: ageText2(a) };
     }
     if (id === "market") {
       var m = d.market_pass && d.market_pass.age_seconds;
@@ -436,6 +483,60 @@
     }
   }
 
+  function buildConnTiles() {
+    var tiles = document.createElement("div");
+    tiles.className = "conn-tiles";
+    tiles.id = "conn-tiles";
+    function tile(label, valueText, cls, smallText) {
+      var cell = document.createElement("div");
+      cell.className = "conn-tile";
+      var em = document.createElement("em");
+      em.textContent = label;
+      var b = document.createElement("b");
+      b.textContent = valueText;
+      if (cls) { b.className = cls; }
+      var sm = document.createElement("small");
+      sm.textContent = smallText;
+      cell.appendChild(em);
+      cell.appendChild(b);
+      cell.appendChild(sm);
+      return cell;
+    }
+    var d0 = lastStrip || {};
+    var pull0 = d0.pull || {};
+    var mp0 = d0.market_pass || {};
+    var sv0 = d0.supervisor || {};
+    var machineVal = d0.machine || "—";
+    tiles.appendChild(tile("Machine", machineVal,
+      machineVal === "ARMED" ? "ok" : (machineVal === "—" ? "" : "warn"),
+      "STOP flags mirrored · authoritative"));
+    tiles.appendChild(tile("Server RTT",
+      lastStrip ? (lastRtt == null ? "answering" : lastRtt + " ms")
+        : "unreachable",
+      lastStrip ? "ok" : "bad", "direct serve.py probe"));
+    var wbT = mirrorWarnBad();
+    tiles.appendChild(tile("Mirror continuity",
+      ageText2(pull0.age_seconds),
+      ageCls(pull0.age_seconds, wbT[0], wbT[1]).replace("v ", ""),
+      "pull every " + (pull0.interval_ms
+        ? Math.round(pull0.interval_ms / 1000) + "s" : "—")));
+    tiles.appendChild(tile("Feed freshness",
+      ageText2(mp0.age_seconds),
+      ageCls(mp0.age_seconds, 45, 120).replace("v ", ""),
+      "market pass on the host"));
+    tiles.appendChild(tile("Supervisor",
+      (sv0.reported_status || "—"),
+      ageCls(sv0.age_seconds, 240, 600).replace("v ", ""),
+      "heartbeat " + ageText2(sv0.age_seconds) + " ago"));
+    var newsAgeTile = (newsData && newsData.as_of)
+      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
+    tiles.appendChild(tile("News loop",
+      newsAgeTile == null ? "no read yet" : ageText2(newsAgeTile),
+      newsAgeTile == null ? "" : (newsAgeTile < 300 ? "ok" : "warn"),
+      "104 public sources"));
+    return tiles;
+  }
+
   function buildConnectionsPage(container) {
     container.textContent = "";
     /* re-sync controllable rows from their single sources of truth */
@@ -458,49 +559,7 @@
     page.appendChild(t);
     page.appendChild(sub);
     page.appendChild(note);
-    var tiles = document.createElement("div");
-    tiles.className = "conn-tiles";
-    function tile(label, valueText, cls, smallText) {
-      var cell = document.createElement("div");
-      cell.className = "conn-tile";
-      var em = document.createElement("em");
-      em.textContent = label;
-      var b = document.createElement("b");
-      b.textContent = valueText;
-      if (cls) { b.className = cls; }
-      var sm = document.createElement("small");
-      sm.textContent = smallText;
-      cell.appendChild(em);
-      cell.appendChild(b);
-      cell.appendChild(sm);
-      return cell;
-    }
-    var d0 = lastStrip || {};
-    var pull0 = d0.pull || {};
-    var mp0 = d0.market_pass || {};
-    var sv0 = d0.supervisor || {};
-    tiles.appendChild(tile("Server RTT",
-      lastStrip ? (lastRtt == null ? "answering" : lastRtt + " ms")
-        : "unreachable",
-      lastStrip ? "ok" : "bad", "direct serve.py probe"));
-    tiles.appendChild(tile("Mirror continuity",
-      ageText2(pull0.age_seconds),
-      ageCls(pull0.age_seconds, 45, 120).replace("v ", ""),
-      "host → Mac pull age"));
-    tiles.appendChild(tile("Feed freshness",
-      ageText2(mp0.age_seconds),
-      ageCls(mp0.age_seconds, 45, 120).replace("v ", ""),
-      "market pass on the host"));
-    tiles.appendChild(tile("Supervisor",
-      (sv0.reported_status || "—"),
-      ageCls(sv0.age_seconds, 240, 600).replace("v ", ""),
-      "heartbeat " + ageText2(sv0.age_seconds) + " ago"));
-    var newsAgeTile = (newsData && newsData.as_of)
-      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
-    tiles.appendChild(tile("News loop",
-      newsAgeTile == null ? "no read yet" : ageText2(newsAgeTile),
-      newsAgeTile == null ? "" : (newsAgeTile < 300 ? "ok" : "warn"),
-      "104 public sources"));
+    var tiles = buildConnTiles();
     page.appendChild(tiles);
 
     var cols = document.createElement("div");
@@ -706,6 +765,15 @@
     if (!sigPop.hidden) { buildSigRows(sigRowsEl); }
     if ((location.hash || "").slice(1) === "connections" && sigPage) {
       refreshConnRows();
+      var oldTiles = document.getElementById("conn-tiles");
+      if (oldTiles && oldTiles.parentNode) {
+        oldTiles.parentNode.replaceChild(buildConnTiles(), oldTiles);
+      }
+      var stamp = document.querySelector(".conn-assessed");
+      if (stamp && lastStripAt) {
+        stamp.textContent = "Assessed " + Math.max(0, Math.round(
+          (Date.now() - lastStripAt) / 1000)) + "s ago";
+      }
     }
   }
 
