@@ -553,7 +553,8 @@
         stroke: defs[d].color,
         fill: shadeFill(defs[d].color, defs.length === 1),
         width: defs.length === 1 ? 1.8 : 1.4,
-        scale: defs[d].unit === "ms" ? "ms" : "s",
+        scale: defs[d].unit === "ms" ? "ms"
+          : defs[d].unit === "%" ? "pct" : "s",
         /* bridge sampling holes so the ribbon reads continuous —
            outages still show in the bars, the banner and the log */
         spanGaps: true,
@@ -562,6 +563,7 @@
     }
 
     var pinned = false;
+    var hoverHere = false;
     var tooltip = document.createElement("div");
     tooltip.className = "st-graph-tip";
     tooltip.style.display = "none";
@@ -577,6 +579,7 @@
 
     function renderTip(u) {
       if (pinned) { return; }
+      if (!hoverHere) { tooltip.style.display = "none"; return; }
       var idx = u.cursor.idx;
       if (idx == null || idx < 0 || idx >= data[0].length) {
         tooltip.style.display = "none";
@@ -592,6 +595,10 @@
         if (!u.series[s + 1].show) { continue; }
         var val = fmtVal(data[s + 1][idx], defs[s].unit);
         if (val == null) { continue; }
+        if (defs[s].raw && defs[s].raw[idx] != null) {
+          val += " \u00b7 " + (Math.round(defs[s].raw[idx] * 10) / 10) +
+            "s";
+        }
         rows.push({ color: defs[s].color, label: defs[s].label, val: val });
       }
       if (!rows.length) { tooltip.style.display = "none"; return; }
@@ -653,8 +660,11 @@
 
     var hasS = false;
     var hasMs = false;
+    var hasPct = false;
     for (var ud = 0; ud < defs.length; ud += 1) {
-      if (defs[ud].unit === "ms") { hasMs = true; } else { hasS = true; }
+      if (defs[ud].unit === "ms") { hasMs = true; }
+      else if (defs[ud].unit === "%") { hasPct = true; }
+      else { hasS = true; }
     }
     function unitAxis(scaleName, unitText, side) {
       var axis = {
@@ -679,13 +689,22 @@
       return axis;
     }
     var axes = [
-      { stroke: muted, font: axisFont, size: cfg.compact ? 38 : 42,
+      { stroke: muted, font: axisFont, size: cfg.compact ? 26 : 30,
         space: cfg.compact ? 88 : 78,
+        /* ranges are 24h max — the time is enough, no date line */
+        values: function (u, splits) {
+          var out = [];
+          for (var j = 0; j < splits.length; j += 1) {
+            out.push(splits[j] == null ? "" : utcHm(splits[j]));
+          }
+          return out;
+        },
         grid: { show: true, stroke: line, width: 1 },
         ticks: { show: false }, border: { show: false } }
     ];
-    if (hasS) { axes.push(unitAxis("s", "s", false)); }
-    if (hasMs) { axes.push(unitAxis("ms", "ms", hasS)); }
+    if (hasPct) { axes.push(unitAxis("pct", "%", false)); }
+    if (hasS) { axes.push(unitAxis("s", "s", hasPct)); }
+    if (hasMs) { axes.push(unitAxis("ms", "ms", hasPct || hasS)); }
 
     var options = {
       width: width,
@@ -710,9 +729,8 @@
       },
       scales: {
         x: { time: true },
-        /* expand mode (default): asinh distribution — the band where
-           lines live gets the room, a runaway spike compresses
-           instead of crushing everything (uPlot distr 4) */
+        /* health graphs share one FIXED frame: 0 dead .. 100 fresh */
+        pct: { range: function () { return [0, 105]; } },
         s: cfg.linearScale
           ? { range: rangeUp }
           : { distr: 4, asinh: 60, range: rangeUp },
@@ -726,7 +744,11 @@
         ready: [function (u) {
           u.over.parentNode.appendChild(tooltip);
           u.over.addEventListener("dblclick", resetXRange);
+          u.over.addEventListener("mouseenter", function () {
+            hoverHere = true;
+          });
           u.over.addEventListener("mouseleave", function () {
+            hoverHere = false;
             if (!pinned) { tooltip.style.display = "none"; }
           });
           u.over.addEventListener("click", function () {

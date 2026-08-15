@@ -835,7 +835,18 @@
       if (up) { up.textContent = off ? "Off" : uptimeText(def.id); }
       var curEl = panel.querySelector("[data-current]");
       if (curEl) {
-        curEl.textContent = st.value == null ? "\u2014" : String(st.value);
+        var m3 = netMetric(def.id);
+        if (m3 && m3.unit === "s") {
+          var age3 = currentVal(def.id);
+          var norm3 = healthNorm(def.id);
+          curEl.textContent = (age3 != null && norm3)
+            ? Math.round(Math.max(0, Math.min(100,
+                100 * (1 - age3 / norm3)))) + "%"
+            : "\u2014";
+        } else {
+          curEl.textContent = st.value == null
+            ? "\u2014" : String(st.value);
+        }
       }
       var stampEl = panel.querySelector("[data-sampled]");
       if (stampEl) {
@@ -872,17 +883,17 @@
      data, uptime %, trend bars, and thresholds come from HERE — the
      page never invents a series again. ---- */
   var NET_METRICS = [
-    { key: "server", field: "rtt_ms", label: "Server RTT", unit: "ms" },
-    { key: "mirror", field: "mirror_s", label: "Mirror age", unit: "s" },
-    { key: "market", field: "market_s", label: "Feed age", unit: "s" },
-    { key: "supervisor", field: "supervisor_s", label: "Supervisor age",
+    { key: "server", field: "rtt_ms", label: "Server ping", unit: "ms" },
+    { key: "mirror", field: "mirror_s", label: "Mirror", unit: "s" },
+    { key: "market", field: "market_s", label: "Feed", unit: "s" },
+    { key: "supervisor", field: "supervisor_s", label: "Supervisor",
       unit: "s" },
-    { key: "newsloop", field: "news_s", label: "News loop age", unit: "s" },
-    { key: "basiswatch", field: "basis_watch_s", label: "Basis watch age",
+    { key: "newsloop", field: "news_s", label: "News loop", unit: "s" },
+    { key: "basiswatch", field: "basis_watch_s", label: "Basis watch",
       unit: "s" },
-    { key: "basissup", field: "basis_sup_s", label: "Basis sup age",
+    { key: "basissup", field: "basis_sup_s", label: "Basis sup",
       unit: "s" },
-    { key: "jobrunner", field: "jobs_s", label: "Job runner age",
+    { key: "jobrunner", field: "jobs_s", label: "Job runner",
       unit: "s" }
   ];
   var netTelem = { range: "1h", data: null };
@@ -1005,6 +1016,23 @@
      x range, identical step, identical point count — a loop sampled
      at 1s and a loop sampled at 30s land on the same skeleton, so
      every chart draws the same shape of box (owner symmetry law). */
+  function healthNorm(key) {
+    /* the limit where a loop counts as silent: its bad threshold
+       (4x measured rhythm, or the honest fallback) */
+    var t = thrFor(key);
+    return t && t.bad ? t.bad : null;
+  }
+
+  function healthSeries(values, norm) {
+    var out = [];
+    for (var i = 0; i < values.length; i += 1) {
+      if (values[i] == null || !norm) { out.push(null); continue; }
+      out.push(Math.max(0, Math.min(100,
+        100 * (1 - values[i] / norm))));
+    }
+    return out;
+  }
+
   function displayGrid() {
     /* second-level granularity: 720 grid points per window, floor 4s
        (1H draws 5s steps; a 1s-polled loop shows near-raw detail) */
@@ -1263,12 +1291,14 @@
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
           var m = NET_METRICS[mi];
           if (m.unit !== "s") { continue; }
+          var rawVals = gridSeries(m, grid);
           defs.push({
             label: m.label,
-            unit: "s",
+            unit: "%",
             color: rootCs.getPropertyValue("--st-s" + (mi + 1))
               .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-            values: gridSeries(m, grid)
+            values: healthSeries(rawVals, healthNorm(m.key)),
+            raw: rawVals
           });
         }
         if (times && times.length >= 2) {
@@ -1312,7 +1342,8 @@
         : silent
           ? "Recorder silent " + newestAge + "s \u00b7 " +
             spanTxt + " \u00b7 UTC"
-          : "Live \u00b7 " + spanTxt + " \u00b7 UTC";
+          : "Live \u00b7 " + spanTxt + " \u00b7 UTC \u00b7 " +
+            "100 = fresh heartbeat, 0 = silent past its limit";
       capEl.style.color = silent ? "var(--st-warn-text)" : "";
       capEl.setAttribute("title", n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples"
@@ -1327,12 +1358,15 @@
         var pHost = document.querySelector(
           "[data-graph=\"" + pm.key + "\"]");
         if (!pHost) { continue; }
+        var pRaw = gridSeries(pm, pgrid);
         var pdef = [{
           label: pm.label,
-          unit: pm.unit,
+          unit: pm.unit === "s" ? "%" : pm.unit,
           color: rootCs.getPropertyValue("--st-s" + (mi + 1))
             .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-          values: gridSeries(pm, pgrid)
+          values: pm.unit === "s"
+            ? healthSeries(pRaw, healthNorm(pm.key)) : pRaw,
+          raw: pm.unit === "s" ? pRaw : null
         }];
         if (pgrid.times.length >= 2) {
           if (panelCharts[pm.key]) {
@@ -1404,7 +1438,7 @@
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
     var gHead = stEl("div", "st-card-head");
-    gHead.appendChild(stEl("div", "st-t-h", "Loop timing"));
+    gHead.appendChild(stEl("div", "st-t-h", "Loop health"));
     gHead.appendChild(stEl("span", "st-spacer"));
     var seg = stEl("div", "st-seg");
     var rdefs = ["1h", "6h", "24h"];
