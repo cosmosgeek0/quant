@@ -289,7 +289,7 @@
 
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
-  .conn-page { max-width: 1180px; margin: 0; padding: 40px 40px 56px; }
+  .conn-page { max-width: 1180px; margin: 0; padding: 72px 40px 56px; }
   .conn-tiles {
     display: flex; gap: 0; margin-top: 22px;
     border: 1px solid var(--line-2); border-radius: 14px;
@@ -399,7 +399,7 @@
   /* News v4 — decongested top, two-column body: list left, dedicated
      Sources box + Activity box on the right (owner-sanctioned boxes:
      functional containers, 1px line, small radius). */
-  .news-page { max-width: none; margin: 0; padding: 40px 40px 56px; }
+  .news-page { max-width: none; margin: 0; padding: 72px 40px 56px; }
   .news-head { display: flex; align-items: center; gap: 14px; }
   .news-title { font-size: 26px; font-weight: 650; color: var(--ink); letter-spacing: -0.015em; }
   .news-live { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
@@ -440,7 +440,9 @@
   .livelabel { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .refresh-btn.kick svg { animation: spin 600ms cubic-bezier(0.2, 0, 0.2, 1); }
 
-  .daystrip { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 24px; }
+  .strip-row { display: flex; align-items: center; gap: 18px; margin-top: 22px; }
+  .strip-row .news-right { align-self: center; }
+  .daystrip { display: flex; gap: 8px; flex-wrap: wrap; flex: 1; min-width: 0; }
   .day {
     border: 1px solid var(--line-2);
     border-radius: 12px;
@@ -688,11 +690,20 @@
      styles.css topbar-suite-v4 final blocks) and verified against the
      live render at 127.0.0.1:57317. HH:MM only — no popup by owner
      order; the popup material goes to Settings later. */
-  .clockpill {
+  /* Invisible topbar: everything above y=56 is chrome (brand left,
+     clock + search right). Page content starts below it — nothing may
+     touch the boundary. The line itself is never drawn. */
+  .topbar-right {
     position: fixed;
     top: 7px;
     right: 59px;
     z-index: 45;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .clockpill {
+    flex: none;
     width: 130px;
     height: 42px;
     padding: 5px;
@@ -794,7 +805,273 @@
     .clock-hourglass-sand,
     .clock-hourglass-stream { animation: none; }
   }
-  .empty { padding: 46px 24px; color: var(--muted); font-size: 13.5px; }
+
+  /* Search — the old room's topbar search ported from source
+     (SidebarSearch topbar placement + its final owner-fixed CSS
+     generation: rounded-full 42px box, ⌘K chip, paired light beams,
+     opaque grouped-results panel), live-measured at 57317 (440x42,
+     r999, hairline, 13.5px input). Bar look matches learn.chatgpt.com
+     (measured 208x38 r9999) — deliberately a size bigger, per owner. */
+  .qsearch {
+    position: relative;
+    width: min(440px, 30vw);
+  }
+  .qsearch-box {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 42px;
+    padding: 0 8px 0 16px;
+    border-radius: 999px;
+    background: var(--panel);
+    border: 1px solid var(--line-2);
+    color: var(--muted);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+    transition: border-color 0.12s, box-shadow 0.12s, background 0.12s;
+  }
+  .qsearch-box.on {
+    border-color: var(--focus);
+    box-shadow: 0 0 0 3px rgba(37, 87, 214, 0.13);
+    background: var(--bg);
+  }
+  .qsearch-box input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: none;
+    outline: none;
+    color: var(--ink);
+    font-size: 13.5px;
+    font-family: inherit;
+  }
+  .qsearch-box input::placeholder { color: var(--faint); }
+  .qsearch-box > svg {
+    flex: none;
+    width: 15px;
+    height: 15px;
+    stroke-width: 1.8;
+    color: var(--muted);
+    margin-right: 5px;
+  }
+  .qsearch-k {
+    flex: none;
+    border: 0;
+    background: color-mix(in srgb, var(--ink) 3%, var(--panel));
+    border-radius: 8px;
+    height: 26px;
+    padding: 0 8px;
+    font-size: 10.5px;
+    font-weight: 680;
+    color: var(--muted);
+    font-family: var(--mono);
+    cursor: pointer;
+  }
+  .qsearch-k:hover { color: var(--focus); }
+  html[data-theme="dark"] .qsearch-box,
+  html[data-theme="dark"] .qsearch-box.on {
+    border-color: color-mix(in srgb, var(--line) 88%, #fff 4%);
+    background: color-mix(in srgb, var(--panel) 94%, #fff 2%);
+    box-shadow: none;
+  }
+
+  /* paired light beams — the old code's final search animation: twin
+     streaks sweep the pill's top and bottom edges, calm at idle,
+     vivid while open. Exact keyframes and gradients from source. */
+  .qsearch {
+    --search-beam-speed: 10s;
+    --search-beam-width: 34%;
+    --search-beam-size: 1px;
+    --search-beam-peak: 0.34;
+    --search-beam-shadow: 0.10;
+  }
+  .qsearch.open {
+    --search-beam-speed: 4.8s;
+    --search-beam-width: 30%;
+    --search-beam-size: 2px;
+    --search-beam-peak: 0.94;
+    --search-beam-shadow: 0.30;
+  }
+  .search-beam {
+    position: absolute;
+    inset: 0;
+    display: block;
+    overflow: hidden;
+    border-radius: 999px;
+    pointer-events: none;
+    z-index: 8;
+  }
+  .search-beam::before,
+  .search-beam::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    width: var(--search-beam-width);
+    height: var(--search-beam-size);
+    border-radius: 999px;
+    opacity: 0;
+    transform: translate3d(-128%, 0, 0);
+    will-change: transform, opacity;
+    background:
+      radial-gradient(circle at 88% 50%, rgba(255, 255, 255, calc(var(--search-beam-peak) * 0.96)) 0 1.5px, transparent 3px),
+      linear-gradient(90deg,
+        transparent 0%,
+        rgba(56, 189, 248, 0) 12%,
+        rgba(56, 189, 248, calc(var(--search-beam-peak) * 0.26)) 34%,
+        rgba(37, 99, 235, calc(var(--search-beam-peak) * 0.62)) 66%,
+        rgba(255, 255, 255, calc(var(--search-beam-peak) * 0.90)) 86%,
+        transparent 100%);
+    box-shadow:
+      0 0 7px rgba(56, 189, 248, var(--search-beam-shadow)),
+      0 0 12px rgba(37, 99, 235, calc(var(--search-beam-shadow) * 0.72));
+    animation: searchPairedBeamIdle var(--search-beam-speed) cubic-bezier(0.22, 0.82, 0.18, 1) infinite;
+  }
+  .search-beam::before { top: 1px; }
+  .search-beam::after { bottom: 1px; animation-delay: 0.04s; }
+  .qsearch.open .search-beam::before,
+  .qsearch.open .search-beam::after {
+    animation-name: searchPairedBeamActive;
+  }
+  @keyframes searchPairedBeamIdle {
+    0%, 68%, 100% { opacity: 0; transform: translate3d(-128%, 0, 0); }
+    5% { opacity: calc(var(--search-beam-peak) * 0.54); }
+    13% { opacity: var(--search-beam-peak); }
+    25% { opacity: calc(var(--search-beam-peak) * 0.68); }
+    31% { opacity: 0; transform: translate3d(334%, 0, 0); }
+  }
+  @keyframes searchPairedBeamActive {
+    0%, 80%, 100% { opacity: 0; transform: translate3d(-132%, 0, 0); }
+    7% { opacity: calc(var(--search-beam-peak) * 0.74); }
+    18%, 43% { opacity: var(--search-beam-peak); }
+    60% { opacity: 0; transform: translate3d(342%, 0, 0); }
+  }
+  html[data-theme="dark"] .qsearch .search-beam::before,
+  html[data-theme="dark"] .qsearch .search-beam::after,
+  html[data-theme="dark"] .qsearch.open .search-beam::before,
+  html[data-theme="dark"] .qsearch.open .search-beam::after {
+    opacity: 0;
+    animation: none;
+    box-shadow: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .search-beam::before,
+    .search-beam::after {
+      animation: none;
+      opacity: 0.18;
+      transform: translate3d(210%, 0, 0);
+    }
+  }
+
+  /* results panel — old .snav-search-pop, opaque by their owner-fix
+     law (never backdrop-filter), grouped rows in our tokens. */
+  .qsearch-pop {
+    position: absolute;
+    top: calc(100% + 7px);
+    left: 0;
+    right: 0;
+    z-index: 90;
+    background: var(--panel);
+    border: 1px solid var(--line-2);
+    border-radius: 12px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.12);
+    padding: 5px;
+    max-height: min(520px, 70vh);
+    overflow-y: auto;
+  }
+  .ssr-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 3px 3px 6px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 4px;
+  }
+  .ssr-tabs button {
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background var(--t), color var(--t);
+  }
+  .ssr-tabs button:hover { background: var(--hover); color: var(--ink); }
+  .ssr-tabs button.on { background: var(--pill); color: var(--ink); font-weight: 600; }
+  .ssr-group-title {
+    padding: 7px 8px 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .ssr-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 7px 8px;
+    border: 0;
+    border-radius: 8px;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+  }
+  .ssr-row.sel { background: rgba(37, 87, 214, 0.08); }
+  .ssr-row[disabled] { opacity: 0.5; cursor: default; }
+  .ssr-mark {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--pill);
+    color: var(--muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
+    overflow: hidden;
+  }
+  .ssr-mark svg { width: 13px; height: 13px; stroke-width: 1.7; }
+  .ssr-mark img { width: 100%; height: 100%; display: block; }
+  .ssr-asset { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .ssr-label {
+    font-size: 12.5px;
+    font-weight: 620;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ssr-hint {
+    font-size: 10px;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ssr-price {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+  }
+  .ssr-price b {
+    font-size: 12px;
+    font-weight: 620;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+  .ssr-price small { font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .ssr-price.single { font-size: 11px; color: var(--muted); }
+  .ssr-empty { padding: 10px; font-size: 11.5px; color: var(--muted); }
+  .empty { padding: 72px 24px 46px; color: var(--muted); font-size: 13.5px; }
   .empty b { color: var(--ink); font-weight: 600; }
 
   /* floating tooltip */
@@ -941,21 +1218,34 @@
     </button>
   </div>
   <main>
-    <div class="clockpill" aria-label="Market Clock — UTC" title="Market Clock — UTC · +00:00">
-      <span class="clock-command-pill">
-        <svg class="clock-hourglass-mark" viewBox="0 0 36 36" aria-hidden="true">
-          <g class="clock-hourglass-rotor">
-            <rect class="clock-hourglass-cap" x="6" y="3" width="24" height="4" rx="2"/>
-            <rect class="clock-hourglass-cap" x="6" y="29" width="24" height="4" rx="2"/>
-            <path class="clock-hourglass-glass" d="M10 7h16c0 6.2-3.1 8-8 11 4.9 3 8 4.8 8 11H10c0-6.2 3.1-8 8-11-4.9-3-8-4.8-8-11Z"/>
-            <path class="clock-hourglass-sand" d="M12.2 9h11.6c-.7 3.2-2.7 4.8-5.8 6.8-3.1-2-5.1-3.6-5.8-6.8Zm0 18c.7-3.2 2.7-4.8 5.8-6.8 3.1 2 5.1 3.6 5.8 6.8H12.2Z"/>
-            <path class="clock-hourglass-stream" d="M18 15.4v5.2"/>
-          </g>
-        </svg>
-        <span class="clock-command-time" id="clock">—:—</span>
-        <i class="clock-command-bullet" aria-hidden="true"></i>
-        <span class="clock-command-zone">UTC</span>
-      </span>
+    <div class="topbar-right">
+      <div class="clockpill" aria-label="Market Clock — UTC" title="Market Clock — UTC · +00:00">
+        <span class="clock-command-pill">
+          <svg class="clock-hourglass-mark" viewBox="0 0 36 36" aria-hidden="true">
+            <g class="clock-hourglass-rotor">
+              <rect class="clock-hourglass-cap" x="6" y="3" width="24" height="4" rx="2"/>
+              <rect class="clock-hourglass-cap" x="6" y="29" width="24" height="4" rx="2"/>
+              <path class="clock-hourglass-glass" d="M10 7h16c0 6.2-3.1 8-8 11 4.9 3 8 4.8 8 11H10c0-6.2 3.1-8 8-11-4.9-3-8-4.8-8-11Z"/>
+              <path class="clock-hourglass-sand" d="M12.2 9h11.6c-.7 3.2-2.7 4.8-5.8 6.8-3.1-2-5.1-3.6-5.8-6.8Zm0 18c.7-3.2 2.7-4.8 5.8-6.8 3.1 2 5.1 3.6 5.8 6.8H12.2Z"/>
+              <path class="clock-hourglass-stream" d="M18 15.4v5.2"/>
+            </g>
+          </svg>
+          <span class="clock-command-time" id="clock">—:—</span>
+          <i class="clock-command-bullet" aria-hidden="true"></i>
+          <span class="clock-command-zone">UTC</span>
+        </span>
+      </div>
+      <div class="qsearch" id="qsearch">
+        <div class="qsearch-box" id="qsearch-box">
+          <input id="qsearch-input" type="text" placeholder="Search pages, symbols, news"
+                 aria-label="Search the whole product" aria-expanded="false"
+                 autocomplete="off" spellcheck="false">
+          <button class="qsearch-k" id="qsearch-k" tabindex="-1" title="Focus search (⌘K)">⌘K</button>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        </div>
+        <span class="search-beam" aria-hidden="true"></span>
+        <div class="qsearch-pop" id="qsearch-pop" hidden></div>
+      </div>
     </div>
     <div class="empty" id="page"></div>
   </main>

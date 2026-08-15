@@ -1393,8 +1393,15 @@
     masterWrap.appendChild(mlabel);
     masterWrap.appendChild(msw);
     right.appendChild(masterWrap);
-    head.appendChild(right);
     newsHost.appendChild(head);
+    /* owner order: title inline with Overview's start; refresh + Live +
+       News-on live BELOW the title row, never at the topbar boundary.
+       The controls row always renders so News can be switched back on
+       even when the mirror is empty or the page is off. */
+    var stripRow = document.createElement("div");
+    stripRow.className = "strip-row";
+    stripRow.appendChild(right);
+    newsHost.appendChild(stripRow);
 
     if (newsData && newsData.as_of) {
       var liveAge = (Date.now() - Date.parse(newsData.as_of)) / 1000;
@@ -1502,7 +1509,7 @@
         strip.appendChild(cell);
       })(dayDefs[di]);
     }
-    newsHost.appendChild(strip);
+    stripRow.insertBefore(strip, right);
 
     /* pools */
     var dayPool = [];
@@ -1864,6 +1871,401 @@
     if (el) { hideTip(); }
   });
   document.addEventListener("scroll", hideTip, true);
+
+  /* ---- global search — the old room's topbar SidebarSearch ported
+     from source: opens on focus, grouped results, arrow/enter keys,
+     ⌘K focus, outside-pointerdown close, their exact scoring
+     (startsWith > word-start > includes > keywords). Index = the real
+     product only: pages, live stream symbols, news headlines, news
+     sources — all from the mirror; absent mirrors say so honestly. */
+  var qsWrap = document.getElementById("qsearch");
+  var qsBox = document.getElementById("qsearch-box");
+  var qsInput = document.getElementById("qsearch-input");
+  var qsKbd = document.getElementById("qsearch-k");
+  var qsPop = document.getElementById("qsearch-pop");
+  var qsQ = "";
+  var qsSel = 0;
+  var qsTab = "top";
+  var qsFocused = false;
+  var qsResults = [];
+  var qsStream = null;
+  var qsStreamAt = 0;
+  var qsNews = null;
+  var qsNewsAt = 0;
+
+  var QS_PAGES = [
+    { kind: "page", label: "Overview", hint: "Money page — empty by decision",
+      page: "overview", keywords: "overview money pnl equity home dashboard" },
+    { kind: "page", label: "Basis", hint: "Not built yet", page: "basis",
+      keywords: "basis gap spot perp edge funding arbitrage" },
+    { kind: "page", label: "Momentum", hint: "Not built yet", page: "momentum",
+      keywords: "momentum volume surge ignition runner mover" },
+    { kind: "page", label: "Machine", hint: "Not built yet", page: "machine",
+      keywords: "machine trader authority policy execution quant" },
+    { kind: "page", label: "Journal", hint: "Not built yet", page: "journal",
+      keywords: "journal history trades receipts events log" },
+    { kind: "page", label: "News", hint: "Live feed · sources · impact",
+      page: "news", keywords: "news headlines sources feed impact tree rss" },
+    { kind: "page", label: "Connections", hint: "Path · toggles · cadence",
+      page: "connections",
+      keywords: "connections watchman signal network polling server mirror" },
+    { kind: "page", label: "Settings", hint: "Not built yet", page: "settings",
+      keywords: "settings preferences theme language account logout" }
+  ];
+
+  function qsOpen() { return qsFocused || qsQ.length > 0; }
+
+  function qsEnsureData() {
+    var now = Date.now();
+    if (!qsStream && now - qsStreamAt > 60000) {
+      qsStreamAt = now;
+      fetch("/api/stream", { cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { qsStream = d; if (qsOpen()) { qsRender(); } })
+        .catch(function () { qsStream = null; });
+    }
+    if (!newsData && !qsNews && now - qsNewsAt > 60000) {
+      qsNewsAt = now;
+      fetch("/api/news", { cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { qsNews = d; if (qsOpen()) { qsRender(); } })
+        .catch(function () { qsNews = null; });
+    }
+  }
+
+  function qsNum(v) {
+    var n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+
+  function qsIndex() {
+    var out = QS_PAGES.slice();
+    var toks = (qsStream && qsStream.present && qsStream.tokens) || [];
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      var d = t.data || {};
+      var hasSpot = d.spot_bid != null;
+      var hasPerp = d.perp_bid != null;
+      var venue = hasSpot && hasPerp ? "Spot + Perp"
+        : (hasPerp ? "Perp" : "Spot");
+      var isSurge = (t.selection || []).indexOf("top_surge") >= 0;
+      out.push({
+        kind: "symbol",
+        label: String(t.symbol),
+        hint: venue + (isSurge ? " · volume surge" : " · basis gap"),
+        page: isSurge ? "momentum" : "basis",
+        surge: isSurge ? qsNum(d.surge_ratio) : null,
+        gap: qsNum(d.basis_gap_pct),
+        keywords: (t.symbol + " " + venue +
+          " token symbol market coin").toLowerCase()
+      });
+    }
+    var newsSrc = newsData || qsNews;
+    var items = (newsSrc && newsSrc.present && newsSrc.items) || [];
+    for (var n = 0; n < items.length; n++) {
+      var it = items[n];
+      out.push({
+        kind: "news",
+        label: it.title || "—",
+        hint: (it.source || "—") +
+          (typeof it.ts === "string" && it.ts.length >= 16
+            ? " · " + it.ts.slice(11, 16) : ""),
+        url: it.url || null,
+        domain: it.domain || null,
+        keywords: ((it.title || "") + " " +
+          (it.source || "")).toLowerCase()
+      });
+    }
+    var board = (newsSrc && newsSrc.sources_board) || {};
+    var srcs = board.sources || [];
+    for (var s = 0; s < srcs.length; s++) {
+      var sr = srcs[s];
+      out.push({
+        kind: "source",
+        label: sr.label || sr.key || "—",
+        hint: (sr.domain || "feed") +
+          (sr.status ? " · " + sr.status : ""),
+        page: "news",
+        domain: sr.domain || null,
+        count: sr.count || 0,
+        keywords: ((sr.label || "") + " " + (sr.domain || "") +
+          " source feed").toLowerCase()
+      });
+    }
+    return out;
+  }
+
+  function qsInTab(e) {
+    if (qsTab === "pages") { return e.kind === "page"; }
+    if (qsTab === "symbols") { return e.kind === "symbol"; }
+    if (qsTab === "news") { return e.kind === "news"; }
+    if (qsTab === "sources") { return e.kind === "source"; }
+    return true;
+  }
+
+  function qsCompute() {
+    var index = qsIndex();
+    var ql = qsQ.trim().toLowerCase();
+    if (!ql) {
+      /* pre-typing board: what's moving now, then the pages — the old
+         room also showed its markets before a query existed. */
+      var idle = index.filter(function (e) {
+        return qsInTab(e) && (e.kind === "symbol" || e.kind === "page");
+      });
+      idle.sort(function (a, b) {
+        if (a.kind !== b.kind) { return a.kind === "symbol" ? -1 : 1; }
+        if (a.kind === "symbol") { return (b.surge || 0) - (a.surge || 0); }
+        return 0;
+      });
+      return idle.slice(0, 8);
+    }
+    var RANK = { page: 0, symbol: 1, news: 2, source: 3 };
+    var scored = [];
+    for (var i = 0; i < index.length; i++) {
+      var e = index[i];
+      if (!qsInTab(e)) { continue; }
+      var l = e.label.toLowerCase();
+      var score = -1;
+      if (l.indexOf(ql) === 0) { score = 0; }
+      else if (l.split(/\s+/).some(function (w) {
+        return w.indexOf(ql) === 0;
+      })) { score = 1; }
+      else if (l.indexOf(ql) !== -1) { score = 2; }
+      else if (e.keywords.indexOf(ql) !== -1) { score = 3; }
+      if (score >= 0) { scored.push({ e: e, score: score }); }
+    }
+    scored.sort(function (a, b) {
+      return a.score - b.score ||
+        (RANK[a.e.kind] - RANK[b.e.kind]) ||
+        ((b.e.surge || b.e.count || 0) - (a.e.surge || a.e.count || 0));
+    });
+    return scored.slice(0, 12).map(function (x) { return x.e; });
+  }
+
+  function qsGo(e) {
+    if (!e) { return; }
+    if (e.kind === "news") {
+      if (e.url) { window.open(e.url, "_blank", "noopener"); }
+      else { location.hash = "#news"; }
+    } else if (e.page) {
+      location.hash = "#" + e.page;
+    }
+    qsQ = "";
+    qsInput.value = "";
+    qsSel = 0;
+    qsFocused = false;
+    qsInput.blur();
+    qsRender();
+  }
+
+  function qsRowEl(e, i) {
+    var row = document.createElement("button");
+    row.type = "button";
+    row.className = "ssr-row" + (i === qsSel ? " sel" : "");
+    var mark = document.createElement("span");
+    mark.className = "ssr-mark";
+    if ((e.kind === "news" || e.kind === "source") && e.domain) {
+      (function (m, label) {
+        var img = document.createElement("img");
+        img.alt = "";
+        img.src = "live/favicons/" + e.domain + ".png";
+        img.addEventListener("error", function () {
+          m.textContent = (label || "?").charAt(0).toUpperCase();
+        });
+        m.appendChild(img);
+      })(mark, e.label);
+    } else if (e.kind === "page") {
+      var navIcon = document.querySelector(
+        '.nav-row[data-page="' + e.page + '"] svg');
+      if (navIcon) { mark.appendChild(navIcon.cloneNode(true)); }
+      else { mark.textContent = e.label.charAt(0); }
+    } else {
+      mark.textContent = e.label.slice(0, 2).toUpperCase();
+    }
+    var asset = document.createElement("span");
+    asset.className = "ssr-asset";
+    var lb = document.createElement("span");
+    lb.className = "ssr-label";
+    lb.textContent = e.label;
+    lb.title = e.label;
+    var ht = document.createElement("span");
+    ht.className = "ssr-hint";
+    ht.textContent = e.hint || "";
+    asset.appendChild(lb);
+    asset.appendChild(ht);
+    var right = document.createElement("span");
+    if (e.kind === "symbol") {
+      right.className = "ssr-price";
+      var b = document.createElement("b");
+      var sm = document.createElement("small");
+      if (e.surge != null) {
+        b.textContent = "×" + (e.surge >= 100
+          ? Math.round(e.surge) : e.surge.toFixed(1));
+        sm.textContent = "surge";
+      } else if (e.gap != null) {
+        b.textContent = e.gap.toFixed(2) + "%";
+        sm.textContent = "gap";
+      } else {
+        b.textContent = "—";
+        sm.textContent = "";
+      }
+      right.appendChild(b);
+      right.appendChild(sm);
+    } else if (e.kind === "source") {
+      right.className = "ssr-price";
+      var b2 = document.createElement("b");
+      b2.textContent = String(e.count || 0);
+      var sm2 = document.createElement("small");
+      sm2.textContent = "items";
+      right.appendChild(b2);
+      right.appendChild(sm2);
+    } else {
+      right.className = "ssr-price single";
+      right.textContent = e.kind === "news" ? "Open ↗" : "Open";
+    }
+    row.appendChild(mark);
+    row.appendChild(asset);
+    row.appendChild(right);
+    row.addEventListener("mouseenter", function () {
+      if (qsSel !== i) {
+        qsSel = i;
+        var rows = qsPop.querySelectorAll(".ssr-row");
+        for (var r = 0; r < rows.length; r++) {
+          rows[r].classList.toggle("sel",
+            rows[r].getAttribute("data-i") === String(i));
+        }
+      }
+    });
+    row.setAttribute("data-i", String(i));
+    row.addEventListener("mousedown", function (ev) {
+      ev.preventDefault();
+      qsGo(e);
+    });
+    return row;
+  }
+
+  function qsRender() {
+    var open = qsOpen();
+    qsWrap.classList.toggle("open", open);
+    qsBox.classList.toggle("on", qsFocused || qsQ.length > 0);
+    qsInput.setAttribute("aria-expanded", open ? "true" : "false");
+    if (!open) { qsPop.hidden = true; return; }
+    qsPop.hidden = false;
+    qsResults = qsCompute();
+    if (qsSel >= qsResults.length) {
+      qsSel = Math.max(0, qsResults.length - 1);
+    }
+    qsPop.textContent = "";
+    var tabs = document.createElement("div");
+    tabs.className = "ssr-tabs";
+    tabs.setAttribute("role", "tablist");
+    var tdefs = [["top", "Top"], ["pages", "Pages"],
+      ["symbols", "Symbols"], ["news", "News"], ["sources", "Sources"]];
+    for (var ti = 0; ti < tdefs.length; ti++) {
+      (function (id, label) {
+        var tb = document.createElement("button");
+        tb.type = "button";
+        tb.className = qsTab === id ? "on" : "";
+        tb.textContent = label;
+        tb.addEventListener("mousedown", function (ev) {
+          ev.preventDefault();
+          qsTab = id;
+          qsSel = 0;
+          qsRender();
+        });
+        tabs.appendChild(tb);
+      })(tdefs[ti][0], tdefs[ti][1]);
+    }
+    qsPop.appendChild(tabs);
+    if (!qsResults.length) {
+      var none = document.createElement("div");
+      none.className = "ssr-empty";
+      none.textContent = (qsStream || newsData || qsNews)
+        ? "No matches. Try a page, symbol, source, or headline."
+        : "Mirror not readable yet — pages remain searchable.";
+      qsPop.appendChild(none);
+      return;
+    }
+    var GROUPS = [["page", "Pages"], ["symbol", "Symbols"],
+      ["news", "News"], ["source", "Sources"]];
+    for (var g = 0; g < GROUPS.length; g++) {
+      var kind = GROUPS[g][0];
+      var rows = [];
+      for (var ri2 = 0; ri2 < qsResults.length; ri2++) {
+        if (qsResults[ri2].kind === kind) {
+          rows.push(qsRowEl(qsResults[ri2], ri2));
+        }
+      }
+      if (!rows.length) { continue; }
+      var grp = document.createElement("div");
+      grp.className = "ssr-group";
+      var gt = document.createElement("div");
+      gt.className = "ssr-group-title";
+      gt.textContent = GROUPS[g][1];
+      grp.appendChild(gt);
+      for (var rw = 0; rw < rows.length; rw++) {
+        grp.appendChild(rows[rw]);
+      }
+      qsPop.appendChild(grp);
+    }
+    var selEl = qsPop.querySelector(".ssr-row.sel");
+    if (selEl && selEl.scrollIntoView) {
+      selEl.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  qsInput.addEventListener("focus", function () {
+    qsFocused = true;
+    qsEnsureData();
+    qsRender();
+  });
+  qsBox.addEventListener("mousedown", function (ev) {
+    if (ev.target !== qsInput) {
+      ev.preventDefault();
+      qsInput.focus();
+    }
+  });
+  qsInput.addEventListener("input", function () {
+    qsQ = qsInput.value;
+    qsSel = 0;
+    qsRender();
+  });
+  qsInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      qsSel = Math.min(qsSel + 1, qsResults.length - 1);
+      qsRender();
+    } else if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      qsSel = Math.max(qsSel - 1, 0);
+      qsRender();
+    } else if (ev.key === "Enter") {
+      if (qsResults[qsSel]) { qsGo(qsResults[qsSel]); }
+    } else if (ev.key === "Escape") {
+      ev.stopPropagation();
+      qsQ = "";
+      qsInput.value = "";
+      qsFocused = false;
+      qsInput.blur();
+      qsRender();
+    }
+  });
+  qsKbd.addEventListener("click", function () { qsInput.focus(); });
+  document.addEventListener("pointerdown", function (ev) {
+    if (qsOpen() && !qsWrap.contains(ev.target)) {
+      qsQ = "";
+      qsInput.value = "";
+      qsFocused = false;
+      qsRender();
+    }
+  });
+  document.addEventListener("keydown", function (ev) {
+    if ((ev.key === "k" || ev.key === "K") &&
+        (isMac ? ev.metaKey : ev.ctrlKey)) {
+      ev.preventDefault();
+      qsInput.focus();
+    }
+  });
 
   /* boot the router last — routes reference structures defined above */
   window.addEventListener("hashchange", route);
