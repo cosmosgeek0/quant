@@ -1,0 +1,138 @@
+PORT PLANS
+SCOPE | MEASURED | Donor root is /Users/cosmosgeek/Desktop/arbitrage-cosmos-stable-backend-14def78; every source below is donor-relative and was read without execution.
+COUNT | MEASURED | Twelve candidates are covered: BASIS-1 through BASIS-9 and VOLUME-1 through VOLUME-3.
+SIZE BASIS | INFERRED | Estimates are non-blank implementation or test lines for the named candidate; separately numbered test candidates are not counted again in their implementation candidate.
+
+CANDIDATE | BASIS-1 | Atomic paired-cut causality | server/src/engine/basis/marketState.ts (667 lines); server/src/engine/basis/gapTracker.ts (462 lines)
+TARGET | INFERRED | New src/basis_causality.py as a pure paired-cut reducer; keep transport and persistence in their existing owners.
+DEPENDENCIES | INFERRED | src/market_feed.py for per-leg source stamps; src/market_stream.py for paired-cut persistence; src/basis_kernel.py for executable Decimal gaps; src/basis_events.py for move coupling; src/basis_ladder.py for add/unwind guards; src/basis_watch.py for projection. Six-file web: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | TypeScript private maps, union results, and mutable public-state objects become frozen dataclasses plus explicit reducer state. Separate source event time, source sequence, receipt time, and accepted sequence; never substitute one clock for another.
+DECIMAL RISK | INFERRED | Donor prices, gaps, slopes, covariance, and thresholds are Number values. Convert every price and gap to Decimal; timestamps and sequences remain bounded integers; missing slope or chronology remains None.
+HOUSE-LAW RISK | MEASURED+INFERRED | Donor validation drops or clears some bad observations and uses float math. The Python port must return named discontinuities, retain high-water marks across clearing, reject floats, and keep an unavailable pair UNKNOWN.
+TEST | INFERRED | Recreate the donor TESTUSDT T0 book/seed cuts for four quadrants, replay conflicts, missing legs, stale/skew cuts, follower confirmation, and restart fencing; reuse local WebSocket rows from tests/test_market_feed.py and coherence cases from tests/test_market_stream.py.
+SIZE | INFERRED | About 620 non-blank implementation lines; BASIS-2 and BASIS-3 carry the larger acceptance suites separately.
+FINDING | MEASURED | The donor files also own universe, funding, depth, borrow, and generic gap statistics. Only paired chronology and causal lifecycle belong in this port; the broader market-state class would duplicate current owners.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-2 | Causal acceptance matrix | server/test/engine-basis-causal-gap.test.mjs (649 lines)
+TARGET | INFERRED | New tests/test_basis_causality.py, table-driven around the BASIS-1 reducer and explicit projection adapters.
+DEPENDENCIES | INFERRED | src/basis_causality.py; src/basis_kernel.py; src/basis_events.py; src/basis_ladder.py; src/basis_watch.py. Five production surfaces are asserted: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | Node replay helpers and JavaScript object mutation become unittest fixtures with immutable Decimal cuts. Projection assertions must be mapped to this repo's event, watch, ladder, and proposal shapes rather than copied by field name.
+DECIMAL RISK | INFERRED | Convert every bid, ask, threshold, micro-decay step, and expected gap to Decimal text at fixture construction; do not preserve JavaScript division or approximate equality.
+HOUSE-LAW RISK | INFERRED | UNKNOWN must survive ties, missing pairs, stale cuts, regressing clocks, and replay conflicts. A later usable cut may start a new cause but may not repair the rejected cut retrospectively.
+TEST | MEASURED+INFERRED | Port all 14 donor test cases: both directions and four quadrants, watermark retention, exact unchanged replay, clearing, stale/skew recovery, growth/decay, flips, expiry, micro-decay, and asymmetric bid/ask movement.
+SIZE | INFERRED | About 560 non-blank test lines after fixture consolidation.
+FINDING | MEASURED | This is not an isolated matrix: the donor test imports the complete replay engine and asserts features, decisions, proposals, and snapshots. Equivalent coverage depends on the five local surfaces named above.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-3 | Runtime clock and restart boundary | server/test/engine-basis-runtime-causality.test.mjs (416 lines)
+TARGET | INFERRED | New tests/test_basis_runtime_causality.py, with small shared test-clock fixtures kept in that test file.
+DEPENDENCIES | INFERRED | src/market_feed.py; src/market_stream.py; src/basis_causality.py; src/basis_watch.py; src/runtime_paths.py. Five-file runtime seam: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | Promise/timer replacement, monkey-patched Date.now, and never-settling fetches become injected clock, read, and timer callables. Preserve generation fencing and do not turn a timeout into market truth.
+DECIMAL RISK | INFERRED | Raw REST/WebSocket price text must enter as Decimal, while source/receipt times and call counts stay integers. An absent Spot event time must remain None, not inherit receipt time.
+HOUSE-LAW RISK | INFERRED | Stop/restart clears causal continuity; late or missing reads stay unavailable; an untimed changed leg may have structural leadership but no source age or event-time slope.
+TEST | MEASURED+INFERRED | Port the seven donor cases: receipt/source separation, bounded acquisition recovery, unchanged replay in both leader directions, older changed leg, dual-change ordering, missing/stale pair, and untimed Spot changes. Reuse local feed reconnect and stream freshness fixtures.
+SIZE | INFERRED | About 390 non-blank test lines.
+FINDING | MEASURED | One donor case is acquisition-timeout recovery rather than causality alone; it belongs here because it proves that runtime recovery does not invent a replacement cut.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-4 | Indicative exact-ratio basis path | quant/src/quant_edge/derivatives/basis_path.py (443 lines)
+TARGET | INFERRED | New src/basis_path.py for offline diagnostics only; extend src/basis_recorder.py only after its history schema can retain both leg prices and completeness gaps.
+DEPENDENCIES | MEASURED+INFERRED | Donor imports quant_edge.derivatives.references, quant_edge.errors, quant_edge.features.domains, quant_edge.features.fixedpoint, quant_edge.labels.rational, quant_edge.labels.series, and quant_edge.lake.contracts, none present in this src layout. Local replacements still require src/basis_recorder.py, src/market_stream.py, src/basis_kernel.py, and src/runtime_paths.py. PORT-HEAVY.
+TRANSLATION RISK | MEASURED+INFERRED | No TypeScript translation is needed; this is Python-to-house-Python adaptation. Replace the donor framework contracts, fixed-point wrappers, and rational helpers with bounded frozen dataclasses and an explicitly versioned Decimal schema.
+DECIMAL RISK | INFERRED | The donor uses exact integer ratios and one later fixed-point quantization. The local form must use Decimal throughout, document precision and rounding, keep stale references absent, and prove attribution sums exactly.
+HOUSE-LAW RISK | MEASURED+INFERRED | The path is indicative midpoint/last-trade research, never executable entry truth. Current basis_history.jsonl stores a precomputed normal gap but not paired leg series or known-gap intervals, so it cannot feed this port as written.
+TEST | INFERRED | Recreate donor quant/tests/q08/test_q08_basis_path.py cases for fresh sampling, merged/clipped gaps, ordering, deterministic mapping, moving-leg attribution, equal contribution, and exact conservation; add current recorder fixtures with missing/stale leg rows.
+SIZE | INFERRED | About 430 non-blank implementation lines after framework removal; about 260 additional test lines.
+FINDING | MEASURED | The digest's algorithm claim is accurate, but the present repo lacks its input contract. A schema extension is a prerequisite, not a value to infer from the stored gap.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-5 | Reverse-basis lifecycle law | server/src/liveEdge/adapters/reverseBasisLifecycle/types.ts (424 lines); server/src/liveEdge/adapters/reverseBasisLifecycle/lifecycle.ts (2844 lines)
+TARGET | INFERRED | New src/reverse_basis_lifecycle.py as a pure event/state owner; a separately permitted new src/margin_hand.py would own Margin-specific read and mutation identities.
+DEPENDENCIES | INFERRED | New src/margin_hand.py; src/basis_ladder.py; src/basis_position.py; src/basis_executor.py; src/futures_hand.py; src/mechanics_reconcile.py; src/account_governor.py; src/limits.py; src/events.py. Nine-file execution and reconciliation web: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | TypeScript discriminated unions, deeply frozen snapshots, content hashes, exhaustive stage derivation, and injected L07/L08 witnesses become enums, frozen dataclasses, canonical JSON, and one deterministic reducer. Do not transplant exchange-twin or execution-policy framework objects.
+DECIMAL RISK | INFERRED | Principal, interest, liabilities, actual fills, remaining quantities, recovery caps, costs, and drift all become canonical Decimal text. Every subtraction floors only at a proved exact zero; missing, duplicate, or inconsistent rows stay None.
+HOUSE-LAW RISK | MEASURED+INFERRED | The donor is a synthetic lifecycle around injected witnesses and has no real Margin hand. No execution authority can be inferred from it; exact-client-id query-first handling, no retry of an unclear mutation, and exact closure reconciliation remain mandatory.
+TEST | INFERRED | Use the BASIS-6 event fixtures as the acceptance oracle: preflight gates, exact liability, actual-fill hedge/close sizing, repay only after both legs are flat, ambiguity durability, recovery caps, checkpoint restore, and terminal reconciliation.
+SIZE | INFERRED | About 2400 non-blank implementation lines after removing donor framework plumbing; BASIS-6 test lines are separate.
+FINDING | MEASURED | The direct imports include foundation canonical JSON, capital exact-decimal helpers, L07 mechanics, L08 policy, and exchange-twin state. The digest already calls the implementation synthetic, so this is a scope weight rather than a digest contradiction.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-6 | Reverse lifecycle invariant suite | server/test/liveEdge/reverseBasisLifecycle/preflight.test.mjs (143 lines); server/test/liveEdge/reverseBasisLifecycle/lifecycle.test.mjs (273 lines); server/test/liveEdge/reverseBasisLifecycle/safety.test.mjs (430 lines); server/test/liveEdge/reverseBasisLifecycle/closure.test.mjs (213 lines); server/test/liveEdge/reverseBasisLifecycle/recovery.test.mjs (298 lines); server/test/liveEdge/reverseBasisLifecycle/restart.test.mjs (116 lines); server/test/liveEdge/reverseBasisLifecycle/exact.test.mjs (40 lines)
+TARGET | INFERRED | New tests/test_reverse_basis_lifecycle.py, grouped by the seven donor themes but sharing one immutable event builder.
+DEPENDENCIES | INFERRED | src/reverse_basis_lifecycle.py; new src/margin_hand.py; src/basis_executor.py; src/mechanics_reconcile.py; src/account_governor.py; src/events.py. Six-file behavior web and seven donor files: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | Convert 78 Node test cases, object-freeze checks, hash checks, and array-order replay into unittest tables. Keep occurrence time distinct from supplied order and compare canonical serialized bytes after restore.
+DECIMAL RISK | INFERRED | Fixture amounts must be Decimal strings, including accrued-interest boundaries, residual amounts, high precision, and exact zero. Reject exponent, negative, float, and noncanonical inputs where the donor exact suite does.
+HOUSE-LAW RISK | INFERRED | All tests stay offline with injected state and no signed calls. Ambiguous borrow, order, repay, or liability outcomes remain visible and cannot become no-effect, flat, or terminal.
+TEST | MEASURED+INFERRED | Preserve the measured 78-case matrix: 12 preflight, 13 lifecycle, 19 safety, 11 closure, 10 recovery, 8 restart, and 5 exact-decimal cases.
+SIZE | INFERRED | About 1320 non-blank test lines after shared-fixture consolidation.
+FINDING | MEASURED | Every named donor test file exists. The suite asserts framework identity and immutability as well as lifecycle law; local tests should preserve the law and canonical-byte guarantees without recreating unrelated framework types.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-7 | Revision-bound proposal invalidation | server/src/engine/basis/proposals.ts (509 lines)
+TARGET | INFERRED | Extend src/basis_ladder.py with a frozen per-rung evidence revision and a pure invalidation predicate; keep proposal-file publication and claim ownership in src/basis_watch.py and src/basis_supervisor.py.
+DEPENDENCIES | INFERRED | src/basis_watch.py for immutable proposal facts; src/basis_kernel.py for current Decimal evidence; src/basis_ladder.py for rung state. Three production files; do not port the donor emitter, store, or static staged-size metadata.
+TRANSLATION RISK | INFERRED | Replace mutable proposal-store updates and EventEmitter callbacks with pure compare-and-return rows. Exact revision acceptance becomes digest plus observed-at identity, not JavaScript numeric equality.
+DECIMAL RISK | INFERRED | Net edge, notional, gaps, funding drag, spread, and depth remain Decimal or None. Acceptance may only reduce a proposed ceiling and must compare canonical Decimal values, never binary float equality.
+HOUSE-LAW RISK | INFERRED | Missing/stale books, funding, borrow, quality, spread, or depth invalidate an add. Known convergence may still reduce exposure. The donor 25/50/100 staged-size rows are excluded because the local ladder already owns its schedule.
+TEST | INFERRED | Extend tests/test_basis_ladder.py with per-rung TTL, revision mismatch, funding change, gap closure, stale data, wide spread, and missing depth; reuse tests/test_basis_watch.py proposal TTL/digest fixtures and tests/test_basis_supervisor.py exact-claim fixtures.
+SIZE | INFERRED | About 180 non-blank implementation lines and 190 test lines.
+FINDING | MEASURED | The reusable donor surface is limited to invalidation order and exact-revision acceptance. The staged sizes are rounded Number metadata and have no fill coupling, so they remain excluded as the digest directs.
+VERDICT | PORT-READY
+
+CANDIDATE | BASIS-8 | Feed-to-engine runtime seam | server/src/services/basisRuntime.ts (754 lines)
+TARGET | INFERRED | Extend src/market_stream.py as the paired-cut publication owner, with narrow source-stamp additions in src/market_feed.py and consumption by src/basis_causality.py.
+DEPENDENCIES | INFERRED | src/market_feed.py; src/market_stream.py; src/basis_causality.py; src/basis_watch.py; src/basis_kernel.py; src/runtime_paths.py. Six-file runtime seam: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | Promise races, intervals, generation counters, and a latched Date.now become injected reads, integer generations, and a non-regressing clock. Preserve same-turn ingest/evaluate coherence without copying the donor service container.
+DECIMAL RISK | INFERRED | Donor books, fees, marks, funding, and configuration use Number arithmetic. Parse source strings directly to Decimal and keep receipt/source clocks as integers; an absent event timestamp stays None.
+HOUSE-LAW RISK | MEASURED+INFERRED | Donor borrow publication is explicitly disconnected, and reverse rows therefore remain blocked. Local source currently uses receipt time when a feed event time is absent; the port must preserve absence separately before making causal claims.
+TEST | INFERRED | Use BASIS-3 runtime fixtures plus local tests/test_market_feed.py and tests/test_market_stream.py cases for missing event time, reconnect, stale snapshots, generation fences, bounded reads, and same-turn publication.
+SIZE | INFERRED | About 430 non-blank implementation lines across the narrow seams; BASIS-3 owns the main test estimate.
+FINDING | MEASURED | The digest's useful seams are present, but the donor file also couples engine, ledger, config, lifecycle, and decay owners. Porting the class itself would duplicate this repo's script-based runtime.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | BASIS-9 | Public opportunity provenance envelope | server/src/engine/basis/publicOpportunityObservation.ts (941 lines)
+TARGET | INFERRED | New src/basis_evidence.py for canonical public-only evidence; integrate first with src/basis_watch.py proposals and later with src/basis_ladder.py rung records.
+DEPENDENCIES | INFERRED | src/market_feed.py and src/market_stream.py for per-leg time provenance; src/basis_kernel.py for economics; src/basis_watch.py for proposal identity; src/basis_ladder.py for rung identity; src/events.py for safe projection. Six-file web and BASIS-8 prerequisite: PORT-HEAVY.
+TRANSLATION RISK | INFERRED | TypeScript readonly interfaces, deep freeze, plain-object inspection, Buffer bounds, crypto digest, and canonical JSON become frozen dataclasses, bounded Mapping validation, bytes limits, hashlib, and sorted compact JSON.
+DECIMAL RISK | INFERRED | Replace donor exact-decimal helper calls with canonical Decimal text and explicit precision/rounding. Gross public edge, assumed costs, and proxy net remain distinct; account-effective edge is always None without private proof.
+HOUSE-LAW RISK | INFERRED | Public proxy, proposal intent, order result, and account-effective outcome must never share a truth label. Unknown or stale component provenance keeps dependent economics None and cannot be zero-filled.
+TEST | MEASURED+INFERRED | Port the eight cases in server/test/liveEdge/basisTicker/public-opportunity-observation.test.mjs: deterministic identity, incomplete costs, reverse borrow unknown, receipt-time Spot provenance, stale/incomplete quotes, strict digest validation, passive-data validation, and payload bounds.
+SIZE | INFERRED | About 700 non-blank implementation lines and 430 test lines.
+FINDING | MEASURED | The source proves an opportunity-level public envelope, not a rung record. Rung binding is a local adaptation and requires exact rung/revision fields rather than relabeling the opportunity digest.
+VERDICT | PORT-HEAVY
+
+CANDIDATE | VOLUME-1 | Aggregate-trade tape features | server/src/engine/volume/adapters.ts (153 lines); server/src/engine/volume/tape.ts (110 lines)
+TARGET | INFERRED | New src/volume_tape.py as a pure Decimal parser/analyzer; later narrow consumers are src/market_feed.py and src/volume_observer.py.
+DEPENDENCIES | INFERRED | src/market_feed.py for raw aggTrade delivery and src/volume_observer.py for bounded feature publication. Two production files; existing study/stage_b.py and study/absorption.py provide fixture semantics only and are not runtime imports.
+TRANSLATION RISK | INFERRED | TypeScript interfaces and Number maps become frozen trade/tape dataclasses. Preserve first/last trade IDs and print count instead of discarding them; replace toPrecision size bins with an explicit Decimal relative-bin rule.
+DECIMAL RISK | INFERRED | Price, quantity, quote value, dominance, taker ratio, range, uniformity, and cluster quote totals are Decimal. Timestamp, trade IDs, print count, and cluster count remain bounded integers; empty evidence returns None where a ratio cannot be proved.
+HOUSE-LAW RISK | MEASURED+INFERRED | Donor filtering silently removes invalid trades and returns numeric zeros for several empty metrics. The port must return named unavailable fields, reject float input, and label the uniformity score as a hand-defined feature rather than learned absorption.
+TEST | INFERRED | Reuse synthetic aggTrade ZIP/CSV builders in tests/test_stage_b.py and tests/test_absorption.py; add f/l spans, one-print and multi-print dominant events, repeated sizes, alternating maker side, flat/moving price, cluster gaps, invalid fields, and deterministic ordering. Compare valid Decimal outputs with donor engine-volume fixtures.
+SIZE | INFERRED | About 250 non-blank implementation lines and 220 test lines.
+FINDING | MEASURED | The adapter derives printCount as lastTradeId minus firstTradeId plus one; the tape records only the maximum print count, not a full print-span distribution. The port plan preserves raw IDs so later ablation can measure more than the donor did.
+VERDICT | PORT-READY
+
+CANDIDATE | VOLUME-2 | Own-history detector ablation | server/src/engine/volume/baseline.ts (77 lines); server/src/engine/volume/rolling.ts (286 lines); server/src/engine/volume/detector.ts (271 lines); server/src/engine/volume/config.ts (171 lines)
+TARGET | INFERRED | Redesign first in new study/volume_detector_ablation.py using frozen tapes; only a measured acceptance promotes a smaller state machine to new src/volume_detector.py.
+DEPENDENCIES | INFERRED | study/stage_b.py for trade features; study/baselines.py for own-token history; study/noise_filter.py for current filtering; study/validate.py for held-out results; src/volume_tape.py from VOLUME-1 for the added tape fields. Five-file research web before any runtime home.
+TRANSLATION RISK | INFERRED | TypeScript ring buffers, Infinity sentinels, Math.log/sqrt, configuration clamping, and mutable detector context require bounded Python state, None sentinels, Decimal math, and refusing invalid configuration instead of silently clamping it.
+DECIMAL RISK | INFERRED | Quote volume, medians, MAD, multiples, returns, volatility, confidence, spread/depth, and thresholds must be Decimal. Counts/times stay integers. Empty windows and unready baselines stay None rather than numeric zero in decision evidence.
+HOUSE-LAW RISK | MEASURED+INFERRED | Donor input filters can drop bad samples while retaining readiness, and several empty-window fields become zero. The redesign must make completeness explicit and compare detector variants only on proved chronological tapes.
+TEST | INFERRED | Use donor engine-volume quiet-history, single-outlier, one-print, sustained-continuation, grace, dwell, stale-book, spread/depth, and no-follow-through scripts; replay them through current Stage-B fixtures, then publish ablation counts and held-out economics with tests/test_validate.py.
+SIZE | INFERRED | About 520 non-blank research implementation lines and 360 tests before any runtime port.
+FINDING | MEASURED | The digest overstates MAD's active role: baseline.ts calculates quotePerMinMad and proposals carry it, but no detector decision branch reads it. The running norm is median/floor plus fixed multiples, so a direct port would not perform the requested MAD ablation.
+VERDICT | REDESIGN-INSTEAD
+
+CANDIDATE | VOLUME-3 | Prospective raw-first evidence capture | server/src/engine/volume/forwardMeasurementEvidence.ts (3628 lines); server/src/engine/volume/forwardMeasurementRunner.ts (1123 lines); server/src/engine/volume/forwardMeasurementScheduler.ts (951 lines); server/src/services/volumeRuntime.ts (1600 lines)
+TARGET | INFERRED | New src/volume_forward_capture.py for framing, chain verification, checkpoint, and scheduler; new study/volume_forward_measure.py for terminal 60-second measurement and validation consumption.
+DEPENDENCIES | MEASURED+INFERRED | Direct donor dependencies omitted from the digest path include forwardMeasurementDetectorSource.ts, the volume engine/config/types/adapters, Binance stream/REST wrappers, decay, observed-order focus, exact-decimal contracts, ledger, and app config. Local dependencies are src/market_feed.py, src/volume_observer.py, src/runtime_paths.py, src/events.py, src/volume_detector.py, study/policy_sim.py, and study/validate.py. PORT-HEAVY.
+TRANSLATION RISK | INFERRED | TypeScript union records, Uint8Array/Base64, SHA-256 chains, BigInt monotonic text, generation state, recursive one-shot timers, and checkpoint cursors become bounded bytes/base64/hashlib/json, integer generations, time.monotonic_ns, and injected timer ports.
+DECIMAL RISK | INFERRED | Evidence bytes remain byte-exact; decoded prices, depth, filters, fees, slippage, and 60-second economics become Decimal. Timestamps, offsets, byte counts, revisions, and sequence numbers remain integers; no raw Number economics may cross the frame boundary.
+HOUSE-LAW RISK | MEASURED+INFERRED | Default state stays OFF, record-only, public-only, and without execution or private-data authority. Missed slots, generation changes, continuity gaps, checkpoint drift, or sink failure terminate the capture as unavailable; they do not trigger backfill or repaired history.
+TEST | INFERRED | Port the 12 runner and 9 scheduler cases from server/test/volume-forward-measurement-runner.test.mjs and server/test/volume-forward-measurement-scheduler.test.mjs; add canonical raw-frame, chain mutation/reorder/truncation, point-in-time filter/depth, exact proposal-to-first-60s-cut, restart, and gap fixtures.
+SIZE | INFERRED | About 4800 non-blank implementation lines and 1200 test lines after consolidating the donor's 7023 non-blank source lines.
+FINDING | MEASURED | The four digest files exist and implement the claimed chain, clocks, generations, schedule, and proposal coverage. They are not self-contained: runner and runtime directly require several unlisted donor modules, so the candidate cannot fire as a four-file transplant.
+VERDICT | PORT-HEAVY
+
+TALLY | INFERRED | PORT-READY 2 | PORT-HEAVY 9 | REDESIGN-INSTEAD 1
