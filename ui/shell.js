@@ -162,7 +162,6 @@
     stopNewsPoll();
     stopNetHealthPoll();
     stopNetTelemetry();
-    stopActivity();
     if (netChart) { netChart.destroy(); netChart = null; }
     if (h === "network") {
       sigPage = pageEl;
@@ -569,61 +568,6 @@
     return b;
   }
 
-  function bannerState() {
-    if (!lastStrip) {
-      return { worst: 1, title: "Connecting to the local server",
-        sub: "No status read has landed yet." };
-    }
-    var worst = connOverallWorst();
-    if (worst === 0) {
-      var n = 0;
-      for (var i = 0; i < CONNECTIONS.length; i++) {
-        if (CONNECTIONS[i].live && connState[CONNECTIONS[i].id]) { n += 1; }
-      }
-      return { worst: 0, title: "All connections operational",
-        sub: "All " + n + " loops are reporting normally." };
-    }
-    var names = [];
-    for (var j = 0; j < CONNECTIONS.length; j += 1) {
-      var def = CONNECTIONS[j];
-      if (!def.live || !connState[def.id]) { continue; }
-      var cls = rowStatus(def).statusCls;
-      if ((worst === 2 && cls === "bad") ||
-          (worst === 1 && cls !== "" && cls !== "ok")) {
-        names.push(def.name);
-      }
-    }
-    return { worst: worst,
-      title: (worst === 2 ? "Outage: " : "Degraded: ") +
-        (names.join(", ") || "one loop"),
-      sub: worst === 2
-        ? "The named loop has stopped reporting \u2014 rows below."
-        : "Past its measured cadence \u2014 rows below." };
-  }
-
-  function updateBanner() {
-    var card = document.getElementById("net-banner");
-    if (!card) { return; }
-    var st = bannerState();
-    var sig = st.worst + "|" + st.title + "|" + st.sub;
-    if (card.getAttribute("data-sig") === sig) { return; }
-    card.setAttribute("data-sig", sig);
-    var plate = document.getElementById("net-plate");
-    if (plate) {
-      plate.className = "st-plate" +
-        (st.worst === 2 ? " bad" : st.worst === 1 ? " warn" : "");
-    }
-    card.textContent = "";
-    var band = stEl("div", "st-banner-band" +
-      (st.worst === 2 ? " bad" : st.worst === 1 ? " warn" : ""));
-    band.appendChild(stIcon(st.worst));
-    band.appendChild(stEl("div", "st-t-h", st.title));
-    card.appendChild(band);
-    var sub = stEl("div", "st-banner-sub");
-    sub.appendChild(stEl("div", "st-t-body", st.sub));
-    card.appendChild(sub);
-  }
-
   function uptimeText(compKey) {
     var pct = uptimePct(compKey);
     if (pct == null) { return "\u2014"; }
@@ -701,139 +645,6 @@
   }
 
   var panelCharts = {};
-  var actTimer = null;
-  var actData = null;
-
-  function fetchActivity() {
-    fetch("/api/telemetry?range=24h", { cache: "no-store" })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) {
-        actData = d && d.present ? (d.points || []) : [];
-        renderActivity();
-      })
-      .catch(function () { actData = null; });
-  }
-
-  function startActivity() {
-    fetchActivity();
-    if (actTimer) { clearInterval(actTimer); }
-    actTimer = setInterval(function () {
-      if (!pollCfg.paused) { fetchActivity(); }
-    }, 60000);
-  }
-
-  function stopActivity() {
-    if (actTimer) { clearInterval(actTimer); actTimer = null; }
-  }
-
-  function activityBuckets() {
-    /* one stacked column per hour, 24 back from now: transitions
-       into bad (H), into warn (M), recoveries to ok (L) */
-    var buckets = [];
-    for (var b = 0; b < 24; b += 1) {
-      buckets.push({ h: 0, m: 0, l: 0 });
-    }
-    if (!actData || actData.length < 2) { return buckets; }
-    var t0 = Date.now() - 24 * 3600 * 1000;
-    for (var mi = 0; mi < NET_METRICS.length; mi += 1) {
-      var m = NET_METRICS[mi];
-      var thr = thrFor(m.key);
-      if (!thr) { continue; }
-      var confirmed = null;
-      var pending = null;
-      var pendingTs = null;
-      for (var i = 0; i < actData.length; i += 1) {
-        var v = telNum(actData[i][m.field]);
-        if (v == null) { continue; }
-        var cur = v >= thr.bad ? "bad"
-          : v >= thr.warn ? "warn" : "ok";
-        if (confirmed === null) { confirmed = cur; continue; }
-        if (cur === confirmed) { pending = null; continue; }
-        if (pending === cur) {
-          var ts = Date.parse(pendingTs);
-          if (isFinite(ts) && ts >= t0) {
-            var at = Math.min(23, Math.max(0,
-              Math.floor((ts - t0) / 3600000)));
-            if (cur === "bad") { buckets[at].h += 1; }
-            else if (cur === "warn") { buckets[at].m += 1; }
-            else { buckets[at].l += 1; }
-          }
-          confirmed = cur;
-          pending = null;
-        } else {
-          pending = cur;
-          pendingTs = actData[i].ts;
-        }
-      }
-    }
-    return buckets;
-  }
-
-  function renderActivity() {
-    var host = document.getElementById("net-activity");
-    if (!host) { return; }
-    var buckets = activityBuckets();
-    var canvas = host.querySelector("canvas");
-    if (!canvas) {
-      host.textContent = "";
-      canvas = document.createElement("canvas");
-      host.appendChild(canvas);
-    }
-    var w = Math.max(120, host.clientWidth);
-    var h = 96;
-    var ratio = Math.max(1, window.devicePixelRatio || 1);
-    canvas.style.width = w + "px";
-    canvas.style.height = h + "px";
-    canvas.width = Math.round(w * ratio);
-    canvas.height = Math.round(h * ratio);
-    var ctx = canvas.getContext("2d");
-    if (!ctx) { return; }
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    var plotH = h - 18;
-    var maxN = 3;
-    for (var i = 0; i < 24; i += 1) {
-      var tot = buckets[i].h + buckets[i].m + buckets[i].l;
-      if (tot > maxN) { maxN = tot; }
-    }
-    var slot = w / 24;
-    var bw = slot * 0.72;
-    var colors = { l: "#24c19a", m: "#fbbf24", h: "#f87171" };
-    for (var b2 = 0; b2 < 24; b2 += 1) {
-      var x = b2 * slot + (slot - bw) / 2;
-      var y = plotH;
-      var parts = ["l", "m", "h"];
-      for (var p = 0; p < parts.length; p += 1) {
-        var n = buckets[b2][parts[p]];
-        if (!n) { continue; }
-        var bh = Math.max(2, (n / maxN) * (plotH - 6));
-        y -= bh;
-        ctx.fillStyle = colors[parts[p]];
-        ctx.fillRect(x, y, bw, bh);
-        y -= 1;
-      }
-    }
-    /* baseline + sparse hour labels, UTC */
-    var styles = getComputedStyle(host);
-    ctx.fillStyle = styles.getPropertyValue("--st-faint").trim() ||
-      "#95959d";
-    ctx.strokeStyle = styles.getPropertyValue("--st-divider").trim() ||
-      "#f0f0f2";
-    ctx.beginPath();
-    ctx.moveTo(0, plotH + 0.5);
-    ctx.lineTo(w, plotH + 0.5);
-    ctx.stroke();
-    ctx.font = "11px " + (styles.getPropertyValue("--sans").trim() ||
-      "InterVariable, sans-serif");
-    var nowH = new Date().getUTCHours();
-    for (var lb = 0; lb < 24; lb += 1) {
-      var hourAt = (nowH - 23 + lb + 48) % 24;
-      if (hourAt % 6 !== 0) { continue; }
-      var tx = lb * slot + slot / 2;
-      var txt = (hourAt < 10 ? "0" : "") + hourAt;
-      ctx.fillText(txt, tx - 6, h - 4);
-    }
-  }
 
   /* theme flips repaint tokens instantly but canvases keep their
      mount-time colors — remount the page's charts on the flip */
@@ -1537,8 +1348,7 @@
       }
     }
     updatePanels();
-    var evHost2 = document.getElementById("net-events");
-    if (evHost2 && window.QNet && QNet.events) {
+    if (window.QNet && QNet.events) {
       var evDefs = [];
       for (var ei = 0; ei < NET_METRICS.length; ei += 1) {
         evDefs.push({ key: NET_METRICS[ei].key,
@@ -1547,36 +1357,22 @@
           thr: thrFor(NET_METRICS[ei].key) });
       }
       var evRows = QNet.events.compute(telemPoints(), evDefs);
-      /* audit fix: learned thresholds drift as history deepens and
-         can re-grade the past, silently erasing real incidents from
-         the list. Once observed, a transition enters the session
-         ledger and stays — the list shows the ledger, windowed. */
+      /* observed transitions persist in the session ledger; the
+         stat tile counts the current window from that one source */
       for (var eli = 0; eli < evRows.length; eli += 1) {
         var er = evRows[eli];
         netEvLedger[er.key + "|" + er.ts + "|" + er.to] = er;
       }
       var cutoff = Date.now() - rangeSeconds() * 1000;
-      var ledgerRows = [];
+      var evCount = 0;
       var evKeys = Object.keys(netEvLedger);
       for (var elk = 0; elk < evKeys.length; elk += 1) {
-        var lr = netEvLedger[evKeys[elk]];
-        var lts = Date.parse(lr.ts);
-        if (isFinite(lts) && lts >= cutoff) { ledgerRows.push(lr); }
+        var lts = Date.parse(netEvLedger[evKeys[elk]].ts);
+        if (isFinite(lts) && lts >= cutoff) { evCount += 1; }
       }
-      ledgerRows.sort(function (a, b) {
-        return new Date(b.ts).getTime() - new Date(a.ts).getTime();
-      });
-      netEvCount = ledgerRows.length;
-      QNet.events.render(evHost2, ledgerRows);
-      var evCap2 = document.getElementById("net-events-cap");
-      if (evCap2) {
-        evCap2.textContent = ledgerRows.length
-          ? ledgerRows.length + " in the " + netTelem.range + " window"
-          : netTelem.range + " window";
-      }
+      netEvCount = evCount;
     }
     updateStats();
-    updateBanner();
   }
 
   function connOverallWorst() {
@@ -1604,13 +1400,6 @@
     var head = stEl("div", "st-head");
     head.appendChild(stEl("div", "st-t-title", "Network"));
     page.appendChild(head);
-
-    var plate = stEl("div", "st-plate");
-    plate.id = "net-plate";
-    var banner = stEl("div", "st-card");
-    banner.id = "net-banner";
-    plate.appendChild(banner);
-    page.appendChild(plate);
 
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
@@ -1757,75 +1546,7 @@
     });
     secHead.appendChild(dfl);
 
-    /* the master graph left, the network log right — one row
-       directly under the banner; panels take the full width below */
-    var cols = stEl("div", "st-cols");
-    var colL = stEl("div", "");
-    var colR = stEl("div", "st-logcol");
-    cols.appendChild(colL);
-    cols.appendChild(colR);
-    colL.appendChild(graphCard);
-    page.appendChild(cols);
-
-    /* activity: the log column's own 24h severity histogram */
-    var actCard = stEl("div", "st-card");
-    var actHead = stEl("div", "st-card-head");
-    actHead.appendChild(stEl("div", "st-t-h", "Activity \u00b7 24h"));
-    actHead.appendChild(stEl("span", "st-spacer"));
-    var lg = stEl("span", "st-t-meta", "");
-    var lgDefs = [["#f87171", "H"], ["#fbbf24", "M"], ["#24c19a", "L"]];
-    for (var lgi = 0; lgi < lgDefs.length; lgi += 1) {
-      var dot = stEl("span", "st-chip-key");
-      dot.style.background = lgDefs[lgi][0];
-      dot.style.marginLeft = lgi ? "8px" : "0";
-      lg.appendChild(dot);
-      lg.appendChild(document.createTextNode(" " + lgDefs[lgi][1]));
-    }
-    actHead.appendChild(lg);
-    actCard.appendChild(actHead);
-    var actHost = stEl("div", "st-activity");
-    actHost.id = "net-activity";
-    actCard.appendChild(actHost);
-    colR.appendChild(actCard);
-
-    var bottom = colR;
-    var evCard = stEl("div", "st-card");
-    evCard.id = "net-evcard";
-    var evHead = stEl("div", "st-card-head");
-    evHead.appendChild(stEl("div", "st-t-h", "State changes"));
-    evHead.appendChild(stEl("span", "st-spacer"));
-    var evCap = stEl("span", "st-t-meta", "");
-    evCap.id = "net-events-cap";
-    evHead.appendChild(evCap);
-    evCard.appendChild(evHead);
-    var evHost = stEl("div", "");
-    evHost.id = "net-events";
-    evCard.appendChild(evHost);
-    bottom.appendChild(evCard);
-
-    var bCard = stEl("div", "st-card");
-    var bHead = stEl("div", "st-card-head");
-    bHead.appendChild(stEl("div", "st-t-h", "Boundaries"));
-    bCard.appendChild(bHead);
-    for (var bi = 0; bi < CONNECTIONS.length; bi += 1) {
-      var bdef = CONNECTIONS[bi];
-      if (bdef.group !== "boundary") { continue; }
-      var brow = stEl("div", "st-row");
-      var bline = stEl("div", "st-row-line");
-      var bicon = stEl("span", "st-check");
-      bicon.appendChild(stIcon(3));
-      bline.appendChild(bicon);
-      bline.appendChild(stEl("span", "st-t-name", bdef.name));
-      bline.appendChild(stEl("span", "st-spacer"));
-      bline.appendChild(stEl("span", "st-word off", "Owner gated"));
-      brow.appendChild(bline);
-      bCard.appendChild(brow);
-    }
-    var bFoot = stEl("div", "st-card-foot st-t-meta",
-      "Poll selects set the recorder\u2019s sampling \u00b7 host " +
-      "loops run on the host.");
-    bCard.appendChild(bFoot);
-    bottom.appendChild(bCard);
+    page.appendChild(graphCard);
 
     /* panels: full width, 4 by 2, under the graph row */
     page.appendChild(secHead);
@@ -1837,7 +1558,6 @@
     page.appendChild(grid);
 
     container.appendChild(page);
-    startActivity();
     fetchPollConfig(function () {
       /* the allowed list and current values arrive after build —
          rebuild every select's options from the live config */
@@ -1860,7 +1580,6 @@
 
   function renderSigAll() {
     if ((location.hash || "").slice(1) === "network" && sigPage) {
-      updateBanner();
       updatePanels();
     }
   }
