@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+LEAD SESSION 2026-08-15 afternoon | successor Lead's first day at the desk | fleet peak 7 codex, 16 verified lanes landed, machine SEALED+FLAT throughout, zero live actions
+symbol class | the non-ASCII listing defect class killed repo-wide: shared validator windows.validate_symbol + 8 modules converted (2 crashed on the real listing, 6 silently skipped its data files) | archive ceiling 1 GiB byte-accounted streaming — the anonymous failure named: AKEUSDT 2026-08-14, 128,057,344 bytes vs the old 128,000,000 bound
+bench | absorption baselines now build from the 13GB tape (proven on 20 real symbols, then full universe: built=469, skipped=21 honest NOT-READY) | gap-history reader landed against the recorder schema | full-suite discovery is a clean instrument again (exit 0, 43 stated sandbox skips)
+wiring verdict | ladder-to-supervisor wiring SHELVED after three adversarial rounds (7+9+9 confirmed findings; R7 proved multi-rung unreachable in the projection-over-v1 shape) | preserved on shelf/ladder-wiring-v1 | engine-shape conclusion per the completeness law, never a strategy verdict
+railroad | POSITION-ADD build running: BUILD-01 v1 contract freeze + runner margin-ops application + standalone events validation upgrade (IR3 R5 repaired) all in flight | IR3's nine findings fold into BUILD-02/03 as receipt-schema requirements
+donor | port plans measured against real donor code: 2 PORT-READY, 9 PORT-HEAVY, 1 REDESIGN-INSTEAD, one digest oversell corrected | margin ops layer landed offline, runner change staged as unapplied proposal behind fresh-eyes review
+standing | owner words open: permit numbers (against measured plans), BNB fee float, re-arm (criterion unchanged), four rung-sizing questions from the design doc | V2 pipeline and first full-universe absorption sweep grinding
+
 LEAD SEAT ASSUMED + LANGUAGE LAW 2026-08-15 ~11:35Z | successor Lead seated per HANDOVER-LEAD (5cae78b) | machine untouched: SEALED + FLAT, tuner advisory
 law | LANGUAGE LAW (owner hard law): clean language, soft tone in every chat, dispatch, report, record, commit — nothing that could flag ordinary engineering work; dirty worker reports go back for cleaning | folded into CLAUDE.md this commit, SEATS row updated same file
 loops | mirror loops measured ALIVE (the handover note was stale): pull manifest 33s fresh, sync log written this second | duplicate instances from this seat's restart attempt killed; exactly one pair stands
