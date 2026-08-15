@@ -862,6 +862,21 @@ class JobRunnerTests(unittest.TestCase):
             self.assertEqual(self.tick(), 0)
         self.assertEqual(refresh.call_count, 1)
 
+    def test_owner_marker_failure_during_creation_halts_factually(self):
+        paths = jr._paths(self.receipt_dir)
+
+        with mock.patch.object(
+                jr, "_process_start_marker", return_value=None), \
+                mock.patch("builtins.print") as output:
+            self.assertEqual(self.tick(), 3)
+
+        output.assert_called_once_with(
+            "JOB-RUNNER | HALTED | runner heartbeat unavailable"
+        )
+        self.assertTrue(os.path.isfile(paths["stop"]))
+        self.assertFalse(os.path.exists(paths["tick_lock"]))
+        self.assertEqual(self.results(), [])
+
     def test_tick_consumes_at_most_one_due_job(self):
         self.job("a")
         self.job("b")
@@ -1952,6 +1967,9 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(
             set(before["authority_digests"]), {"job_file"}
         )
+        self.assertEqual(before["mutation_attempts"], 0)
+        self.assertNotIn("submission", before)
+        self.assertNotIn("transaction_id", before)
 
         self.assertEqual(self.tick(), 0)
 
@@ -1966,6 +1984,93 @@ class JobRunnerTests(unittest.TestCase):
         )
         with open(row["receipt_path"], encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["governor_release"], "RECOVERED")
+
+    def test_runner_only_recovery_refuses_unknown_mutation_fields(self):
+        job_id = "margin-runner-only-fields"
+        row, lock_path = self.interrupt_margin_governor_release(
+            job_id, measured_sha="invalid-sha"
+        )
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        runner["mutation_attempts"] = 1
+        runner["submission"] = {
+            "kind": "ok",
+            "transaction_id": "7301",
+        }
+        with open(row["receipt_path"], "w", encoding="utf-8") as handle:
+            json.dump(runner, handle)
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        refusals = self.result_events("margin_governor_recovery_refused")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["job_id"], job_id)
+        self.assertEqual(
+            refusals[0]["reason"], "DURABLE_OWNERSHIP_MISMATCH"
+        )
+
+    def test_pre_receipt_job_replacement_is_caught_by_validated_digest(self):
+        job_id = "margin-pre-receipt-replacement"
+        job_path = self.margin_job(job_id)
+        validated_digest = hashlib.sha256(
+            Path(job_path).read_bytes()
+        ).hexdigest()
+        lock_path = os.path.join(
+            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+        write_runner_receipt = jr._write_runner_receipt
+
+        class ReleaseInterrupted(Exception):
+            pass
+
+        def replace_before_receipt(*args, **kwargs):
+            with open(job_path, encoding="utf-8") as handle:
+                replacement = json.load(handle)
+            replacement["principal"] = "999"
+            with open(job_path, "w", encoding="utf-8") as handle:
+                json.dump(replacement, handle)
+            return write_runner_receipt(*args, **kwargs)
+
+        def pause_release(_release, token, _receipt_dir):
+            with open(lock_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "version": 1,
+                    "token": token,
+                    "op": "MARGIN_BORROW",
+                    "symbol": "USDT",
+                    "utc": utc(NOW),
+                }, handle)
+            raise ReleaseInterrupted
+
+        with mock.patch.dict(os.environ, {"QUANT_SHA": "invalid-sha"}), \
+                mock.patch.object(
+                    jr, "_write_runner_receipt",
+                    side_effect=replace_before_receipt), \
+                mock.patch.object(
+                    jr, "_release_governor", side_effect=pause_release):
+            with self.assertRaises(ReleaseInterrupted):
+                self.margin_tick()
+
+        row = self.results()[0]
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        replacement_digest = hashlib.sha256(
+            Path(job_path).read_bytes()
+        ).hexdigest()
+        self.assertEqual(
+            runner["authority_digests"]["job_file"], validated_digest
+        )
+        self.assertNotEqual(validated_digest, replacement_digest)
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(lock_path))
+        refusals = self.result_events("margin_governor_recovery_refused")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["job_id"], job_id)
 
     def test_sourceless_recovery_refuses_one_job_digest_disagreement(self):
         job_id = "margin-sourceless-disagreement"

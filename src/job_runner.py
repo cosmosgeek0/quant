@@ -76,6 +76,23 @@ MARGIN_GOVERNOR_RECOVERY_LEGACY_FIELDS = (
 MARGIN_GOVERNOR_RECOVERY_REFUSAL_FIELDS = {
     "kind", "job_id", "op", "symbol", "reason", "utc",
 }
+MARGIN_RECOVERY_RUNNER_FIELDS = {
+    "job_id", "op", "symbol", "verdict", "reason", "utc",
+    "measured_sha", "sha_valid", "authority_digests", "governor_token",
+    "governor_release",
+}
+MARGIN_SOURCE_BACKED_RUNNER_FIELDS = MARGIN_RECOVERY_RUNNER_FIELDS | {
+    "sha", "source_receipt_path",
+}
+MARGIN_RUNNER_ONLY_REFUSAL_FIELDS = MARGIN_RECOVERY_RUNNER_FIELDS | {
+    "mutation_attempts",
+}
+MARGIN_RUNNER_ONLY_REFUSAL_VERDICTS = frozenset(("REFUSED",))
+MARGIN_SOURCE_AUTHORITY_DIGEST_FIELDS = {
+    "ready_params", "job_file", "accept_one", "operator", "stop_jobs",
+    "operator_token", "job_expiry",
+}
+MARGIN_RUNNER_ONLY_AUTHORITY_DIGEST_FIELDS = {"job_file"}
 TICK_LOCK_RECOVERY_FIELDS = {
     "kind", "pid", "age_seconds", "utc",
 }
@@ -876,15 +893,27 @@ def _create_tick_lock(path: str, now: datetime) -> str:
     encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
         "ascii"
     )
-    descriptor = os.open(
-        path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-    )
+    created = False
     try:
-        os.write(descriptor, encoded)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    _fsync_parent_directory(path)
+        descriptor = os.open(
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        created = True
+        try:
+            if os.write(descriptor, encoded) != len(encoded):
+                raise OSError("runner lock write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_parent_directory(path)
+    except OSError:
+        if created:
+            try:
+                os.unlink(path)
+                _fsync_parent_directory(path, best_effort=True)
+            except OSError:
+                pass
+        raise
     return token
 
 
@@ -1183,8 +1212,9 @@ def _claim_margin_intent(paths: Dict[str, str], intent_id: str,
     return True
 
 
-def _runner_authority_digests(paths: Dict[str, str], job_id: str,
-                              source_path: str) -> Dict[str, str]:
+def _runner_authority_digests(source_path: str,
+                              validated_job_digest: str) \
+        -> Dict[str, str]:
     digests: Dict[str, str] = {}
     if source_path:
         source = _load_plain_receipt(source_path)
@@ -1196,14 +1226,9 @@ def _runner_authority_digests(paths: Dict[str, str], job_id: str,
                 and re.fullmatch(r"[0-9a-f]{64}", value) is not None
                 for name, value in recorded.items()):
             digests.update(recorded)
-    if "job_file" not in digests:
-        job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
-        try:
-            digests["job_file"] = _authority_digest(
-                _read_file_bytes(job_path)
-            )
-        except OSError:
-            pass
+    if type(validated_job_digest) is str \
+            and re.fullmatch(r"[0-9a-f]{64}", validated_job_digest):
+        digests["job_file"] = validated_job_digest
     return digests
 
 
@@ -1211,7 +1236,8 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
                           symbol: str, verdict: str, reason: str,
                           now: datetime, source_path: str = "",
                           ledger: Optional[Dict[str, Any]] = None,
-                          governor_token: str = "") -> str:
+                          governor_token: str = "",
+                          validated_job_digest: str = "") -> str:
     path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
     measured_sha = os.environ.get("QUANT_SHA", "")
     sha_valid = SHA_RE.fullmatch(measured_sha.lower()) is not None
@@ -1229,10 +1255,12 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
         payload["source_receipt_path"] = source_path
     if op in MARGIN_OPS:
         authority_digests = _runner_authority_digests(
-            paths, job_id, source_path
+            source_path, validated_job_digest
         )
         if authority_digests:
             payload["authority_digests"] = authority_digests
+        if not source_path:
+            payload["mutation_attempts"] = 0
         if sha_valid:
             payload["sha"] = measured_sha.lower()
         if governor_token:
@@ -3579,13 +3607,17 @@ def _json_authority_digest(value: Any) -> Optional[str]:
 
 def _margin_post_authority(
         job: Job, paths: Dict[str, str], operation: Dict[str, Any],
-        post_params: Dict[str, Any]) \
+        post_params: Dict[str, Any], validated_job_digest: str) \
         -> Tuple[str, datetime, Dict[str, str], bool]:
     ready_params_digest = _json_authority_digest(post_params)
     if ready_params_digest is None:
         ready_params_digest = _authority_digest(None)
     digests: Dict[str, str] = {
         "ready_params": ready_params_digest,
+        "job_file": validated_job_digest
+        if type(validated_job_digest) is str
+        and re.fullmatch(r"[0-9a-f]{64}", validated_job_digest)
+        else _authority_digest(None),
     }
     job_encoded = None
     accept_encoded = None
@@ -3596,6 +3628,9 @@ def _margin_post_authority(
     try:
         job_encoded = _read_file_bytes(job_path)
     except OSError:
+        read_reason = "MARGIN_VALIDATION_UNKNOWN"
+    if job_encoded is not None and _authority_digest(job_encoded) \
+            != validated_job_digest:
         read_reason = "MARGIN_VALIDATION_UNKNOWN"
     try:
         accept_encoded = _read_file_bytes(paths["accept_one"])
@@ -3618,7 +3653,6 @@ def _margin_post_authority(
 
     verified_now = _utc_now()
     digests.update({
-        "job_file": _authority_digest(job_encoded),
         "accept_one": _authority_digest(accept_encoded),
         "operator": _authority_digest(operator_encoded),
         "stop_jobs": _authority_digest(stop_encoded),
@@ -3707,7 +3741,8 @@ def _margin_post_authority(
 def _run_margin_operation(
         job: Job, paths: Dict[str, str],
         request: Optional[Callable[..., Tuple[str, Any]]] = None,
-        governor_token: str = "", sha: str = "") -> Outcome:
+        governor_token: str = "", sha: str = "",
+        validated_job_digest: str = "") -> Outcome:
     fresh_now = _utc_now()
     principal = _canonical_decimal_text(job.requested_max_notional)
     projection = {
@@ -3778,7 +3813,9 @@ def _run_margin_operation(
 
     post_params = dict(operation["params"])
     authority_refusal, authority_now, authority_digests, stop_present = \
-        _margin_post_authority(job, paths, operation, post_params)
+        _margin_post_authority(
+            job, paths, operation, post_params, validated_job_digest
+        )
     receipt["authority_checked_utc"] = _utc_text(authority_now)
     receipt["authority_digests"] = authority_digests
     receipt["authority_stop_jobs_present"] = stop_present
@@ -3921,6 +3958,7 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
              futures_entry: Optional[Callable[[], Any]],
              basis_entry: Optional[Callable[[Any], Any]],
              now: datetime, governor_token: str = "",
+             validated_job_digest: str = "",
              momentum_measurement: Optional[Dict[str, Any]] = None,
              spot_request: Optional[
                  Callable[..., Tuple[str, Any]]
@@ -3942,7 +3980,8 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
             return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
     if job.op in MARGIN_OPS:
         return _run_margin_operation(
-            job, paths, margin_request, governor_token, sha
+            job, paths, margin_request, governor_token, sha,
+            validated_job_digest,
         )
 
     values = {
@@ -4012,6 +4051,63 @@ def _load_plain_receipt(path: str) -> Optional[Dict[str, Any]]:
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _exact_authority_digests(value: Any, fields: set) -> bool:
+    return isinstance(value, dict) \
+        and set(value) == fields \
+        and all(
+            type(digest) is str
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            for digest in value.values()
+        )
+
+
+def _runner_sha_fields_cohere(runner: Dict[str, Any]) -> bool:
+    measured_sha = runner.get("measured_sha")
+    sha_flag = runner.get("sha_valid")
+    return type(measured_sha) is str \
+        and type(sha_flag) is bool \
+        and (
+            sha_flag
+            and SHA_RE.fullmatch(measured_sha.lower()) is not None
+            and runner.get("sha") == measured_sha.lower()
+            or not sha_flag
+            and SHA_RE.fullmatch(measured_sha.lower()) is None
+            and "sha" not in runner
+        )
+
+
+def _margin_recovery_runner_has_exact_shape(
+        runner: Any, source_backed: bool) -> bool:
+    if not isinstance(runner, dict):
+        return False
+    if source_backed:
+        expected_fields = MARGIN_SOURCE_BACKED_RUNNER_FIELDS
+        digest_fields = MARGIN_SOURCE_AUTHORITY_DIGEST_FIELDS
+    else:
+        expected_fields = MARGIN_RUNNER_ONLY_REFUSAL_FIELDS
+        if runner.get("sha_valid") is True:
+            expected_fields = expected_fields | {"sha"}
+        digest_fields = MARGIN_RUNNER_ONLY_AUTHORITY_DIGEST_FIELDS
+    if set(runner) != expected_fields:
+        return False
+    string_fields = expected_fields - {
+        "authority_digests", "mutation_attempts", "sha_valid",
+    }
+    if any(type(runner.get(name)) is not str for name in string_fields):
+        return False
+    if not _runner_sha_fields_cohere(runner) \
+            or not _exact_authority_digests(
+                runner.get("authority_digests"), digest_fields
+            ):
+        return False
+    if source_backed:
+        return runner.get("sha_valid") is True
+    return runner.get("verdict") in MARGIN_RUNNER_ONLY_REFUSAL_VERDICTS \
+        and type(runner.get("mutation_attempts")) is int \
+        and runner.get("mutation_attempts") == 0 \
+        and bool(runner.get("reason"))
 
 
 def _mark_margin_governor_released(
@@ -4108,6 +4204,7 @@ def _recover_final_margin_governor(
         runner = _load_plain_receipt(runner_path)
         source = _load_plain_receipt(source_path)
         source_exists = os.path.exists(source_path)
+        lock = _load_plain_receipt(lock_path)
         pending = (
             isinstance(runner, dict)
             and runner.get("governor_release") == "PENDING"
@@ -4115,16 +4212,22 @@ def _recover_final_margin_governor(
             isinstance(source, dict)
             and source.get("governor_release") == "PENDING"
         )
-        if not pending:
+        receipt_tokens = {
+            payload.get("governor_token")
+            for payload in (runner, source)
+            if isinstance(payload, dict)
+            and type(payload.get("governor_token")) is str
+            and payload.get("governor_token")
+        }
+        owned_lock_evidence = isinstance(lock, dict) \
+            and lock.get("token") in receipt_tokens
+        if not pending and not owned_lock_evidence:
             continue
-        lock = _load_plain_receipt(lock_path)
         job = _load_plain_receipt(job_path)
         governor_token = runner.get("governor_token") \
             if isinstance(runner, dict) else None
         ready = source.get("ready") if isinstance(source, dict) else None
         params = ready.get("params") if isinstance(ready, dict) else None
-        measured_sha = runner.get("measured_sha") \
-            if isinstance(runner, dict) else None
         authority_digests = runner.get("authority_digests") \
             if isinstance(runner, dict) else None
         try:
@@ -4137,25 +4240,19 @@ def _recover_final_margin_governor(
             and job_digest is not None
             and authority_digests.get("job_file") == job_digest
         )
-        sha_flag = runner.get("sha_valid") \
-            if isinstance(runner, dict) else None
-        sha_valid = sha_flag is True
-        sha_agrees = (
-            type(measured_sha) is str
-            and type(sha_flag) is bool
-            and (
-                sha_valid
-                and SHA_RE.fullmatch(measured_sha.lower()) is not None
-                and runner.get("sha") == measured_sha.lower()
-                or not sha_valid
-                and SHA_RE.fullmatch(measured_sha.lower()) is None
-                and "sha" not in runner
-            )
+        sha_valid = isinstance(runner, dict) \
+            and runner.get("sha_valid") is True
+        source_backed = source_exists \
+            or isinstance(runner, dict) \
+            and "source_receipt_path" in runner
+        runner_shape_agrees = _margin_recovery_runner_has_exact_shape(
+            runner, source_backed
         )
         common_agrees = (
             os.path.abspath(str(row.get("receipt_path", "")))
             == os.path.abspath(runner_path)
             and isinstance(runner, dict)
+            and runner_shape_agrees
             and isinstance(lock, dict)
             and isinstance(job, dict)
             and runner.get("job_id") == job_id
@@ -4175,11 +4272,7 @@ def _recover_final_margin_governor(
             and job.get("op") == margin_ops.MARGIN_BORROW
             and job.get("asset") == row.get("symbol")
             and job_attested
-            and sha_agrees
         )
-        source_backed = source_exists \
-            or isinstance(runner, dict) \
-            and "source_receipt_path" in runner
         if source_backed:
             ready_params_digest = _json_authority_digest(params) \
                 if isinstance(params, dict) else None
@@ -4209,13 +4302,9 @@ def _recover_final_margin_governor(
         else:
             ownership_agrees = (
                 common_agrees
-                and row.get("verdict") == "REFUSED"
+                and row.get("verdict")
+                in MARGIN_RUNNER_ONLY_REFUSAL_VERDICTS
                 and row.get("exit_code") == 2
-                and runner.get("verdict") == "REFUSED"
-                and type(runner.get("reason")) is str
-                and bool(runner.get("reason"))
-                and "source_receipt_path" not in runner
-                and set(authority_digests) == {"job_file"}
             )
             recovery_shape = "RUNNER_ONLY_FINAL_REFUSAL"
             release_source_path = ""
@@ -4290,13 +4379,15 @@ def _record_realized_close(outcome: Outcome, receipt_dir: str) -> bool:
 def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
                     op: str, symbol: str, outcome: Outcome,
                     now: datetime, accept_one_checked: bool = False,
-                    governor_token: str = "") -> int:
+                    governor_token: str = "",
+                    validated_job_digest: str = "") -> int:
     if not accept_one_checked:
         outcome = _final_entry_outcome(paths, job_id, op, outcome)
     if outcome.reason or outcome.ledger is not None:
         receipt_path = _write_runner_receipt(
             paths, job_id, op, symbol, outcome.verdict, outcome.reason, now,
             outcome.receipt_path, outcome.ledger, governor_token,
+            validated_job_digest,
         )
         outcome = Outcome(
             outcome.verdict, outcome.exit_code, receipt_path, "",
@@ -4487,9 +4578,14 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
     paths = _paths(receipt_dir)
     _make_dirs(paths)
 
-    token, stale, stale_recovery = _acquire_tick_lock(
-        paths["tick_lock"], now
-    )
+    try:
+        token, stale, stale_recovery = _acquire_tick_lock(
+            paths["tick_lock"], now
+        )
+    except OSError:
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | HALTED | runner heartbeat unavailable")
+        return 3
     if stale:
         _touch_stop(paths["stop"])
         print("JOB-RUNNER | HALTED | unresolved runner lock")
@@ -4563,8 +4659,9 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             raw: Dict[str, Any] = {}
             refusal = ""
             job = None
+            validated_job_digest = ""
             try:
-                raw = _load_job(path)
+                raw, validated_job_digest = _load_job_with_digest(path)
                 job = _validate_job(raw, filename_id, now, receipt_dir)
                 if job.created_utc > now:
                     continue
@@ -4578,7 +4675,8 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     else _safe_text(raw, "symbol")
                 outcome = Outcome("REFUSED", 2, "", refusal)
                 return _finish_claimed(
-                    paths, receipt_dir, filename_id, op, symbol, outcome, now
+                    paths, receipt_dir, filename_id, op, symbol, outcome, now,
+                    validated_job_digest=validated_job_digest,
                 )
             if job.op in MARGIN_OPS \
                     and _margin_intent_is_claimed(paths, job.intent_id):
@@ -4587,14 +4685,16 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 )
                 return _finish_claimed(
                     paths, receipt_dir, job.job_id, job.op,
-                    job.symbol, outcome, now
+                    job.symbol, outcome, now,
+                    validated_job_digest=validated_job_digest,
                 )
             if job.op == margin_ops.MARGIN_BORROW \
                     and os.path.isfile(paths["stop"]):
                 outcome = Outcome("REFUSED", 2, "", "STOP_JOBS_SEALED")
                 return _finish_claimed(
                     paths, receipt_dir, job.job_id, job.op,
-                    job.symbol, outcome, now
+                    job.symbol, outcome, now,
+                    validated_job_digest=validated_job_digest,
                 )
             if job.op in ENTRY_OPS:
                 refusal = _entry_ticket_refusal(job, paths, now)
@@ -4602,7 +4702,8 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     outcome = Outcome("REFUSED", 2, "", refusal)
                     return _finish_claimed(
                         paths, receipt_dir, job.job_id, job.op,
-                        job.symbol, outcome, now
+                        job.symbol, outcome, now,
+                        validated_job_digest=validated_job_digest,
                     )
             governor_token = ""
             release_governor = None
@@ -4615,6 +4716,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     outcome = _execute(
                         job, receipt_dir, paths, futures_entry,
                         basis_entry, now, governor_token,
+                        validated_job_digest,
                         momentum_measurement=standing_measurement,
                         spot_request=spot_request,
                         margin_request=margin_request,
@@ -4623,6 +4725,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 outcome = _execute(
                     job, receipt_dir, paths, futures_entry,
                     basis_entry, now,
+                    validated_job_digest=validated_job_digest,
                     momentum_measurement=standing_measurement,
                     spot_request=spot_request,
                     margin_request=margin_request,
@@ -4634,6 +4737,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 paths, receipt_dir, job.job_id, job.op, job.symbol,
                 outcome, now, accept_one_checked=True,
                 governor_token=governor_token,
+                validated_job_digest=validated_job_digest,
             )
             if governor_token and _entry_outcome_terminal(outcome):
                 governor_released = _release_governor(
