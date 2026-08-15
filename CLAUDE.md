@@ -106,6 +106,14 @@ freeze-time fact.
   retired promptly via `git worktree remove` (branches survive in git);
   superseded loose files move to Desktop/trash, never rm. Stale worktrees
   and stale files breed stale-order traps.
+- ENGINE-COMPLETENESS BEFORE EDGE VERDICTS (owner law 2026-08-15): no seat
+  calls a strategy profitable or unprofitable until the engine implements it
+  AS THE OWNER ACTUALLY TRADES IT (basis = laddered add as the gap grows,
+  laddered unwind as it closes, both directions, sized against the gap,
+  coupled to violent-move events — not enter-once/exit-once on quiet gaps).
+  The first question on any bad result is "what part of the engine is
+  missing?" — never "the strategy is dead." Verdict rows must name the
+  engine surface they tested.
 - Dense or risky material never enters the Lead's context raw: a worker
   reads it and returns a plain digest (paths, counts, verdicts).
 
