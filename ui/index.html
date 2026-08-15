@@ -5,25 +5,114 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
 <style>
-  html, body { margin: 0; padding: 0; background: #ffffff; }
-  /* Topbar geometry measured off learn.chatgpt.com at 100% (dpr 1):
-     bar 64px, bottom hairline 1px @ 5% black, brand mark 24px tall,
-     24px from the left edge, vertically centered.
-     Lockup is composed from two exact-ink crops of the owner's
-     Quant.png (never redrawn, never typed): lockup-mark.png 775x836
-     and lockup-word.png 775x182, split at the file's own 55px gap.
-     Mark and wordmark are sized independently, like any real lockup. */
+  /* Quant owner shell — built from the owner's taste-law, no template:
+     white everywhere, paper-thin 1px lines, precise small type, pure
+     icons on a slim rail, color only where a fact earns it. */
+  @font-face {
+    font-family: "InterVariable";
+    src: url("fonts/InterVariable.woff2") format("woff2");
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+  }
+  :root {
+    --ink: #0d0d0d;
+    --muted: #5d5d5d;
+    --faint: #b9bbc0;
+    --line: rgba(13, 13, 13, 0.07);
+    --pill: #ededed;
+    --hover: #f5f5f5;
+    --green: #06806b;
+    --amber: #99640a;
+    --red: #cc2f3c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #fff; height: 100%; }
+  body {
+    color: var(--ink);
+    font: 400 14px/1.5 InterVariable, Inter, -apple-system, "Segoe UI", sans-serif;
+    font-feature-settings: "tnum" 1, "lnum" 1;
+  }
+  :focus-visible { outline: 2px solid #2557d6; outline-offset: 1px; border-radius: 6px; }
+
+  /* topbar */
   .topbar {
     height: 64px;
     display: flex;
     align-items: center;
-    padding: 0 24px;
-    background: #ffffff;
-    border-bottom: 1px solid rgba(13, 13, 13, 0.05);
+    padding: 0 20px 0 24px;
+    border-bottom: 1px solid var(--line);
   }
   .brand-lockup { display: flex; align-items: center; gap: 10px; }
   .brand-lockup .mark { display: block; height: 28px; width: auto; }
   .brand-lockup .word { display: block; height: 15px; width: auto; }
+  .topbar .right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .clock {
+    font-size: 13px;
+    color: var(--muted);
+    letter-spacing: 0.01em;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  /* frame below the bar: rail + main */
+  .frame { display: flex; min-height: calc(100vh - 64px); }
+  .rail {
+    width: 48px;
+    flex: none;
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 10px;
+    gap: 4px;
+  }
+  .rail .nav-ic {
+    width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 8px;
+    color: var(--muted);
+  }
+  .rail a.nav-ic:hover { background: var(--hover); color: var(--ink); }
+  .rail .nav-ic.active { background: var(--pill); color: var(--ink); }
+  .rail .nav-ic[aria-disabled="true"] { color: var(--faint); }
+  .rail svg { width: 18px; height: 18px; stroke-width: 1.5; }
+
+  main { flex: 1; min-width: 0; }
+
+  /* truth strip — live mirror facts only, no authority claims */
+  .strip {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--line);
+  }
+  .chip { display: flex; align-items: baseline; gap: 7px; }
+  .chip .k {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .chip .v {
+    font-size: 13px;
+    font-variant-numeric: tabular-nums lining-nums;
+    color: var(--ink);
+  }
+  .chip .v.ok { color: var(--green); }
+  .chip .v.warn { color: var(--amber); }
+  .chip .v.bad { color: var(--red); }
+  .chip .v.off { color: var(--faint); }
+
+  /* honest empty page */
+  .empty {
+    padding: 48px 24px;
+    color: var(--muted);
+    font-size: 13.5px;
+  }
+  .empty b { color: var(--ink); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -32,6 +121,40 @@
     <img class="mark" src="lockup-mark.png" alt="">
     <img class="word" src="lockup-word.png" alt="Quant">
   </span>
+  <span class="right">
+    <span class="clock" id="clock" aria-label="UTC time">—:—:— UTC</span>
+  </span>
 </header>
+<div class="frame">
+  <nav class="rail" aria-label="Pages">
+    <a class="nav-ic active" href="#overview" aria-current="page" title="Overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+    </a>
+    <span class="nav-ic" aria-disabled="true" title="Basis — not built yet">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="m19 8 3 8a5 5 0 0 1-6 0zV7"/><path d="M3 7h1a17 17 0 0 0 8-2 17 17 0 0 0 8 2h1"/><path d="m5 8 3 8a5 5 0 0 1-6 0zV7"/><path d="M7 21h10"/></svg>
+    </span>
+    <span class="nav-ic" aria-disabled="true" title="Momentum — not built yet">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M16 7h6v6"/><path d="m22 7-8.5 8.5-5-5L2 17"/></svg>
+    </span>
+    <span class="nav-ic" aria-disabled="true" title="Machine — not built yet">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>
+    </span>
+    <span class="nav-ic" aria-disabled="true" title="Journal — not built yet">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V7"/><path d="M16 8h-6a2 2 0 0 0 0 4h4a2 2 0 0 1 0 4H8"/><path d="M4 3a1 1 0 0 1 1-1 1.3 1.3 0 0 1 .7.2l.933.6a1.3 1.3 0 0 0 1.4 0l.934-.6a1.3 1.3 0 0 1 1.4 0l.933.6a1.3 1.3 0 0 0 1.4 0l.933-.6a1.3 1.3 0 0 1 1.4 0l.934.6a1.3 1.3 0 0 0 1.4 0l.933-.6A1.3 1.3 0 0 1 19 2a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1 1.3 1.3 0 0 1-.7-.2l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.934.6a1.3 1.3 0 0 1-1.4 0l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-1.4 0l-.934-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-.7.2 1 1 0 0 1-1-1z"/></svg>
+    </span>
+  </nav>
+  <main>
+    <div class="strip" id="strip" aria-label="Live mirror freshness">
+      <span class="chip"><span class="k">Market</span><span class="v off" id="c-market">—</span></span>
+      <span class="chip"><span class="k">Supervisor</span><span class="v off" id="c-super">—</span></span>
+      <span class="chip"><span class="k">Mirror</span><span class="v off" id="c-pull">—</span></span>
+    </div>
+    <div class="empty">
+      <b>Overview.</b> No bands built yet — each one is added on the
+      owner's word. The strip above is live from the machine's mirror.
+    </div>
+  </main>
+</div>
+<script src="shell.js"></script>
 </body>
 </html>
