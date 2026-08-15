@@ -19,7 +19,7 @@ import socket
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 
@@ -1835,7 +1835,7 @@ class StateFileTests(MachineCase):
 class MainWiringTests(unittest.TestCase):
     def test_mode_flag_required(self):
         with self.assertRaises(SystemExit):
-            with redirect_stdout(io.StringIO()):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 bp.main([])
 
     def test_bad_env_blocks_before_any_transport(self):

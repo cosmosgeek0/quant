@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -87,7 +88,29 @@ def proposal(proposal_id="live01", expires="2099-08-13T00:02:00.000Z"):
 class ServerHarness(unittest.TestCase):
     """Start the real server on 127.0.0.1:0 with isolated source paths."""
 
+    _bind_probe_complete = False
+    _bind_probe_error = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if ServerHarness._bind_probe_complete:
+            return
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", 0))
+        except OSError as error:
+            ServerHarness._bind_probe_error = "%s: %s" % (
+                type(error).__name__, error)
+        finally:
+            probe.close()
+            ServerHarness._bind_probe_complete = True
+
     def start(self, sources):
+        if ServerHarness._bind_probe_error is not None:
+            self.skipTest(
+                "127.0.0.1 socket bind unavailable: %s"
+                % ServerHarness._bind_probe_error)
         server = serve.make_server(sources, port=0)
         thread = threading.Thread(
             target=lambda: server.serve_forever(poll_interval=0.05),

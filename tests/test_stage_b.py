@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Synthetic local-tape tests for Volume Dataset v2 Stage B."""
 
+import io
 import json
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 
@@ -424,8 +426,11 @@ class StageBFeatureTests(unittest.TestCase):
         no_float(self, row)
 
     def test_help_is_available_without_touching_data(self):
-        with self.assertRaises(SystemExit) as raised:
-            stage_b.argument_parser().parse_args(["--help"])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                stage_b.argument_parser().parse_args(["--help"])
         self.assertEqual(raised.exception.code, 0)
 
     def test_absent_data_directory_still_emits_honest_skip_row(self):
