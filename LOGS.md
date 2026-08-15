@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+LOOSENED + CURED + REDEPLOYED 2026-08-15 | release d962ac33 live | 919/919 Lead-run | machine armed, ticket flat-gated, four clean passes proven on host
+owner order | gating variables are KNOBS now: limits.MOMENTUM_IGNITION_SURGE_RATIO 10->3 (env QUANT_IGNITION_SURGE), governor 5/day 1.00 -> 10/day 2.00 USDT (env-overridable, garbage fails closed) | money physics untouched: clamp 8, 1x, reduce-only, consume-on-fill, 2% adverse stop
+brain saga closed | RX rotation immunity (worker died pre-report, Lead-verified from disk) + Lead's fresh-redecision fix: one deterministic id over a NEW observation = benign newest-wins; same-observation mismatch stays fatal | the id-vs-observation collision was the TRUE root of every crash-loop
+ops scars banked | rail break point measured between 32KB (passes) and 86KB (fails) — bundle-tgz under 32KB or 8KB chunks | RELEASE write via quoted inline printf produced an empty file once — root scripts only | worker end-detection needs last-120-bytes marker, prompt echo lies
+delta re-audit | requested from the review lane on d962ac33 (three commits since its READY) | machine hunts during audit per owner's standing word
+queued | owner's volume/basis product vision (spoken to standby seat, memory vault) folds into repo files after the proof receipt
+
 BRAIN OUTAGE + CURE 2026-08-15 | 17h blind (10:06Z-03:00Z) + 20min relapse | zero exposure throughout, fail-closed every tick
 root | decisions-ledger rotation at 10:06:14Z tore mid-write during symbol AAOIBUSDT's ENTER_SMALL publish — decision row landed, job file did not; every later tick rebuilt the orphan with fresh timestamps -> deterministic id conflict -> exit 2 | the round-2 audit finding triaged "minor, deferred" fired at full scale
 stolen | AAOIBUSDT was the machine's SECOND genuine ignition (10:04:11Z) and a valid ticket stood — the race ate a live entry, not just uptime | BLUAI (09:45Z) was the first: refused on the Lead's expired ticket, guard correct
