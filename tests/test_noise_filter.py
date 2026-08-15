@@ -17,6 +17,10 @@ BASE_MS = 1_767_225_600_000
 RUNNER = "RUNUSDT"
 SPIKE = "SPIKEUSDT"
 SPAM = "SPAMUSDT"
+FIXTURE_SYMBOL = json.loads(
+    (Path(__file__).parent / "fixtures" / "stage_a_line197191_event.json")
+    .read_text(encoding="utf-8")
+)["symbol"]
 EVENTS = {
     RUNNER: (90,),
     SPIKE: (90,),
@@ -131,6 +135,47 @@ class AdaptiveNoiseFilterTests(unittest.TestCase):
         baselines.run_baselines(self.data_dir, self.baseline_path)
         self.replay_path = self.output_dir / "replay-2026-01-01.jsonl"
         write_replay(self.replay_path)
+
+    def test_value_symbols_use_shared_validation(self):
+        self.assertEqual(
+            noise_filter._validated_symbol(
+                FIXTURE_SYMBOL, "event has invalid symbol"
+            ),
+            FIXTURE_SYMBOL,
+        )
+        self.assertEqual(
+            noise_filter._validated_symbol(
+                RUNNER, "event has invalid symbol"
+            ),
+            RUNNER,
+        )
+        with self.assertRaisesRegex(
+            noise_filter.FilterError, "event has invalid symbol"
+        ):
+            noise_filter._validated_symbol(
+                f"../{RUNNER}", "event has invalid symbol"
+            )
+
+        fixture_path = self.output_dir / "replay-2026-01-02.jsonl"
+        fixture_path.write_text(
+            json.dumps(ignition(FIXTURE_SYMBOL, 90, ("1", "2", "3")))
+            + "\n",
+            encoding="utf-8",
+        )
+        rows = noise_filter._read_replay(fixture_path)
+        self.assertEqual(rows[0]["symbol"], FIXTURE_SYMBOL)
+
+        invalid_path = self.output_dir / "replay-2026-01-03.jsonl"
+        invalid_path.write_text(
+            json.dumps(ignition(f"../{RUNNER}", 90, ("1", "2", "3")))
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            noise_filter.FilterError,
+            r"replay-2026-01-03\.jsonl:1 has invalid symbol",
+        ):
+            noise_filter._read_replay(invalid_path)
 
     def test_runner_kept_spike_and_serial_spammer_dropped(self):
         rows, output_path = noise_filter.run_filter(

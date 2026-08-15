@@ -32,6 +32,13 @@ if str(ROOT) not in sys.path:
 
 from study import baselines  # noqa: E402
 
+try:
+    from study.windows import WindowError as _SymbolValidationError
+    from study.windows import validate_symbol
+except ImportError:
+    from windows import WindowError as _SymbolValidationError
+    from windows import validate_symbol
+
 
 STUDY_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = STUDY_DIR / "data"
@@ -40,9 +47,8 @@ DEFAULT_FILTERED_PATTERN = "filtered-*.jsonl"
 DEFAULT_FILTER_NAME = "adaptive-noise-filter-v1"
 DEFAULT_HORIZONS_MINUTES = (60, 360, 1_440)
 EXIT_MODELS = ("simple", "ladder")
-SYMBOL = re.compile(r"[A-Z0-9]{5,30}")
 ARCHIVE_NAME = re.compile(
-    r"(?P<symbol>[A-Z0-9]{5,30})-1m-"
+    r"(?P<symbol>.+?)-1m-"
     r"(?P<day>\d{4}-\d{2}-\d{2})\.zip"
 )
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -162,6 +168,27 @@ def utc_ms(raw: Any, source: str) -> int:
     )
 
 
+def _validated_symbol(raw: Any, error_message: str) -> str:
+    try:
+        return validate_symbol(raw, "symbol")
+    except _SymbolValidationError:
+        raise RescoreError(error_message) from None
+
+
+def _archive_name_parts(name: str) -> Optional[Tuple[str, str]]:
+    match = ARCHIVE_NAME.fullmatch(name)
+    if match is None:
+        return None
+    candidate = match.group("symbol")
+    try:
+        symbol = validate_symbol(candidate, f"{name} symbol")
+    except _SymbolValidationError:
+        return None
+    if symbol != candidate:
+        return None
+    return symbol, match.group("day")
+
+
 def _read_json_lines(path: Path) -> Iterable[Tuple[int, Dict[str, Any]]]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -229,10 +256,10 @@ def load_kept_trades(
                 raise RescoreError(f"{source} has invalid decision")
             if decision == "drop":
                 continue
-            symbol = row.get("symbol")
+            symbol = _validated_symbol(
+                row.get("symbol"), f"{source} has invalid symbol"
+            )
             utc = row.get("utc")
-            if type(symbol) is not str or SYMBOL.fullmatch(symbol) is None:
-                raise RescoreError(f"{source} has invalid symbol")
             close_ms = utc_ms(utc, f"{source} utc")
             key = (symbol, close_ms)
             if key in seen:
@@ -287,16 +314,25 @@ def load_relevant_tape(
         raise RescoreError(f"data directory does not exist: {root}")
     required = _required_archive_days(trades, max_horizon_minutes)
     selected: List[Tuple[Path, str, str]] = []
+    skipped = 0
     for path in root.rglob("*.zip"):
         if not path.is_file():
             continue
         match = ARCHIVE_NAME.fullmatch(path.name)
         if match is None:
             continue
-        symbol = match.group("symbol")
-        day = match.group("day")
+        parts = _archive_name_parts(path.name)
+        if parts is None:
+            skipped += 1
+            continue
+        symbol, day = parts
         if day in required.get(symbol, set()):
             selected.append((path, symbol, day))
+    if skipped:
+        print(
+            "RESCORE | tape=klines | "
+            f"skipped={skipped} | reason=invalid_symbol_filename"
+        )
     if trades and not selected:
         raise RescoreError("data directory has no relevant 1m kline zips")
 

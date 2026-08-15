@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Synthetic offline tests for long-horizon kept-cohort re-scoring."""
 
+import io
 import json
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from decimal import Decimal, localcontext
 from pathlib import Path
 
@@ -15,6 +17,11 @@ from study import rescore_horizons as rescore
 
 BASE_MS = 1_767_225_600_000
 SYMBOL = "SLOWUSDT"
+DAY = "2026-01-01"
+FIXTURE_SYMBOL = json.loads(
+    (Path(__file__).parent / "fixtures" / "stage_a_line197191_event.json")
+    .read_text(encoding="utf-8")
+)["symbol"]
 
 
 def decimal_text(value):
@@ -122,6 +129,54 @@ class RescoreHorizonTests(unittest.TestCase):
         self.fees = (
             rescore.FeeModel("taker_round_trip", Decimal("0.30")),
             rescore.FeeModel("maker_exit", Decimal("0.20")),
+        )
+
+    def test_archive_and_value_symbols_use_shared_validation(self):
+        self.assertEqual(
+            rescore._archive_name_parts(
+                f"{FIXTURE_SYMBOL}-1m-{DAY}.zip"
+            ),
+            (FIXTURE_SYMBOL, DAY),
+        )
+        self.assertEqual(
+            rescore._archive_name_parts(f"{SYMBOL}-1m-{DAY}.zip"),
+            (SYMBOL, DAY),
+        )
+        self.assertIsNone(
+            rescore._archive_name_parts(
+                f"{SYMBOL.lower()}-1m-{DAY}.zip"
+            )
+        )
+        self.assertIsNone(
+            rescore._archive_name_parts(f"..-1m-{DAY}.zip")
+        )
+        self.assertEqual(
+            rescore._validated_symbol(
+                FIXTURE_SYMBOL, "cohort has invalid symbol"
+            ),
+            FIXTURE_SYMBOL,
+        )
+        self.assertEqual(
+            rescore._validated_symbol(SYMBOL, "cohort has invalid symbol"),
+            SYMBOL,
+        )
+        with self.assertRaisesRegex(
+            rescore.RescoreError, "cohort has invalid symbol"
+        ):
+            rescore._validated_symbol(
+                f"../{SYMBOL}", "cohort has invalid symbol"
+            )
+
+        (self.data_dir / f"..-1m-{DAY}.zip").touch()
+        trades = rescore.load_kept_trades((self.filtered,))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            tape = rescore.load_relevant_tape(self.data_dir, trades, 5)
+        self.assertEqual(tuple(tape), (SYMBOL,))
+        self.assertEqual(
+            output.getvalue().strip(),
+            "RESCORE | tape=klines | skipped=1 | "
+            "reason=invalid_symbol_filename",
         )
 
     def test_slow_runner_is_negative_at_5m_but_positive_at_6h_ladder(self):

@@ -15,6 +15,11 @@ from study import replay_detector as replay
 
 BASE_MS = 1_767_225_600_000
 SYMBOL = "AAAUSDT"
+DAY = "2026-01-01"
+FIXTURE_SYMBOL = json.loads(
+    (Path(__file__).parent / "fixtures" / "stage_a_line197191_event.json")
+    .read_text(encoding="utf-8")
+)["symbol"]
 
 
 def kline(index, close, quote_volume):
@@ -73,6 +78,25 @@ class ReplayDetectorTests(unittest.TestCase):
         self.config = replace(
             replay.momentum_lifecycle.LifecycleConfig(),
             ignition_surge_ratio=Decimal("3"),
+        )
+
+    def test_filename_symbols_use_shared_validation(self):
+        self.assertEqual(
+            replay._symbol_from_name(
+                f"{FIXTURE_SYMBOL}-1m-{DAY}.zip"
+            ),
+            FIXTURE_SYMBOL,
+        )
+        self.assertEqual(
+            replay._symbol_from_name(f"{SYMBOL}-1m-{DAY}.zip"),
+            SYMBOL,
+        )
+        self.assertEqual(
+            replay._symbol_from_name(f"aaausdt-1M-{DAY}.zip"),
+            SYMBOL,
+        )
+        self.assertIsNone(
+            replay._symbol_from_name(f"../{SYMBOL}-1m-{DAY}.zip")
         )
 
     def disk_rows(self):

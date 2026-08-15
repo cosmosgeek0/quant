@@ -27,6 +27,13 @@ if str(ROOT) not in sys.path:
 
 from study import baselines  # noqa: E402
 
+try:
+    from study.windows import WindowError as _SymbolValidationError
+    from study.windows import validate_symbol
+except ImportError:
+    from windows import WindowError as _SymbolValidationError
+    from windows import validate_symbol
+
 
 STUDY_DIR = Path(__file__).resolve().parent
 DEFAULT_SCORE_PATH = STUDY_DIR / "out" / "replay-2026-08-15.jsonl"
@@ -44,12 +51,18 @@ MAGNITUDE_BUCKETS: Tuple[
     ("10x_plus", Decimal("10"), None),
 )
 SCORE_DATE = re.compile(r"^replay-(\d{4}-\d{2}-\d{2})\.jsonl$")
-SYMBOL = re.compile(r"[A-Z0-9]{5,30}")
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class FilterError(Exception):
     """Replay, baseline, tape, or output data cannot be proved valid."""
+
+
+def _validated_symbol(raw: Any, error_message: str) -> str:
+    try:
+        return validate_symbol(raw, "symbol")
+    except _SymbolValidationError:
+        raise FilterError(error_message) from None
 
 
 def _decimal(
@@ -168,15 +181,11 @@ def _read_replay(path: Path) -> Tuple[Dict[str, Any], ...]:
                     raise FilterError(
                         f"{path.name}:{line_number} has unknown kind"
                     )
-                symbol = raw.get("symbol")
+                symbol = _validated_symbol(
+                    raw.get("symbol"),
+                    f"{path.name}:{line_number} has invalid symbol",
+                )
                 utc = raw.get("utc")
-                if (
-                    type(symbol) is not str
-                    or SYMBOL.fullmatch(symbol) is None
-                ):
-                    raise FilterError(
-                        f"{path.name}:{line_number} has invalid symbol"
-                    )
                 _utc_ms(utc, f"{path.name}:{line_number} utc")
                 surge = _decimal(
                     raw.get("surge_ratio"),
@@ -642,17 +651,26 @@ def score_ignitions(
     _validate_baseline_document(baseline_payload)
     _validate_sustained_parameters(sustained_required, sustained_window)
     symbols = baseline_payload["symbols"]
-    counts = Counter(str(row.get("symbol")) for row in events)
+    normalized_events: List[Mapping[str, Any]] = []
+    for event in events:
+        symbol = _validated_symbol(
+            event.get("symbol"), "event has invalid symbol"
+        )
+        if event.get("symbol") == symbol:
+            normalized_events.append(event)
+        else:
+            normalized = dict(event)
+            normalized["symbol"] = symbol
+            normalized_events.append(normalized)
+    counts = Counter(str(row["symbol"]) for row in normalized_events)
     repeat_values = [Decimal(value) for value in counts.values()]
     repeat_hot = baselines.quantile(repeat_values, 9, 10)
     if repeat_hot is None:
         repeat_hot = Decimal("1")
 
     scored: List[Dict[str, Any]] = []
-    for event in events:
-        symbol = event.get("symbol")
-        if type(symbol) is not str or SYMBOL.fullmatch(symbol) is None:
-            raise FilterError("event has invalid symbol")
+    for event in normalized_events:
+        symbol = str(event["symbol"])
         repeat_count = counts[symbol]
         token = symbols.get(symbol)
         bars = tape.get(symbol)

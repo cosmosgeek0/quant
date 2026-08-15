@@ -23,6 +23,13 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+try:
+    from study.windows import WindowError as _SymbolValidationError
+    from study.windows import validate_symbol
+except ImportError:
+    from windows import WindowError as _SymbolValidationError
+    from windows import validate_symbol
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -39,7 +46,7 @@ DEFAULT_OUTPUT_DIR = STUDY_DIR / "out"
 FORWARD_MINUTES = (5, 15, 60)
 COMPARISON_RATIOS = (Decimal("3"), Decimal("10"))
 SYMBOL_FROM_NAME = re.compile(
-    r"^([A-Z0-9]{5,30})-1m(?:-|\.)", re.IGNORECASE
+    r"^(?P<symbol>.+?)-1m(?:-|\.)", re.IGNORECASE
 )
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -96,8 +103,15 @@ def _utc_text(epoch_ms: int) -> str:
 
 
 def _symbol_from_name(name: str) -> Optional[str]:
-    match = SYMBOL_FROM_NAME.match(Path(name).name)
-    return None if match is None else match.group(1).upper()
+    match = SYMBOL_FROM_NAME.match(name)
+    if match is None:
+        return None
+    try:
+        return validate_symbol(
+            match.group("symbol").upper(), f"{name} symbol"
+        )
+    except _SymbolValidationError:
+        return None
 
 
 def _rows_from_member(

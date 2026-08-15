@@ -24,6 +24,13 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+try:
+    from study.windows import WindowError as _SymbolValidationError
+    from study.windows import validate_symbol
+except ImportError:
+    from windows import WindowError as _SymbolValidationError
+    from windows import validate_symbol
+
 
 STUDY_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = STUDY_DIR / "data"
@@ -36,10 +43,10 @@ MAX_LOOKBACK_DAYS = 90
 FORWARD_HOURS = (1, 6, 24)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 KLINE_ARCHIVE = re.compile(
-    r"^(?P<symbol>[A-Z0-9]{5,30})-1m-(?P<day>\d{4}-\d{2}-\d{2})\.zip$"
+    r"^(?P<symbol>.+?)-1m-(?P<day>\d{4}-\d{2}-\d{2})\.zip$"
 )
 AGG_TRADES_ARCHIVE = re.compile(
-    r"^(?P<symbol>[A-Z0-9]{5,30})-aggTrades-"
+    r"^(?P<symbol>.+?)-aggTrades-"
     r"(?P<day>\d{4}-\d{2}-\d{2})\.zip$"
 )
 
@@ -150,6 +157,45 @@ def _boolean(raw: Any, source: str) -> bool:
 def utc_text(epoch_ms: int) -> str:
     value = EPOCH + timedelta(milliseconds=epoch_ms)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _archive_name_parts(
+    name: str, pattern: Any
+) -> Optional[Tuple[str, str]]:
+    match = pattern.fullmatch(name)
+    if match is None:
+        return None
+    candidate = match.group("symbol")
+    try:
+        symbol = validate_symbol(candidate, f"{name} symbol")
+    except _SymbolValidationError:
+        return None
+    if symbol != candidate:
+        return None
+    return symbol, match.group("day")
+
+
+def _matching_archives(
+    root: Path, pattern: Any, tape_name: str
+) -> List[Tuple[Path, str, str]]:
+    matches: List[Tuple[Path, str, str]] = []
+    skipped = 0
+    for path in sorted(root.rglob("*.zip")):
+        if not path.is_file() or pattern.fullmatch(path.name) is None:
+            continue
+        parts = _archive_name_parts(path.name, pattern)
+        if parts is None:
+            skipped += 1
+            continue
+        symbol, day = parts
+        matches.append((path, symbol, day))
+    if skipped:
+        print(
+            "ABSORPTION | "
+            f"tape={tape_name} | skipped={skipped} | "
+            "reason=invalid_symbol_filename"
+        )
+    return matches
 
 
 def _archive_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]:
@@ -316,19 +362,11 @@ def load_klines(data_dir: Path = DEFAULT_DATA_DIR) -> Dict[str, Tuple[KlineBar, 
     root = Path(data_dir)
     if not root.is_dir():
         raise AbsorptionError(f"data directory does not exist: {root}")
-    archives = sorted(
-        path
-        for path in root.rglob("*.zip")
-        if path.is_file() and KLINE_ARCHIVE.fullmatch(path.name) is not None
-    )
+    archives = _matching_archives(root, KLINE_ARCHIVE, "klines")
     if not archives:
         raise AbsorptionError(f"data directory has no daily 1m kline zips: {root}")
     indexed: Dict[str, Dict[int, KlineBar]] = {}
-    for archive in archives:
-        match = KLINE_ARCHIVE.fullmatch(archive.name)
-        if match is None:
-            continue
-        symbol = match.group("symbol")
+    for archive, symbol, _day in archives:
         for bar in _kline_rows(archive, symbol):
             existing = indexed.setdefault(symbol, {}).get(bar.open_ms)
             if existing is not None and existing != bar:
@@ -349,22 +387,15 @@ def load_agg_trades(
     root = Path(data_dir)
     if not root.is_dir():
         raise AbsorptionError(f"data directory does not exist: {root}")
-    archives = sorted(
-        path
-        for path in root.rglob("*.zip")
-        if path.is_file()
-        and AGG_TRADES_ARCHIVE.fullmatch(path.name) is not None
+    archives = _matching_archives(
+        root, AGG_TRADES_ARCHIVE, "aggTrades"
     )
     if not archives:
         raise AbsorptionError(
             f"data directory has no daily aggTrades zips: {root}"
         )
     indexed: Dict[str, Dict[int, AggTrade]] = {}
-    for archive in archives:
-        match = AGG_TRADES_ARCHIVE.fullmatch(archive.name)
-        if match is None:
-            continue
-        symbol = match.group("symbol")
+    for archive, symbol, _day in archives:
         for trade in _agg_trade_rows(archive, symbol):
             existing = indexed.setdefault(symbol, {}).get(trade.aggregate_id)
             if existing is not None and existing != trade:

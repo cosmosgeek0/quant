@@ -14,6 +14,11 @@ from study import baselines
 
 BASE_MS = 1_767_225_600_000
 SYMBOL = "AAAUSDT"
+DAY = "2026-01-01"
+FIXTURE_SYMBOL = json.loads(
+    (Path(__file__).parent / "fixtures" / "stage_a_line197191_event.json")
+    .read_text(encoding="utf-8")
+)["symbol"]
 
 
 def kline(index, volume):
@@ -68,6 +73,25 @@ class AdaptiveBaselineTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.data_dir = write_tape(self.root)
         self.output_dir = self.root / "out"
+
+    def test_filename_symbols_use_shared_validation(self):
+        self.assertEqual(
+            baselines._symbol_from_name(
+                f"{FIXTURE_SYMBOL}-1m-{DAY}.zip"
+            ),
+            FIXTURE_SYMBOL,
+        )
+        self.assertEqual(
+            baselines._symbol_from_name(f"{SYMBOL}-1m-{DAY}.zip"),
+            SYMBOL,
+        )
+        self.assertEqual(
+            baselines._symbol_from_name(f"aaausdt-1M-{DAY}.zip"),
+            SYMBOL,
+        )
+        self.assertIsNone(
+            baselines._symbol_from_name(f"../{SYMBOL}-1m-{DAY}.zip")
+        )
 
     def test_synthetic_tape_derives_token_regimes_and_seasonality(self):
         output = self.output_dir / "baselines.json"

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Offline fixtures for the pre-ignition absorption study."""
 
+import io
 import json
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,10 @@ from study import tape_pull
 BASE_MS = 1_767_225_600_000
 DAY = "2026-01-01"
 SYMBOL = "AAAUSDT"
+FIXTURE_SYMBOL = json.loads(
+    (Path(__file__).parent / "fixtures" / "stage_a_line197191_event.json")
+    .read_text(encoding="utf-8")
+)["symbol"]
 
 
 def bar(index, close, *, spread="0.5", volume="20"):
@@ -165,6 +171,64 @@ class AbsorptionTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+
+    def test_archive_symbols_validate_and_invalid_skips_are_counted(self):
+        self.assertEqual(
+            absorption._archive_name_parts(
+                f"{FIXTURE_SYMBOL}-1m-{DAY}.zip",
+                absorption.KLINE_ARCHIVE,
+            ),
+            (FIXTURE_SYMBOL, DAY),
+        )
+        self.assertEqual(
+            absorption._archive_name_parts(
+                f"{FIXTURE_SYMBOL}-aggTrades-{DAY}.zip",
+                absorption.AGG_TRADES_ARCHIVE,
+            ),
+            (FIXTURE_SYMBOL, DAY),
+        )
+        self.assertEqual(
+            absorption._archive_name_parts(
+                f"{SYMBOL}-1m-{DAY}.zip", absorption.KLINE_ARCHIVE
+            ),
+            (SYMBOL, DAY),
+        )
+        self.assertIsNone(
+            absorption._archive_name_parts(
+                f"{SYMBOL.lower()}-1m-{DAY}.zip",
+                absorption.KLINE_ARCHIVE,
+            )
+        )
+        self.assertIsNone(
+            absorption._archive_name_parts(
+                f"..-1m-{DAY}.zip", absorption.KLINE_ARCHIVE
+            )
+        )
+
+        bars, trades, _aggregate_id = baseline_fixture()
+        write_tape(self.root, bars, trades)
+        (self.root / f"..-1m-{DAY}.zip").touch()
+        (self.root / f"..-aggTrades-{DAY}.zip").touch()
+
+        kline_output = io.StringIO()
+        with redirect_stdout(kline_output):
+            klines = absorption.load_klines(self.root)
+        self.assertEqual(tuple(klines), (SYMBOL,))
+        self.assertEqual(
+            kline_output.getvalue().strip(),
+            "ABSORPTION | tape=klines | skipped=1 | "
+            "reason=invalid_symbol_filename",
+        )
+
+        trade_output = io.StringIO()
+        with redirect_stdout(trade_output):
+            loaded_trades = absorption.load_agg_trades(self.root)
+        self.assertEqual(tuple(loaded_trades), (SYMBOL,))
+        self.assertEqual(
+            trade_output.getvalue().strip(),
+            "ABSORPTION | tape=aggTrades | skipped=1 | "
+            "reason=invalid_symbol_filename",
+        )
 
     def test_taker_imbalance_math_is_exact(self):
         trades = (
