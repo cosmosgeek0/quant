@@ -131,6 +131,7 @@ class MomentumLiveTests(unittest.TestCase):
         self.decisions = self.root / "decisions.jsonl"
         self.runner = self.root / "runner"
         self.jobs = self.runner / "jobs"
+        self.funnel = self.runner / "funnel.jsonl"
         self.position = self.runner / "momentum-position.json"
         self.results = self.jobs / "results.jsonl"
         self.config = test_config()
@@ -173,6 +174,21 @@ class MomentumLiveTests(unittest.TestCase):
             if line.strip()
         ]
 
+    def funnel_rows(self):
+        rows = []
+        for path in (
+            self.funnel.with_name(self.funnel.name + ".1"),
+            self.funnel,
+        ):
+            if not path.exists():
+                continue
+            rows.extend(
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        return rows
+
     def job_paths(self):
         return sorted(self.jobs.glob("job-*.json")) if self.jobs.exists() else []
 
@@ -193,6 +209,90 @@ class MomentumLiveTests(unittest.TestCase):
             ),
         ]
         return results
+
+    def test_funnel_writes_one_correct_row_per_synthetic_tick(self):
+        self.signal()
+
+        rows = self.funnel_rows()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[-1], {
+            "utc": FIXED_NOW,
+            "universe": 1,
+            "fresh_ok": 1,
+            "baseline_ok": 1,
+            "ignited": 1,
+            "ticket_eligible": 1,
+            "entered": 1,
+            "starving_stage": "none",
+        })
+
+    def test_funnel_starving_stage_is_first_dead_stage(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(stream_payload(1, "101", "2", "110", "1001"))
+
+        self.assertEqual(self.funnel_rows()[-1], {
+            "utc": FIXED_NOW,
+            "universe": 1,
+            "fresh_ok": 1,
+            "baseline_ok": 1,
+            "ignited": 0,
+            "ticket_eligible": 0,
+            "entered": 0,
+            "starving_stage": "ignited",
+        })
+
+    def test_funnel_zero_universe_is_honest(self):
+        self.stream.write_text("{}", encoding="utf-8")
+        result = live.run_tick(
+            self.stream,
+            state_path=self.state,
+            receipt_path=self.receipts,
+            decisions_path=self.decisions,
+            jobs_dir=self.jobs,
+            position_path=self.position,
+            results_path=self.results,
+            config=self.config,
+            now_fn=fixed_now,
+        )
+
+        self.assertEqual(result.decisions, ())
+        self.assertEqual(self.funnel_rows(), [{
+            "utc": FIXED_NOW,
+            "universe": 0,
+            "fresh_ok": 0,
+            "baseline_ok": 0,
+            "ignited": 0,
+            "ticket_eligible": 0,
+            "entered": 0,
+            "starving_stage": "universe",
+        }])
+
+    def test_funnel_rotation_keeps_two_size_capped_atomic_segments(self):
+        row = {
+            "utc": FIXED_NOW,
+            "universe": 1,
+            "fresh_ok": 1,
+            "baseline_ok": 1,
+            "ignited": 0,
+            "ticket_eligible": 0,
+            "entered": 0,
+            "starving_stage": "ignited",
+        }
+        encoded = (
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        threshold = len(encoded) * 2
+
+        with mock.patch.object(live, "FUNNEL_ROTATE_BYTES", threshold):
+            live.append_funnel(self.funnel, row)
+            live.append_funnel(self.funnel, row)
+            live.append_funnel(self.funnel, row)
+
+        backup = self.funnel.with_name(self.funnel.name + ".1")
+        self.assertTrue(backup.exists())
+        self.assertLessEqual(self.funnel.stat().st_size, threshold)
+        self.assertLessEqual(backup.stat().st_size, threshold)
+        self.assertEqual(self.funnel_rows(), [row, row, row])
 
     def inject_open(self, job, *, qty="0.071", price="112.5", fills=None):
         self.position.parent.mkdir(parents=True, exist_ok=True)

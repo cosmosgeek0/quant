@@ -46,6 +46,17 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DECISIONS_PATH = ROOT / "decisions.jsonl"
 DECISIONS_ROTATE_BYTES = 4 * 1024 * 1024
+FUNNEL_FILENAME = "funnel.jsonl"
+FUNNEL_ROTATE_BYTES = DECISIONS_ROTATE_BYTES
+FUNNEL_COUNT_FIELDS = (
+    "universe",
+    "fresh_ok",
+    "baseline_ok",
+    "ignited",
+    "ticket_eligible",
+    "entered",
+)
+FUNNEL_FIELDS = frozenset(("utc", *FUNNEL_COUNT_FIELDS, "starving_stage"))
 DECISION_LEDGER_QUARANTINE_TYPE = "momentum_decision_ledger_quarantine"
 HARD_MAX_NOTIONAL = PER_LEG_CAP_USDT
 DEFAULT_INITIAL_NOTIONAL = Decimal("8")
@@ -124,6 +135,10 @@ def default_position_path(jobs_dir: Path) -> Path:
 
 def default_results_path(jobs_dir: Path) -> Path:
     return Path(jobs_dir) / "results.jsonl"
+
+
+def default_funnel_path(jobs_dir: Path) -> Path:
+    return Path(jobs_dir).parent / FUNNEL_FILENAME
 
 
 def default_lifecycle_config() -> lifecycle.LifecycleConfig:
@@ -566,13 +581,17 @@ def _replace_decision_payload(path: Path, payload: bytes) -> None:
             pass
 
 
-def _rotate_decisions(
+def _rotate_jsonl(
     path: Path,
     incoming: bytes,
+    rotate_bytes: int,
+    ledger_name: str,
     current_payload: Optional[bytes] = None,
 ) -> bool:
-    if DECISIONS_ROTATE_BYTES <= 0:
-        raise MomentumLiveError("decision rotation threshold must be positive")
+    if rotate_bytes <= 0:
+        raise MomentumLiveError(
+            f"{ledger_name} rotation threshold must be positive"
+        )
     if current_payload is None:
         try:
             size = path.stat().st_size
@@ -580,18 +599,18 @@ def _rotate_decisions(
             return False
         except OSError:
             raise MomentumLiveError(
-                f"decision ledger is unreadable: {path}"
+                f"{ledger_name} ledger is unreadable: {path}"
             ) from None
-        if size == 0 or size + len(incoming) <= DECISIONS_ROTATE_BYTES:
+        if size == 0 or size + len(incoming) <= rotate_bytes:
             return False
         try:
             current_payload = path.read_bytes()
         except OSError:
             raise MomentumLiveError(
-                f"decision ledger is unreadable: {path}"
+                f"{ledger_name} ledger is unreadable: {path}"
             ) from None
     if not current_payload \
-            or len(current_payload) + len(incoming) <= DECISIONS_ROTATE_BYTES:
+            or len(current_payload) + len(incoming) <= rotate_bytes:
         return False
     remainder_temporary: Optional[Path] = None
     backup_temporary: Optional[Path] = None
@@ -608,7 +627,9 @@ def _rotate_decisions(
         remainder_temporary = None
         _fsync_directory(path.parent)
     except OSError:
-        raise MomentumLiveError(f"decision ledger rotation failed: {path}") from None
+        raise MomentumLiveError(
+            f"{ledger_name} ledger rotation failed: {path}"
+        ) from None
     finally:
         for temporary in (remainder_temporary, backup_temporary):
             if temporary is None:
@@ -619,6 +640,29 @@ def _rotate_decisions(
                 pass
     _DECISION_INDEXES.pop(_decision_cache_key(path), None)
     return True
+
+
+def _rotate_decisions(
+    path: Path,
+    incoming: bytes,
+    current_payload: Optional[bytes] = None,
+) -> bool:
+    return _rotate_jsonl(
+        path,
+        incoming,
+        DECISIONS_ROTATE_BYTES,
+        "decision",
+        current_payload,
+    )
+
+
+def _rotate_funnel(path: Path, incoming: bytes) -> bool:
+    return _rotate_jsonl(
+        path,
+        incoming,
+        FUNNEL_ROTATE_BYTES,
+        "funnel",
+    )
 
 
 def _data_decimal(raw: Any, name: str) -> Optional[Decimal]:
@@ -1000,6 +1044,101 @@ def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
     _index_decision(index, json.loads(encoded))
     index.signature = _decision_signature(path)
     return True
+
+
+def _starving_stage(counts: Mapping[str, int]) -> str:
+    if counts["entered"] > 0:
+        return "none"
+    parent = 1
+    for name in FUNNEL_COUNT_FIELDS:
+        count = counts[name]
+        if count == 0 and parent > 0:
+            return name
+        parent = count
+    return "none"
+
+
+def _funnel_signal_counts(
+    records: Mapping[str, lifecycle.StreamRecord],
+    config: lifecycle.LifecycleConfig,
+) -> Dict[str, int]:
+    counts = {name: 0 for name in FUNNEL_COUNT_FIELDS}
+    counts["universe"] = len(records)
+    for record in records.values():
+        if not record.is_fresh(config):
+            continue
+        counts["fresh_ok"] += 1
+        if record.vol_med_1m is None or record.vol_med_1m <= 0:
+            continue
+        counts["baseline_ok"] += 1
+        if record.surge_ratio is not None \
+                and record.surge_ratio >= config.ignition_surge_ratio:
+            counts["ignited"] += 1
+    return counts
+
+
+def _validate_funnel_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(row, Mapping) or set(row) != FUNNEL_FIELDS:
+        raise MomentumLiveError("funnel row does not match the item-20 schema")
+    _parse_utc(row.get("utc"), "funnel utc")
+    counts: Dict[str, int] = {}
+    for name in FUNNEL_COUNT_FIELDS:
+        value = row.get(name)
+        if type(value) is not int or value < 0:
+            raise MomentumLiveError(f"funnel {name} must be a non-negative int")
+        counts[name] = value
+    starving = row.get("starving_stage")
+    if starving != _starving_stage(counts):
+        raise MomentumLiveError("funnel starving_stage is inconsistent")
+    return dict(row)
+
+
+def append_funnel(path: Path, row: Mapping[str, Any]) -> None:
+    """Durably append one bounded item-20 funnel row."""
+    validated = _validate_funnel_row(row)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(validated, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if _rotate_funnel(path, encoded):
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    descriptor = os.open(str(path), flags, 0o600)
+    try:
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("funnel append made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _append_tick_funnel(
+    path: Path,
+    utc: str,
+    signal_counts: Mapping[str, int],
+    rows: Iterable[Mapping[str, Any]],
+    entered: int,
+) -> None:
+    counts = dict(signal_counts)
+    counts["ticket_eligible"] = sum(
+        row.get("action") == lifecycle.ACTION_ENTER_SMALL
+        and row.get("job_eligible") is True
+        for row in rows
+    )
+    counts["entered"] = entered
+    append_funnel(
+        path,
+        {
+            "utc": utc,
+            **counts,
+            "starving_stage": _starving_stage(counts),
+        },
+    )
 
 
 def _ignitions(rows: Iterable[Mapping[str, Any]]) -> Dict[str, str]:
@@ -1504,6 +1643,7 @@ def run_tick(
         else default_results_path(resolved_jobs_dir)
     )
     resolved_job_writer = job_writer or write_job_record
+    resolved_funnel_path = default_funnel_path(resolved_jobs_dir)
 
     ignition_by_symbol = dict(decision_index.ignition_by_symbol)
     issued_job_ids = {
@@ -1540,6 +1680,7 @@ def run_tick(
             result_rows,
             resolved_config,
         )
+    funnel_counts = _funnel_signal_counts(records, resolved_config)
     rows: List[Dict[str, Any]] = []
     pending_jobs: List[Dict[str, Any]] = []
     standing_symbol = (
@@ -1708,37 +1849,53 @@ def run_tick(
     if discarded_receipts is not None:
         discarded_receipts.cleanup()
     lifecycle.save_state(Path(state_path), state, now_fn)
-    if decision_only and not manage_only:
-        return TickResult(
-            decisions=tuple(rows),
-            replayed_receipts=replayed,
-            recovered_job_ids=(),
-            written_job_ids=(),
-        )
-    recovery_rows = (
-        prior_job_rows
-        if not manage_only
-        else tuple(
-            row for row in prior_job_rows
-            if row.get("action") == lifecycle.ACTION_EXIT
-        )
-    )
-    recovered = list(
-        _recover_jobs(recovery_rows, resolved_jobs_dir, resolved_job_writer)
-    )
-    for job in unlogged_jobs:
-        if resolved_job_writer(resolved_jobs_dir, job):
-            recovered.append(job["job_id"])
+    recovered: List[str] = []
     written: List[str] = []
-    for job in pending_jobs:
-        if resolved_job_writer(resolved_jobs_dir, job):
-            written.append(job["job_id"])
-    return TickResult(
+    entered_job_ids = set()
+    if not (decision_only and not manage_only):
+        recovery_rows = (
+            prior_job_rows
+            if not manage_only
+            else tuple(
+                row for row in prior_job_rows
+                if row.get("action") == lifecycle.ACTION_EXIT
+            )
+        )
+        recovery_entry_ids = set()
+        for row in recovery_rows:
+            payload = row.get("job")
+            if row.get("action") == lifecycle.ACTION_ENTER_SMALL \
+                    and isinstance(payload, dict) \
+                    and isinstance(payload.get("job_id"), str):
+                recovery_entry_ids.add(payload["job_id"])
+        recovered.extend(
+            _recover_jobs(recovery_rows, resolved_jobs_dir, resolved_job_writer)
+        )
+        entered_job_ids.update(recovery_entry_ids.intersection(recovered))
+        for job in unlogged_jobs:
+            if resolved_job_writer(resolved_jobs_dir, job):
+                recovered.append(job["job_id"])
+                if job["op"] == JOB_OPEN_OP:
+                    entered_job_ids.add(job["job_id"])
+        for job in pending_jobs:
+            if resolved_job_writer(resolved_jobs_dir, job):
+                written.append(job["job_id"])
+                if job["op"] == JOB_OPEN_OP:
+                    entered_job_ids.add(job["job_id"])
+    result = TickResult(
         decisions=tuple(rows),
         replayed_receipts=replayed,
         recovered_job_ids=tuple(recovered),
         written_job_ids=tuple(written),
     )
+    _append_tick_funnel(
+        resolved_funnel_path,
+        now_fn(),
+        funnel_counts,
+        rows,
+        len(entered_job_ids),
+    )
+    return result
 
 
 def _positive_seconds(raw: str) -> timedelta:

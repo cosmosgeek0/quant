@@ -22,6 +22,13 @@ eval "$PATH_ASSIGNMENTS"
 export RECEIPT_DIR
 export PYTHONDONTWRITEBYTECODE=1
 
+KNOBS_FILE="$DEPLOY_DIR/knobs.env"
+if [ -f "$KNOBS_FILE" ]; then
+  set -a
+  . "$KNOBS_FILE"
+  set +a
+fi
+
 FEED_STATE="$WATCH_DIR/feed_state.json"
 FEED_LOG="$WATCH_DIR/feed.log"
 FEED_PID_FILE="$WATCH_DIR/feed.pid"
