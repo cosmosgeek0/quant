@@ -587,10 +587,10 @@
     var then = Date.parse(asOf);
     if (!isFinite(then)) { return "—"; }
     var sec = Math.max(0, Math.round((Date.now() - then) / 1000));
-    if (sec < 90) { return "updated " + sec + "s ago"; }
+    if (sec < 90) { return sec + "s"; }
     var min = Math.round(sec / 60);
-    if (min < 90) { return "updated " + min + "m ago"; }
-    return "updated " + Math.round(min / 60) + "h ago";
+    if (min < 90) { return min + "m"; }
+    return Math.round(min / 60) + "h";
   }
 
   function fetchNews(force) {
@@ -784,6 +784,69 @@
     return box;
   }
 
+  function hbarBox(title, pairs) {
+    var box = document.createElement("div");
+    box.className = "rbox";
+    var head = document.createElement("div");
+    head.className = "rbox-h";
+    var t = document.createElement("span");
+    t.className = "rbox-title";
+    t.textContent = title;
+    head.appendChild(t);
+    box.appendChild(head);
+    var maxV = 1;
+    for (var i = 0; i < pairs.length; i++) {
+      if (pairs[i][1] > maxV) { maxV = pairs[i][1]; }
+    }
+    for (var r = 0; r < pairs.length; r++) {
+      var row = document.createElement("div");
+      row.className = "hbar-row";
+      var lab = document.createElement("span");
+      lab.className = "hbar-label";
+      lab.textContent = pairs[r][0];
+      lab.title = pairs[r][0];
+      var track = document.createElement("span");
+      track.className = "hbar-track";
+      var fill = document.createElement("span");
+      fill.className = "hbar-fill";
+      fill.style.width = Math.max(2, Math.round(
+        (pairs[r][1] / maxV) * 100)) + "%";
+      track.appendChild(fill);
+      var val = document.createElement("span");
+      val.className = "hbar-val";
+      val.textContent = String(pairs[r][1]);
+      row.appendChild(lab);
+      row.appendChild(track);
+      row.appendChild(val);
+      box.appendChild(row);
+    }
+    return box;
+  }
+
+  function topSourcesBox(pool) {
+    var counts = {};
+    for (var i = 0; i < pool.length; i++) {
+      var nm = pool[i].source || "—";
+      counts[nm] = (counts[nm] || 0) + 1;
+    }
+    var pairs = Object.keys(counts).map(function (k) {
+      return [k, counts[k]];
+    }).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 8);
+    return hbarBox("Top sources", pairs);
+  }
+
+  function categoriesBox(pool) {
+    var counts = {};
+    for (var i = 0; i < pool.length; i++) {
+      var c = pool[i].category || "Crypto";
+      counts[c] = (counts[c] || 0) + 1;
+    }
+    var pairs = Object.keys(counts).map(function (k) {
+      return [k, counts[k]];
+    }).sort(function (a, b) { return b[1] - a[1]; });
+    return hbarBox("Categories", pairs);
+  }
+
   function sourcesBox() {
     var board = (newsData && newsData.sources_board) || {};
     var rows = board.sources || [];
@@ -822,12 +885,21 @@
     list.className = "srclist";
     box.appendChild(list);
 
+    var STATUS_RANK = { live: 3, delayed: 2, error: 1, pending: 0 };
+    var ordered = rows.slice().sort(function (a, b) {
+      var d = (b.count || 0) - (a.count || 0);
+      if (d) { return d; }
+      d = (STATUS_RANK[b.status] || 0) - (STATUS_RANK[a.status] || 0);
+      if (d) { return d; }
+      return String(a.label).localeCompare(String(b.label));
+    });
+
     function paint() {
       list.textContent = "";
       var needle = srcSearch.trim().toLowerCase();
       var shown = 0;
-      for (var i = 0; i < rows.length; i++) {
-        var srcRow = rows[i];
+      for (var i = 0; i < ordered.length; i++) {
+        var srcRow = ordered[i];
         var label = srcRow.label || srcRow.key;
         if (needle && label.toLowerCase().indexOf(needle) === -1) { continue; }
         shown += 1;
@@ -925,20 +997,6 @@
     head.appendChild(liveLbl);
     var right = document.createElement("div");
     right.className = "news-right";
-    var refresh = document.createElement("button");
-    refresh.className = "refresh-btn";
-    refresh.setAttribute("aria-label", "Refresh");
-    refresh.setAttribute("data-tip", "Refresh");
-    var rsvg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
-      stroke: "currentColor", "stroke-linecap": "round",
-      "stroke-linejoin": "round" });
-    rsvg.appendChild(svgEl("path", {
-      d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
-    rsvg.appendChild(svgEl("path", { d: "M3 3v5h5" }));
-    refresh.appendChild(rsvg);
-    refresh.addEventListener("click", function () { fetchNews(true); });
-    var upd = document.createElement("span");
-    upd.className = "news-upd";
     var masterWrap = document.createElement("span");
     masterWrap.className = "master-wrap";
     var mlabel = document.createElement("span");
@@ -955,8 +1013,6 @@
     msw.addEventListener("click", function () { setMaster(!newsMaster); });
     masterWrap.appendChild(mlabel);
     masterWrap.appendChild(msw);
-    right.appendChild(refresh);
-    right.appendChild(upd);
     right.appendChild(masterWrap);
     head.appendChild(right);
     newsHost.appendChild(head);
@@ -973,7 +1029,6 @@
     var items = (newsData && newsData.present && newsData.items) || [];
 
     if (newsMaster && (!newsData || !newsData.present)) {
-      upd.textContent = "—";
       var empty0 = document.createElement("div");
       empty0.className = "news-empty";
       empty0.textContent = newsData
@@ -983,11 +1038,7 @@
       newsSeen = null;
       return;
     }
-    if (newsData) {
-      upd.textContent = newsAgeText(newsData.as_of);
-      var ageSec = (Date.now() - Date.parse(newsData.as_of)) / 1000;
-      upd.classList.toggle("stale", isFinite(ageSec) && ageSec > 400);
-    }
+
 
     /* day strip */
     var strip = document.createElement("div");
@@ -1107,6 +1158,33 @@
         impbar.appendChild(b);
       })(defs2[fi][0], defs2[fi][1], defs2[fi][2]);
     }
+    var barRight = document.createElement("span");
+    barRight.className = "bar-right";
+    var refresh = document.createElement("button");
+    refresh.className = "refresh-btn";
+    refresh.setAttribute("aria-label", "Refresh");
+    refresh.setAttribute("data-tip", "Refresh");
+    var rsvg = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    rsvg.appendChild(svgEl("path", {
+      d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
+    rsvg.appendChild(svgEl("path", { d: "M3 3v5h5" }));
+    refresh.appendChild(rsvg);
+    refresh.addEventListener("click", function () { fetchNews(true); });
+    var upd = document.createElement("span");
+    upd.className = "news-upd";
+    upd.title = "Age of the last mirror write";
+    barRight.appendChild(refresh);
+    barRight.appendChild(upd);
+    if (newsData) {
+      upd.textContent = newsAgeText(newsData.as_of);
+      var ageSec2 = (Date.now() - Date.parse(newsData.as_of)) / 1000;
+      upd.classList.toggle("stale", isFinite(ageSec2) && ageSec2 > 400);
+    } else {
+      upd.textContent = "—";
+    }
+    impbar.appendChild(barRight);
     newsHost.appendChild(impbar);
 
     /* two columns */
@@ -1208,6 +1286,8 @@
 
     rightcol.appendChild(sourcesBox());
     rightcol.appendChild(activityBox(pool));
+    rightcol.appendChild(topSourcesBox(pool));
+    rightcol.appendChild(categoriesBox(pool));
 
     cols.appendChild(maincol);
     cols.appendChild(rightcol);
