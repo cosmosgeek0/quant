@@ -351,24 +351,15 @@
     transition: opacity 130ms ease, transform 130ms ease;
   }
   .pop.on { opacity: 1; transform: translateY(0); }
-  .pop-id { padding: 10px 12px 8px; }
+  .pop-id {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 7px 8px 5px 12px;
+  }
   .pop-id .pname { font-size: 14px; font-weight: 500; color: var(--ink); }
-  .pop-id .pemail { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
-  .pstatus {
-    display: flex; align-items: center; gap: 6px;
-    margin-top: 7px;
-    font-size: 12px; color: var(--muted);
-  }
-  .pstatus .pdot {
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--faint);
-  }
-  .pstatus.on .pdot { background: #2ebd85; }
-  .pstatus.off .pdot { background: #cc2f3c; }
+  .pop-id .pemail { display: none; }
   .theme-trio {
     display: inline-flex;
     gap: 2px;
-    margin-top: 10px;
     border: 1px solid var(--line-2);
     border-radius: 8px;
     padding: 2px;
@@ -390,13 +381,14 @@
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
   }
   .tbtn svg { width: 18px; height: 18px; stroke-width: 1.6; }
-  .pop-sep { height: 1px; background: var(--line); margin: 8px 4px; }
+  .pop-sep { height: 1px; background: var(--line); margin: 5px 4px; }
   .pop-row {
     display: flex; align-items: center; gap: 11px;
-    height: 36px;
+    height: 32px;
     padding: 0 12px;
     border-radius: 8px;
     font-size: 14px;
+    font-weight: 500;
     color: var(--ink);
     text-decoration: none;
     cursor: pointer;
@@ -407,6 +399,8 @@
   .pop-row .pv { margin-left: auto; font-size: 13px; color: var(--muted); }
   .pop-row.inert { cursor: default; color: var(--muted); }
   .pop-row.inert:hover { background: none; }
+  .pop-row.danger:hover { background: rgba(204, 47, 60, 0.08); color: #cc2f3c; }
+  .pop-row.danger:hover svg { color: #cc2f3c; }
 
   @media (prefers-reduced-motion: reduce) {
     .side, .nav-row, .brand-btn, .side-collapse, .nav-row svg, #tip,
@@ -485,8 +479,6 @@
 <div class="pop" id="pop" role="menu" hidden>
   <div class="pop-id">
     <span class="pname">CosmosGeek</span>
-    <span class="pemail">cosmosgeek@pm.me</span>
-    <span class="pstatus" id="pop-status"><span class="pdot"></span><span id="pop-status-text">checking…</span></span>
     <div class="theme-trio" role="group" aria-label="Theme">
       <button class="tbtn" data-theme-set="system" aria-label="System theme" title="System">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
@@ -510,7 +502,7 @@
     <span class="pv">English</span>
   </div>
   <div class="pop-sep"></div>
-  <a class="pop-row" id="pop-logout" href="/cdn-cgi/access/logout" role="menuitem">
+  <a class="pop-row danger" id="pop-logout" href="/cdn-cgi/access/logout" role="menuitem">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></svg>
     Log out
   </a>
