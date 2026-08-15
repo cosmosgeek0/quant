@@ -13,6 +13,11 @@ from study import windows
 
 
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+FIXTURE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "lane-logs"
+    / "V1-fixture-line197191.json"
+)
 
 
 def utc(day, hour=0):
@@ -55,6 +60,76 @@ def parsed(rows):
         windows.parse_event(row, line_number)
         for line_number, row in enumerate(rows, start=1)
     )
+
+
+class SymbolValidationTests(unittest.TestCase):
+    def test_exact_stage_a_fixture_symbol_is_accepted(self):
+        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+        parsed_fixture = windows.parse_event(fixture, 197191)
+
+        self.assertEqual(parsed_fixture.symbol, fixture["symbol"])
+
+    def test_filename_risk_classes_are_rejected(self):
+        risky_symbols = {
+            "empty": "",
+            "control": "BTC\x00USDT",
+            "delete-control": "BTC\x7fUSDT",
+            "space": "BTC USDT",
+            "tab": "BTC\tUSDT",
+            "newline": "BTC\nUSDT",
+            "non-breaking-space": "BTC\u00a0USDT",
+            "slash": "BTC/USDT",
+            "backslash": "BTC\\USDT",
+            "double-dot": "BTC..USDT",
+            "colon": "BTC:USDT",
+            "single-dot-component": ".",
+            "over-64-characters": "A" * 65,
+        }
+        for name, symbol in risky_symbols.items():
+            with self.subTest(name=name):
+                row = event(
+                    "risk-check",
+                    symbol,
+                    1,
+                    "Ignition",
+                    "spot_only",
+                    False,
+                    "50",
+                )
+                with self.assertRaisesRegex(
+                    windows.WindowError, "symbol is invalid"
+                ):
+                    windows.parse_event(row, 1)
+
+    def test_invalid_utf8_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            events_path = Path(temporary) / "events.jsonl"
+            events_path.write_bytes(b'{"symbol":"BTC\xffUSDT"}\n')
+
+            with self.assertRaisesRegex(
+                windows.WindowError, "cannot read events file"
+            ):
+                windows.load_events(events_path)
+
+    def test_plain_ascii_symbols_keep_prior_normalization(self):
+        cases = {
+            "BTCUSDT": "BTCUSDT",
+            "ABC123": "ABC123",
+            "btcusdt": "BTCUSDT",
+        }
+        for supplied, expected in cases.items():
+            with self.subTest(symbol=supplied):
+                row = event(
+                    "ascii-check",
+                    supplied,
+                    1,
+                    "Ignition",
+                    "spot_only",
+                    False,
+                    "50",
+                )
+                self.assertEqual(windows.parse_event(row, 1).symbol, expected)
 
 
 class WindowManifestTests(unittest.TestCase):

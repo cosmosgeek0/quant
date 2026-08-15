@@ -18,7 +18,6 @@ import argparse
 import bisect
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,7 +47,7 @@ VOLUME_PERCENTILE_BAND = Decimal("10")
 MILLISECONDS_PER_MINUTE = 60_000
 MILLISECONDS_PER_HOUR = 3_600_000
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{3,30}")
+MAX_SYMBOL_LENGTH = 64
 NESTED_STATE_KEYS = ("pre_state", "features", "state")
 
 
@@ -218,17 +217,36 @@ def _decimal(raw: Any, source: str) -> Decimal:
     return value
 
 
+def _symbol(raw: Any, source: str) -> str:
+    """Return a normalized symbol that is safe as a filename component."""
+    if not isinstance(raw, str):
+        raise WindowError(f"{source} is not a string")
+    symbol = raw.upper()
+    try:
+        encoded = symbol.encode("utf-8")
+    except UnicodeEncodeError:
+        raise WindowError(f"{source} is invalid") from None
+    if (
+        not symbol
+        or len(symbol) > MAX_SYMBOL_LENGTH
+        or len(encoded) > MAX_SYMBOL_LENGTH
+        or not symbol.isprintable()
+        or any(character.isspace() for character in symbol)
+        or symbol == "."
+        or ".." in symbol
+        or any(character in symbol for character in ("/", "\\", ":"))
+    ):
+        raise WindowError(f"{source} is invalid")
+    return symbol
+
+
 def parse_event(row: Mapping[str, Any], line_number: int) -> Event:
     """Validate and normalize one input mapping."""
     source = f"events.jsonl line {line_number}"
     if not isinstance(row, Mapping):
         raise WindowError(f"{source} is not a JSON object")
     raw_symbol = _single_value(row, ("symbol",), source)
-    if not isinstance(raw_symbol, str):
-        raise WindowError(f"{source} symbol is not a string")
-    symbol = raw_symbol.strip().upper()
-    if SYMBOL_PATTERN.fullmatch(symbol) is None:
-        raise WindowError(f"{source} symbol is invalid")
+    symbol = _symbol(raw_symbol, f"{source} symbol")
 
     raw_venue = _single_value(row, ("venue_class",), source)
     if not isinstance(raw_venue, str) or raw_venue not in VENUE_CLASSES:
