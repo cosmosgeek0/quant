@@ -432,6 +432,90 @@ class JobRunnerTests(unittest.TestCase):
     def result_events(self, kind):
         return [row for row in self.results() if row.get("kind") == kind]
 
+    def latest_margin_anomaly(self):
+        path = jr._paths(self.receipt_dir)["results"]
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        return json.loads(lines[-1])
+
+    def standing_margin_artifacts(self, job_id):
+        row, lock_path = self.interrupt_margin_governor_release(job_id)
+        runner_path = row["receipt_path"]
+        with open(runner_path, encoding="utf-8") as handle:
+            source_path = json.load(handle)["source_receipt_path"]
+        paths = {
+            "RESULT": jr._paths(self.receipt_dir)["results"],
+            "RUNNER_RECEIPT": runner_path,
+            "SOURCE_RECEIPT": source_path,
+            "JOB_FILE": os.path.join(
+                self.jobs_dir, "job-%s.json" % job_id
+            ),
+            "LOCK": lock_path,
+        }
+        return paths, {
+            path: Path(path).read_bytes() for path in paths.values()
+        }
+
+    def restore_margin_artifacts(self, originals):
+        for path, encoded in originals.items():
+            Path(path).write_bytes(encoded)
+        stop = os.path.join(self.receipt_dir, "STOP-JOBS")
+        if os.path.exists(stop):
+            os.unlink(stop)
+        self.governor_releases.clear()
+
+    @staticmethod
+    def replace_json_field(path, field, value):
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload[field] = value
+        Path(path).write_text(
+            json.dumps(payload, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def replace_with_nested_json(path, field, levels, wide_count=0):
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload.pop(field)
+        prefix = json.dumps(payload, separators=(",", ":"))[:-1]
+        if wide_count:
+            nested = "[" + ",".join("null" for _unused in range(
+                wide_count
+            )) + "]"
+        else:
+            nested = "[" * levels + '"value"' + "]" * levels
+        encoded = "%s,%s:%s}\n" % (
+            prefix, json.dumps(field), nested
+        )
+        Path(path).write_text(encoded, encoding="utf-8")
+
+    @staticmethod
+    def add_duplicate_json_field(path, field):
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        encoded = json.dumps(payload, separators=(",", ":"))[:-1]
+        encoded += ",%s:%s}\n" % (
+            json.dumps(field),
+            json.dumps(payload[field], separators=(",", ":")),
+        )
+        Path(path).write_text(encoded, encoding="utf-8")
+
+    def assert_margin_anomaly_halt(self, job_id, lock_path, artifact,
+                                   field, anomaly_type):
+        event = self.latest_margin_anomaly()
+        self.assertEqual(event, {
+            "kind": "margin_governor_artifact_halted",
+            "job_id": job_id,
+            "artifact": artifact,
+            "field": field,
+            "anomaly_type": anomaly_type,
+            "lock_exists": True,
+            "utc": utc(NOW),
+        })
+        self.assertTrue(os.path.isfile(lock_path))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertEqual(self.governor_releases, [])
+
     def write_tick_lock(self, **overrides):
         paths = jr._paths(self.receipt_dir)
         jr._make_dirs(paths)
@@ -1972,6 +2056,204 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(
             len([call for call in self.margin.calls if call[0] == "POST"]),
             1,
+        )
+
+    def test_margin_release_boundary_is_same_tick_only(self):
+        same_tick_id = "margin-same-tick-release"
+        self.margin_job(same_tick_id)
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        same_tick_row = self.results()[0]
+        with open(same_tick_row["receipt_path"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["governor_release"], "RELEASED")
+        self.assertEqual(
+            self.margin_source(same_tick_row)["governor_release"], "RELEASED"
+        )
+
+        self.write_accept_one()
+        standing_id = "margin-prior-tick-lock"
+        _row, lock_path = self.interrupt_margin_governor_release(standing_id)
+        releases_before_later_tick = list(self.governor_releases)
+
+        self.assertEqual(self.tick(), 3)
+
+        self.assertEqual(self.governor_releases, releases_before_later_tick)
+        self.assertTrue(os.path.isfile(lock_path))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_exact_margin_artifact_anomalies_halt_tick_and_manual(self):
+        job_id = "margin-exact-anomalies"
+        paths, originals = self.standing_margin_artifacts(job_id)
+        lock_path = paths["LOCK"]
+        cases = (
+            (
+                "RESULT", "verdict", "TYPE", "RESULT_VERDICT_TYPE",
+                lambda: self.replace_json_field(
+                    paths["RESULT"], "verdict", []
+                ),
+            ),
+            (
+                "LOCK", "token", "TYPE", "LOCK_TOKEN_TYPE",
+                lambda: self.replace_json_field(paths["LOCK"], "token", []),
+            ),
+            (
+                "RUNNER_RECEIPT", "reason", "DEPTH_LIMIT",
+                "RUNNER_RECEIPT_STRUCTURE_LIMIT",
+                lambda: self.replace_with_nested_json(
+                    paths["RUNNER_RECEIPT"], "reason", 1200
+                ),
+            ),
+        )
+        for artifact, field, anomaly_type, reason, mutate in cases:
+            for command in ("tick", "manual"):
+                with self.subTest(
+                        artifact=artifact, field=field, command=command):
+                    self.restore_margin_artifacts(originals)
+                    mutate()
+                    if command == "tick":
+                        self.assertEqual(self.tick(), 3)
+                    else:
+                        with mock.patch("builtins.print") as output:
+                            self.assertEqual(jr.release_stuck_lock(
+                                job_id, True, self.receipt_dir, NOW
+                            ), 3)
+                        output.assert_called_once_with(
+                            "JOB-RUNNER | RELEASE REFUSED | " + reason
+                        )
+                    self.assert_margin_anomaly_halt(
+                        job_id, lock_path, artifact, field, anomaly_type
+                    )
+
+    def test_manual_release_types_every_margin_artifact_field(self):
+        job_id = "margin-artifact-types"
+        paths, originals = self.standing_margin_artifacts(job_id)
+        lock_path = paths["LOCK"]
+        cases = (
+            ("RESULT", "verdict"),
+            ("RUNNER_RECEIPT", "verdict"),
+            ("SOURCE_RECEIPT", "verdict"),
+            ("JOB_FILE", "created_utc"),
+            ("LOCK", "token"),
+        )
+        for artifact, field in cases:
+            with self.subTest(artifact=artifact, field=field):
+                self.restore_margin_artifacts(originals)
+                self.replace_json_field(paths[artifact], field, [])
+
+                self.assertEqual(jr.release_stuck_lock(
+                    job_id, True, self.receipt_dir, NOW
+                ), 3)
+
+                self.assert_margin_anomaly_halt(
+                    job_id, lock_path, artifact, field, "TYPE"
+                )
+
+    def test_manual_release_bounds_depth_in_every_margin_artifact(self):
+        job_id = "margin-artifact-depth"
+        paths, originals = self.standing_margin_artifacts(job_id)
+        lock_path = paths["LOCK"]
+        cases = (
+            ("RESULT", "verdict"),
+            ("RUNNER_RECEIPT", "reason"),
+            ("SOURCE_RECEIPT", "reason"),
+            ("JOB_FILE", "requested_by"),
+            ("LOCK", "token"),
+        )
+        for artifact, field in cases:
+            with self.subTest(artifact=artifact, field=field):
+                self.restore_margin_artifacts(originals)
+                self.replace_with_nested_json(
+                    paths[artifact], field, 1200
+                )
+
+                self.assertEqual(jr.release_stuck_lock(
+                    job_id, True, self.receipt_dir, NOW
+                ), 3)
+
+                self.assert_margin_anomaly_halt(
+                    job_id, lock_path, artifact, field, "DEPTH_LIMIT"
+                )
+
+    def test_manual_release_bounds_margin_artifact_node_count(self):
+        job_id = "margin-artifact-nodes"
+        paths, originals = self.standing_margin_artifacts(job_id)
+        lock_path = paths["LOCK"]
+        self.restore_margin_artifacts(originals)
+        self.replace_with_nested_json(
+            paths["RUNNER_RECEIPT"], "reason", 0,
+            wide_count=jr.MARGIN_ARTIFACT_MAX_NODES + 1,
+        )
+
+        self.assertEqual(jr.release_stuck_lock(
+            job_id, True, self.receipt_dir, NOW
+        ), 3)
+
+        self.assert_margin_anomaly_halt(
+            job_id, lock_path, "RUNNER_RECEIPT", "reason", "NODE_LIMIT"
+        )
+
+    def test_manual_release_types_duplicates_and_unparseable_lock(self):
+        job_id = "margin-artifact-json"
+        paths, originals = self.standing_margin_artifacts(job_id)
+        lock_path = paths["LOCK"]
+        duplicate_cases = (
+            ("RESULT", "verdict"),
+            ("SOURCE_RECEIPT", "reason"),
+            ("JOB_FILE", "requested_by"),
+            ("LOCK", "token"),
+        )
+        for artifact, field in duplicate_cases:
+            with self.subTest(artifact=artifact, field=field):
+                self.restore_margin_artifacts(originals)
+                self.add_duplicate_json_field(paths[artifact], field)
+
+                self.assertEqual(jr.release_stuck_lock(
+                    job_id, True, self.receipt_dir, NOW
+                ), 3)
+
+                self.assert_margin_anomaly_halt(
+                    job_id, lock_path, artifact, field, "DUPLICATE_FIELD"
+                )
+
+        self.restore_margin_artifacts(originals)
+        Path(lock_path).write_text("{", encoding="utf-8")
+
+        self.assertEqual(jr.release_stuck_lock(
+            job_id, True, self.receipt_dir, NOW
+        ), 3)
+
+        self.assert_margin_anomaly_halt(
+            job_id, lock_path, "LOCK", "$", "INVALID_JSON"
+        )
+
+    def test_manual_release_is_idempotent_after_receipts_are_released(self):
+        job_id = "margin-repeat-manual"
+        row, lock_path = self.interrupt_margin_governor_release(job_id)
+
+        self.assertEqual(jr.release_stuck_lock(
+            job_id, True, self.receipt_dir, NOW
+        ), 0)
+        releases_after_first = list(self.governor_releases)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.release_stuck_lock(
+                job_id, True, self.receipt_dir, NOW
+            ), 0)
+
+        output.assert_called_once_with(
+            "JOB-RUNNER | ALREADY_RELEASED | " + job_id
+        )
+        self.assertEqual(self.governor_releases, releases_after_first)
+        self.assertFalse(os.path.exists(lock_path))
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["governor_release"], "RELEASED")
+        self.assertEqual(
+            self.margin_source(row)["governor_release"], "RELEASED"
         )
 
     def test_sourceless_final_refusal_halts_with_exact_durable_facts(self):

@@ -71,6 +71,10 @@ MARGIN_GOVERNOR_HALT_FIELDS = {
     "lock_symbol", "runner_receipt_exists", "runner_verdict",
     "source_receipt_exists", "source_verdict", "utc",
 }
+MARGIN_GOVERNOR_ANOMALY_FIELDS = {
+    "kind", "job_id", "artifact", "field", "anomaly_type",
+    "lock_exists", "utc",
+}
 TICK_LOCK_RECOVERY_FIELDS = {
     "kind", "pid", "age_seconds", "utc",
 }
@@ -110,6 +114,10 @@ MARGIN_IDENTITY_KEY_RE = re.compile(
 MARGIN_IDENTITY_MAX_NODES = 4096
 # Bound the encoded response material examined by one identity walk to 1 MiB.
 MARGIN_IDENTITY_MAX_RESPONSE_BYTES = 1024 * 1024
+# Durable Margin release evidence uses the same bounded node walk.  A separate
+# depth ceiling keeps the standard JSON decoder below its recursion boundary.
+MARGIN_ARTIFACT_MAX_NODES = MARGIN_IDENTITY_MAX_NODES
+MARGIN_ARTIFACT_MAX_DEPTH = 64
 ACCOUNT_GOVERNOR_LOCK_FILE = "account-governor.lock"
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -134,6 +142,26 @@ class JobRefusal(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class DuplicateField(JobRefusal):
+    """Strict JSON found one repeated object member name."""
+
+    def __init__(self, field: str):
+        super().__init__("DUPLICATE_FIELD")
+        self.field = field
+
+
+class ArtifactAnomaly(JobRefusal):
+    """One durable release artifact has a typed, bounded-read anomaly."""
+
+    def __init__(self, artifact: str, field: str, anomaly_type: str,
+                 reason: str, job_id: str = "UNKNOWN"):
+        super().__init__(reason)
+        self.artifact = artifact
+        self.field = field
+        self.anomaly_type = anomaly_type
+        self.job_id = job_id
 
 
 class MomentumStateError(Exception):
@@ -211,7 +239,7 @@ def _strict_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise JobRefusal("DUPLICATE_FIELD")
+            raise DuplicateField(key)
         result[key] = value
     return result
 
@@ -1064,6 +1092,16 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                             )):
                         return set(), True, False
                     continue
+                if fields == MARGIN_GOVERNOR_ANOMALY_FIELDS:
+                    if row.get("kind") \
+                            != "margin_governor_artifact_halted" \
+                            or type(row.get("lock_exists")) is not bool \
+                            or any(type(row.get(name)) is not str for name in (
+                                "job_id", "artifact", "field",
+                                "anomaly_type", "utc",
+                            )):
+                        return set(), True, False
+                    continue
                 if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
                     return set(), True, False
                 if type(row["job_id"]) is not str or row["job_id"] in identifiers:
@@ -1087,14 +1125,15 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                     receipt = _decode_strict_plain_object(
                         _read_file_bytes(receipt_path)
                     )
-                except (JobRefusal, OSError, ValueError, UnicodeError):
+                except (JobRefusal, OSError, ValueError, UnicodeError,
+                        RecursionError):
                     return set(), True, False
                 if not isinstance(receipt, dict) \
                         or receipt.get("verdict") != row["verdict"]:
                     return set(), True, False
                 unresolved = unresolved or _receipt_is_unresolved(receipt_path)
                 identifiers.add(row["job_id"])
-    except (JobRefusal, OSError, ValueError, UnicodeError):
+    except (JobRefusal, OSError, ValueError, UnicodeError, RecursionError):
         return set(), True, False
     return identifiers, False, unresolved
 
@@ -1114,7 +1153,9 @@ def _receipt_is_unresolved(path: str) -> bool:
         return True
     verdict = receipt["verdict"]
     if verdict == "OPEN_EXPOSURE" and receipt.get("reconciled_by"):
-        note = str(receipt.get("reconciled_note", ""))
+        note = receipt.get("reconciled_note", "")
+        if type(note) is not str:
+            return True
         return note.startswith("dust_accepted")
     return verdict in FREEZE_VERDICTS
 
@@ -1249,7 +1290,14 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
 
 
 def _append_results_row(paths: Dict[str, str], row: Dict[str, Any]) -> None:
-    line = json.dumps(row, separators=(",", ":")) + "\n"
+    separator = ""
+    try:
+        existing = _read_file_bytes(paths["results"])
+        if existing and not existing.endswith(b"\n"):
+            separator = "\n"
+    except (FileNotFoundError, OSError):
+        pass
+    line = separator + json.dumps(row, separators=(",", ":")) + "\n"
     created = False
     try:
         descriptor = os.open(
@@ -4020,9 +4068,295 @@ def _load_plain_receipt(path: str) -> Optional[Dict[str, Any]]:
     try:
         payload = _decode_strict_plain_object(_read_file_bytes(path))
     except (JobRefusal, OSError, UnicodeError, ValueError,
-            json.JSONDecodeError):
+            json.JSONDecodeError, RecursionError):
         return None
     return payload
+
+
+def _safe_artifact_field(value: Any) -> str:
+    if type(value) is str \
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) is not None:
+        return value
+    return "$"
+
+
+def _artifact_reason(artifact: str, field: str, anomaly_type: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9]+", "_", field).strip("_").upper()
+    parts = [artifact]
+    if name:
+        parts.append(name)
+    parts.append(anomaly_type)
+    return "_".join(parts)
+
+
+def _artifact_anomaly(artifact: str, field: str, anomaly_type: str,
+                      reason: str = "", job_id: str = "UNKNOWN") \
+        -> ArtifactAnomaly:
+    safe_field = _safe_artifact_field(field)
+    return ArtifactAnomaly(
+        artifact, safe_field, anomaly_type,
+        reason or _artifact_reason(artifact, safe_field, anomaly_type),
+        job_id if type(job_id) is str and job_id else "UNKNOWN",
+    )
+
+
+def _preflight_json_depth(encoded: bytes, artifact: str,
+                          reason_label: str) -> None:
+    """Bound JSON nesting iteratively and retain its top-level field name."""
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeError:
+        raise _artifact_anomaly(
+            artifact, "$", "INVALID_JSON", reason_label + "_INVALID_JSON"
+        ) from None
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    string_start = 0
+    root_key_expected = False
+    pending_root_field = ""
+    root_field = "$"
+    for index, character in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+                if len(stack) == 1 and stack[0] == "{" \
+                        and root_key_expected:
+                    try:
+                        decoded = json.loads(text[string_start:index + 1])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        decoded = ""
+                    pending_root_field = _safe_artifact_field(decoded)
+                    root_key_expected = False
+            continue
+        if character == '"':
+            in_string = True
+            string_start = index
+            continue
+        if character in "{[":
+            stack.append(character)
+            if len(stack) == 1 and character == "{":
+                root_key_expected = True
+            if len(stack) > MARGIN_ARTIFACT_MAX_DEPTH:
+                raise _artifact_anomaly(
+                    artifact, root_field, "DEPTH_LIMIT",
+                    reason_label + "_STRUCTURE_LIMIT",
+                )
+            continue
+        if character == ":" and len(stack) == 1 and stack[0] == "{":
+            root_field = pending_root_field or "$"
+            continue
+        if character == "," and len(stack) == 1 and stack[0] == "{":
+            pending_root_field = ""
+            root_field = "$"
+            root_key_expected = True
+            continue
+        if character in "}]" and stack:
+            stack.pop()
+            if not stack:
+                root_field = "$"
+
+
+def _bound_json_structure(payload: Dict[str, Any], artifact: str,
+                          reason_label: str) -> None:
+    """Walk decoded JSON without recursion under fixed depth and node bounds."""
+    stack: List[Tuple[Any, int, str]] = [(payload, 0, "$")]
+    visited = set()
+    scheduled_nodes = 1
+    visited_nodes = 0
+    while stack:
+        current, depth, top_field = stack.pop()
+        visited_nodes += 1
+        if visited_nodes > MARGIN_ARTIFACT_MAX_NODES:
+            raise _artifact_anomaly(
+                artifact, top_field, "NODE_LIMIT",
+                reason_label + "_STRUCTURE_LIMIT",
+            )
+        if depth > MARGIN_ARTIFACT_MAX_DEPTH:
+            raise _artifact_anomaly(
+                artifact, top_field, "DEPTH_LIMIT",
+                reason_label + "_STRUCTURE_LIMIT",
+            )
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if scheduled_nodes + len(current) > MARGIN_ARTIFACT_MAX_NODES:
+                raise _artifact_anomaly(
+                    artifact, top_field, "NODE_LIMIT",
+                    reason_label + "_STRUCTURE_LIMIT",
+                )
+            children = []
+            for name, value in current.items():
+                child_field = _safe_artifact_field(name) \
+                    if depth == 0 else top_field
+                children.append((value, depth + 1, child_field))
+            scheduled_nodes += len(children)
+            stack.extend(reversed(children))
+        elif isinstance(current, list):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if scheduled_nodes + len(current) > MARGIN_ARTIFACT_MAX_NODES:
+                raise _artifact_anomaly(
+                    artifact, top_field, "NODE_LIMIT",
+                    reason_label + "_STRUCTURE_LIMIT",
+                )
+            scheduled_nodes += len(current)
+            stack.extend(
+                (value, depth + 1, top_field)
+                for value in reversed(current)
+            )
+
+
+def _decode_bounded_plain_object(encoded: bytes, artifact: str,
+                                 reason_label: Optional[str] = None) \
+        -> Dict[str, Any]:
+    label = reason_label or artifact
+    _preflight_json_depth(encoded, artifact, label)
+    try:
+        payload = _decode_strict_plain_object(encoded)
+    except DuplicateField as error:
+        raise _artifact_anomaly(
+            artifact, error.field, "DUPLICATE_FIELD",
+            label + "_DUPLICATE_FIELD",
+        ) from None
+    except RecursionError:
+        raise _artifact_anomaly(
+            artifact, "$", "DEPTH_LIMIT", label + "_STRUCTURE_LIMIT"
+        ) from None
+    except (JobRefusal, UnicodeError, ValueError, json.JSONDecodeError):
+        raise _artifact_anomaly(
+            artifact, "$", "INVALID_JSON", label + "_INVALID_JSON"
+        ) from None
+    _bound_json_structure(payload, artifact, label)
+    return payload
+
+
+def _artifact_value(payload: Dict[str, Any], artifact: str, field: str,
+                    expected_type: type, job_id: str = "UNKNOWN",
+                    optional: bool = False) -> Any:
+    if field not in payload:
+        if optional:
+            return None
+        raise _artifact_anomaly(
+            artifact, field, "MISSING", job_id=job_id
+        )
+    value = payload[field]
+    if type(value) is not expected_type:
+        raise _artifact_anomaly(
+            artifact, field, "TYPE", job_id=job_id
+        )
+    return value
+
+
+def _validate_known_margin_artifact_fields(
+        payload: Dict[str, Any], artifact: str, job_id: str) -> None:
+    string_fields = {
+        "RESULT": (
+            "job_id", "op", "symbol", "verdict", "receipt_path", "utc",
+        ),
+        "RUNNER_RECEIPT": (
+            "job_id", "op", "symbol", "verdict", "reason", "utc",
+            "measured_sha", "sha", "source_receipt_path",
+            "governor_token", "governor_release", "governor_released_utc",
+        ),
+        "SOURCE_RECEIPT": (
+            "kind", "job_id", "sha", "verdict", "reason", "started_utc",
+            "finished_utc", "governor_token", "governor_release",
+            "governor_released_utc", "authority_checked_utc",
+            "mutation_started_utc",
+        ),
+        "JOB_FILE": tuple(sorted(MARGIN_JOB_REQUIRED_FIELDS)),
+        "LOCK": ("token", "op", "symbol", "utc"),
+    }.get(artifact, ())
+    for field in string_fields:
+        if field in payload:
+            _artifact_value(
+                payload, artifact, field, str, job_id, optional=True
+            )
+    exact_types = {
+        "RESULT": {},
+        "RUNNER_RECEIPT": {
+            "sha_valid": bool, "authority_digests": dict,
+            "mutation_attempts": int,
+        },
+        "SOURCE_RECEIPT": {
+            "ready": dict,
+            "submission": dict, "ledger_confirmation": dict,
+            "account_liability": dict, "authority_digests": dict,
+            "authority_stop_jobs_present": bool,
+        },
+        "LOCK": {"version": int},
+    }.get(artifact, {})
+    for field, expected_type in exact_types.items():
+        if field in payload:
+            _artifact_value(
+                payload, artifact, field, expected_type, job_id, optional=True
+            )
+    if artifact == "RESULT" and "exit_code" in payload \
+            and type(payload["exit_code"]) not in (int, bool):
+        raise _artifact_anomaly(
+            artifact, "exit_code", "TYPE", job_id=job_id
+        )
+    if artifact == "SOURCE_RECEIPT" and "mutation_attempts" in payload \
+            and type(payload["mutation_attempts"]) not in (int, bool):
+        raise _artifact_anomaly(
+            artifact, "mutation_attempts", "TYPE", job_id=job_id
+        )
+
+
+def _validate_artifact_types_like(actual: Any, expected: Any,
+                                  artifact: str, field: str,
+                                  job_id: str) -> None:
+    stack = [(actual, expected, field)]
+    while stack:
+        current, model, current_field = stack.pop()
+        if isinstance(model, dict):
+            if type(current) is not dict:
+                raise _artifact_anomaly(
+                    artifact, current_field, "TYPE", job_id=job_id
+                )
+            for name, model_value in model.items():
+                child_field = current_field + "." + name
+                if name not in current:
+                    raise _artifact_anomaly(
+                        artifact, child_field, "MISSING", job_id=job_id
+                    )
+                stack.append((current[name], model_value, child_field))
+        elif isinstance(model, list):
+            if type(current) is not list:
+                raise _artifact_anomaly(
+                    artifact, current_field, "TYPE", job_id=job_id
+                )
+            if model and len(current) == len(model):
+                stack.extend(
+                    (value, model_value, current_field)
+                    for value, model_value in zip(current, model)
+                )
+        elif type(current) is not type(model):
+            raise _artifact_anomaly(
+                artifact, current_field, "TYPE", job_id=job_id
+            )
+
+
+def _validate_artifact_string_map(payload: Dict[str, Any], artifact: str,
+                                  field: str, job_id: str) -> None:
+    values = _artifact_value(
+        payload, artifact, field, dict, job_id
+    )
+    for name, value in values.items():
+        child = field + "." + _safe_artifact_field(name)
+        if type(name) is not str or type(value) is not str:
+            raise _artifact_anomaly(
+                artifact, child, "TYPE", job_id=job_id
+            )
 
 
 def _mark_margin_governor_released(
@@ -4035,10 +4369,21 @@ def _mark_margin_governor_released(
     if source_path and os.path.abspath(source_path) != os.path.abspath(
             expected_source):
         return False
-    targets = [expected_source, runner_path] if source_path else [runner_path]
-    for path in targets:
-        payload = _load_plain_receipt(path)
-        if payload is None or payload.get("job_id") != job_id \
+    targets = [
+        ("SOURCE_RECEIPT", expected_source),
+        ("RUNNER_RECEIPT", runner_path),
+    ] if source_path else [("RUNNER_RECEIPT", runner_path)]
+    for artifact, path in targets:
+        try:
+            payload = _decode_bounded_plain_object(
+                _read_file_bytes(path), artifact
+            )
+            _validate_known_margin_artifact_fields(
+                payload, artifact, job_id
+            )
+        except (ArtifactAnomaly, OSError):
+            return False
+        if payload.get("job_id") != job_id \
                 or payload.get("governor_token") != governor_token:
             return False
         payload["governor_release"] = state
@@ -4057,109 +4402,214 @@ def _margin_governor_halt_rows(paths: Dict[str, str]) \
     try:
         encoded = _read_file_bytes(paths["results"])
         for line in encoded.splitlines():
-            row = _decode_strict_plain_object(line)
+            if not line:
+                raise _artifact_anomaly(
+                    "RESULT", "$", "INVALID_JSON", "RESULTS_INVALID_JSON"
+                )
+            row = _decode_bounded_plain_object(
+                line, "RESULT", "RESULTS"
+            )
             if set(row) == MARGIN_GOVERNOR_HALT_FIELDS \
                     and row.get("kind") == "margin_governor_release_halted" \
                     and type(row.get("job_id")) is str:
+                for name in (
+                        "lock_exists", "runner_receipt_exists",
+                        "source_receipt_exists"):
+                    if type(row.get(name)) is not bool:
+                        raise _artifact_anomaly(
+                            "RESULT", name, "TYPE", job_id=row["job_id"]
+                        )
+                for name in (
+                        "lock_token", "lock_op", "lock_symbol",
+                        "runner_verdict", "source_verdict", "utc"):
+                    if type(row.get(name)) is not str:
+                        raise _artifact_anomaly(
+                            "RESULT", name, "TYPE", job_id=row["job_id"]
+                        )
                 halt_rows[row["job_id"]] = row
-            elif set(row) == RESULT_FIELDS \
-                    and row.get("op") == margin_ops.MARGIN_BORROW \
-                    and row.get("verdict") not in FREEZE_VERDICTS \
-                    and type(row.get("job_id")) is str:
+            elif set(row) == RESULT_FIELDS:
+                row_job_id = row.get("job_id") \
+                    if type(row.get("job_id")) is str else "UNKNOWN"
+                _validate_known_margin_artifact_fields(
+                    row, "RESULT", row_job_id
+                )
+                if row["op"] == margin_ops.MARGIN_BORROW \
+                        and row["verdict"] not in FREEZE_VERDICTS:
                     final_rows[row["job_id"]] = row
-    except (FileNotFoundError, JobRefusal, OSError, UnicodeError, ValueError,
-            json.JSONDecodeError):
+    except FileNotFoundError:
         return {}, {}
+    except OSError:
+        raise _artifact_anomaly(
+            "RESULT", "$", "READ_ERROR", "RESULTS_READ_ERROR"
+        ) from None
     return final_rows, halt_rows
 
 
-def _margin_receipt_fact(path: str) \
+def _margin_receipt_fact(path: str, artifact: str, job_id: str) \
         -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     exists = os.path.exists(path)
-    payload = _load_plain_receipt(path) if exists else None
-    verdict = payload.get("verdict") if isinstance(payload, dict) else None
-    return exists, verdict if type(verdict) is str else (
-        "UNKNOWN" if exists else "ABSENT"
-    ), payload
+    if not exists:
+        return False, "ABSENT", None
+    try:
+        encoded = _read_file_bytes(path)
+    except OSError:
+        raise _artifact_anomaly(
+            artifact, "$", "READ_ERROR", job_id=job_id
+        ) from None
+    payload = _decode_bounded_plain_object(encoded, artifact)
+    _validate_known_margin_artifact_fields(payload, artifact, job_id)
+    verdict = _artifact_value(payload, artifact, "verdict", str, job_id)
+    return True, verdict, payload
+
+
+def _margin_lock_fact(path: str, job_id: str) \
+        -> Optional[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return None
+    try:
+        encoded = _read_file_bytes(path)
+    except OSError:
+        raise _artifact_anomaly(
+            "LOCK", "$", "READ_ERROR", job_id=job_id
+        ) from None
+    lock = _decode_bounded_plain_object(encoded, "LOCK")
+    _validate_known_margin_artifact_fields(lock, "LOCK", job_id)
+    for field in ("token", "op", "symbol", "utc"):
+        _artifact_value(lock, "LOCK", field, str, job_id)
+    _artifact_value(lock, "LOCK", "version", int, job_id)
+    return lock
+
+
+def _append_margin_governor_anomaly(
+        paths: Dict[str, str], receipt_dir: str, job_id: str,
+        anomaly: ArtifactAnomaly, now: datetime, emit: bool = False) -> bool:
+    event = {
+        "kind": "margin_governor_artifact_halted",
+        "job_id": job_id if type(job_id) is str and job_id else "UNKNOWN",
+        "artifact": anomaly.artifact,
+        "field": anomaly.field,
+        "anomaly_type": anomaly.anomaly_type,
+        "lock_exists": os.path.exists(os.path.join(
+            receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE
+        )),
+        "utc": _utc_text(now),
+    }
+    facts = {name: value for name, value in event.items() if name != "utc"}
+    found = False
+    try:
+        for line in _read_file_bytes(paths["results"]).splitlines():
+            try:
+                prior = _decode_bounded_plain_object(
+                    line, "RESULT", "RESULTS"
+                )
+            except ArtifactAnomaly:
+                continue
+            if set(prior) == MARGIN_GOVERNOR_ANOMALY_FIELDS and {
+                    name: value for name, value in prior.items()
+                    if name != "utc"} == facts:
+                found = True
+                break
+    except (FileNotFoundError, OSError):
+        pass
+    if not found:
+        try:
+            _append_results_row(paths, event)
+        except Exception:
+            return False
+        if emit:
+            print(json.dumps(event, separators=(",", ":")))
+    return True
 
 
 def _halt_interrupted_margin_governor(
         paths: Dict[str, str], receipt_dir: str, now: datetime) \
         -> Optional[bool]:
-    final_rows, prior_halts = _margin_governor_halt_rows(paths)
     lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
     lock_exists = os.path.exists(lock_path)
-    lock = _load_plain_receipt(lock_path) if lock_exists else None
-    for job_id in sorted(final_rows):
-        row = final_rows[job_id]
-        runner_path = os.path.join(
-            paths["receipts"], "job-%s.json" % job_id
+    current_job_id = "UNKNOWN"
+    try:
+        final_rows, prior_halts = _margin_governor_halt_rows(paths)
+        if len(final_rows) == 1:
+            current_job_id = next(iter(final_rows))
+        lock = _margin_lock_fact(lock_path, current_job_id) \
+            if lock_exists else None
+        for job_id in sorted(final_rows):
+            current_job_id = job_id
+            row = final_rows[job_id]
+            runner_path = os.path.join(
+                paths["receipts"], "job-%s.json" % job_id
+            )
+            source_path = os.path.join(
+                paths["receipts"], "margin-%s.json" % job_id
+            )
+            runner_exists, runner_verdict, runner = _margin_receipt_fact(
+                runner_path, "RUNNER_RECEIPT", job_id
+            )
+            source_exists, source_verdict, source = _margin_receipt_fact(
+                source_path, "SOURCE_RECEIPT", job_id
+            )
+            pending = (
+                isinstance(runner, dict)
+                and runner.get("governor_release") == "PENDING"
+            ) or (
+                isinstance(source, dict)
+                and source.get("governor_release") == "PENDING"
+            )
+            tokens = {
+                payload.get("governor_token")
+                for payload in (runner, source)
+                if isinstance(payload, dict)
+                and type(payload.get("governor_token")) is str
+                and payload.get("governor_token")
+            }
+            lock_owned = isinstance(lock, dict) \
+                and lock["token"] in tokens
+            result_names_runner = os.path.abspath(row["receipt_path"]) \
+                == os.path.abspath(runner_path)
+            unreadable_evidence = lock_exists and result_names_runner and (
+                runner_exists and runner is None
+                or source_exists and source is None
+                or lock is None
+            )
+            if not pending and not lock_owned and not unreadable_evidence:
+                continue
+            absent = "ABSENT" if not lock_exists else "UNKNOWN"
+            event = {
+                "kind": "margin_governor_release_halted",
+                "job_id": job_id,
+                "lock_exists": lock_exists,
+                "lock_token": lock["token"]
+                if isinstance(lock, dict) else absent,
+                "lock_op": lock["op"]
+                if isinstance(lock, dict) else absent,
+                "lock_symbol": lock["symbol"]
+                if isinstance(lock, dict) else absent,
+                "runner_receipt_exists": runner_exists,
+                "runner_verdict": runner_verdict,
+                "source_receipt_exists": source_exists,
+                "source_verdict": source_verdict,
+                "utc": _utc_text(now),
+            }
+            prior = prior_halts.get(job_id, {})
+            facts = {
+                name: value for name, value in event.items() if name != "utc"
+            }
+            prior_facts = {
+                name: value for name, value in prior.items() if name != "utc"
+            }
+            if facts != prior_facts:
+                try:
+                    _append_results_row(paths, event)
+                except Exception:
+                    return False
+                print(json.dumps(event, separators=(",", ":")))
+            return True
+    except ArtifactAnomaly as anomaly:
+        anomaly_job_id = current_job_id \
+            if current_job_id != "UNKNOWN" else anomaly.job_id
+        return _append_margin_governor_anomaly(
+            paths, receipt_dir, anomaly_job_id, anomaly, now, emit=True
         )
-        source_path = os.path.join(
-            paths["receipts"], "margin-%s.json" % job_id
-        )
-        runner_exists, runner_verdict, runner = _margin_receipt_fact(
-            runner_path
-        )
-        source_exists, source_verdict, source = _margin_receipt_fact(
-            source_path
-        )
-        pending = (
-            isinstance(runner, dict)
-            and runner.get("governor_release") == "PENDING"
-        ) or (
-            isinstance(source, dict)
-            and source.get("governor_release") == "PENDING"
-        )
-        tokens = {
-            payload.get("governor_token")
-            for payload in (runner, source)
-            if isinstance(payload, dict)
-            and type(payload.get("governor_token")) is str
-            and payload.get("governor_token")
-        }
-        lock_owned = isinstance(lock, dict) and lock.get("token") in tokens
-        result_names_runner = os.path.abspath(str(row.get("receipt_path", ""))) \
-            == os.path.abspath(runner_path)
-        unreadable_evidence = lock_exists and result_names_runner and (
-            runner_exists and runner is None
-            or source_exists and source is None
-            or lock is None
-        )
-        if not pending and not lock_owned and not unreadable_evidence:
-            continue
-        absent = "ABSENT" if not lock_exists else "UNKNOWN"
-        event = {
-            "kind": "margin_governor_release_halted",
-            "job_id": job_id,
-            "lock_exists": lock_exists,
-            "lock_token": lock.get("token")
-            if isinstance(lock, dict) and type(lock.get("token")) is str
-            else absent,
-            "lock_op": lock.get("op")
-            if isinstance(lock, dict) and type(lock.get("op")) is str
-            else absent,
-            "lock_symbol": lock.get("symbol")
-            if isinstance(lock, dict) and type(lock.get("symbol")) is str
-            else absent,
-            "runner_receipt_exists": runner_exists,
-            "runner_verdict": runner_verdict,
-            "source_receipt_exists": source_exists,
-            "source_verdict": source_verdict,
-            "utc": _utc_text(now),
-        }
-        prior = prior_halts.get(job_id, {})
-        facts = {name: value for name, value in event.items() if name != "utc"}
-        prior_facts = {
-            name: value for name, value in prior.items() if name != "utc"
-        }
-        if facts != prior_facts:
-            try:
-                _append_results_row(paths, event)
-            except Exception:
-                return False
-            print(json.dumps(event, separators=(",", ":")))
-        return True
     return None
 
 
@@ -4167,30 +4617,46 @@ def _release_artifact(path: str, label: str) \
         -> Tuple[Dict[str, Any], bytes]:
     try:
         encoded = _read_file_bytes(path)
-        return _decode_strict_plain_object(encoded), encoded
+        return _decode_bounded_plain_object(encoded, label), encoded
     except FileNotFoundError:
-        reason = label + "_MISSING"
-    except JobRefusal:
-        reason = label + "_DUPLICATE_FIELD"
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        reason = label + "_INVALID_JSON"
-    raise JobRefusal(reason) from None
+        raise _artifact_anomaly(
+            label, "$", "MISSING", label + "_MISSING"
+        ) from None
+    except OSError:
+        raise _artifact_anomaly(
+            label, "$", "READ_ERROR", label + "_INVALID_JSON"
+        ) from None
 
 
 def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
     try:
         lines = _read_file_bytes(paths["results"]).splitlines()
         if any(not line for line in lines):
-            raise ValueError
-        rows = [_decode_strict_plain_object(line) for line in lines]
+            raise _artifact_anomaly(
+                "RESULT", "$", "INVALID_JSON", "RESULTS_INVALID_JSON",
+                job_id,
+            )
+        rows = [
+            _decode_bounded_plain_object(line, "RESULT", "RESULTS")
+            for line in lines
+        ]
     except FileNotFoundError:
-        raise JobRefusal("RESULT_MISSING") from None
-    except JobRefusal:
-        raise JobRefusal("RESULTS_DUPLICATE_FIELD") from None
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        raise JobRefusal("RESULTS_INVALID_JSON") from None
-    matches = [row for row in rows
-               if set(row) == RESULT_FIELDS and row.get("job_id") == job_id]
+        raise _artifact_anomaly(
+            "RESULT", "$", "MISSING", "RESULT_MISSING", job_id
+        ) from None
+    except OSError:
+        raise _artifact_anomaly(
+            "RESULT", "$", "READ_ERROR", "RESULTS_INVALID_JSON", job_id
+        ) from None
+    matches = []
+    for row in rows:
+        if set(row) != RESULT_FIELDS:
+            continue
+        row_job_id = row.get("job_id") \
+            if type(row.get("job_id")) is str else job_id
+        _validate_known_margin_artifact_fields(row, "RESULT", row_job_id)
+        if row["job_id"] == job_id:
+            matches.append(row)
     if len(matches) != 1:
         raise JobRefusal("RESULT_MISSING" if not matches else "RESULT_DUPLICATE")
     return matches[0]
@@ -4210,7 +4676,7 @@ def _release_compare(label: str, actual: Dict[str, Any],
 
 def _attest_stuck_margin_lock(
         paths: Dict[str, str], receipt_dir: str, job_id: str) \
-        -> Tuple[str, str]:
+        -> Tuple[str, str, bool]:
     _release_require(type(job_id) is str and JOB_ID_RE.fullmatch(job_id),
                      "BAD_JOB_ID")
     runner_path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
@@ -4219,61 +4685,99 @@ def _attest_stuck_margin_lock(
     lock_path = os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)
     result = _release_result(paths, job_id)
     runner, _encoded = _release_artifact(runner_path, "RUNNER_RECEIPT")
+    _validate_known_margin_artifact_fields(
+        runner, "RUNNER_RECEIPT", job_id
+    )
     source_exists = os.path.exists(source_path)
     _release_require(source_exists == ("source_receipt_path" in runner),
                      "SOURCE_RECEIPT_PRESENCE_MISMATCH")
     source = _release_artifact(source_path, "SOURCE_RECEIPT")[0] \
         if source_exists else None
+    if source is not None:
+        _validate_known_margin_artifact_fields(
+            source, "SOURCE_RECEIPT", job_id
+        )
     job, job_encoded = _release_artifact(job_path, "JOB_FILE")
+    _validate_known_margin_artifact_fields(job, "JOB_FILE", job_id)
+    for field in sorted(MARGIN_JOB_REQUIRED_FIELDS):
+        _artifact_value(job, "JOB_FILE", field, str, job_id)
 
-    _release_require(result.get("op") == margin_ops.MARGIN_BORROW,
+    _release_require(result["op"] == margin_ops.MARGIN_BORROW,
                      "RESULT_OP_MISMATCH")
-    _release_require(type(result.get("exit_code")) is int
-                     and (result.get("verdict"), result["exit_code"])
+    _release_require(type(result["exit_code"]) is int
+                     and (result["verdict"], result["exit_code"])
                      in {("OPEN", 0), ("REFUSED", 2)},
                      "RESULT_OUTCOME_MISMATCH")
-    _release_require(result.get("symbol") == job.get("asset"),
+    _release_require(result["symbol"] == job["asset"],
                      "RESULT_SYMBOL_MISMATCH")
-    _release_require(os.path.abspath(str(result.get("receipt_path", "")))
+    _release_require(os.path.abspath(result["receipt_path"])
                      == os.path.abspath(runner_path),
                      "RESULT_RECEIPT_PATH_MISMATCH")
+    release_state = _artifact_value(
+        runner, "RUNNER_RECEIPT", "governor_release", str, job_id
+    )
+    sha_valid = _artifact_value(
+        runner, "RUNNER_RECEIPT", "sha_valid", bool, job_id
+    )
+    _release_require(release_state in {"PENDING", "RELEASED"},
+                     "RUNNER_GOVERNOR_RELEASE_MISMATCH")
+    already_released = release_state == "RELEASED"
     runner_fields = {
         "job_id", "op", "symbol", "verdict", "reason", "utc",
         "measured_sha", "sha_valid", "authority_digests", "governor_token",
         "governor_release",
     } | ({"sha", "source_receipt_path"} if source_exists
          else {"mutation_attempts"})
-    if runner.get("sha_valid") is True:
+    if already_released:
+        runner_fields.add("governor_released_utc")
+    if sha_valid:
         runner_fields.add("sha")
     _release_require(set(runner) == runner_fields,
                      "RUNNER_RECEIPT_SHAPE_MISMATCH")
     _release_compare("RUNNER", runner, {
         "job_id": job_id, "op": margin_ops.MARGIN_BORROW,
-        "symbol": job.get("asset"), "verdict": result["verdict"],
-        "utc": result["utc"], "governor_release": "PENDING",
+        "symbol": job["asset"], "verdict": result["verdict"],
+        "utc": result["utc"], "governor_release": release_state,
     })
-    token = runner.get("governor_token")
-    _release_require(type(token) is str and bool(token), "RUNNER_TOKEN_INVALID")
-    measured_sha = runner.get("measured_sha")
-    sha_valid = runner.get("sha_valid")
-    _release_require(type(measured_sha) is str and type(sha_valid) is bool
-                     and (sha_valid
-                          and SHA_RE.fullmatch(measured_sha.lower()) is not None
-                          and runner.get("sha") == measured_sha.lower()
-                          or not sha_valid
-                          and SHA_RE.fullmatch(measured_sha.lower()) is None
-                          and "sha" not in runner), "RUNNER_SHA_MISMATCH")
-    digests = runner.get("authority_digests")
-    _release_require(isinstance(digests, dict), "RUNNER_DIGESTS_INVALID")
+    token = _artifact_value(
+        runner, "RUNNER_RECEIPT", "governor_token", str, job_id
+    )
+    _release_require(bool(token), "RUNNER_TOKEN_INVALID")
+    measured_sha = _artifact_value(
+        runner, "RUNNER_RECEIPT", "measured_sha", str, job_id
+    )
+    _release_require(
+        sha_valid
+        and SHA_RE.fullmatch(measured_sha.lower()) is not None
+        and runner.get("sha") == measured_sha.lower()
+        or not sha_valid
+        and SHA_RE.fullmatch(measured_sha.lower()) is None
+        and "sha" not in runner,
+        "RUNNER_SHA_MISMATCH",
+    )
+    _validate_artifact_string_map(
+        runner, "RUNNER_RECEIPT", "authority_digests", job_id
+    )
+    digests = runner["authority_digests"]
     _release_require(digests.get("job_file")
                      == hashlib.sha256(job_encoded).hexdigest(),
                      "JOB_DIGEST_MISMATCH")
     try:
         validated = _validate_margin_job(
-            job, job_id, _timestamp(job.get("created_utc"))
+            job, job_id, _timestamp(job["created_utc"])
         )
-    except (JobRefusal, TypeError):
+    except JobRefusal:
         raise JobRefusal("JOB_FILE_INVALID") from None
+
+    released_utc = ""
+    if already_released:
+        released_utc = _artifact_value(
+            runner, "RUNNER_RECEIPT", "governor_released_utc", str, job_id
+        )
+        try:
+            _timestamp(released_utc)
+        except JobRefusal:
+            raise JobRefusal("RUNNER_RELEASE_UTC_INVALID") from None
 
     if source is None:
         _release_require(set(digests) == {"job_file"},
@@ -4291,6 +4795,8 @@ def _attest_stuck_margin_lock(
             "governor_token", "governor_release", "authority_checked_utc",
             "authority_digests", "authority_stop_jobs_present",
         }
+        if already_released:
+            source_fields.add("governor_released_utc")
         if result["verdict"] == "OPEN":
             source_fields |= {
                 "mutation_started_utc", "submission", "ledger_confirmation",
@@ -4298,25 +4804,42 @@ def _attest_stuck_margin_lock(
             }
         _release_require(set(source) == source_fields,
                          "SOURCE_RECEIPT_SHAPE_MISMATCH")
+        _validate_artifact_types_like(
+            source["ready"], validated.margin_operation,
+            "SOURCE_RECEIPT", "ready", job_id,
+        )
+        _validate_artifact_string_map(
+            source, "SOURCE_RECEIPT", "authority_digests", job_id
+        )
         _release_compare("SOURCE", source, {
             "kind": "margin_operation", "job_id": job_id,
             "sha": runner.get("sha"), "ready": validated.margin_operation,
-            "verdict": result["verdict"], "reason": runner.get("reason"),
-            "governor_token": token, "governor_release": "PENDING",
+            "verdict": result["verdict"], "reason": runner["reason"],
+            "governor_token": token, "governor_release": release_state,
             "authority_digests": digests,
         })
-        _release_require(runner.get("source_receipt_path") == source_path,
+        _release_require(runner["source_receipt_path"] == source_path,
                          "SOURCE_RECEIPT_PATH_MISMATCH")
+        if already_released:
+            source_released_utc = _artifact_value(
+                source, "SOURCE_RECEIPT", "governor_released_utc", str,
+                job_id,
+            )
+            _release_require(source_released_utc == released_utc,
+                             "SOURCE_RELEASE_UTC_MISMATCH")
+            try:
+                _timestamp(source_released_utc)
+            except JobRefusal:
+                raise JobRefusal("SOURCE_RELEASE_UTC_INVALID") from None
         digest_fields = {
             "ready_params", "job_file", "accept_one", "operator",
             "stop_jobs", "operator_token", "job_expiry",
         }
         _release_require(set(digests) == digest_fields and all(
-            type(value) is str
-            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            re.fullmatch(r"[0-9a-f]{64}", value) is not None
             for value in digests.values()
         ), "SOURCE_DIGESTS_SHAPE_MISMATCH")
-        _release_require(source.get("authority_stop_jobs_present") is
+        _release_require(source["authority_stop_jobs_present"] is
                          (digests.get("stop_jobs") != _authority_digest(None)),
                          "SOURCE_STOP_JOBS_DIGEST_MISMATCH")
         ready = source["ready"]
@@ -4331,48 +4854,67 @@ def _attest_stuck_margin_lock(
         })
         if result["verdict"] == "OPEN":
             principal = _canonical_decimal_text(validated.requested_max_notional)
-            submission = source.get("submission")
-            _release_require(runner.get("reason")
+            submission = source["submission"]
+            _release_require(runner["reason"]
                              == ready["expected_ledger_confirmation"]["status"],
                              "RUNNER_REASON_MISMATCH")
-            _release_require(type(source.get("mutation_attempts")) is int,
+            _release_require(type(source["mutation_attempts"]) is int,
                              "SOURCE_MUTATION_ATTEMPTS_MISMATCH")
-            _release_compare("SOURCE", source, {
+            expected_facts = {
                 "mutation_attempts": 1,
                 "ledger_confirmation": ready["expected_ledger_confirmation"],
                 "account_liability": {
                     "asset": validated.symbol, "borrowed": principal,
                     "interest": "0", "total_liability": principal,
                 },
-            })
+            }
+            _validate_artifact_types_like(
+                source["ledger_confirmation"],
+                expected_facts["ledger_confirmation"],
+                "SOURCE_RECEIPT", "ledger_confirmation", job_id,
+            )
+            _validate_artifact_types_like(
+                source["account_liability"],
+                expected_facts["account_liability"],
+                "SOURCE_RECEIPT", "account_liability", job_id,
+            )
+            _release_compare("SOURCE", source, expected_facts)
+            _validate_artifact_types_like(
+                submission, {"kind": "ok", "transaction_id": ""},
+                "SOURCE_RECEIPT", "submission", job_id,
+            )
             _release_require(
-                isinstance(submission, dict)
-                and set(submission) == {"kind", "transaction_id"}
+                set(submission) == {"kind", "transaction_id"}
                 and submission.get("kind") == "ok"
-                and type(submission.get("transaction_id")) is str
                 and bool(submission["transaction_id"]),
                 "SOURCE_SUBMISSION_MISMATCH",
             )
         else:
-            _release_require(type(source.get("mutation_attempts")) is int
-                             and source["mutation_attempts"] == 0
-                             and type(source.get("reason")) is str
+            _release_require(source["mutation_attempts"] == 0
                              and bool(source["reason"]),
                              "SOURCE_REFUSAL_MISMATCH")
 
+    if already_released:
+        _release_require(not os.path.exists(lock_path),
+                         "LOCK_PRESENT_AFTER_RELEASE")
+        return token, source_path if source_exists else "", True
+
     lock = _release_artifact(lock_path, "LOCK")[0]
+    _validate_known_margin_artifact_fields(lock, "LOCK", job_id)
+    for field in ("token", "op", "symbol", "utc"):
+        _artifact_value(lock, "LOCK", field, str, job_id)
+    _artifact_value(lock, "LOCK", "version", int, job_id)
     _release_require(set(lock) == {"version", "token", "op", "symbol", "utc"}
-                     and type(lock.get("version")) is int
-                     and lock.get("version") == 1, "LOCK_SHAPE_MISMATCH")
+                     and lock["version"] == 1, "LOCK_SHAPE_MISMATCH")
     _release_compare("LOCK", lock, {
         "token": token, "op": margin_ops.MARGIN_BORROW,
         "symbol": validated.symbol,
     })
     try:
-        _timestamp(lock.get("utc"))
-    except (JobRefusal, TypeError):
+        _timestamp(lock["utc"])
+    except JobRefusal:
         raise JobRefusal("LOCK_UTC_INVALID") from None
-    return token, source_path if source_exists else ""
+    return token, source_path if source_exists else "", False
 
 
 def release_stuck_lock(job_id: str, confirm_release: bool,
@@ -4388,13 +4930,25 @@ def release_stuck_lock(job_id: str, confirm_release: bool,
     now = now or _utc_now()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
     try:
-        token, source_path = _attest_stuck_margin_lock(
+        token, source_path, already_released = _attest_stuck_margin_lock(
             paths, receipt_dir, job_id
         )
+    except ArtifactAnomaly as anomaly:
+        _touch_stop(paths["stop"])
+        _append_margin_governor_anomaly(
+            paths, receipt_dir, job_id, anomaly, now
+        )
+        print("JOB-RUNNER | RELEASE REFUSED | " + anomaly.reason)
+        return 3
     except JobRefusal as refusal:
+        _touch_stop(paths["stop"])
         print("JOB-RUNNER | RELEASE REFUSED | " + refusal.reason)
         return 3
+    if already_released:
+        print("JOB-RUNNER | ALREADY_RELEASED | " + job_id)
+        return 0
     if not _release_recovered_governor(token, receipt_dir):
         reason = "GOVERNOR_RELEASE_FAILED"
     elif os.path.exists(os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE)):
@@ -4405,6 +4959,7 @@ def release_stuck_lock(job_id: str, confirm_release: bool,
     else:
         print("JOB-RUNNER | RELEASED | " + job_id)
         return 0
+    _touch_stop(paths["stop"])
     print("JOB-RUNNER | RELEASE REFUSED | " + reason)
     return 3
 
@@ -4676,8 +5231,9 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 print("JOB-RUNNER | HALTED | stale lock evidence unavailable")
                 return 3
             print(json.dumps(stale_recovery, separators=(",", ":")))
-        # Automatic governor release is forbidden.  Review the durable halt
-        # row, then use release-stuck-lock with the job id and confirmation.
+        # Release boundary: a Margin governor lock that survived an earlier
+        # tick is never released by a later tick.  Review its durable halt row,
+        # then use release-stuck-lock with the job id and confirmation.
         margin_governor_halt = _halt_interrupted_margin_governor(
             paths, receipt_dir, now
         )
@@ -4812,6 +5368,8 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 governor_token=governor_token,
                 validated_job_digest=validated_job_digest,
             )
+            # A token acquired by this tick is released inline when that same
+            # tick reaches a terminal outcome, as for every other entry op.
             if governor_token and _entry_outcome_terminal(outcome):
                 governor_released = _release_governor(
                     release_governor, governor_token, receipt_dir
