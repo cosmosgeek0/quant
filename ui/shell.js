@@ -12,10 +12,11 @@
 
   function tickClock() {
     var d = new Date();
-    clockEl.textContent = two(d.getUTCHours()) + ":" + two(d.getUTCMinutes());
+    clockEl.textContent = two(d.getUTCHours()) + ":" +
+      two(d.getUTCMinutes()) + ":" + two(d.getUTCSeconds());
   }
   tickClock();
-  setInterval(tickClock, 5000);
+  setInterval(tickClock, 1000);
 
   /* ---- elements ---- */
   var side = document.getElementById("side");
@@ -203,6 +204,7 @@
   var avatarEl = profile.querySelector(".avatar");
   var sigBtn = document.getElementById("rb-signal");
   var lastStrip = null;
+  var lastStripAt = null;
 
   var POLL_DEFAULTS = { strip: 10, news: 20 };
   var pollCfg = { strip: 10, news: 20, paused: false };
@@ -242,6 +244,7 @@
       .then(function (d) {
         lastRtt = Math.round(performance.now() - t0);
         lastStrip = d;
+        lastStripAt = Date.now();
         setOnline(!!d);
         if (!d) { sigClass("sig-bad"); renderSigAll(); return; }
         var age = d.pull && d.pull.age_seconds;
@@ -435,6 +438,9 @@
 
   function buildConnectionsPage(container) {
     container.textContent = "";
+    /* re-sync controllable rows from their single sources of truth */
+    connState.server = !pollCfg.paused;
+    connState.newsloop = newsMaster;
     var page = document.createElement("div");
     page.className = "conn-page";
     var t = document.createElement("div");
@@ -443,7 +449,7 @@
     var sub = document.createElement("div");
     sub.className = "conn-sub";
     sub.textContent =
-      "Every line this product depends on, and its live state.";
+      "Website · machine mirror · public sources · owner-gated boundaries.";
     var note = document.createElement("div");
     note.className = "conn-note";
     note.textContent =
@@ -452,12 +458,71 @@
     page.appendChild(t);
     page.appendChild(sub);
     page.appendChild(note);
+    var tiles = document.createElement("div");
+    tiles.className = "conn-tiles";
+    function tile(label, valueText, cls, smallText) {
+      var cell = document.createElement("div");
+      cell.className = "conn-tile";
+      var em = document.createElement("em");
+      em.textContent = label;
+      var b = document.createElement("b");
+      b.textContent = valueText;
+      if (cls) { b.className = cls; }
+      var sm = document.createElement("small");
+      sm.textContent = smallText;
+      cell.appendChild(em);
+      cell.appendChild(b);
+      cell.appendChild(sm);
+      return cell;
+    }
+    var d0 = lastStrip || {};
+    var pull0 = d0.pull || {};
+    var mp0 = d0.market_pass || {};
+    var sv0 = d0.supervisor || {};
+    tiles.appendChild(tile("Server RTT",
+      lastStrip ? (lastRtt == null ? "answering" : lastRtt + " ms")
+        : "unreachable",
+      lastStrip ? "ok" : "bad", "direct serve.py probe"));
+    tiles.appendChild(tile("Mirror continuity",
+      ageText2(pull0.age_seconds),
+      ageCls(pull0.age_seconds, 45, 120).replace("v ", ""),
+      "host → Mac pull age"));
+    tiles.appendChild(tile("Feed freshness",
+      ageText2(mp0.age_seconds),
+      ageCls(mp0.age_seconds, 45, 120).replace("v ", ""),
+      "market pass on the host"));
+    tiles.appendChild(tile("Supervisor",
+      (sv0.reported_status || "—"),
+      ageCls(sv0.age_seconds, 240, 600).replace("v ", ""),
+      "heartbeat " + ageText2(sv0.age_seconds) + " ago"));
+    var newsAgeTile = (newsData && newsData.as_of)
+      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
+    tiles.appendChild(tile("News loop",
+      newsAgeTile == null ? "no read yet" : ageText2(newsAgeTile),
+      newsAgeTile == null ? "" : (newsAgeTile < 300 ? "ok" : "warn"),
+      "104 public sources"));
+    page.appendChild(tiles);
+
     var cols = document.createElement("div");
     cols.className = "conn-cols";
     var mainCol = document.createElement("div");
     mainCol.className = "conn-main";
     var sideCol = document.createElement("div");
     sideCol.className = "conn-side";
+    var pathHead = document.createElement("div");
+    pathHead.className = "rbox-h";
+    pathHead.style.padding = "0 0 4px";
+    var ph1 = document.createElement("span");
+    ph1.className = "rbox-title";
+    ph1.textContent = "Connection path";
+    var ph2 = document.createElement("span");
+    ph2.className = "rbox-sub conn-assessed";
+    ph2.textContent = lastStripAt
+      ? "Assessed " + Math.max(0, Math.round((Date.now() - lastStripAt) / 1000)) + "s ago"
+      : "Connecting";
+    pathHead.appendChild(ph1);
+    pathHead.appendChild(ph2);
+    mainCol.appendChild(pathHead);
     var list = document.createElement("div");
     list.className = "conn-list";
     for (var i = 0; i < CONNECTIONS.length; i++) {
@@ -497,9 +562,32 @@
             connState[def.id] ? "true" : "false");
           refreshConnRows();
         });
+        var rec = document.createElement("button");
+        rec.className = "conn-recover";
+        var recAllowed = (def.id === "server" || def.id === "newsloop");
+        var rsvg2 = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+          stroke: "currentColor", "stroke-linecap": "round",
+          "stroke-linejoin": "round" });
+        rsvg2.appendChild(svgEl("path", {
+          d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
+        rsvg2.appendChild(svgEl("path", { d: "M3 3v5h5" }));
+        rec.appendChild(rsvg2);
+        if (recAllowed) {
+          rec.setAttribute("data-tip", "Refresh now");
+          rec.addEventListener("click", function () {
+            rec.classList.add("kick");
+            setTimeout(function () { rec.classList.remove("kick"); }, 650);
+            if (def.id === "server") { pollStrip(); }
+            if (def.id === "newsloop") { fetchNews(true); }
+          });
+        } else {
+          rec.setAttribute("disabled", "");
+          rec.title = "Control preview required — recovery lands with the wiring build";
+        }
         row.appendChild(dot);
         row.appendChild(main);
         row.appendChild(val);
+        row.appendChild(rec);
         row.appendChild(sw);
         list.appendChild(row);
       })(CONNECTIONS[i]);

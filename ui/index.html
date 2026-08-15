@@ -236,6 +236,45 @@
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
   .conn-page { max-width: 1180px; margin: 0; padding: 40px 40px 56px; }
+  .conn-tiles {
+    display: flex; gap: 0; margin-top: 22px;
+    border: 1px solid var(--line-2); border-radius: 14px;
+    overflow: hidden;
+  }
+  .conn-tile { flex: 1; padding: 13px 16px; border-right: 1px solid var(--line); min-width: 0; }
+  .conn-tile:last-child { border-right: 0; }
+  .conn-tile em {
+    display: block; font-style: normal;
+    font-size: 10px; font-weight: 650; letter-spacing: 0.05em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .conn-tile b {
+    display: block; margin-top: 3px;
+    font-size: 15px; font-weight: 650; color: var(--ink);
+    font-variant-numeric: tabular-nums lining-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .conn-tile b.ok { color: #16a34a; }
+  .conn-tile b.warn { color: #d4a406; }
+  .conn-tile b.bad { color: #cc2f3c; }
+  .conn-tile small {
+    display: block; margin-top: 2px;
+    font-size: 10.5px; color: var(--faint);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .conn-assessed { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .conn-recover {
+    width: 28px; height: 28px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: none; border: 0; border-radius: 8px;
+    color: var(--muted); cursor: pointer;
+    transition: background var(--t), color var(--t);
+  }
+  .conn-recover:hover { background: var(--hover); color: var(--ink); }
+  .conn-recover[disabled] { color: var(--faint); cursor: default; }
+  .conn-recover[disabled]:hover { background: none; }
+  .conn-recover svg { width: 13px; height: 13px; stroke-width: 1.7; }
+  .conn-recover.kick svg { animation: spin 600ms cubic-bezier(0.2, 0, 0.2, 1); }
   .conn-cols { display: flex; gap: 32px; align-items: flex-start; margin-top: 22px; }
   .conn-main { flex: 1; min-width: 0; max-width: 720px; }
   .conn-side { width: 344px; flex: none; display: flex; flex-direction: column; gap: 20px; }
@@ -594,18 +633,23 @@
     top: 12px;
     right: 64px;
     z-index: 45;
-    display: flex; align-items: center; gap: 7px;
+    display: inline-flex; align-items: center; gap: 6px;
     height: 30px;
-    padding: 0 12px;
+    padding: 0 10px;
     border: 1px solid var(--line-2);
-    border-radius: 999px;
+    border-radius: 10px;
     background: var(--panel);
     font-size: 12.5px;
     color: var(--ink);
     font-variant-numeric: tabular-nums lining-nums;
   }
-  .clockpill svg { width: 13px; height: 13px; stroke-width: 1.7; color: var(--muted); }
-  .clockpill .utc { color: #16a34a; font-weight: 600; font-size: 11.5px; }
+  .clockpill svg { width: 13px; height: 13px; stroke-width: 1.6; color: var(--muted); opacity: 0.82; }
+  .clockpill .num { font-weight: 640; letter-spacing: 0.2px; }
+  .clockpill .dot { color: var(--faint); }
+  .clockpill .utc {
+    color: #16a34a; font-weight: 650; font-size: 9.5px;
+    letter-spacing: 0.4px;
+  }
   .empty { padding: 46px 24px; color: var(--muted); font-size: 13.5px; }
   .empty b { color: var(--ink); font-weight: 600; }
 
@@ -754,8 +798,9 @@
   </div>
   <main>
     <div class="clockpill" aria-label="UTC time">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="10" x2="14" y1="2" y2="2"/><line x1="12" x2="15" y1="14" y2="11"/><circle cx="12" cy="14" r="8"/></svg>
-      <span id="clock">—:—</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M5 22h14"/><path d="M5 2h14"/><path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"/><path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"/></svg>
+      <span id="clock" class="num">—:—:—</span>
+      <span class="dot">·</span>
       <span class="utc">UTC</span>
     </div>
     <div class="empty" id="page"></div>
