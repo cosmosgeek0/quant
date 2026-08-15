@@ -9,24 +9,29 @@
   /* Topbar geometry measured off learn.chatgpt.com at 100% (dpr 1):
      bar 64px, bottom hairline 1px @ 5% black, brand mark 24px tall,
      24px from the left edge, vertically centered.
-     Our lockup file (1754x1241, ink bbox x 74..1678 y 203..1038, ink
-     margins symmetric) shows 24px of ink at a 35.6px box height; its
-     own 2.1px internal left margin makes 22px padding land the ink at
-     x=24. Image used as-is — mark and wordmark scale together. */
+     Lockup is composed from two exact-ink crops of the owner's
+     Quant.png (never redrawn, never typed): lockup-mark.png 775x836
+     and lockup-word.png 775x182, split at the file's own 55px gap.
+     Mark and wordmark are sized independently, like any real lockup. */
   .topbar {
     height: 64px;
     display: flex;
     align-items: center;
-    padding: 0 24px 0 22px;
+    padding: 0 24px;
     background: #ffffff;
     border-bottom: 1px solid rgba(13, 13, 13, 0.05);
   }
-  .brand { display: block; height: 35.6px; width: auto; }
+  .brand-lockup { display: flex; align-items: center; gap: 10px; }
+  .brand-lockup .mark { display: block; height: 24px; width: auto; }
+  .brand-lockup .word { display: block; height: 15px; width: auto; }
 </style>
 </head>
 <body>
 <header class="topbar">
-  <img class="brand" src="brand.png" alt="Quant">
+  <span class="brand-lockup">
+    <img class="mark" src="lockup-mark.png" alt="">
+    <img class="word" src="lockup-word.png" alt="Quant">
+  </span>
 </header>
 </body>
 </html>
