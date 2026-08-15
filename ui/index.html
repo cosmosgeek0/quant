@@ -4,7 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  /* Owner lockup, used as-is (ui/brand.png = Desktop/Quant.png, sha-verified).
+     Measured ink bbox in the 1754x1241 file: x 74..1678, y 203..1038; at
+     96px display height the file's own transparent margins contribute
+     ~5.7px left / ~15.7px top, so 14px container padding lands the visible
+     ink at ~20px/16px from the corner. */
+  .brand { display: block; height: 96px; width: auto; }
+  .brand-corner { padding: 0 0 0 14px; }
+</style>
 </head>
 <body>
+<header class="brand-corner">
+  <img class="brand" src="brand.png" alt="Quant">
+</header>
 </body>
 </html>
