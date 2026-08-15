@@ -24,6 +24,13 @@ FIXTURE_SYMBOL = json.loads(
     (Path(__file__).parent / "fixtures" / "stage_a_line197191_event.json")
     .read_text(encoding="utf-8")
 )["symbol"]
+SHADOW_FIELDS = (
+    "history_class",
+    "low_position_365",
+    "score_shadow_veteran",
+    "score_shadow_fresh",
+    "shadow_note",
+)
 
 
 def bar(index, close, *, spread="0.5", volume="20"):
@@ -83,6 +90,22 @@ def accumulation_fixture():
         trade(aggregate_id, 12, "30", buyer_is_maker=False),
         trade(aggregate_id + 1, 13, "30", buyer_is_maker=False),
         trade(aggregate_id + 2, 15, "10", buyer_is_maker=True),
+    )
+    return baseline_bars, window_bars, baseline_trades, window_trades
+
+
+def graded_shadow_fixture():
+    baseline_bars, _window_bars, baseline_trades, window_trades = (
+        accumulation_fixture()
+    )
+    window_bars = tuple(
+        bar(
+            12 + offset,
+            "110.25",
+            spread="0.05",
+            volume="10" if offset == 3 else "20",
+        )
+        for offset in range(4)
     )
     return baseline_bars, window_bars, baseline_trades, window_trades
 
@@ -226,6 +249,33 @@ def write_complete_absorption_tape(root):
     return bars, trades
 
 
+def write_long_lows(root, days_of_history, low_position_365):
+    path = root / "long-low-positions.json"
+    status = "READY" if days_of_history >= 90 else "NOT-READY"
+    payload = {
+        "schema": "long-low-positions-v1",
+        "symbol_count": 1,
+        "symbols": {
+            SYMBOL: {
+                "days_of_history": days_of_history,
+                "low_position_365": str(low_position_365),
+                "status": status,
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def production_row_bytes(row):
+    production = dict(row)
+    for field in SHADOW_FIELDS:
+        production.pop(field)
+    return json.dumps(
+        production, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
 class AbsorptionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -330,6 +380,125 @@ class AbsorptionTests(unittest.TestCase):
             row["features"]["trade_size_median_shift_ratio"], "3"
         )
         no_float(self, row)
+
+    def test_absent_long_lows_reports_unknown_without_a_shadow(self):
+        baseline_bars, window_bars, baseline_trades, window_trades = (
+            accumulation_fixture()
+        )
+        row = absorption.score_absorption_window(
+            SYMBOL,
+            baseline_bars,
+            window_bars,
+            baseline_trades,
+            window_trades,
+        )
+
+        self.assertEqual(row["history_class"], "unknown")
+        self.assertIsNone(row["low_position_365"])
+        self.assertIsNone(row["score_shadow_veteran"])
+        self.assertIsNone(row["score_shadow_fresh"])
+        self.assertEqual(
+            row["shadow_note"], "no shadow applies without long lows"
+        )
+        self.assertIsNone(absorption.argument_parser().parse_args([]).long_lows)
+
+    def test_fresh_boundary_uses_ab4_graded_30_arithmetic(self):
+        baseline_bars, window_bars, baseline_trades, window_trades = (
+            graded_shadow_fixture()
+        )
+        row = absorption.score_absorption_window(
+            SYMBOL,
+            baseline_bars,
+            window_bars,
+            baseline_trades,
+            window_trades,
+            long_low_position=absorption.LongLowPosition(
+                days_of_history=89,
+                low_position_365=Decimal("0.25"),
+            ),
+        )
+
+        self.assertEqual(row["absorption_score"], "0")
+        self.assertEqual(row["history_class"], "fresh")
+        self.assertEqual(row["low_position_365"], "0.25")
+        self.assertEqual(row["score_shadow_fresh"], "43.75")
+        self.assertIsNone(row["score_shadow_veteran"])
+        self.assertEqual(
+            row["shadow_note"], "fresh graded-30 shadow applies"
+        )
+
+    def test_veteran_boundary_uses_ab6_graded_365_arithmetic(self):
+        baseline_bars, window_bars, baseline_trades, window_trades = (
+            graded_shadow_fixture()
+        )
+        row = absorption.score_absorption_window(
+            SYMBOL,
+            baseline_bars,
+            window_bars,
+            baseline_trades,
+            window_trades,
+            long_low_position=absorption.LongLowPosition(
+                days_of_history=90,
+                low_position_365=Decimal("0.25"),
+            ),
+        )
+
+        self.assertEqual(row["absorption_score"], "0")
+        self.assertEqual(row["history_class"], "veteran")
+        self.assertEqual(row["low_position_365"], "0.25")
+        self.assertEqual(row["score_shadow_veteran"], "65.625")
+        self.assertIsNone(row["score_shadow_fresh"])
+        self.assertEqual(
+            row["shadow_note"], "veteran graded-365 shadow applies"
+        )
+
+    def test_long_lows_flag_changes_only_shadow_fields(self):
+        baseline_bars, window_bars, baseline_trades, window_trades = (
+            accumulation_fixture()
+        )
+        write_tape(
+            self.root,
+            baseline_bars + window_bars,
+            baseline_trades + window_trades,
+        )
+        without_path = self.root / "without.jsonl"
+        with_path = self.root / "with.jsonl"
+        long_lows_path = write_long_lows(self.root, 90, "0.25")
+
+        without_rows = absorption.run_absorption(
+            self.root,
+            without_path,
+            window_minutes=4,
+            lookback_minutes=12,
+            step_minutes=1_440,
+        )
+        with_rows = absorption.run_absorption(
+            self.root,
+            with_path,
+            window_minutes=4,
+            lookback_minutes=12,
+            step_minutes=1_440,
+            long_lows_path=long_lows_path,
+        )
+
+        self.assertEqual(len(without_rows), 1)
+        self.assertEqual(len(with_rows), 1)
+        self.assertEqual(
+            production_row_bytes(without_rows[0]),
+            production_row_bytes(with_rows[0]),
+        )
+        self.assertEqual(
+            absorption.argument_parser().parse_args(
+                ["--long-lows", str(long_lows_path)]
+            ).long_lows,
+            long_lows_path,
+        )
+        self.assertEqual(with_rows[0]["history_class"], "veteran")
+        self.assertEqual(with_rows[0]["score_shadow_veteran"], "65.625")
+        self.assertEqual(
+            without_rows[0]["absorption_score"],
+            with_rows[0]["absorption_score"],
+        )
 
     def test_already_pumping_window_scores_zero(self):
         baseline_bars, baseline_trades, aggregate_id = baseline_fixture()

@@ -42,6 +42,8 @@ MAX_WINDOW_MINUTES = 1_440
 MAX_LOOKBACK_DAYS = 90
 MINUTES_PER_DAY = 1_440
 ABSORPTION_BASELINE_SCHEMA = "absorption-kline-baselines-v1"
+LONG_LOW_POSITIONS_SCHEMA = "long-low-positions-v1"
+VETERAN_HISTORY_DAYS = 90
 FORWARD_HOURS = (1, 6, 24)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 KLINE_ARCHIVE = re.compile(
@@ -120,6 +122,12 @@ class HistoricalKlineBaseline:
     window_range_samples_pct: Tuple[Decimal, ...]
     window_quote_volume_samples: Tuple[Decimal, ...]
     tape: Optional[HistoricalTapeBaseline] = None
+
+
+@dataclass(frozen=True)
+class LongLowPosition:
+    days_of_history: int
+    low_position_365: Decimal
 
 
 @dataclass(frozen=True)
@@ -946,6 +954,63 @@ def load_historical_baselines(
     return loaded
 
 
+def load_long_low_positions(path: Path) -> Dict[str, LongLowPosition]:
+    """Load the AB5 long-low positions used only by shadow scoring."""
+    source_path = Path(path)
+    try:
+        with open(source_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AbsorptionError(
+            f"cannot read long-lows file {source_path}: {error}"
+        ) from None
+    if not isinstance(payload, Mapping):
+        raise AbsorptionError("long-lows file root is not an object")
+    if payload.get("schema") != LONG_LOW_POSITIONS_SCHEMA:
+        raise AbsorptionError("long-lows file schema is not supported")
+    raw_symbols = payload.get("symbols")
+    if not isinstance(raw_symbols, Mapping) or not raw_symbols:
+        raise AbsorptionError("long-lows file has no symbols")
+
+    loaded: Dict[str, LongLowPosition] = {}
+    for raw_symbol, raw_record in sorted(raw_symbols.items()):
+        if not isinstance(raw_symbol, str):
+            raise AbsorptionError("long-lows symbol key is not text")
+        try:
+            symbol = validate_symbol(raw_symbol, "long-lows symbol")
+        except _SymbolValidationError as error:
+            raise AbsorptionError(str(error)) from None
+        if symbol != raw_symbol:
+            raise AbsorptionError("long-lows symbol key is not canonical")
+        if not isinstance(raw_record, Mapping):
+            raise AbsorptionError(f"{symbol} long-lows record is not an object")
+        if raw_record.get("status") not in {"READY", "NOT-READY"}:
+            raise AbsorptionError(f"{symbol} long-lows status is invalid")
+        days_of_history = _integer(
+            raw_record.get("days_of_history"),
+            f"{symbol} long-lows days_of_history",
+            non_negative=True,
+        )
+        if days_of_history < 1:
+            raise AbsorptionError(
+                f"{symbol} long-lows days_of_history is invalid"
+            )
+        low_position_365 = _decimal(
+            raw_record.get("low_position_365"),
+            f"{symbol} low_position_365",
+            positive=False,
+        )
+        if low_position_365 > Decimal("1"):
+            raise AbsorptionError(
+                f"{symbol} low_position_365 is outside zero to one"
+            )
+        loaded[symbol] = LongLowPosition(
+            days_of_history=days_of_history,
+            low_position_365=low_position_365,
+        )
+    return loaded
+
+
 def quantile(
     values: Sequence[Decimal], numerator: int, denominator: int
 ) -> Optional[Decimal]:
@@ -1083,6 +1148,41 @@ def _optional_text(value: Optional[Decimal]) -> Optional[str]:
     return None if value is None else decimal_text(value)
 
 
+def _graded_low_factor(low_position: Decimal) -> Decimal:
+    with localcontext() as context:
+        context.prec = 28
+        return Decimal("1") - _clamp01(low_position)
+
+
+def _shadow_score(
+    low_factor: Decimal,
+    components: Mapping[str, Optional[Decimal]],
+    unknown: Sequence[str],
+    *,
+    price_flat: bool,
+    volume_surging: bool,
+    pumping: bool,
+) -> Decimal:
+    score = Decimal("0")
+    if not unknown and price_flat and not volume_surging and not pumping:
+        with localcontext() as context:
+            context.prec = 50
+            score = Decimal("100") * _clamp01(low_factor)
+            for name in (
+                "range_compression",
+                "volume_floor",
+                "taker_imbalance_shift",
+                "trade_size_shift",
+            ):
+                value = components[name]
+                if value is None:
+                    raise AbsorptionError(
+                        "unknown shadow component escaped gate"
+                    )
+                score *= _clamp01(value)
+    return score
+
+
 def score_absorption_window(
     symbol: str,
     baseline_bars: Sequence[KlineBar],
@@ -1092,6 +1192,7 @@ def score_absorption_window(
     *,
     forward_outcomes: Optional[Mapping[str, Mapping[str, Optional[str]]]] = None,
     historical_baseline: Optional[HistoricalKlineBaseline] = None,
+    long_low_position: Optional[LongLowPosition] = None,
 ) -> Dict[str, Any]:
     """Score one proved symbol/window against measured historical evidence."""
     baseline_bars = tuple(baseline_bars)
@@ -1332,6 +1433,36 @@ def score_absorption_window(
                     raise AbsorptionError("unknown score component escaped gate")
                 score *= _clamp01(value)
 
+    history_class = "unknown"
+    score_shadow_veteran: Optional[Decimal] = None
+    score_shadow_fresh: Optional[Decimal] = None
+    shadow_note = "no shadow applies without long lows"
+    if long_low_position is not None:
+        if long_low_position.days_of_history >= VETERAN_HISTORY_DAYS:
+            history_class = "veteran"
+            # lane-logs/AB6-report.txt defines the veteran graded-365 shadow.
+            score_shadow_veteran = _shadow_score(
+                _graded_low_factor(long_low_position.low_position_365),
+                components,
+                unknown,
+                price_flat=price_flat,
+                volume_surging=volume_surging,
+                pumping=pumping,
+            )
+            shadow_note = "veteran graded-365 shadow applies"
+        else:
+            history_class = "fresh"
+            # lane-logs/AB4-report.txt defines the fresh graded-30 shadow.
+            score_shadow_fresh = _shadow_score(
+                _graded_low_factor(low_position),
+                components,
+                unknown,
+                price_flat=price_flat,
+                volume_surging=volume_surging,
+                pumping=pumping,
+            )
+            shadow_note = "fresh graded-30 shadow applies"
+
     features: Dict[str, Any] = {
         "at_multiweek_lows": at_multiweek_lows,
         "low_reference_close_q20": _optional_text(close_q20),
@@ -1382,6 +1513,15 @@ def score_absorption_window(
         ),
         "baseline_last_utc": baseline_last_utc,
         "absorption_score": decimal_text(score),
+        "history_class": history_class,
+        "low_position_365": (
+            None
+            if long_low_position is None
+            else decimal_text(long_low_position.low_position_365)
+        ),
+        "score_shadow_veteran": _optional_text(score_shadow_veteran),
+        "score_shadow_fresh": _optional_text(score_shadow_fresh),
+        "shadow_note": shadow_note,
         "score_components": {
             name: _optional_text(value) for name, value in components.items()
         },
@@ -1451,6 +1591,7 @@ def absorption_rows(
     historical_baselines: Optional[
         Mapping[str, HistoricalKlineBaseline]
     ] = None,
+    long_low_positions: Optional[Mapping[str, LongLowPosition]] = None,
 ) -> Tuple[Dict[str, Any], ...]:
     """Build deterministic rows for every proved symbol/window pair."""
     for value, name, maximum in (
@@ -1505,6 +1646,15 @@ def absorption_rows(
             if historical_baselines is None
             else historical_baselines[symbol]
         )
+        if long_low_positions is None:
+            long_low_position = None
+        else:
+            try:
+                long_low_position = long_low_positions[symbol]
+            except KeyError:
+                raise AbsorptionError(
+                    f"{symbol} is missing from the long-lows file"
+                ) from None
         first_start = 0 if profile is not None else lookback_minutes
         last_start = len(bars) - window_minutes
         for start in range(first_start, last_start + 1, step_minutes):
@@ -1533,6 +1683,7 @@ def absorption_rows(
                 current_window_trades,
                 forward_outcomes=_forward_outcomes(bars, end_index),
                 historical_baseline=profile,
+                long_low_position=long_low_position,
             )
             rows.append(row)
     if not rows:
@@ -1586,6 +1737,7 @@ def run_absorption(
     lookback_minutes: int = DEFAULT_LOOKBACK_DAYS * 1_440,
     step_minutes: int = DEFAULT_STEP_MINUTES,
     baseline_path: Optional[Path] = None,
+    long_lows_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], ...]:
     historical_baselines = (
         None
@@ -1594,6 +1746,11 @@ def run_absorption(
             baseline_path,
             expected_window_minutes=window_minutes,
         )
+    )
+    long_low_positions = (
+        None
+        if long_lows_path is None
+        else load_long_low_positions(long_lows_path)
     )
     selected_symbols = (
         None
@@ -1618,6 +1775,7 @@ def run_absorption(
         lookback_minutes=lookback_minutes,
         step_minutes=step_minutes,
         historical_baselines=historical_baselines,
+        long_low_positions=long_low_positions,
     )
     _write_jsonl(output_path or default_output_path(), rows)
     return rows
@@ -1654,6 +1812,11 @@ def argument_parser() -> argparse.ArgumentParser:
         "--baseline",
         type=Path,
         help="historical kline baseline built by study.baselines",
+    )
+    parser.add_argument(
+        "--long-lows",
+        type=Path,
+        help="AB5 long-low-positions.json for shadow scoring",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--date", type=_run_date)
@@ -1694,6 +1857,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lookback_minutes=args.lookback_days * 1_440,
             step_minutes=args.step,
             baseline_path=args.baseline,
+            long_lows_path=args.long_lows,
         )
     except AbsorptionError as error:
         print(f"absorption: {error}", file=sys.stderr)
