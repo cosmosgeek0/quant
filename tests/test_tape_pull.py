@@ -49,6 +49,47 @@ def zip_bytes(symbol=SYMBOL, day=DAY, payload=None):
     return output.getvalue()
 
 
+def agg_trades_csv(extra_bytes=0):
+    row = b"1,100,0.1,1,1,1786665600000,false,true\n"
+    return row + (b"x" * extra_bytes)
+
+
+def agg_trades_zip_bytes(symbol=SYMBOL, day=DAY, payload=None):
+    output = io.BytesIO()
+    member = "%s-aggTrades-%s.csv" % (symbol, day.isoformat())
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            member, payload if payload is not None else agg_trades_csv()
+        )
+    return output.getvalue()
+
+
+def write_agg_trades_zip(
+    root, symbol=SYMBOL, day=DAY, payload=None, venue=tp.VENUE_SPOT
+):
+    path = tp.agg_trades_path(Path(root), symbol, day, venue)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(agg_trades_zip_bytes(symbol, day, payload))
+    return path
+
+
+def write_windows_manifest(path, symbols):
+    start_ms = tp._day_start_ms(DAY)
+    payload = {
+        "windows": [
+            {
+                "symbol": symbol,
+                "venue_class": "spot_only",
+                "start_ms": start_ms,
+                "end_ms": start_ms + 60_000,
+                "gap_days": [],
+            }
+            for symbol in symbols
+        ]
+    }
+    Path(path).write_text(json.dumps(payload), encoding="utf-8")
+
+
 class FakeResponse:
     def __init__(self, payload, url, status=200, headers=None):
         self._handle = io.BytesIO(payload)
@@ -284,6 +325,159 @@ class TapePullTests(unittest.TestCase):
         self.assertEqual(result.status, "SKIPPED")
         self.assertEqual(result.path, expected)
         tp.verify_kline_zip(expected, SYMBOL, DAY)
+
+    def test_under_bound_agg_trades_member_streams_and_is_published(self):
+        payload = agg_trades_csv(17)
+        member_bound = len(payload) + 1
+        url = tp.agg_trades_url(SYMBOL, DAY)
+
+        def opener(request, timeout):
+            return FakeResponse(
+                agg_trades_zip_bytes(payload=payload), request.full_url
+            )
+
+        with mock.patch.object(tp, "READ_CHUNK_BYTES", 7):
+            result = tp.download_agg_trades(
+                SYMBOL,
+                DAY,
+                self.root,
+                opener=opener,
+                max_member_bytes=member_bound,
+            )
+        self.assertEqual(result.status, "DOWNLOADED")
+        self.assertEqual(url, tp.agg_trades_url(result.symbol, result.day))
+        tp.verify_agg_trades_zip(
+            result.path,
+            SYMBOL,
+            DAY,
+            max_member_bytes=member_bound,
+        )
+
+    def test_raised_ceiling_streams_above_a_smaller_injected_policy(self):
+        self.assertEqual(tp.MAX_MEMBER_BYTES, 1_073_741_824)
+        payload = agg_trades_csv(33)
+        path = write_agg_trades_zip(self.root, payload=payload)
+        smaller_bound = len(payload) - 1
+        with self.assertRaises(tp.ArchiveError) as raised:
+            tp.verify_agg_trades_zip(
+                path,
+                SYMBOL,
+                DAY,
+                max_member_bytes=smaller_bound,
+            )
+        self.assertEqual(raised.exception.measured_value, len(payload))
+        self.assertEqual(raised.exception.bound, smaller_bound)
+        with mock.patch.object(tp, "READ_CHUNK_BYTES", 5):
+            tp.verify_agg_trades_zip(
+                path,
+                SYMBOL,
+                DAY,
+                max_member_bytes=len(payload) + 1,
+            )
+
+    def test_above_bound_archive_is_identified_and_batch_continues(self):
+        large_symbol = "LARGEUSDT"
+        small_symbol = "SMALLUSDT"
+        manifest = self.root / "windows.json"
+        write_windows_manifest(manifest, [large_symbol, small_symbol])
+        small_payload = agg_trades_csv()
+        member_bound = len(small_payload) + 1
+        large_payload = agg_trades_csv(64)
+
+        def opener(request, timeout):
+            symbol = (
+                large_symbol
+                if "/%s/" % large_symbol in request.full_url
+                else small_symbol
+            )
+            payload = large_payload if symbol == large_symbol else small_payload
+            return FakeResponse(
+                agg_trades_zip_bytes(symbol, DAY, payload), request.full_url
+            )
+
+        rows = []
+        summary = tp.pull_windows_file(
+            manifest,
+            self.root,
+            opener=opener,
+            emit=rows.append,
+            max_member_bytes=member_bound,
+        )
+        self.assertEqual(summary.requests, 2)
+        self.assertEqual(summary.downloaded, 1)
+        self.assertEqual(summary.skipped, 0)
+        self.assertEqual(summary.gaps, ())
+        self.assertEqual(len(summary.failures), 1)
+        self.assertEqual(summary.failures[0].request.symbol, large_symbol)
+        error_row = next(row for row in rows if row.startswith("ERROR |"))
+        self.assertIn("ERROR | ArchiveError |", error_row)
+        self.assertIn("symbol=%s" % large_symbol, error_row)
+        self.assertIn("date=%s" % DAY.isoformat(), error_row)
+        self.assertIn("venue=spot", error_row)
+        self.assertIn("measured=%d" % len(large_payload), error_row)
+        self.assertIn("bound=%d" % member_bound, error_row)
+        self.assertTrue(rows[-1].endswith("gaps=0 | failures=1"))
+        self.assertFalse(
+            tp.agg_trades_path(self.root, large_symbol, DAY).exists()
+        )
+        self.assertTrue(
+            tp.agg_trades_path(self.root, small_symbol, DAY).exists()
+        )
+        manifest_rows = {
+            row["symbol"]: row
+            for row in json.loads(manifest.read_text(encoding="utf-8"))["windows"]
+        }
+        self.assertEqual(
+            manifest_rows[large_symbol]["gap_days"], [DAY.isoformat()]
+        )
+        self.assertEqual(manifest_rows[small_symbol]["gap_days"], [])
+
+    def test_windows_resume_keeps_verified_archive_skipped(self):
+        manifest = self.root / "windows.json"
+        write_windows_manifest(manifest, [SYMBOL])
+        expected = write_agg_trades_zip(self.root)
+        rows = []
+        with mock.patch.object(
+            tp, "_open_get", side_effect=AssertionError("network")
+        ):
+            summary = tp.pull_windows_file(
+                manifest, self.root, emit=rows.append
+            )
+        self.assertEqual(summary.downloaded, 0)
+        self.assertEqual(summary.skipped, 1)
+        self.assertEqual(summary.failures, ())
+        self.assertEqual(
+            tp.agg_trades_path(self.root, SYMBOL, DAY), expected
+        )
+        self.assertTrue(any(row.startswith("SKIPPED | %s |" % SYMBOL) for row in rows))
+
+    def test_completed_failure_exit_code_is_distinct_from_clean(self):
+        request = tp.ArchiveRequest(SYMBOL, tp.VENUE_SPOT, DAY)
+        failure = tp.ArchiveFailure(
+            request,
+            "ArchiveError",
+            "archive member size is outside bounds",
+            "81",
+            "80",
+        )
+        failed = tp.ManifestPullSummary(
+            "windows_file", (SYMBOL,), 1, 0, 0, (), (failure,)
+        )
+        clean = tp.ManifestPullSummary(
+            "windows_file", (SYMBOL,), 1, 1, 0, ()
+        )
+        arguments = [
+            "--windows-file",
+            str(self.root / "windows.json"),
+            "--dest",
+            str(self.root),
+        ]
+        with mock.patch.object(tp, "pull_windows_file", return_value=failed):
+            self.assertEqual(
+                tp.main(arguments), tp.COMPLETED_WITH_FAILURES_EXIT_CODE
+            )
+        with mock.patch.object(tp, "pull_windows_file", return_value=clean):
+            self.assertEqual(tp.main(arguments), 0)
 
     def test_corrupt_existing_zip_fixture_is_rejected_without_network(self):
         path = tp.kline_path(self.root, SYMBOL, DAY)

@@ -43,7 +43,9 @@ HTTP_TIMEOUT_SECONDS = 30.0
 MAX_429_RETRIES = 4
 MAX_METADATA_BYTES = 24_000_000
 MAX_ARCHIVE_BYTES = 128_000_000
-MAX_MEMBER_BYTES = 256_000_000
+# ZIP members are verified by byte-accounted streaming, so high-volume daily
+# aggTrades CSVs may safely reach 1 GiB without being held in memory.
+MAX_MEMBER_BYTES = 1_073_741_824
 MAX_MANIFEST_BYTES = 32_000_000
 MAX_MANIFEST_WINDOWS = 1_000_000
 MAX_WINDOW_DURATION_MS = 24 * 60 * 60 * 1_000
@@ -51,6 +53,7 @@ FUNDING_PAGE_LIMIT = 1_000
 MAX_FUNDING_PAGES = 16
 READ_CHUNK_BYTES = 128 * 1024
 USER_AGENT = "quant-study-tape-pull/1"
+COMPLETED_WITH_FAILURES_EXIT_CODE = 2
 VENUE_SPOT = "spot"
 VENUE_FUTURES = "futures"
 VENUE_CLASS_VENUES = {
@@ -83,6 +86,17 @@ class ArchiveMissing(PublicReadError):
 class ArchiveError(TapePullError):
     """A file is not a usable, intact expected archive."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        measured_value: Optional[Any] = None,
+        bound: Optional[Any] = None,
+    ) -> None:
+        super().__init__(message)
+        self.measured_value = measured_value
+        self.bound = bound
+
 
 @dataclass(frozen=True)
 class DownloadResult:
@@ -99,6 +113,15 @@ class ArchiveRequest:
     symbol: str
     venue: str
     day: date
+
+
+@dataclass(frozen=True)
+class ArchiveFailure:
+    request: ArchiveRequest
+    error_type: str
+    reason: str
+    measured_value: str
+    bound: str
 
 
 @dataclass(frozen=True)
@@ -123,6 +146,7 @@ class ManifestPullSummary:
     downloaded: int
     skipped: int
     gaps: Tuple[ArchiveRequest, ...]
+    failures: Tuple[ArchiveFailure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,6 +185,7 @@ class PullSummary:
     skipped: int
     gaps: Tuple[Tuple[str, date], ...]
     days: Tuple[date, ...]
+    failures: Tuple[ArchiveFailure, ...] = ()
 
 
 def _archive_path_allowed(path: str) -> bool:
@@ -538,63 +563,130 @@ def _expected_agg_trades_member(symbol: str, day: date) -> str:
     return "%s-aggTrades-%s.csv" % (symbol, day.isoformat())
 
 
-def verify_kline_zip(path: Path, symbol: str, day: Any) -> None:
-    """Verify ZIP structure, expected member name, size, and every stored CRC."""
-    path = Path(path)
-    symbol = _validate_symbol(symbol)
-    day = _coerce_day(day)
-    expected = _expected_member(symbol, day)
+def _validate_member_byte_bound(max_member_bytes: int) -> int:
+    if (
+        isinstance(max_member_bytes, bool)
+        or not isinstance(max_member_bytes, int)
+        or max_member_bytes <= 0
+    ):
+        raise InputError("member byte bound must be a positive integer")
+    return max_member_bytes
+
+
+def _stream_verified_member(
+    archive: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    max_member_bytes: int,
+) -> None:
+    """Read one member in bounded chunks while accounting for every byte."""
+    declared_bytes = member.file_size
+    if declared_bytes <= 0 or declared_bytes > max_member_bytes:
+        raise ArchiveError(
+            "archive member size is outside bounds",
+            measured_value=declared_bytes,
+            bound=max_member_bytes,
+        )
+    streamed_bytes = 0
     try:
-        with zipfile.ZipFile(path, "r") as archive:
-            members = [item for item in archive.infolist() if not item.is_dir()]
-            if len(members) != 1 or members[0].filename != expected:
-                raise ArchiveError("archive member does not match expected kline CSV")
-            member = members[0]
-            if member.flag_bits & 0x1:
-                raise ArchiveError("encrypted archive member is not accepted")
-            if member.file_size <= 0 or member.file_size > MAX_MEMBER_BYTES:
-                raise ArchiveError("archive member size is outside bounds")
-            bad_member = archive.testzip()
-            if bad_member is not None:
-                raise ArchiveError("archive CRC failed")
-    except ArchiveError:
-        raise
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
-        raise ArchiveError("file is not an intact kline ZIP") from error
+        with archive.open(member, "r") as handle:
+            while True:
+                remaining_with_guard = max_member_bytes - streamed_bytes + 1
+                chunk = handle.read(min(READ_CHUNK_BYTES, remaining_with_guard))
+                if not chunk:
+                    break
+                streamed_bytes += len(chunk)
+                if streamed_bytes > max_member_bytes:
+                    raise ArchiveError(
+                        "streamed archive member exceeded byte bound",
+                        measured_value=streamed_bytes,
+                        bound=max_member_bytes,
+                    )
+    except zipfile.BadZipFile as error:
+        raise ArchiveError(
+            "archive CRC failed",
+            measured_value=streamed_bytes,
+            bound=declared_bytes,
+        ) from error
+    if streamed_bytes != declared_bytes:
+        raise ArchiveError(
+            "streamed archive member size differs from ZIP metadata",
+            measured_value=streamed_bytes,
+            bound=declared_bytes,
+        )
 
 
-def verify_agg_trades_zip(path: Path, symbol: str, day: Any) -> None:
-    """Verify aggTrades member identity, size, encryption state, and CRC."""
-    path = Path(path)
-    symbol = _validate_symbol(symbol)
-    day = _coerce_day(day)
-    expected = _expected_agg_trades_member(symbol, day)
+def _verify_single_member_zip(
+    path: Path,
+    expected: str,
+    label: str,
+    max_member_bytes: int,
+) -> None:
+    max_member_bytes = _validate_member_byte_bound(max_member_bytes)
     try:
         with zipfile.ZipFile(path, "r") as archive:
             members = [item for item in archive.infolist() if not item.is_dir()]
             if len(members) != 1 or members[0].filename != expected:
                 raise ArchiveError(
-                    "archive member does not match expected aggTrades CSV"
+                    "archive member does not match expected %s CSV" % label
                 )
             member = members[0]
             if member.flag_bits & 0x1:
                 raise ArchiveError("encrypted archive member is not accepted")
-            if member.file_size <= 0 or member.file_size > MAX_MEMBER_BYTES:
-                raise ArchiveError("archive member size is outside bounds")
-            bad_member = archive.testzip()
-            if bad_member is not None:
-                raise ArchiveError("archive CRC failed")
+            _stream_verified_member(archive, member, max_member_bytes)
     except ArchiveError:
         raise
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
-        raise ArchiveError("file is not an intact aggTrades ZIP") from error
+        raise ArchiveError("file is not an intact %s ZIP" % label) from error
 
 
-def quote_volume_from_zip(path: Path, symbol: str, day: Any) -> Decimal:
+def verify_kline_zip(
+    path: Path,
+    symbol: str,
+    day: Any,
+    *,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
+) -> None:
+    """Stream and verify the expected kline member without full extraction."""
+    path = Path(path)
+    symbol = _validate_symbol(symbol)
+    day = _coerce_day(day)
+    _verify_single_member_zip(
+        path, _expected_member(symbol, day), "kline", max_member_bytes
+    )
+
+
+def verify_agg_trades_zip(
+    path: Path,
+    symbol: str,
+    day: Any,
+    *,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
+) -> None:
+    """Stream and verify the expected aggTrades member and stored CRC."""
+    path = Path(path)
+    symbol = _validate_symbol(symbol)
+    day = _coerce_day(day)
+    _verify_single_member_zip(
+        path,
+        _expected_agg_trades_member(symbol, day),
+        "aggTrades",
+        max_member_bytes,
+    )
+
+
+def quote_volume_from_zip(
+    path: Path,
+    symbol: str,
+    day: Any,
+    *,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
+) -> Decimal:
     """Sum column 8 (quote-asset volume) with Decimal-only arithmetic."""
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
-    verify_kline_zip(path, symbol, day)
+    verify_kline_zip(
+        path, symbol, day, max_member_bytes=max_member_bytes
+    )
     member = _expected_member(symbol, day)
     total = Decimal(0)
     rows = 0
@@ -632,14 +724,18 @@ def download_kline(
     venue: str = VENUE_SPOT,
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
 ) -> DownloadResult:
     """Download one archive atomically, or verify and skip an existing one."""
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
     venue = _validate_venue(venue)
+    max_member_bytes = _validate_member_byte_bound(max_member_bytes)
     target = kline_path(Path(destination), symbol, day, venue)
     if target.exists():
-        verify_kline_zip(target, symbol, day)
+        verify_kline_zip(
+            target, symbol, day, max_member_bytes=max_member_bytes
+        )
         return DownloadResult(
             "SKIPPED", symbol, day, target, target.stat().st_size, venue
         )
@@ -663,17 +759,27 @@ def download_kline(
                         break
                     written += len(chunk)
                     if written > MAX_ARCHIVE_BYTES:
-                        raise ArchiveError("archive response exceeded byte limit")
+                        raise ArchiveError(
+                            "archive response exceeded byte limit",
+                            measured_value=written,
+                            bound=MAX_ARCHIVE_BYTES,
+                        )
                     handle.write(chunk)
                 handle.flush()
                 os.fsync(handle.fileno())
         finally:
             response.close()
         if written == 0:
-            raise ArchiveError("archive response was empty")
-        verify_kline_zip(temporary, symbol, day)
+            raise ArchiveError(
+                "archive response was empty", measured_value=written, bound=1
+            )
+        verify_kline_zip(
+            temporary, symbol, day, max_member_bytes=max_member_bytes
+        )
         if target.exists():
-            verify_kline_zip(target, symbol, day)
+            verify_kline_zip(
+                target, symbol, day, max_member_bytes=max_member_bytes
+            )
             return DownloadResult(
                 "SKIPPED", symbol, day, target, target.stat().st_size, venue
             )
@@ -700,14 +806,18 @@ def download_agg_trades(
     venue: str = VENUE_SPOT,
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
 ) -> DownloadResult:
     """Download one daily aggTrades archive atomically and idempotently."""
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
     venue = _validate_venue(venue)
+    max_member_bytes = _validate_member_byte_bound(max_member_bytes)
     target = agg_trades_path(Path(destination), symbol, day, venue)
     if target.exists():
-        verify_agg_trades_zip(target, symbol, day)
+        verify_agg_trades_zip(
+            target, symbol, day, max_member_bytes=max_member_bytes
+        )
         return DownloadResult(
             "SKIPPED", symbol, day, target, target.stat().st_size, venue
         )
@@ -731,17 +841,27 @@ def download_agg_trades(
                         break
                     written += len(chunk)
                     if written > MAX_ARCHIVE_BYTES:
-                        raise ArchiveError("archive response exceeded byte limit")
+                        raise ArchiveError(
+                            "archive response exceeded byte limit",
+                            measured_value=written,
+                            bound=MAX_ARCHIVE_BYTES,
+                        )
                     handle.write(chunk)
                 handle.flush()
                 os.fsync(handle.fileno())
         finally:
             response.close()
         if written == 0:
-            raise ArchiveError("archive response was empty")
-        verify_agg_trades_zip(temporary, symbol, day)
+            raise ArchiveError(
+                "archive response was empty", measured_value=written, bound=1
+            )
+        verify_agg_trades_zip(
+            temporary, symbol, day, max_member_bytes=max_member_bytes
+        )
         if target.exists():
-            verify_agg_trades_zip(target, symbol, day)
+            verify_agg_trades_zip(
+                target, symbol, day, max_member_bytes=max_member_bytes
+            )
             return DownloadResult(
                 "SKIPPED", symbol, day, target, target.stat().st_size, venue
             )
@@ -1179,6 +1299,49 @@ def format_progress(result: DownloadResult) -> str:
     )
 
 
+def _row_value(value: Any) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("|", "/")
+    compact = " ".join(text.split())
+    return compact if compact else "unknown"
+
+
+def _identified_archive_failure(
+    request: ArchiveRequest, error: TapePullError
+) -> ArchiveFailure:
+    measured_value = getattr(error, "measured_value", None)
+    bound = getattr(error, "bound", None)
+    if measured_value is None and isinstance(error, PublicReadError):
+        measured_value = error.status
+        if measured_value is not None:
+            bound = 399
+    return ArchiveFailure(
+        request=request,
+        error_type=type(error).__name__,
+        reason=_row_value(error),
+        measured_value=(
+            "unknown" if measured_value is None else _row_value(measured_value)
+        ),
+        bound="not_applicable" if bound is None else _row_value(bound),
+    )
+
+
+def format_archive_failure(failure: ArchiveFailure) -> str:
+    request = failure.request
+    return (
+        "ERROR | %s | symbol=%s | date=%s | venue=%s | measured=%s | "
+        "bound=%s | reason=%s"
+        % (
+            failure.error_type,
+            request.symbol,
+            request.day.isoformat(),
+            request.venue,
+            failure.measured_value,
+            failure.bound,
+            failure.reason,
+        )
+    )
+
+
 def _pull_archive_requests(
     requests: Sequence[ArchiveRequest],
     destination: Path,
@@ -1187,9 +1350,12 @@ def _pull_archive_requests(
     opener: Optional[Callable[..., Any]],
     sleep_fn: Callable[[float], None],
     emit: Callable[[str], None],
-) -> Tuple[List[DownloadResult], List[ArchiveRequest]]:
+    max_member_bytes: int = MAX_MEMBER_BYTES,
+) -> Tuple[List[DownloadResult], List[ArchiveRequest], List[ArchiveFailure]]:
+    max_member_bytes = _validate_member_byte_bound(max_member_bytes)
     results: List[DownloadResult] = []
     gaps: List[ArchiveRequest] = []
+    failures: List[ArchiveFailure] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
@@ -1200,6 +1366,7 @@ def _pull_archive_requests(
                 venue=request.venue,
                 opener=opener,
                 sleep_fn=sleep_fn,
+                max_member_bytes=max_member_bytes,
             ): request
             for request in requests
         }
@@ -1214,10 +1381,22 @@ def _pull_archive_requests(
                     % (request.symbol, request.day.isoformat(), request.venue)
                 )
                 continue
+            except TapePullError as error:
+                failure = _identified_archive_failure(request, error)
+                failures.append(failure)
+                emit(format_archive_failure(failure))
+                continue
             results.append(result)
             emit(format_progress(result))
     gaps.sort(key=lambda item: (item.day, item.symbol, item.venue))
-    return results, gaps
+    failures.sort(
+        key=lambda item: (
+            item.request.day,
+            item.request.symbol,
+            item.request.venue,
+        )
+    )
+    return results, gaps, failures
 
 
 def pull_cohort_file(
@@ -1229,6 +1408,7 @@ def pull_cohort_file(
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     emit: Callable[[str], None] = print,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
 ) -> ManifestPullSummary:
     """Pull only manifest-declared spot/perpetual kline archives."""
     entries = load_cohort_manifest(cohort_file)
@@ -1238,21 +1418,32 @@ def pull_cohort_file(
         "MODE | cohort_file | symbols=%d | requests=%d | workers=%d"
         % (len(entries), len(requests), MAX_WORKERS)
     )
-    results, gaps = _pull_archive_requests(
+    results, gaps, failures = _pull_archive_requests(
         requests,
         Path(destination),
         download_kline,
         opener=opener,
         sleep_fn=sleep_fn,
         emit=emit,
+        max_member_bytes=max_member_bytes,
     )
-    update_cohort_gap_days(cohort_file, requests, gaps)
+    unavailable = tuple(gaps) + tuple(
+        failure.request for failure in failures
+    )
+    update_cohort_gap_days(cohort_file, requests, unavailable)
     downloaded = sum(result.status == "DOWNLOADED" for result in results)
     skipped = sum(result.status == "SKIPPED" for result in results)
     emit(
         "DONE | mode=cohort_file | symbols=%d | requests=%d | "
-        "downloaded=%d | skipped=%d | gaps=%d"
-        % (len(entries), len(requests), downloaded, skipped, len(gaps))
+        "downloaded=%d | skipped=%d | gaps=%d | failures=%d"
+        % (
+            len(entries),
+            len(requests),
+            downloaded,
+            skipped,
+            len(gaps),
+            len(failures),
+        )
     )
     return ManifestPullSummary(
         "cohort_file",
@@ -1261,6 +1452,7 @@ def pull_cohort_file(
         downloaded,
         skipped,
         tuple(gaps),
+        tuple(failures),
     )
 
 
@@ -1271,6 +1463,7 @@ def pull_windows_file(
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     emit: Callable[[str], None] = print,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
 ) -> ManifestPullSummary:
     """Pull daily aggTrades archives only for days touched by explicit windows."""
     payload = _read_json_file(windows_file, "windows manifest")
@@ -1280,21 +1473,32 @@ def pull_windows_file(
         "MODE | windows_file | symbols=%d | requests=%d | workers=%d"
         % (len(symbols), len(requests), MAX_WORKERS)
     )
-    results, gaps = _pull_archive_requests(
+    results, gaps, failures = _pull_archive_requests(
         requests,
         Path(destination),
         download_agg_trades,
         opener=opener,
         sleep_fn=sleep_fn,
         emit=emit,
+        max_member_bytes=max_member_bytes,
     )
-    update_window_gap_days(windows_file, requests, gaps)
+    unavailable = tuple(gaps) + tuple(
+        failure.request for failure in failures
+    )
+    update_window_gap_days(windows_file, requests, unavailable)
     downloaded = sum(result.status == "DOWNLOADED" for result in results)
     skipped = sum(result.status == "SKIPPED" for result in results)
     emit(
         "DONE | mode=windows_file | symbols=%d | requests=%d | "
-        "downloaded=%d | skipped=%d | gaps=%d"
-        % (len(symbols), len(requests), downloaded, skipped, len(gaps))
+        "downloaded=%d | skipped=%d | gaps=%d | failures=%d"
+        % (
+            len(symbols),
+            len(requests),
+            downloaded,
+            skipped,
+            len(gaps),
+            len(failures),
+        )
     )
     return ManifestPullSummary(
         "windows_file",
@@ -1303,6 +1507,7 @@ def pull_windows_file(
         downloaded,
         skipped,
         tuple(gaps),
+        tuple(failures),
     )
 
 
@@ -1529,15 +1734,25 @@ def _ranking_archive(
     scratch: Path,
     opener: Optional[Callable[..., Any]],
     sleep_fn: Callable[[float], None],
+    max_member_bytes: int,
 ) -> RankedArchive:
     existing = kline_path(destination, symbol, day)
     if existing.exists():
-        volume = quote_volume_from_zip(existing, symbol, day)
+        volume = quote_volume_from_zip(
+            existing, symbol, day, max_member_bytes=max_member_bytes
+        )
         return RankedArchive(symbol, volume, existing, True)
     result = download_kline(
-        symbol, day, scratch, opener=opener, sleep_fn=sleep_fn
+        symbol,
+        day,
+        scratch,
+        opener=opener,
+        sleep_fn=sleep_fn,
+        max_member_bytes=max_member_bytes,
     )
-    volume = quote_volume_from_zip(result.path, symbol, day)
+    volume = quote_volume_from_zip(
+        result.path, symbol, day, max_member_bytes=max_member_bytes
+    )
     return RankedArchive(symbol, volume, result.path, False)
 
 
@@ -1551,12 +1766,14 @@ def pull_tapes(
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     emit: Callable[[str], None] = print,
+    max_member_bytes: int = MAX_MEMBER_BYTES,
 ) -> PullSummary:
     """Discover, rank, and materialize one historical tape cohort."""
     if agg_trades:
         raise InputError(
             "indiscriminate aggTrades pulls are disabled; use --windows-file"
         )
+    max_member_bytes = _validate_member_byte_bound(max_member_bytes)
     requested_days = completed_utc_days(days, now)
     if (
         isinstance(cohort, bool)
@@ -1579,6 +1796,7 @@ def pull_tapes(
     )
 
     ranked_archives: Dict[str, RankedArchive] = {}
+    failures: List[ArchiveFailure] = []
     missing = 0
     completed = 0
     with tempfile.TemporaryDirectory(prefix="tape-cohort-") as scratch_name:
@@ -1593,6 +1811,7 @@ def pull_tapes(
                     scratch,
                     opener,
                     sleep_fn,
+                    max_member_bytes,
                 ): symbol
                 for symbol in candidates
             }
@@ -1603,6 +1822,12 @@ def pull_tapes(
                     ranked_archives[symbol] = future.result()
                 except ArchiveMissing:
                     missing += 1
+                except TapePullError as error:
+                    failure = _identified_archive_failure(
+                        ArchiveRequest(symbol, VENUE_SPOT, ranking_day), error
+                    )
+                    failures.append(failure)
+                    emit(format_archive_failure(failure))
                 if completed % 25 == 0 or completed == len(candidates):
                     emit(
                         "RANK | checked=%d/%d | available=%d | missing=%d"
@@ -1631,7 +1856,12 @@ def pull_tapes(
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
-                    verify_kline_zip(target, symbol, ranking_day)
+                    verify_kline_zip(
+                        target,
+                        symbol,
+                        ranking_day,
+                        max_member_bytes=max_member_bytes,
+                    )
                     result = DownloadResult(
                         "SKIPPED", symbol, ranking_day, target, target.stat().st_size
                     )
@@ -1658,6 +1888,7 @@ def pull_tapes(
                     destination,
                     opener=opener,
                     sleep_fn=sleep_fn,
+                    max_member_bytes=max_member_bytes,
                 ): (symbol, day)
                 for symbol, day in remaining
             }
@@ -1672,15 +1903,37 @@ def pull_tapes(
                         % (symbol, day.isoformat())
                     )
                     continue
+                except TapePullError as error:
+                    failure = _identified_archive_failure(
+                        ArchiveRequest(symbol, VENUE_SPOT, day), error
+                    )
+                    failures.append(failure)
+                    emit(format_archive_failure(failure))
+                    continue
                 results.append(result)
                 emit(format_progress(result))
 
     downloaded = sum(result.status == "DOWNLOADED" for result in results)
     skipped = sum(result.status == "SKIPPED" for result in results)
     gaps.sort(key=lambda item: (item[1], item[0]))
+    failures.sort(
+        key=lambda item: (
+            item.request.day,
+            item.request.symbol,
+            item.request.venue,
+        )
+    )
     emit(
-        "DONE | symbols=%d | days=%d | downloaded=%d | skipped=%d | gaps=%d"
-        % (len(selected), len(requested_days), downloaded, skipped, len(gaps))
+        "DONE | symbols=%d | days=%d | downloaded=%d | skipped=%d | "
+        "gaps=%d | failures=%d"
+        % (
+            len(selected),
+            len(requested_days),
+            downloaded,
+            skipped,
+            len(gaps),
+            len(failures),
+        )
     )
     return PullSummary(
         candidates=len(candidates),
@@ -1690,6 +1943,7 @@ def pull_tapes(
         skipped=skipped,
         gaps=tuple(gaps),
         days=tuple(requested_days),
+        failures=tuple(failures),
     )
 
 
@@ -1769,26 +2023,34 @@ def selected_mode(arguments: argparse.Namespace) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_parser().parse_args(argv)
+    summary: Any = None
     try:
         mode = selected_mode(arguments)
         if mode == "cohort_file":
-            pull_cohort_file(
+            summary = pull_cohort_file(
                 arguments.cohort_file, arguments.days, arguments.dest
             )
         elif mode == "windows_file":
-            pull_windows_file(arguments.windows_file, arguments.dest)
+            summary = pull_windows_file(arguments.windows_file, arguments.dest)
         elif mode == "funding":
-            pull_funding(arguments.cohort_file, arguments.days, arguments.dest)
+            summary = pull_funding(
+                arguments.cohort_file, arguments.days, arguments.dest
+            )
         else:
-            pull_tapes(
+            summary = pull_tapes(
                 arguments.cohort,
                 arguments.days,
                 arguments.dest,
                 agg_trades=arguments.agg_trades,
             )
     except TapePullError as error:
-        print("ERROR | %s | %s" % (type(error).__name__, error), file=sys.stderr)
+        print(
+            "FATAL | %s | reason=%s" % (type(error).__name__, _row_value(error)),
+            file=sys.stderr,
+        )
         return 1
+    if isinstance(summary, (ManifestPullSummary, PullSummary)) and summary.failures:
+        return COMPLETED_WITH_FAILURES_EXIT_CODE
     return 0
 
 
