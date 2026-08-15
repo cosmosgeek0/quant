@@ -319,7 +319,7 @@
   "keywords": []
  },
  {
-  "key": "okx-announcements-2",
+  "key": "okx-announcements-3",
   "label": "OKX",
   "domain": "okx.com",
   "channel": "venue",
@@ -331,7 +331,7 @@
   "keywords": []
  },
  {
-  "key": "okx-announcements-2",
+  "key": "okx-announcements-4",
   "label": "OKX",
   "domain": "okx.com",
   "channel": "venue",
@@ -343,7 +343,7 @@
   "keywords": []
  },
  {
-  "key": "okx-announcements-2",
+  "key": "okx-announcements-5",
   "label": "OKX",
   "domain": "okx.com",
   "channel": "venue",
@@ -389,7 +389,7 @@
   "keywords": []
  },
  {
-  "key": "bybit-announcements-2",
+  "key": "bybit-announcements-3",
   "label": "Bybit",
   "domain": "announcements.bybit.com",
   "channel": "venue",
@@ -1047,6 +1047,30 @@
   "feeds": [
    "https://www.bis.org/doclist/all_statistics.rss"
   ],
+  "keywords": []
+ },
+ {
+  "key": "japan-fsa",
+  "label": "Japan FSA",
+  "domain": "fsa.go.jp",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.fsa.go.jp/fsaNewsListAll_rss2.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "uk-fca",
+  "label": "UK Financial Conduct Authority",
+  "domain": "fca.org.uk",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.fca.org.uk/news/rss.xml"
+  ],
   "keywords": [
    "crypto",
    "market",
@@ -1091,6 +1115,66 @@
   "feeds": [
    "https://crypto.news/feed/"
   ],
+  "keywords": []
+ },
+ {
+  "key": "ledger-insights",
+  "label": "Ledger Insights",
+  "domain": "ledgerinsights.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.ledgerinsights.com/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "rekt",
+  "label": "Rekt",
+  "domain": "rekt.news",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.rekt.news/rss/feed.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "beincrypto",
+  "label": "BeInCrypto",
+  "domain": "beincrypto.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://beincrypto.com/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "coinshares-research",
+  "label": "CoinShares Research",
+  "domain": "coinshares.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://researchblog.coinshares.com/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "financialjuice",
+  "label": "FinancialJuice",
+  "domain": "financialjuice.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.financialjuice.com/feed.ashx"
+  ],
   "keywords": [
    "fed",
    "ecb",
@@ -1115,6 +1199,42 @@
   "parser": "",
   "feeds": [
    "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "benzinga",
+  "label": "Benzinga",
+  "domain": "benzinga.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.benzinga.com/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "ft-alphaville",
+  "label": "FT Alphaville",
+  "domain": "ft.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.ft.com/alphaville?format=rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "cnbc-markets",
+  "label": "CNBC Markets",
+  "domain": "cnbc.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.cnbc.com/id/15839069/device/rss/rss.html"
   ],
   "keywords": [
    "market",
@@ -1165,6 +1285,18 @@
   "parser": "",
   "feeds": [
    "https://finance.yahoo.com/news/rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "investing-news",
+  "label": "Investing.com News",
+  "domain": "investing.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.investing.com/rss/news.rss"
   ],
   "keywords": [
    "market",
@@ -1231,6 +1363,42 @@
   "keywords": []
  },
  {
+  "key": "the-block",
+  "label": "The Block",
+  "domain": "theblock.co",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.theblock.co/rss.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "blockworks",
+  "label": "Blockworks",
+  "domain": "blockworks.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://blockworks.com/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "dl-news",
+  "label": "DL News",
+  "domain": "dlnews.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.dlnews.com/rss/"
+  ],
+  "keywords": []
+ },
+ {
   "key": "unchained",
   "label": "Unchained",
   "domain": "unchainedcrypto.com",
@@ -1243,6 +1411,42 @@
   "keywords": []
  },
  {
+  "key": "protos",
+  "label": "Protos",
+  "domain": "protos.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://protos.com/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "the-defiant",
+  "label": "The Defiant",
+  "domain": "thedefiant.io",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://thedefiant.io/api/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "kaiko",
+  "label": "Kaiko Research",
+  "domain": "kaiko.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.kaiko.com/resources/categories/data-blog"
+  ],
+  "keywords": []
+ },
+ {
   "key": "bankless",
   "label": "Bankless",
   "domain": "bankless.com",
@@ -1251,6 +1455,78 @@
   "parser": "",
   "feeds": [
    "https://www.bankless.com/rss/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "glassnode-insights",
+  "label": "Glassnode Insights",
+  "domain": "research.glassnode.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://research.glassnode.com/rss/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "chainalysis",
+  "label": "Chainalysis",
+  "domain": "chainalysis.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.chainalysis.com/feed/"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "trm-labs",
+  "label": "TRM Labs",
+  "domain": "trmlabs.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.trmlabs.com/resources/blog/rss.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "elliptic",
+  "label": "Elliptic",
+  "domain": "elliptic.co",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://www.elliptic.co/blog/rss.xml"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "wublockchain",
+  "label": "WuBlockchain / Substack",
+  "domain": "wublock.substack.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://wublock.substack.com/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "zerohedge",
+  "label": "ZeroHedge",
+  "domain": "zerohedge.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://cms.zerohedge.com/fullrss2.xml"
   ],
   "keywords": [
    "market",
@@ -1291,6 +1567,42 @@
    "fed",
    "market"
   ]
+ },
+ {
+  "key": "cointelegraph",
+  "label": "Cointelegraph",
+  "domain": "cointelegraph.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://cointelegraph.com/rss"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "decrypt",
+  "label": "Decrypt",
+  "domain": "decrypt.co",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://decrypt.co/feed"
+  ],
+  "keywords": []
+ },
+ {
+  "key": "cryptoslate",
+  "label": "CryptoSlate",
+  "domain": "cryptoslate.com",
+  "channel": "editorial",
+  "mode": "feed",
+  "parser": "",
+  "feeds": [
+   "https://cryptoslate.com/feed/"
+  ],
+  "keywords": []
  },
  {
   "key": "tree",

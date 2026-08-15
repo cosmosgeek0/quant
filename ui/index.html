@@ -324,7 +324,7 @@
   }
   .fpill .cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
-  .bars { width: 13px; height: 12px; flex: none; }
+  .bars { width: 11px; height: 10px; flex: none; }
   .bars rect { fill: var(--faint); }
   .bars.b3 rect { fill: #e8850c; }
   .bars.b2 rect.r1, .bars.b2 rect.r2 { fill: #3b82f6; }
@@ -362,11 +362,15 @@
   .src-name { flex: 1; min-width: 0; font-size: 13px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .src-row.off .src-name { color: var(--faint); }
   .src-row.off .fav, .src-row.off .badge { opacity: 0.4; }
-  .src-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex: none; }
-  .src-dot.live { background: #2ebd85; }
-  .src-dot.delayed { background: #c9a227; }
-  .src-dot.error { background: #b3564d; }
-  .src-dot.pending { background: var(--faint); }
+  .src-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: transparent;
+    border: 1.5px solid var(--faint);
+    flex: none;
+  }
+  .src-dot.live { background: #2ebd85; border-color: #2ebd85; }
+  .src-dot.delayed { background: var(--faint); border-color: var(--faint); }
+  .src-dot.error { background: #b3564d; border-color: #b3564d; }
   .src-cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 22px; text-align: right; }
   .sp-note { margin-top: 9px; font-size: 10.5px; color: var(--faint); line-height: 1.45; }
 
