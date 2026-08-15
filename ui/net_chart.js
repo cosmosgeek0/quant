@@ -693,6 +693,10 @@
         scale: scaleName, stroke: muted, font: axisFont,
         size: 52,
         side: 3,
+        /* numbers START on the page's flush left lane, like every
+           word on the News tab — not right-tucked against the plot */
+        align: 1,
+        gap: 0,
         space: cfg.compact ? 34 : 40,
         values: function (u, splits) {
           var out = [];
