@@ -527,41 +527,20 @@
     var data = [cfg.times || []];
     for (var i = 0; i < defs.length; i += 1) { data.push(defs[i].values); }
 
-    function levelBands() {
-      /* order series by mean level; each fills down to the next */
-      if (defs.length < 2) { return []; }
-      var means = [];
-      for (var di2 = 0; di2 < defs.length; di2 += 1) {
-        var sum = 0;
-        var n2 = 0;
-        for (var p2 = 0; p2 < data[di2 + 1].length; p2 += 1) {
-          var v2 = data[di2 + 1][p2];
-          if (v2 != null) { sum += v2; n2 += 1; }
-        }
-        means.push({ idx: di2 + 1, mean: n2 ? sum / n2 : 0 });
-      }
-      means.sort(function (a, b) { return b.mean - a.mean; });
-      var out = [];
-      for (var b2 = 0; b2 + 1 < means.length; b2 += 1) {
-        out.push({ series: [means[b2].idx, means[b2 + 1].idx] });
-      }
-      return out;
-    }
-
     function rangeUp(u, dataMin, dataMax) {
       var hi = (typeof dataMax === "number" && isFinite(dataMax) &&
         dataMax > 0) ? dataMax * 1.12 : 1;
       return [0, hi];
     }
 
-    function shadeFill(color, strong) {
-      /* the reference graph's grammar: colour fading to nothing
-         under each line */
+    function shadeFill(color) {
+      /* single-series whisper: a hint of ground under the line —
+         never a poured band (stacked fills read as decoration) */
       return function (u, si) {
         var ctx2 = u.ctx;
         var g = ctx2.createLinearGradient(0, u.bbox.top, 0,
           u.bbox.top + u.bbox.height);
-        g.addColorStop(0, alphaColor(color, strong ? 0.24 : 0.22));
+        g.addColorStop(0, alphaColor(color, 0.10));
         g.addColorStop(1, alphaColor(color, 0.01));
         return g;
       };
@@ -572,11 +551,10 @@
       series.push({
         label: defs[d].label,
         stroke: defs[d].color,
-        /* the reference grammar: every gap between adjacent lines
-           pours the UPPER line's colour as a gradient (uPlot bands,
-           built below); the lowest line pours to zero */
-        fill: shadeFill(defs[d].color, defs.length === 1),
-        width: defs.length === 1 ? 1.8 : 1.6,
+        /* overlay = thin bare lines on white (the measured serious
+           grammar); only a lone series earns its whisper of ground */
+        fill: defs.length === 1 ? shadeFill(defs[d].color) : null,
+        width: defs.length === 1 ? 1.5 : 1.25,
         scale: defs[d].unit === "ms" ? "ms" : "s",
         /* bridge sampling holes so the ribbon reads continuous —
            outages still show in the bars, the banner and the log */
@@ -752,9 +730,38 @@
         ms: { range: rangeUp }
       },
       axes: axes,
-      bands: levelBands(),
       series: series,
       hooks: {
+        draw: [function (u) {
+          /* rhythm guide: one dashed muted line at the loop's own
+             cadence — flat ON the guide is the picture of health */
+          var g = cfg.guide;
+          if (g == null || !isFinite(g) || g <= 0) { return; }
+          var scaleKey = hasMs && !hasS ? "ms" : "s";
+          var y = u.valToPos(g, scaleKey, true);
+          if (!isFinite(y) || y < u.bbox.top ||
+              y > u.bbox.top + u.bbox.height) { return; }
+          var c = u.ctx;
+          c.save();
+          c.strokeStyle = alphaColor(muted, 0.45);
+          c.lineWidth = 1;
+          c.setLineDash([4, 4]);
+          c.beginPath();
+          c.moveTo(u.bbox.left, y);
+          c.lineTo(u.bbox.left + u.bbox.width, y);
+          c.stroke();
+          if (cfg.guideLabel) {
+            var dpr = root.devicePixelRatio || 1;
+            c.setLineDash([]);
+            c.font = (10 * dpr) + "px " + sans;
+            c.fillStyle = alphaColor(muted, 0.85);
+            c.textAlign = "left";
+            var ty = y - 5 * dpr;
+            if (ty - 10 * dpr < u.bbox.top) { ty = y + 13 * dpr; }
+            c.fillText(cfg.guideLabel, u.bbox.left + 6 * dpr, ty);
+          }
+          c.restore();
+        }],
         ready: [function (u) {
           u.over.parentNode.appendChild(tooltip);
           u.over.addEventListener("dblclick", resetXRange);
@@ -815,6 +822,11 @@
       },
       setShow: function (idx, on) {
         plot.setSeries(idx + 1, { show: !!on });
+      },
+      setGuide: function (v, label) {
+        /* applied on the next draw (setData always follows) */
+        cfg.guide = v;
+        cfg.guideLabel = label;
       },
       setFocus: function (idx) {
         /* audit F: uPlot keys focus off the series INDEX whenever a

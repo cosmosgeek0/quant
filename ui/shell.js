@@ -675,6 +675,10 @@
       head.appendChild(stEl("span", "st-tier", tdef.tier));
     }
     head.appendChild(stEl("span", "st-spacer"));
+    /* the number carries its word (lag = seconds behind right now);
+       the loop's rhythm labels the dashed guide inside its graph */
+    head.appendChild(stEl("span", "st-t-meta",
+      def.id === "server" ? "ping" : "lag"));
     var cur = stEl("span", "st-t-datum st-val", "\u2014");
     cur.setAttribute("data-current", def.id);
     head.appendChild(cur);
@@ -1391,14 +1395,17 @@
             .replace(/^\s+|\s+$/g, "") || "#3b82f6",
           values: gridSeries(pm, pgrid)
         }];
+        var pGuide = pm.unit === "s" ? cadenceEst(pm.field) : null;
+        var pGuideLbl = pGuide ? "rhythm " + ageText2(pGuide) : null;
         if (pgrid.times.length >= 2) {
           if (panelCharts[pm.key]) {
+            panelCharts[pm.key].setGuide(pGuide, pGuideLbl);
             panelCharts[pm.key].setData(pgrid.times, pdef);
           } else {
             pHost.textContent = "";
             panelCharts[pm.key] = QNet.chart.mountMulti(pHost, {
               times: pgrid.times, series: pdef, height: 150,
-              compact: true
+              compact: true, guide: pGuide, guideLabel: pGuideLbl
             });
           }
         }
