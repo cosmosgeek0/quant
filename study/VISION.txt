@@ -1,0 +1,150 @@
+---
+name: product-volume-basis-spec
+description: "Owner's 2026-08-15 product vision for the two scanners — VOLUME (dead-token runner catcher) and BASIS (gap-vs-funding during violent moves) — spoken in-channel to the standby seat; NOT yet folded into repo files (Lead's job on owner word / at handover)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 77dbb32b-b441-4b76-930b-f1979416c8c8
+  modified: 2026-08-15T04:40:46.291Z
+---
+
+OWNER PRODUCT WORDS 2026-08-15 (~04:30Z, in-channel to the standby successor
+seat). The owner's own design, played back and vault-recorded the same turn.
+Repo fold-in (NOW.md / spec file) is the seated Lead's act — NOT done yet;
+the Lead ("fresh lane") has not seen this. Related: [[quant-program-lead]].
+
+## POINT 1 — VOLUME SCANNER (the hard one; built slowly, step by step)
+
+TARGET CLASS: dead/stale tokens. Chart flat, most candles close flat, stuck,
+rock bottom, no current volume; chart age irrelevant. The biggest money is
+the rebound from dead lows ("bitcoin at dead lows" class). ~450+ tokens on
+Binance (program measured 656 tradable: 132 spot-only / 167 perp-only / 357
+both — all three venue classes produce these runs).
+
+1. NOISE FILTER — a literal, named component. Dead charts are the MOST
+   noise-prone: they throw fake volume spikes and pump/dumps. The filter is
+   NEVER designed by assumption — it is LEARNED: study 100/200/500 tokens one
+   by one, specifically the ones that DID pump from dead — what their bottom
+   data looked like (volume, trades) → that becomes the baseline. Detection =
+   the SHIFT when that baseline breaks.
+2. ACCUMULATION TELL: at the dead zone people keep buying but price does not
+   move (absorption); the change comes when market buyers take interest.
+   Early-sign variables, plural: volume, incoming trades (tape), funding,
+   more — "a token has many variables that give early signs."
+3. EARLY = SIZE = the whole edge: the earlier the detection, the bigger the
+   entry at the lows at low risk. The named failure mode of this strategy:
+   token pumps, then dumps back within minutes (<15 min). Buying at +5% and
+   losing it, or exiting breakeven, still loses (fees + gone opportunity).
+4. ARCHITECTURE: never one front quant doing everything — multiple dedicated
+   side SERVICES, each one watching exactly ONE thing, running alongside.
+5. FILTER HIERARCHY: hard filters remove garbage tokens outright so full
+   compute/scanning is spent only on survivors.
+6. VENUES: spot-only, futures-only, and spot+futures all count. Spot is
+   preferred (worst case ≈ breakeven exit; but note most late entries buy
+   the top and eat the dump — that path needs its own protection system).
+7. TRADE-TAPE EDGE (the big advantage over a human trader who only sees
+   volume bars): (a) HISTORICAL — pull ALL trades (1–2M) of past comparable
+   pumps and learn the pattern: order sizes, buy vs sell aggression, how the
+   trades came in at the bottom and during ignition; (b) LIVE — read the tape
+   during an event to judge continuation ("is this going to continue?").
+8. ENTRY LADDER: never YOLO on a volume pump. Start small; add as
+   confirmation grows over the next 10–20 seconds. NEVER fixed-size adds at
+   fixed steps ("100 at each 5% move will wreck you"). The initial entry is
+   the best price but needs the MOST confirmation.
+9. MULTI-TIMEFRAME BASELINES: compare 10-min / 15-min / 1-hour volume against
+   baseline levels; a signal that "catches the eye" promotes the token to
+   focused scanning.
+10. EXIT: ladder out little by little as it runs (e.g., start selling
+    portions around +50% of the move).
+11. NOTHING STATIC: every threshold variable/adaptive. "If you think this is
+    just static, that is the biggest mistake."
+
+## POINT 2 — BASIS SCANNER (the easier one)
+
+1. Instantaneous gap (spot vs perp) is trivial — the REQUIRED build is
+   HISTORY: per token, queryable gap over the past 1h / 5h / 15h / 1 day.
+   Watch the gap GROW or SHRINK as a variable, never a snapshot.
+2. FUNDING IS THE RULER: a gap's value = gap size vs funding burned until it
+   closes. A standing 5% gap on a quiet token can take 2 days to close and
+   funding can eat 10x the gap ("half of your funds as funding"). Binance
+   funding max ≈ 2% per interval. Owner's origin story: a 25% gap that
+   closed 2 hours later — the trade class that started this whole program.
+3. STANDING GAPS ON QUIET TOKENS ARE TRAPS: if it were free money the market
+   makers would have closed it already — "why will they give it to me."
+   A static rule ("gap > 2% → buy") is named WRONG.
+4. REAL OPPORTUNITY = DURING VIOLENT MOVES: token pumping hard, spot and
+   futures fluctuating wildly, gap stretching 10–20–25% — that is when to
+   lock the basis in.
+5. GAP GROWTH IS GRADUAL: you see it building; never full account at first
+   sight (you cannot know how far it stretches — 25% observed). Sizing is
+   laddered/variable against the gap, entered as it develops.
+
+## CROSS-CUTTING LAWS (owner, verbatim spirit)
+- Built STEP BY STEP — "cannot be built in one day," and not in one go.
+- STATIC IS THE ENEMY everywhere — thresholds, sizing, baselines all adapt.
+- LEARN FROM REAL TOKEN DATA (historical studies of actual runners), never
+  design by assumption.
+- Layered hard filters protect compute; deep analysis only on survivors.
+- Many single-purpose side services beat one monolith scanner.
+
+## OWNER ITERATION DOCTRINE (2026-08-15 second batch — HOW it gets built)
+1. NO WAIT-AND-HOPE: "built it, now hoping a trade comes" is a banned state.
+   Catching nothing is a verdict on the design, never patience. The 17 dead
+   hours are the named disgrace ("there's no law… this is ridiculous").
+2. ONE-HOUR RULE: maximum one hour to the question "did you catch
+   something?" No catch → CHANGE THE SYSTEM (retune/widen). 450+ tradable
+   tokens; an hour of silence means the scanner is wrong, not the market.
+3. NARROW → WIDEN: define a boundary, make it work in a narrow area first;
+   when the narrow area does not satisfy, increase the area. Start at one
+   side of the boundary and iterate outward.
+4. CODE BY NECESSITY ONLY: every new line exists because (a) previous code
+   did not work, (b) a needed capability is missing, or (c) there is a
+   failure. NEVER because a feature was imagined — explicitly including
+   features from the owner's own description ("you cannot add features just
+   because I thought it is a feature").
+5. INCREMENTS: a 10,000-line vision lands in ~1,000-line steps — local
+   tests → test in the REAL thing → pass → next increment adds complexity.
+   Never one dump.
+6. PARALLEL WORKERS each target a single action/feature, continuously fed
+   new narrow work — test live, keep moving, keep iterating, keep building.
+7. The spoken spec = 5–10% of the real product; complexity arrives through
+   iteration, never day one. The system is dynamic, never finished-static.
+8. RESEARCH LAW: product words get grounded in real research (web, data,
+   published work) the same turn — compression-playback alone is failure
+   ("I have not seen you do a single web search").
+9. Owner verdict on record 2026-08-15: current momentum brain =
+   overconfident bad design (life record: 2 genuine ignitions, both eaten
+   by the system's own defects, zero completed trades); the seated Lead has
+   not yet internalized this doctrine ("even till now, Freshlane is not
+   able to understand what I said").
+
+## RESEARCH FACTS (standby seat, web-verified 2026-08-15)
+- BULK TAPE EXISTS (CONFIRMED, official binance/binance-public-data):
+  data.binance.vision serves aggTrades + trades + klines for BOTH spot and
+  USD-M futures as daily/monthly checksummed ZIPs — the complete historical
+  tape of every symbol is bulk-downloadable with NO API rate-limit grind.
+  This is the direct enabler of "study 100–500 runners' bottoms one by one"
+  and historical tape-pattern learning. (Spot timestamps switch to
+  microseconds from 2025-01-01.) Community downloaders additionally list
+  fundingRate, metrics (open interest / long-short / taker ratios),
+  liquidationSnapshot, bookDepth/bookTicker, premium/mark/index klines for
+  futures — REPORTED by multiple tools, official README fetch didn't
+  enumerate them; verify by listing the bucket XML before relying.
+- OI HISTORY IS 30 DAYS ONLY (CONFIRMED, official docs): REST
+  openInterestHist retains the latest 30 days (UM and CM both). Any
+  open-interest variable needs its own archiver started EARLY, or the
+  Vision metrics dataset where granularity suffices.
+- FUNDING CAPS ARE PER-SYMBOL VARIABLES (CONFIRMED): not a universal ±2% —
+  ±3% fixed for contracts ≤25x max leverage; per-symbol adjusted caps exist
+  (e.g. ±2.5%); the fundingInfo endpoint returns adjustedFundingRateCap /
+  adjustedFundingRateFloor per symbol; settlement FREQUENCY also varies and
+  Binance adjusts it (4h/1h announcements, incl. 2026-01). The basis
+  "funding ruler" must read cap + interval per symbol live — the owner's
+  nothing-static law applies to funding physics itself.
+- DETECTION LITERATURE EXISTS: published feature sets for pump/anomaly
+  detection — volume z-scores vs per-token history, time-compressed
+  price/volume signatures, OHLCV + market-cap features; manipulation
+  clusters in sub-$50M caps; real-time ML detectors (arxiv 2412.18848) and
+  a survey (MDPI Future Internet 15/8/267). The noise filter starts from a
+  literature base, then learns from OUR pulled tape — matching the owner's
+  learn-from-data order, not assumption.
