@@ -40,6 +40,8 @@ DEFAULT_STEP_MINUTES = 60
 DEFAULT_LOOKBACK_DAYS = 21
 MAX_WINDOW_MINUTES = 1_440
 MAX_LOOKBACK_DAYS = 90
+MINUTES_PER_DAY = 1_440
+ABSORPTION_BASELINE_SCHEMA = "absorption-kline-baselines-v1"
 FORWARD_HOURS = (1, 6, 24)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 KLINE_ARCHIVE = re.compile(
@@ -88,6 +90,21 @@ class WindowMetrics:
     range_pct: Decimal
     move_pct: Decimal
     quote_volume: Decimal
+
+
+@dataclass(frozen=True)
+class HistoricalKlineBaseline:
+    symbol: str
+    window_minutes: int
+    day_count: int
+    bar_count: int
+    first_open_ms: int
+    last_close_ms: int
+    historical_low: Decimal
+    historical_high: Decimal
+    close_q20: Decimal
+    window_range_samples_pct: Tuple[Decimal, ...]
+    window_quote_volume_samples: Tuple[Decimal, ...]
 
 
 @dataclass(frozen=True)
@@ -176,8 +193,21 @@ def _archive_name_parts(
 
 
 def _matching_archives(
-    root: Path, pattern: Any, tape_name: str
+    root: Path,
+    pattern: Any,
+    tape_name: str,
+    symbols: Optional[Sequence[str]] = None,
 ) -> List[Tuple[Path, str, str]]:
+    selected: Optional[set] = None
+    if symbols is not None:
+        selected = set()
+        for raw in symbols:
+            try:
+                selected.add(validate_symbol(raw, "requested symbol"))
+            except _SymbolValidationError as error:
+                raise AbsorptionError(str(error)) from None
+        if not selected:
+            raise AbsorptionError("requested symbol list is empty")
     matches: List[Tuple[Path, str, str]] = []
     skipped = 0
     for path in sorted(root.rglob("*.zip")):
@@ -188,6 +218,8 @@ def _matching_archives(
             skipped += 1
             continue
         symbol, day = parts
+        if selected is not None and symbol not in selected:
+            continue
         matches.append((path, symbol, day))
     if skipped:
         print(
@@ -196,6 +228,13 @@ def _matching_archives(
             "reason=invalid_symbol_filename"
         )
     return matches
+
+
+def _spot_tape_root(root: Path) -> Path:
+    candidate = root / "spot"
+    if (candidate / "daily").is_dir():
+        return candidate
+    return root
 
 
 def _archive_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]:
@@ -358,11 +397,21 @@ def _agg_trade_rows(path: Path, symbol: str) -> Iterable[AggTrade]:
         raise AbsorptionError(f"{path.name}:{expected} has no aggTrades rows")
 
 
-def load_klines(data_dir: Path = DEFAULT_DATA_DIR) -> Dict[str, Tuple[KlineBar, ...]]:
+def load_klines(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    spot_only: bool = False,
+) -> Dict[str, Tuple[KlineBar, ...]]:
     root = Path(data_dir)
     if not root.is_dir():
         raise AbsorptionError(f"data directory does not exist: {root}")
-    archives = _matching_archives(root, KLINE_ARCHIVE, "klines")
+    archives = _matching_archives(
+        _spot_tape_root(root) if spot_only else root,
+        KLINE_ARCHIVE,
+        "klines",
+        symbols,
+    )
     if not archives:
         raise AbsorptionError(f"data directory has no daily 1m kline zips: {root}")
     indexed: Dict[str, Dict[int, KlineBar]] = {}
@@ -383,14 +432,23 @@ def load_klines(data_dir: Path = DEFAULT_DATA_DIR) -> Dict[str, Tuple[KlineBar, 
 
 def load_agg_trades(
     data_dir: Path = DEFAULT_DATA_DIR,
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    allow_empty: bool = False,
+    spot_only: bool = False,
 ) -> Dict[str, Tuple[AggTrade, ...]]:
     root = Path(data_dir)
     if not root.is_dir():
         raise AbsorptionError(f"data directory does not exist: {root}")
     archives = _matching_archives(
-        root, AGG_TRADES_ARCHIVE, "aggTrades"
+        _spot_tape_root(root) if spot_only else root,
+        AGG_TRADES_ARCHIVE,
+        "aggTrades",
+        symbols,
     )
     if not archives:
+        if allow_empty:
+            return {}
         raise AbsorptionError(
             f"data directory has no daily aggTrades zips: {root}"
         )
@@ -413,6 +471,185 @@ def load_agg_trades(
         )
         for symbol, by_id in sorted(indexed.items())
     }
+
+
+def _decimal_samples(raw: Any, source: str) -> Tuple[Decimal, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise AbsorptionError(f"{source} is not a non-empty list")
+    values = tuple(
+        _decimal(value, f"{source}[{index}]", positive=False)
+        for index, value in enumerate(raw)
+    )
+    if values != tuple(sorted(values)):
+        raise AbsorptionError(f"{source} is not ordered")
+    return values
+
+
+def load_historical_baselines(
+    path: Path,
+    *,
+    expected_window_minutes: int,
+) -> Dict[str, HistoricalKlineBaseline]:
+    """Load and fully validate one compact historical kline baseline file."""
+    source_path = Path(path)
+    try:
+        with open(source_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AbsorptionError(
+            f"cannot read baseline file {source_path}: {error}"
+        ) from None
+    if not isinstance(payload, Mapping):
+        raise AbsorptionError("baseline file root is not an object")
+    if payload.get("schema") != ABSORPTION_BASELINE_SCHEMA:
+        raise AbsorptionError("baseline file schema is not supported")
+    file_window = _integer(
+        payload.get("window_minutes"),
+        "baseline window_minutes",
+        non_negative=True,
+    )
+    if file_window != expected_window_minutes:
+        raise AbsorptionError(
+            "baseline window does not match the requested scoring window"
+        )
+    minimum_days = _integer(
+        payload.get("minimum_days"),
+        "baseline minimum_days",
+        non_negative=True,
+    )
+    if not 1 <= minimum_days <= MAX_LOOKBACK_DAYS:
+        raise AbsorptionError("baseline minimum_days is invalid")
+    raw_symbols = payload.get("symbols")
+    if not isinstance(raw_symbols, Mapping) or not raw_symbols:
+        raise AbsorptionError("baseline file has no ready symbols")
+
+    loaded: Dict[str, HistoricalKlineBaseline] = {}
+    for raw_symbol, raw_profile in sorted(raw_symbols.items()):
+        if not isinstance(raw_symbol, str):
+            raise AbsorptionError("baseline symbol key is not text")
+        try:
+            symbol = validate_symbol(raw_symbol, "baseline symbol")
+        except _SymbolValidationError as error:
+            raise AbsorptionError(str(error)) from None
+        if symbol != raw_symbol:
+            raise AbsorptionError("baseline symbol key is not canonical")
+        if not isinstance(raw_profile, Mapping):
+            raise AbsorptionError(f"{symbol} baseline is not an object")
+        if raw_profile.get("status") != "READY":
+            raise AbsorptionError(f"{symbol} baseline is not READY")
+        day_count = _integer(
+            raw_profile.get("day_count"),
+            f"{symbol} day_count",
+            non_negative=True,
+        )
+        bar_count = _integer(
+            raw_profile.get("bar_count"),
+            f"{symbol} bar_count",
+            non_negative=True,
+        )
+        sample_count = _integer(
+            raw_profile.get("window_sample_count"),
+            f"{symbol} window_sample_count",
+            non_negative=True,
+        )
+        if (
+            day_count < minimum_days
+            or bar_count != day_count * MINUTES_PER_DAY
+        ):
+            raise AbsorptionError(f"{symbol} baseline day coverage is invalid")
+        raw_days = raw_profile.get("days_used")
+        if not isinstance(raw_days, list) or len(raw_days) != day_count:
+            raise AbsorptionError(f"{symbol} days_used does not match")
+        parsed_days: List[str] = []
+        for raw_day in raw_days:
+            if not isinstance(raw_day, str):
+                raise AbsorptionError(f"{symbol} days_used is invalid")
+            try:
+                parsed_day = date.fromisoformat(raw_day)
+            except ValueError:
+                raise AbsorptionError(
+                    f"{symbol} days_used is invalid"
+                ) from None
+            if parsed_day.isoformat() != raw_day:
+                raise AbsorptionError(f"{symbol} days_used is invalid")
+            parsed_days.append(raw_day)
+        if parsed_days != sorted(set(parsed_days)):
+            raise AbsorptionError(f"{symbol} days_used is not ordered")
+        expected_samples = day_count * (
+            MINUTES_PER_DAY // expected_window_minutes
+        )
+        if sample_count != expected_samples or sample_count <= 0:
+            raise AbsorptionError(
+                f"{symbol} baseline window coverage is invalid"
+            )
+        ranges = _decimal_samples(
+            raw_profile.get("window_range_samples_pct"),
+            f"{symbol} window_range_samples_pct",
+        )
+        volumes = _decimal_samples(
+            raw_profile.get("window_quote_volume_samples"),
+            f"{symbol} window_quote_volume_samples",
+        )
+        if len(ranges) != sample_count or len(volumes) != sample_count:
+            raise AbsorptionError(
+                f"{symbol} baseline sample count does not match"
+            )
+        historical_low = _decimal(
+            raw_profile.get("historical_low"),
+            f"{symbol} historical_low",
+            positive=True,
+        )
+        historical_high = _decimal(
+            raw_profile.get("historical_high"),
+            f"{symbol} historical_high",
+            positive=True,
+        )
+        close_q20 = _decimal(
+            raw_profile.get("close_q20"),
+            f"{symbol} close_q20",
+            positive=True,
+        )
+        if (
+            historical_high < historical_low
+            or close_q20 < historical_low
+            or close_q20 > historical_high
+        ):
+            raise AbsorptionError(
+                f"{symbol} baseline price bounds are inconsistent"
+            )
+        first_open_ms = _timestamp_ms(
+            raw_profile.get("first_open_ms"),
+            f"{symbol} first_open_ms",
+        )
+        last_close_ms = _timestamp_ms(
+            raw_profile.get("last_close_ms"),
+            f"{symbol} last_close_ms",
+        )
+        if last_close_ms <= first_open_ms:
+            raise AbsorptionError(
+                f"{symbol} baseline time bounds are inconsistent"
+            )
+        loaded[symbol] = HistoricalKlineBaseline(
+            symbol=symbol,
+            window_minutes=file_window,
+            day_count=day_count,
+            bar_count=bar_count,
+            first_open_ms=first_open_ms,
+            last_close_ms=last_close_ms,
+            historical_low=historical_low,
+            historical_high=historical_high,
+            close_q20=close_q20,
+            window_range_samples_pct=ranges,
+            window_quote_volume_samples=volumes,
+        )
+    declared = _integer(
+        payload.get("symbol_count"),
+        "baseline symbol_count",
+        non_negative=True,
+    )
+    if declared != len(loaded):
+        raise AbsorptionError("baseline symbol_count does not match")
+    return loaded
 
 
 def quantile(
@@ -560,41 +797,85 @@ def score_absorption_window(
     window_trades: Sequence[AggTrade],
     *,
     forward_outcomes: Optional[Mapping[str, Mapping[str, Optional[str]]]] = None,
+    historical_baseline: Optional[HistoricalKlineBaseline] = None,
 ) -> Dict[str, Any]:
-    """Score one proved symbol/window against only its preceding baseline."""
+    """Score one proved symbol/window against measured historical evidence."""
     baseline_bars = tuple(baseline_bars)
     window_bars = tuple(window_bars)
     baseline_trades = tuple(baseline_trades)
     window_trades = tuple(window_trades)
-    if not baseline_bars or not window_bars:
-        raise AbsorptionError("baseline and scoring windows must contain bars")
-    if len(baseline_bars) < len(window_bars):
-        raise AbsorptionError("baseline is shorter than the scoring window")
-    all_bars = baseline_bars + window_bars
+    if not window_bars:
+        raise AbsorptionError("scoring window must contain bars")
+    if historical_baseline is None:
+        if not baseline_bars:
+            raise AbsorptionError("baseline and scoring windows must contain bars")
+        if len(baseline_bars) < len(window_bars):
+            raise AbsorptionError("baseline is shorter than the scoring window")
+        all_bars = baseline_bars + window_bars
+        if not _contiguous(all_bars):
+            raise AbsorptionError(
+                "baseline and scoring bars are not contiguous"
+            )
+    else:
+        if baseline_bars:
+            raise AbsorptionError(
+                "raw and historical kline baselines cannot be combined"
+            )
+        if historical_baseline.symbol != symbol:
+            raise AbsorptionError("historical baseline contains another symbol")
+        if historical_baseline.window_minutes != len(window_bars):
+            raise AbsorptionError(
+                "historical baseline window does not match scoring bars"
+            )
+        all_bars = window_bars
+        if not _contiguous(all_bars):
+            raise AbsorptionError("scoring bars are not contiguous")
     if any(bar.symbol != symbol for bar in all_bars):
         raise AbsorptionError("kline window contains another symbol")
     if any(trade.symbol != symbol for trade in baseline_trades + window_trades):
         raise AbsorptionError("aggTrades window contains another symbol")
-    if not _contiguous(all_bars):
-        raise AbsorptionError("baseline and scoring bars are not contiguous")
-
-    historical_windows = _bar_windows(baseline_bars, len(window_bars))
-    if not historical_windows:
-        raise AbsorptionError("baseline has no comparable kline window")
-    historical_metrics = tuple(_window_metrics(bars) for bars in historical_windows)
     current = _window_metrics(window_bars)
-    historical_ranges = [metrics.range_pct for metrics in historical_metrics]
-    historical_volumes = [metrics.quote_volume for metrics in historical_metrics]
+    if historical_baseline is None:
+        historical_windows = _bar_windows(baseline_bars, len(window_bars))
+        if not historical_windows:
+            raise AbsorptionError("baseline has no comparable kline window")
+        historical_metrics = tuple(
+            _window_metrics(bars) for bars in historical_windows
+        )
+        historical_ranges = [
+            metrics.range_pct for metrics in historical_metrics
+        ]
+        historical_volumes = [
+            metrics.quote_volume for metrics in historical_metrics
+        ]
+        close_q20 = quantile([bar.close for bar in baseline_bars], 1, 5)
+        historical_low = min(bar.low for bar in baseline_bars)
+        historical_high = max(bar.high for bar in baseline_bars)
+        baseline_minutes = len(baseline_bars)
+        baseline_days: Optional[int] = None
+        baseline_source = "preceding_tape"
+        baseline_last_utc = utc_text(baseline_bars[-1].close_ms)
+    else:
+        historical_windows = ()
+        historical_ranges = list(
+            historical_baseline.window_range_samples_pct
+        )
+        historical_volumes = list(
+            historical_baseline.window_quote_volume_samples
+        )
+        close_q20 = historical_baseline.close_q20
+        historical_low = historical_baseline.historical_low
+        historical_high = historical_baseline.historical_high
+        baseline_minutes = historical_baseline.bar_count
+        baseline_days = historical_baseline.day_count
+        baseline_source = "historical_file"
+        baseline_last_utc = utc_text(historical_baseline.last_close_ms)
     positive_volumes = [value for value in historical_volumes if value > 0]
     range_q20 = quantile(historical_ranges, 1, 5)
     range_median = quantile(historical_ranges, 1, 2)
     range_q90 = quantile(historical_ranges, 9, 10)
     volume_floor = quantile(positive_volumes, 1, 5)
     volume_q90 = quantile(positive_volumes, 9, 10)
-    close_q20 = quantile([bar.close for bar in baseline_bars], 1, 5)
-
-    historical_low = min(bar.low for bar in baseline_bars)
-    historical_high = max(bar.high for bar in baseline_bars)
     if historical_high == historical_low:
         low_position = (
             Decimal("0")
@@ -781,7 +1062,10 @@ def score_absorption_window(
         "window_minutes": len(window_bars),
         "window_start_utc": utc_text(window_bars[0].open_ms),
         "window_end_utc": utc_text(window_bars[-1].close_ms),
-        "baseline_minutes": len(baseline_bars),
+        "baseline_source": baseline_source,
+        "baseline_minutes": baseline_minutes,
+        "baseline_days": baseline_days,
+        "baseline_last_utc": baseline_last_utc,
         "absorption_score": decimal_text(score),
         "score_components": {
             name: _optional_text(value) for name, value in components.items()
@@ -849,6 +1133,9 @@ def absorption_rows(
     window_minutes: int = DEFAULT_WINDOW_MINUTES,
     lookback_minutes: int = DEFAULT_LOOKBACK_DAYS * 1_440,
     step_minutes: int = DEFAULT_STEP_MINUTES,
+    historical_baselines: Optional[
+        Mapping[str, HistoricalKlineBaseline]
+    ] = None,
 ) -> Tuple[Dict[str, Any], ...]:
     """Build deterministic rows for every proved symbol/window pair."""
     for value, name, maximum in (
@@ -866,14 +1153,19 @@ def absorption_rows(
         raise AbsorptionError(
             f"lookback must be between window and {MAX_LOOKBACK_DAYS} days"
         )
-    symbols = sorted(set(klines) & set(agg_trades))
+    if historical_baselines is None:
+        symbols = sorted(set(klines) & set(agg_trades))
+    else:
+        symbols = sorted(set(klines) & set(historical_baselines))
     if not symbols:
-        raise AbsorptionError("kline and aggTrades tapes share no symbol")
+        if historical_baselines is None:
+            raise AbsorptionError("kline and aggTrades tapes share no symbol")
+        raise AbsorptionError("tape and baseline share no ready symbol")
 
     rows: List[Dict[str, Any]] = []
     for symbol in symbols:
         bars = tuple(klines[symbol])
-        trades = tuple(agg_trades[symbol])
+        trades = tuple(agg_trades.get(symbol, ()))
         if any(bar.symbol != symbol for bar in bars):
             raise AbsorptionError(f"{symbol} kline map contains another symbol")
         if any(trade.symbol != symbol for trade in trades):
@@ -893,16 +1185,27 @@ def absorption_rows(
             trades,
             tuple(trade.timestamp_ms for trade in trades),
         )
-        first_start = lookback_minutes
+        profile = (
+            None
+            if historical_baselines is None
+            else historical_baselines[symbol]
+        )
+        first_start = 0 if profile is not None else lookback_minutes
         last_start = len(bars) - window_minutes
         for start in range(first_start, last_start + 1, step_minutes):
-            baseline = bars[start - lookback_minutes : start]
             window = bars[start : start + window_minutes]
-            if not _contiguous(baseline + window):
-                continue
-            baseline_window_trades = trade_index.between(
-                baseline[0].open_ms, baseline[-1].close_ms
-            )
+            if profile is None:
+                baseline = bars[start - lookback_minutes : start]
+                if not _contiguous(baseline + window):
+                    continue
+                baseline_window_trades = trade_index.between(
+                    baseline[0].open_ms, baseline[-1].close_ms
+                )
+            else:
+                baseline = ()
+                if not _contiguous(window):
+                    continue
+                baseline_window_trades = ()
             current_window_trades = trade_index.between(
                 window[0].open_ms, window[-1].close_ms
             )
@@ -914,6 +1217,7 @@ def absorption_rows(
                 baseline_window_trades,
                 current_window_trades,
                 forward_outcomes=_forward_outcomes(bars, end_index),
+                historical_baseline=profile,
             )
             rows.append(row)
     if not rows:
@@ -966,15 +1270,39 @@ def run_absorption(
     window_minutes: int = DEFAULT_WINDOW_MINUTES,
     lookback_minutes: int = DEFAULT_LOOKBACK_DAYS * 1_440,
     step_minutes: int = DEFAULT_STEP_MINUTES,
+    baseline_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], ...]:
-    klines = load_klines(Path(data_dir))
-    trades = load_agg_trades(Path(data_dir))
+    historical_baselines = (
+        None
+        if baseline_path is None
+        else load_historical_baselines(
+            baseline_path,
+            expected_window_minutes=window_minutes,
+        )
+    )
+    selected_symbols = (
+        None
+        if historical_baselines is None
+        else tuple(historical_baselines)
+    )
+    klines = load_klines(
+        Path(data_dir),
+        selected_symbols,
+        spot_only=historical_baselines is not None,
+    )
+    trades = load_agg_trades(
+        Path(data_dir),
+        selected_symbols,
+        allow_empty=historical_baselines is not None,
+        spot_only=historical_baselines is not None,
+    )
     rows = absorption_rows(
         klines,
         trades,
         window_minutes=window_minutes,
         lookback_minutes=lookback_minutes,
         step_minutes=step_minutes,
+        historical_baselines=historical_baselines,
     )
     _write_jsonl(output_path or default_output_path(), rows)
     return rows
@@ -1007,6 +1335,11 @@ def argument_parser() -> argparse.ArgumentParser:
         description="Score pre-ignition absorption from kline and aggTrades zips."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="historical kline baseline built by study.baselines",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--date", type=_run_date)
     parser.add_argument(
@@ -1029,7 +1362,7 @@ def argument_parser() -> argparse.ArgumentParser:
             raw, "lookback-days", MAX_LOOKBACK_DAYS
         ),
         default=DEFAULT_LOOKBACK_DAYS,
-        help="preceding per-token baseline days (default: 21)",
+        help="preceding tape days when --baseline is absent (default: 21)",
     )
     return parser
 
@@ -1045,6 +1378,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             window_minutes=args.window,
             lookback_minutes=args.lookback_days * 1_440,
             step_minutes=args.step,
+            baseline_path=args.baseline,
         )
     except AbsorptionError as error:
         print(f"absorption: {error}", file=sys.stderr)
@@ -1061,7 +1395,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         "ABSORPTION | "
         f"windows={len(rows)} | symbols={len({row['symbol'] for row in rows})} | "
-        f"top={top['symbol']}:{top['absorption_score']} | output={output_path}"
+        f"baseline={top['baseline_source']} | "
+        f"top={top['symbol']}:{top['absorption_score']} | "
+        f"output={output_path}"
     )
     return 0
 

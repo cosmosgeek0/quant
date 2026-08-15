@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Offline fixture tests for adaptive per-token tape baselines."""
 
+import io
 import json
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 
@@ -52,6 +54,22 @@ def write_tape(root):
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
         zipped.writestr(
             f"{SYMBOL}-1m-2026-01-01.csv", "\n".join(rows) + "\n"
+        )
+    return data_dir
+
+
+def write_complete_tape(root):
+    data_dir = root / "complete-data"
+    archive_dir = data_dir / "spot" / "daily" / "klines" / SYMBOL / "1m"
+    archive_dir.mkdir(parents=True)
+    rows = [
+        ",".join(kline(index, str((index // 60) + 1)))
+        for index in range(1_440)
+    ]
+    archive = archive_dir / f"{SYMBOL}-1m-{DAY}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+        zipped.writestr(
+            f"{SYMBOL}-1m-{DAY}.csv", "\n".join(rows) + "\n"
         )
     return data_dir
 
@@ -133,6 +151,86 @@ class AdaptiveBaselineTests(unittest.TestCase):
             first_path.read_bytes(), second_path.read_bytes()
         )
         self.assertEqual(first["source"]["data_dir"], "../data")
+
+    def test_absorption_build_uses_exact_complete_kline_windows(self):
+        data_dir = write_complete_tape(self.root)
+        output = self.output_dir / "absorption-baseline.json"
+        payload = baselines.run_absorption_baselines(
+            data_dir,
+            output,
+            symbols=[SYMBOL],
+            window_minutes=60,
+            minimum_days=1,
+        )
+        disk = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload, disk)
+        self.assertEqual(
+            payload["schema"], "absorption-kline-baselines-v1"
+        )
+        profile = payload["symbols"][SYMBOL]
+        self.assertEqual(profile["day_count"], 1)
+        self.assertEqual(profile["bar_count"], 1_440)
+        self.assertEqual(profile["window_sample_count"], 24)
+        self.assertEqual(profile["window_quote_volume_samples"][0], "60")
+        self.assertEqual(profile["window_quote_volume_samples"][-1], "1440")
+        self.assertEqual(profile["historical_low"], "99.9")
+        self.assertEqual(profile["historical_high"], "100.1")
+        self.assertEqual(profile["close_q20"], "100")
+        assert_no_float(self, disk)
+
+    def test_absorption_cli_reports_ready_and_not_ready_symbols(self):
+        data_dir = write_complete_tape(self.root)
+        output = self.output_dir / "coverage.json"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = baselines.main(
+                [
+                    "--absorption",
+                    "--data-dir",
+                    str(data_dir),
+                    "--output",
+                    str(output),
+                    "--symbols",
+                    SYMBOL,
+                    "MISSINGUSDT",
+                    "--min-days",
+                    "1",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            f"symbol={SYMBOL} | status=READY | days_used=1",
+            stdout.getvalue(),
+        )
+        self.assertIn(
+            "symbol=MISSINGUSDT | status=NOT-READY | days_found=0 | "
+            "reason=no_kline_archives",
+            stdout.getvalue(),
+        )
+
+    def test_absorption_build_does_not_fill_a_partial_day(self):
+        output = self.output_dir / "not-ready.json"
+        payload = baselines.run_absorption_baselines(
+            self.data_dir,
+            output,
+            symbols=[SYMBOL],
+            window_minutes=60,
+            minimum_days=1,
+        )
+
+        self.assertEqual(payload["symbol_count"], 0)
+        self.assertEqual(payload["not_ready_count"], 1)
+        self.assertEqual(
+            payload["not_ready"][SYMBOL],
+            {
+                "status": "NOT-READY",
+                "days_found": 0,
+                "reason": "insufficient_complete_days",
+                "required_days": 1,
+            },
+        )
 
 
 if __name__ == "__main__":

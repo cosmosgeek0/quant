@@ -13,6 +13,7 @@ from unittest import mock
 
 
 from study import absorption
+from study import baselines
 from study import tape_pull
 
 
@@ -164,6 +165,24 @@ def write_tape(root, bars, trades):
             + "\n",
         )
     return kline_path, trade_path
+
+
+def write_complete_absorption_tape(root):
+    bars = tuple(
+        bar(
+            index,
+            "100",
+            spread="0.1",
+            volume=str((index // 60) + 1),
+        )
+        for index in range(1_440)
+    )
+    trades = (
+        trade(1, 0, "10", buyer_is_maker=False),
+        trade(2, 59, "5", buyer_is_maker=True),
+    )
+    write_tape(root, bars, trades)
+    return bars, trades
 
 
 class AbsorptionTests(unittest.TestCase):
@@ -342,6 +361,54 @@ class AbsorptionTests(unittest.TestCase):
             first["forward_outcomes"]["24h"]["close_return_pct"], "24"
         )
         no_float(self, disk)
+
+    def test_built_baseline_allows_a_short_tape_to_be_evaluated(self):
+        write_complete_absorption_tape(self.root)
+        baseline_path = self.root / "out" / "historical-baseline.json"
+        baselines.run_absorption_baselines(
+            self.root,
+            baseline_path,
+            symbols=[SYMBOL],
+            window_minutes=60,
+            minimum_days=1,
+        )
+        output = self.root / "out" / "absorption-built.jsonl"
+
+        rows = absorption.run_absorption(
+            self.root,
+            output,
+            window_minutes=60,
+            step_minutes=1_440,
+            baseline_path=baseline_path,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], SYMBOL)
+        self.assertEqual(rows[0]["baseline_source"], "historical_file")
+        self.assertEqual(rows[0]["baseline_days"], 1)
+        self.assertEqual(rows[0]["baseline_minutes"], 1_440)
+        self.assertIsNotNone(
+            rows[0]["features"]["baseline_window_volume_floor"]
+        )
+        self.assertIn("trade_size_shift", rows[0]["unknown_features"])
+        self.assertTrue(output.is_file())
+        no_float(self, rows)
+
+    def test_short_tape_still_refuses_without_a_built_baseline(self):
+        write_complete_absorption_tape(self.root)
+        output = self.root / "out" / "absorption-refusal.jsonl"
+
+        with self.assertRaisesRegex(
+            absorption.AbsorptionError,
+            "tape has no proved absorption scoring windows",
+        ):
+            absorption.run_absorption(
+                self.root,
+                output,
+                window_minutes=60,
+                step_minutes=1_440,
+            )
+        self.assertFalse(output.exists())
 
     def test_agg_trades_pull_path_and_existing_zip_are_idempotent(self):
         day = "2026-01-01"
