@@ -618,7 +618,7 @@
     var sv0 = d0.supervisor || {};
     var machineVal = d0.machine || "—";
     tiles.appendChild(tile("Machine", machineVal,
-      machineVal === "ARMED" ? "ok" : (machineVal === "—" ? "" : "warn"),
+      machineVal === "ARMED" || machineVal === "—" ? "" : "warn",
       "STOP flags mirrored · authoritative"));
     tiles.appendChild(tile("Server RTT",
       lastStrip ? (lastRtt == null ? "answering" : lastRtt + " ms")
@@ -920,14 +920,8 @@
     sub.className = "page-sub";
     sub.textContent =
       "Website · machine mirror · public sources · owner-gated boundaries.";
-    var note = document.createElement("div");
-    note.className = "conn-note";
-    note.textContent =
-      "Web server and News loop toggles act now (client side). " +
-      "Host-side toggles stay visual until the control endpoint lands.";
     page.appendChild(headRow);
     page.appendChild(sub);
-    page.appendChild(note);
     page.appendChild(buildConnTiles());
 
     /* the ONE chart — real file history, UTC axis, threshold bands */
@@ -1024,6 +1018,12 @@
     var tableEl = document.createElement("div");
     tableEl.className = "qnet-table-host";
     page.appendChild(tableEl);
+    var tblNote = document.createElement("div");
+    tblNote.className = "qnet-note";
+    tblNote.textContent = "Host-side rows are read-only until the signed " +
+      "control endpoint lands · the Web server and News loop switches " +
+      "act client-side today.";
+    page.appendChild(tblNote);
     if (window.QNet && QNet.table) {
       netTable = QNet.table.build(tableEl, buildTableModel());
       netTableHasCadence = !!(lastStrip && lastStrip.pull &&
@@ -1066,7 +1066,7 @@
         var mb = mchipEl.querySelector("b");
         var mv = (lastStrip && lastStrip.machine) || "—";
         mb.textContent = mv;
-        mb.className = mv === "ARMED" ? "ok" : (mv === "—" ? "" : "warn");
+        mb.className = mv === "ARMED" || mv === "—" ? "" : "warn";
       }
       var stamp = document.querySelector(".conn-assessed");
       if (stamp && lastStripAt) {

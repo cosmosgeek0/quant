@@ -225,7 +225,7 @@
     line-height: 24px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .conn-tile b.ok { color: #16a34a; }
+  /* nominal tile values stay ink (DESIGN.md §2) — only deviation colors */
   .conn-tile b.warn { color: #d4a406; }
   .conn-tile b.bad { color: #cc2f3c; }
   .conn-tile small {
@@ -241,8 +241,7 @@
     font-variant-numeric: tabular-nums;
     color: var(--muted);
   }
-  .machine-chip b { font-family: var(--mono); font-weight: 400; font-size: 12.5px; }
-  .machine-chip b.ok { color: #16a34a; }
+  .machine-chip b { font-family: var(--mono); font-weight: 400; font-size: 12.5px; color: var(--ink); }
   .machine-chip b.warn { color: #d4a406; }
   .machine-chip b.bad { color: #cc2f3c; }
   .conn-assessed { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -258,14 +257,19 @@
   .conn-overall {
     display: inline-flex; align-items: center; gap: 7px;
     margin-left: auto;
-    font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em;
+    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+    text-transform: uppercase;
     color: var(--muted);
   }
-  .conn-overall .livedot { width: 8px; height: 8px; }
+  /* the page lamp: quiet dot, no pulse — deviation classes stay loud */
+  .conn-overall .livedot {
+    width: 8px; height: 8px;
+    background: #57b47a;
+    animation: none;
+  }
   .conn-head-row { display: flex; align-items: center; gap: 14px; }
   .conn-title { font-size: 16px; font-weight: 600; color: var(--ink); }
   .conn-sub { margin-top: 4px; font-size: 13px; color: var(--muted); }
-  .conn-note { margin-top: 2px; font-size: 12.5px; color: var(--faint); }
   /* News v4 — decongested top, two-column body: list left, dedicated
      Sources box + Activity box on the right (owner-sanctioned boxes:
      functional containers, 1px line, small radius). */
