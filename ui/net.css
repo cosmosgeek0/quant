@@ -128,7 +128,7 @@ html[data-theme="dark"] {
 }
 .st-card-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 14px 16px 12px;
+  padding: 14px 16px 12px 19px;
 }
 .st-card-head .st-spacer { flex: 1; }
 
@@ -224,7 +224,12 @@ html[data-theme="dark"] {
 /* ---- section line + panel grid (4 left, 4 right) + bottom split ---- */
 .st-sec-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 22px 2px 2px;
+  padding: 24px 2px 2px 19px;
+}
+.st-sec-head .st-t-h,
+.st-card-head .st-t-h {
+  font-size: 13px; font-weight: 600; letter-spacing: 0;
+  line-height: 18px;
 }
 .st-sec-head .st-spacer { flex: 1; }
 .st-grid {
@@ -360,6 +365,15 @@ html[data-theme="dark"] .st-btn-dark { color: #101418; }
 .st-foot-center { display: flex; justify-content: center; padding: 20px 0 0; }
 
 /* ---- controls card ---- */
+.st-iconbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border: 1px solid var(--st-line); background: none;
+  border-radius: 6px; cursor: pointer; color: var(--st-mid);
+  padding: 0;
+}
+.st-iconbtn:hover { color: var(--st-ink); }
+
 .st-ctl-btn {
   border: 1px solid var(--st-line); background: var(--st-card);
   border-radius: 6px; padding: 4px 10px; cursor: pointer;
@@ -391,6 +405,11 @@ html[data-theme="dark"] .st-btn-dark { color: #101418; }
 
 /* ---- global network master: red means stopped ---- */
 .st-master { display: inline-flex; align-items: center; gap: 10px; }
+.st-page.paused > :not(.st-head) {
+  opacity: 0.45;
+  filter: grayscale(0.9);
+  transition: opacity 200ms ease;
+}
 .st-master.stopped .st-t-mid { color: var(--st-bad-text); }
 .st-master.stopped .switch { background: var(--st-bar-bad) !important; }
 
