@@ -144,6 +144,18 @@ ACK RULE (owner order 2026-08-14, extends RAIL RULE): every rail nudge
 ends with "ACK by rail when read." No ACK within ~10 minutes → the sender
 escalates to the owner instead of assuming delivery. Orders never travel
 by rail — only pointers to disk.
+SILENCE IS AN ALARM (owner order 2026-08-15, paid for with 17 blind hours):
+an event-watch cannot hear silence — no-news IS an event. Three layers,
+all mandatory while the machine is armed: (1) HOST-SIDE PULSE — a host
+cron watchdog (quant-run/aliveness.sh, */2) writes a heartbeat row to
+health.jsonl and raises ALARM-brain-stale when decisions or feed stop
+>15 min; the Mac is a viewer, never the machine's pulse. (2) STALENESS
+WAKES — the Lead's watch wakes on missing fresh decision rows (>10 min),
+diagnoses, and tells the owner in words. (3) MAC-SIDE HONESTY — every
+session boot states loop liveness and mirror age out loud; a dead loop is
+reported in words, never left to a red chip nobody reads. Any defect in
+the decision-writing path is money-critical even when fail-closed:
+safe-but-blind still spends the owner's time.
 
 ## Session operations (handoff nuance — things the record didn't say)
 - SEATS as of 2026-08-14 (owner promotion, late): "fresh lane" IS the
