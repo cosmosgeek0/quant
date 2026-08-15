@@ -240,6 +240,14 @@ def _symbol(raw: Any, source: str) -> str:
     return symbol
 
 
+# Shared symbol validator for every study stage: accepts anything the
+# exchange itself can list (printable UTF-8, filename-safe, byte-capped),
+# refuses control/whitespace/traversal strings. Stages must use this and
+# never keep a private ASCII-only pattern — that pattern silently hid or
+# crashed on real non-ASCII listings.
+validate_symbol = _symbol
+
+
 def parse_event(row: Mapping[str, Any], line_number: int) -> Event:
     """Validate and normalize one input mapping."""
     source = f"events.jsonl line {line_number}"

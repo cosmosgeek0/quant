@@ -42,7 +42,10 @@ MAX_WORKERS = 4
 HTTP_TIMEOUT_SECONDS = 30.0
 MAX_429_RETRIES = 4
 MAX_METADATA_BYTES = 24_000_000
-MAX_ARCHIVE_BYTES = 128_000_000
+# Archive responses stream to disk with per-chunk byte accounting, so a
+# monster-volume day (AKEUSDT 2026-08-14 measured 128,057,344 bytes) may
+# safely exceed the old 128 MB bound; refusal above the ceiling stays.
+MAX_ARCHIVE_BYTES = 1_073_741_824
 # ZIP members are verified by byte-accounted streaming, so high-volume daily
 # aggTrades CSVs may safely reach 1 GiB without being held in memory.
 MAX_MEMBER_BYTES = 1_073_741_824
