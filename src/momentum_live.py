@@ -1712,7 +1712,15 @@ def _positive_seconds(raw: str) -> timedelta:
 def build_parser() -> argparse.ArgumentParser:
     parser = lifecycle.build_parser()
     parser.description = "route momentum OPEN/HOLD/EXIT decisions to runner jobs"
-    parser.set_defaults(initial_notional=DEFAULT_INITIAL_NOTIONAL)
+    parser.set_defaults(
+        ignition_threshold=default_lifecycle_config().ignition_surge_ratio,
+        initial_notional=DEFAULT_INITIAL_NOTIONAL,
+    )
+    parser.add_argument(
+        "--ignition-surge",
+        dest="ignition_threshold",
+        type=lifecycle._decimal_argument,
+    )
     parser.add_argument("--decisions", type=Path, default=DEFAULT_DECISIONS_PATH)
     parser.add_argument("--jobs-dir", type=Path, default=None)
     parser.add_argument("--position", type=Path, default=None)

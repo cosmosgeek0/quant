@@ -71,14 +71,15 @@ class AccountGovernorTests(unittest.TestCase):
 
     def test_entry_count_limit_rolls_on_the_next_utc_day(self):
         with mock.patch.object(governor, "_utc_now", return_value=DAY):
-            for index in range(5):
+            for index in range(governor.DEFAULT_MAX_ENTRIES_PER_UTC_DAY):
                 token = governor.acquire_entry_slot(
                     f"ENTRY_{index}", "ETHUSDT", self.receipt_dir
                 )
                 governor.release_entry_slot(token, self.receipt_dir)
             allowed, reason = governor.budgets_allow(self.receipt_dir)
             self.assertFalse(allowed)
-            self.assertIn("5 of 5", reason)
+            cap = governor.DEFAULT_MAX_ENTRIES_PER_UTC_DAY
+            self.assertIn("%d of %d" % (cap, cap), reason)
             with self.assertRaises(governor.GovernorRefusal) as refused:
                 governor.acquire_entry_slot("ENTRY_6", "ETHUSDT",
                                             self.receipt_dir)
@@ -92,13 +93,16 @@ class AccountGovernorTests(unittest.TestCase):
                 "NEXT_DAY", "ETHUSDT", self.receipt_dir
             )
             governor.release_entry_slot(token, self.receipt_dir)
-        self.assertEqual(len(self.ledger_rows(DAY)), 5)
+        self.assertEqual(
+            len(self.ledger_rows(DAY)), governor.DEFAULT_MAX_ENTRIES_PER_UTC_DAY
+        )
         self.assertEqual(len(self.ledger_rows(tomorrow)), 1)
 
     def test_realized_loss_plus_fees_trips_and_stays_tripped_for_day(self):
         with mock.patch.object(governor, "_utc_now", return_value=DAY):
+            loss_cap = governor.DEFAULT_DAILY_LOSS_PLUS_FEES_USDT
             governor.record_realized(
-                Decimal("-0.60"), Decimal("0.20"), self.receipt_dir
+                -(loss_cap - Decimal("0.40")), Decimal("0.20"), self.receipt_dir
             )
             allowed, reason = governor.budgets_allow(self.receipt_dir)
             self.assertTrue(allowed, reason)
@@ -107,7 +111,9 @@ class AccountGovernorTests(unittest.TestCase):
             )
             allowed, reason = governor.budgets_allow(self.receipt_dir)
             self.assertFalse(allowed)
-            self.assertIn("1.00 USDT", reason)
+            self.assertIn(
+                "%s USDT" % governor.DEFAULT_DAILY_LOSS_PLUS_FEES_USDT, reason
+            )
             governor.record_realized(
                 Decimal("10"), Decimal("0"), self.receipt_dir
             )

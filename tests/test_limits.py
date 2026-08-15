@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Tests for the single money-cap authority."""
 
+import importlib.util
+import os
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
@@ -17,6 +20,15 @@ import limits  # noqa: E402
 
 
 NOW = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+LIMITS_PATH = SRC / "limits.py"
+ACCOUNT_GOVERNOR_PATH = SRC / "account_governor.py"
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def job(max_notional):
@@ -44,6 +56,63 @@ class LimitsTests(unittest.TestCase):
                 self.assertIs(type(actual), Decimal)
                 self.assertEqual(actual, value)
                 self.assertGreater(actual, Decimal("0"))
+
+    def test_knob_environment_overrides_are_honored(self):
+        environment = {
+            "QUANT_IGNITION_SURGE": "4.25",
+            "QUANT_MAX_ENTRIES_DAY": "17",
+            "QUANT_DAILY_LOSS_CAP": "6.50",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            configured = load_module("limits_overrides_test", LIMITS_PATH)
+
+        self.assertEqual(
+            configured.MOMENTUM_IGNITION_SURGE_RATIO, Decimal("4.25")
+        )
+        self.assertEqual(configured.MAX_ENTRIES_PER_UTC_DAY, 17)
+        self.assertEqual(
+            configured.DAILY_LOSS_PLUS_FEES_USDT, Decimal("6.50")
+        )
+
+    def test_invalid_knob_environment_falls_back_to_defaults(self):
+        environment = {
+            "QUANT_IGNITION_SURGE": "NaN",
+            "QUANT_MAX_ENTRIES_DAY": "0",
+            "QUANT_DAILY_LOSS_CAP": "garbage",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            configured = load_module("limits_garbage_test", LIMITS_PATH)
+
+        self.assertEqual(
+            configured.MOMENTUM_IGNITION_SURGE_RATIO, Decimal("3")
+        )
+        self.assertEqual(configured.MAX_ENTRIES_PER_UTC_DAY, 10)
+        self.assertEqual(
+            configured.DAILY_LOSS_PLUS_FEES_USDT, Decimal("2.00")
+        )
+
+    def test_governor_defaults_follow_limits_values(self):
+        environment = {
+            "QUANT_MAX_ENTRIES_DAY": "19",
+            "QUANT_DAILY_LOSS_CAP": "7.25",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            configured_limits = load_module(
+                "limits_governor_test", LIMITS_PATH
+            )
+            with mock.patch.dict(sys.modules, {"limits": configured_limits}):
+                configured_governor = load_module(
+                    "account_governor_limits_test", ACCOUNT_GOVERNOR_PATH
+                )
+
+        self.assertEqual(
+            configured_governor.DEFAULT_MAX_ENTRIES_PER_UTC_DAY,
+            configured_limits.MAX_ENTRIES_PER_UTC_DAY,
+        )
+        self.assertEqual(
+            configured_governor.DEFAULT_DAILY_LOSS_PLUS_FEES_USDT,
+            configured_limits.DAILY_LOSS_PLUS_FEES_USDT,
+        )
 
     def test_runner_clamps_first_trade_until_close_marker_exists(self):
         with tempfile.TemporaryDirectory() as receipt_dir:

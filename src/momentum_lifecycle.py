@@ -36,6 +36,11 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
+try:
+    from limits import MOMENTUM_IGNITION_SURGE_RATIO
+except ImportError:
+    MOMENTUM_IGNITION_SURGE_RATIO = Decimal("3")
+
 
 STATE_VERSION = 2
 DECISION_NOTE = "strategy decision only; runner owns every position mutation"
@@ -126,7 +131,7 @@ class LifecycleConfig:
     use the percent units supplied verbatim by the shared stream.
     """
 
-    ignition_surge_ratio: Decimal = Decimal("10")
+    ignition_surge_ratio: Decimal = MOMENTUM_IGNITION_SURGE_RATIO
     persistence_surge_ratio: Decimal = Decimal("8")
     persistence_passes: int = 2
     persistence_price_hold_pct: Decimal = Decimal("0")

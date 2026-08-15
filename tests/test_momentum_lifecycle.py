@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Offline tests for runner-backed momentum signal and HOLD lifecycle."""
 
+import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+from contextlib import redirect_stderr
 from decimal import Decimal
 from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import limits
 import momentum_lifecycle as ml
+import momentum_live as live
 
 
 FIXED_NOW = "2026-08-14T12:00:00.000Z"
@@ -72,7 +79,7 @@ def record(symbol, *args, **kwargs):
 
 def test_config(**overrides):
     values = dict(
-        ignition_surge_ratio=Decimal("10"),
+        ignition_surge_ratio=ml.MOMENTUM_IGNITION_SURGE_RATIO,
         persistence_surge_ratio=Decimal("8"),
         persistence_passes=2,
         initial_notional=Decimal("8"),
@@ -260,6 +267,100 @@ class MomentumLifecycleTests(unittest.TestCase):
         payload["mark"] = 100
         with self.assertRaises(ml.StreamDataError):
             ml.StreamRecord.from_payload("AAAUSDT", payload)
+
+    def test_ignition_default_flows_from_limits(self):
+        expected = getattr(
+            limits, "MOMENTUM_IGNITION_SURGE_RATIO", Decimal("3")
+        )
+        self.assertEqual(ml.LifecycleConfig().ignition_surge_ratio, expected)
+        self.assertEqual(
+            live.default_lifecycle_config().ignition_surge_ratio, expected
+        )
+
+    def test_live_cli_ignition_surge_override_wins(self):
+        parser = live.build_parser()
+        default_args = parser.parse_args(["--tick", str(self.root / "stream.json")])
+        self.assertEqual(
+            ml._config_from_args(default_args).ignition_surge_ratio,
+            live.default_lifecycle_config().ignition_surge_ratio,
+        )
+
+        override_args = parser.parse_args(
+            ["--tick", str(self.root / "stream.json"), "--ignition-surge", "5.5"]
+        )
+        self.assertEqual(
+            ml._config_from_args(override_args).ignition_surge_ratio,
+            Decimal("5.5"),
+        )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["--tick", str(self.root / "stream.json"), "--ignition-surge", "NaN"]
+            )
+
+    def test_env_ignition_value_reaches_live_tick_decision(self):
+        script = textwrap.dedent(
+            """
+            import json
+            import tempfile
+            from pathlib import Path
+
+            from tests.test_momentum_lifecycle import fixed_now, stream_payload
+            import limits
+            import momentum_live as live
+
+            provided = hasattr(limits, "MOMENTUM_IGNITION_SURGE_RATIO")
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stream = root / "stream.json"
+                common = {
+                    "state_path": root / "state.json",
+                    "receipt_path": root / "receipts.jsonl",
+                    "decisions_path": root / "decisions.jsonl",
+                    "jobs_dir": root / "jobs",
+                    "position_path": root / "position.json",
+                    "results_path": root / "results.jsonl",
+                    "now_fn": fixed_now,
+                    "decision_only": True,
+                }
+                stream.write_text(json.dumps({
+                    "AAAUSDT": stream_payload(0, "100", "2", "100", "1000")
+                }), encoding="utf-8")
+                live.run_tick(stream, **common)
+                stream.write_text(json.dumps({
+                    "AAAUSDT": stream_payload(1, "101", "5", "500", "1010")
+                }), encoding="utf-8")
+                result = live.run_tick(stream, **common)
+
+            print(json.dumps({
+                "action": result.decisions[0]["action"],
+                "provided": provided,
+                "reason": result.decisions[0]["reason"],
+                "threshold": str(
+                    live.default_lifecycle_config().ignition_surge_ratio
+                ),
+            }))
+            """
+        )
+        environment = dict(
+            os.environ,
+            PYTHONPYCACHEPREFIX="/private/tmp/basis-w3-env-test-pycache",
+            QUANT_IGNITION_SURGE="4",
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["threshold"], "4" if result["provided"] else "3")
+        self.assertEqual(result["action"], ml.ACTION_WATCH)
+        self.assertEqual(
+            result["reason"], "ignition edge observed; persistence started"
+        )
 
 
 if __name__ == "__main__":

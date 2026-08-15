@@ -19,14 +19,21 @@ from typing import Any, Dict, Iterable, Tuple
 
 import runtime_paths
 
+try:
+    from limits import (
+        DAILY_LOSS_PLUS_FEES_USDT as DEFAULT_DAILY_LOSS_PLUS_FEES_USDT,
+        MAX_ENTRIES_PER_UTC_DAY as DEFAULT_MAX_ENTRIES_PER_UTC_DAY,
+    )
+except ImportError:
+    DEFAULT_MAX_ENTRIES_PER_UTC_DAY = 10
+    DEFAULT_DAILY_LOSS_PLUS_FEES_USDT = Decimal("2.00")
+
 
 ENTRY_LOCK_FILE = "account-governor.lock"
 DAILY_LEDGER_PREFIX = "account-governor-"
 DAILY_LEDGER_SUFFIX = ".jsonl"
 BASIS_POSITION_FILE = "basis-position.json"
 LOCK_STALE_AFTER = timedelta(hours=2)
-DEFAULT_MAX_ENTRIES_PER_UTC_DAY = 5
-DEFAULT_DAILY_LOSS_PLUS_FEES_USDT = Decimal("1.00")
 
 _BASIS_STANDING_STATES = frozenset(
     {"OPENING", "OPEN", "ONE_LEG_EXPOSED", "CLOSING", "UNKNOWN"}
