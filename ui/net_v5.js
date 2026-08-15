@@ -293,13 +293,20 @@
       var l = Date.parse(pts[pts.length - 1].ts);
       if (isFinite(f) && isFinite(l)) { span = (l - f) / 1000; }
     }
-    var changes = 0;
-    var prevMachine = null;
-    for (i = 0; i < pts.length; i += 1) {
-      var mc = pts[i].machine;
-      if (typeof mc !== "string" || !mc) { continue; }
-      if (prevMachine != null && mc !== prevMachine) { changes += 1; }
-      prevMachine = mc;
+    /* state-change rows: the shipped events module (flicker-debounced,
+       two consecutive samples confirm a transition) */
+    var evRows = [];
+    if (root.QNet && root.QNet.events) {
+      var evDefs = [];
+      for (i = 0; i < LOOPS.length; i += 1) {
+        var le = LOOPS[i];
+        if (m[le.key].thr) {
+          evDefs.push({ key: le.key, field: le.age,
+            label: le.name === "News fetch loop" ? "News loop" : le.name,
+            thr: m[le.key].thr });
+        }
+      }
+      evRows = root.QNet.events.compute(pts, evDefs);
     }
     return {
       loops: m,
@@ -307,7 +314,7 @@
       pingP95: quantile(rtt, 0.95),
       onSched: onSched, loopsGraded: loopsGraded, worst: worst,
       samples: pts.length, freshest: freshest, span: span,
-      stateChanges: changes, t0: t0, t1: nowS
+      events: evRows, t0: t0, t1: nowS
     };
   }
 
@@ -771,6 +778,22 @@
       "beats are the loop's measured tick intervals"));
     page.appendChild(tableCard);
 
+    /* ---- state-change log: the census's most common instrument
+       element (86/150 operator surfaces) — what changed, when ---- */
+    var evCard = el("div", "st-card");
+    var evHead = el("div", "v5-card-head");
+    evHead.appendChild(el("span", "v5-card-lbl", "State changes"));
+    evHead.appendChild(el("span", "st-spacer"));
+    var evMeta = el("span", "v5-note", "");
+    evMeta.style.marginTop = "0";
+    evHead.appendChild(evMeta);
+    state.els.evMeta = evMeta;
+    evCard.appendChild(evHead);
+    var evHost = el("div", "v5-ev-host");
+    state.els.evHost = evHost;
+    evCard.appendChild(evHost);
+    page.appendChild(evCard);
+
     /* ---- envelope panels ---- */
     var grid = el("div", "v5-grid");
     LOOPS.forEach(function (lp) {
@@ -870,7 +893,14 @@
     tiles["Samples"].textContent = String(d.samples);
     tiles["History held"].textContent =
       d.span != null ? (Math.round(d.span / 360) / 10) + "h" : "—";
-    tiles["State changes"].textContent = String(d.stateChanges);
+    tiles["State changes"].textContent = String(d.events.length);
+    if (state.els.evHost && root.QNet && root.QNet.events) {
+      root.QNet.events.render(state.els.evHost, d.events);
+      state.els.evMeta.textContent = d.events.length > 30
+        ? "newest 30 of " + d.events.length + " · " +
+          state.range.toUpperCase() + " window"
+        : state.range.toUpperCase() + " window";
+    }
 
     /* deviation coloring on the worst tile value only when deviating */
     var worstCls = "";

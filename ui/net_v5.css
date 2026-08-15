@@ -180,3 +180,6 @@
 
 /* focus flash when the table jumps you to a panel */
 .v5-panel.flash { border-color: var(--focus, #2557d6); }
+
+/* state-change log stays a card, not a page: newest visible, rest scroll */
+.v5-ev-host { max-height: 264px; overflow-y: auto; }
