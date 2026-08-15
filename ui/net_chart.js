@@ -150,12 +150,15 @@
     var line = cssValue(styles, "--line", alphaColor(ink, 0.07));
     var line2 = cssValue(styles, "--line-2", alphaColor(ink, 0.12));
     var mono = cssValue(styles, "--mono", styles.fontFamily);
-    var seriesColor = alphaColor(ink, 0.78);
-    var warnFill = alphaColor(WARN, 0.05);
-    var badFill = alphaColor(BAD, 0.05);
-    var warnGuide = alphaColor(WARN, 0.35);
-    var badGuide = alphaColor(BAD, 0.35);
-    var axisFont = "10px " + mono;
+    /* one sage data line with a soft body under it — the owner's
+       reference chart grammar; state colors stay on the guides */
+    var seriesColor = cssValue(styles, "--st-data", "#57b47a");
+    var seriesFill = cssValue(styles, "--st-data-fill",
+      "rgba(87,180,122,0.10)");
+    var warnGuide = alphaColor(WARN, 0.45);
+    var badGuide = alphaColor(BAD, 0.45);
+    var axisFont = "12px " + cssValue(styles, "--sans",
+      "InterVariable, system-ui, sans-serif");
     var width = Math.max(280, Math.round(el.clientWidth || 0));
     var destroyed = false;
     var hovering = false;
@@ -196,17 +199,16 @@
           highest = values[j];
         }
       }
-      if (currentThresholds.warn != null && currentThresholds.warn > highest) {
-        highest = currentThresholds.warn;
-      }
-      if (currentThresholds.bad != null && currentThresholds.bad > highest) {
-        highest = currentThresholds.bad;
-      }
       return highest;
     }
 
+    /* the axis belongs to the DATA (owner law, 2026-08-15): fit the
+       range to what was measured plus headroom. Thresholds never own
+       the scale — a healthy 20ms series must fill the panel, not sit
+       crushed under an empty 1000ms "safety" ceiling. Guides draw
+       only when they fall inside the fitted range. */
     function yRange(u, dataMin, dataMax) {
-      return [0, cleanMax(highestValue(dataMax))];
+      return [0, cleanMax(highestValue(dataMax) * 1.15)];
     }
 
     function xValues(u, splits) {
@@ -336,9 +338,9 @@
     }
 
     function thresholdY(u, value) {
-      var y = u.valToPos(value, "y", true);
-      return Math.max(u.bbox.top,
-        Math.min(y, u.bbox.top + u.bbox.height));
+      /* honest position only — a guide outside the fitted scale is
+         skipped by the callers, never clamped to a fake edge line */
+      return u.valToPos(value, "y", true);
     }
 
     function drawThresholds(u) {
@@ -358,15 +360,6 @@
       ctx.beginPath();
       ctx.rect(box.left, box.top, box.width, box.height);
       ctx.clip();
-
-      if (warnY != null && badY != null && bad >= warn) {
-        ctx.fillStyle = warnFill;
-        ctx.fillRect(box.left, badY, box.width, warnY - badY);
-      }
-      if (badY != null) {
-        ctx.fillStyle = badFill;
-        ctx.fillRect(box.left, top, box.width, badY - top);
-      }
 
       ctx.lineWidth = ratio;
       ctx.setLineDash([4 * ratio, 3 * ratio]);
@@ -430,11 +423,11 @@
         {
           stroke: muted,
           font: axisFont,
-          size: 28,
+          size: 30,
           space: xSpace,
           splits: xSplits,
           values: xValues,
-          grid: { show: false },
+          grid: { show: true, stroke: line, width: 1 },
           ticks: { show: false },
           border: { show: false }
         },
@@ -453,7 +446,8 @@
         {},
         {
           stroke: seriesColor,
-          width: 1.6,
+          fill: seriesFill,
+          width: 1.8,
           spanGaps: false,
           points: { show: false }
         }

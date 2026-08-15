@@ -1,17 +1,18 @@
 "use strict";
 
 (function () {
-  var BAR_WIDTH = 3;
+  /* bar grammar measured off status.openai.com (2026-08-15): bars
+     ~4.75x15px, ~2.25px gap, square corners, full state colors —
+     bars are history DATA, so they carry the real palette */
+  var BAR_WIDTH = 5;
   var BAR_GAP = 2;
-  var BAR_HEIGHT = 14;
-  var BAR_RADIUS = 1;
+  var BAR_HEIGHT = 15;
+  var BAR_RADIUS = 0.5;
   var CAPACITY = 90;
-  /* nominal history ticks stay quiet (DESIGN.md §2.4) so deviation
-     ticks are the loud ones */
   var COLORS = {
-    ok: "#57b47a",
-    warn: "#d4a406",
-    bad: "#cc2f3c"
+    ok: "#24c19a",
+    warn: "#fbbf24",
+    bad: "#f87171"
   };
 
   function drawBar(ctx, x, y, color) {

@@ -1,298 +1,215 @@
-.qnet-table {
-  display: grid;
-  grid-template-columns: minmax(200px, 1.1fr) 108px minmax(90px, auto) minmax(150px, 1fr) 64px 104px 34px 44px;
-  column-gap: 18px;
-  width: 100%;
+/* Network page — status-page constitution skin.
+   Every value below is measured from status.openai.com (2026-08-15,
+   computed styles read off the live DOM) or from the owner's reference
+   chart. Ladder: Inter 12/14/16/20 at 400/500 only; ink/mid/faint grays;
+   color = state or data, never decoration. No tracked micro-caps. */
+
+:root {
+  --st-ink: #161618;        /* rgb(22,22,24) measured */
+  --st-mid: #787882;        /* rgb(120,120,130) measured */
+  --st-faint: #95959d;      /* rgb(149,149,157) measured */
+  --st-line: #e5e7eb;       /* hairline, measured */
+  --st-card: #ffffff;
+  --st-hover: #fafafb;
+  --st-mint: #d8f8f0;       /* banner band, measured */
+  --st-green: #24c19a;      /* state green, measured */
+  --st-amber-soft: #fdf3d7; /* degraded band */
+  --st-red-soft: #fde8e8;   /* outage band */
+  --st-bar-ok: #24c19a;     /* bar colors measured off their strip */
+  --st-bar-warn: #fbbf24;
+  --st-bar-bad: #f87171;
+  --st-warn-text: #b45309;  /* deviating VALUES need readable amber */
+  --st-bad-text: #cc2f3c;
+  --st-data: #57b47a;       /* the one chart line (owner ref: sage) */
+  --st-data-fill: rgba(87, 180, 122, 0.10);
+}
+html[data-theme="dark"] {
+  --st-ink: #ececee;
+  --st-mid: #a0a3ab;
+  --st-faint: #73767e;
+  --st-line: #262a30;
+  --st-card: #101418;
+  --st-hover: #161b20;
+  --st-mint: rgba(36, 193, 154, 0.16);
+  --st-amber-soft: rgba(251, 191, 36, 0.14);
+  --st-red-soft: rgba(248, 113, 113, 0.14);
+  --st-warn-text: #e3a63b;
+  --st-bad-text: #f27e8a;
+  --st-data: #6fbf8f;
+  --st-data-fill: rgba(111, 191, 143, 0.12);
 }
 
-.qnet-th {
-  min-width: 0;
-  padding: 8px 0 7px;
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 9.75px;
-  font-weight: 500;
-  letter-spacing: .045em;
-  text-transform: uppercase;
+/* ---- page column: 660px centered, the measured narrow calm ---- */
+.st-page {
+  max-width: 660px;
+  margin: 0 auto;
+  /* content starts below the invisible 72px topbar line (owner law) */
+  padding: 72px 20px 56px;
+  font-family: var(--sans, "InterVariable", system-ui, sans-serif);
+  color: var(--st-ink);
 }
+.st-page * { letter-spacing: normal; }
 
-.qnet-group {
-  grid-column: 1 / -1;
-  margin-top: 20px;
-  padding-bottom: 4px;
-  color: var(--muted);
-  font-size: 9.75px;
-  font-weight: 500;
-  letter-spacing: .045em;
-  text-transform: uppercase;
+/* ---- text castes (the only voices on this page) ---- */
+.st-t-title { font-size: 20px; font-weight: 500; letter-spacing: -0.3px;
+  line-height: 28px; color: var(--st-ink); }
+.st-t-h { font-size: 16px; font-weight: 500; letter-spacing: -0.2px;
+  line-height: 24px; color: var(--st-ink); }
+.st-t-name { font-size: 14px; font-weight: 500; letter-spacing: -0.07px;
+  line-height: 20px; color: var(--st-ink); }
+.st-t-body { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
+  line-height: 20px; color: var(--st-ink); }
+.st-t-mid { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
+  line-height: 20px; color: var(--st-mid); }
+.st-t-meta { font-size: 12px; font-weight: 400; line-height: 16px;
+  color: var(--st-faint); }
+.st-t-metamid { font-size: 12px; font-weight: 400; line-height: 16px;
+  color: var(--st-mid); }
+.st-t-datum { font-family: var(--mono, "JBMono", monospace);
+  font-size: 13px; font-weight: 400; line-height: 20px;
+  font-variant-numeric: tabular-nums; color: var(--st-ink); }
+
+/* ---- page header: title + authority, one line, no lamp
+   (the banner is the only overall-state announcement) ---- */
+.st-head {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 26px 0 14px;
 }
+.st-head .st-spacer { flex: 1; }
+.st-authority { font-size: 12px; font-weight: 400; line-height: 16px;
+  color: var(--st-mid); white-space: nowrap; }
+.st-authority b { font-family: var(--mono, "JBMono", monospace);
+  font-weight: 400; font-size: 12px; color: var(--st-mid); }
+.st-authority b.warn { color: var(--st-warn-text); }
+.st-authority b.bad { color: var(--st-bad-text); }
 
-.qnet-row {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: subgrid;
-  align-items: center;
-  min-height: 40px;
-  border-bottom: 1px solid var(--line);
-}
-
-.qnet-row:hover {
-  background: var(--hover);
-}
-
-.qnet-cell {
-  min-width: 0;
-}
-
-.qnet-name {
-  color: var(--ink);
-  font-size: 13.5px;
-  font-weight: 500;
-}
-
-.qnet-detail {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.qnet-val {
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.qnet-bars {
-  display: flex;
-  align-items: flex-end;
-  justify-content: flex-end;
-  height: 14px;
-}
-
-.qnet-cad select {
-  height: 28px;
-  border: 1px solid var(--line-2);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--ink);
-  font: inherit;
-  font-size: 12px;
-}
-
-.qnet-cad select:focus-visible,
-.qnet-refresh:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
-.qnet-cad-fixed {
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
-.qnet-refresh {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: 0;
+/* ---- cards: one anatomy, measured (radius 7, hairline, white) ---- */
+.st-card {
+  background: var(--st-card);
+  border: 1px solid var(--st-line);
   border-radius: 7px;
-  background: none;
-  color: var(--muted);
-  cursor: pointer;
+  margin-top: 16px;
+  overflow: hidden;
 }
-
-.qnet-refresh:hover {
-  background: var(--hover);
-  color: var(--ink);
+.st-card-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px 12px;
 }
+.st-card-head .st-spacer { flex: 1; }
 
-.qnet-refresh.kick svg {
-  animation: spin 600ms cubic-bezier(.2, 0, .2, 1);
+/* ---- banner (their anatomy exactly: band 14x16, sub in white) ---- */
+.st-banner-band {
+  display: flex; align-items: center; gap: 9px;
+  padding: 14px 16px;
+  background: var(--st-mint);
 }
+.st-banner-band.warn { background: var(--st-amber-soft); }
+.st-banner-band.bad { background: var(--st-red-soft); }
+.st-banner-band svg { flex: 0 0 16px; }
+.st-banner-sub { padding: 12px 16px; }
 
-.qnet-note {
-  margin-top: 12px;
-  color: var(--faint);
-  font-size: 10.5px;
+/* ---- status rows ---- */
+.st-group {
+  padding: 14px 16px 2px;
+  font-size: 12px; font-weight: 400; line-height: 16px;
+  color: var(--st-faint);
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .qnet-refresh.kick svg {
-    animation: none;
-  }
+.st-row {
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--st-line);
 }
-
-/* ---- integrator seam: selectors for the table module's emitted
-   class names (module header lists them; aliases of the blocks
-   above so both vocabularies style identically). ---- */
-.qnet-header {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: subgrid;
+.st-row:hover { background: var(--st-hover); }
+.st-row-line {
+  display: flex; align-items: center; gap: 8px;
 }
-
-.qnet-heading {
-  min-width: 0;
-  padding: 8px 0 7px;
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 9.75px;
-  font-weight: 500;
-  letter-spacing: .045em;
-  text-transform: uppercase;
+.st-row-line .st-spacer { flex: 1; }
+.st-dot {
+  flex: 0 0 6px; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--st-green);
 }
-
-/* status grammar (DESIGN.md §3, amended after owner verdict): colored
-   GLYPH + ink word, no capsule. The dot carries the state color at full
-   strength; the word stays readable ink for nominal and takes status
-   color only on deviation. Presence without the capsule. */
-.qnet-status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  width: max-content;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 450;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.qnet-status-pill.qnet-status-ok { color: var(--ink); }
-
-.qnet-status-pill.qnet-status-warn { color: #b58a06; font-weight: 500; }
-
-.qnet-status-pill.qnet-status-bad { color: #cc2f3c; font-weight: 500; }
-
-.qnet-status-dot {
-  display: block;
-  flex: 0 0 auto;
-  box-sizing: border-box;
-  width: 6px;
-  height: 6px;
-  border: 1px solid var(--line-2);
-  border-radius: 50%;
+.st-dot.warn { background: var(--st-bar-warn); }
+.st-dot.bad { background: var(--st-bar-bad); }
+.st-dot.off {
   background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--st-faint);
 }
-
-.qnet-status-ok .qnet-status-dot {
-  border: 0;
-  background: #16a34a;
+.st-word { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
+  color: var(--st-mid); white-space: nowrap; }
+.st-word.warn { color: var(--st-warn-text); }
+.st-word.bad { color: var(--st-bad-text); }
+.st-word.off { color: var(--st-faint); }
+.st-row .st-t-datum { margin-left: 4px; }
+.st-row .st-t-datum.warn { color: var(--st-warn-text); }
+.st-row .st-t-datum.bad { color: var(--st-bad-text); }
+.st-detail { margin-left: 14px; }
+.st-bars { height: 15px; margin: 8px 0 0 14px; }
+.st-row-foot {
+  display: flex; margin: 4px 0 0 14px;
 }
+.st-row-foot .st-spacer { flex: 1; }
 
-.qnet-status-warn .qnet-status-dot {
-  border: 0;
-  background: #d4a406;
+/* ---- chart card ---- */
+.st-chart-tools { display: flex; align-items: center; gap: 12px; }
+.st-select {
+  height: 26px;
+  border: 1px solid var(--st-line);
+  border-radius: 6px;
+  background: var(--st-card);
+  color: var(--st-ink);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 0 6px;
 }
-
-.qnet-status-bad .qnet-status-dot {
-  border: 0;
-  background: #cc2f3c;
+.st-select:focus { outline: 1px solid var(--st-mid); outline-offset: 0; }
+.st-seg { display: flex; gap: 2px; }
+.st-seg button {
+  border: 0; background: transparent;
+  font-family: inherit; font-size: 12px; font-weight: 500;
+  line-height: 16px; color: var(--st-faint);
+  padding: 5px 7px; border-radius: 6px; cursor: pointer;
 }
-
-.qnet-value {
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
+.st-seg button:hover { color: var(--st-mid); }
+.st-seg button.on { color: var(--st-ink); background: var(--st-hover); }
+.st-chart-host { padding: 4px 10px 0 4px; }
+.st-legend {
+  display: flex; align-items: center; gap: 7px;
+  padding: 2px 16px 0;
 }
-
-/* numeric columns read right-aligned, headers align with their cells */
-.qnet-heading:nth-child(5) { text-align: right; }
-
-/* the control column keeps its rhythm: rows without a real switch show
-   the same placeholder dash the other honest-empty cells use */
-.qnet-nocontrol {
-  color: var(--faint);
-  font-family: var(--mono);
-  font-size: 12.5px;
+.st-key {
+  width: 8px; height: 8px; border-radius: 2px;
+  background: var(--st-data);
 }
+.st-card-foot { padding: 10px 16px 12px; }
 
-.qnet-trend {
-  display: flex;
-  align-items: flex-end;
-  justify-content: flex-end;
-  height: 14px;
-  min-width: 0;
+/* ---- controls card ---- */
+.st-ctl-btn {
+  border: 1px solid var(--st-line); background: var(--st-card);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  font-family: inherit; font-size: 12px; font-weight: 500;
+  line-height: 16px; color: var(--st-mid);
 }
+.st-ctl-btn:hover { color: var(--st-ink); }
 
-.qnet-trend canvas { display: block; }
-
-.qnet-cadence { min-width: 0; }
-
-.qnet-cadence-select {
-  height: 28px;
-  border: 1px solid var(--line-2);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--ink);
-  font: inherit;
-  font-size: 12.5px;
+/* ---- state changes (events reskin) ---- */
+.qevents { padding: 2px 0 6px; }
+.qevents-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 16px;
+  border-top: 1px solid var(--st-line);
 }
+.qevents-time { font-family: var(--mono, "JBMono", monospace);
+  font-size: 12px; color: var(--st-faint);
+  font-variant-numeric: tabular-nums; }
+.qevents-name { font-size: 14px; font-weight: 400;
+  letter-spacing: -0.07px; color: var(--st-ink); }
+.qevents-arrow { font-size: 12px; color: var(--st-faint); }
+.qevents-state { font-size: 14px; font-weight: 400;
+  letter-spacing: -0.07px; }
+.qevents-state.qe-ok { color: var(--st-mid); }
+.qevents-state.qe-warn { color: var(--st-warn-text); }
+.qevents-state.qe-bad { color: var(--st-bad-text); }
+.qevents-empty { padding: 10px 16px 12px; font-size: 12px;
+  color: var(--st-faint); }
 
-.qnet-cadence-select:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
-.qnet-cadence-fixed {
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.qnet-faint { color: var(--faint); }
-
-.qnet-refresh-cell { min-width: 0; }
-
-.qnet-refresh[hidden] { display: none; }
-
-.qnet-refresh.qnet-spin-kick svg {
-  animation: spin 600ms cubic-bezier(.2, 0, .2, 1);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .qnet-refresh.qnet-spin-kick svg {
-    animation: none;
-  }
-}
-
-
-/* ---- v2: uptime column, taller status-page trend bars, chart card ---- */
-.qnet-uptime {
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
-.qnet-trend,
-.qnet-bars { height: 20px; }
-
-.qnet-chartcard {
-  margin-top: 18px;
-  border: 1px solid var(--line-2);
-  border-radius: 14px;
-  padding: 14px 16px 10px;
-  background: var(--panel);
-}
-
-.qnet-chart-tools {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.qnet-chart-tools .pillbar { margin-top: 0; }
-
-.qnet-chart-ranges { margin-left: auto; }
-
-.qnet-chart { margin-top: 10px; min-height: 220px; position: relative; }
+/* ---- shared switch, sized to the quiet page ---- */
+.st-page .switch { transform: scale(0.92); transform-origin: right center; }

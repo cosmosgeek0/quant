@@ -163,9 +163,6 @@
     stopNetHealthPoll();
     stopNetTelemetry();
     if (netChart) { netChart.destroy(); netChart = null; }
-    if (netMulti) { netMulti.destroy(); netMulti = null; }
-    netTable = null;
-    netTableHasCadence = false;
     if (h === "network") {
       sigPage = pageEl;
       buildNetworkPage(pageEl);
@@ -509,142 +506,173 @@
       statusCls: "", statusText: "Owner gated" };
   }
 
-  function connCadence(def) {
-    if (def.id === "server") {
-      return { kind: "select", value: pollCfg.strip,
-        options: [5, 10, 30, 60] };
-    }
-    if (def.id === "newsloop") {
-      return { kind: "fixed", text: "120s · fixed" };
-    }
-    if (def.id === "mirror") {
-      var iv = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
-      return (typeof iv === "number" && iv > 0)
-        ? { kind: "fixed", text: Math.round(iv / 1000) + "s pull" }
-        : null;
-    }
-    return null;
+  /* ---- status-page anatomy: banner + rows. Every measurement in
+     net.css and here is read off status.openai.com's live DOM
+     (2026-08-15). The banner is the ONE place overall state is
+     announced; rows carry dot/name left, datum/word right, real
+     uptime bars from the telemetry file underneath. ---- */
+  function stEl(tag, cls, text) {
+    var el = document.createElement(tag);
+    if (cls) { el.className = cls; }
+    if (text != null) { el.textContent = text; }
+    return el;
   }
 
-  function buildTableModel() {
-    var groups = [];
-    for (var gi = 0; gi < CONN_GROUPS.length; gi++) {
-      var rows3 = [];
-      for (var mi = 0; mi < CONNECTIONS.length; mi++) {
-        var def = CONNECTIONS[mi];
-        if (def.group !== CONN_GROUPS[gi][0]) { continue; }
-        var st = rowStatus(def);
-        rows3.push({
-          id: def.id,
-          name: def.name,
-          detail: def.detail,
-          statusCls: st.statusCls,
-          statusText: st.statusText,
-          value: st.value,
-          bars: statusSamples(def.id, 60),
-          uptime: uptimePct(def.id),
-          cadence: connCadence(def),
-          canRefresh: def.id === "server" || def.id === "newsloop" ||
-            def.live === "health",
-          active: !!connState[def.id],
-          hasControl: def.control === "pause" || def.control === "news",
-          gated: def.group === "boundary"
-        });
-      }
-      if (rows3.length) {
-        groups.push({ id: CONN_GROUPS[gi][0], label: CONN_GROUPS[gi][1],
-          rows: rows3 });
-      }
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  function stIcon(state) {
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("width", "16");
+    svg.setAttribute("height", "16");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("aria-hidden", "true");
+    var c = document.createElementNS(SVG_NS, "circle");
+    c.setAttribute("cx", "8");
+    c.setAttribute("cy", "8");
+    c.setAttribute("r", "8");
+    c.setAttribute("fill", state === 2 ? "#f87171"
+      : state === 1 ? "#fbbf24" : "#24c19a");
+    svg.appendChild(c);
+    var p = document.createElementNS(SVG_NS, "path");
+    p.setAttribute("stroke", "#ffffff");
+    p.setAttribute("stroke-width", "1.7");
+    p.setAttribute("fill", "none");
+    p.setAttribute("stroke-linecap", "round");
+    if (state === 0) {
+      p.setAttribute("d", "M4.6 8.4l2.2 2.2 4.6-4.8");
+      p.setAttribute("stroke-linejoin", "round");
+    } else {
+      p.setAttribute("d", "M8 4.4v4.4m0 2.6v.2");
     }
-    return {
-      groups: groups,
-      callbacks: {
-        onToggle: function (id, on) {
-          if (connState[id] === on) { return; }
-          connState[id] = on;
-          var tdef = null;
-          for (var i = 0; i < CONNECTIONS.length; i++) {
-            if (CONNECTIONS[i].id === id) { tdef = CONNECTIONS[i]; }
-          }
-          if (tdef && tdef.control === "pause") {
-            pollCfg.paused = !on;
-            savePollCfg();
-          }
-          if (tdef && tdef.control === "news") { setMaster(on); }
-          renderSigAll();
-        },
-        onRefresh: function (id) {
-          if (id === "server") { pollStrip(); }
-          else if (id === "newsloop") { fetchNews(true); }
-          else { fetchNetHealth(); }
-        },
-        onCadence: function (id, sec) {
-          if (id !== "server") { return; }
-          pollCfg.strip = sec;
-          savePollCfg();
-          restartStripPoll();
-          if ((location.hash || "").slice(1) === "network") {
-            startNetHealthPoll();
-          }
-        }
-      }
-    };
+    svg.appendChild(p);
+    return svg;
   }
 
-  /* ---- the compact status band, restored (the proven old-room
-     port the audit ordered back): label / mono value / subtitle,
-     value colored by the SAME thresholds the whole page uses. ---- */
-  function buildConnTiles() {
-    var tiles = document.createElement("div");
-    tiles.className = "conn-tiles";
-    tiles.id = "conn-tiles";
-    function tile(label, valueText, cls, smallText) {
-      var cell = document.createElement("div");
-      cell.className = "conn-tile";
-      var em = document.createElement("em");
-      em.textContent = label;
-      var b = document.createElement("b");
-      b.textContent = valueText;
-      if (cls) { b.className = cls; }
-      var sm = document.createElement("small");
-      sm.textContent = smallText;
-      cell.appendChild(em);
-      cell.appendChild(b);
-      cell.appendChild(sm);
-      return cell;
+  function mkSwitch(on, onChange) {
+    var b = stEl("button", "switch" + (on ? " on" : ""));
+    b.setAttribute("type", "button");
+    b.setAttribute("role", "switch");
+    b.setAttribute("aria-checked", on ? "true" : "false");
+    b.appendChild(stEl("span", "knob"));
+    b.addEventListener("click", function () {
+      var now = !b.classList.contains("on");
+      b.classList.toggle("on", now);
+      b.setAttribute("aria-checked", now ? "true" : "false");
+      onChange(now);
+    });
+    return b;
+  }
+
+  function bannerState() {
+    if (!lastStrip) {
+      return { worst: 1, title: "Connecting to the local server",
+        sub: "No status read has landed yet." };
     }
-    var d0 = lastStrip || {};
-    var pull0 = d0.pull || {};
-    var mp0 = d0.market_pass || {};
-    var sv0 = d0.supervisor || {};
-    var machineVal = d0.machine || "—";
-    tiles.appendChild(tile("Machine", machineVal,
-      machineVal === "ARMED" || machineVal === "—" ? "" : "warn",
-      "STOP flags mirrored · authoritative"));
-    tiles.appendChild(tile("Server RTT",
-      lastStrip ? (lastRtt == null ? "answering" : lastRtt + " ms")
-        : "unreachable",
-      lastStrip ? thrCls("server", telNum(lastRtt)) : "bad",
-      "direct serve.py probe"));
-    tiles.appendChild(tile("Mirror continuity",
-      ageText2(pull0.age_seconds),
-      thrCls("mirror", telNum(pull0.age_seconds)),
-      "pull every " + (pull0.interval_ms
-        ? Math.round(pull0.interval_ms / 1000) + "s" : "—")));
-    tiles.appendChild(tile("Feed freshness",
-      ageText2(mp0.age_seconds),
-      thrCls("market", telNum(mp0.age_seconds)),
-      "market pass on the host"));
-    tiles.appendChild(tile("Supervisor",
-      (sv0.reported_status || "—"),
-      thrCls("supervisor", telNum(sv0.age_seconds)),
-      "heartbeat " + ageText2(sv0.age_seconds) + " ago"));
-    var newsAgeTile = currentVal("newsloop");
-    tiles.appendChild(tile("News loop",
-      newsAgeTile == null ? "no read yet" : ageText2(newsAgeTile),
-      newsAgeTile == null ? "" : thrCls("newsloop", newsAgeTile),
-      "104 public sources"));
-    return tiles;
+    var worst = connOverallWorst();
+    if (worst === 0) {
+      var n = 0;
+      for (var i = 0; i < CONNECTIONS.length; i++) {
+        if (CONNECTIONS[i].live && connState[CONNECTIONS[i].id]) { n += 1; }
+      }
+      return { worst: 0, title: "All connections operational",
+        sub: "Every measured loop is inside its cadence \u00b7 " + n +
+          " loops measured through the host mirror." };
+    }
+    var names = [];
+    for (var j = 0; j < CONNECTIONS.length; j += 1) {
+      var def = CONNECTIONS[j];
+      if (!def.live || !connState[def.id]) { continue; }
+      var cls = rowStatus(def).statusCls;
+      if ((worst === 2 && cls === "bad") ||
+          (worst === 1 && cls !== "" && cls !== "ok")) {
+        names.push(def.name);
+      }
+    }
+    return { worst: worst,
+      title: (worst === 2 ? "Outage: " : "Degraded: ") +
+        (names.join(", ") || "one loop"),
+      sub: worst === 2
+        ? "The named loop has stopped reporting \u2014 rows below."
+        : "Past its measured cadence \u2014 rows below." };
+  }
+
+  function updateBanner() {
+    var card = document.getElementById("net-banner");
+    if (!card) { return; }
+    var st = bannerState();
+    var sig = st.worst + "|" + st.title + "|" + st.sub;
+    if (card.getAttribute("data-sig") === sig) { return; }
+    card.setAttribute("data-sig", sig);
+    card.textContent = "";
+    var band = stEl("div", "st-banner-band" +
+      (st.worst === 2 ? " bad" : st.worst === 1 ? " warn" : ""));
+    band.appendChild(stIcon(st.worst));
+    band.appendChild(stEl("div", "st-t-h", st.title));
+    card.appendChild(band);
+    var sub = stEl("div", "st-banner-sub");
+    sub.appendChild(stEl("div", "st-t-body", st.sub));
+    card.appendChild(sub);
+  }
+
+  function buildStatusRow(def) {
+    var row = stEl("div", "st-row");
+    row.id = "strow-" + def.id;
+    var line = stEl("div", "st-row-line");
+    line.appendChild(stEl("span", "st-dot"));
+    line.appendChild(stEl("span", "st-t-name", def.name));
+    line.appendChild(stEl("span", "st-spacer"));
+    line.appendChild(stEl("span", "st-t-datum"));
+    line.appendChild(stEl("span", "st-word"));
+    row.appendChild(line);
+    row.appendChild(stEl("div", "st-detail st-t-meta", def.detail));
+    if (def.group !== "boundary") {
+      var bars = stEl("div", "st-bars");
+      bars.setAttribute("data-bars", def.id);
+      row.appendChild(bars);
+      var foot = stEl("div", "st-row-foot");
+      var up = stEl("span", "st-t-metamid", "uptime \u2014");
+      up.setAttribute("data-uptime", def.id);
+      foot.appendChild(up);
+      row.appendChild(foot);
+    }
+    return row;
+  }
+
+  function updateStatusRows() {
+    for (var i = 0; i < CONNECTIONS.length; i += 1) {
+      var def = CONNECTIONS[i];
+      var row = document.getElementById("strow-" + def.id);
+      if (!row) { continue; }
+      var st = rowStatus(def);
+      var off = def.group === "boundary" || !connState[def.id];
+      var cls = st.statusCls === "bad" ? " bad"
+        : st.statusCls === "warn" ? " warn" : "";
+      row.querySelector(".st-dot").className =
+        "st-dot" + (off ? " off" : cls);
+      var datum = row.querySelector(".st-t-datum");
+      datum.textContent = st.value == null ? "\u2014" : String(st.value);
+      datum.className = "st-t-datum" + cls;
+      var word = row.querySelector(".st-word");
+      word.textContent = def.group === "boundary" ? "Owner gated"
+        : (!connState[def.id] ? (st.value === "polling paused"
+            ? "Paused" : "Off")
+          : (st.statusText || "Measuring"));
+      word.className = "st-word" + (off ? " off" : cls);
+      var bars = row.querySelector("[data-bars]");
+      if (bars && window.QNet && QNet.bars) {
+        var fit = Math.max(12, Math.floor((bars.clientWidth + 2) / 7));
+        var samples = statusSamples(def.id, Math.min(fit, 90));
+        if (samples && samples.length) {
+          QNet.bars.render(bars, samples);
+        } else { bars.textContent = ""; }
+      }
+      var up = row.querySelector("[data-uptime]");
+      if (up) {
+        var pct = uptimePct(def.id);
+        up.textContent = pct == null
+          ? "uptime \u2014 \u00b7 history still thin"
+          : "uptime " + (Math.round(pct * 10) / 10) + "%";
+      }
+    }
   }
 
   /* ---- telemetry file client: real history via /api/telemetry
@@ -881,8 +909,18 @@
           netTelem.range + " window · UTC"
         : "History arrives from the telemetry recorder.";
     }
-    if (netTable) { netTable.update(buildTableModel()); }
-    if (netMulti) { netMulti.update(buildMultiModel()); }
+    updateStatusRows();
+    var legendLbl = document.getElementById("net-legend-lbl");
+    var legendVal = document.getElementById("net-legend-val");
+    if (legendLbl && legendVal) {
+      var lm = netMetric(netChartSel) || NET_METRICS[0];
+      legendLbl.textContent = lm.label;
+      var lvs = telemSeries(lm.field)[1];
+      var li = lvs.length - 1;
+      while (li >= 0 && lvs[li] == null) { li -= 1; }
+      legendVal.textContent = li >= 0
+        ? (Math.round(lvs[li] * 10) / 10) + " " + lm.unit : "\u2014";
+    }
     var evHost2 = document.getElementById("net-events");
     if (evHost2 && window.QNet && QNet.events) {
       var evDefs = [];
@@ -904,58 +942,7 @@
     /* lamp and rows must repaint from the same threshold state —
        telemetry landing changes measured cadences, so the lamp
        re-evaluates here too, never one poll behind the table */
-    updateOverallLamp();
-  }
-
-  function updateOverallLamp() {
-    var overallEl = document.getElementById("conn-overall");
-    if (!overallEl) { return; }
-    var worst = connOverallWorst();
-    var od = overallEl.querySelector(".livedot");
-    var ol = overallEl.querySelector("span:last-child");
-    od.className = "livedot" +
-      (worst === 2 ? " dead" : (worst === 1 ? " stale" : ""));
-    ol.textContent = worst === 2 ? "OUTAGE"
-      : (worst === 1 ? "DEGRADED" : "OPERATIONAL");
-  }
-
-  function sparkSeries(field) {
-    /* sawtooth age series at 15s sampling render as fur inside a
-       ~130px panel — stride-downsample to <=48 points so the spark
-       shows shape, not noise. The big chart keeps full resolution. */
-    var full = telemSeries(field);
-    var ts = full[0];
-    var vs = full[1];
-    if (vs.length <= 48) { return full; }
-    var stride = Math.ceil(vs.length / 48);
-    var ots = [];
-    var ovs = [];
-    for (var i = 0; i < vs.length; i += stride) {
-      ots.push(ts[i]);
-      ovs.push(vs[i]);
-    }
-    if ((vs.length - 1) % stride !== 0) {
-      ots.push(ts[vs.length - 1]);
-      ovs.push(vs[vs.length - 1]);
-    }
-    return [ots, ovs];
-  }
-
-  function buildMultiModel() {
-    var mets = [];
-    for (var i = 0; i < NET_METRICS.length; i++) {
-      var m = NET_METRICS[i];
-      mets.push({ key: m.key, label: m.label, unit: m.unit,
-        series: sparkSeries(m.field), thr: thrFor(m.key),
-        current: currentVal(m.key) });
-    }
-    return { metrics: mets, selected: netChartSel,
-      onSelect: function (key) {
-        if (netChartSel === key) { return; }
-        netChartSel = key;
-        if (netChart) { netChart.destroy(); netChart = null; }
-        renderTelemetry();
-      } };
+    updateBanner();
   }
 
   function connOverallWorst() {
@@ -977,103 +964,122 @@
     /* re-sync controllable rows from their single sources of truth */
     connState.server = !pollCfg.paused;
     connState.newsloop = newsMaster;
-    var page = document.createElement("div");
-    page.className = "conn-page";
-    var headRow = document.createElement("div");
-    headRow.className = "conn-head-row";
-    var t = document.createElement("div");
-    t.className = "news-title";
-    t.textContent = "Network";
-    var mchip = document.createElement("span");
-    mchip.className = "machine-chip";
-    mchip.id = "net-machine";
-    mchip.appendChild(document.createTextNode("MACHINE"));
-    var mval = document.createElement("b");
-    mval.textContent = "—";
-    mchip.appendChild(mval);
-    var overall = document.createElement("span");
-    overall.className = "conn-overall";
-    overall.id = "conn-overall";
-    var odot = document.createElement("span");
-    odot.className = "livedot";
-    var olbl = document.createElement("span");
-    olbl.textContent = "CONNECTING";
-    overall.appendChild(odot);
-    overall.appendChild(olbl);
-    headRow.appendChild(t);
-    headRow.appendChild(mchip);
-    headRow.appendChild(overall);
-    var sub = document.createElement("div");
-    sub.className = "page-sub";
-    sub.textContent =
-      "Website · machine mirror · public sources · owner-gated boundaries.";
-    page.appendChild(headRow);
-    page.appendChild(sub);
-    page.appendChild(buildConnTiles());
 
-    /* the ONE chart — real file history, UTC axis, threshold bands */
-    var chartCard = document.createElement("div");
-    chartCard.className = "qnet-chartcard";
-    var tools = document.createElement("div");
-    tools.className = "qnet-chart-tools";
-    var rwrap = document.createElement("div");
-    rwrap.className = "pillbar qnet-chart-ranges";
+    var page = stEl("div", "st-page");
+
+    /* header: title + machine authority chip. No lamp here — the
+       banner below is the single overall-state announcement. */
+    var head = stEl("div", "st-head");
+    head.appendChild(stEl("div", "st-t-title", "Network"));
+    head.appendChild(stEl("span", "st-spacer"));
+    var authority = stEl("span", "st-authority");
+    authority.id = "net-machine";
+    authority.appendChild(document.createTextNode("Machine \u00b7 "));
+    authority.appendChild(stEl("b", "", "\u2014"));
+    head.appendChild(authority);
+    page.appendChild(head);
+
+    /* banner card (their anatomy: tinted band + white sub, one card) */
+    var banner = stEl("div", "st-card");
+    banner.id = "net-banner";
+    page.appendChild(banner);
+
+    /* system status card: grouped rows with real uptime bars */
+    var statusCard = stEl("div", "st-card");
+    var sHead = stEl("div", "st-card-head");
+    sHead.appendChild(stEl("div", "st-t-h", "System status"));
+    sHead.appendChild(stEl("span", "st-spacer"));
+    var assessed = stEl("span", "st-t-meta", "Connecting");
+    assessed.id = "net-assessed";
+    sHead.appendChild(assessed);
+    statusCard.appendChild(sHead);
+    for (var gi = 0; gi < CONN_GROUPS.length; gi += 1) {
+      var g = CONN_GROUPS[gi];
+      var any = false;
+      for (var ci = 0; ci < CONNECTIONS.length; ci += 1) {
+        if (CONNECTIONS[ci].group === g[0]) { any = true; }
+      }
+      if (!any) { continue; }
+      statusCard.appendChild(stEl("div", "st-group", g[1]));
+      for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
+        if (CONNECTIONS[ri].group === g[0]) {
+          statusCard.appendChild(buildStatusRow(CONNECTIONS[ri]));
+        }
+      }
+    }
+    var sFoot = stEl("div", "st-card-foot st-t-meta",
+      "History: ui/live/telemetry.jsonl \u00b7 owner-gated rows carry " +
+      "no telemetry \u2014 signed reads live on the host only.");
+    statusCard.appendChild(sFoot);
+    page.appendChild(statusCard);
+
+    /* chart card: ONE instrument, data-fitted axis, metric select */
+    var chartCard = stEl("div", "st-card");
+    var cHead = stEl("div", "st-card-head");
+    cHead.appendChild(stEl("div", "st-t-h", "Loop timing"));
+    cHead.appendChild(stEl("span", "st-spacer"));
+    var tools = stEl("div", "st-chart-tools");
+    var sel = stEl("select", "st-select");
+    for (var mi = 0; mi < NET_METRICS.length; mi += 1) {
+      var opt = stEl("option", "", NET_METRICS[mi].label);
+      opt.value = NET_METRICS[mi].key;
+      if (NET_METRICS[mi].key === netChartSel) { opt.selected = true; }
+      sel.appendChild(opt);
+    }
+    sel.addEventListener("change", function () {
+      netChartSel = sel.value;
+      if (netChart) { netChart.destroy(); netChart = null; }
+      renderTelemetry();
+    });
+    tools.appendChild(sel);
+    var seg = stEl("div", "st-seg");
     var rdefs = ["1h", "6h", "24h"];
-    for (var ri2 = 0; ri2 < rdefs.length; ri2++) {
+    for (var si = 0; si < rdefs.length; si += 1) {
       (function (rg) {
-        var rb = document.createElement("button");
-        rb.className = "fpill" + (netTelem.range === rg ? " on" : "");
-        rb.textContent = rg.toUpperCase();
+        var rb = stEl("button", netTelem.range === rg ? "on" : "",
+          rg.toUpperCase());
+        rb.setAttribute("type", "button");
         rb.addEventListener("click", function () {
           netTelem.range = rg;
-          var pills = rwrap.querySelectorAll(".fpill");
-          for (var q = 0; q < pills.length; q++) {
-            pills[q].classList.toggle("on",
-              pills[q].textContent === rg.toUpperCase());
+          var bs = seg.querySelectorAll("button");
+          for (var q = 0; q < bs.length; q += 1) {
+            bs[q].classList.toggle("on",
+              bs[q].textContent === rg.toUpperCase());
           }
           fetchTelemetry();
         });
-        rwrap.appendChild(rb);
-      })(rdefs[ri2]);
+        seg.appendChild(rb);
+      })(rdefs[si]);
     }
-    tools.appendChild(rwrap);
-    chartCard.appendChild(tools);
-    /* the instrument grid: every metric visible at once — label,
-       current, real sparkline; click = zoom that metric in the chart */
-    var multiHost = document.createElement("div");
-    multiHost.className = "qmulti-host";
-    chartCard.appendChild(multiHost);
-    if (window.QNet && QNet.multi) {
-      netMulti = QNet.multi.mount(multiHost, buildMultiModel());
-    } else {
-      netMulti = null;
-    }
-    var chartHost = document.createElement("div");
+    tools.appendChild(seg);
+    cHead.appendChild(tools);
+    chartCard.appendChild(cHead);
+    var legend = stEl("div", "st-legend");
+    legend.appendChild(stEl("span", "st-key"));
+    var legendLbl = stEl("span", "st-t-metamid", "");
+    legendLbl.id = "net-legend-lbl";
+    legend.appendChild(legendLbl);
+    legend.appendChild(stEl("span", "st-spacer"));
+    var legendVal = stEl("span", "st-t-datum", "");
+    legendVal.id = "net-legend-val";
+    legend.appendChild(legendVal);
+    chartCard.appendChild(legend);
+    var chartHost = stEl("div", "st-chart-host");
     chartHost.id = "net-chart";
-    chartHost.className = "qnet-chart";
     chartCard.appendChild(chartHost);
-    var cap = document.createElement("div");
+    var cap = stEl("div", "st-card-foot st-t-meta",
+      "History arrives from the telemetry recorder.");
     cap.id = "net-chart-cap";
-    cap.className = "qnet-note";
-    cap.textContent = "History arrives from the telemetry recorder.";
     chartCard.appendChild(cap);
     page.appendChild(chartCard);
 
-    var pathHead = document.createElement("div");
-    pathHead.className = "conn-head-row";
-    pathHead.style.marginTop = "26px";
-    var ph1 = document.createElement("div");
-    ph1.className = "conn-title";
-    ph1.textContent = "Connection path";
-    var ph2 = document.createElement("span");
-    ph2.className = "conn-overall conn-assessed";
-    ph2.textContent = lastStripAt
-      ? "Assessed " + Math.max(0, Math.round(
-          (Date.now() - lastStripAt) / 1000)) + "s ago"
-      : "Connecting";
-    var dfl = document.createElement("button");
-    dfl.className = "conn-defaults";
-    dfl.textContent = "Defaults";
+    /* controls card: only switches that do something real today */
+    var ctl = stEl("div", "st-card");
+    var ctlHead = stEl("div", "st-card-head");
+    ctlHead.appendChild(stEl("div", "st-t-h", "Controls"));
+    ctlHead.appendChild(stEl("span", "st-spacer"));
+    var dfl = stEl("button", "st-ctl-btn", "Defaults");
+    dfl.setAttribute("type", "button");
     dfl.addEventListener("click", function () {
       pollCfg.strip = POLL_DEFAULTS.strip;
       pollCfg.news = POLL_DEFAULTS.news;
@@ -1086,50 +1092,76 @@
         buildNetworkPage(pageEl);
       }
     });
-    pathHead.appendChild(ph1);
-    pathHead.appendChild(ph2);
-    pathHead.appendChild(dfl);
-    page.appendChild(pathHead);
+    ctlHead.appendChild(dfl);
+    ctl.appendChild(ctlHead);
 
-    var tableEl = document.createElement("div");
-    tableEl.className = "qnet-table-host";
-    page.appendChild(tableEl);
-    var tblNote = document.createElement("div");
-    tblNote.className = "qnet-note";
-    tblNote.textContent = "Host-side rows are read-only until the signed " +
-      "control endpoint lands · the Web server and News loop switches " +
-      "act client-side today.";
-    page.appendChild(tblNote);
-
-    /* state-change log — transitions computed from the telemetry file,
-       the page's honest incident history */
-    var evHead = document.createElement("div");
-    evHead.className = "conn-head-row";
-    evHead.style.marginTop = "26px";
-    var evTitle = document.createElement("div");
-    evTitle.className = "conn-title";
-    evTitle.textContent = "State changes";
-    var evCap = document.createElement("span");
-    evCap.className = "conn-overall";
-    evCap.id = "net-events-cap";
-    evCap.textContent = "";
-    evHead.appendChild(evTitle);
-    evHead.appendChild(evCap);
-    page.appendChild(evHead);
-    var evHost = document.createElement("div");
-    evHost.id = "net-events";
-    page.appendChild(evHost);
-    if (window.QNet && QNet.table) {
-      netTable = QNet.table.build(tableEl, buildTableModel());
-      netTableHasCadence = !!(lastStrip && lastStrip.pull &&
-        lastStrip.pull.interval_ms);
-    } else {
-      netTable = null;
-      var missing = document.createElement("div");
-      missing.className = "qnet-note";
-      missing.textContent = "Table module not loaded.";
-      tableEl.appendChild(missing);
+    var r1 = stEl("div", "st-row");
+    var r1l = stEl("div", "st-row-line");
+    r1l.appendChild(stEl("span", "st-t-name", "Web server poll"));
+    r1l.appendChild(stEl("span", "st-spacer"));
+    var cadSel = stEl("select", "st-select");
+    var cads = [5, 10, 30, 60];
+    for (var qi = 0; qi < cads.length; qi += 1) {
+      var co = stEl("option", "", cads[qi] + "s");
+      co.value = String(cads[qi]);
+      if (pollCfg.strip === cads[qi]) { co.selected = true; }
+      cadSel.appendChild(co);
     }
+    cadSel.addEventListener("change", function () {
+      pollCfg.strip = parseInt(cadSel.value, 10);
+      savePollCfg();
+      restartStripPoll();
+      if ((location.hash || "").slice(1) === "network") {
+        startNetHealthPoll();
+      }
+    });
+    r1l.appendChild(cadSel);
+    r1l.appendChild(mkSwitch(!pollCfg.paused, function (on) {
+      connState.server = on;
+      pollCfg.paused = !on;
+      savePollCfg();
+      renderSigAll();
+    }));
+    r1.appendChild(r1l);
+    r1.appendChild(stEl("div", "st-detail st-t-meta",
+      "strip cadence \u00b7 pause stops this page\u2019s polling only"));
+    ctl.appendChild(r1);
+
+    var r2 = stEl("div", "st-row");
+    var r2l = stEl("div", "st-row-line");
+    r2l.appendChild(stEl("span", "st-t-name", "News master"));
+    r2l.appendChild(stEl("span", "st-spacer"));
+    r2l.appendChild(stEl("span", "st-t-metamid", "120s \u00b7 fixed"));
+    r2l.appendChild(mkSwitch(newsMaster, function (on) {
+      connState.newsloop = on;
+      setMaster(on);
+      renderSigAll();
+    }));
+    r2.appendChild(r2l);
+    r2.appendChild(stEl("div", "st-detail st-t-meta",
+      "client-side master for the news fetch loop"));
+    ctl.appendChild(r2);
+
+    var ctlFoot = stEl("div", "st-card-foot st-t-meta",
+      "Host-side rows stay read-only until the signed control " +
+      "endpoint lands.");
+    ctl.appendChild(ctlFoot);
+    page.appendChild(ctl);
+
+    /* state changes: transitions computed from the telemetry file */
+    var evCard = stEl("div", "st-card");
+    var evHead = stEl("div", "st-card-head");
+    evHead.appendChild(stEl("div", "st-t-h", "State changes"));
+    evHead.appendChild(stEl("span", "st-spacer"));
+    var evCap = stEl("span", "st-t-meta", "");
+    evCap.id = "net-events-cap";
+    evHead.appendChild(evCap);
+    evCard.appendChild(evHead);
+    var evHost = stEl("div", "");
+    evHost.id = "net-events";
+    evCard.appendChild(evHost);
+    page.appendChild(evCard);
+
     container.appendChild(page);
     renderSigAll();
     renderTelemetry();
@@ -1137,46 +1169,25 @@
 
   function renderSigAll() {
     if ((location.hash || "").slice(1) === "network" && sigPage) {
-      var oldTiles = document.getElementById("conn-tiles");
-      if (oldTiles && oldTiles.parentNode) {
-        oldTiles.parentNode.replaceChild(buildConnTiles(), oldTiles);
-      }
-      if (netTable) {
-        /* cadence cells render once at build; if the table was built
-           before the first strip landed, rebuild one time so the
-           mirror's measured pull interval appears. */
-        var ivNow = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
-        if (!netTableHasCadence && typeof ivNow === "number" && ivNow > 0) {
-          netTableHasCadence = true;
-          var host = document.querySelector(".qnet-table-host");
-          if (host && window.QNet && QNet.table) {
-            netTable = QNet.table.build(host, buildTableModel());
-          }
-        } else {
-          netTable.update(buildTableModel());
-        }
-      }
+      updateBanner();
+      updateStatusRows();
       var mchipEl = document.getElementById("net-machine");
       if (mchipEl) {
         var mb = mchipEl.querySelector("b");
-        var mv = (lastStrip && lastStrip.machine) || "—";
+        var mv = (lastStrip && lastStrip.machine) || "\u2014";
         mb.textContent = mv;
-        mb.className = mv === "ARMED" || mv === "—" ? "" : "warn";
+        mb.className = mv === "ARMED" || mv === "\u2014" ? "" : "warn";
       }
-      var stamp = document.querySelector(".conn-assessed");
+      var stamp = document.getElementById("net-assessed");
       if (stamp && lastStripAt) {
         stamp.textContent = "Assessed " + Math.max(0, Math.round(
           (Date.now() - lastStripAt) / 1000)) + "s ago";
       }
-      updateOverallLamp();
     }
   }
 
   /* the Network page keeps its live reference for poll refreshes */
   var sigPage = null;
-  var netTable = null;
-  var netMulti = null;
-  var netTableHasCadence = false;
 
   /* log out: real endpoint on the hosted site only.
      OWNER NOTE 2026-08-15 (verify at next deploy): on
