@@ -23,9 +23,11 @@ market-maker leftovers.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field, fields
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, Literal, Mapping, Optional, Tuple
@@ -142,6 +144,11 @@ class DetectionThresholds:
 
 DEFAULT_THRESHOLDS = DetectionThresholds()
 
+# A ladder-facing event must still describe the same fresh observation that
+# the detector accepted.  Reuse the detector's five-second stream bound for
+# wall-clock event age so delayed or replayed event objects are not actionable.
+ACTIONABLE_EVENT_MAX_AGE_MS = DEFAULT_THRESHOLDS.max_freshness_ms
+
 
 @dataclass(frozen=True)
 class DislocationEvent:
@@ -238,6 +245,101 @@ def _return_pct(later: Decimal, earlier: Decimal) -> Decimal:
         return (later - earlier) / earlier * HUNDRED
 
 
+def _executable_gaps(
+    spot_bid: Decimal,
+    spot_ask: Decimal,
+    perp_bid: Decimal,
+    perp_ask: Decimal,
+) -> Tuple[Decimal, Decimal]:
+    """Derive the two executable gaps used by both emission and validation."""
+    return (
+        _return_pct(perp_bid, spot_ask),
+        # Same executable unwind-cost convention used by StreamStateReads.
+        _return_pct(perp_ask, spot_bid),
+    )
+
+
+def _observation_is_continuous(
+    observation_gap_ms: Any, thresholds: DetectionThresholds
+) -> bool:
+    return (
+        not isinstance(observation_gap_ms, bool)
+        and isinstance(observation_gap_ms, int)
+        and 0 < observation_gap_ms <= thresholds.max_observation_gap_ms
+    )
+
+
+def _violent_move(
+    surge_ratio: Decimal,
+    price_accel_pct: Decimal,
+    thresholds: DetectionThresholds,
+) -> bool:
+    return (
+        surge_ratio >= thresholds.min_surge_ratio
+        and abs(price_accel_pct) >= thresholds.min_abs_price_accel_pct
+    )
+
+
+def _magnitude_checks(
+    entry_gap_pct: Decimal,
+    gap_growth_pct: Decimal,
+    funding_rate: Decimal,
+    funding_rate_delta: Decimal,
+    thresholds: DetectionThresholds,
+) -> Dict[str, bool]:
+    """Compute every classification comparison once for both public paths."""
+    gap_magnitude = abs(entry_gap_pct)
+    return {
+        "funding_rate": abs(funding_rate)
+        >= thresholds.min_abs_funding_rate,
+        "funding_change": abs(funding_rate_delta)
+        >= thresholds.min_abs_funding_rate_change,
+        "funding_gap": gap_magnitude >= thresholds.min_funding_gap_pct,
+        "spike_gap": gap_magnitude >= thresholds.min_gap_spike_pct,
+        "spike_growth": gap_growth_pct
+        >= thresholds.min_gap_spike_growth_pct,
+        "runner_gap": gap_magnitude >= thresholds.min_runner_gap_pct,
+        "runner_growth": gap_growth_pct
+        >= thresholds.min_runner_gap_growth_pct,
+    }
+
+
+def _emitted_kind(
+    entry_gap_pct: Decimal,
+    gap_growth_pct: Decimal,
+    funding_rate: Decimal,
+    funding_rate_delta: Decimal,
+    thresholds: DetectionThresholds,
+) -> Optional[DislocationKind]:
+    """Apply the detector's one classification policy in priority order."""
+    checks = _magnitude_checks(
+        entry_gap_pct, gap_growth_pct, funding_rate, funding_rate_delta,
+        thresholds)
+    if checks["funding_rate"] and checks["funding_change"] \
+            and checks["funding_gap"]:
+        return "funding_dislocation"
+    if checks["spike_gap"] and checks["spike_growth"]:
+        return "gap_spike"
+    if checks["runner_gap"] and checks["runner_growth"]:
+        return "runner_hedge_window"
+    return None
+
+
+def _quotes_are_consistent(quotes: Tuple[Decimal, ...]) -> bool:
+    spot_bid, spot_ask, perp_bid, perp_ask = quotes
+    return (
+        min(quotes) > ZERO
+        and spot_bid <= spot_ask
+        and perp_bid <= perp_ask
+    )
+
+
+def _funding_is_sane(
+    funding_rate: Decimal, thresholds: DetectionThresholds
+) -> bool:
+    return abs(funding_rate) <= thresholds.max_abs_funding_rate
+
+
 def _sample(
     record: Any, thresholds: DetectionThresholds
 ) -> Optional[_Sample]:
@@ -272,17 +374,19 @@ def _sample(
     assert perp_bid is not None and perp_ask is not None
     assert surge_ratio is not None and funding_rate is not None
     assert freshness_ms is not None
-    if min(spot_bid, spot_ask, perp_bid, perp_ask) <= ZERO \
-            or spot_bid > spot_ask or perp_bid > perp_ask:
+    if not _quotes_are_consistent(
+            (spot_bid, spot_ask, perp_bid, perp_ask)):
         return None
     if surge_ratio < ZERO or freshness_ms < ZERO \
             or freshness_ms > thresholds.max_freshness_ms:
         return None
-    if abs(funding_rate) > thresholds.max_abs_funding_rate:
+    if not _funding_is_sane(funding_rate, thresholds):
         return None
     with localcontext() as context:
         context.prec = 50
         spot_mid = (spot_bid + spot_ask) / Decimal("2")
+    entry_gap_pct, exit_gap_pct = _executable_gaps(
+        spot_bid, spot_ask, perp_bid, perp_ask)
     return _Sample(
         utc=raw_utc,
         utc_value=utc_value,
@@ -291,9 +395,8 @@ def _sample(
         perp_bid=perp_bid,
         perp_ask=perp_ask,
         spot_mid=spot_mid,
-        entry_gap_pct=_return_pct(perp_bid, spot_ask),
-        # Same executable unwind-cost convention used by StreamStateReads.
-        exit_gap_pct=_return_pct(perp_ask, spot_bid),
+        entry_gap_pct=entry_gap_pct,
+        exit_gap_pct=exit_gap_pct,
         surge_ratio=surge_ratio,
         funding_rate=funding_rate,
         freshness_ms=freshness_ms,
@@ -307,6 +410,190 @@ def _delta_ms(later: datetime, earlier: datetime) -> int:
         + delta.seconds * 1_000
         + delta.microseconds // 1_000
     )
+
+
+def _event_decimal(event: DislocationEvent, name: str) -> Optional[Decimal]:
+    value = getattr(event, name, None)
+    if not isinstance(value, Decimal) or not value.is_finite():
+        return None
+    return value
+
+
+_EVENT_DECIMAL_FIELDS = (
+    "entry_gap_pct",
+    "exit_gap_pct",
+    "surge_ratio",
+    "price_accel_pct",
+    "gap_growth_pct",
+    "funding_rate",
+    "funding_rate_delta",
+    "freshness_ms",
+    "spot_bid",
+    "spot_ask",
+    "perp_bid",
+    "perp_ask",
+)
+_EVENT_FIELDS = (
+    "utc", "symbol", "kind", *_EVENT_DECIMAL_FIELDS,
+    "observation_gap_ms",
+)
+
+
+def serialize_event(event: DislocationEvent) -> Dict[str, Any]:
+    """Return one canonical JSON-safe event record with Decimal text."""
+    if not isinstance(event, DislocationEvent):
+        raise ValueError("event must be a DislocationEvent")
+    payload: Dict[str, Any] = {
+        "utc": event.utc,
+        "symbol": event.symbol,
+        "kind": event.kind,
+        "observation_gap_ms": event.observation_gap_ms,
+    }
+    for name in _EVENT_DECIMAL_FIELDS:
+        value = _event_decimal(event, name)
+        if value is None:
+            raise ValueError("event %s must be a finite Decimal" % name)
+        payload[name] = format(value, "f")
+    return payload
+
+
+def restore_event(payload: Any) -> DislocationEvent:
+    """Restore only the exact canonical event record shape."""
+    if not isinstance(payload, Mapping) or set(payload) != set(_EVENT_FIELDS):
+        raise ValueError("event record shape is invalid")
+    values: Dict[str, Any] = {}
+    for name in _EVENT_DECIMAL_FIELDS:
+        raw = payload.get(name)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError("event record %s is invalid" % name)
+        value = _decimal(raw)
+        if value is None:
+            raise ValueError("event record %s is invalid" % name)
+        values[name] = value
+    observation_gap_ms = payload.get("observation_gap_ms")
+    if isinstance(observation_gap_ms, bool) \
+            or not isinstance(observation_gap_ms, int):
+        raise ValueError("event record observation gap is invalid")
+    return DislocationEvent(
+        utc=payload.get("utc"),
+        symbol=payload.get("symbol"),
+        kind=payload.get("kind"),
+        observation_gap_ms=observation_gap_ms,
+        **values,
+    )
+
+
+def event_digest(event: DislocationEvent) -> str:
+    """Digest the full canonical event envelope for durable provenance."""
+    encoded = json.dumps(
+        serialize_event(event), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_actionable(event: Any, now_ms: Any) -> Optional[str]:
+    """Return ``None`` only for a fresh event matching detector policy.
+
+    The UTC age bound is ``ACTIONABLE_EVENT_MAX_AGE_MS`` and is intentionally
+    the same as ``DetectionThresholds.max_freshness_ms``.  A non-empty reason
+    is a stable refusal row for callers; this function never grants authority
+    from the dataclass type alone.
+    """
+    if not isinstance(event, DislocationEvent):
+        return "DISLOCATION_EVENT_TYPE_INVALID"
+    if event.kind not in DISLOCATION_KINDS:
+        return "DISLOCATION_EVENT_KIND_NOT_ACTIONABLE"
+    if not isinstance(event.symbol, str) \
+            or SYMBOL_RE.fullmatch(event.symbol) is None:
+        return "DISLOCATION_EVENT_SYMBOL_INVALID"
+    if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+        return "DISLOCATION_EVENT_NOW_INVALID"
+
+    utc_value = _utc(event.utc)
+    if utc_value is None:
+        return "DISLOCATION_EVENT_UTC_INVALID"
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    event_ms = _delta_ms(utc_value, epoch)
+    age_ms = now_ms - event_ms
+    if age_ms < 0:
+        return "DISLOCATION_EVENT_UTC_IN_FUTURE"
+    if Decimal(age_ms) > ACTIONABLE_EVENT_MAX_AGE_MS:
+        return "DISLOCATION_EVENT_UTC_STALE"
+
+    freshness = _event_decimal(event, "freshness_ms")
+    if freshness is None or freshness < ZERO:
+        return "DISLOCATION_EVENT_FRESHNESS_INVALID"
+    if freshness > DEFAULT_THRESHOLDS.max_freshness_ms:
+        return "DISLOCATION_EVENT_FRESHNESS_EXCEEDED"
+
+    observation_gap_ms = event.observation_gap_ms
+    if isinstance(observation_gap_ms, bool) \
+            or not isinstance(observation_gap_ms, int) \
+            or observation_gap_ms <= 0:
+        return "DISLOCATION_EVENT_CONTINUITY_INVALID"
+    if not _observation_is_continuous(
+            observation_gap_ms, DEFAULT_THRESHOLDS):
+        return "DISLOCATION_EVENT_CONTINUITY_EXCEEDED"
+
+    surge = _event_decimal(event, "surge_ratio")
+    acceleration = _event_decimal(event, "price_accel_pct")
+    if surge is None:
+        return "DISLOCATION_EVENT_SURGE_BELOW_THRESHOLD"
+    if acceleration is None:
+        return "DISLOCATION_EVENT_ACCELERATION_BELOW_THRESHOLD"
+    if not _violent_move(surge, acceleration, DEFAULT_THRESHOLDS) \
+            and surge < DEFAULT_THRESHOLDS.min_surge_ratio:
+        return "DISLOCATION_EVENT_SURGE_BELOW_THRESHOLD"
+    if not _violent_move(surge, acceleration, DEFAULT_THRESHOLDS):
+        return "DISLOCATION_EVENT_ACCELERATION_BELOW_THRESHOLD"
+    entry_gap = _event_decimal(event, "entry_gap_pct")
+    exit_gap = _event_decimal(event, "exit_gap_pct")
+    growth = _event_decimal(event, "gap_growth_pct")
+    funding = _event_decimal(event, "funding_rate")
+    funding_delta = _event_decimal(event, "funding_rate_delta")
+    if entry_gap is None or exit_gap is None or growth is None:
+        return "DISLOCATION_EVENT_MAGNITUDE_INVALID"
+    if funding is None or funding_delta is None \
+            or not _funding_is_sane(funding, DEFAULT_THRESHOLDS):
+        return "DISLOCATION_EVENT_FUNDING_INVALID"
+
+    checks = _magnitude_checks(
+        entry_gap, growth, funding, funding_delta, DEFAULT_THRESHOLDS)
+    if event.kind == "gap_spike":
+        if not checks["spike_gap"]:
+            return "DISLOCATION_EVENT_GAP_BELOW_THRESHOLD"
+        if not checks["spike_growth"]:
+            return "DISLOCATION_EVENT_GROWTH_BELOW_THRESHOLD"
+    elif event.kind == "runner_hedge_window":
+        if not checks["runner_gap"]:
+            return "DISLOCATION_EVENT_GAP_BELOW_THRESHOLD"
+        if not checks["runner_growth"]:
+            return "DISLOCATION_EVENT_GROWTH_BELOW_THRESHOLD"
+    else:
+        if not checks["funding_rate"] or not checks["funding_change"]:
+            return "DISLOCATION_EVENT_FUNDING_BELOW_THRESHOLD"
+        if not checks["funding_gap"]:
+            return "DISLOCATION_EVENT_GAP_BELOW_THRESHOLD"
+
+    detected_kind = _emitted_kind(
+        entry_gap, growth, funding, funding_delta, DEFAULT_THRESHOLDS)
+    if detected_kind != event.kind:
+        return "DISLOCATION_EVENT_KIND_MISMATCH"
+
+    quotes = tuple(_event_decimal(event, name) for name in (
+        "spot_bid", "spot_ask", "perp_bid", "perp_ask"))
+    if any(value is None for value in quotes):
+        return "DISLOCATION_EVENT_QUOTES_INVALID"
+    spot_bid, spot_ask, perp_bid, perp_ask = quotes
+    assert spot_bid is not None and spot_ask is not None
+    assert perp_bid is not None and perp_ask is not None
+    if not _quotes_are_consistent(quotes):
+        return "DISLOCATION_EVENT_QUOTES_INVALID"
+    derived_entry, derived_exit = _executable_gaps(
+        spot_bid, spot_ask, perp_bid, perp_ask)
+    if entry_gap != derived_entry or exit_gap != derived_exit:
+        return "DISLOCATION_EVENT_GAP_NOT_DERIVABLE"
+    return None
 
 
 class DislocationDetector:
@@ -349,7 +636,8 @@ class DislocationDetector:
         if observation_gap_ms <= 0:
             return None
         self._previous[symbol] = current
-        if observation_gap_ms > self.thresholds.max_observation_gap_ms:
+        if not _observation_is_continuous(
+                observation_gap_ms, self.thresholds):
             self._episode_active[symbol] = False
             return None
 
@@ -358,42 +646,21 @@ class DislocationDetector:
             abs(current.entry_gap_pct) - abs(previous.entry_gap_pct)
         )
         funding_rate_delta = current.funding_rate - previous.funding_rate
-        violent = (
-            current.surge_ratio >= self.thresholds.min_surge_ratio
-            and abs(price_accel_pct)
-            >= self.thresholds.min_abs_price_accel_pct
-        )
+        violent = _violent_move(
+            current.surge_ratio, price_accel_pct, self.thresholds)
         if not violent:
             self._episode_active[symbol] = False
             return None
         if self._episode_active.get(symbol, False):
             return None
 
-        gap_magnitude = abs(current.entry_gap_pct)
-        funding_dislocation = (
-            abs(current.funding_rate)
-            >= self.thresholds.min_abs_funding_rate
-            and abs(funding_rate_delta)
-            >= self.thresholds.min_abs_funding_rate_change
-            and gap_magnitude >= self.thresholds.min_funding_gap_pct
+        kind = _emitted_kind(
+            current.entry_gap_pct,
+            gap_growth_pct,
+            current.funding_rate,
+            funding_rate_delta,
+            self.thresholds,
         )
-        gap_spike = (
-            gap_magnitude >= self.thresholds.min_gap_spike_pct
-            and gap_growth_pct >= self.thresholds.min_gap_spike_growth_pct
-        )
-        runner_window = (
-            gap_magnitude >= self.thresholds.min_runner_gap_pct
-            and gap_growth_pct >= self.thresholds.min_runner_gap_growth_pct
-        )
-        kind: Optional[DislocationKind]
-        if funding_dislocation:
-            kind = "funding_dislocation"
-        elif gap_spike:
-            kind = "gap_spike"
-        elif runner_window:
-            kind = "runner_hedge_window"
-        else:
-            kind = None
         if kind is None:
             return None
 
@@ -446,4 +713,3 @@ def detect_dislocations(
         if event is not None:
             events.append(event)
     return tuple(events)
-

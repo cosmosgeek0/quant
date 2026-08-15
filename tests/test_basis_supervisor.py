@@ -22,6 +22,8 @@ if str(SRC) not in sys.path:
 import basis_position as bp  # noqa: E402
 import basis_supervisor as bs  # noqa: E402
 import basis_watch as bw  # noqa: E402
+import basis_ladder as bl  # noqa: E402
+from basis_events import DislocationEvent  # noqa: E402
 from basis_position import PositionConfig  # noqa: E402
 from tests.test_basis_position import (  # noqa: E402
     FLAT_POSITION,
@@ -201,7 +203,8 @@ class BasisSupervisorTests(unittest.TestCase):
 
     def run_tick(self, transport, claimant="test-supervisor", *,
                  accept_result=True, governor_result=None,
-                 patch_entry_gates=True):
+                 patch_entry_gates=True, ladder_config=None,
+                 ladder_event=None):
         output = io.StringIO()
         with ExitStack() as stack:
             stack.enter_context(redirect_stdout(output))
@@ -224,8 +227,85 @@ class BasisSupervisorTests(unittest.TestCase):
                         return_value=governor_result))
             code = bs.tick(
                 self.cfg, transport, sleep=lambda _seconds: None,
-                now_ms=lambda: T_OPEN, claimant=claimant)
+                now_ms=lambda: T_OPEN, claimant=claimant,
+                ladder_config=ladder_config,
+                ladder_event=ladder_event)
         return code, output.getvalue()
+
+    def dislocation_event(self, **changes):
+        payload = dict(
+            utc="2025-08-12T12:00:00.000Z",
+            symbol=SYMBOL,
+            kind="gap_spike",
+            entry_gap_pct=Decimal("1.2"),
+            exit_gap_pct=Decimal("1.2"),
+            surge_ratio=Decimal("9"),
+            price_accel_pct=Decimal("0.6"),
+            gap_growth_pct=Decimal("0.6"),
+            funding_rate=Decimal("0.0001"),
+            funding_rate_delta=Decimal("0"),
+            freshness_ms=Decimal("10"),
+            observation_gap_ms=1000,
+            spot_bid=Decimal("100"),
+            spot_ask=Decimal("100.0"),
+            perp_bid=Decimal("101.2"),
+            perp_ask=Decimal("101.2"),
+        )
+        payload.update(changes)
+        return DislocationEvent(**payload)
+
+    def ladder_config(self, *, direction=bl.NORMAL,
+                      reverse_enabled=False, rung_size="10",
+                      max_total_notional=None):
+        size = Decimal(rung_size)
+        maximum = size if max_total_notional is None \
+            else Decimal(max_total_notional)
+        return bs.LadderModeConfig(
+            schedule=((Decimal("0.1"), size),),
+            max_rungs=1,
+            max_total_notional=maximum,
+            min_notional=Decimal("5"),
+            symbol=SYMBOL,
+            direction=direction,
+            reverse_enabled=reverse_enabled,
+            convergence_gap=Decimal("0"),
+        )
+
+    def pending_record(self):
+        return bs._load_pending_record(self.dir)
+
+    def rewrite_pending(self, record, **changes):
+        changed = dataclasses.replace(record, record_digest="", **changes)
+        digest = bs._pending_digest(bs._pending_payload(changed))
+        changed = dataclasses.replace(changed, record_digest=digest)
+        bs._write_pending_record(self.dir, changed)
+        return changed
+
+    def make_pending(self, config, *, size=None, cap=None, event=None):
+        event = event or self.dislocation_event()
+        funding = bl.FundingContext(
+            event.funding_rate - event.funding_rate_delta,
+            event.funding_rate,
+        )
+        intent = bl.advance(
+            bl.LadderState.flat(config.direction),
+            event.entry_gap_pct,
+            event.exit_gap_pct,
+            funding,
+            config.engine,
+            borrow_power=False,
+        ).intent
+        if size is not None:
+            amount = Decimal(size)
+            intent = dataclasses.replace(
+                intent,
+                size=amount,
+                total_notional_after=amount,
+            )
+        candidate = bs._load_candidate(self.cfg, PROPOSAL_ID, T_OPEN)
+        effective = intent.size if cap is None else Decimal(cap)
+        return bs._make_pending_record(
+            config, candidate, intent, effective, event, T_OPEN, 0)
 
     def open_directly(self, spec=None, symbol=SYMBOL,
                       proposal_id=PROPOSAL_ID):
@@ -253,6 +333,552 @@ class BasisSupervisorTests(unittest.TestCase):
         self.assertTrue(claim["utc"].endswith("Z"))
         self.assertLess(output.index("SUPERVISOR | CLAIM | CREATED"),
                         output.index("SUPERVISOR | OPEN | DONE"))
+
+    def test_ladder_event_proposes_through_existing_entry_chain(self):
+        config = self.ladder_config(rung_size="6")
+        transport = ScriptedTransport(happy_spec())
+
+        code, output = self.run_tick(
+            transport, ladder_config=config,
+            ladder_event=self.dislocation_event())
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertIn("SUPERVISOR | RUNG-GATE | PASS", output)
+        self.assertIn("SUPERVISOR | LADDER | PROPOSED | ADD_RUNG", output)
+        self.assertLess(output.index("SUPERVISOR | LADDER | PROPOSED"),
+                        output.index("SUPERVISOR | CLAIM | CREATED"))
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+        self.assertEqual(self.governor_jobs[0][0].effective_notional,
+                         Decimal("6"))
+        self.assertLessEqual(
+            Decimal(transport.posts[0][1]["quoteOrderQty"]), Decimal("6"))
+        pending = self.pending_record()
+        self.assertEqual(pending.proposal_id, PROPOSAL_ID)
+        self.assertEqual(pending.effective_cap, Decimal("6"))
+        self.assertFalse(hasattr(config, "state"))
+
+    def test_finding_1_pending_oversize_is_refused_before_entry_chain(self):
+        config = self.ladder_config(
+            rung_size="32", max_total_notional="6")
+        bs._write_pending_record(
+            self.dir, self.make_pending(config, size="32", cap="6"))
+        transport = ScriptedTransport(happy_spec())
+
+        with mock.patch.object(bs, "_claim") as claim, \
+                mock.patch.object(bs, "cmd_open") as open_call, \
+                mock.patch.object(bs, "_acquire_governor") as acquire:
+            code, output = self.run_tick(
+                transport, ladder_config=config,
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_SIZE_OUT_OF_BOUNDS", output)
+        self.assertEqual(transport.calls, [])
+        claim.assert_not_called()
+        open_call.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_finding_3_pending_reverse_is_refused_before_entry_chain(self):
+        config = self.ladder_config(direction=bl.REVERSE)
+        transport = ScriptedTransport(happy_spec())
+
+        with mock.patch.object(bs, "_claim") as claim, \
+                mock.patch.object(bs, "cmd_open") as open_call:
+            code, output = self.run_tick(
+                transport, ladder_config=config,
+                ladder_event=self.dislocation_event(),
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        self.assertIn("REVERSE_DIRECTION_DISABLED", output)
+        self.assertEqual(transport.calls, [])
+        claim.assert_not_called()
+        open_call.assert_not_called()
+
+    def test_finding_4_quiet_kind_event_is_refused(self):
+        event = self.dislocation_event(
+            kind="quiet_gap",
+            surge_ratio=Decimal("0"),
+            price_accel_pct=Decimal("0"),
+            gap_growth_pct=Decimal("0"),
+            freshness_ms=Decimal("999999"),
+        )
+        transport = ScriptedTransport(happy_spec())
+
+        with mock.patch.object(bs, "_claim") as claim, \
+                mock.patch.object(bs, "cmd_open") as open_call:
+            code, output = self.run_tick(
+                transport, ladder_config=self.ladder_config(),
+                ladder_event=event, patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        self.assertIn("DISLOCATION_EVENT_KIND_NOT_ACTIONABLE", output)
+        self.assertEqual(transport.calls, [])
+        claim.assert_not_called()
+        open_call.assert_not_called()
+
+    def test_finding_4_stale_utc_event_is_refused(self):
+        stale_utc = datetime.fromtimestamp(
+            (T_OPEN - 5001) / 1000, timezone.utc).isoformat(
+                timespec="milliseconds").replace("+00:00", "Z")
+        event = self.dislocation_event(utc=stale_utc)
+
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()),
+            ladder_config=self.ladder_config(), ladder_event=event,
+            patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        self.assertIn("DISLOCATION_EVENT_UTC_STALE", output)
+
+    def test_finding_4_sub_threshold_event_is_refused(self):
+        event = self.dislocation_event(
+            entry_gap_pct=Decimal("0.2"),
+            exit_gap_pct=Decimal("0.2"),
+            perp_bid=Decimal("100.2"),
+            perp_ask=Decimal("100.2"),
+        )
+
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()),
+            ladder_config=self.ladder_config(), ladder_event=event,
+            patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        self.assertIn("DISLOCATION_EVENT_GAP_BELOW_THRESHOLD", output)
+
+    def test_ladder_chain_refusal_keeps_rung_unheld(self):
+        config = self.ladder_config()
+        transport = ScriptedTransport(happy_spec())
+
+        code, output = self.run_tick(
+            transport, accept_result=False, ladder_config=config,
+            ladder_event=self.dislocation_event())
+
+        expected = "ENTRY_BLOCKED_NOT_ACCEPTED"
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertIn("SUPERVISOR | ENTRY | HELD | %s" % expected, output)
+        self.assertIn("SUPERVISOR | LADDER | REFUSED | %s" % expected,
+                      output)
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(self.position())
+        self.assertIsNotNone(self.pending_record())
+
+    def test_ladder_revalidation_refusal_keeps_position_reason(self):
+        config = self.ladder_config()
+        spec = happy_spec()
+        spec["spot_book"] = {
+            "symbol": SYMBOL, "bidPrice": "100.9", "askPrice": "101.0"}
+        spec["usdm_book"] = {
+            "symbol": SYMBOL, "bidPrice": "100.2", "askPrice": "100.3",
+            "time": T_OPEN}
+        transport = ScriptedTransport(spec)
+
+        code, output = self.run_tick(
+            transport, ladder_config=config,
+            ladder_event=self.dislocation_event())
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertIn("NOTE: ENTRY_REVALIDATION_FAILED:", output)
+        self.assertIn("SUPERVISOR | LADDER | REFUSED | "
+                      "ENTRY_REVALIDATION_FAILED:", output)
+        self.assertEqual(transport.posts, [])
+        self.assertIsNotNone(self.pending_record())
+
+    def test_ladder_state_waits_for_resume_fill_reconciliation(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        config = self.ladder_config()
+
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        pending = self.pending_record()
+        self.assertIsNotNone(pending)
+
+        reconciled = PositionSequenceTransport(
+            happy_spec(),
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]],
+        )
+        code, output = self.run_tick(
+            reconciled, ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertIn("SUPERVISOR | LADDER | RECONCILED | "
+                      "RUNG_FILL_CONFIRMED", output)
+        gate = bs.validate_rung_gate(
+            config, pending, None, self.position())
+        self.assertEqual(gate.outcome, bs.RUNG_GATE_PASS)
+        self.assertEqual(len(gate.state.rungs), 1)
+        self.assertEqual(gate.state.rungs[0].size, Decimal("9.9"))
+
+    def test_finding_2_own_fill_evidence_missing_freezes_rung(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        config = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+
+        resume_spec = happy_spec()
+        resume_spec["legs"]["enter_short"] = {"query": [MISSING]}
+        reconciled = PositionSequenceTransport(
+            resume_spec,
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]],
+        )
+        code, output = self.run_tick(reconciled, ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_PROVENANCE_INVALID", output)
+        self.assertNotIn("RUNG_FILL_CONFIRMED", output)
+        self.assertEqual(
+            bs.validate_rung_gate(
+                config, self.pending_record(), None, self.position()).outcome,
+            bs.RUNG_GATE_FROZEN)
+
+    def test_finding_5_reconciliation_uses_effective_entry_cap(self):
+        config = self.ladder_config(rung_size="32")
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            ladder_event=self.dislocation_event())
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        pending = self.pending_record()
+        self.assertEqual(pending.intent_size, Decimal("32"))
+        self.assertEqual(pending.effective_cap, Decimal("8"))
+
+        reconciled = PositionSequenceTransport(
+            happy_spec(),
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]],
+        )
+        code, output = self.run_tick(reconciled, ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_SIZE_OUT_OF_BOUNDS", output)
+        self.assertEqual(self.pending_record().effective_cap, Decimal("8"))
+
+    def test_finding_7_immutable_config_has_no_ladder_residue_surface(self):
+        config = self.ladder_config()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            config.max_total_notional = Decimal("99")
+        self.assertFalse(hasattr(bs, "LadderProposalSource"))
+        self.assertFalse(hasattr(config, "state"))
+
+    def test_finding_7_projection_error_is_contained(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        config = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+
+        reconciled = PositionSequenceTransport(
+            happy_spec(),
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]],
+        )
+        with mock.patch.object(
+                bs, "_reconciled_rung_notional",
+                side_effect=RuntimeError("local test condition")):
+            code, output = self.run_tick(
+                reconciled, ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_PROVENANCE_INVALID", output)
+        self.assertNotIn("RUNG_FILL_CONFIRMED", output)
+
+    def test_ladder_reverse_direction_is_refused_by_default(self):
+        config = self.ladder_config(direction=bl.REVERSE)
+        transport = ScriptedTransport(happy_spec())
+
+        with mock.patch.object(bs, "_claim") as claim, \
+                mock.patch.object(bs, "cmd_open") as open_call:
+            code, output = self.run_tick(
+                transport, ladder_config=config,
+                ladder_event=self.dislocation_event(),
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        self.assertIn("REVERSE_DIRECTION_DISABLED", output)
+        self.assertEqual(transport.calls, [])
+        claim.assert_not_called()
+        open_call.assert_not_called()
+
+    def test_ladder_stop_keeps_exit_and_reconciliation_available(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        config = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+
+        Path(self.dir, bp.STOP_FILE).touch()
+        closing_spec = happy_spec()
+        closing_spec["spot_book"] = {
+            "symbol": SYMBOL, "bidPrice": "100.0", "askPrice": "100.0"}
+        closing_spec["usdm_book"] = {
+            "symbol": SYMBOL, "bidPrice": "100.0", "askPrice": "100.1",
+            "time": T_OPEN}
+        closing = PositionSequenceTransport(
+            closing_spec,
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}],
+             FLAT_POSITION],
+        )
+
+        with mock.patch.object(
+                bs, "_entry_ticket_refusal",
+                side_effect=AssertionError("exit consulted entry ticket")), \
+                mock.patch.object(
+                    bs, "_acquire_governor",
+                    side_effect=AssertionError("exit consulted governor")):
+            code, output = self.run_tick(
+                closing, ladder_config=config,
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertEqual(post_stages(closing.base),
+                         ["exit_short", "exit_spot"])
+        self.assertIn("SUPERVISOR | RECONCILE | DONE", output)
+        self.assertIn("SUPERVISOR | CLOSE-RECONCILE | DONE", output)
+        self.assertIn("SUPERVISOR | LADDER | RECONCILED | "
+                      "RUNG_EXIT_FILL_CONFIRMED", output)
+
+        with mock.patch.object(bs, "_claim") as claim, \
+                mock.patch.object(bs, "cmd_open") as open_call:
+            code, output = self.run_tick(
+                ScriptedTransport(happy_spec()), ladder_config=config,
+                ladder_event=self.dislocation_event(),
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_IDLE, output)
+        self.assertIn("SUPERVISOR | ENTRY | SKIPPED | STOP file present",
+                      output)
+        self.assertIn("SUPERVISOR | LADDER | REFUSED | STOP file present",
+                      output)
+        claim.assert_not_called()
+        open_call.assert_not_called()
+
+    def test_ir2_a1_caller_state_change_cannot_stale_receipt_headroom(self):
+        config = self.ladder_config(
+            rung_size="6", max_total_notional="6")
+        caller_state = [bl.LadderState.flat()]
+
+        def change_caller_state(*_args, **_kwargs):
+            caller_state[0] = bl.LadderState(
+                bl.NORMAL, (bl.Rung(Decimal("1.2"), Decimal("6")),))
+            return ""
+
+        transport = ScriptedTransport(happy_spec())
+        with mock.patch.object(
+                bs, "_entry_ticket_refusal",
+                side_effect=change_caller_state), \
+                mock.patch.object(bs, "_consume_accept_one",
+                                  return_value=True), \
+                mock.patch.object(bs, "_acquire_governor",
+                                  side_effect=self.acquire_governor):
+            code, output = self.run_tick(
+                transport, ladder_config=config,
+                ladder_event=self.dislocation_event(),
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertEqual(caller_state[0].total_notional, Decimal("6"))
+        self.assertLessEqual(
+            Decimal(transport.posts[0][1]["quoteOrderQty"]), Decimal("6"))
+        self.assertFalse(hasattr(config, "state"))
+
+    def test_ir2_a2_reverse_resume_is_refused_before_rung_credit(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        normal = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=normal,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        reverse = self.ladder_config(direction=bl.REVERSE)
+        self.rewrite_pending(
+            self.pending_record(),
+            direction=bl.REVERSE,
+            config_digest=bs._ladder_config_digest(reverse),
+        )
+        reconciled = PositionSequenceTransport(
+            happy_spec(),
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]],
+        )
+
+        code, output = self.run_tick(
+            reconciled, ladder_config=reverse)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("REVERSE_DIRECTION_DISABLED", output)
+        self.assertNotIn("RUNG_FILL_CONFIRMED", output)
+
+    def test_ir2_a3_foreign_entry_ids_do_not_bind_to_pending_proposal(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        config = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        position = self.position()
+        replacements = {}
+        renamed = {}
+        for old_id, meta in position["client_ids"].items():
+            new_id = "basis-foreign-%s" % meta["stage"].lower()
+            replacements[old_id] = new_id
+            renamed[new_id] = dict(meta)
+        position["client_ids"] = renamed
+        for leg in position["legs"]:
+            leg["client_id"] = replacements[leg["client_id"]]
+        bp.save_position(self.dir, position)
+        reconciled = PositionSequenceTransport(
+            happy_spec(),
+            [[{"symbol": SYMBOL, "positionAmt": "-0.098"}]],
+        )
+
+        code, output = self.run_tick(
+            reconciled, ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_PROVENANCE_INVALID", output)
+        self.assertNotIn("RUNG_FILL_CONFIRMED", output)
+
+    def test_ir2_a3_unknown_leg_terminal_resume_credits_own_pair(self):
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+        config = self.ladder_config()
+        uncertain = happy_spec()
+
+        def pending_short(params):
+            return ("ok", {
+                "symbol": SYMBOL,
+                "status": "NEW",
+                "clientOrderId": params["origClientOrderId"],
+                "executedQty": "0.098",
+                "cumQuote": "9.9",
+                "orderId": 22,
+            })
+
+        uncertain["legs"]["enter_short"] = {
+            "submit": ("unclear", {"http": 504}),
+            "query": [pending_short],
+        }
+        code, output = self.run_tick(
+            ScriptedTransport(uncertain), ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertEqual(self.position()["state"], bp.ST_UNKNOWN)
+        short_leg = [leg for leg in self.position()["legs"]
+                     if leg["stage"] == bp.ENTER_SHORT][0]
+        self.assertEqual(short_leg["outcome"], "unknown")
+
+        resume_spec = happy_spec()
+        resume_spec["position"] = [
+            {"symbol": SYMBOL, "positionAmt": "-0.098"}]
+        code, output = self.run_tick(
+            ScriptedTransport(resume_spec), ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertIn("RUNG_FILL_CONFIRMED", output)
+        self.assertEqual(
+            bs.validate_rung_gate(
+                config, self.pending_record(), None, self.position()).outcome,
+            bs.RUNG_GATE_PASS)
+
+    def test_ir2_a5_restart_keeps_the_effective_entry_cap(self):
+        config = self.ladder_config(rung_size="32")
+        first = ScriptedTransport(happy_spec())
+        code, output = self.run_tick(
+            first, accept_result=False, ladder_config=config,
+            ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        self.assertEqual(self.pending_record().effective_cap, Decimal("8"))
+        Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
+
+        second = ScriptedTransport(happy_spec())
+        code, output = self.run_tick(second, ladder_config=config)
+
+        self.assertEqual(code, bs.EXIT_ACTED, output)
+        self.assertLessEqual(
+            Decimal(second.posts[0][1]["quoteOrderQty"]), Decimal("8"))
+        self.assertEqual(self.pending_record().effective_cap, Decimal("8"))
+
+    def test_ir2_a6_pending_apply_is_transactional_and_freezes_cleanly(self):
+        config = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), accept_result=False,
+            ladder_config=config, ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        path = os.path.join(self.dir, bs.PENDING_RUNG_FILE)
+        with open(path, "rb") as handle:
+            prior = handle.read()
+        next_record = self.rewrite_pending(
+            self.pending_record(), created_ms=T_OPEN + 1)
+        with open(path, "wb") as handle:
+            handle.write(prior)
+        real_replace = os.replace
+
+        def refuse_pending_replace(source, destination):
+            if destination == path:
+                raise OSError("local replace condition")
+            return real_replace(source, destination)
+
+        with mock.patch.object(
+                bs.os, "replace", side_effect=refuse_pending_replace):
+            with self.assertRaises(bp.PositionError):
+                bs._write_pending_record(self.dir, next_record)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), prior)
+
+        os.unlink(path)
+        os.unlink(self.claim_path())
+        with mock.patch.object(
+                bs, "_write_pending_record",
+                side_effect=bp.PositionError("local write condition")):
+            code, output = self.run_tick(
+                ScriptedTransport(happy_spec()), ladder_config=config,
+                ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("SUPERVISOR | LADDER | FROZEN", output)
+        self.assertFalse(os.path.exists(path))
+
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), ladder_config=config,
+            patch_entry_gates=False)
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_RECORD_MISSING", output)
+
+    def test_ir2_b1_eventless_pending_record_refuses_before_entry(self):
+        config = self.ladder_config()
+        code, output = self.run_tick(
+            ScriptedTransport(happy_spec()), accept_result=False,
+            ladder_config=config, ladder_event=self.dislocation_event())
+        self.assertEqual(code, bs.EXIT_HELD, output)
+        path = os.path.join(self.dir, bs.PENDING_RUNG_FILE)
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload.pop("event")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+
+        transport = ScriptedTransport(happy_spec())
+        with mock.patch.object(bs, "cmd_open") as open_call:
+            code, output = self.run_tick(
+                transport, ladder_config=config,
+                patch_entry_gates=False)
+
+        self.assertEqual(code, bs.EXIT_FROZEN, output)
+        self.assertIn("PENDING_RUNG_RECORD_INVALID", output)
+        self.assertEqual(transport.calls, [])
+        open_call.assert_not_called()
+
+    def test_ir2_b3_new_shape_removes_mutable_source_surface(self):
+        config = self.ladder_config()
+        parameters = bs.tick.__code__.co_varnames[
+            :bs.tick.__code__.co_argcount + bs.tick.__code__.co_kwonlyargcount]
+        self.assertNotIn("ladder_source", parameters)
+        self.assertIn("ladder_config", parameters)
+        self.assertFalse(hasattr(bs, "LadderProposalSource"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            config.direction = bl.REVERSE
 
     def test_entry_without_accept_one_is_held_before_governor_or_open(self):
         transport = ScriptedTransport(happy_spec())
