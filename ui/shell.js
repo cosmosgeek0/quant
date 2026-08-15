@@ -161,7 +161,9 @@
     pageEl.textContent = "";
     stopNewsPoll();
     stopNetHealthPoll();
-    destroyNetCharts();
+    destroyStatPanels();
+    netTable = null;
+    netTableHasCadence = false;
     if (h === "network") {
       sigPage = pageEl;
       buildNetworkPage(pageEl);
@@ -294,6 +296,30 @@
     if (TEL.t.length > TEL_CAP) {
       for (var k in TEL) {
         if (Object.prototype.hasOwnProperty.call(TEL, k)) { TEL[k].shift(); }
+      }
+    }
+    sampleStatuses();
+  }
+
+  /* per-component status ring (status-page uptime-bar material):
+     one sample per strip poll — ok/warn/bad, null when off/unknown. */
+  var STAT_HIST = {};
+  var STAT_HIST_CAP = 90;
+
+  function sampleStatuses() {
+    if (typeof CONNECTIONS === "undefined") { return; }
+    for (var i = 0; i < CONNECTIONS.length; i++) {
+      var def = CONNECTIONS[i];
+      if (!STAT_HIST[def.id]) { STAT_HIST[def.id] = []; }
+      var sample = null;
+      if (def.live && connState[def.id]) {
+        var cls = connLive(def.id).cls;
+        sample = cls === "ok" || cls === "warn" || cls === "bad"
+          ? cls : null;
+      }
+      STAT_HIST[def.id].push(sample);
+      if (STAT_HIST[def.id].length > STAT_HIST_CAP) {
+        STAT_HIST[def.id].shift();
       }
     }
   }
@@ -512,72 +538,130 @@
     return { cls: "", val: "via host" };
   }
 
-  function refreshConnRows() {
-    if (!sigPage) { return; }
-    var rows2 = sigPage.querySelectorAll(".conn-row");
-    for (var i = 0; i < rows2.length; i++) {
-      var id = rows2[i].getAttribute("data-conn");
-      var def = null;
-      for (var k = 0; k < CONNECTIONS.length; k++) {
-        if (CONNECTIONS[k].id === id) { def = CONNECTIONS[k]; }
-      }
-      var dot = rows2[i].querySelector(".conn-dot");
-      var val = rows2[i].querySelector(".conn-val");
-      var stat = rows2[i].querySelector(".conn-status");
-      var on = connState[id];
-      rows2[i].classList.toggle("off", !on);
-      if (!on) {
-        dot.className = "conn-dot";
-        val.textContent = def && def.control === "pause"
-          ? "polling paused" : "off";
-        if (stat) { stat.className = "conn-status"; stat.textContent = "Off"; }
-        continue;
-      }
-      if (def && def.live) {
-        var lv = connLive(id);
-        dot.className = "conn-dot" + (lv.cls ? " " + lv.cls : "");
-        val.textContent = lv.val;
-        if (stat) {
-          stat.className = "conn-status" + (lv.cls ? " " + lv.cls : "");
-          stat.textContent = connStatusText(lv.cls) || "Measuring";
-        }
-      } else {
-        dot.className = "conn-dot";
-        val.textContent = def && def.id === "binance" ? "via host" : "SSM only";
-        if (stat) {
-          stat.className = "conn-status";
-          stat.textContent = "Owner gated";
-        }
-      }
+  function rowStatus(def) {
+    /* one place computes a row's value + status pair */
+    if (!connState[def.id]) {
+      return { value: def.control === "pause" ? "polling paused" : "off",
+        statusCls: "", statusText: "Off" };
     }
+    if (def.live) {
+      var lv = connLive(def.id);
+      return { value: lv.val,
+        statusCls: lv.cls || "",
+        statusText: connStatusText(lv.cls) || "Measuring" };
+    }
+    return { value: def.id === "binance" ? "via host" : "SSM only",
+      statusCls: "", statusText: "Owner gated" };
   }
 
-  /* telemetry panels — five live line charts over the session series,
-     drawn with the vendored uPlot (TradingView-class canvas engine). */
-  var TEL_DEFS = [
-    { key: "rtt", label: "Server RTT", unit: "ms", color: "#3b82f6",
+  function connCadence(def) {
+    if (def.id === "server") {
+      return { kind: "select", value: pollCfg.strip,
+        options: [5, 10, 30, 60] };
+    }
+    if (def.id === "newsloop") {
+      return { kind: "fixed", text: "120s · process-set" };
+    }
+    if (def.id === "mirror") {
+      var iv = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
+      return (typeof iv === "number" && iv > 0)
+        ? { kind: "fixed", text: Math.round(iv / 1000) + "s pull" }
+        : null;
+    }
+    return null;
+  }
+
+  function buildTableModel() {
+    var groups = [];
+    for (var gi = 0; gi < CONN_GROUPS.length; gi++) {
+      var rows3 = [];
+      for (var mi = 0; mi < CONNECTIONS.length; mi++) {
+        var def = CONNECTIONS[mi];
+        if (def.group !== CONN_GROUPS[gi][0]) { continue; }
+        var st = rowStatus(def);
+        rows3.push({
+          id: def.id,
+          name: def.name,
+          detail: def.detail,
+          statusCls: st.statusCls,
+          statusText: st.statusText,
+          value: st.value,
+          bars: STAT_HIST[def.id] ? STAT_HIST[def.id].slice() : null,
+          cadence: connCadence(def),
+          canRefresh: def.id === "server" || def.id === "newsloop" ||
+            def.live === "health",
+          active: !!connState[def.id],
+          gated: def.group === "boundary"
+        });
+      }
+      if (rows3.length) {
+        groups.push({ id: CONN_GROUPS[gi][0], label: CONN_GROUPS[gi][1],
+          rows: rows3 });
+      }
+    }
+    return {
+      groups: groups,
+      callbacks: {
+        onToggle: function (id, on) {
+          if (connState[id] === on) { return; }
+          connState[id] = on;
+          var tdef = null;
+          for (var i = 0; i < CONNECTIONS.length; i++) {
+            if (CONNECTIONS[i].id === id) { tdef = CONNECTIONS[i]; }
+          }
+          if (tdef && tdef.control === "pause") {
+            pollCfg.paused = !on;
+            savePollCfg();
+          }
+          if (tdef && tdef.control === "news") { setMaster(on); }
+          renderSigAll();
+        },
+        onRefresh: function (id) {
+          if (id === "server") { pollStrip(); }
+          else if (id === "newsloop") { fetchNews(true); }
+          else { fetchNetHealth(); }
+        },
+        onCadence: function (id, sec) {
+          if (id !== "server") { return; }
+          pollCfg.strip = sec;
+          savePollCfg();
+          restartStripPoll();
+          if ((location.hash || "").slice(1) === "network") {
+            startNetHealthPoll();
+          }
+        }
+      }
+    };
+  }
+
+  /* stat panels — Grafana-stat-panel grade: big threshold-colored
+     value + axis-free area sparkline (QNet.spark, codex-built module
+     on the vendored uPlot). One data accent; status colors reserved
+     for the value. */
+  var STAT_DEFS = [
+    { key: "rtt", label: "Server RTT", unit: "ms",
       cls: function (v) {
         return v == null ? "bad" : (v >= 800 ? "bad" : (v >= 350 ? "warn" : "ok"));
       } },
-    { key: "mirror", label: "Mirror age", unit: "s", color: "#16a34a",
+    { key: "mirror", label: "Mirror age", unit: "s",
       cls: function (v) {
         var wb = mirrorWarnBad();
         return v == null ? "bad" : (v > wb[1] ? "bad" : (v > wb[0] ? "warn" : "ok"));
       } },
-    { key: "market", label: "Feed age", unit: "s", color: "#d4a406",
+    { key: "market", label: "Feed age", unit: "s",
       cls: function (v) {
         return v == null ? "bad" : (v > 120 ? "bad" : (v > 45 ? "warn" : "ok"));
       } },
-    { key: "supervisor", label: "Supervisor age", unit: "s", color: "#8b5cf6",
+    { key: "supervisor", label: "Supervisor age", unit: "s",
       cls: function (v) {
         return v == null ? "bad" : (v > 600 ? "bad" : (v > 240 ? "warn" : "ok"));
       } },
-    { key: "news", label: "News loop age", unit: "s", color: "#2ebd85",
+    { key: "news", label: "News loop age", unit: "s",
       cls: function (v) {
         return v == null ? "" : (v > 900 ? "bad" : (v > 300 ? "warn" : "ok"));
       } }
   ];
-  var netCharts = [];
+  var statPanels = [];
 
   function telLast(key) {
     var arr = TEL[key];
@@ -587,85 +671,67 @@
     return null;
   }
 
-  function destroyNetCharts() {
-    for (var i = 0; i < netCharts.length; i++) {
-      if (netCharts[i].u) { netCharts[i].u.destroy(); }
+  function destroyStatPanels() {
+    for (var i = 0; i < statPanels.length; i++) {
+      if (statPanels[i].handle) { statPanels[i].handle.destroy(); }
     }
-    netCharts = [];
+    statPanels = [];
   }
 
-  function buildNetGrid() {
-    destroyNetCharts();
+  function buildStatGrid() {
+    destroyStatPanels();
     var grid = document.createElement("div");
-    grid.className = "net-grid";
-    var css = getComputedStyle(document.documentElement);
-    var axisInk = css.getPropertyValue("--muted").trim() || "#5d5d5d";
-    var gridLn = css.getPropertyValue("--line").trim() || "rgba(0,0,0,0.07)";
-    for (var i = 0; i < TEL_DEFS.length; i++) {
+    grid.className = "qnet-statgrid";
+    for (var i = 0; i < STAT_DEFS.length; i++) {
       (function (def) {
         var panel = document.createElement("div");
-        panel.className = "net-panel";
+        panel.className = "qnet-stat";
         var head = document.createElement("div");
-        head.className = "net-panel-h";
+        head.className = "qnet-stat-h";
         var em = document.createElement("em");
         em.textContent = def.label;
         var val = document.createElement("b");
         val.textContent = "—";
+        var un = document.createElement("small");
+        un.textContent = def.unit;
         head.appendChild(em);
         head.appendChild(val);
+        head.appendChild(un);
         var plot = document.createElement("div");
-        plot.className = "net-plot";
+        plot.className = "qnet-stat-plot";
         panel.appendChild(head);
         panel.appendChild(plot);
         grid.appendChild(panel);
-        netCharts.push({ def: def, valEl: val, plotEl: plot, u: null,
-          axisInk: axisInk, gridLn: gridLn });
-      })(TEL_DEFS[i]);
+        statPanels.push({ def: def, valEl: val, plotEl: plot, handle: null });
+      })(STAT_DEFS[i]);
     }
     return grid;
   }
 
-  function mountNetCharts() {
-    if (typeof uPlot === "undefined") { return; }
-    for (var i = 0; i < netCharts.length; i++) {
-      (function (c) {
-        if (c.u || !c.plotEl.isConnected) { return; }
-        var w = Math.max(220, c.plotEl.clientWidth);
-        c.u = new uPlot({
-          width: w,
-          height: 96,
-          padding: [6, 4, 0, 0],
-          cursor: { y: false },
-          legend: { show: false },
-          scales: { x: { time: true } },
-          series: [
-            {},
-            { stroke: c.def.color, width: 1.5, spanGaps: false,
-              points: { show: false } }
-          ],
-          axes: [
-            { stroke: c.axisInk, size: 26,
-              font: "9.5px InterVariable, sans-serif",
-              ticks: { show: false }, grid: { show: false } },
-            { stroke: c.axisInk, size: 34,
-              font: "9.5px InterVariable, sans-serif",
-              ticks: { show: false },
-              grid: { stroke: c.gridLn, width: 1 } }
-          ]
-        }, [TEL.t, TEL[c.def.key]], c.plotEl);
-      })(netCharts[i]);
+  function mountStatPanels() {
+    if (!window.QNet || !QNet.spark) { return; }
+    for (var i = 0; i < statPanels.length; i++) {
+      var pn = statPanels[i];
+      if (!pn.handle && pn.plotEl.isConnected) {
+        pn.handle = QNet.spark.mount(pn.plotEl, {
+          data: [TEL.t, TEL[pn.def.key]],
+          height: 86,
+          unit: pn.def.unit
+        });
+      }
     }
   }
 
-  function updateNetCharts() {
-    for (var i = 0; i < netCharts.length; i++) {
-      var c = netCharts[i];
-      if (!c.plotEl.isConnected) { continue; }
-      if (c.u) { c.u.setData([TEL.t, TEL[c.def.key]]); }
-      var v = telLast(c.def.key);
-      c.valEl.textContent = v == null ? "—"
-        : Math.round(v) + " " + c.def.unit;
-      c.valEl.className = c.def.cls(v);
+  function updateStatPanels() {
+    for (var i = 0; i < statPanels.length; i++) {
+      var pn = statPanels[i];
+      if (!pn.plotEl.isConnected) { continue; }
+      if (pn.handle) {
+        pn.handle.setData([TEL.t, TEL[pn.def.key]]);
+      }
+      var v = telLast(pn.def.key);
+      pn.valEl.textContent = v == null ? "—" : String(Math.round(v));
+      pn.valEl.className = pn.def.cls(v);
     }
   }
 
@@ -673,11 +739,9 @@
   window.addEventListener("resize", function () {
     if (netResizeTimer) { clearTimeout(netResizeTimer); }
     netResizeTimer = setTimeout(function () {
-      for (var i = 0; i < netCharts.length; i++) {
-        var c = netCharts[i];
-        if (c.u && c.plotEl.isConnected) {
-          c.u.setSize({ width: Math.max(220, c.plotEl.clientWidth),
-            height: 96 });
+      for (var i = 0; i < statPanels.length; i++) {
+        if (statPanels[i].handle && statPanels[i].plotEl.isConnected) {
+          statPanels[i].handle.resize();
         }
       }
     }, 180);
@@ -740,243 +804,84 @@
     page.appendChild(headRow);
     page.appendChild(sub);
     page.appendChild(note);
-    page.appendChild(buildNetGrid());
+    page.appendChild(buildStatGrid());
     var telNote = document.createElement("div");
-    telNote.className = "net-note";
+    telNote.className = "qnet-note";
     telNote.textContent = "This session · one sample per status poll (" +
       pollCfg.strip + "s) · gaps are missed polls · durable history " +
       "arrives with a telemetry contract.";
     page.appendChild(telNote);
 
-    var cols = document.createElement("div");
-    cols.className = "conn-cols";
-    var mainCol = document.createElement("div");
-    mainCol.className = "conn-main";
-    var sideCol = document.createElement("div");
-    sideCol.className = "conn-side";
     var pathHead = document.createElement("div");
-    pathHead.className = "rbox-h";
-    pathHead.style.padding = "0 0 4px";
-    var ph1 = document.createElement("span");
-    ph1.className = "rbox-title";
+    pathHead.className = "conn-head-row";
+    pathHead.style.marginTop = "26px";
+    var ph1 = document.createElement("div");
+    ph1.className = "conn-title";
     ph1.textContent = "Connection path";
     var ph2 = document.createElement("span");
-    ph2.className = "rbox-sub conn-assessed";
+    ph2.className = "conn-overall conn-assessed";
     ph2.textContent = lastStripAt
-      ? "Assessed " + Math.max(0, Math.round((Date.now() - lastStripAt) / 1000)) + "s ago"
+      ? "Assessed " + Math.max(0, Math.round(
+          (Date.now() - lastStripAt) / 1000)) + "s ago"
       : "Connecting";
-    pathHead.appendChild(ph1);
-    pathHead.appendChild(ph2);
-    mainCol.appendChild(pathHead);
-    var list = document.createElement("div");
-    list.className = "conn-list";
-    function addGroupTitle(text) {
-      var gt = document.createElement("div");
-      gt.className = "conn-group-title";
-      gt.textContent = text;
-      list.appendChild(gt);
-    }
-    function addConnRow(def) {
-      (function (def) {
-        var row = document.createElement("div");
-        row.className = "conn-row";
-        row.setAttribute("data-conn", def.id);
-        var dot = document.createElement("span");
-        dot.className = "conn-dot";
-        var main = document.createElement("div");
-        main.className = "conn-main";
-        var nm = document.createElement("div");
-        nm.className = "conn-name"; nm.textContent = def.name;
-        var dt = document.createElement("div");
-        dt.className = "conn-detail"; dt.textContent = def.detail;
-        main.appendChild(nm); main.appendChild(dt);
-        var val = document.createElement("span");
-        val.className = "conn-val"; val.textContent = "—";
-        var sw = document.createElement("button");
-        sw.className = "switch";
-        sw.setAttribute("role", "switch");
-        sw.setAttribute("aria-checked", connState[def.id] ? "true" : "false");
-        sw.setAttribute("aria-label", def.name + " connection");
-        var knob = document.createElement("span");
-        knob.className = "knob";
-        sw.appendChild(knob);
-        sw.addEventListener("click", function () {
-          connState[def.id] = !connState[def.id];
-          if (def.control === "pause") {
-            pollCfg.paused = !connState[def.id];
-            savePollCfg();
-          }
-          if (def.control === "news") {
-            setMaster(connState[def.id]);
-          }
-          sw.setAttribute("aria-checked",
-            connState[def.id] ? "true" : "false");
-          refreshConnRows();
-        });
-        var rec = document.createElement("button");
-        rec.className = "conn-recover";
-        var recAllowed = (def.id === "server" || def.id === "newsloop");
-        var rsvg2 = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
-          stroke: "currentColor", "stroke-linecap": "round",
-          "stroke-linejoin": "round" });
-        rsvg2.appendChild(svgEl("path", {
-          d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
-        rsvg2.appendChild(svgEl("path", { d: "M3 3v5h5" }));
-        rec.appendChild(rsvg2);
-        if (recAllowed) {
-          rec.setAttribute("data-tip", "Refresh now");
-          rec.addEventListener("click", function () {
-            rec.classList.add("kick");
-            setTimeout(function () { rec.classList.remove("kick"); }, 650);
-            if (def.id === "server") { pollStrip(); }
-            if (def.id === "newsloop") { fetchNews(true); }
-          });
-        } else {
-          rec.setAttribute("disabled", "");
-          rec.title = "Control preview required — recovery lands with the wiring build";
-        }
-        var rightCol = document.createElement("span");
-        rightCol.className = "conn-right";
-        var stat = document.createElement("span");
-        stat.className = "conn-status";
-        stat.textContent = "";
-        rightCol.appendChild(val);
-        rightCol.appendChild(stat);
-        row.appendChild(dot);
-        row.appendChild(main);
-        row.appendChild(rightCol);
-        row.appendChild(rec);
-        row.appendChild(sw);
-        list.appendChild(row);
-      })(def);
-    }
-    for (var gi = 0; gi < CONN_GROUPS.length; gi++) {
-      var members = [];
-      for (var mi = 0; mi < CONNECTIONS.length; mi++) {
-        if (CONNECTIONS[mi].group === CONN_GROUPS[gi][0]) {
-          members.push(CONNECTIONS[mi]);
-        }
-      }
-      if (!members.length) { continue; }
-      addGroupTitle(CONN_GROUPS[gi][1]);
-      for (var mj = 0; mj < members.length; mj++) { addConnRow(members[mj]); }
-    }
-    mainCol.appendChild(list);
-    cols.appendChild(mainCol);
-    sideCol.appendChild(pollingBox());
-    cols.appendChild(sideCol);
-    page.appendChild(cols);
-    container.appendChild(page);
-    mountNetCharts();
-    updateNetCharts();
-    refreshConnRows();
-    renderSigAll();
-  }
-
-  function pollingBox() {
-    var box = document.createElement("div");
-    box.className = "rbox";
-    var head = document.createElement("div");
-    head.className = "rbox-h";
-    var t = document.createElement("span");
-    t.className = "rbox-title";
-    t.textContent = "Polling cadence";
-    var def = document.createElement("button");
-    def.className = "conn-defaults";
-    def.textContent = "Defaults";
-    def.addEventListener("click", function () {
+    var dfl = document.createElement("button");
+    dfl.className = "conn-defaults";
+    dfl.textContent = "Defaults";
+    dfl.addEventListener("click", function () {
       pollCfg.strip = POLL_DEFAULTS.strip;
       pollCfg.news = POLL_DEFAULTS.news;
       savePollCfg();
       restartStripPoll();
       if (newsTimer) { startNewsPoll(); }
       if ((location.hash || "").slice(1) === "network") {
+        startNetHealthPoll();
         pageEl.textContent = "";
         buildNetworkPage(pageEl);
       }
     });
-    var spacer = document.createElement("span");
-    spacer.className = "rbox-sub";
-    spacer.appendChild(def);
-    head.appendChild(t);
-    head.appendChild(spacer);
-    box.appendChild(head);
+    pathHead.appendChild(ph1);
+    pathHead.appendChild(ph2);
+    pathHead.appendChild(dfl);
+    page.appendChild(pathHead);
 
-    function selRow(name, subText, key, options, onchange, fixedText) {
-      var row = document.createElement("div");
-      row.className = "poll-row";
-      var main = document.createElement("div");
-      main.className = "poll-main";
-      var nm = document.createElement("div");
-      nm.className = "poll-name";
-      nm.textContent = name;
-      var sb = document.createElement("div");
-      sb.className = "poll-sub";
-      sb.textContent = subText;
-      main.appendChild(nm);
-      main.appendChild(sb);
-      row.appendChild(main);
-      if (fixedText) {
-        var fx = document.createElement("span");
-        fx.className = "poll-fixed";
-        fx.textContent = fixedText;
-        row.appendChild(fx);
-        return row;
-      }
-      var sel = document.createElement("select");
-      sel.className = "poll-sel";
-      for (var i = 0; i < options.length; i++) {
-        var opt = document.createElement("option");
-        opt.value = String(options[i]);
-        opt.textContent = options[i] + "s";
-        if (pollCfg[key] === options[i]) { opt.selected = true; }
-        sel.appendChild(opt);
-      }
-      sel.addEventListener("change", function () {
-        pollCfg[key] = parseInt(sel.value, 10);
-        savePollCfg();
-        onchange();
-      });
-      row.appendChild(sel);
-      var go = document.createElement("button");
-      go.className = "poll-go";
-      go.setAttribute("aria-label", "Refresh now");
-      go.setAttribute("data-tip", "Refresh now");
-      var gs = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
-        stroke: "currentColor", "stroke-linecap": "round",
-        "stroke-linejoin": "round" });
-      gs.appendChild(svgEl("path", {
-        d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
-      gs.appendChild(svgEl("path", { d: "M3 3v5h5" }));
-      go.appendChild(gs);
-      go.addEventListener("click", function () {
-        go.classList.add("kick");
-        setTimeout(function () { go.classList.remove("kick"); }, 650);
-        if (key === "strip") { pollStrip(); }
-        if (key === "news") { fetchNews(true); }
-      });
-      row.appendChild(go);
-      return row;
+    var tableEl = document.createElement("div");
+    tableEl.className = "qnet-table-host";
+    page.appendChild(tableEl);
+    if (window.QNet && QNet.table) {
+      netTable = QNet.table.build(tableEl, buildTableModel());
+      netTableHasCadence = !!(lastStrip && lastStrip.pull &&
+        lastStrip.pull.interval_ms);
+    } else {
+      netTable = null;
+      var missing = document.createElement("div");
+      missing.className = "qnet-note";
+      missing.textContent = "Table module not loaded.";
+      tableEl.appendChild(missing);
     }
-
-    box.appendChild(selRow("Machine status",
-      "strip · avatar dot · Network tint", "strip", [5, 10, 30, 60],
-      restartStripPoll));
-    box.appendChild(selRow("News mirror read",
-      "list refresh while on the News page", "news", [10, 20, 60, 120],
-      function () { if (newsTimer) { startNewsPoll(); } }));
-    box.appendChild(selRow("News fetch loop",
-      "process-set · becomes a control with the wiring build", null, null,
-      null, "120s"));
-    box.appendChild(selRow("Mirror pull (host → Mac)",
-      "Lead's SSM loop · read-only here", null, null, null, "~30–60s"));
-    return box;
+    container.appendChild(page);
+    mountStatPanels();
+    updateStatPanels();
+    renderSigAll();
   }
 
   function renderSigAll() {
     if ((location.hash || "").slice(1) === "network" && sigPage) {
-      refreshConnRows();
-      updateNetCharts();
+      if (netTable) {
+        /* cadence cells render once at build; if the table was built
+           before the first strip landed, rebuild one time so the
+           mirror's measured pull interval appears. */
+        var ivNow = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
+        if (!netTableHasCadence && typeof ivNow === "number" && ivNow > 0) {
+          netTableHasCadence = true;
+          var host = document.querySelector(".qnet-table-host");
+          if (host && window.QNet && QNet.table) {
+            netTable = QNet.table.build(host, buildTableModel());
+          }
+        } else {
+          netTable.update(buildTableModel());
+        }
+      }
+      updateStatPanels();
       var mchipEl = document.getElementById("net-machine");
       if (mchipEl) {
         var mb = mchipEl.querySelector("b");
@@ -1004,6 +909,8 @@
 
   /* the Network page keeps its live reference for poll refreshes */
   var sigPage = null;
+  var netTable = null;
+  var netTableHasCadence = false;
 
   /* log out: real endpoint on the hosted site only.
      OWNER NOTE 2026-08-15 (verify at next deploy): on

@@ -206,41 +206,6 @@
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
   .conn-page { max-width: none; margin: 0; padding: 72px 40px 56px; }
-  /* Network telemetry — live uPlot line panels (this-session series,
-     sampled at the strip cadence). Panels are functional containers:
-     1px line, small radius — sanctioned. */
-  .net-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 14px;
-    margin-top: 22px;
-  }
-  .net-panel {
-    border: 1px solid var(--line-2);
-    border-radius: 14px;
-    padding: 13px 14px 8px;
-    background: var(--panel);
-    min-width: 0;
-  }
-  .net-panel-h { display: flex; align-items: baseline; gap: 8px; }
-  .net-panel-h em {
-    font-style: normal;
-    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
-    text-transform: uppercase; color: var(--muted);
-  }
-  .net-panel-h b {
-    margin-left: auto;
-    font-family: var(--mono);
-    font-size: 15px; font-weight: 400; color: var(--ink);
-    font-variant-numeric: tabular-nums lining-nums;
-    white-space: nowrap;
-  }
-  .net-panel-h b.ok { color: #16a34a; }
-  .net-panel-h b.warn { color: #d4a406; }
-  .net-panel-h b.bad { color: #cc2f3c; }
-  .net-plot { margin-top: 6px; height: 96px; }
-  .net-plot .u-legend { display: none; }
-  .net-note { margin-top: 12px; font-size: 10.5px; color: var(--faint); }
   .machine-chip {
     display: inline-flex; align-items: center; gap: 7px;
     height: 28px; padding: 0 11px;
@@ -254,46 +219,6 @@
   .machine-chip b.warn { color: #d4a406; }
   .machine-chip b.bad { color: #cc2f3c; }
   .conn-assessed { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .conn-recover {
-    width: 28px; height: 28px; flex: none;
-    display: flex; align-items: center; justify-content: center;
-    background: none; border: 0; border-radius: 8px;
-    color: var(--muted); cursor: pointer;
-    transition: background var(--t), color var(--t);
-  }
-  .conn-recover:hover { background: var(--hover); color: var(--ink); }
-  .conn-recover[disabled] { color: var(--faint); cursor: default; }
-  .conn-recover[disabled]:hover { background: none; }
-  .conn-recover svg { width: 13px; height: 13px; stroke-width: 1.7; }
-  .conn-recover.kick svg { animation: spin 600ms cubic-bezier(0.2, 0, 0.2, 1); }
-  .conn-cols { display: flex; gap: 32px; align-items: flex-start; margin-top: 22px; }
-  .conn-main { flex: 1; min-width: 0; }
-  .conn-side { width: 344px; flex: none; display: flex; flex-direction: column; gap: 20px; }
-  .poll-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
-  .poll-row:last-child { border-bottom: 0; }
-  .poll-main { flex: 1; min-width: 0; }
-  .poll-name { font-size: 13px; font-weight: 500; color: var(--ink); }
-  .poll-sub { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
-  .poll-sel {
-    height: 30px;
-    border: 1px solid var(--line-2);
-    border-radius: 8px;
-    background: var(--panel);
-    color: var(--ink);
-    font: inherit; font-size: 12.5px;
-    padding: 0 8px;
-  }
-  .poll-fixed { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .poll-go {
-    width: 28px; height: 28px;
-    display: flex; align-items: center; justify-content: center;
-    background: none; border: 0; border-radius: 8px;
-    color: var(--muted); cursor: pointer;
-    transition: background var(--t), color var(--t);
-  }
-  .poll-go:hover { background: var(--hover); color: var(--ink); }
-  .poll-go svg { width: 13px; height: 13px; stroke-width: 1.7; }
-  .poll-go.kick svg { animation: spin 600ms cubic-bezier(0.2, 0, 0.2, 1); }
   .conn-defaults {
     height: 30px; padding: 0 12px;
     border: 1px solid var(--line-2); border-radius: 8px;
@@ -310,55 +235,10 @@
     color: var(--muted);
   }
   .conn-overall .livedot { width: 8px; height: 8px; }
-  .conn-group-title {
-    margin-top: 20px;
-    padding: 0 2px 4px;
-    font-size: 10px; font-weight: 600;
-    letter-spacing: 0.05em; text-transform: uppercase;
-    color: var(--faint);
-  }
-  .conn-right {
-    margin-left: auto;
-    display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
-    flex: none;
-  }
-  .conn-status {
-    font-size: 9.75px; font-weight: 640; letter-spacing: 0.045em;
-    text-transform: uppercase; color: var(--faint);
-  }
-  .conn-status.ok { color: #16a34a; }
-  .conn-status.warn { color: #d4a406; }
-  .conn-status.bad { color: #cc2f3c; }
   .conn-head-row { display: flex; align-items: center; gap: 14px; }
   .conn-title { font-size: 16px; font-weight: 600; color: var(--ink); }
   .conn-sub { margin-top: 4px; font-size: 13px; color: var(--muted); }
   .conn-note { margin-top: 2px; font-size: 12.5px; color: var(--faint); }
-  .conn-list { margin-top: 22px; }
-  .conn-row {
-    display: flex; align-items: center; gap: 12px;
-    padding: 13px 2px;
-    border-bottom: 1px solid var(--line);
-  }
-  .conn-row:last-child { border-bottom: 0; }
-  .conn-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--faint); flex: none;
-    transition: background var(--t);
-  }
-  .conn-dot.ok { background: #2ebd85; }
-  .conn-dot.warn { background: #99640a; }
-  .conn-dot.bad { background: #cc2f3c; }
-  .conn-main { min-width: 0; }
-  .conn-name { font-size: 14px; font-weight: 500; color: var(--ink); }
-  .conn-detail { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
-  .conn-val {
-    font-size: 13px; color: var(--muted);
-    font-family: var(--mono);
-    font-variant-numeric: tabular-nums lining-nums;
-  }
-  .conn-row.off .conn-dot { background: var(--faint); }
-  .conn-row.off .conn-val { color: var(--faint); }
-
   /* News v4 — decongested top, two-column body: list left, dedicated
      Sources box + Activity box on the right (owner-sanctioned boxes:
      functional containers, 1px line, small radius). */
@@ -1126,6 +1006,7 @@
     .pop, .profile, .tbtn, .pop-row { transition: none; }
   }
 </style>
+<link rel="stylesheet" href="net.css">
 </head>
 <body>
 <div class="frame">
@@ -1245,6 +1126,9 @@
 
 <div id="tip" role="tooltip" aria-hidden="true"></div>
 <script src="vendor/uPlot.iife.min.js"></script>
+<script src="net_spark.js"></script>
+<script src="net_bars.js"></script>
+<script src="net_table.js"></script>
 <script src="shell.js"></script>
 </body>
 </html>

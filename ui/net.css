@@ -1,0 +1,370 @@
+.qnet-statgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.qnet-stat {
+  min-width: 0;
+  padding: 14px 16px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.qnet-stat-h {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.qnet-stat-h em {
+  color: var(--muted);
+  font-size: 9.75px;
+  font-style: normal;
+  font-weight: 500;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+}
+
+.qnet-stat-h b {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.qnet-stat-h b.ok {
+  color: #16a34a;
+}
+
+.qnet-stat-h b.warn {
+  color: #d4a406;
+}
+
+.qnet-stat-h b.bad {
+  color: #cc2f3c;
+}
+
+.qnet-stat-h small {
+  margin-left: .5ch;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.qnet-stat-plot {
+  --qnet-accent: #2557d6;
+
+  height: 86px;
+  margin-top: 8px;
+  color: var(--qnet-accent);
+}
+
+.qnet-stat-plot svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.qnet-table {
+  display: grid;
+  grid-template-columns: minmax(210px, 1.2fr) 110px minmax(90px, auto) minmax(160px, 1fr) 110px 34px 44px;
+  column-gap: 18px;
+  width: 100%;
+}
+
+.qnet-th {
+  min-width: 0;
+  padding: 8px 0 7px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 9.75px;
+  font-weight: 500;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+}
+
+.qnet-group {
+  grid-column: 1 / -1;
+  margin-top: 20px;
+  padding-bottom: 4px;
+  color: var(--faint);
+  font-size: 9.75px;
+  font-weight: 500;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+}
+
+.qnet-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  min-height: 46px;
+  border-bottom: 1px solid var(--line);
+}
+
+.qnet-row:hover {
+  background: var(--hover);
+}
+
+.qnet-cell {
+  min-width: 0;
+}
+
+.qnet-name {
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.qnet-detail {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.qnet-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  height: 20px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: var(--pill);
+  color: var(--muted);
+  font-size: 9.75px;
+  font-weight: 640;
+  letter-spacing: .045em;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.qnet-pill.ok {
+  background: color-mix(in srgb, #16a34a 8%, var(--panel));
+  color: #16a34a;
+}
+
+.qnet-pill.warn {
+  background: color-mix(in srgb, #d4a406 8%, var(--panel));
+  color: #d4a406;
+}
+
+.qnet-pill.bad {
+  background: color-mix(in srgb, #cc2f3c 8%, var(--panel));
+  color: #cc2f3c;
+}
+
+.qnet-pill i {
+  display: block;
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.qnet-val {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.qnet-bars {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  height: 14px;
+}
+
+.qnet-cad select {
+  height: 28px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+}
+
+.qnet-cad select:focus-visible,
+.qnet-refresh:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.qnet-cad-fixed {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.qnet-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.qnet-refresh:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.qnet-refresh.kick svg {
+  animation: spin 600ms cubic-bezier(.2, 0, .2, 1);
+}
+
+.qnet-gated {
+  opacity: .45;
+  cursor: default;
+}
+
+.qnet-note {
+  margin-top: 12px;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
+html[data-theme="dark"] .qnet-stat-plot {
+  --qnet-accent: #7d9bff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qnet-refresh.kick svg {
+    animation: none;
+  }
+}
+
+/* ---- integrator seam: selectors for the table module's emitted
+   class names (module header lists them; aliases of the blocks
+   above so both vocabularies style identically). ---- */
+.qnet-header {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+}
+
+.qnet-heading {
+  min-width: 0;
+  padding: 8px 0 7px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 9.75px;
+  font-weight: 500;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+}
+
+.qnet-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  height: 20px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: var(--pill);
+  color: var(--muted);
+  font-size: 9.75px;
+  font-weight: 640;
+  letter-spacing: .045em;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.qnet-status-pill.qnet-status-ok {
+  background: color-mix(in srgb, #16a34a 8%, var(--panel));
+  color: #16a34a;
+}
+
+.qnet-status-pill.qnet-status-warn {
+  background: color-mix(in srgb, #d4a406 8%, var(--panel));
+  color: #d4a406;
+}
+
+.qnet-status-pill.qnet-status-bad {
+  background: color-mix(in srgb, #cc2f3c 8%, var(--panel));
+  color: #cc2f3c;
+}
+
+.qnet-status-dot {
+  display: block;
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.qnet-value {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.qnet-trend {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  height: 14px;
+  min-width: 0;
+}
+
+.qnet-trend canvas { display: block; }
+
+.qnet-cadence { min-width: 0; }
+
+.qnet-cadence-select {
+  height: 28px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+}
+
+.qnet-cadence-select:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.qnet-cadence-fixed {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.qnet-faint { color: var(--faint); }
+
+.qnet-refresh-cell { min-width: 0; }
+
+.qnet-refresh[hidden] { display: none; }
+
+.qnet-refresh.qnet-spin-kick svg {
+  animation: spin 600ms cubic-bezier(.2, 0, .2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qnet-refresh.qnet-spin-kick svg {
+    animation: none;
+  }
+}
