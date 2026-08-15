@@ -1,0 +1,159 @@
+Refresh the repository before doing anything. Current GitHub head at the time of this order is:
+
+90fce8c727f68ede5a02240d49c36370d140bd15
+
+Read the current source and evidence directly. Do not rely blindly on NOW.md or old lane claims because parts of the written standing state are stale.
+
+CURRENT MEASURED STATE
+
+1. The execution machine genuinely works end to end.
+
+It autonomously found OPENUSDT, opened approximately 7.98 USDT at 1x, held across ticks, exited reduce-only, reconciled flat and resealed itself. Net result was -0.01228295 USDT.
+
+This proves execution mechanics. It does not prove a profitable strategy.
+
+2. The current raw Momentum/Volume detector has no demonstrated edge.
+
+Three-day replay over the present 100-token cohort produced:
+
+- Approximately 413 ignitions per day.
+- Five-minute median return around +0.010%.
+- Fifteen-minute and sixty-minute medians around zero.
+- Win rate approximately 47–50%.
+- Measured round-trip cost approximately 0.30%.
+
+3. Noise Filter v1 improves selectivity but remains economically useless.
+
+It reduced approximately 413 signals/day to 84/day. The kept signals produced approximately +0.020% median after five minutes, still far below measured costs.
+
+Do not describe Filter v1 as profitable, learned intelligence or proof that the strategy works. It is only the first measurable filtering experiment.
+
+4. The present study does not properly test the owner’s actual Volume thesis.
+
+It uses only three days, approximately 100 high-volume tokens, mostly common Spot-plus-Futures markets and primarily one-minute candles.
+
+The real thesis concerns dead/stale tokens across:
+
+- Spot-only.
+- Futures-only.
+- Both Spot and Futures.
+
+The existing study does not yet analyze real trade-level behaviour, buyer aggression, trade sizes, absorption, order-book changes, funding or open-interest context.
+
+5. Basis execution mechanics exist, but dynamic Basis intelligence does not.
+
+The system can calculate a current executable gap and has completed a real four-leg mechanics cycle. It does not yet maintain useful per-token Basis history, detect gap expansion episodes, measure convergence probability or perform evidence-based layered entries.
+
+IMMEDIATE TASK — VOLUME DATASET V2
+
+Do only this milestone now. Do not simultaneously rebuild Basis, alter the execution runtime or start another general architecture wave.
+
+Build a research-only two-stage dataset and replay system.
+
+Stage A — locate events cheaply
+
+Use at least 30 days of one-minute public market data across every available venue class:
+
+- Spot-only.
+- Futures-only.
+- Spot plus Futures.
+
+Do not select only the largest-volume tokens.
+
+For each token and time, measure its state before movement:
+
+- Percentage of flat or nearly flat candles.
+- Time since the last meaningful move.
+- Volume percentile relative to that token’s own history.
+- Trade-count or activity percentile where available.
+- Multi-timeframe volume acceleration across 1, 5, 10, 15 and 60 minutes.
+- Price acceleration.
+- Whether the market was genuinely dead before ignition.
+
+Create explicit, reproducible definitions for:
+
+- Dead regime.
+- Ignition.
+- Genuine runner.
+- False ignition.
+- Slow ramp.
+- Already-pumped event.
+
+Stage B — inspect the actual tape
+
+For every labelled runner window, download aggregate-trade data around the event. Also download matched non-runner windows from similar tokens and regimes.
+
+Extract:
+
+- Buyer-initiated versus seller-initiated activity.
+- Change in trade frequency.
+- Trade-size distribution.
+- Repeated large taker activity.
+- Persistence after the first volume print.
+- Whether buying is absorbed without price movement.
+- Spread and available depth where obtainable.
+- Futures premium, funding and open-interest changes where applicable.
+
+Do not download years of full tick history indiscriminately. Use the cheap candle pass to locate windows, then pull detailed data only for event windows and matched controls.
+
+VALIDATION
+
+Split evaluation by both time and token. A token or time period used for fitting rules must not leak into final scoring.
+
+Test an explicit trading policy, not merely forward price movement:
+
+- Exact entry delay.
+- Staged-entry schedule.
+- Maximum allocation.
+- Stop condition.
+- Partial exits.
+- Final exit.
+- Fees.
+- Spread.
+- Conservative slippage.
+
+Report:
+
+- Events detected per day.
+- Runner precision and recall.
+- False positives.
+- Entry latency.
+- Maximum favourable excursion.
+- Maximum adverse excursion.
+- Time to peak.
+- Median and mean gross return.
+- Tail winners and tail losses.
+- Net return after all costs.
+- Drawdown.
+- Results separated by Spot-only, Futures-only and both-venue markets.
+
+HARD RULES
+
+- Do not lower thresholds merely because one live hour produced no signal.
+- Silence is a liveness question, not proof that the threshold is wrong.
+- Do not integrate Filter v2 into the live runtime during this milestone.
+- Do not deploy or re-arm the machine.
+- Do not modify proven execution mechanics.
+- Do not invent more governance documents or broad test ceremonies.
+- Keep the implementation inside the research/study boundary.
+- Use real Binance data, not generated fixtures, for the result.
+- Focused unit tests are acceptable, but the deliverable is the measured replay result.
+
+DELIVERABLE
+
+Commit:
+
+1. The reproducible dataset/replay code.
+2. The exact cohort and missing-data manifest.
+3. A machine-readable result.
+4. A short evidence report containing the complete economic result.
+5. The exact command needed to reproduce it.
+
+Stop after Volume Dataset v2 is measured and committed. Report whether it demonstrates positive out-of-sample expectancy after costs.
+
+If it does not, say so directly. Do not keep tuning until the same test data becomes green.
+
+Basis History v1 is the next milestone after this result is independently reviewed. It is not part of this task.
+
+
+

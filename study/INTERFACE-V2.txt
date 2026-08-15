@@ -1,0 +1,32 @@
+VOLUME DATASET V2 — frozen interface (Lead, 2026-08-15; commander order in ORDER-VOLUME-V2.txt)
+Layout: study/cohort.py, study/definitions.py, study/stage_a.py, study/windows.py,
+study/stage_b.py, study/policy_sim.py, study/validate.py. Data: study/data/ (gitignored).
+Outputs: study/out/v2/ (gitignored except *_result.json + *_manifest.json which the Lead
+commits copies of into evidence/).
+1. cohort.py: FULL universe, venue classes spot_only|futures_only|both from the two public
+   exchangeInfo endpoints; never volume-ranked selection. Emits cohort_manifest.json:
+   [{symbol, venue_class, listed_since?, days_available, gap_days:[...]}].
+2. definitions.py: ALL thresholds for the six labels in ONE dataclass (DeadRegime, Ignition,
+   GenuineRunner, FalseIgnition, SlowRamp, AlreadyPumped) with documented defaults —
+   reproducible, no magic numbers elsewhere. Every other module imports from here.
+3. stage_a.py: per (symbol, minute) pre-move state from 1m klines: flat-candle pct (1h/6h/24h),
+   minutes since last >X% move, volume percentile vs OWN trailing 30d, activity percentile,
+   volume acceleration 1/5/10/15/60m, price acceleration, dead_regime bool. Labels events per
+   definitions. Emits events.jsonl (one row per labelled event with full pre-state).
+4. windows.py: for each GenuineRunner event -> tape window [T-60m, T+120m]; matched controls:
+   same venue_class + dead_regime + volume percentile band, no event within ±24h. Emits
+   windows_manifest.json (what Stage B must fetch).
+5. stage_b.py: consumes aggTrades zips for manifest windows ONLY: taker buy/sell imbalance,
+   trade-frequency delta, size-distribution shift (quantiles), repeated-large-taker score,
+   persistence after first print, absorption score (buy volume vs price movement), spread
+   proxy (kline range), funding/OI context columns when files exist. Emits features.jsonl.
+6. policy_sim.py: EXPLICIT policy struct (entry_delay_min, stages:[(frac, trigger)],
+   max_alloc_usdt, stop_pct, partials:[(frac, gain_pct)], final_exit, taker_fee=0.001/side
+   spot 0.0005 perp, spread_cost, slippage_conservative). Simulates policy over labelled
+   events using tape prices. Emits trades.jsonl per event.
+7. validate.py: split by time (first 20d fit / last 10d score) AND token (70/30 disjoint);
+   fit-set only for threshold selection; final score on held-out both-ways. Report per
+   venue_class: events/day, precision/recall vs GenuineRunner, false positives, entry
+   latency, MFE, MAE, time-to-peak, gross med/mean, tails, NET after all costs, drawdown.
+   Emits v2_result.json (machine-readable, complete) + prints the exact repro command.
+Decimal-as-text in all outputs. Every module: CLI with --help, deterministic given data.
