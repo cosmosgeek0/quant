@@ -7,6 +7,11 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+FILTER v1 SCORED 2026-08-15 | bench, zero live impact | kept 84/day of 413, 5m med +0.02% win 51.8% — right direction, still under fees
+built+verified | adaptive per-token baselines (tape regimes) + noise filter v1 (serial-igniter, one-print, baseline-relative features) + spot-venue entry rung OFFLINE (every gate identical, deploys only after audit) | 948/948 Lead-run; both workers died pre-report, disk-verified
+mandate | v2 features per the vision: sustained-tape confirmation, entry-ladder timing, funding/spread context | iteration stays replay-scored on the bench until kept-trades clear fees
+standing | machine sealed, flat, first receipt banked, 32 unlocked | owner words open: re-arm now vs after filter clears fees; tuner automatic vs advisory
+
 REPLAY STUDY 2026-08-15 | 3-day 100-token real tape through the CURRENT detector | abundant signals, zero raw edge
 numbers | bar 3: ~413 ignitions/day, forward returns a coin flip (5m med +0.01%, 15m/60m ~0.000%, win 47-50%) | bar 10: same coin flip, fewer catches | all medians far below the 0.30% measured fees
 verdict | surge-alone is fee-negative noise at any bar — the bar filters quantity, not quality | serial igniters dominate the tape (JST x55...)

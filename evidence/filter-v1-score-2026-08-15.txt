@@ -1,0 +1,6 @@
+NOISE FILTER v1 — first real score (3-day 100-token tape, replay cohort 413 ignitions/day)
+kept 84/day | dropped 329/day
+KEPT forward returns: 5m n=253 med +0.02% win 51.8% | 15m med +0.007% win 50.8% | 60m med 0.0%
+verdict: selectivity works (median doubled at 5m vs raw), edge still far below 0.30% fees —
+v1 proves the approach and kills nothing; v2 iterates features (sustained-tape confirmation,
+entry-ladder timing, funding/spread context) on the bench before anything touches live.
