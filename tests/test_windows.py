@@ -14,9 +14,9 @@ from study import windows
 
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 FIXTURE_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "lane-logs"
-    / "V1-fixture-line197191.json"
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "stage_a_line197191_event.json"
 )
 
 
