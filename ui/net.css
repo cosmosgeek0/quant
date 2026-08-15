@@ -25,6 +25,9 @@
   --st-divider: #f7f7f8;    /* row separator measured: 1px one step off white */
   --st-btn-dark: #29292f;   /* their subscribe button */
   --st-btn-border: #cacace; /* their outline button */
+  /* series palette: the measured categorical family, one hue per loop */
+  --st-s1: #3b82f6; --st-s2: #8b5cf6; --st-s3: #10b981; --st-s4: #f59e0b;
+  --st-s5: #ec4899; --st-s6: #06b6d4; --st-s7: #6366f1; --st-s8: #f97316;
 }
 html[data-theme="dark"] {
   --st-ink: #ececee;
@@ -43,16 +46,28 @@ html[data-theme="dark"] {
   --st-divider: #1a1e23;
   --st-btn-dark: #ececee;
   --st-btn-border: #3a3f46;
+  --st-s1: #60a5fa; --st-s2: #a78bfa; --st-s3: #34d399; --st-s4: #fbbf24;
+  --st-s5: #f472b6; --st-s6: #22d3ee; --st-s7: #818cf8; --st-s8: #fb923c;
 }
 
-/* ---- page column: 660px centered, the measured narrow calm ---- */
+/* ---- page: wide instrument layout — graph on top, columns below;
+   the status card keeps its measured 660 width in the left column ---- */
 .st-page {
-  max-width: 660px;
+  max-width: 1160px;
   margin: 0 auto;
   /* content starts below the invisible 72px topbar line (owner law) */
-  padding: 72px 20px 56px;
+  padding: 72px 24px 56px;
   font-family: var(--sans, "InterVariable", system-ui, sans-serif);
   color: var(--st-ink);
+}
+.st-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 400px;
+  gap: 0 16px;
+  align-items: start;
+}
+@media (max-width: 1040px) {
+  .st-cols { grid-template-columns: minmax(0, 1fr); }
 }
 .st-page * { letter-spacing: normal; }
 
@@ -206,6 +221,51 @@ html[data-theme="dark"] {
   background: var(--st-data);
 }
 .st-card-foot { padding: 10px 16px 12px; }
+
+/* ---- overview graph: chips legend + granular overlay + readout ---- */
+.st-chips {
+  display: flex; flex-wrap: wrap; gap: 4px 4px;
+  padding: 0 10px 2px;
+}
+.st-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 0; background: none; cursor: pointer;
+  font-family: inherit; font-size: 12px; font-weight: 400;
+  line-height: 16px; color: var(--st-mid);
+  padding: 3px 6px; border-radius: 6px;
+}
+.st-chip:hover { background: var(--st-hover); }
+.st-chip-key {
+  width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+}
+.st-chip.off { color: var(--st-faint); }
+.st-chip.off .st-chip-key { opacity: 0.25; }
+.st-graph-host { padding: 2px 8px 0 8px; position: relative; }
+.st-graph-tip {
+  position: absolute; z-index: 5; pointer-events: none;
+  background: var(--st-card); border: 1px solid var(--st-line);
+  border-radius: 6px; padding: 7px 9px;
+  box-shadow: 0 4px 14px rgba(22, 22, 24, 0.07);
+  min-width: 150px;
+}
+.st-graph-tip-time {
+  font-family: var(--mono, "JBMono", monospace);
+  font-size: 11px; color: var(--st-faint); padding-bottom: 4px;
+}
+.st-graph-tip-row {
+  display: flex; align-items: center; gap: 6px; padding: 1px 0;
+}
+.st-graph-tip-key {
+  width: 7px; height: 7px; border-radius: 2px; flex: 0 0 7px;
+}
+.st-graph-tip-label {
+  font-size: 12px; color: var(--st-mid); flex: 1; padding-right: 10px;
+}
+.st-graph-tip-val {
+  font-family: var(--mono, "JBMono", monospace);
+  font-size: 12px; color: var(--st-ink);
+  font-variant-numeric: tabular-nums;
+}
 
 /* ---- head pager (their date-range grammar, cycling the window) ---- */
 .st-pager { display: flex; align-items: center; gap: 8px; }

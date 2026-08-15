@@ -508,5 +508,207 @@
     return handle;
   }
 
-  QNet.chart = { mount: mount };
+  /* ---- overview overlay: every loop on one granular instrument.
+     Two honest scales (ages in s left, RTT in ms right), full
+     resolution, cursor readout listing every visible series value
+     at the hovered moment. ---- */
+  function mountMulti(el, cfg) {
+    if (!el) { throw new TypeError("QNet.chart.mountMulti needs a host"); }
+    var defs = cfg.series || [];
+    var height = cfg.height || 260;
+    var styles = root.getComputedStyle(el);
+    var ink = cssValue(styles, "--st-ink", styles.color);
+    var muted = cssValue(styles, "--st-mid", ink);
+    var line = cssValue(styles, "--st-divider", "#f0f0f2");
+    var sans = cssValue(styles, "--sans", "InterVariable, sans-serif");
+    var axisFont = "12px " + sans;
+    var width = Math.max(320, Math.round(el.clientWidth || 0));
+
+    var data = [cfg.times || []];
+    for (var i = 0; i < defs.length; i += 1) { data.push(defs[i].values); }
+
+    function rangeUp(u, dataMin, dataMax) {
+      var hi = (typeof dataMax === "number" && isFinite(dataMax) &&
+        dataMax > 0) ? dataMax * 1.12 : 1;
+      return [0, hi];
+    }
+
+    var series = [{}];
+    for (var d = 0; d < defs.length; d += 1) {
+      series.push({
+        label: defs[d].label,
+        stroke: defs[d].color,
+        width: 1.4,
+        scale: defs[d].unit === "ms" ? "ms" : "s",
+        spanGaps: false,
+        points: { show: false }
+      });
+    }
+
+    var tooltip = document.createElement("div");
+    tooltip.className = "st-graph-tip";
+    tooltip.style.display = "none";
+    tooltip.setAttribute("aria-hidden", "true");
+
+    var plot = null;
+    var destroyed = false;
+
+    function fmtVal(v, unit) {
+      if (v == null || !isFinite(v)) { return null; }
+      return (Math.round(v * 10) / 10) + " " + unit;
+    }
+
+    function renderTip(u) {
+      var idx = u.cursor.idx;
+      if (idx == null || idx < 0 || idx >= data[0].length) {
+        tooltip.style.display = "none";
+        return;
+      }
+      var t = data[0][idx];
+      if (!isFinite(t)) { tooltip.style.display = "none"; return; }
+      var dt = new Date(t * 1000);
+      var stamp = two(dt.getUTCHours()) + ":" + two(dt.getUTCMinutes()) +
+        ":" + two(dt.getUTCSeconds());
+      var rows = [];
+      for (var s = 0; s < defs.length; s += 1) {
+        if (!u.series[s + 1].show) { continue; }
+        var val = fmtVal(data[s + 1][idx], defs[s].unit);
+        if (val == null) { continue; }
+        rows.push({ color: defs[s].color, label: defs[s].label, val: val });
+      }
+      if (!rows.length) { tooltip.style.display = "none"; return; }
+      tooltip.textContent = "";
+      var head = document.createElement("div");
+      head.className = "st-graph-tip-time";
+      head.textContent = stamp + " UTC";
+      tooltip.appendChild(head);
+      for (var r2 = 0; r2 < rows.length; r2 += 1) {
+        var rowEl = document.createElement("div");
+        rowEl.className = "st-graph-tip-row";
+        var key = document.createElement("span");
+        key.className = "st-graph-tip-key";
+        key.style.background = rows[r2].color;
+        rowEl.appendChild(key);
+        var lbl = document.createElement("span");
+        lbl.className = "st-graph-tip-label";
+        lbl.textContent = rows[r2].label;
+        rowEl.appendChild(lbl);
+        var vv = document.createElement("span");
+        vv.className = "st-graph-tip-val";
+        vv.textContent = rows[r2].val;
+        rowEl.appendChild(vv);
+        tooltip.appendChild(rowEl);
+      }
+      var left = u.cursor.left;
+      var top = u.cursor.top;
+      if (left == null || top == null || left < 0) {
+        tooltip.style.display = "none";
+        return;
+      }
+      tooltip.style.display = "block";
+      var host = u.over.parentNode;
+      var hw = host.clientWidth;
+      var tw = tooltip.offsetWidth;
+      var x = u.over.offsetLeft + left + 14;
+      if (x + tw > hw - 6) { x = u.over.offsetLeft + left - tw - 14; }
+      tooltip.style.left = Math.max(6, Math.round(x)) + "px";
+      var y = u.over.offsetTop + top - 10;
+      var hh = host.clientHeight;
+      var th = tooltip.offsetHeight;
+      if (y + th > hh - 4) { y = hh - th - 4; }
+      tooltip.style.top = Math.max(6, Math.round(y)) + "px";
+    }
+
+    var options = {
+      width: width,
+      height: height,
+      padding: [10, 8, 0, 8],
+      legend: { show: false },
+      tzDate: function (timestamp) {
+        var date = new Date(timestamp * 1000);
+        return typeof root.uPlot.tzDate === "function"
+          ? root.uPlot.tzDate(date, "UTC") : date;
+      },
+      cursor: {
+        show: true, x: true, y: false,
+        points: { show: false },
+        drag: { x: false, y: false, setScale: false }
+      },
+      scales: {
+        x: { time: true },
+        s: { range: rangeUp },
+        ms: { range: rangeUp }
+      },
+      axes: [
+        { stroke: muted, font: axisFont, size: 30,
+          grid: { show: true, stroke: line, width: 1 },
+          ticks: { show: false }, border: { show: false } },
+        { scale: "s", stroke: muted, font: axisFont, size: 46,
+          values: function (u, splits) {
+            var out = [];
+            for (var j = 0; j < splits.length; j += 1) {
+              out.push(splits[j] + "s");
+            }
+            return out;
+          },
+          grid: { show: true, stroke: line, width: 1 },
+          ticks: { show: false }, border: { show: false } },
+        { scale: "ms", side: 1, stroke: muted, font: axisFont, size: 52,
+          values: function (u, splits) {
+            var out = [];
+            for (var j = 0; j < splits.length; j += 1) {
+              out.push(splits[j] + "ms");
+            }
+            return out;
+          },
+          grid: { show: false },
+          ticks: { show: false }, border: { show: false } }
+      ],
+      series: series,
+      hooks: {
+        ready: [function (u) {
+          u.over.parentNode.appendChild(tooltip);
+          u.over.addEventListener("mouseleave", function () {
+            tooltip.style.display = "none";
+          });
+        }],
+        setCursor: [renderTip]
+      }
+    };
+
+    el.textContent = "";
+    plot = new root.uPlot(options, data, el);
+
+    function handleResize() {
+      if (destroyed) { return; }
+      plot.setSize({
+        width: Math.max(320, Math.round(el.clientWidth || 0)),
+        height: height
+      });
+    }
+    root.addEventListener("resize", handleResize);
+
+    return {
+      setData: function (times, defsNext) {
+        data = [times];
+        for (var q = 0; q < defsNext.length; q += 1) {
+          data.push(defsNext[q].values);
+        }
+        plot.setData(data);
+      },
+      setShow: function (idx, on) {
+        plot.setSeries(idx + 1, { show: !!on });
+      },
+      destroy: function () {
+        destroyed = true;
+        root.removeEventListener("resize", handleResize);
+        if (tooltip.parentNode) {
+          tooltip.parentNode.removeChild(tooltip);
+        }
+        plot.destroy();
+      }
+    };
+  }
+
+  QNet.chart = { mount: mount, mountMulti: mountMulti };
 })(window);
