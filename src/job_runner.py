@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -62,6 +63,9 @@ MOMENTUM_LEDGER_FIELDS = {"fills", "fees", "realized"}
 MOMENTUM_RESULT_FIELDS = RESULT_FIELDS | MOMENTUM_LEDGER_FIELDS
 ADVERSE_STOP_REFUSAL_FIELDS = {"kind", "error", "symbol", "utc"}
 ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
+MARGIN_GOVERNOR_RECOVERY_FIELDS = {
+    "kind", "job_id", "op", "symbol", "verdict", "utc",
+}
 TRADING_OPS = {
     "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
     "MOMENTUM_OPEN", "MOMENTUM_EXIT",
@@ -81,6 +85,9 @@ MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
 MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+MARGIN_IDENTITY_KEY_RE = re.compile(
+    r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$", re.IGNORECASE
+)
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
@@ -143,7 +150,7 @@ class Outcome:
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(timezone.utc)
 
 
 def _utc_text(value: datetime) -> str:
@@ -185,27 +192,58 @@ def _strict_object(pairs):
     return result
 
 
-def _load_job(path: str) -> Dict[str, Any]:
+def _decode_strict_object(encoded: bytes) -> Dict[str, Any]:
+    try:
+        value = json.loads(
+            encoded.decode("utf-8"),
+            parse_float=Decimal,
+            parse_int=Decimal,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_strict_object,
+        )
+    except JobRefusal:
+        raise
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        raise ValueError("JSON object is invalid") from None
+    if not isinstance(value, dict):
+        raise ValueError("JSON value is not an object")
+    return value
+
+
+def _read_file_bytes(path: str) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
+        return handle.read()
+
+
+def _load_strict_object_and_digest(path: str) \
+        -> Tuple[Dict[str, Any], str]:
     try:
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            value = json.load(
-                handle,
-                parse_float=Decimal,
-                parse_int=Decimal,
-                parse_constant=_reject_constant,
-                object_pairs_hook=_strict_object,
-            )
+        encoded = _read_file_bytes(path)
+        value = _decode_strict_object(encoded)
+    except FileNotFoundError:
+        raise
     except JobRefusal:
         raise
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        raise ValueError("JSON object is invalid") from None
+    return value, hashlib.sha256(encoded).hexdigest()
+
+
+def _load_job_with_digest(path: str) -> Tuple[Dict[str, Any], str]:
+    try:
+        return _load_strict_object_and_digest(path)
+    except FileNotFoundError:
         raise JobRefusal("BAD_JSON") from None
-    if not isinstance(value, dict):
-        raise JobRefusal("BAD_TYPE")
-    return value
+    except ValueError:
+        raise JobRefusal("BAD_JSON") from None
+
+
+def _load_job(path: str) -> Dict[str, Any]:
+    return _load_job_with_digest(path)[0]
 
 
 def _timestamp(value: str) -> datetime:
@@ -219,36 +257,16 @@ def _timestamp(value: str) -> datetime:
 
 
 def _load_marker_object(path: str) -> Dict[str, Any]:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            value = json.load(
-                handle,
-                parse_float=Decimal,
-                parse_int=Decimal,
-                parse_constant=_reject_constant,
-                object_pairs_hook=_strict_object,
-            )
+        return _load_strict_object_and_digest(path)[0]
     except FileNotFoundError:
         raise
-    except (JobRefusal, OSError, UnicodeError, ValueError,
-            json.JSONDecodeError):
+    except (JobRefusal, ValueError):
         raise ValueError("marker JSON is invalid") from None
-    if not isinstance(value, dict):
-        raise ValueError("marker JSON is not an object")
-    return value
 
 
-def _load_accept_one(path: str, now: datetime) -> Optional[AcceptOne]:
-    try:
-        raw = _load_marker_object(path)
-    except FileNotFoundError:
-        return None
-    except ValueError:
-        raise JobRefusal("ACCEPT_ONE_INVALID") from None
+def _validate_accept_one_object(raw: Dict[str, Any],
+                                now: datetime) -> AcceptOne:
     try:
         if set(raw) != ACCEPT_ONE_FIELDS:
             raise ValueError
@@ -273,14 +291,28 @@ def _load_accept_one(path: str, now: datetime) -> Optional[AcceptOne]:
     )
 
 
+def _load_accept_one(path: str, now: datetime) -> Optional[AcceptOne]:
+    try:
+        raw = _load_marker_object(path)
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        raise JobRefusal("ACCEPT_ONE_INVALID") from None
+    return _validate_accept_one_object(raw, now)
+
+
+def _validate_operator_object(raw: Dict[str, Any]) -> Optional[str]:
+    if set(raw) != OPERATOR_FIELDS or type(raw.get("operator")) is not str:
+        return None
+    return raw["operator"]
+
+
 def _load_operator(path: str) -> Optional[str]:
     try:
         raw = _load_marker_object(path)
     except (FileNotFoundError, ValueError):
         return None
-    if set(raw) != OPERATOR_FIELDS or type(raw.get("operator")) is not str:
-        return None
-    return raw["operator"]
+    return _validate_operator_object(raw)
 
 
 def _margin_job_projection(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -294,7 +326,9 @@ def _margin_job_projection(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
-                         now: datetime) -> Job:
+                         now: datetime,
+                         prebuilt_operation: Optional[Dict[str, Any]] = None) \
+        -> Job:
     unknown = set(raw) - MARGIN_JOB_FIELDS
     if unknown:
         trading_fields = TRADING_JOB_FIELDS | set(
@@ -328,12 +362,15 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
     if now >= expires:
         raise JobRefusal("EXPIRED")
 
-    try:
-        operation = margin_ops.build_margin_operation(
-            _margin_job_projection(raw), MARGIN_ASSET_WHITELIST, now
-        )
-    except Exception:
-        raise JobRefusal("MARGIN_VALIDATION_UNKNOWN") from None
+    if prebuilt_operation is None:
+        try:
+            operation = margin_ops.build_margin_operation(
+                _margin_job_projection(raw), MARGIN_ASSET_WHITELIST, now
+            )
+        except Exception:
+            raise JobRefusal("MARGIN_VALIDATION_UNKNOWN") from None
+    else:
+        operation = prebuilt_operation
     if not isinstance(operation, dict):
         raise JobRefusal("MARGIN_VALIDATION_UNKNOWN")
     if operation.get("verdict") == "REFUSED":
@@ -495,6 +532,39 @@ def _fsync_parent_directory(path: str) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _persist_json_receipt(path: str, payload: Dict[str, Any],
+                          create: bool = False) -> None:
+    """Persist one JSON receipt and its directory entry before returning."""
+    encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if create:
+        descriptor = os.open(
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_parent_directory(path)
+        return
+    temporary = path + ".tmp-" + secrets.token_hex(6)
+    try:
+        with open(temporary, "xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        _fsync_parent_directory(temporary)
+        os.replace(temporary, path)
+        _fsync_parent_directory(path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _touch_stop(path: str) -> None:
@@ -683,6 +753,7 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
     if not os.path.exists(path):
         return set(), False, False
     identifiers = set()
+    margin_recovery_ids = set()
     unresolved = False
     try:
         with open(path, encoding="utf-8") as handle:
@@ -702,6 +773,20 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                     if row["kind"] != "adverse_stop_blocked_unknown" or any(
                             type(row[name]) is not str for name in fields):
                         return set(), True, False
+                    continue
+                if fields == MARGIN_GOVERNOR_RECOVERY_FIELDS:
+                    job_id = row.get("job_id")
+                    if row.get("kind") != "margin_governor_release_recovered" \
+                            or row.get("op") != margin_ops.MARGIN_BORROW \
+                            or type(job_id) is not str \
+                            or job_id not in identifiers \
+                            or job_id in margin_recovery_ids \
+                            or row.get("verdict") in FREEZE_VERDICTS \
+                            or any(type(row.get(name)) is not str for name in (
+                                "symbol", "verdict", "utc"
+                            )):
+                        return set(), True, False
+                    margin_recovery_ids.add(job_id)
                     continue
                 if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
                     return set(), True, False
@@ -790,10 +875,47 @@ def _claim(paths: Dict[str, str], job_id: str, now: datetime) -> bool:
     return True
 
 
+def _margin_tag_claim_path(paths: Dict[str, str], client_tag: str) -> str:
+    return os.path.join(paths["claims"], "tag-%s.claim" % client_tag)
+
+
+def _margin_tag_is_claimed(paths: Dict[str, str], client_tag: str) -> bool:
+    return type(client_tag) is str \
+        and margin_ops.CLIENT_TAG_RE.fullmatch(client_tag) is not None \
+        and os.path.isfile(_margin_tag_claim_path(paths, client_tag))
+
+
+def _claim_margin_tag(paths: Dict[str, str], client_tag: str,
+                      job_id: str, now: datetime) -> bool:
+    if type(client_tag) is not str \
+            or margin_ops.CLIENT_TAG_RE.fullmatch(client_tag) is None:
+        return False
+    path = _margin_tag_claim_path(paths, client_tag)
+    try:
+        descriptor = os.open(
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+    except FileExistsError:
+        return False
+    body = json.dumps({
+        "client_tag": client_tag,
+        "job_id": job_id,
+        "claimed_utc": _utc_text(now),
+    }, separators=(",", ":")) + "\n"
+    try:
+        os.write(descriptor, body.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_parent_directory(path)
+    return True
+
+
 def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
                           symbol: str, verdict: str, reason: str,
                           now: datetime, source_path: str = "",
-                          ledger: Optional[Dict[str, Any]] = None) -> str:
+                          ledger: Optional[Dict[str, Any]] = None,
+                          governor_token: str = "") -> str:
     path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
     payload = {
         "job_id": job_id,
@@ -805,20 +927,18 @@ def _write_runner_receipt(paths: Dict[str, str], job_id: str, op: str,
     }
     if source_path:
         payload["source_receipt_path"] = source_path
+    if op in MARGIN_OPS:
+        payload["sha"] = os.environ.get("QUANT_SHA", "").lower()
+        if governor_token:
+            payload["governor_token"] = governor_token
+            payload["governor_release"] = "PENDING"
     if ledger is not None:
         payload.update({
             "fills": list(ledger.get("fills", [])),
             "fees": list(ledger.get("fees", [])),
             "realized": dict(ledger.get("realized", {})),
         })
-    temporary = path + ".tmp-%s" % secrets.token_hex(6)
-    with open(temporary, "x", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    _persist_json_receipt(path, payload)
     return path
 
 
@@ -2879,34 +2999,7 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
 
 def _persist_margin_source(path: str, payload: Dict[str, Any],
                            create: bool = False) -> None:
-    encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
-    if create:
-        descriptor = os.open(
-            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_parent_directory(path)
-        return
-    temporary = path + ".tmp-" + secrets.token_hex(6)
-    try:
-        with open(temporary, "xb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        _fsync_parent_directory(temporary)
-        os.replace(temporary, path)
-        _fsync_parent_directory(path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+    _persist_json_receipt(path, payload, create=create)
 
 
 def _margin_transaction_id(payload: Any) -> str:
@@ -2917,7 +3010,7 @@ def _margin_transaction_id(payload: Any) -> str:
         if name not in payload:
             continue
         value = payload[name]
-        if isinstance(value, bool) or not isinstance(value, (int, str)):
+        if type(value) not in (int, str):
             return ""
         text = str(value)
         if not text or len(text) > 128:
@@ -2953,22 +3046,24 @@ def _margin_history_confirmation(payload: Any, transaction_id: str,
     for row in payload["rows"]:
         if not isinstance(row, dict):
             continue
+        if any(
+                type(name) is str
+                and MARGIN_IDENTITY_KEY_RE.fullmatch(name) is not None
+                and name not in {"tranId", "txId"}
+                for name in row):
+            return None
         aliases = []
-        invalid_alias = False
         for name in ("tranId", "txId"):
             if name not in row:
                 continue
             value = row[name]
-            if isinstance(value, bool) or not isinstance(value, (int, str)):
-                invalid_alias = True
-                continue
+            if type(value) not in (int, str):
+                return None
             text = str(value)
             if not text or len(text) > 128:
-                invalid_alias = True
-                continue
+                return None
             aliases.append(text)
-        if transaction_id in aliases and (
-                invalid_alias or len(set(aliases)) != 1):
+        if len(set(aliases)) > 1:
             return None
         if _margin_transaction_id(row) == transaction_id:
             matches.append(row)
@@ -2977,7 +3072,7 @@ def _margin_history_confirmation(payload: Any, transaction_id: str,
     row = matches[0]
     if row.get("asset") != expected["asset"]:
         return None
-    if "type" in row and row.get("type") != request_type:
+    if "type" not in row or row.get("type") != request_type:
         return None
     principal = _margin_decimal_text(row.get("principal"))
     interest = _margin_decimal_text(row.get("interest"))
@@ -3055,9 +3150,137 @@ def _finish_margin_before_post(receipt: Dict[str, Any], path: str,
     )
 
 
+def _authority_digest(encoded: Optional[bytes]) -> str:
+    material = encoded if encoded is not None else b"ABSENT"
+    return hashlib.sha256(material).hexdigest()
+
+
+def _margin_post_authority(
+        job: Job, paths: Dict[str, str], operation: Dict[str, Any],
+        post_params: Dict[str, Any]) \
+        -> Tuple[str, datetime, Dict[str, str], bool]:
+    digests: Dict[str, str] = {}
+    job_encoded = None
+    accept_encoded = None
+    operator_encoded = None
+    stop_encoded = None
+    read_reason = ""
+    job_path = os.path.join(paths["jobs"], "job-%s.json" % job.job_id)
+    try:
+        job_encoded = _read_file_bytes(job_path)
+    except OSError:
+        read_reason = "MARGIN_VALIDATION_UNKNOWN"
+    try:
+        accept_encoded = _read_file_bytes(paths["accept_one"])
+    except FileNotFoundError:
+        pass
+    except OSError:
+        read_reason = read_reason or "ACCEPT_ONE_INVALID"
+    try:
+        operator_encoded = _read_file_bytes(paths["operator"])
+    except FileNotFoundError:
+        pass
+    except OSError:
+        read_reason = read_reason or "OPERATOR_MISMATCH"
+    try:
+        stop_encoded = _read_file_bytes(paths["stop"])
+    except FileNotFoundError:
+        pass
+    except OSError:
+        read_reason = read_reason or "MARGIN_VALIDATION_UNKNOWN"
+
+    verified_now = _utc_now()
+    digests.update({
+        "job_file": _authority_digest(job_encoded),
+        "accept_one": _authority_digest(accept_encoded),
+        "operator": _authority_digest(operator_encoded),
+        "stop_jobs": _authority_digest(stop_encoded),
+    })
+    stop_present = stop_encoded is not None
+    if read_reason:
+        return read_reason, verified_now, digests, stop_present
+
+    try:
+        fresh_raw = _decode_strict_object(job_encoded or b"")
+        token = fresh_raw.get("operator_token")
+        expiry = fresh_raw.get("expires_utc")
+        if type(token) is str:
+            digests["operator_token"] = _authority_digest(
+                token.encode("utf-8")
+            )
+        if type(expiry) is str:
+            digests["job_expiry"] = _authority_digest(
+                expiry.encode("utf-8")
+            )
+        final_operation = margin_ops.build_margin_operation(
+            _margin_job_projection(fresh_raw), MARGIN_ASSET_WHITELIST,
+            verified_now,
+        )
+    except (JobRefusal, KeyError, TypeError, ValueError):
+        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
+    except Exception:
+        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
+    if not isinstance(final_operation, dict):
+        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
+    if final_operation.get("verdict") == "REFUSED":
+        reason = final_operation.get("reason")
+        if type(reason) is not str or not reason:
+            reason = "MARGIN_VALIDATION_UNKNOWN"
+        return reason, verified_now, digests, stop_present
+    try:
+        fresh_job = _validate_margin_job(
+            fresh_raw, job.job_id, verified_now, final_operation
+        )
+    except JobRefusal as error:
+        return error.reason, verified_now, digests, stop_present
+    except ValueError:
+        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
+    if fresh_job.operator_token != job.operator_token:
+        return "OPERATOR_MISMATCH", verified_now, digests, stop_present
+    if fresh_job != job or fresh_job.margin_operation != operation \
+            or not isinstance(fresh_job.margin_operation, dict) \
+            or fresh_job.margin_operation.get("params") != post_params:
+        return (
+            "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
+        )
+    if job.op == margin_ops.MARGIN_BORROW and stop_present:
+        return "STOP_JOBS_SEALED", verified_now, digests, stop_present
+    if job.op != margin_ops.MARGIN_BORROW:
+        return "", verified_now, digests, stop_present
+    if accept_encoded is None:
+        return (
+            "ENTRY_BLOCKED_NOT_ACCEPTED", verified_now, digests, stop_present
+        )
+    try:
+        acceptance = _validate_accept_one_object(
+            _decode_strict_object(accept_encoded), verified_now
+        )
+    except (JobRefusal, ValueError):
+        return "ACCEPT_ONE_INVALID", verified_now, digests, stop_present
+    if operator_encoded is None:
+        return "OPERATOR_MISMATCH", verified_now, digests, stop_present
+    try:
+        operator = _validate_operator_object(
+            _decode_strict_object(operator_encoded)
+        )
+    except (JobRefusal, ValueError):
+        operator = None
+    if operator is None or fresh_job.requested_by != operator \
+            or acceptance.operator != operator \
+            or fresh_job.operator_token != operator:
+        return "OPERATOR_MISMATCH", verified_now, digests, stop_present
+    if fresh_job.requested_max_notional > acceptance.max_notional:
+        return (
+            "ACCEPT_ONE_NOTIONAL_EXCEEDED", verified_now, digests,
+            stop_present,
+        )
+    return "", verified_now, digests, stop_present
+
+
 def _run_margin_operation(
         job: Job, paths: Dict[str, str],
-        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+        request: Optional[Callable[..., Tuple[str, Any]]] = None,
+        governor_token: str = "", sha: str = "") -> Outcome:
     fresh_now = _utc_now()
     principal = _canonical_decimal_text(job.requested_max_notional)
     projection = {
@@ -3094,21 +3317,18 @@ def _run_margin_operation(
     receipt = {
         "kind": "margin_operation",
         "job_id": job.job_id,
+        "sha": sha,
         "ready": operation,
         "mutation_attempts": 0,
         "verdict": "READY",
         "reason": "",
         "started_utc": _utc_text(fresh_now),
     }
-    sealed_repay = job.op == margin_ops.MARGIN_REPAY \
-        and os.path.isfile(paths["stop"])
-    if sealed_repay:
-        receipt["execution_mode"] = "STOP_JOBS_REPAY"
+    if governor_token:
+        receipt["governor_token"] = governor_token
+        receipt["governor_release"] = "PENDING"
     try:
         _persist_margin_source(source_path, receipt, create=True)
-        receipt["mutation_attempts"] = 1
-        receipt["mutation_started_utc"] = _utc_text(fresh_now)
-        _persist_margin_source(source_path, receipt)
     except Exception:
         return Outcome(
             "UNKNOWN", 4,
@@ -3128,49 +3348,52 @@ def _run_margin_operation(
             "MARGIN_POST_UNREADABLE", fresh_now,
         )
 
-    mutation_now = _utc_now()
+    post_params = dict(operation["params"])
+    authority_refusal, authority_now, authority_digests, stop_present = \
+        _margin_post_authority(job, paths, operation, post_params)
+    receipt["authority_checked_utc"] = _utc_text(authority_now)
+    receipt["authority_digests"] = authority_digests
+    receipt["authority_stop_jobs_present"] = stop_present
+    if authority_refusal:
+        return _finish_margin_before_post(
+            receipt, source_path, "REFUSED", 2,
+            authority_refusal, authority_now,
+        )
+
+    client_tag = operation["client_tag"]
     try:
-        mutation_operation = margin_ops.build_margin_operation(
-            projection, MARGIN_ASSET_WHITELIST, mutation_now
+        tag_claimed = _claim_margin_tag(
+            paths, client_tag, job.job_id, authority_now
         )
     except Exception:
-        mutation_operation = None
-    if not isinstance(mutation_operation, dict):
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_TAG_CLAIM_PERSISTENCE_FAILED", authority_now,
+        )
+    if not tag_claimed:
         return _finish_margin_before_post(
             receipt, source_path, "REFUSED", 2,
-            "MARGIN_VALIDATION_UNKNOWN", mutation_now,
+            "TAG_ALREADY_CLAIMED", authority_now,
         )
-    if mutation_operation.get("verdict") == "REFUSED":
-        reason = mutation_operation.get("reason")
-        if type(reason) is not str or not reason:
-            reason = "MARGIN_VALIDATION_UNKNOWN"
-        return _finish_margin_before_post(
-            receipt, source_path, "REFUSED", 2, reason, mutation_now,
+    sealed_repay = job.op == margin_ops.MARGIN_REPAY and stop_present
+    if sealed_repay:
+        receipt["execution_mode"] = "STOP_JOBS_REPAY"
+    receipt["mutation_attempts"] = 1
+    receipt["mutation_started_utc"] = _utc_text(authority_now)
+    try:
+        _persist_margin_source(source_path, receipt)
+    except Exception:
+        return Outcome(
+            "UNKNOWN", 4, source_path, "MARGIN_READY_PERSISTENCE_FAILED"
         )
-    if mutation_operation != operation:
-        return _finish_margin_before_post(
-            receipt, source_path, "REFUSED", 2,
-            "MARGIN_VALIDATION_UNKNOWN", mutation_now,
-        )
-    if job.op == margin_ops.MARGIN_BORROW \
-            and os.path.isfile(paths["stop"]):
-        return _finish_margin_before_post(
-            receipt, source_path, "REFUSED", 2,
-            "STOP_JOBS_SEALED", mutation_now,
-        )
-    if job.op in ENTRY_OPS:
-        authority_refusal = _entry_ticket_refusal(job, paths, mutation_now)
-        receipt["authority_checked_utc"] = _utc_text(mutation_now)
-        if authority_refusal:
-            return _finish_margin_before_post(
-                receipt, source_path, "REFUSED", 2,
-                authority_refusal, mutation_now,
-            )
 
+    # These separate file reads and the socket write cannot be one OS-level
+    # transaction.  The remaining read-to-write window is irreducible; the
+    # durable timestamp and digests above record it without claiming otherwise.
     try:
         post_result = transport(
             "POST", base_url, operation["endpoint_path"],
-            dict(operation["params"]), True,
+            post_params, True,
         )
     except Exception:
         return _finish_margin_source(
@@ -3290,7 +3513,9 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
         if not os.path.isfile(paths["proof"]) or not basis_proof:
             return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
     if job.op in MARGIN_OPS:
-        return _run_margin_operation(job, paths, margin_request)
+        return _run_margin_operation(
+            job, paths, margin_request, governor_token, sha
+        )
 
     values = {
         "SYMBOL": job.symbol,
@@ -3352,6 +3577,111 @@ def _release_recovered_governor(token: str, receipt_dir: str) -> bool:
     return _release_governor(release, token, receipt_dir)
 
 
+def _load_plain_receipt(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _mark_margin_governor_released(
+        paths: Dict[str, str], job_id: str, source_path: str,
+        governor_token: str, now: datetime, state: str) -> bool:
+    runner_path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
+    expected_source = os.path.join(
+        paths["receipts"], "margin-%s.json" % job_id
+    )
+    if source_path and os.path.abspath(source_path) != os.path.abspath(
+            expected_source):
+        return False
+    targets = [expected_source, runner_path] if source_path else [runner_path]
+    for path in targets:
+        payload = _load_plain_receipt(path)
+        if payload is None or payload.get("job_id") != job_id \
+                or payload.get("governor_token") != governor_token:
+            return False
+        payload["governor_release"] = state
+        payload["governor_released_utc"] = _utc_text(now)
+        try:
+            _persist_json_receipt(path, payload)
+        except Exception:
+            return False
+    return True
+
+
+def _margin_governor_recovery_rows(paths: Dict[str, str]) \
+        -> Tuple[Dict[str, Dict[str, Any]], set]:
+    final_rows: Dict[str, Dict[str, Any]] = {}
+    recovered_ids = set()
+    try:
+        with open(paths["results"], encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return {}, set()
+                if row.get("kind") == "margin_governor_release_recovered":
+                    job_id = row.get("job_id")
+                    if type(job_id) is str:
+                        recovered_ids.add(job_id)
+                    continue
+                if row.get("op") == margin_ops.MARGIN_BORROW \
+                        and row.get("verdict") not in FREEZE_VERDICTS \
+                        and type(row.get("job_id")) is str:
+                    final_rows[row["job_id"]] = row
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return {}, set()
+    return final_rows, recovered_ids
+
+
+def _recover_final_margin_governor(
+        paths: Dict[str, str], receipt_dir: str, now: datetime) \
+        -> Optional[bool]:
+    final_rows, recovered_ids = _margin_governor_recovery_rows(paths)
+    for job_id in sorted(final_rows):
+        row = final_rows[job_id]
+        runner_path = os.path.join(
+            paths["receipts"], "job-%s.json" % job_id
+        )
+        if os.path.abspath(str(row.get("receipt_path", ""))) \
+                != os.path.abspath(runner_path):
+            continue
+        runner = _load_plain_receipt(runner_path)
+        if runner is None or runner.get("job_id") != job_id \
+                or runner.get("op") != margin_ops.MARGIN_BORROW \
+                or runner.get("symbol") != row.get("symbol") \
+                or runner.get("verdict") != row.get("verdict") \
+                or runner.get("governor_release") != "PENDING" \
+                or not SHA_RE.fullmatch(str(runner.get("sha", ""))):
+            continue
+        governor_token = runner.get("governor_token")
+        if type(governor_token) is not str or not governor_token:
+            continue
+        if not _release_recovered_governor(governor_token, receipt_dir):
+            return False
+        if job_id not in recovered_ids:
+            event = {
+                "kind": "margin_governor_release_recovered",
+                "job_id": job_id,
+                "op": margin_ops.MARGIN_BORROW,
+                "symbol": row["symbol"],
+                "verdict": row["verdict"],
+                "utc": _utc_text(now),
+            }
+            try:
+                _append_results_row(paths, event)
+            except Exception:
+                return False
+            print(json.dumps(event, separators=(",", ":")))
+        source_path = runner.get("source_receipt_path", "")
+        if type(source_path) is not str or not _mark_margin_governor_released(
+                paths, job_id, source_path, governor_token, now, "RECOVERED"):
+            return False
+        return True
+    return None
+
+
 def _realized_close_values(outcome: Outcome) \
         -> Optional[Tuple[Decimal, Decimal]]:
     if outcome.verdict != "CLOSED" or not isinstance(outcome.ledger, dict):
@@ -3391,13 +3721,14 @@ def _record_realized_close(outcome: Outcome, receipt_dir: str) -> bool:
 
 def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
                     op: str, symbol: str, outcome: Outcome,
-                    now: datetime, accept_one_checked: bool = False) -> int:
+                    now: datetime, accept_one_checked: bool = False,
+                    governor_token: str = "") -> int:
     if not accept_one_checked:
         outcome = _final_entry_outcome(paths, job_id, op, outcome)
     if outcome.reason or outcome.ledger is not None:
         receipt_path = _write_runner_receipt(
             paths, job_id, op, symbol, outcome.verdict, outcome.reason, now,
-            outcome.receipt_path, outcome.ledger,
+            outcome.receipt_path, outcome.ledger, governor_token,
         )
         outcome = Outcome(
             outcome.verdict, outcome.exit_code, receipt_path, "",
@@ -3598,8 +3929,20 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
         return 0
     try:
         result_ids, bad_results, unresolved_result = _result_ids(paths["results"])
-        if bad_results or unresolved_result \
-                or _unresolved_account_state(receipt_dir):
+        if bad_results:
+            _touch_stop(paths["stop"])
+            print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
+            return 3
+        margin_governor_recovery = _recover_final_margin_governor(
+            paths, receipt_dir, now
+        )
+        if margin_governor_recovery is not None:
+            if not margin_governor_recovery:
+                _touch_stop(paths["stop"])
+                print("JOB-RUNNER | HALTED | governor recovery incomplete")
+                return 3
+            return 0
+        if unresolved_result or _unresolved_account_state(receipt_dir):
             _touch_stop(paths["stop"])
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
             return 3
@@ -3655,6 +3998,18 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 return _finish_claimed(
                     paths, receipt_dir, filename_id, op, symbol, outcome, now
                 )
+            if job.op in MARGIN_OPS and isinstance(
+                    job.margin_operation, dict) \
+                    and _margin_tag_is_claimed(
+                        paths, job.margin_operation.get("client_tag", "")
+                    ):
+                outcome = Outcome(
+                    "REFUSED", 2, "", "TAG_ALREADY_CLAIMED"
+                )
+                return _finish_claimed(
+                    paths, receipt_dir, job.job_id, job.op,
+                    job.symbol, outcome, now
+                )
             if job.op == margin_ops.MARGIN_BORROW \
                     and os.path.isfile(paths["stop"]):
                 outcome = Outcome("REFUSED", 2, "", "STOP_JOBS_SEALED")
@@ -3699,12 +4054,19 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             code = _finish_claimed(
                 paths, receipt_dir, job.job_id, job.op, job.symbol,
                 outcome, now, accept_one_checked=True,
+                governor_token=governor_token,
             )
-            if governor_token and _entry_outcome_terminal(outcome) \
-                    and not _release_governor(
-                        release_governor, governor_token, receipt_dir
-                    ):
-                _touch_stop(paths["stop"])
+            if governor_token and _entry_outcome_terminal(outcome):
+                governor_released = _release_governor(
+                    release_governor, governor_token, receipt_dir
+                )
+                if governor_released and job.op == margin_ops.MARGIN_BORROW:
+                    governor_released = _mark_margin_governor_released(
+                        paths, job.job_id, outcome.receipt_path,
+                        governor_token, now, "RELEASED",
+                    )
+                if not governor_released:
+                    _touch_stop(paths["stop"])
             return code
         if adverse_blocked_unknown:
             return 0

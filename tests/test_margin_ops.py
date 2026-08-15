@@ -214,8 +214,19 @@ class MarginOperationTests(unittest.TestCase):
         changed = margin_ops.deterministic_client_tag(
             "MARGIN_REPAY", ASSET, "3", EXPIRY
         )
+        changed_asset = margin_ops.deterministic_client_tag(
+            "MARGIN_BORROW", "BTC", "3", EXPIRY
+        )
+        changed_principal = margin_ops.deterministic_client_tag(
+            "MARGIN_BORROW", ASSET, "2", EXPIRY
+        )
+        changed_expiry = margin_ops.deterministic_client_tag(
+            "MARGIN_BORROW", ASSET, "3", "2026-08-15T10:10:00.000001Z"
+        )
         self.assertEqual(first, second)
-        self.assertNotEqual(first, changed)
+        for candidate in (
+                changed, changed_asset, changed_principal, changed_expiry):
+            self.assertNotEqual(first, candidate)
         self.assertRegex(first, re.compile(r"^mrg-[0-9a-f]{24}$"))
         value = job(client_tag="mrg-" + ("0" * 24))
         row = margin_ops.build_margin_operation(value, {ASSET}, NOW)
@@ -244,6 +255,28 @@ class MarginOperationTests(unittest.TestCase):
                 )
                 self.assertEqual((row["verdict"], row["reason"]),
                                  ("REFUSED", "EXPIRED"))
+
+    def test_expiry_comparison_preserves_microseconds(self):
+        expiry = "2026-08-15T10:00:00.500000Z"
+        before = datetime(
+            2026, 8, 15, 10, 0, 0, 499999, tzinfo=timezone.utc
+        )
+        at_expiry = datetime(
+            2026, 8, 15, 10, 0, 0, 500000, tzinfo=timezone.utc
+        )
+        self.assertEqual(
+            margin_ops.build_margin_operation(
+                job(expires_utc=expiry), {ASSET}, before
+            )["verdict"],
+            "READY",
+        )
+        refused = margin_ops.build_margin_operation(
+            job(expires_utc=expiry), {ASSET}, at_expiry
+        )
+        self.assertEqual(
+            (refused["verdict"], refused["reason"]),
+            ("REFUSED", "EXPIRED"),
+        )
 
     def test_expiry_too_far_or_malformed_refuses(self):
         too_far = job(expires_utc="2026-08-15T10:15:00.000001Z")
