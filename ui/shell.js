@@ -670,6 +670,10 @@
     var icon = stEl("span", "st-check");
     icon.appendChild(stIcon(0));
     head.appendChild(icon);
+    var tdef = netMetric(def.id);
+    if (tdef && tdef.tier) {
+      head.appendChild(stEl("span", "st-tier", tdef.tier));
+    }
     head.appendChild(stEl("span", "st-spacer"));
     var cur = stEl("span", "st-t-datum st-val", "\u2014");
     cur.setAttribute("data-current", def.id);
@@ -1210,6 +1214,119 @@
     host.appendChild(statTile("History held", spanTxt2));
     host.appendChild(statTile("Freshest sample", newestAge2));
     host.appendChild(statTile("State changes", String(netEvCount)));
+    updateHero();
+    updateChipVals();
+  }
+
+  /* ---- Trading-path hero: SEE = feed truth, DECIDE = brain loops,
+     ACT = machine authority + runner, VIEW = mirror freshness. Grades
+     ride the attributed capture ages, so a stale courier degrades VIEW
+     alone — never the machine. ---- */
+  function heroWord(el, text, cls) {
+    if (!el) { return; }
+    el.textContent = text;
+    el.className = "st-hero-word" + (cls ? " " + cls : "");
+  }
+
+  function worstOf(keys) {
+    var rank = { "": 0, ok: 0, warn: 1, bad: 2 };
+    var worst = { cls: "ok", key: null, val: null };
+    var sawAny = false;
+    for (var i = 0; i < keys.length; i += 1) {
+      var v = currentVal(keys[i]);
+      if (v == null) { continue; }
+      sawAny = true;
+      var c = thrCls(keys[i], v) || "ok";
+      if (rank[c] > rank[worst.cls] || worst.key === null) {
+        if (rank[c] >= rank[worst.cls]) {
+          worst = { cls: c, key: keys[i], val: v };
+        }
+      }
+    }
+    return sawAny ? worst : null;
+  }
+
+  function heroLoopText(w) {
+    if (!w) { return ["Measuring", ""]; }
+    if (w.cls === "ok") { return ["On rhythm", ""]; }
+    var m = netMetric(w.key);
+    var name = m ? m.label : w.key;
+    return [name + " " + (w.cls === "bad" ? "silent" : "late") + " "
+      + ageText2(w.val), w.cls];
+  }
+
+  function updateHero() {
+    var line = document.getElementById("net-hero-line");
+    if (!line) { return; }
+    var see = worstOf(["market"]);
+    var decide = worstOf(["supervisor", "basiswatch", "basissup"]);
+    var act = worstOf(["jobrunner"]);
+    var st = heroLoopText(see);
+    heroWord(document.getElementById("net-hero-see"), st[0], st[1]);
+    var dt = heroLoopText(decide);
+    heroWord(document.getElementById("net-hero-decide"), dt[0], dt[1]);
+    /* ACT carries machine authority (constitution: ink when ARMED,
+       amber for sealed/paused — armed is normal, never a celebration) */
+    var machine = (lastStrip && lastStrip.machine) || null;
+    var actEl = document.getElementById("net-hero-act");
+    var runnerBad = act && act.cls !== "ok" ? act : null;
+    if (runnerBad) {
+      var rt = heroLoopText(runnerBad);
+      heroWord(actEl, rt[0], rt[1]);
+    } else if (machine === "ARMED") {
+      heroWord(actEl, "Armed", "");
+    } else if (machine === "ENTRY-SEALED") {
+      heroWord(actEl, "Entry-sealed", "warn");
+    } else if (machine === "PAUSED") {
+      heroWord(actEl, "Paused", "warn");
+    } else if (machine) {
+      heroWord(actEl, "No data", "bad");
+    } else {
+      heroWord(actEl, "Measuring", "");
+    }
+    var pullAge = lastStrip && lastStrip.pull
+      ? telNum(lastStrip.pull.age_seconds) : null;
+    var viewCls = thrCls("mirror", pullAge) || "";
+    heroWord(document.getElementById("net-hero-view"),
+      pullAge == null ? "no pull yet" : ageText2(pullAge) + " old",
+      viewCls === "ok" ? "" : viewCls);
+    /* the one sentence: name the worst thing, or state the rhythm */
+    var caps = [[see, "SEE"], [decide, "DECIDE"], [act, "ACT"]];
+    var rank2 = { ok: 0, warn: 1, bad: 2 };
+    var worstCap = null;
+    for (var ci4 = 0; ci4 < caps.length; ci4 += 1) {
+      var cw = caps[ci4][0];
+      if (cw && cw.cls !== "ok" &&
+          (!worstCap || rank2[cw.cls] > rank2[worstCap[0].cls])) {
+        worstCap = [cw, caps[ci4][1]];
+      }
+    }
+    if (worstCap) {
+      var wm = netMetric(worstCap[0].key);
+      line.textContent = (wm ? wm.label : worstCap[0].key) + " "
+        + (worstCap[0].cls === "bad" ? "silent" : "late") + " "
+        + ageText2(worstCap[0].val) + " — " + worstCap[1] + " degraded";
+      line.className = "st-hero-line " + worstCap[0].cls;
+    } else if (viewCls && viewCls !== "ok") {
+      line.textContent = "View " + ageText2(pullAge)
+        + " stale — loops last seen healthy";
+      line.className = "st-hero-line " + viewCls;
+    } else {
+      line.textContent = "Loops on rhythm";
+      line.className = "st-hero-line";
+    }
+  }
+
+  function updateChipVals() {
+    for (var i = 0; i < NET_METRICS.length; i += 1) {
+      var m = NET_METRICS[i];
+      if (m.unit !== "s") { continue; }
+      var el = document.querySelector(
+        "[data-chipval=\"" + m.key + "\"]");
+      if (!el) { continue; }
+      var v = currentVal(m.key);
+      el.textContent = v == null ? "" : ageText2(v);
+    }
   }
 
   function renderTelemetry() {
@@ -1343,6 +1460,26 @@
     head.appendChild(stEl("span", "st-spacer"));
     page.appendChild(head);
 
+    /* Trading-path hero: the one truth first (can the machine SEE,
+       DECIDE, ACT — and how old is our VIEW of it). One row, no box. */
+    var hero = stEl("div", "st-hero");
+    var heroLine = stEl("div", "st-hero-line", "—");
+    heroLine.id = "net-hero-line";
+    hero.appendChild(heroLine);
+    hero.appendChild(stEl("span", "st-spacer"));
+    var HERO_CAPS = [["see", "SEE"], ["decide", "DECIDE"],
+      ["act", "ACT"], ["view", "VIEW"]];
+    for (var hc = 0; hc < HERO_CAPS.length; hc += 1) {
+      var cap = stEl("span", "st-hero-cap");
+      cap.appendChild(stEl("span", "st-t-meta st-hero-lbl",
+        HERO_CAPS[hc][1]));
+      var w = stEl("span", "st-hero-word", "—");
+      w.id = "net-hero-" + HERO_CAPS[hc][0];
+      cap.appendChild(w);
+      hero.appendChild(cap);
+    }
+    page.appendChild(hero);
+
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
     var gHead = stEl("div", "st-card-head");
@@ -1407,10 +1544,14 @@
       (function (m, idx) {
         var chip = stEl("button", "st-chip");
         chip.setAttribute("type", "button");
+        chip.setAttribute("data-chip", m.key);
         var key = stEl("span", "st-chip-key");
         key.style.background = "var(--st-s" + (idx + 1) + ")";
         chip.appendChild(key);
-        chip.appendChild(document.createTextNode(m.label));
+        chip.appendChild(stEl("span", "st-chip-lbl", m.label));
+        var chipVal = stEl("span", "st-chip-val", "");
+        chipVal.setAttribute("data-chipval", m.key);
+        chip.appendChild(chipVal);
         chip.addEventListener("click", function () {
           /* owner order: click a name = SEE that loop alone; click
              it again = everything back */
@@ -1423,18 +1564,10 @@
             var kk = NET_METRICS[ci3].key;
             chipOn[kk] = aloneAlready ? true : (kk === m.key);
           }
-          var cs3 = chips.querySelectorAll(".st-chip");
+          var cs3 = chips.querySelectorAll(".st-chip[data-chip]");
           for (var cq3 = 0; cq3 < cs3.length; cq3 += 1) {
-            var lbl3 = cs3[cq3].textContent;
-            var on3 = true;
-            for (var vj3 = 0; vj3 < NET_METRICS.length; vj3 += 1) {
-              if (NET_METRICS[vj3].label === lbl3) {
-                on3 = chipOn[NET_METRICS[vj3].key] !== false;
-              }
-            }
-            if (lbl3 !== "All") {
-              cs3[cq3].classList.toggle("off", !on3);
-            }
+            var ck3 = cs3[cq3].getAttribute("data-chip");
+            cs3[cq3].classList.toggle("off", chipOn[ck3] === false);
           }
           syncOverviewShow();
         });
