@@ -525,7 +525,29 @@ class AcceptOneReworkTests(unittest.TestCase):
 
         for index, op in enumerate(sorted(jr.ENTRY_OPS)):
             with self.subTest(op=op):
-                self.job("unaccepted-%s" % index, op=op)
+                if op in jr.MARGIN_OPS:
+                    # A margin op must be WELL-FORMED so the refusal under
+                    # test is genuinely the acceptance gate, not the schema.
+                    self.job(
+                        "unaccepted-%s" % index, op=op,
+                        symbol=None, max_notional=None,
+                        asset="USDT", principal="2",
+                        client_tag="acc-%s" % index,
+                        operator_token="lead",
+                    )
+                    path = os.path.join(
+                        self.jobs_dir, "job-unaccepted-%s.json" % index
+                    )
+                    with open(path, encoding="utf-8") as handle:
+                        value = json.load(handle)
+                    value = {
+                        key: item for key, item in value.items()
+                        if item is not None
+                    }
+                    with open(path, "w", encoding="utf-8") as handle:
+                        json.dump(value, handle)
+                else:
+                    self.job("unaccepted-%s" % index, op=op)
 
                 self.assertEqual(self.tick(), 2)
 

@@ -394,17 +394,6 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
 def _validate_job(raw: Dict[str, Any], filename_id: str,
                   now: datetime, receipt_dir: str = "") -> Job:
     if type(raw.get("op")) is str and raw["op"] in MARGIN_OPS:
-        identifier = raw.get("job_id")
-        malformed_borrow = raw["op"] == margin_ops.MARGIN_BORROW \
-            and set(raw) != MARGIN_JOB_FIELDS
-        exact_identity = type(identifier) is str \
-            and JOB_ID_RE.fullmatch(identifier) is not None \
-            and identifier == filename_id
-        if malformed_borrow and exact_identity and receipt_dir \
-                and not os.path.isfile(os.path.join(
-                    receipt_dir, "ACCEPT-ONE"
-                )):
-            raise JobRefusal("ENTRY_BLOCKED_NOT_ACCEPTED")
         return _validate_margin_job(raw, filename_id, now)
 
     unknown = set(raw) - JOB_FIELDS
@@ -494,6 +483,18 @@ def _paths(receipt_dir: str) -> Dict[str, str]:
 def _make_dirs(paths: Dict[str, str]) -> None:
     for name in ("jobs", "claims", "receipts"):
         os.makedirs(paths[name], mode=0o700, exist_ok=True)
+
+
+def _fsync_parent_directory(path: str) -> None:
+    """Make one created or replaced directory entry durable."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(os.path.dirname(os.path.abspath(path)), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _touch_stop(path: str) -> None:
@@ -780,9 +781,12 @@ def _claim(paths: Dict[str, str], job_id: str, now: datetime) -> bool:
         return False
     body = json.dumps({"job_id": job_id, "claimed_utc": _utc_text(now)},
                       separators=(",", ":")) + "\n"
-    os.write(descriptor, body.encode("utf-8"))
-    os.fsync(descriptor)
-    os.close(descriptor)
+    try:
+        os.write(descriptor, body.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_parent_directory(path)
     return True
 
 
@@ -2886,6 +2890,7 @@ def _persist_margin_source(path: str, payload: Dict[str, Any],
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_parent_directory(path)
         return
     temporary = path + ".tmp-" + secrets.token_hex(6)
     try:
@@ -2894,7 +2899,9 @@ def _persist_margin_source(path: str, payload: Dict[str, Any],
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
+        _fsync_parent_directory(temporary)
         os.replace(temporary, path)
+        _fsync_parent_directory(path)
     finally:
         try:
             os.unlink(temporary)
@@ -2942,11 +2949,29 @@ def _margin_history_confirmation(payload: Any, transaction_id: str,
     if not isinstance(payload, dict) or not isinstance(
             payload.get("rows"), list):
         return None
-    matches = [
-        row for row in payload["rows"]
-        if isinstance(row, dict)
-        and _margin_transaction_id(row) == transaction_id
-    ]
+    matches = []
+    for row in payload["rows"]:
+        if not isinstance(row, dict):
+            continue
+        aliases = []
+        invalid_alias = False
+        for name in ("tranId", "txId"):
+            if name not in row:
+                continue
+            value = row[name]
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                invalid_alias = True
+                continue
+            text = str(value)
+            if not text or len(text) > 128:
+                invalid_alias = True
+                continue
+            aliases.append(text)
+        if transaction_id in aliases and (
+                invalid_alias or len(set(aliases)) != 1):
+            return None
+        if _margin_transaction_id(row) == transaction_id:
+            matches.append(row)
     if len(matches) != 1:
         return None
     row = matches[0]
@@ -3020,6 +3045,16 @@ def _finish_margin_source(receipt: Dict[str, Any], path: str,
     return Outcome(verdict, exit_code, path, reason)
 
 
+def _finish_margin_before_post(receipt: Dict[str, Any], path: str,
+                               verdict: str, exit_code: int, reason: str,
+                               now: datetime) -> Outcome:
+    receipt["mutation_attempts"] = 0
+    receipt.pop("mutation_started_utc", None)
+    return _finish_margin_source(
+        receipt, path, verdict, exit_code, reason, now
+    )
+
+
 def _run_margin_operation(
         job: Job, paths: Dict[str, str],
         request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
@@ -3065,6 +3100,10 @@ def _run_margin_operation(
         "reason": "",
         "started_utc": _utc_text(fresh_now),
     }
+    sealed_repay = job.op == margin_ops.MARGIN_REPAY \
+        and os.path.isfile(paths["stop"])
+    if sealed_repay:
+        receipt["execution_mode"] = "STOP_JOBS_REPAY"
     try:
         _persist_margin_source(source_path, receipt, create=True)
         receipt["mutation_attempts"] = 1
@@ -3083,6 +3122,52 @@ def _run_margin_operation(
             os.environ.get("BINANCE_API_KEY", ""),
             os.environ.get("BINANCE_API_SECRET", ""),
         )
+    except Exception:
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_POST_UNREADABLE", fresh_now,
+        )
+
+    mutation_now = _utc_now()
+    try:
+        mutation_operation = margin_ops.build_margin_operation(
+            projection, MARGIN_ASSET_WHITELIST, mutation_now
+        )
+    except Exception:
+        mutation_operation = None
+    if not isinstance(mutation_operation, dict):
+        return _finish_margin_before_post(
+            receipt, source_path, "REFUSED", 2,
+            "MARGIN_VALIDATION_UNKNOWN", mutation_now,
+        )
+    if mutation_operation.get("verdict") == "REFUSED":
+        reason = mutation_operation.get("reason")
+        if type(reason) is not str or not reason:
+            reason = "MARGIN_VALIDATION_UNKNOWN"
+        return _finish_margin_before_post(
+            receipt, source_path, "REFUSED", 2, reason, mutation_now,
+        )
+    if mutation_operation != operation:
+        return _finish_margin_before_post(
+            receipt, source_path, "REFUSED", 2,
+            "MARGIN_VALIDATION_UNKNOWN", mutation_now,
+        )
+    if job.op == margin_ops.MARGIN_BORROW \
+            and os.path.isfile(paths["stop"]):
+        return _finish_margin_before_post(
+            receipt, source_path, "REFUSED", 2,
+            "STOP_JOBS_SEALED", mutation_now,
+        )
+    if job.op in ENTRY_OPS:
+        authority_refusal = _entry_ticket_refusal(job, paths, mutation_now)
+        receipt["authority_checked_utc"] = _utc_text(mutation_now)
+        if authority_refusal:
+            return _finish_margin_before_post(
+                receipt, source_path, "REFUSED", 2,
+                authority_refusal, mutation_now,
+            )
+
+    try:
         post_result = transport(
             "POST", base_url, operation["endpoint_path"],
             dict(operation["params"]), True,
@@ -3172,8 +3257,11 @@ def _run_margin_operation(
             "MARGIN_LIABILITY_MISMATCH", fresh_now,
             confirmation, liability,
         )
+    success_reason = expected["status"]
+    if sealed_repay:
+        success_reason = "REPAY_CONFIRMED_UNDER_STOP_JOBS"
     return _finish_margin_source(
-        receipt, source_path, verdict, 0, expected["status"], fresh_now,
+        receipt, source_path, verdict, 0, success_reason, fresh_now,
         confirmation, liability,
     )
 
@@ -3242,6 +3330,17 @@ def _entry_outcome_succeeded(outcome: Outcome) -> bool:
     return outcome.exit_code == 0 and outcome.verdict in {"OPEN", "CLOSED"}
 
 
+def _final_entry_outcome(paths: Dict[str, str], job_id: str, op: str,
+                         outcome: Outcome) -> Outcome:
+    if op in ENTRY_OPS and _entry_outcome_succeeded(outcome) \
+            and not _consume_accept_one(paths["accept_one"], job_id):
+        return Outcome(
+            "UNKNOWN", 4, outcome.receipt_path,
+            "ACCEPT_ONE_CLAIM_FAILED", outcome.ledger,
+        )
+    return outcome
+
+
 def _release_recovered_governor(token: str, receipt_dir: str) -> bool:
     if not token:
         return True
@@ -3292,13 +3391,9 @@ def _record_realized_close(outcome: Outcome, receipt_dir: str) -> bool:
 
 def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
                     op: str, symbol: str, outcome: Outcome,
-                    now: datetime) -> int:
-    if op in ENTRY_OPS and _entry_outcome_succeeded(outcome) \
-            and not _consume_accept_one(paths["accept_one"], job_id):
-        outcome = Outcome(
-            "UNKNOWN", 4, outcome.receipt_path,
-            "ACCEPT_ONE_CLAIM_FAILED", outcome.ledger,
-        )
+                    now: datetime, accept_one_checked: bool = False) -> int:
+    if not accept_one_checked:
+        outcome = _final_entry_outcome(paths, job_id, op, outcome)
     if outcome.reason or outcome.ledger is not None:
         receipt_path = _write_runner_receipt(
             paths, job_id, op, symbol, outcome.verdict, outcome.reason, now,
@@ -3513,8 +3608,10 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
         )
         if recovery is not None:
             job_id, op, symbol, outcome, governor_token = recovery
+            outcome = _final_entry_outcome(paths, job_id, op, outcome)
             code = _finish_claimed(
-                paths, receipt_dir, job_id, op, symbol, outcome, now
+                paths, receipt_dir, job_id, op, symbol, outcome, now,
+                accept_one_checked=True,
             )
             if governor_token and _entry_outcome_terminal(outcome) \
                     and not _release_recovered_governor(
@@ -3558,7 +3655,8 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 return _finish_claimed(
                     paths, receipt_dir, filename_id, op, symbol, outcome, now
                 )
-            if job.op in MARGIN_OPS and os.path.isfile(paths["stop"]):
+            if job.op == margin_ops.MARGIN_BORROW \
+                    and os.path.isfile(paths["stop"]):
                 outcome = Outcome("REFUSED", 2, "", "STOP_JOBS_SEALED")
                 return _finish_claimed(
                     paths, receipt_dir, job.job_id, job.op,
@@ -3595,9 +3693,12 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     spot_request=spot_request,
                     margin_request=margin_request,
                 )
+            outcome = _final_entry_outcome(
+                paths, job.job_id, job.op, outcome
+            )
             code = _finish_claimed(
                 paths, receipt_dir, job.job_id, job.op, job.symbol,
-                outcome, now
+                outcome, now, accept_one_checked=True,
             )
             if governor_token and _entry_outcome_terminal(outcome) \
                     and not _release_governor(

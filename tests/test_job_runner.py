@@ -869,6 +869,16 @@ class JobRunnerTests(unittest.TestCase):
                 self.assertEqual(job.margin_operation["verdict"], "READY")
                 self.assertEqual(set(raw), jr.MARGIN_JOB_FIELDS)
 
+    def test_margin_runner_refuses_non_usdt_asset(self):
+        self.margin_job("margin-asset", asset="BTC")
+
+        self.assertEqual(self.margin_tick(), 2)
+
+        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]), "ASSET_NOT_ALLOWED"
+        )
+
     def test_margin_runner_clamp_refuses_before_request(self):
         self.margin_job("margin-cap", principal="3.01")
 
@@ -881,7 +891,46 @@ class JobRunnerTests(unittest.TestCase):
             "PRINCIPAL_CEILING_EXCEEDED",
         )
 
+    def test_margin_runner_clamp_is_independent_of_margin_ops(self):
+        self.margin_job("margin-runner-cap", principal="3.01")
+
+        def permissive_builder(projection, _whitelist, _now):
+            request_type = "BORROW" \
+                if projection["op"] == "MARGIN_BORROW" else "REPAY"
+            return {
+                "verdict": "READY",
+                "op": projection["op"],
+                "client_tag": projection["client_tag"],
+                "expires_utc": projection["expires_utc"],
+                "endpoint_path": jr.MARGIN_ENDPOINT_PATH,
+                "params": {
+                    "asset": projection["asset"],
+                    "amount": projection["principal"],
+                    "type": request_type,
+                },
+                "expected_ledger_confirmation": {
+                    "asset": projection["asset"],
+                    "principal": projection["principal"],
+                    "interest": "0",
+                    "status": request_type + "_CONFIRMED",
+                },
+                "evidence": [],
+            }
+
+        with mock.patch.object(
+                jr.margin_ops, "build_margin_operation",
+                side_effect=permissive_builder) as builder:
+            self.assertEqual(self.margin_tick(), 2)
+
+        self.assertEqual(builder.call_count, 1)
+        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]),
+            "PRINCIPAL_CEILING_EXCEEDED",
+        )
+
     def test_margin_trading_fields_are_forbidden(self):
+        os.unlink(os.path.join(self.receipt_dir, "ACCEPT-ONE"))
         cases = {
             "leverage": "1",
             "max_notional": "3",
@@ -898,6 +947,9 @@ class JobRunnerTests(unittest.TestCase):
                 row = self.results()[-1]
                 self.assertEqual(row["symbol"], "USDT")
                 self.assertEqual(self.reason(row), "FORBIDDEN_FIELD")
+                self.assertFalse(os.path.exists(os.path.join(
+                    self.receipt_dir, "ACCEPT-ONE"
+                )))
         self.assertEqual(self.margin.calls, [])
 
     def test_margin_expiry_at_mutation_refuses_without_post(self):
@@ -914,6 +966,82 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "ACCEPT-ONE"
         )))
         self.assertEqual(len(self.governor_releases), 1)
+
+    def test_margin_accept_one_is_rechecked_at_post_boundary(self):
+        self.write_accept_one(
+            expires_utc=utc(NOW + timedelta(seconds=1))
+        )
+        self.margin_job("margin-ticket-freshness")
+
+        code = self.margin_tick(
+            mutation_now=NOW + timedelta(seconds=2)
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.margin.calls, [])
+        result = self.results()[0]
+        self.assertEqual(self.reason(result), "ACCEPT_ONE_INVALID")
+        source = self.margin_source(result)
+        self.assertEqual(source["mutation_attempts"], 0)
+        self.assertEqual(
+            source["authority_checked_utc"],
+            utc(NOW + timedelta(seconds=2)),
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+
+    def test_margin_operator_is_rechecked_at_post_boundary(self):
+        self.margin_job("margin-operator-freshness")
+        persist = jr._persist_margin_source
+
+        def change_operator_after_create(path, payload, create=False):
+            persist(path, payload, create=create)
+            if create:
+                self.write_operator("replacement-operator")
+
+        with mock.patch.object(
+                jr, "_persist_margin_source",
+                side_effect=change_operator_after_create):
+            code = self.margin_tick()
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.margin.calls, [])
+        result = self.results()[0]
+        self.assertEqual(self.reason(result), "OPERATOR_MISMATCH")
+        self.assertEqual(
+            self.margin_source(result)["authority_checked_utc"], utc(NOW)
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+
+    def test_margin_borrow_rechecks_stop_jobs_at_post_boundary(self):
+        self.margin_job("margin-stop-freshness")
+        persist = jr._persist_margin_source
+
+        def seal_after_create(path, payload, create=False):
+            persist(path, payload, create=create)
+            if create:
+                Path(os.path.join(
+                    self.receipt_dir, "STOP-JOBS"
+                )).touch()
+
+        with mock.patch.object(
+                jr, "_persist_margin_source",
+                side_effect=seal_after_create):
+            code = self.margin_tick()
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.margin.calls, [])
+        result = self.results()[0]
+        self.assertEqual(self.reason(result), "STOP_JOBS_SEALED")
+        self.assertEqual(
+            self.margin_source(result)["mutation_attempts"], 0
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
 
     def test_margin_borrow_operator_token_must_match_owner(self):
         self.margin_job("margin-owner", operator_token="another-operator")
@@ -955,6 +1083,62 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "ACCEPT-ONE.claimed-margin-borrow"
         )))
 
+    def test_claim_and_margin_receipt_directory_entries_are_fsynced(self):
+        paths = jr._paths(self.receipt_dir)
+        jr._make_dirs(paths)
+        claim_path = os.path.join(
+            paths["claims"], "job-margin-durable.claim"
+        )
+        source_path = os.path.join(
+            paths["receipts"], "margin-margin-durable.json"
+        )
+
+        with mock.patch.object(
+                jr, "_fsync_parent_directory",
+                wraps=jr._fsync_parent_directory) as parent_sync:
+            self.assertTrue(jr._claim(paths, "margin-durable", NOW))
+            jr._persist_margin_source(
+                source_path, {"state": "READY"}, create=True
+            )
+            jr._persist_margin_source(
+                source_path, {"state": "FINISHED"}
+            )
+
+        synced_paths = [call.args[0] for call in parent_sync.call_args_list]
+        self.assertEqual(synced_paths[0:2], [claim_path, source_path])
+        self.assertTrue(synced_paths[2].startswith(source_path + ".tmp-"))
+        self.assertEqual(synced_paths[3], source_path)
+
+    def test_margin_claim_replay_without_result_id_never_reposts(self):
+        self.margin_job("margin-claim-replay")
+
+        class FinishInterrupted(Exception):
+            pass
+
+        with mock.patch.object(
+                jr, "_finish_claimed", side_effect=FinishInterrupted):
+            with self.assertRaises(FinishInterrupted):
+                self.margin_tick()
+
+        result_ids, bad_results, unresolved = jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        )
+        self.assertEqual(result_ids, set())
+        self.assertFalse(bad_results)
+        self.assertFalse(unresolved)
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
+
+        self.assertEqual(self.margin_tick(), 3)
+
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
+        self.assertEqual(self.results(), [])
+
     def test_margin_history_disagreement_freezes_without_repost(self):
         self.margin.history_payload = {"rows": [{
             "txId": "7301",
@@ -981,6 +1165,60 @@ class JobRunnerTests(unittest.TestCase):
             len([call for call in self.margin.calls if call[0] == "POST"]),
             1,
         )
+
+    def test_margin_history_rejects_target_identity_conflicts_and_duplicates(
+            self):
+        expected = {
+            "asset": "USDT",
+            "principal": "3",
+            "interest": "0",
+            "status": "BORROW_CONFIRMED",
+        }
+        valid = {
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "3",
+            "interest": "0",
+            "status": "CONFIRMED",
+            "type": "BORROW",
+        }
+        cases = {
+            "conflict": [
+                dict(valid),
+                dict(valid, tranId="8301"),
+            ],
+            "duplicate": [dict(valid), dict(valid)],
+        }
+        for name, rows in cases.items():
+            with self.subTest(name=name):
+                self.assertIsNone(jr._margin_history_confirmation(
+                    {"rows": rows}, "7301", expected, "BORROW"
+                ))
+
+    def test_margin_history_identity_conflict_freezes_unknown(self):
+        valid = {
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "3",
+            "interest": "0",
+            "status": "CONFIRMED",
+            "type": "BORROW",
+        }
+        self.margin.history_payload = {"rows": [
+            valid,
+            dict(valid, tranId="8301"),
+        ]}
+        self.margin_job("margin-identity-conflict")
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(self.results()[0]), "MARGIN_CONFIRMATION_MISMATCH"
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
 
     def test_unreadable_margin_history_freezes(self):
         self.margin.history_kind = "unclear"
@@ -1030,20 +1268,67 @@ class JobRunnerTests(unittest.TestCase):
             self.reason(open_result), "MARGIN_LIABILITY_MISMATCH"
         )
 
-    def test_stop_jobs_seals_both_margin_directions(self):
+    def test_stop_jobs_seals_borrow_and_allows_repay_without_ticket_claim(self):
         Path(os.path.join(self.receipt_dir, "STOP-JOBS")).touch()
         self.margin_job("margin-seal-borrow", op="MARGIN_BORROW")
         self.margin_job("margin-seal-repay", op="MARGIN_REPAY")
 
         self.assertEqual(self.margin_tick(), 2)
-        self.assertEqual(self.margin_tick(), 2)
+        self.assertEqual(self.margin_tick(), 0)
 
         self.assertEqual(
             [self.reason(row) for row in self.results()],
-            ["STOP_JOBS_SEALED", "STOP_JOBS_SEALED"],
+            ["STOP_JOBS_SEALED", "REPAY_CONFIRMED_UNDER_STOP_JOBS"],
         )
-        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            [row["verdict"] for row in self.results()],
+            ["REFUSED", "CLOSED"],
+        )
+        self.assertEqual(
+            self.margin_source(self.results()[1])["execution_mode"],
+            "STOP_JOBS_REPAY",
+        )
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
         self.assertEqual(self.governor_budget_calls, [])
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE.claimed-margin-seal-borrow"
+        )))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE.claimed-margin-seal-repay"
+        )))
+        for job_id in ("margin-seal-borrow", "margin-seal-repay"):
+            self.assertTrue(os.path.isfile(os.path.join(
+                self.jobs_dir, "claims", "job-%s.claim" % job_id
+            )))
+
+    def test_margin_claim_collision_keeps_governor_slot_on_final_unknown(self):
+        job_id = "margin-governor-collision"
+        Path(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE.claimed-" + job_id
+        )).touch()
+        self.margin_job(job_id)
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(self.results()[0]), "ACCEPT_ONE_CLAIM_FAILED"
+        )
+        self.assertEqual(len(self.governor_acquire_calls), 1)
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
 
     def test_unknown_touches_stop_and_blocks_next_job(self):
         self.job("a")
