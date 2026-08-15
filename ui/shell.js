@@ -704,7 +704,7 @@
     t.textContent = "Activity · 24h";
     var lgwrap = document.createElement("span");
     lgwrap.className = "rbox-sub act-h";
-    var defs = [["H", "#dc2626"], ["M", "#f59e0b"], ["L", "#9aa3af"]];
+    var defs = [["H", "#e8850c"], ["M", "#3b82f6"], ["L", "#9aa3af"]];
     for (var li2 = 0; li2 < defs.length; li2++) {
       var lg = document.createElement("span");
       lg.className = "lg";
@@ -738,7 +738,7 @@
       var tot = buckets[mb].h + buckets[mb].m + buckets[mb].l;
       if (tot > maxN) { maxN = tot; }
     }
-    var W = 276, H = 72, plotH = 52, baseY = 58;
+    var W = 312, H = 88, plotH = 64, baseY = 72;
     var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H,
       "class": "actchart" });
     var slot = W / 24;
@@ -750,7 +750,7 @@
       var hourLabel = ((nowHour - (23 - x)) % 24 + 24) % 24;
       var col = svgEl("g", {});
       var y = baseY;
-      var segs = [["l", "#9aa3af"], ["m", "#f59e0b"], ["h", "#dc2626"]];
+      var segs = [["l", "#9aa3af"], ["m", "#3b82f6"], ["h", "#e8850c"]];
       for (var s2 = 0; s2 < segs.length; s2++) {
         var n = bkt[segs[s2][0]];
         if (!n) { continue; }

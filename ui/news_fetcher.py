@@ -296,6 +296,8 @@ def parse_tree(blob, source):
             domain = url.split("/", 3)[2] if url else ""
         except IndexError:
             domain = ""
+        if domain.startswith("www."):
+            domain = domain[4:]
         items.append({
             "id": str(raw.get("_id") or "")[:64],
             "ts": iso_from_epoch_ms(time_ms),
@@ -497,14 +499,21 @@ def fetch_source(source):
 FAVICON_DIR = BASE / "live" / "favicons"
 
 
-def mirror_favicons(catalog, quiet):
-    """Mirror source favicons same-origin (Google s2, cached on disk) so
-    the UI can show real logos without any external request."""
+DOMAIN_OK = re.compile(r"^[a-z0-9.-]{4,64}$")
+
+
+def mirror_favicons(domains, quiet, cap=60):
+    """Mirror favicons same-origin (Google s2, cached on disk) so the
+    UI shows real logos with zero external requests from the page."""
     FAVICON_DIR.mkdir(parents=True, exist_ok=True)
     fetched = 0
-    for src in catalog:
-        domain = (src.get("domain") or "").strip().lower()
-        if not domain:
+    for domain in domains:
+        if fetched >= cap:
+            break
+        domain = (domain or "").strip().lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if not DOMAIN_OK.match(domain):
             continue
         out = FAVICON_DIR / (domain + ".png")
         if out.exists() and out.stat().st_size > 0:
@@ -608,6 +617,15 @@ def run_cycle(catalog, quiet):
         "sources": board,
     }, ensure_ascii=False, indent=1))
 
+    domains = set()
+    for src in catalog:
+        if src.get("domain"):
+            domains.add(src["domain"])
+    for item in fresh:
+        if item.get("domain"):
+            domains.add(item["domain"])
+    mirror_favicons(sorted(domains), quiet)
+
     if not quiet:
         high = sum(1 for entry in fresh if entry["impact"] == 3)
         print("news_fetcher: %d items (%d high) from %d/%d live sources "
@@ -627,7 +645,6 @@ def main():
     catalog = [src for src in catalog
                if src.get("feeds") or (src.get("mode") == "page")]
 
-    mirror_favicons(catalog, args.quiet)
     if args.loop <= 0:
         return run_cycle(catalog, args.quiet)
     interval = max(60, args.loop)
