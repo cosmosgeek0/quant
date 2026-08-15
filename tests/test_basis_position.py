@@ -22,6 +22,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
@@ -33,6 +34,10 @@ from basis_position import PositionConfig  # noqa: E402
 
 SPEC_PATH = Path(__file__).resolve().parent / "fixtures" / \
     "old_engine_spec.json"
+V1_CONTRACT_DIR = Path(__file__).resolve().parent / "fixtures" / \
+    "position_v1_contract"
+V1_CONTRACT_PATH = V1_CONTRACT_DIR / "basis-position.json"
+V1_CONTRACT_UTC = "2025-08-12T00:00:00Z"
 with open(SPEC_PATH, encoding="utf-8") as _handle:
     SPEC = json.load(_handle)
 LIFECYCLE_FIXTURES = {f["name"] for f in SPEC["lifecycle"]["fixtures"]}
@@ -901,6 +906,286 @@ class MachineCase(unittest.TestCase):
                                             spec or happy_spec())
         self.assertEqual(code, 0, out)
         return transport
+
+
+# ==========================================================================
+# Version-1 persisted-position contract for the version-2 rung transition.
+# The fixture is one happy open, check, resume, and close cycle emitted by
+# the current writer with a fixed clock. Conditional recovery-only fields
+# remain absent, and that absence is part of this canonical happy contract.
+# ==========================================================================
+
+class VersionOneContractTests(unittest.TestCase):
+    def fixture_position(self):
+        position = bp.load_position(str(V1_CONTRACT_DIR))
+        self.assertIsNotNone(position)
+        return position
+
+    def assert_typed_fields(self, value, expected, path):
+        self.assertIs(type(value), dict, path)
+        self.assertEqual(set(value), set(expected), path)
+        for field, expected_type in expected.items():
+            with self.subTest(path="%s.%s" % (path, field)):
+                self.assertIs(type(value[field]), expected_type)
+
+    def save_and_reload(self, position):
+        with tempfile.TemporaryDirectory() as receipt_dir:
+            path = Path(receipt_dir) / bp.STATE_FILE
+            path.write_text(json.dumps(position, indent=2), encoding="utf-8")
+            loaded = bp.load_position(receipt_dir)
+            with mock.patch.object(bp, "utc", return_value=V1_CONTRACT_UTC):
+                bp.save_position(receipt_dir, loaded)
+            return bp.load_position(receipt_dir)
+
+    def test_v1_contract_happy_cycle_load_save_round_trip_is_byte_stable(self):
+        fixture_bytes = V1_CONTRACT_PATH.read_bytes()
+        with tempfile.TemporaryDirectory() as receipt_dir:
+            state_path = Path(receipt_dir) / bp.STATE_FILE
+            state_path.write_bytes(fixture_bytes)
+            position = bp.load_position(receipt_dir)
+            with mock.patch.object(bp, "utc", return_value=V1_CONTRACT_UTC):
+                bp.save_position(receipt_dir, position)
+            saved_bytes = state_path.read_bytes()
+
+        revision_before = b'  "revision": 17,'
+        revision_after = b'  "revision": 18,'
+        self.assertEqual(fixture_bytes.count(revision_before), 1)
+        expected_bytes = fixture_bytes.rstrip(b"\n").replace(
+            revision_before, revision_after, 1)
+        self.assertEqual(saved_bytes, expected_bytes)
+        self.assertEqual(position["revision"], 18)
+        self.assertEqual(position["updated_utc"], V1_CONTRACT_UTC)
+
+    def test_v1_contract_canonical_happy_cycle_field_types_and_presence(self):
+        position = self.fixture_position()
+        self.assert_typed_fields(position, {
+            "version": int,
+            "symbol": str,
+            "sha": str,
+            "state": str,
+            "open_run_id": str,
+            "proposal_id": str,
+            "proposal_digest": str,
+            "thesis": dict,
+            "entry": dict,
+            "legs": list,
+            "client_ids": dict,
+            "pending_intent": type(None),
+            "revision": int,
+            "verdict": str,
+            "updated_utc": str,
+            "last_check": dict,
+            "reconcile": dict,
+            "resume_proven": dict,
+            "close_run_id": str,
+            "close": dict,
+        }, "position")
+        self.assert_typed_fields(position["thesis"], {
+            "opened_at_ms": int,
+            "max_hold_ms": int,
+            "watch_gap_pct": str,
+            "min_remaining_edge_pct": str,
+            "max_adverse_move_pct": str,
+        }, "position.thesis")
+        self.assert_typed_fields(position["entry"], {
+            "opened_utc": str,
+            "entry_gap_bps": str,
+            "entry_gap_pct": str,
+            "funding_rate": str,
+            "proposal_net_edge_pct": str,
+            "spot": dict,
+            "shared_step": str,
+            "spot_step": str,
+            "base_asset": str,
+            "hedge_qty": str,
+            "short": dict,
+        }, "position.entry")
+        self.assert_typed_fields(position["entry"]["spot"], {
+            "executed_qty": str,
+            "quote_spent": str,
+            "base_fee": str,
+            "net_base": str,
+        }, "position.entry.spot")
+        self.assert_typed_fields(position["entry"]["short"], {
+            "filled_qty": str,
+            "cum_quote": str,
+        }, "position.entry.short")
+
+        common_leg_fields = {
+            "stage": str,
+            "client_id": str,
+            "market": str,
+            "outcome": str,
+            "utc": str,
+            "status": str,
+            "executed_qty": str,
+            "quote": str,
+        }
+        expected_stages = [bp.ENTER_SPOT, bp.ENTER_SHORT,
+                           bp.EXIT_SHORT, bp.EXIT_SPOT]
+        self.assertEqual([leg["stage"] for leg in position["legs"]],
+                         expected_stages)
+        for index, leg in enumerate(position["legs"]):
+            expected = dict(common_leg_fields)
+            if leg["stage"] in (bp.ENTER_SPOT, bp.EXIT_SPOT):
+                expected["fee_by_asset"] = dict
+            self.assert_typed_fields(
+                leg, expected, "position.legs[%d]" % index)
+        self.assert_typed_fields(position["legs"][0]["fee_by_asset"], {
+            "BTC": str,
+        }, "position.legs[0].fee_by_asset")
+        self.assert_typed_fields(position["legs"][3]["fee_by_asset"], {
+            "USDT": str,
+        }, "position.legs[3].fee_by_asset")
+
+        expected_client_ids = {
+            "bc-cafe01-enter_spot",
+            "bc-cafe01-enter_short",
+            "bc-cafe04-exit_short",
+            "bc-cafe04-exit_spot",
+        }
+        self.assertEqual(set(position["client_ids"]), expected_client_ids)
+        for client_id, metadata in position["client_ids"].items():
+            self.assert_typed_fields(metadata, {
+                "stage": str,
+                "market": str,
+                "run_id": str,
+            }, "position.client_ids.%s" % client_id)
+
+        self.assert_typed_fields(position["last_check"], {
+            "utc": str,
+            "now_ms": int,
+            "current_gap_pct": str,
+            "exit_fees_pct": str,
+            "fees_source": str,
+            "decision": str,
+            "why": str,
+        }, "position.last_check")
+        self.assert_typed_fields(position["reconcile"], {
+            "utc": str,
+            "run_id": str,
+            "truths": dict,
+            "futures_position": str,
+            "base_free": str,
+            "recommendations": list,
+        }, "position.reconcile")
+        self.assert_typed_fields(position["reconcile"]["truths"], {
+            "bc-cafe01-enter_short": str,
+            "bc-cafe01-enter_spot": str,
+        }, "position.reconcile.truths")
+        self.assertEqual(position["reconcile"]["recommendations"], [])
+        self.assert_typed_fields(position["resume_proven"], {
+            "run_id": str,
+            "short_qty": str,
+            "source": str,
+        }, "position.resume_proven")
+        self.assert_typed_fields(position["close"], {
+            "closed_utc": str,
+            "short_closed_qty": str,
+            "exit_short_quote": str,
+            "spot_sold_qty": str,
+            "quote_received": str,
+            "pnl": dict,
+        }, "position.close")
+        self.assert_typed_fields(position["close"]["pnl"], {
+            "spot_quote_pnl_usdt": str,
+            "short_quote_pnl_usdt": str,
+            "spot_fees_usdt": str,
+            "usdm_commission_usdt": str,
+            "funding_usdt": str,
+            "residual_base": str,
+            "total_usdt": str,
+            "spot_fees_by_asset": dict,
+            "total_usdt_status": str,
+            "excluded_spot_fees_by_asset": dict,
+        }, "position.close.pnl")
+        self.assert_typed_fields(
+            position["close"]["pnl"]["spot_fees_by_asset"], {
+                "BTC": str,
+                "USDT": str,
+            }, "position.close.pnl.spot_fees_by_asset")
+        self.assert_typed_fields(
+            position["close"]["pnl"]["excluded_spot_fees_by_asset"], {
+                "BTC": str,
+            }, "position.close.pnl.excluded_spot_fees_by_asset")
+
+    def test_v1_contract_derive_resume_states_and_verdicts_are_pinned(self):
+        position = self.fixture_position()
+        closed_truths = {
+            leg["client_id"]: (
+                "terminal", {"executedQty": leg["executed_qty"]})
+            for leg in position["legs"]
+        }
+        closed = bp.derive_resume(
+            position, closed_truths, Decimal("0"), Decimal("0.000001"),
+            Decimal(position["entry"]["spot_step"]))
+        self.assertEqual(closed, {
+            "state": bp.ST_CLOSED,
+            "verdict": "CLOSED",
+            "note": "every leg terminal, futures flat, no sellable base",
+            "exposure": "none",
+            "recommendations": [],
+        })
+
+        intact_truths = {
+            client_id: ("terminal", payload)
+            if client_id.startswith("bc-cafe01-") else ("not_found", None)
+            for client_id, (_state, payload) in closed_truths.items()
+        }
+        intact = bp.derive_resume(
+            position, intact_truths, Decimal("-0.098"),
+            Decimal("0.098901"),
+            Decimal(position["entry"]["spot_step"]))
+        self.assertEqual(intact, {
+            "state": bp.ST_OPEN,
+            "verdict": "OPEN",
+            "note": "short -0.098 stands on the exchange",
+            "exposure": "short -0.098",
+            "recommendations": [],
+        })
+
+    def test_v1_contract_resume_closed_trail_keeps_closed_state_and_verdict(self):
+        fixture_bytes = V1_CONTRACT_PATH.read_bytes()
+        with tempfile.TemporaryDirectory() as receipt_dir:
+            state_path = Path(receipt_dir) / bp.STATE_FILE
+            state_path.write_bytes(fixture_bytes)
+            cfg = PositionConfig(
+                symbol=SYMBOL, sha=SHA, receipt_dir=receipt_dir,
+                run_id="cafe05", max_hold_ms=86400000,
+                min_remaining_edge_pct=Decimal("0.01"),
+                max_adverse_move_pct=Decimal("0.5"))
+
+            def no_transport(*args, **kwargs):
+                self.fail("closed version-1 resume attempted transport")
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = bp.cmd_resume(
+                    cfg, no_transport, sleep=lambda seconds: None,
+                    now_ms=lambda: T_OPEN + 120000)
+            persisted = bp.load_position(receipt_dir)
+            persisted_bytes = state_path.read_bytes()
+
+        self.assertEqual(code, bp.EXIT_CODE["NOTHING_STANDING"])
+        self.assertEqual((persisted["state"], persisted["verdict"]),
+                         (bp.ST_CLOSED, "CLOSED"))
+        self.assertEqual(persisted_bytes, fixture_bytes)
+        self.assertIn("state CLOSED | nothing standing", output.getvalue())
+
+    def test_v1_contract_current_behavior_accepts_unknown_future_field(self):
+        position = self.fixture_position()
+        future_value = {"rung_receipts": [{"rung_id": "future-01"}]}
+        position["future_extension"] = future_value
+        persisted = self.save_and_reload(position)
+        self.assertEqual(persisted["future_extension"], future_value)
+        self.assertEqual(persisted["version"], 1)
+
+    def test_v1_contract_current_behavior_accepts_noncurrent_version_marker(self):
+        position = self.fixture_position()
+        position["version"] = 2
+        persisted = self.save_and_reload(position)
+        self.assertEqual(persisted["version"], 2)
+        self.assertEqual(persisted["state"], bp.ST_CLOSED)
 
 
 class RatesTests(MachineCase):

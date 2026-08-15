@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "symbol": "BTCUSDT",
+  "sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+  "state": "CLOSED",
+  "open_run_id": "cafe01",
+  "proposal_id": "abc123",
+  "proposal_digest": "ef9b0ffe74b2833d92b32475db7536cd7903d049f1c7571ce60b66361ae9faeb",
+  "thesis": {
+    "opened_at_ms": 1755000000000,
+    "max_hold_ms": 86400000,
+    "watch_gap_pct": "0.15",
+    "min_remaining_edge_pct": "0.01",
+    "max_adverse_move_pct": "0.5"
+  },
+  "entry": {
+    "opened_utc": "2025-08-12T00:00:00Z",
+    "entry_gap_bps": "20.0",
+    "entry_gap_pct": "0.2",
+    "funding_rate": "0.0001",
+    "proposal_net_edge_pct": "0.05",
+    "spot": {
+      "executed_qty": "0.09900000",
+      "quote_spent": "9.90000000",
+      "base_fee": "0.00009900",
+      "net_base": "0.09890100"
+    },
+    "shared_step": "0.00100000",
+    "spot_step": "0.00010000",
+    "base_asset": "BTC",
+    "hedge_qty": "0.09800000",
+    "short": {
+      "filled_qty": "0.098",
+      "cum_quote": "9.81960000"
+    }
+  },
+  "legs": [
+    {
+      "stage": "ENTER_SPOT",
+      "client_id": "bc-cafe01-enter_spot",
+      "market": "spot",
+      "outcome": "terminal",
+      "utc": "2025-08-12T00:00:00Z",
+      "status": "FILLED",
+      "executed_qty": "0.09900000",
+      "quote": "9.90000000",
+      "fee_by_asset": {
+        "BTC": "0.00009900"
+      }
+    },
+    {
+      "stage": "ENTER_SHORT",
+      "client_id": "bc-cafe01-enter_short",
+      "market": "usdm",
+      "outcome": "terminal",
+      "utc": "2025-08-12T00:00:00Z",
+      "status": "FILLED",
+      "executed_qty": "0.098",
+      "quote": "9.81960000"
+    },
+    {
+      "stage": "EXIT_SHORT",
+      "client_id": "bc-cafe04-exit_short",
+      "market": "usdm",
+      "outcome": "terminal",
+      "utc": "2025-08-12T00:00:00Z",
+      "status": "FILLED",
+      "executed_qty": "0.098",
+      "quote": "9.81060000"
+    },
+    {
+      "stage": "EXIT_SPOT",
+      "client_id": "bc-cafe04-exit_spot",
+      "market": "spot",
+      "outcome": "terminal",
+      "utc": "2025-08-12T00:00:00Z",
+      "status": "FILLED",
+      "executed_qty": "0.09890000",
+      "quote": "9.88011000",
+      "fee_by_asset": {
+        "USDT": "0.00988000"
+      }
+    }
+  ],
+  "client_ids": {
+    "bc-cafe01-enter_spot": {
+      "stage": "ENTER_SPOT",
+      "market": "spot",
+      "run_id": "cafe01"
+    },
+    "bc-cafe01-enter_short": {
+      "stage": "ENTER_SHORT",
+      "market": "usdm",
+      "run_id": "cafe01"
+    },
+    "bc-cafe04-exit_short": {
+      "stage": "EXIT_SHORT",
+      "market": "usdm",
+      "run_id": "cafe04"
+    },
+    "bc-cafe04-exit_spot": {
+      "stage": "EXIT_SPOT",
+      "market": "spot",
+      "run_id": "cafe04"
+    }
+  },
+  "pending_intent": null,
+  "revision": 17,
+  "verdict": "CLOSED",
+  "updated_utc": "2025-08-12T00:00:00Z",
+  "last_check": {
+    "utc": "2025-08-12T00:00:00Z",
+    "now_ms": 1755000060000,
+    "current_gap_pct": "0.20000000",
+    "exit_fees_pct": "0.15",
+    "fees_source": "spec_default",
+    "decision": "HOLD",
+    "why": "BASIS_THESIS_REMAINS_WITHIN_POLICY"
+  },
+  "reconcile": {
+    "utc": "2025-08-12T00:00:00Z",
+    "run_id": "cafe03",
+    "truths": {
+      "bc-cafe01-enter_short": "terminal",
+      "bc-cafe01-enter_spot": "terminal"
+    },
+    "futures_position": "-0.098",
+    "base_free": "0.098901",
+    "recommendations": []
+  },
+  "resume_proven": {
+    "run_id": "cafe03",
+    "short_qty": "0.098",
+    "source": "positionRisk"
+  },
+  "close_run_id": "cafe04",
+  "close": {
+    "closed_utc": "2025-08-12T00:00:00Z",
+    "short_closed_qty": "0.098",
+    "exit_short_quote": "9.81060000",
+    "spot_sold_qty": "0.09890000",
+    "quote_received": "9.88011000",
+    "pnl": {
+      "spot_quote_pnl_usdt": "-0.01989000",
+      "short_quote_pnl_usdt": "0.00900000",
+      "spot_fees_usdt": "0.00988000",
+      "usdm_commission_usdt": "-0.0079",
+      "funding_usdt": "0.0011",
+      "residual_base": "0.00000100",
+      "total_usdt": "-0.02757000",
+      "spot_fees_by_asset": {
+        "BTC": "0.00009900",
+        "USDT": "0.00988000"
+      },
+      "total_usdt_status": "PARTIAL_FEES_EXCLUDED",
+      "excluded_spot_fees_by_asset": {
+        "BTC": "0.00009900"
+      }
+    }
+  }
+}
