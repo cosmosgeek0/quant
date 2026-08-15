@@ -1218,108 +1218,7 @@
     host.appendChild(statTile("History held", spanTxt2));
     host.appendChild(statTile("Freshest sample", newestAge2));
     host.appendChild(statTile("State changes", String(netEvCount)));
-    updateHero();
   }
-
-  /* ---- Trading-path hero: SEE = feed truth, DECIDE = brain loops,
-     ACT = machine authority + runner, VIEW = mirror freshness. Grades
-     ride the attributed capture ages, so a stale courier degrades VIEW
-     alone — never the machine. ---- */
-  function heroWord(el, text, cls) {
-    if (!el) { return; }
-    el.textContent = text;
-    el.className = "st-hero-word" + (cls ? " " + cls : "");
-  }
-
-  function worstOf(keys) {
-    var rank = { "": 0, ok: 0, warn: 1, bad: 2 };
-    var worst = { cls: "ok", key: null, val: null };
-    var sawAny = false;
-    for (var i = 0; i < keys.length; i += 1) {
-      var v = currentVal(keys[i]);
-      if (v == null) { continue; }
-      sawAny = true;
-      var c = thrCls(keys[i], v) || "ok";
-      if (rank[c] > rank[worst.cls] || worst.key === null) {
-        if (rank[c] >= rank[worst.cls]) {
-          worst = { cls: c, key: keys[i], val: v };
-        }
-      }
-    }
-    return sawAny ? worst : null;
-  }
-
-  function heroLoopText(w) {
-    if (!w) { return ["Measuring", ""]; }
-    if (w.cls === "ok") { return ["On rhythm", ""]; }
-    var m = netMetric(w.key);
-    var name = m ? m.label : w.key;
-    return [name + " " + (w.cls === "bad" ? "silent" : "late") + " "
-      + ageText2(w.val), w.cls];
-  }
-
-  function updateHero() {
-    var line = document.getElementById("net-hero-line");
-    if (!line) { return; }
-    var see = worstOf(["market"]);
-    var decide = worstOf(["supervisor", "basiswatch", "basissup"]);
-    var act = worstOf(["jobrunner"]);
-    var st = heroLoopText(see);
-    heroWord(document.getElementById("net-hero-see"), st[0], st[1]);
-    var dt = heroLoopText(decide);
-    heroWord(document.getElementById("net-hero-decide"), dt[0], dt[1]);
-    /* ACT carries machine authority (constitution: ink when ARMED,
-       amber for sealed/paused — armed is normal, never a celebration) */
-    var machine = (lastStrip && lastStrip.machine) || null;
-    var actEl = document.getElementById("net-hero-act");
-    var runnerBad = act && act.cls !== "ok" ? act : null;
-    if (runnerBad) {
-      var rt = heroLoopText(runnerBad);
-      heroWord(actEl, rt[0], rt[1]);
-    } else if (machine === "ARMED") {
-      heroWord(actEl, "Armed", "");
-    } else if (machine === "ENTRY-SEALED") {
-      heroWord(actEl, "Entry-sealed", "warn");
-    } else if (machine === "PAUSED") {
-      heroWord(actEl, "Paused", "warn");
-    } else if (machine) {
-      heroWord(actEl, "No data", "bad");
-    } else {
-      heroWord(actEl, "Measuring", "");
-    }
-    var pullAge = lastStrip && lastStrip.pull
-      ? telNum(lastStrip.pull.age_seconds) : null;
-    var viewCls = thrCls("mirror", pullAge) || "";
-    heroWord(document.getElementById("net-hero-view"),
-      pullAge == null ? "no pull yet" : ageText2(pullAge) + " old",
-      viewCls === "ok" ? "" : viewCls);
-    /* the one sentence: name the worst thing, or state the rhythm */
-    var caps = [[see, "SEE"], [decide, "DECIDE"], [act, "ACT"]];
-    var rank2 = { ok: 0, warn: 1, bad: 2 };
-    var worstCap = null;
-    for (var ci4 = 0; ci4 < caps.length; ci4 += 1) {
-      var cw = caps[ci4][0];
-      if (cw && cw.cls !== "ok" &&
-          (!worstCap || rank2[cw.cls] > rank2[worstCap[0].cls])) {
-        worstCap = [cw, caps[ci4][1]];
-      }
-    }
-    if (worstCap) {
-      var wm = netMetric(worstCap[0].key);
-      line.textContent = (wm ? wm.label : worstCap[0].key) + " "
-        + (worstCap[0].cls === "bad" ? "silent" : "late") + " "
-        + ageText2(worstCap[0].val) + " — " + worstCap[1] + " degraded";
-      line.className = "st-hero-line " + worstCap[0].cls;
-    } else if (viewCls && viewCls !== "ok") {
-      line.textContent = "View " + ageText2(pullAge)
-        + " stale — loops last seen healthy";
-      line.className = "st-hero-line " + viewCls;
-    } else {
-      line.textContent = "Loops on rhythm";
-      line.className = "st-hero-line";
-    }
-  }
-
 
   function renderTelemetry() {
     var d = netTelem.data;
@@ -1454,25 +1353,6 @@
     head.appendChild(stEl("span", "st-spacer"));
     page.appendChild(head);
 
-    /* Trading-path hero: the one truth first (can the machine SEE,
-       DECIDE, ACT — and how old is our VIEW of it). One row, no box. */
-    var hero = stEl("div", "st-hero");
-    var heroLine = stEl("div", "st-hero-line", "—");
-    heroLine.id = "net-hero-line";
-    hero.appendChild(heroLine);
-    hero.appendChild(stEl("span", "st-spacer"));
-    var HERO_CAPS = [["see", "SEE"], ["decide", "DECIDE"],
-      ["act", "ACT"], ["view", "VIEW"]];
-    for (var hc = 0; hc < HERO_CAPS.length; hc += 1) {
-      var cap = stEl("span", "st-hero-cap");
-      cap.appendChild(stEl("span", "st-t-meta st-hero-lbl",
-        HERO_CAPS[hc][1]));
-      var w = stEl("span", "st-hero-word", "—");
-      w.id = "net-hero-" + HERO_CAPS[hc][0];
-      cap.appendChild(w);
-      hero.appendChild(cap);
-    }
-    page.appendChild(hero);
 
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");

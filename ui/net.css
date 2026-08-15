@@ -273,38 +273,6 @@ html[data-theme="dark"] {
 }
 
 /* ---- overview graph: chips legend + granular overlay + readout ---- */
-/* Trading-path hero — one row, no box: the sentence left, the four
-   capability words right. Nominal ink, deviation colored (§2). */
-.st-hero {
-  display: flex;
-  align-items: baseline;
-  gap: 26px;
-  padding: 2px 0 14px;
-  border-bottom: 1px solid var(--st-divider);
-  margin-bottom: 14px;
-}
-.st-hero .st-spacer { flex: 1; }
-.st-hero-line {
-  font-size: 13.5px;
-  font-weight: 500;
-  color: var(--st-ink);
-}
-.st-hero-line.warn { color: var(--st-warn-text); }
-.st-hero-line.bad { color: var(--st-bad-text); }
-.st-hero-cap {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 7px;
-  white-space: nowrap;
-}
-.st-hero-word {
-  font-size: 12.5px;
-  font-weight: 450;
-  color: var(--st-ink);
-}
-.st-hero-word.warn { color: var(--st-warn-text); font-weight: 500; }
-.st-hero-word.bad { color: var(--st-bad-text); font-weight: 500; }
-
 /* tier tag: quiet provenance in each panel head */
 .st-tier {
   font-size: 9px;
