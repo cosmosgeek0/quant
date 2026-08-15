@@ -644,6 +644,7 @@
     }
     var axes = [
       { stroke: muted, font: axisFont, size: cfg.compact ? 26 : 30,
+        space: cfg.compact ? 96 : 110,
         grid: { show: true, stroke: line, width: 1 },
         ticks: { show: false }, border: { show: false } }
     ];

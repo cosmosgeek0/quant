@@ -690,6 +690,54 @@
     return out;
   }
 
+  /* time-bucket averaging: the anti-aliasing the sawtooths need.
+     A bucket wide enough to hold a loop's whole tooth period turns
+     the see-saw into its honest average staleness level; stride
+     sampling (which turned 6H/24H into noise) never touches the
+     display path again. */
+  function bucketAvg(ts, vs, spanSec) {
+    if (!ts.length || spanSec <= 0) { return [ts, vs]; }
+    var t0 = ts[0];
+    var buckets = [];
+    for (var i = 0; i < ts.length; i += 1) {
+      var b = Math.floor((ts[i] - t0) / spanSec);
+      if (!buckets[b]) { buckets[b] = { sum: 0, n: 0 }; }
+      if (vs[i] != null) {
+        buckets[b].sum += vs[i];
+        buckets[b].n += 1;
+      }
+    }
+    var bts = [];
+    var bvs = [];
+    for (var j = 0; j < buckets.length; j += 1) {
+      bts.push(Math.round(t0 + (j + 0.5) * spanSec));
+      var cell = buckets[j];
+      bvs.push(cell && cell.n ? cell.sum / cell.n : null);
+    }
+    return [bts, bvs];
+  }
+
+  function rangeSeconds() {
+    return netTelem.range === "24h" ? 86400
+      : netTelem.range === "6h" ? 21600 : 3600;
+  }
+
+  function smoothWidthFor(field, spanSec) {
+    var cad = cadenceEst(field);
+    if (!cad) { return 3; }
+    var w = Math.ceil((cad / spanSec) * 2) + 1;
+    if (w % 2 === 0) { w += 1; }
+    return Math.max(3, Math.min(15, w));
+  }
+
+  function displaySeries(m, targetPoints) {
+    var sf = seriesFilled(m.field, m.key);
+    var span = Math.max(60, Math.round(rangeSeconds() / targetPoints));
+    var bucketedPair = bucketAvg(sf[0], sf[1], span);
+    return [bucketedPair[0],
+      movAvg(bucketedPair[1], smoothWidthFor(m.field, span))];
+  }
+
   var panelCharts = {};
 
   /* theme flips repaint tokens instantly but canvases keep their
@@ -1067,14 +1115,14 @@
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
           var m = NET_METRICS[mi];
           if (m.unit !== "s") { continue; }
-          var sf = seriesFilled(m.field, m.key);
-          if (!times) { times = sf[0]; }
+          var ds = displaySeries(m, 240);
+          if (!times) { times = ds[0]; }
           defs.push({
             label: m.label,
             unit: "s",
             color: rootCs.getPropertyValue("--st-s" + (mi + 1))
               .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-            values: movAvg(sf[1], 5)
+            values: ds[1]
           });
         }
         if (times && times.length >= 2) {
@@ -1093,7 +1141,7 @@
       var n = d && d.present ? (d.count || 0) : 0;
       capEl.textContent = n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples \u00b7 " +
-          netTelem.range + " window \u00b7 5-sample smoothed \u00b7 UTC"
+          netTelem.range + " window \u00b7 bucket-averaged \u00b7 UTC"
         : "History arrives from the telemetry recorder.";
     }
     /* panel graphs: each loop's own line in its own color */
@@ -1104,13 +1152,13 @@
         var pHost = document.querySelector(
           "[data-graph=\"" + pm.key + "\"]");
         if (!pHost) { continue; }
-        var psf = seriesFilled(pm.field, pm.key);
+        var psf = displaySeries(pm, 140);
         var pdef = [{
           label: pm.label,
           unit: pm.unit,
           color: rootCs.getPropertyValue("--st-s" + (mi + 1))
             .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-          values: movAvg(psf[1], 3)
+          values: psf[1]
         }];
         if (psf[0].length >= 2) {
           if (panelCharts[pm.key]) {
