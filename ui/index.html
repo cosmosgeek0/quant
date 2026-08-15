@@ -354,6 +354,17 @@
   .pop-id { padding: 10px 12px 8px; }
   .pop-id .pname { font-size: 14px; font-weight: 500; color: var(--ink); }
   .pop-id .pemail { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .pstatus {
+    display: flex; align-items: center; gap: 6px;
+    margin-top: 7px;
+    font-size: 12px; color: var(--muted);
+  }
+  .pstatus .pdot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--faint);
+  }
+  .pstatus.on .pdot { background: #2ebd85; }
+  .pstatus.off .pdot { background: #cc2f3c; }
   .theme-trio {
     display: inline-flex;
     gap: 2px;
@@ -372,11 +383,16 @@
     transition: background var(--t), color var(--t);
   }
   .tbtn:hover { background: var(--hover); color: var(--ink); }
-  .tbtn.on { background: var(--pill); color: var(--ink); }
+  .tbtn.on {
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--line-2);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
+  }
   .tbtn svg { width: 18px; height: 18px; stroke-width: 1.6; }
-  .pop-sep { height: 1px; background: var(--line); margin: 6px 4px; }
+  .pop-sep { height: 1px; background: var(--line); margin: 8px 4px; }
   .pop-row {
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; gap: 11px;
     height: 36px;
     padding: 0 12px;
     border-radius: 8px;
@@ -470,6 +486,7 @@
   <div class="pop-id">
     <span class="pname">CosmosGeek</span>
     <span class="pemail">cosmosgeek@pm.me</span>
+    <span class="pstatus" id="pop-status"><span class="pdot"></span><span id="pop-status-text">checking…</span></span>
     <div class="theme-trio" role="group" aria-label="Theme">
       <button class="tbtn" data-theme-set="system" aria-label="System theme" title="System">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>

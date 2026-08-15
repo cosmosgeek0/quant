@@ -199,11 +199,19 @@
   var sigBtn = document.getElementById("rb-signal");
   var lastStrip = null;
 
+  var popStatus = document.getElementById("pop-status");
+  var popStatusText = document.getElementById("pop-status-text");
+
   function setOnline(ok) {
     avatarEl.classList.toggle("on", !!ok);
-    profile.title = ok
-      ? "Online — data plane answering"
-      : "Offline — data plane unreachable";
+    profile.removeAttribute("title");
+    if (popStatus) {
+      popStatus.classList.toggle("on", !!ok);
+      popStatus.classList.toggle("off", !ok);
+      popStatusText.textContent = ok
+        ? "Online — data plane answering"
+        : "Offline — data plane unreachable";
+    }
   }
 
   function sigClass(cls) {
