@@ -53,18 +53,37 @@ html[data-theme="dark"] {
 /* ---- page: wide instrument layout — graph on top, columns below;
    the status card keeps its measured 660 width in the left column ---- */
 .st-page {
-  max-width: 1780px;
-  margin: 0 auto;
+  /* News-page width law: fill the frame, 40px gutters, no cap —
+     measured: News spans the full main column */
+  max-width: none;
+  margin: 0;
   /* content starts below the invisible 72px topbar line (owner law) */
-  padding: 72px 24px 56px;
+  padding: 72px 40px 56px;
   font-family: var(--sans, "InterVariable", system-ui, sans-serif);
   color: var(--st-ink);
 }
 .st-cols {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr) 400px;
   gap: 0 16px;
-  align-items: start;
+  /* stretch: the log column fills the graph card's full height —
+     no void under Boundaries */
+  align-items: stretch;
+}
+.st-logcol {
+  display: flex;
+  flex-direction: column;
+}
+.st-logcol #net-evcard {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.st-logcol #net-events {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }
 .st-page * { letter-spacing: normal; }
 
@@ -229,6 +248,11 @@ html[data-theme="dark"] {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 0 16px;
+}
+@media (min-width: 1700px) {
+  .st-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
 }
 @media (max-width: 1000px) {
   .st-grid { grid-template-columns: minmax(0, 1fr); }
