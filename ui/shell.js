@@ -10,13 +10,24 @@
 
   function two(n) { return n < 10 ? "0" + n : "" + n; }
 
+  /* Old room's premium clock, ported: HH:MM, en-GB h23, UTC zone,
+     250ms tick (Header.tsx clockParts + its interval). Falls back to
+     manual UTC parts exactly as their try/catch does. */
+  var clockFmt = null;
+  try {
+    clockFmt = new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit", minute: "2-digit",
+      hourCycle: "h23", timeZone: "UTC"
+    });
+  } catch (e) { clockFmt = null; }
+
   function tickClock() {
     var d = new Date();
-    clockEl.textContent = two(d.getUTCHours()) + ":" +
-      two(d.getUTCMinutes()) + ":" + two(d.getUTCSeconds());
+    clockEl.textContent = clockFmt ? clockFmt.format(d)
+      : two(d.getUTCHours()) + ":" + two(d.getUTCMinutes());
   }
   tickClock();
-  setInterval(tickClock, 1000);
+  setInterval(tickClock, 250);
 
   /* ---- elements ---- */
   var side = document.getElementById("side");
