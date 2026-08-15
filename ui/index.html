@@ -179,6 +179,63 @@
   .profile .prole { font-size: 12px; color: var(--muted); }
 
   main { flex: 1; min-width: 0; }
+
+  /* right utility rail (TradingView pattern): thin icon strip pinned
+     right; panels slide in to its left and push the canvas. */
+  .rrail {
+    flex: none;
+    width: 48px;
+    border-left: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 12px 0;
+    gap: 10px;
+  }
+  .rbtn {
+    width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    background: none; border: 0; padding: 0;
+    border-radius: 9px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background var(--t), color var(--t), transform var(--t);
+  }
+  .rbtn:hover { background: var(--hover); color: var(--ink); }
+  .rbtn:active { transform: scale(0.95); }
+  .rbtn.active { background: var(--pill); color: var(--ink); }
+  .rbtn svg { width: 20px; height: 20px; stroke-width: 1.5; }
+  .rbtn.rb-signal { margin-top: auto; }
+  .rbtn.rb-signal.sig-ok { color: #2ebd85; }
+  .rbtn.rb-signal.sig-stale { color: #99640a; }
+  .rbtn.rb-signal.sig-bad { color: #cc2f3c; }
+
+  .rpanel {
+    flex: none;
+    width: 320px;
+    border-left: 1px solid var(--line);
+    display: none;
+    flex-direction: column;
+  }
+  .rpanel.open { display: flex; }
+  .rpanel-head {
+    display: flex; align-items: center;
+    padding: 16px 16px 10px;
+    font-size: 14px; font-weight: 500;
+  }
+  .rpanel-body { padding: 4px 16px 16px; font-size: 13px; color: var(--muted); }
+  .rpanel-body b { color: var(--ink); font-weight: 600; }
+  .sigrow {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .sigrow:last-child { border-bottom: 0; }
+  .sigrow .k { font-size: 12.5px; color: var(--muted); }
+  .sigrow .v { font-size: 13px; color: var(--ink); font-variant-numeric: tabular-nums lining-nums; }
+  .sigrow .v.ok { color: #2ebd85; }
+  .sigrow .v.warn { color: #99640a; }
+  .sigrow .v.bad { color: #cc2f3c; }
   .canvas-top {
     display: flex;
     align-items: center;
@@ -332,6 +389,24 @@
     </div>
     <div class="empty" id="page"></div>
   </main>
+  <aside class="rpanel" id="rpanel" aria-label="Utility panel">
+    <div class="rpanel-head" id="rpanel-title"></div>
+    <div class="rpanel-body" id="rpanel-body"></div>
+  </aside>
+  <div class="rrail" aria-label="Utilities">
+    <button class="rbtn" data-panel="watchlist" data-tip="Watchlist" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>
+    </button>
+    <button class="rbtn" data-panel="news" data-tip="News" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18h-5"/><path d="M18 14h-8"/><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-4 0v-9a2 2 0 0 1 2-2h2"/><rect width="8" height="4" x="10" y="6" rx="1"/></svg>
+    </button>
+    <button class="rbtn" data-panel="calendar" data-tip="Calendar" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v3"/><path d="M16 2v3"/><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/></svg>
+    </button>
+    <button class="rbtn rb-signal" id="rb-signal" data-panel="signal" data-tip="Signal" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M2 20h.01"/><path d="M7 20v-4"/><path d="M12 20v-8"/><path d="M17 20V8"/><path d="M22 4v16"/></svg>
+    </button>
+  </div>
 </div>
 
 <div class="pop" id="pop" role="menu" hidden>

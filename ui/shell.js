@@ -186,9 +186,12 @@
         !profile.contains(ev.target)) { closePop(); }
   });
 
-  /* status dot on the avatar: green = data plane answering here,
-     black = unreachable. Polls a HEAD of /api/health every 10s. */
+  /* one live poll feeds the avatar dot (online/offline) and the
+     right-rail Signal tint (green fresh / amber stale / red dead),
+     from /api/strip mirror ages — measured, never decorative. */
   var avatarEl = profile.querySelector(".avatar");
+  var sigBtn = document.getElementById("rb-signal");
+  var lastStrip = null;
 
   function setOnline(ok) {
     avatarEl.classList.toggle("on", !!ok);
@@ -197,13 +200,142 @@
       : "Offline — data plane unreachable";
   }
 
-  function pollHealth() {
-    fetch("/api/health", { method: "HEAD", cache: "no-store" })
-      .then(function (r) { setOnline(r.ok); })
-      .catch(function () { setOnline(false); });
+  function sigClass(cls) {
+    sigBtn.classList.remove("sig-ok", "sig-stale", "sig-bad");
+    if (cls) { sigBtn.classList.add(cls); }
   }
-  pollHealth();
-  setInterval(pollHealth, 10000);
+
+  function pollStrip() {
+    fetch("/api/strip", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        lastStrip = d;
+        setOnline(!!d);
+        if (!d) { sigClass("sig-bad"); renderSignal(); return; }
+        var age = d.pull && d.pull.age_seconds;
+        if (age == null || !isFinite(age)) { sigClass("sig-bad"); }
+        else if (age > 120) { sigClass("sig-bad"); }
+        else if (age > 45) { sigClass("sig-stale"); }
+        else { sigClass("sig-ok"); }
+        renderSignal();
+      })
+      .catch(function () {
+        lastStrip = null;
+        setOnline(false);
+        sigClass("sig-bad");
+        renderSignal();
+      });
+  }
+  pollStrip();
+  setInterval(pollStrip, 10000);
+
+  /* ---- right rail panels (TradingView pattern) ---- */
+  var rpanel = document.getElementById("rpanel");
+  var rtitle = document.getElementById("rpanel-title");
+  var rbody = document.getElementById("rpanel-body");
+  var rbtns = document.querySelectorAll(".rbtn[data-panel]");
+  var RKEY = "quant.rpanel";
+  var rOpen = null;
+
+  var RPANELS = {
+    watchlist: ["Watchlist",
+      "Empty — tokens arrive when you order them."],
+    news: ["News",
+      "No source wired yet — arrives with a data contract."],
+    calendar: ["Calendar",
+      "No source wired yet — arrives with a data contract."]
+  };
+
+  function ageText2(sec) {
+    if (sec == null || !isFinite(sec)) { return "—"; }
+    var v = Math.round(sec);
+    if (v < 120) { return v + "s"; }
+    return Math.floor(v / 60) + "m " + (v % 60) + "s";
+  }
+
+  function ageCls(sec, warnAt, badAt) {
+    if (sec == null || !isFinite(sec)) { return "v bad"; }
+    if (sec > badAt) { return "v bad"; }
+    if (sec > warnAt) { return "v warn"; }
+    return "v ok";
+  }
+
+  function sigRow(k, vText, vCls) {
+    var row = document.createElement("div");
+    row.className = "sigrow";
+    var kk = document.createElement("span");
+    kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span");
+    vv.className = vCls; vv.textContent = vText;
+    row.appendChild(kk); row.appendChild(vv);
+    return row;
+  }
+
+  function renderSignal() {
+    if (rOpen !== "signal") { return; }
+    rbody.textContent = "";
+    if (!lastStrip) {
+      rbody.appendChild(sigRow("Server", "unreachable", "v bad"));
+      return;
+    }
+    var d = lastStrip;
+    rbody.appendChild(sigRow("Server", "answering", "v ok"));
+    var pl = d.pull || {};
+    rbody.appendChild(sigRow("Mirror age",
+      ageText2(pl.age_seconds), ageCls(pl.age_seconds, 45, 120)));
+    var mp = d.market_pass || {};
+    rbody.appendChild(sigRow("Market pass",
+      ageText2(mp.age_seconds), ageCls(mp.age_seconds, 45, 120)));
+    var sv = d.supervisor || {};
+    rbody.appendChild(sigRow("Supervisor",
+      ageText2(sv.age_seconds), ageCls(sv.age_seconds, 240, 600)));
+  }
+
+  function renderPanel(key) {
+    if (key === "signal") {
+      rtitle.textContent = "Signal";
+      renderSignal();
+      return;
+    }
+    var def = RPANELS[key];
+    rtitle.textContent = def[0];
+    rbody.textContent = "";
+    var b = document.createElement("b");
+    b.textContent = def[0] + ".";
+    rbody.appendChild(b);
+    rbody.appendChild(document.createTextNode(" " + def[1]));
+  }
+
+  function setRPanel(key) {
+    rOpen = key;
+    rpanel.classList.toggle("open", !!key);
+    for (var i = 0; i < rbtns.length; i++) {
+      var on = rbtns[i].getAttribute("data-panel") === key;
+      rbtns[i].classList.toggle("active", on);
+      rbtns[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+    if (key) { renderPanel(key); }
+    try {
+      if (key) { localStorage.setItem(RKEY, key); }
+      else { localStorage.removeItem(RKEY); }
+    } catch (e) { /* private mode */ }
+  }
+
+  for (var ri = 0; ri < rbtns.length; ri++) {
+    (function (btn) {
+      btn.addEventListener("click", function () {
+        var key = btn.getAttribute("data-panel");
+        setRPanel(rOpen === key ? null : key);
+      });
+    })(rbtns[ri]);
+  }
+
+  var rSaved = null;
+  try { rSaved = localStorage.getItem(RKEY); } catch (e) { rSaved = null; }
+  if (rSaved && (rSaved === "signal" ||
+      Object.prototype.hasOwnProperty.call(RPANELS, rSaved))) {
+    setRPanel(rSaved);
+  }
 
   /* log out: real endpoint on the hosted site only.
      OWNER NOTE 2026-08-15 (verify at next deploy): on
@@ -232,10 +364,14 @@
       tip.appendChild(k1); tip.appendChild(k2);
     }
     var r = el.getBoundingClientRect();
-    tip.style.left = Math.round(r.right + 10) + "px";
+    tip.style.left = "0px";
     tip.style.top = "0px";
     tip.setAttribute("aria-hidden", "false");
+    var w = tip.offsetWidth;
     var h = tip.offsetHeight;
+    var onRight = !!el.closest(".rrail");
+    tip.style.left = Math.round(
+      onRight ? r.left - w - 10 : r.right + 10) + "px";
     tip.style.top = Math.round(r.top + r.height / 2 - h / 2) + "px";
     tip.classList.add("on");
   }
