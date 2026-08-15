@@ -62,6 +62,36 @@
     }
   });
 
+  /* ---- router: five pages, each honest about its state ---- */
+  var pageEl = document.getElementById("page");
+  var rows = document.querySelectorAll(".nav-row[data-page]");
+  var PAGES = {
+    overview: ["Overview", "Empty by decision — sections arrive one at a time on your word."],
+    basis: ["Basis", "Not built yet — it arrives when you order it."],
+    momentum: ["Momentum", "Not built yet — it arrives when you order it."],
+    machine: ["Machine", "Not built yet — it arrives when you order it."],
+    journal: ["Journal", "Not built yet — it arrives when you order it."]
+  };
+
+  function route() {
+    var h = (location.hash || "#overview").slice(1);
+    if (!Object.prototype.hasOwnProperty.call(PAGES, h)) { h = "overview"; }
+    for (var i = 0; i < rows.length; i++) {
+      var on = rows[i].getAttribute("data-page") === h;
+      rows[i].classList.toggle("active", on);
+      if (on) { rows[i].setAttribute("aria-current", "page"); }
+      else { rows[i].removeAttribute("aria-current"); }
+    }
+    var b = document.createElement("b");
+    b.textContent = PAGES[h][0] + ".";
+    pageEl.textContent = "";
+    pageEl.appendChild(b);
+    pageEl.appendChild(document.createTextNode(" " + PAGES[h][1]));
+  }
+
+  window.addEventListener("hashchange", route);
+  route();
+
   /* ---- one floating tooltip for every [data-tip] ---- */
   function showTip(el) {
     var text = el.getAttribute("data-tip");

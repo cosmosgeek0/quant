@@ -75,7 +75,7 @@
   .side-collapse:active { transform: scale(0.94); }
   .side-collapse svg { width: 17px; height: 17px; stroke-width: 1.5; }
 
-  .side[data-state="expanded"] { width: 224px; }
+  .side[data-state="expanded"] { width: 184px; }
   .side[data-state="expanded"] .side-top {
     justify-content: flex-start;
     padding: 0 10px 0 14px;
@@ -98,16 +98,15 @@
   a.nav-row:hover { background: var(--hover); color: var(--ink); transform: translateX(1px); }
   a.nav-row:active { transform: scale(0.97); }
   .nav-row.active { background: var(--pill); color: var(--ink); }
-  .nav-row[aria-disabled="true"] { color: var(--faint); }
   .nav-row svg { width: 22px; height: 22px; stroke-width: 1.5; flex: none; transition: transform var(--t); }
   a.nav-row:hover svg { transform: scale(1.06); }
 
-  .side[data-state="expanded"] nav { align-items: stretch; padding: 0 12px; }
+  .side[data-state="expanded"] nav { align-items: stretch; padding: 0 10px; }
   .side[data-state="expanded"] .nav-row {
     width: auto;
     justify-content: flex-start;
-    gap: 11px;
-    padding: 0 11px;
+    gap: 10px;
+    padding: 0 10px;
   }
   .side[data-state="expanded"] .nav-row .nm { display: inline; }
   .side[data-state="expanded"] .nav-row.active .nm { font-weight: 500; }
@@ -173,36 +172,33 @@
       </button>
     </div>
     <nav aria-label="Pages">
-      <a class="nav-row active" href="#overview" aria-current="page" data-tip="Overview">
+      <a class="nav-row" href="#overview" data-page="overview" data-tip="Overview">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
         <span class="nm">Overview</span>
       </a>
-      <span class="nav-row" aria-disabled="true" data-tip="Basis — not built yet">
+      <a class="nav-row" href="#basis" data-page="basis" data-tip="Basis">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="m19 8 3 8a5 5 0 0 1-6 0zV7"/><path d="M3 7h1a17 17 0 0 0 8-2 17 17 0 0 0 8 2h1"/><path d="m5 8 3 8a5 5 0 0 1-6 0zV7"/><path d="M7 21h10"/></svg>
         <span class="nm">Basis</span>
-      </span>
-      <span class="nav-row" aria-disabled="true" data-tip="Momentum — not built yet">
+      </a>
+      <a class="nav-row" href="#momentum" data-page="momentum" data-tip="Momentum">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M16 7h6v6"/><path d="m22 7-8.5 8.5-5-5L2 17"/></svg>
         <span class="nm">Momentum</span>
-      </span>
-      <span class="nav-row" aria-disabled="true" data-tip="Machine — not built yet">
+      </a>
+      <a class="nav-row" href="#machine" data-page="machine" data-tip="Machine">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>
         <span class="nm">Machine</span>
-      </span>
-      <span class="nav-row" aria-disabled="true" data-tip="Journal — not built yet">
+      </a>
+      <a class="nav-row" href="#journal" data-page="journal" data-tip="Journal">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V7"/><path d="M16 8h-6a2 2 0 0 0 0 4h4a2 2 0 0 1 0 4H8"/><path d="M4 3a1 1 0 0 1 1-1 1.3 1.3 0 0 1 .7.2l.933.6a1.3 1.3 0 0 0 1.4 0l.934-.6a1.3 1.3 0 0 1 1.4 0l.933.6a1.3 1.3 0 0 0 1.4 0l.933-.6a1.3 1.3 0 0 1 1.4 0l.934.6a1.3 1.3 0 0 0 1.4 0l.933-.6A1.3 1.3 0 0 1 19 2a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1 1.3 1.3 0 0 1-.7-.2l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.934.6a1.3 1.3 0 0 1-1.4 0l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-1.4 0l-.934-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-.7.2 1 1 0 0 1-1-1z"/></svg>
         <span class="nm">Journal</span>
-      </span>
+      </a>
     </nav>
   </div>
   <main>
     <div class="canvas-top">
       <span class="clock" id="clock" aria-label="UTC time">—:—:— UTC</span>
     </div>
-    <div class="empty">
-      <b>Overview.</b> Empty by decision — sections arrive one at a time
-      on your word.
-    </div>
+    <div class="empty" id="page"></div>
   </main>
 </div>
 <div id="tip" role="tooltip" aria-hidden="true"></div>
