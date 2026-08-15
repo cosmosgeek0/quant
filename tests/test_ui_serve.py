@@ -1497,6 +1497,79 @@ class TestTelemetryEndpoint(ServerHarness):
         self.assertEqual([row["value"] for row in payload["points"]], [2])
 
 
+class TestLagAttribution(ServerHarness):
+    """Observed age = transport age + true loop lag; the derived fields
+    must carry ONLY the loop's own truth."""
+
+    def test_capture_age_subtracts_transport_and_floors_at_zero(self):
+        self.assertEqual(serve._capture_age_seconds(150.0, 120.0), 30.0)
+        self.assertEqual(serve._capture_age_seconds(100.0, 120.0), 0.0)
+        self.assertIsNone(serve._capture_age_seconds(None, 120.0))
+        self.assertIsNone(serve._capture_age_seconds(150.0, None))
+        self.assertIsNone(serve._capture_age_seconds(True, 120.0))
+
+    def test_derive_true_lags_carries_mirror_and_honors_window(self):
+        base = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            {"ts": self.utc_text(base), "mirror_s": 60.0,
+             "market_s": 65.0},
+            # 30s later, no mirror sample: carried transport = 60 + 30
+            {"ts": self.utc_text(base + timedelta(seconds=30)),
+             "market_s": 95.0, "supervisor_s": 200.0},
+            # past the carry window: derived fields must be None
+            {"ts": self.utc_text(
+                base + timedelta(seconds=30 + serve
+                                 .TRUE_LAG_MIRROR_CARRY_SECONDS + 1)),
+             "market_s": 40.0},
+        ]
+        serve._derive_true_lags(rows)
+        self.assertEqual(rows[0]["market_true_s"], 5.0)
+        self.assertEqual(rows[1]["market_true_s"], 5.0)
+        self.assertEqual(rows[1]["supervisor_true_s"], 110.0)
+        self.assertIsNone(rows[2]["market_true_s"])
+        self.assertNotIn("supervisor_true_s", rows[2])
+
+    def test_telemetry_endpoint_serves_true_fields_without_cache_leak(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(seconds=20)),
+             "mirror_s": 50.0, "jobs_s": 80.0},
+        ]
+        sources = self.empty_sources(root / "missing")
+        sources["telemetry"] = root / "telemetry.jsonl"
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+        server = self.start(sources)
+        first = self.get_json(server, "/api/telemetry?range=1h")
+        second = self.get_json(server, "/api/telemetry?range=1h")
+        for payload in (first, second):
+            self.assertEqual(payload["points"][0]["jobs_true_s"], 30.0)
+        # raw file rows stay untouched — derivation never rewrites disk
+        on_disk = sources["telemetry"].read_text(encoding="utf-8")
+        self.assertNotIn("jobs_true_s", on_disk)
+
+    def test_strip_and_health_carry_capture_age(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        sources = self.empty_sources(root)
+        manifest = {"utc": self.utc_text(now - timedelta(seconds=90)),
+                    "ok": True, "interval_ms": 45000}
+        sources["manifest"].write_text(json.dumps(manifest),
+                                       encoding="utf-8")
+        state = {"as_of": self.utc_text(now - timedelta(seconds=100))}
+        sources["stream_state"].write_text(json.dumps(state),
+                                           encoding="utf-8")
+        server = self.start(sources)
+        strip = self.get_json(server, "/api/strip")
+        market = strip["market_pass"]
+        self.assertIsNotNone(market["capture_age_seconds"])
+        self.assertAlmostEqual(market["capture_age_seconds"],
+                               market["age_seconds"]
+                               - strip["pull"]["age_seconds"], places=1)
+
+
 class TestPollConfigEndpoint(ServerHarness):
     """The server's one write: the recorder's per-metric poll config."""
 

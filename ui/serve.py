@@ -1038,6 +1038,10 @@ def api_health(sources, now=None):
             continue
         latest[name] = record
 
+    # Transport term for attribution: these files arrive via the mirror
+    # pull, so each service's observed age includes the pull's own age.
+    pull_age = _strip_pull_facts(sources, now).get("age_seconds")
+
     services = []
     for name in sorted(latest):
         record = latest[name]
@@ -1052,11 +1056,14 @@ def api_health(sources, now=None):
             "reported_status": reported,
             "last_seen_utc": last_seen,
             "last_seen_age_seconds": age,
+            "capture_age_seconds": _capture_age_seconds(age, pull_age),
             "last_seen_basis": "record" if record_as_of else "file_mtime",
             "record": record,
         })
 
     jobs = _jobs_log_summary(sources["jobs_log"], now)
+    jobs["capture_age_seconds"] = _capture_age_seconds(
+        jobs.get("last_tick_age_seconds"), pull_age)
     flags = {}
     for label, source_name in (("STOP", "stop"), ("STOP-JOBS", "stop_jobs")):
         flag_path = sources[source_name]
@@ -1185,6 +1192,62 @@ def api_news(sources):
 TELEMETRY_TAIL_BYTES = 16 * 1024 * 1024
 
 
+# Attribution: a host loop's observed age on this Mac = transport age
+# (mirror pull) + the loop's REAL lag at the moment the mirror snapshotted
+# the host. The raw *_s fields conflate the two, which paints the pull
+# cycle's sawtooth onto every host loop. The derived *_true_s fields carry
+# the loop's own truth; mirror_s alone carries the transport.
+TRUE_LAG_FIELDS = {
+    "market_s": "market_true_s",
+    "supervisor_s": "supervisor_true_s",
+    "basis_watch_s": "basis_watch_true_s",
+    "basis_sup_s": "basis_sup_true_s",
+    "jobs_s": "jobs_true_s",
+}
+TRUE_LAG_MIRROR_CARRY_SECONDS = 240
+
+
+def _capture_age_seconds(age, pull_age):
+    """Loop lag at the mirror's snapshot instant: observed minus transport,
+    floored at zero (host-vs-Mac clock skew appears as a constant; the
+    floor keeps the number honest rather than negative)."""
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        return None
+    if isinstance(pull_age, bool) or not isinstance(pull_age, (int, float)):
+        return None
+    return round(max(0.0, float(age) - float(pull_age)), 3)
+
+
+def _derive_true_lags(records):
+    """Add *_true_s to chronological telemetry rows. mirror_s is carried
+    forward briefly (growing by wall clock, as a manifest age does) so
+    sparse loop samples still receive their transport term; past the carry
+    window the derived field is honestly None."""
+    last_mirror = None
+    last_mirror_ts = None
+    for record in records:
+        ts = _parse_utc(record.get("ts"))
+        mirror = record.get("mirror_s")
+        if (ts is not None and not isinstance(mirror, bool)
+                and isinstance(mirror, (int, float))):
+            last_mirror = float(mirror)
+            last_mirror_ts = ts
+        carried = None
+        if ts is not None and last_mirror_ts is not None:
+            gap = (ts - last_mirror_ts).total_seconds()
+            if 0 <= gap <= TRUE_LAG_MIRROR_CARRY_SECONDS:
+                carried = last_mirror + gap
+        for raw_key, true_key in TRUE_LAG_FIELDS.items():
+            if raw_key not in record:
+                continue
+            value = record.get(raw_key)
+            if (carried is not None and not isinstance(value, bool)
+                    and isinstance(value, (int, float))):
+                record[true_key] = _capture_age_seconds(value, carried)
+            else:
+                record[true_key] = None
+
+
 def api_telemetry(sources, range_name="1h", now=None):
     path = sources["telemetry"]
     if range_name not in TELEMETRY_RANGE_HOURS:
@@ -1210,7 +1273,10 @@ def api_telemetry(sources, range_name="1h", now=None):
             kept.append((parsed, record))
     kept.sort(key=lambda item: item[0])
 
-    records = [record for _, record in kept]
+    # dict copies: the jsonl tail is cached; derived fields must never
+    # leak into the shared cache rows.
+    records = [dict(record) for _, record in kept]
+    _derive_true_lags(records)
     kept_count = len(records)
     truncated = tail_truncated
     stride = None
@@ -1514,6 +1580,7 @@ def api_strip(sources, now=None):
                 "reported_status": service.get("reported_status"),
                 "last_seen_utc": service.get("last_seen_utc"),
                 "age_seconds": service.get("last_seen_age_seconds"),
+                "capture_age_seconds": service.get("capture_age_seconds"),
             }
             break
 
@@ -1532,6 +1599,8 @@ def api_strip(sources, now=None):
             "state": market_state,
             "as_of": market_as_of,
             "age_seconds": market_age,
+            "capture_age_seconds": _capture_age_seconds(
+                market_age, pull.get("age_seconds")),
         },
         "supervisor": supervisor,
         "governor": _strip_governor_facts(sources, now),
