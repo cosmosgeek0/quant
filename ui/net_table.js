@@ -237,6 +237,10 @@
         record.active.appendChild(toggle);
       } else {
         record.toggle = null;
+        var noCtl = document.createElement("span");
+        noCtl.className = "qnet-nocontrol";
+        noCtl.textContent = "—";
+        record.active.appendChild(noCtl);
       }
 
       rowEl.appendChild(record.component);

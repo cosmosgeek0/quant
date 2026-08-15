@@ -53,11 +53,15 @@ for nominal states, decorative line colors, any hue outside
 
 Vocabulary (old room's watchman, unchanged): Operational · Degraded ·
 Outage · Owner gated · Off · Measuring. The word always appears with the
-color (color never alone). Rendering: dot (5px) + word in T2. Nominal =
-muted word + quiet green dot. Deviation = amber/red word + dot. Boundary =
-faint word, hollow dot. NO pill capsule, no background fill, no border —
-the capsule shape spends attention on the most repeated element of the
-page and is the named "kids' play" defect.
+color (color never alone). Rendering (amended 2026-08-15 after the owner's
+side-by-side verdict — the first cut over-quieted into washout): colored
+GLYPH + readable word, no capsule. Dot 6px at full status color (#16a34a
+green nominal — the glyph, not the text, carries the green; GitHub-status/
+Datadog pattern); word 11px/450 sentence case in INK for nominal, status
+color + 500 for deviation, muted for boundary/off. NO pill capsule, no
+background fill — but also no washed-out gray whispers: silence means the
+word doesn't shout, not that it fades. Columns keep their rhythm: cells
+with nothing real to show render the honest "—", never blank voids.
 
 ## 4. Controls tell the truth
 
