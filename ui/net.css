@@ -256,7 +256,7 @@ html[data-theme="dark"] {
 .st-val { min-width: 76px; text-align: right; }
 .st-panel-head .st-uptime { min-width: 104px; text-align: right; }
 .st-panel .st-bars { margin: 2px 16px 0; }
-.st-panel-graph { padding: 4px 8px 0 8px; position: relative; }
+.st-panel-graph { padding: 4px 0 0 0; position: relative; }
 .st-panel-foot {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 16px 12px;
@@ -294,7 +294,7 @@ html[data-theme="dark"] {
 .st-chip-all { color: var(--st-mid); font-weight: 500; }
 .st-panel.off { opacity: 0.55; }
 .st-panel.off .st-panel-graph { filter: grayscale(1); }
-.st-graph-host { padding: 2px 8px 0 8px; position: relative; }
+.st-graph-host { padding: 0; position: relative; }
 .st-graph-tip {
   position: absolute; z-index: 5; pointer-events: none;
   background: var(--st-card); border: 1px solid var(--st-line);

@@ -787,6 +787,16 @@
       });
     }
     root.addEventListener("resize", handleResize);
+    /* the canvas must track its HOST, not the window: mount-time
+       measurement can catch an unsettled layout and leave the plot
+       overhanging its column (measured 141px past the edge) */
+    var ro = null;
+    if (typeof ResizeObserver === "function") {
+      ro = new ResizeObserver(function () { handleResize(); });
+      ro.observe(el);
+    } else {
+      requestAnimationFrame(handleResize);
+    }
 
     return {
       setData: function (times, defsNext) {
@@ -818,6 +828,7 @@
       destroy: function () {
         destroyed = true;
         root.removeEventListener("resize", handleResize);
+        if (ro) { ro.disconnect(); }
         if (plot && plot.over) {
           plot.over.removeEventListener("dblclick", resetXRange);
         }
