@@ -24,9 +24,15 @@ export PYTHONDONTWRITEBYTECODE=1
 
 KNOBS_FILE="$DEPLOY_DIR/knobs.env"
 if [ -f "$KNOBS_FILE" ]; then
-  set -a
-  . "$KNOBS_FILE"
-  set +a
+  # Auditor note (18b193f delta): never source free shell — accept only
+  # strict KEY=decimal lines; anything else is ignored, not executed.
+  while IFS= read -r knob_line; do
+    case "$knob_line" in
+      QUANT_[A-Z_]*=[0-9]*|QUANT_[A-Z_]*=[0-9]*.[0-9]*)
+        export "${knob_line%%=*}=${knob_line#*=}"
+        ;;
+    esac
+  done < "$KNOBS_FILE"
 fi
 
 FEED_STATE="$WATCH_DIR/feed_state.json"
