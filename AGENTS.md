@@ -26,3 +26,9 @@ files touched | each change in one line | test counts (before/after, green
 or not) | first failure HONESTLY (a passing rerun never erases it) | basis
 per claim: MEASURED (you ran/read it) vs INFERRED | what you did NOT check.
 No stack traces, no raw logs, no secrets, no celebration.
+
+## Language (owner hard law 2026-08-15)
+Clean words, soft tone, everywhere — reports, code comments, test names,
+row text. No profanity, no aggressive or shock wording, nothing that could
+trip a content flag on ordinary engineering work. A report that arrives
+worded badly goes back to you for cleaning before it is read.
