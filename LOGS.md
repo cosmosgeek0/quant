@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+MARGIN RUNNER MERGED 2026-08-15 night | a4d3b42 on main after EIGHT adversarial rounds | NOT deployed; live proof waits on the owner's one line
+loop | MRV1-8 x MJ2-8: 26 confirmed findings repaired; core money physics PASS since round three; final verdict MERGE-SAFE with limits stated (attestation scope, power-loss untested, two live-proof items)
+tripwire | pre-committed and FIRED: automatic governor recovery removed at round six's verdict — halt-only with typed fact rows + one manually attested release command; the diff removed more than it added
+capability | MARGIN_BORROW/MARGIN_REPAY through claim-once (Lead-assigned intent_id), final authority read at the POST boundary, strict confirmations, 3-USDT double clamp, borrow sealed under STOP-JOBS while repay stays exit-class
+bench | absorption learned from the real runners: 4/5 components fired pre-ignition on both; the 30d lows gate was the one blindness (OPENUSDT was at 0.017 of its YEARLY range); class-routed shadows instrumented, production untouched
+census | owner priority order: pump census running — every +25%/24h episode on 3x volume in 30 days, HELD vs COLLAPSED, prior-48h component scoreboard; adoption words wait for it
+standing | machine SEALED+FLAT, zero live actions today | NOW.md rewritten to current truth | owner words open: M2 line, re-arm, permit numbers, BNB float
+
 LEAD SESSION 2026-08-15 afternoon | successor Lead's first day at the desk | fleet peak 7 codex, 16 verified lanes landed, machine SEALED+FLAT throughout, zero live actions
 symbol class | the non-ASCII listing defect class killed repo-wide: shared validator windows.validate_symbol + 8 modules converted (2 crashed on the real listing, 6 silently skipped its data files) | archive ceiling 1 GiB byte-accounted streaming — the anonymous failure named: AKEUSDT 2026-08-14, 128,057,344 bytes vs the old 128,000,000 bound
 bench | absorption baselines now build from the 13GB tape (proven on 20 real symbols, then full universe: built=469, skipped=21 honest NOT-READY) | gap-history reader landed against the recorder schema | full-suite discovery is a clean instrument again (exit 0, 43 stated sandbox skips)

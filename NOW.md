@@ -1,76 +1,51 @@
 # NOW.md — current orders and measured truth (one page, rewritten in place)
 
-## Orders (commander audit 2026-08-14, in force)
-- KEEP STOP ACTIVE. No activation until the one vertical live lifecycle
-  works end to end.
-- BUILD THE VERTICAL, nothing else: momentum OPEN -> HOLD across ticks ->
-  strategy-driven REDUCE/EXIT with actual fills feeding state; full-universe
-  live volume into momentum; basis_watch actually wired to the supervisor
-  on the host; ONE unified runtime control, one STOP, real commit identity,
-  failure propagation, UI paths matching runtime truth.
-- DEPLOYED PAUSED 2026-08-14 (release 26b5a8d2, superseded same day by
-  7dcfd195 with the commander tracks): unified cron live, RELEASE identity
-  valid, both STOP interlocks verified, ticks green and honest.
-- ACCEPTANCE HONORABLE since 2026-08-14T06:10Z: release a9352d3 deployed
-  with raw transcript (evidence/deploy-transcript-2026-08-14-a9352d3.txt),
-  three Opus attack rounds survived (round 3: all eight repairs HOLD, zero
-  money-severity), 904 tests green pre-push. The machine observes under
-  both seals on the new release (656 symbols, honest refusals, zero jobs).
-  The ONE remaining act is the owner's acceptance word -> Lead writes
-  OPERATOR + ACCEPT-ONE -> one natural entry <= 8 USDT at 1x, managed
-  exits, reconcile flat, auto-reseal. Minor queue: round-3 F1-F3
-  (fail-closed liveness nits), feed same-host clock-skew lane in flight,
-  host hygiene apply pending.
-- THEN: the runner — not a human, not a pasted job — takes ONE naturally
-  generated capped live trade (first trade at 8 by Lead decision, cap 32
-  only after one clean strategy close), holds it across ticks, exits from
-  the strategy, and records exact fills, fees, P&L, balances, flatness.
-- AUDIT CORRECTIONS ON RECORD: the momentum receipt was queued manually by
-  the Lead (autonomous signal-to-trade is NOT yet proven); the old
-  MOMENTUM_ROUNDTRIP cannot hold and must never be armed as strategy; the
-  "~five cents" cost figure is UNVERIFIED until commissions and ledger
-  reconciliation are read signed (reader built: src/mechanics_reconcile.py
-  in this worktree, untracked, host run pending).
+## Orders (in force, 2026-08-15 night)
+- MACHINE STAYS SEALED. Open owner words: re-arm (criterion unchanged: a
+  configuration clears fees plus slippage on replay first, then smallest
+  cap the same hour), the 12-item donor permit numbers (against the
+  measured PORT-PLANS costs), the BNB fee-float purchase, and the M2 line
+  below. Tuner stays advisory.
+- M2 MARGIN PROOF is armed at the record level: runner margin operations
+  (MARGIN_BORROW / MARGIN_REPAY) are MERGED on main after EIGHT adversarial
+  review rounds — NOT deployed. Sequence when the owner says the word:
+  hash-gated host deploy -> owner's ONE line -> borrow ~2.5 USDT -> read
+  the real liability including accrued interest -> repay the measured
+  total -> reconcile flat. Two live-proof items ride along: endpoint
+  semantics, and accrued-interest behavior on full repay (an UNKNOWN there
+  is honest fail-closed, not failure).
+- PRODUCT LANE PRIORITY (owner order tonight): learn ONLY from tokens that
+  actually pumped. The pump census (30 days, all 659 symbols, HELD vs
+  COLLAPSED, prior-48h component scoreboard) is the standing study; no
+  formula adoption words before its numbers; no test without a one-line
+  purpose an owner can read.
+- BASIS ENGINE: ladder + events landed on main; the supervisor wiring is
+  SHELVED (three review rounds proved the projection shape wrong;
+  shelf/ladder-wiring-v1 preserves it). The POSITION-ADD railroad is the
+  build: BUILD-01 contract freeze DONE; BUILD-02 (v2 rung/transition
+  receipts) next, carrying IR3's nine findings as schema requirements.
+  Reverse basis waits only on the M2 proof.
 
-## Truth (measured 2026-08-14)
-- Runtime ALIVE-PAUSED on host: release 7dcfd195 deployed (RELEASE byte-read
-  matches, seat-verified 2026-08-14T03:44Z), cron unified (runner 1m + runtime
-  chain 3m), BOTH STOP interlocks present, no ACCEPT-ONE flag anywhere,
-  supervisor honest IDLE every 3 min, market feed honestly STOPPED (feed
-  stage runs only when STOP absent — runtime_tick.sh:175), no jobs since the
-  three CLOSED proofs.
-- Commander tracks live (815 tests, seat re-run green in 4s): STOP blocks NEW
-  ENTRIES ONLY (exits+reconciliation sacred), account governor (one entry
-  lock across strategies, daily budgets 5 entries / 1.00 USDT loss+fees,
-  fail-closed), feed supervised into the runtime, executable sizing metadata.
-- Acceptance physics BUILT this wave (865 tests, Lead-run, worktree HEAD):
-  universal ACCEPT-ONE entry ticket in BOTH modes consumed on FILL (never
-  attempt), OPERATOR token on every entry, seal-on-flat, first-trade clamp
-  8 -> 32 lifted only by a clean strategy close (a stop-out never lifts it),
-  fee-aware max-adverse stop (2% realized incl. 0.30 measured fees) that
-  never starves the exit loop and seals UNKNOWN visibly, basis entries
-  through the same governor+ticket, observation alive under seals
-  (observe-only watch / decision-only momentum / manage-only standing).
-  Acceptance sequence on the repaired release: owner speaks -> Lead writes
-  OPERATOR + ACCEPT-ONE -> machine finds its own signal, opens once <= 8,
-  manages under its own exits, reconciles flat, reseals itself.
-- Built and green: token stream (TRADING+PERPETUAL universe,
-  measured live 132 spot-only / 167 perp-only / 357 both = 656), momentum
-  lifecycle (APRUSDT fixture passes), stream-fed basis, six live-truth UI
-  endpoints, proposal-only entry, full-equation net edge, supervisor with
-  7 proven crash boundaries.
-- Account (signed reads): spot 84.31 USDT + 0.00096 BNB dust; USD-M 11.03;
-  zero positions; zero open orders. Commissions measured: 0.30% round trip.
-- FUTURES PROVEN 2026-08-13T22:13Z: first real futures fills — 565 TST short
-  opened and reduce-only closed, both FILLED, flat, receipted, ~1.4 cents,
-  via the armed job runner with zero owner presses.
-- BASIS CYCLE PROVEN 2026-08-13T22:20Z: four real fills (spot 568.1 in/568
-  out, short 568 open/reduce-only close), verdict CLOSED, hedged exposure
-  none, 0.1 TST dust recorded — the complete mechanics chain is live.
-  MOMENTUM PROVEN 2026-08-13T23:21Z (receipt three).
-- Money history: one CLOSED spot round trip (d1b204b); one honest
-  OPEN_EXPOSURE freeze whose residual was later sold by the ordered
-  reconcile; futures fills: six (short proof + basis cycle + momentum, 2026-08-13);
-  completed basis cycles: one (mechanics-only); profit proven: none. Not
-  guaranteed money — the machine refuses when the full equation is
-  negative, which today it is.
+## Truth (measured 2026-08-15 night)
+- Machine SEALED + FLAT the entire day; zero live actions; host release
+  unchanged (4ba03977 deployed); aliveness watchdog and mirror loops live.
+- First autonomous trade receipt stands (05:41Z OPENUSDT, net -0.0123
+  USDT, cost of proof); first_autonomous_close_passed -> 32 cap unlocked.
+- Bench day: surge-alone is fee-negative at any bar (413/day, coin flip).
+  Absorption: before BOTH real ignitions, four of five components fired;
+  the hard 30-day lows gate was the single blindness; OPENUSDT sat at
+  0.017 of its YEARLY range (the thesis held, the memory was short);
+  AAOIBUSDT is a fresh listing — its own class. Class-routed shadow
+  scoring is instrumented (production untouched); the full-universe
+  tape-side baseline builds overnight; the pump census runs now.
+- Runner margin ops merged a4d3b42: intent-keyed run-at-most-once, final
+  authority read at the POST boundary, strict identity confirmations,
+  halt-only recovery with a manually attested release command, total halt
+  surface (typed anomalies, never bare exceptions). 147 focused and 1172
+  full tests green. NOT deployed to the host.
+- V2 volume pipeline: full tape complete including the named 166.8MB
+  AKEUSDT day; Stage B feature extraction running; the verdict, when it
+  lands, is read as a blind-spot map of the tested policies per the
+  engine-completeness law — never a strategy obituary.
+- Canonical checkout remains diverged (UI seat's local commits vs origin)
+  — coordination item; work runs from worktrees pinned to origin/main.
