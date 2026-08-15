@@ -148,6 +148,9 @@
     padding: 0 10px;
   }
   .side[data-state="expanded"] .nav-row .nm { display: inline; }
+  .nav-row.sig-ok svg { color: #2ebd85; }
+  .nav-row.sig-stale svg { color: #99640a; }
+  .nav-row.sig-bad svg { color: #cc2f3c; }
   .side[data-state="expanded"] .nav-row.active .nm { font-weight: 500; }
 
   /* bottom profile */
@@ -198,94 +201,6 @@
 
   main { flex: 1; min-width: 0; }
 
-  /* right utility rail (TradingView pattern): thin icon strip pinned
-     right; panels slide in to its left and push the canvas. */
-  .rrail {
-    flex: none;
-    width: 48px;
-    border-left: 1px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 12px 0;
-    gap: 10px;
-    position: sticky;
-    top: 0;
-    height: 100vh;
-  }
-  .rbtn {
-    width: 36px; height: 36px;
-    display: flex; align-items: center; justify-content: center;
-    background: none; border: 0; padding: 0;
-    border-radius: 9px;
-    color: var(--muted);
-    cursor: pointer;
-    transition: background var(--t), color var(--t), transform var(--t);
-  }
-  .rbtn:hover { background: var(--hover); color: var(--ink); }
-  .rbtn:active { transform: scale(0.95); }
-  .rbtn.active { background: var(--pill); color: var(--ink); }
-  .rbtn svg { width: 20px; height: 20px; stroke-width: 1.5; }
-  .rbtn.rb-signal { margin-top: auto; }
-  .rbtn.rb-signal.sig-ok { color: #2ebd85; }
-  .rbtn.rb-signal.sig-stale { color: #99640a; }
-  .rbtn.rb-signal.sig-bad { color: #cc2f3c; }
-
-  .rpanel {
-    flex: none;
-    width: 320px;
-    border-left: 1px solid var(--line);
-    display: none;
-    flex-direction: column;
-  }
-  .rpanel.open { display: flex; }
-  .rpanel-head {
-    display: flex; align-items: center;
-    padding: 16px 16px 10px;
-    font-size: 14px; font-weight: 500;
-  }
-  .rpanel-body { padding: 4px 16px 16px; font-size: 13px; color: var(--muted); }
-  .rpanel-body b { color: var(--ink); font-weight: 600; }
-  .sigpop { width: 336px; padding: 0; overflow: hidden; }
-  .sigpop .sp-head {
-    display: flex; align-items: center; gap: 8px;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--line);
-  }
-  .sigpop .sp-title { font-size: 13.5px; font-weight: 600; color: var(--ink); }
-  .sigpop .sp-pulse { display: flex; align-items: center; gap: 6px; margin-left: auto; }
-  .sigpop .sp-pulse .plabel {
-    font-size: 9.75px; font-weight: 620; letter-spacing: 0.04em;
-    text-transform: uppercase; color: var(--muted);
-  }
-  .sig-grid { display: grid; grid-template-columns: 1fr 1fr; }
-  .sig-cell {
-    padding: 9px 14px;
-    border-right: 1px solid var(--line);
-    border-bottom: 1px solid var(--line);
-    min-width: 0;
-  }
-  .sig-cell:nth-child(2n) { border-right: 0; }
-  .sig-cell:nth-last-child(-n+2) { border-bottom: 0; }
-  .sig-cell em {
-    display: block; font-style: normal;
-    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
-    text-transform: uppercase; color: var(--muted); line-height: 13px;
-  }
-  .sig-cell b {
-    display: block; margin-top: 1px;
-    font-family: var(--mono);
-    font-size: 14px; font-weight: 400; line-height: 20px;
-    color: var(--ink);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .sig-cell b.ok { color: #16a34a; }
-  .sig-cell b.warn { color: #d4a406; }
-  .sig-cell b.bad { color: #cc2f3c; }
-  .sigpop .sp-foot {
-    padding: 7px 14px;
-    font-size: 9.75px; color: var(--faint);
-  }
 
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
@@ -367,6 +282,33 @@
     transition: background var(--t), color var(--t);
   }
   .conn-defaults:hover { background: var(--hover); color: var(--ink); }
+  .conn-overall {
+    display: inline-flex; align-items: center; gap: 7px;
+    margin-left: auto;
+    font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  .conn-overall .livedot { width: 8px; height: 8px; }
+  .conn-group-title {
+    margin-top: 20px;
+    padding: 0 2px 4px;
+    font-size: 10px; font-weight: 600;
+    letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--faint);
+  }
+  .conn-right {
+    margin-left: auto;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
+    flex: none;
+  }
+  .conn-status {
+    font-size: 9.75px; font-weight: 640; letter-spacing: 0.045em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .conn-status.ok { color: #16a34a; }
+  .conn-status.warn { color: #d4a406; }
+  .conn-status.bad { color: #cc2f3c; }
+  .conn-head-row { display: flex; align-items: center; gap: 14px; }
   .conn-title { font-size: 16px; font-weight: 600; color: var(--ink); }
   .conn-sub { margin-top: 4px; font-size: 13px; color: var(--muted); }
   .conn-note { margin-top: 2px; font-size: 12.5px; color: var(--faint); }
@@ -389,8 +331,8 @@
   .conn-name { font-size: 14px; font-weight: 500; color: var(--ink); }
   .conn-detail { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
   .conn-val {
-    margin-left: auto;
     font-size: 13px; color: var(--muted);
+    font-family: var(--mono);
     font-variant-numeric: tabular-nums lining-nums;
   }
   .conn-row.off .conn-dot { background: var(--faint); }
@@ -672,18 +614,6 @@
   .switch[aria-checked="true"] { background: var(--focus); }
   .switch[aria-checked="true"] .knob { transform: translateX(16px); }
   html[data-theme="dark"] .switch .knob { background: #e8eaef; }
-  .sigpop-rows { padding: 0 10px 6px; }
-  .sigrow {
-    display: flex; align-items: baseline; justify-content: space-between;
-    padding: 7px 0;
-    border-bottom: 1px solid var(--line);
-  }
-  .sigrow:last-child { border-bottom: 0; }
-  .sigrow .k { font-size: 12.5px; color: var(--muted); }
-  .sigrow .v { font-size: 13px; color: var(--ink); font-variant-numeric: tabular-nums lining-nums; }
-  .sigrow .v.ok { color: #2ebd85; }
-  .sigrow .v.warn { color: #99640a; }
-  .sigrow .v.bad { color: #cc2f3c; }
   .canvas-top { display: none; }
   /* Clock — the old room's premium pill, ported from its source
      (old project 20th: Header.tsx trig('clock') + HourglassMotionMark;
@@ -696,7 +626,7 @@
   .topbar-right {
     position: fixed;
     top: 7px;
-    right: 59px;
+    right: 40px;
     z-index: 45;
     display: flex;
     align-items: center;
@@ -822,7 +752,7 @@
     align-items: center;
     gap: 10px;
     height: 42px;
-    padding: 0 8px 0 16px;
+    padding: 0 8px 0 14px;
     border-radius: 999px;
     background: var(--panel);
     border: 1px solid var(--line-2);
@@ -852,7 +782,6 @@
     height: 15px;
     stroke-width: 1.8;
     color: var(--muted);
-    margin-right: 5px;
   }
   .qsearch-k {
     flex: none;
@@ -1071,8 +1000,10 @@
   .ssr-price small { font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .ssr-price.single { font-size: 11px; color: var(--muted); }
   .ssr-empty { padding: 10px; font-size: 11.5px; color: var(--muted); }
-  .empty { padding: 72px 24px 46px; color: var(--muted); font-size: 13.5px; }
-  .empty b { color: var(--ink); font-weight: 600; }
+  /* one page grid: every page's title sits exactly where News's
+     title sits (72px down, 40px in) — no page moves. */
+  .page-shell { max-width: 1180px; padding: 72px 40px 56px; }
+  .page-sub { margin-top: 8px; font-size: 13.5px; color: var(--muted); }
 
   /* floating tooltip */
   #tip {
@@ -1208,6 +1139,14 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V7"/><path d="M16 8h-6a2 2 0 0 0 0 4h4a2 2 0 0 1 0 4H8"/><path d="M4 3a1 1 0 0 1 1-1 1.3 1.3 0 0 1 .7.2l.933.6a1.3 1.3 0 0 0 1.4 0l.934-.6a1.3 1.3 0 0 1 1.4 0l.933.6a1.3 1.3 0 0 0 1.4 0l.933-.6a1.3 1.3 0 0 1 1.4 0l.934.6a1.3 1.3 0 0 0 1.4 0l.933-.6A1.3 1.3 0 0 1 19 2a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1 1.3 1.3 0 0 1-.7-.2l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.934.6a1.3 1.3 0 0 1-1.4 0l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-1.4 0l-.934-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-.7.2 1 1 0 0 1-1-1z"/></svg>
         <span class="nm">Journal</span>
       </a>
+      <a class="nav-row" href="#news" data-page="news" data-tip="News">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18h-5"/><path d="M18 14h-8"/><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-4 0v-9a2 2 0 0 1 2-2h2"/><rect width="8" height="4" x="10" y="6" rx="1"/></svg>
+        <span class="nm">News</span>
+      </a>
+      <a class="nav-row" href="#network" data-page="network" id="nav-network" data-tip="Network">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M2 20h.01"/><path d="M7 20v-4"/><path d="M12 20v-8"/><path d="M17 20V8"/><path d="M22 4v16"/></svg>
+        <span class="nm">Network</span>
+      </a>
     </nav>
     <button class="profile" id="profile" aria-haspopup="menu" aria-expanded="false" aria-label="Account">
       <span class="avatar" aria-hidden="true"></span>
@@ -1237,36 +1176,18 @@
       </div>
       <div class="qsearch" id="qsearch">
         <div class="qsearch-box" id="qsearch-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
           <input id="qsearch-input" type="text" placeholder="Search pages, symbols, news"
                  aria-label="Search the whole product" aria-expanded="false"
                  autocomplete="off" spellcheck="false">
           <button class="qsearch-k" id="qsearch-k" tabindex="-1" title="Focus search (⌘K)">⌘K</button>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
         </div>
         <span class="search-beam" aria-hidden="true"></span>
         <div class="qsearch-pop" id="qsearch-pop" hidden></div>
       </div>
     </div>
-    <div class="empty" id="page"></div>
+    <div id="page"></div>
   </main>
-  <aside class="rpanel" id="rpanel" aria-label="Utility panel">
-    <div class="rpanel-head" id="rpanel-title"></div>
-    <div class="rpanel-body" id="rpanel-body"></div>
-  </aside>
-  <div class="rrail" aria-label="Utilities">
-    <button class="rbtn" data-panel="watchlist" data-tip="Watchlist" aria-pressed="false">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>
-    </button>
-    <button class="rbtn" id="rb-news" data-tip="News" aria-label="News">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18h-5"/><path d="M18 14h-8"/><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-4 0v-9a2 2 0 0 1 2-2h2"/><rect width="8" height="4" x="10" y="6" rx="1"/></svg>
-    </button>
-    <button class="rbtn" data-panel="calendar" data-tip="Calendar" aria-pressed="false">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v3"/><path d="M16 2v3"/><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/></svg>
-    </button>
-    <button class="rbtn rb-signal" id="rb-signal" aria-haspopup="true" aria-expanded="false" aria-label="Signal">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M2 20h.01"/><path d="M7 20v-4"/><path d="M12 20v-8"/><path d="M17 20V8"/><path d="M22 4v16"/></svg>
-    </button>
-  </div>
 </div>
 
 <div class="pop" id="pop" role="menu" hidden>
@@ -1299,15 +1220,6 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></svg>
     Log out
   </a>
-</div>
-
-<div class="pop sigpop" id="sigpop" role="dialog" aria-label="Signal" hidden>
-  <div class="sp-head">
-    <span class="sp-title">Signal</span>
-    <span class="sp-pulse"><span class="livedot"></span><span class="plabel">Live monitor</span></span>
-  </div>
-  <div class="sig-grid" id="sigpop-rows"></div>
-  <div class="sp-foot" id="sig-asof">connecting</div>
 </div>
 
 <div id="tip" role="tooltip" aria-hidden="true"></div>
