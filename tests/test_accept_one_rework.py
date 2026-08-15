@@ -528,11 +528,14 @@ class AcceptOneReworkTests(unittest.TestCase):
                 if op in jr.MARGIN_OPS:
                     # A margin op must be WELL-FORMED so the refusal under
                     # test is genuinely the acceptance gate, not the schema.
+                    expires = utc(NOW + timedelta(minutes=10))
                     self.job(
                         "unaccepted-%s" % index, op=op,
                         symbol=None, max_notional=None,
                         asset="USDT", principal="2",
-                        client_tag="acc-%s" % index,
+                        client_tag=jr.margin_ops.deterministic_client_tag(
+                            op, "USDT", "2", expires,
+                        ),
                         operator_token="lead",
                     )
                     path = os.path.join(
