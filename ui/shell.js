@@ -169,7 +169,7 @@
 
   function scheduleClose() {
     if (popTimer) { clearTimeout(popTimer); }
-    popTimer = setTimeout(closePop, 150);
+    popTimer = setTimeout(closePop, 250);
   }
 
   profile.addEventListener("mouseenter", openPop);
@@ -186,7 +186,30 @@
         !profile.contains(ev.target)) { closePop(); }
   });
 
-  /* log out: real endpoint on the hosted site only */
+  /* status dot on the avatar: green = data plane answering here,
+     black = unreachable. Polls a HEAD of /api/health every 10s. */
+  var avatarEl = profile.querySelector(".avatar");
+
+  function setOnline(ok) {
+    avatarEl.classList.toggle("on", !!ok);
+    profile.title = ok
+      ? "Online — data plane answering"
+      : "Offline — data plane unreachable";
+  }
+
+  function pollHealth() {
+    fetch("/api/health", { method: "HEAD", cache: "no-store" })
+      .then(function (r) { setOnline(r.ok); })
+      .catch(function () { setOnline(false); });
+  }
+  pollHealth();
+  setInterval(pollHealth, 10000);
+
+  /* log out: real endpoint on the hosted site only.
+     OWNER NOTE 2026-08-15 (verify at next deploy): on
+     arbitrage.cosmosgeek.org the row must hit /cdn-cgi/access/logout so
+     Cloudflare Access (YubiKey login, ~7-day session) drops the session
+     and locks the front end for this browser until the next login. */
   var local = location.hostname === "127.0.0.1" ||
     location.hostname === "localhost";
   if (local) {

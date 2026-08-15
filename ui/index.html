@@ -137,7 +137,7 @@
     margin-top: auto;
     display: flex; align-items: center; justify-content: center;
     align-self: center;
-    width: 40px; height: 40px;
+    width: 44px; height: 44px;
     background: none; border: 0; padding: 0;
     border-radius: 10px;
     cursor: pointer;
@@ -147,36 +147,36 @@
   .profile:active { transform: scale(0.96); }
   .avatar {
     position: relative;
-    width: 30px; height: 30px;
+    width: 34px; height: 34px;
     border-radius: 50%;
     flex: none;
-    background:
-      radial-gradient(130% 130% at 30% 20%,
-        #6f8fe8 0%, #3a5bc0 42%, #16255f 78%, #0c1638 100%);
+    background: #16255f url("avatar.png") center / cover no-repeat;
   }
   .avatar::after {
     content: "";
     position: absolute;
     right: -2px; bottom: -2px;
-    width: 11px; height: 11px;
+    width: 13px; height: 13px;
     border-radius: 50%;
-    background: #8d939e;
-    border: 2px solid var(--bg);
+    background: #23262c; /* black = offline */
+    border: 2.5px solid var(--bg);
+    transition: background var(--t);
   }
+  .avatar.on::after { background: #2ebd85; /* green = online */ }
   .profile .pcol { display: none; min-width: 0; text-align: left; }
   .side[data-state="expanded"] .profile {
     align-self: stretch;
     width: auto;
     margin: auto 10px 0;
     justify-content: flex-start;
-    gap: 10px;
+    gap: 11px;
     padding: 0 8px;
-    height: 46px;
+    height: 56px;
   }
-  .side[data-state="expanded"] .profile .avatar { width: 28px; height: 28px; }
-  .side[data-state="expanded"] .profile .pcol { display: flex; flex-direction: column; line-height: 1.25; }
-  .profile .pname { font-size: 13px; font-weight: 500; color: var(--ink); }
-  .profile .prole { font-size: 11.5px; color: var(--muted); }
+  .side[data-state="expanded"] .profile .avatar { width: 32px; height: 32px; }
+  .side[data-state="expanded"] .profile .pcol { display: flex; flex-direction: column; line-height: 1.4; gap: 1px; }
+  .profile .pname { font-size: 14px; font-weight: 500; color: var(--ink); }
+  .profile .prole { font-size: 12px; color: var(--muted); }
 
   main { flex: 1; min-width: 0; }
   .canvas-top {
@@ -226,10 +226,10 @@
   .pop {
     position: fixed;
     z-index: 60;
-    width: 238px;
+    width: 292px;
     background: var(--panel);
     border: 1px solid var(--line-2);
-    border-radius: 12px;
+    border-radius: 14px;
     box-shadow: 0 10px 32px rgba(0, 0, 0, 0.12);
     padding: 6px;
     opacity: 0;
@@ -237,19 +237,19 @@
     transition: opacity 130ms ease, transform 130ms ease;
   }
   .pop.on { opacity: 1; transform: translateY(0); }
-  .pop-id { padding: 8px 10px 6px; }
-  .pop-id .pname { font-size: 13px; font-weight: 500; color: var(--ink); }
-  .pop-id .pemail { display: block; font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .pop-id { padding: 10px 12px 8px; }
+  .pop-id .pname { font-size: 14px; font-weight: 500; color: var(--ink); }
+  .pop-id .pemail { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
   .theme-trio {
     display: inline-flex;
     gap: 2px;
-    margin-top: 9px;
+    margin-top: 10px;
     border: 1px solid var(--line-2);
     border-radius: 8px;
     padding: 2px;
   }
   .tbtn {
-    width: 26px; height: 24px;
+    width: 28px; height: 28px;
     display: flex; align-items: center; justify-content: center;
     background: none; border: 0; padding: 0;
     border-radius: 6px;
@@ -259,22 +259,22 @@
   }
   .tbtn:hover { background: var(--hover); color: var(--ink); }
   .tbtn.on { background: var(--pill); color: var(--ink); }
-  .tbtn svg { width: 14px; height: 14px; stroke-width: 1.6; }
+  .tbtn svg { width: 18px; height: 18px; stroke-width: 1.6; }
   .pop-sep { height: 1px; background: var(--line); margin: 6px 4px; }
   .pop-row {
-    display: flex; align-items: center; gap: 9px;
-    height: 34px;
-    padding: 0 10px;
+    display: flex; align-items: center; gap: 10px;
+    height: 36px;
+    padding: 0 12px;
     border-radius: 8px;
-    font-size: 13px;
+    font-size: 14px;
     color: var(--ink);
     text-decoration: none;
     cursor: pointer;
     transition: background var(--t);
   }
   .pop-row:hover { background: var(--hover); }
-  .pop-row svg { width: 15px; height: 15px; stroke-width: 1.6; color: var(--muted); flex: none; }
-  .pop-row .pv { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .pop-row svg { width: 17px; height: 17px; stroke-width: 1.6; color: var(--muted); flex: none; }
+  .pop-row .pv { margin-left: auto; font-size: 13px; color: var(--muted); }
   .pop-row.inert { cursor: default; color: var(--muted); }
   .pop-row.inert:hover { background: none; }
 
@@ -321,7 +321,7 @@
     <button class="profile" id="profile" aria-haspopup="menu" aria-expanded="false" aria-label="Account">
       <span class="avatar" aria-hidden="true"></span>
       <span class="pcol">
-        <span class="pname">Deepak</span>
+        <span class="pname">CosmosGeek</span>
         <span class="prole">Owner</span>
       </span>
     </button>
@@ -336,7 +336,7 @@
 
 <div class="pop" id="pop" role="menu" hidden>
   <div class="pop-id">
-    <span class="pname">Deepak</span>
+    <span class="pname">CosmosGeek</span>
     <span class="pemail">cosmosgeek@pm.me</span>
     <div class="theme-trio" role="group" aria-label="Theme">
       <button class="tbtn" data-theme-set="system" aria-label="System theme" title="System">
