@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+DONOR MINED 2026-08-15 | three digest lanes over the old project's stable-backend copy | read-only, zero imports, digests committed at study/donor/
+basis | a COMPLETE 14-state reverse-basis lifecycle design exists (borrow/liability/repay/recovery exact-laws) — proven offline only because the old project lacked the margin capability the owner just authorized | causality machinery (paired-cut chronology, four-quadrant leader/follower, watermarks) is real learning our ladder lacks | their own docs name why it stalled: designed ahead of capabilities
+volume | their forward-measurement design (hash-chained prospective capture — repaired history can never become evidence) directly hardens our V2 validation | noise features we lack: one-print dominance, wash score, burst clusters, print-span | their fatal cohort trap: prefiltered by 24h volume so dead tokens were invisible — validates our full-universe cohort
+lessons | 50 named deaths -> 16 DO-NOT-REBUILD gates tied to CURRENT modules | biting now: intent is not held exposure (ladder advances on reconciled fills only); never fork money truth (one execution path); borrow boolean is not reverse readiness; zero is not unknown; live silence is not license to retune; no experiment sprawl — one falsifiable question, terminal verdict, then expand
+pulls | 12 pull-candidates listed with per-item cost (9 basis, 3 volume) | actual code crosses only on the owner's per-item permits per the donor law
+
 OWNER WORD — REVERSE-BASIS BORROW AUTHORIZED 2026-08-15 | capability MEASURED same turn
 word | the owner authorizes borrow for reverse basis (the account power parked unasked since 08-12)
 measured | signed GET-only probe: cross-margin account ACCESSIBLE with the existing key, borrowEnabled=true, marginLevel 999 (no borrows outstanding), margin wallet ~0.00003 BTC | margin TRADE permission of the key remains UNVERIFIED until the first real margin action
