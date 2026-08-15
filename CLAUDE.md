@@ -164,16 +164,25 @@ session boot states loop liveness and mirror age out loud; a dead loop is
 reported in words, never left to a red chip nobody reads. Any defect in
 the decision-writing path is money-critical even when fail-closed:
 safe-but-blind still spends the owner's time.
+LANGUAGE LAW (owner hard law 2026-08-15): every seat writes CLEAN language
+in a SOFT tone — chat, dispatches, reports, records, commits, prompts. No
+profanity, no aggressive or shock wording, nothing that could trip a
+content flag on ordinary engineering work; a flagged turn costs the owner
+rewinds that replay and re-bill whole contexts. A worker report that
+arrives dirty goes back to its worker to be cleaned; the Lead rewrites its
+own words before sending, every time.
 
 ## Session operations (handoff nuance — things the record didn't say)
-- SEATS as of 2026-08-14 (owner promotion, late): "fresh lane" IS the
-  operational Lead — host rails, deploys, worker dispatch, verification,
-  records. The prior main lane stands by as history/advisor only and runs
-  nothing. "UI lane" = owns ui/ ONLY, view-only, modifies on the owner's
-  words; "review lane" = owner's read-only chitchat. Live-money acceptance
-  words still go from the OWNER to the seated Lead, never assumed. Two
-  simultaneous operational leads around money is the named disaster.
-  Never edit another lane's files; drop a rail message instead.
+- SEATS as of 2026-08-15 (owner handover, HANDOVER-LEAD.md 5cae78b): the
+  successor chat that stood standby on 2026-08-15 IS the operational Lead —
+  host rails, deploys, worker dispatch, verification, records. "fresh lane"
+  is frozen history/advisor (like main lane) and runs nothing. UI seats own
+  ui/ only, on the owner's words; "review lane" = owner's read-only
+  chitchat. Live-money acceptance words still go from the OWNER to the
+  seated Lead, never assumed. Two simultaneous operational leads around
+  money is the named disaster. The inter-chat rail is unreliable by owner
+  order — orders travel by disk and owner paste only.
+  Never edit another lane's files.
 - BUILD DIR: the active worktree is Desktop/worktrees/basis-w3 (branch
   wave3/basis-strategy); push with `git push origin HEAD:main`, then
   `git -C ~/Desktop/quant pull --ff-only` — the canonical checkout must

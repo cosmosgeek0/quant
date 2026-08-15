@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+LEAD SEAT ASSUMED + LANGUAGE LAW 2026-08-15 ~11:35Z | successor Lead seated per HANDOVER-LEAD (5cae78b) | machine untouched: SEALED + FLAT, tuner advisory
+law | LANGUAGE LAW (owner hard law): clean language, soft tone in every chat, dispatch, report, record, commit — nothing that could flag ordinary engineering work; dirty worker reports go back for cleaning | folded into CLAUDE.md this commit, SEATS row updated same file
+loops | mirror loops measured ALIVE (the handover note was stale): pull manifest 33s fresh, sync log written this second | duplicate instances from this seat's restart attempt killed; exactly one pair stands
+lanes | R1 margin/borrow reconciliation core landed on lane/lead2-r1 (7b2afb7): typed liability/partial-unwind/flat/unknown verdicts per the donor laws, exchange-truth only, 11 offline tests, Lead-verified by own run | R2 reverse-liability lifecycle in flight in the same lane, verification next
+v2 | WINDOWS crash (events line 197191, symbol rejected by the windower validator) owned by this seat — fix lane queued: exchange-safe alias at Stage A emit or a widened windower charset, then the pipeline resumes from WINDOWS on the completed Stage-A output
+standing | with the owner: permit-menu numbers (12 donor pulls), BNB fee float, re-arm word (criterion unchanged: a config clears fees on replay first) | tuner stays advisory
+
 DONOR MINED 2026-08-15 | three digest lanes over the old project's stable-backend copy | read-only, zero imports, digests committed at study/donor/
 basis | a COMPLETE 14-state reverse-basis lifecycle design exists (borrow/liability/repay/recovery exact-laws) — proven offline only because the old project lacked the margin capability the owner just authorized | causality machinery (paired-cut chronology, four-quadrant leader/follower, watermarks) is real learning our ladder lacks | their own docs name why it stalled: designed ahead of capabilities
 volume | their forward-measurement design (hash-chained prospective capture — repaired history can never become evidence) directly hardens our V2 validation | noise features we lack: one-print dominance, wash score, burst clusters, print-span | their fatal cohort trap: prefiltered by 24h volume so dead tokens were invisible — validates our full-universe cohort
