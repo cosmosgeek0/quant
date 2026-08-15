@@ -281,7 +281,7 @@
   .refresh-btn.busy svg { animation: spin 900ms linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .news-upd { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
-  .news-upd.stale { color: #99640a; }
+  .news-upd.stale { color: #e8850c; }
   .bar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
   .master-wrap { display: flex; align-items: center; gap: 8px; }
   .master-wrap .mlabel { font-size: 12.5px; color: var(--muted); }
@@ -302,8 +302,8 @@
   .day.dim { opacity: 0.45; }
   .day .d1 { display: block; font-size: 13px; font-weight: 600; color: var(--ink); }
   .day .d2 { display: block; font-size: 11.5px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums lining-nums; }
-  .day .d2 .hh { color: #b45309; font-weight: 600; }
-  .day .d2 .mm { color: #2563eb; font-weight: 600; }
+  .day .d2 .hh { color: #e8850c; font-weight: 600; }
+  .day .d2 .mm { color: #3b82f6; font-weight: 600; }
 
   .pillbar { display: flex; align-items: center; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
   .fpill {
@@ -333,14 +333,13 @@
   .news-cols { display: flex; gap: 32px; margin-top: 22px; align-items: flex-start; }
   .news-maincol { flex: 1; min-width: 0; }
   .news-rightcol {
-    width: 344px; flex: none;
+    width: 392px; flex: none;
     display: flex; flex-direction: column; gap: 20px;
-    position: sticky; top: 20px;
   }
   .rbox {
     border: 1px solid var(--line-2);
     border-radius: 16px;
-    padding: 16px;
+    padding: 18px;
     background: var(--panel);
   }
   .rbox-h { display: flex; align-items: baseline; padding: 2px 2px 12px; }
@@ -356,10 +355,10 @@
   }
   .srcsearch svg { width: 13px; height: 13px; stroke-width: 1.8; color: var(--muted); flex: none; }
   .srcsearch input { border: 0; outline: 0; background: none; font: inherit; font-size: 12.5px; color: var(--ink); width: 100%; }
-  .srclist { margin-top: 8px; max-height: 480px; overflow-y: auto; padding-right: 10px; scrollbar-gutter: stable; }
-  .src-row { display: flex; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
+  .srclist { margin-top: 8px; max-height: 420px; overflow-y: auto; padding-right: 12px; scrollbar-gutter: stable; }
+  .src-row { display: flex; align-items: center; gap: 11px; padding: 11px 2px; border-bottom: 1px solid var(--line); }
   .src-row:last-child { border-bottom: 0; }
-  .src-name { flex: 1; min-width: 0; font-size: 13px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .src-name { flex: 1; min-width: 0; font-size: 13.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .src-row.off .src-name { color: var(--faint); }
   .src-row.off .fav, .src-row.off .badge { opacity: 0.4; }
   .src-dot {
@@ -374,10 +373,10 @@
   .src-cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 22px; text-align: right; }
   .sp-note { margin-top: 9px; font-size: 10.5px; color: var(--faint); line-height: 1.45; }
 
-  .fav { width: 20px; height: 20px; border-radius: 5px; flex: none; display: block; }
+  .fav { width: 22px; height: 22px; border-radius: 5px; flex: none; display: block; }
   .news-row .fav, .news-row .badge { width: 15px; height: 15px; border-radius: 4px; font-size: 8px; }
   .badge {
-    width: 20px; height: 20px; flex: none;
+    width: 22px; height: 22px; flex: none;
     border-radius: 5px;
     background: var(--pill);
     color: var(--muted);
@@ -385,15 +384,15 @@
     font-size: 9.5px; font-weight: 600;
   }
 
-  .hbar-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
-  .hbar-label { width: 96px; flex: none; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .hbar-track { flex: 1; height: 8px; border-radius: 4px; background: var(--inset, var(--hover)); position: relative; }
-  .hbar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: #8fa8c8; }
-  .hbar-val { width: 34px; flex: none; text-align: right; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .hbar-row { display: flex; align-items: center; gap: 11px; padding: 7px 0; }
+  .hbar-label { width: 116px; flex: none; font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hbar-track { flex: 1; height: 10px; border-radius: 5px; background: var(--inset, var(--hover)); position: relative; }
+  .hbar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; background: rgba(59, 130, 246, 0.55); }
+  .hbar-val { width: 38px; flex: none; text-align: right; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .act-h { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
   .act-h .lg { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
   .act-h .dotc { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
-  .actchart { display: block; width: 100%; height: 88px; margin-top: 10px; }
+  .actchart { display: block; width: 100%; height: 118px; margin-top: 12px; }
   .actchart .bl { stroke: var(--line-2); }
   .acthour { font-size: 9px; fill: var(--muted); }
 
@@ -437,6 +436,32 @@
   .n-link svg { width: 13px; height: 13px; stroke-width: 1.7; }
   .n-link a:hover { color: var(--ink); }
   .news-empty { margin-top: 22px; font-size: 13px; color: var(--muted); }
+
+  .pager { display: flex; align-items: center; gap: 6px; margin-top: 16px; }
+  .pbtn {
+    min-width: 30px; height: 30px; padding: 0 9px;
+    border: 0; border-radius: 8px;
+    background: none;
+    font-size: 12.5px; font-weight: 500; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition: background var(--t), color var(--t);
+  }
+  .pbtn:hover { background: var(--hover); color: var(--ink); }
+  .pbtn.on { background: var(--pill); color: var(--ink); font-weight: 600; }
+  .pbtn[disabled] { opacity: 0.35; cursor: default; }
+  .pager .pinfo { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .newsearch {
+    display: flex; align-items: center; gap: 7px;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    padding: 0 13px;
+    height: 31px;
+    width: 230px;
+  }
+  .newsearch svg { width: 13px; height: 13px; stroke-width: 1.8; color: var(--muted); flex: none; }
+  .newsearch input { border: 0; outline: 0; background: none; font: inherit; font-size: 12.5px; color: var(--ink); width: 100%; }
 
   .news-page.dead .daystrip,
   .news-page.dead .pillbar,

@@ -561,6 +561,9 @@
   var newsFilter = "all";
   var newsCat = "all";
   var newsDay = "all";
+  var newsPage = 1;
+  var NEWS_PAGE_SIZE = 25;
+  var newsQuery = "";
   var newsTimer = null;
   var newsHost = null;
   var newsSeen = null;
@@ -738,7 +741,7 @@
       var tot = buckets[mb].h + buckets[mb].m + buckets[mb].l;
       if (tot > maxN) { maxN = tot; }
     }
-    var W = 312, H = 88, plotH = 64, baseY = 72;
+    var W = 356, H = 118, plotH = 88, baseY = 98;
     var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H,
       "class": "actchart" });
     var slot = W / 24;
@@ -1091,6 +1094,7 @@
         cell.appendChild(l2);
         cell.addEventListener("click", function () {
           newsDay = def.key;
+          newsPage = 1;
           renderNews();
         });
         strip.appendChild(cell);
@@ -1113,8 +1117,16 @@
       }
     }
     var pool = [];
+    var needleQ = newsQuery.trim().toLowerCase();
     for (var i2 = 0; i2 < catPool.length; i2++) {
-      if (!newsSrcOff[catPool[i2].source || "—"]) { pool.push(catPool[i2]); }
+      var itQ = catPool[i2];
+      if (newsSrcOff[itQ.source || "—"]) { continue; }
+      if (needleQ &&
+          String(itQ.title || "").toLowerCase().indexOf(needleQ) === -1 &&
+          String(itQ.source || "").toLowerCase().indexOf(needleQ) === -1) {
+        continue;
+      }
+      pool.push(itQ);
     }
 
     /* category + impact pill rows */
@@ -1128,11 +1140,39 @@
         b.textContent = name;
         b.addEventListener("click", function () {
           newsCat = val;
+          newsPage = 1;
           renderNews();
         });
         catbar.appendChild(b);
       })(NEWS_CATS[ci2]);
     }
+    var searchWrap = document.createElement("span");
+    searchWrap.className = "bar-right";
+    var nsearch = document.createElement("span");
+    nsearch.className = "newsearch";
+    var nsIcon = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+      stroke: "currentColor", "stroke-linecap": "round",
+      "stroke-linejoin": "round" });
+    nsIcon.appendChild(svgEl("circle", { cx: 11, cy: 11, r: 8 }));
+    nsIcon.appendChild(svgEl("path", { d: "m21 21-4.3-4.3" }));
+    nsearch.appendChild(nsIcon);
+    var nsInput = document.createElement("input");
+    nsInput.type = "text";
+    nsInput.placeholder = "Search news";
+    nsInput.value = newsQuery;
+    nsInput.addEventListener("input", function () {
+      newsQuery = nsInput.value;
+      newsPage = 1;
+      renderNews();
+      var again = newsHost.querySelector(".newsearch input");
+      if (again) {
+        again.focus();
+        again.setSelectionRange(again.value.length, again.value.length);
+      }
+    });
+    nsearch.appendChild(nsInput);
+    searchWrap.appendChild(nsearch);
+    catbar.appendChild(searchWrap);
     newsHost.appendChild(catbar);
 
     var counts = { 3: 0, 2: 0, 1: 0 };
@@ -1153,6 +1193,7 @@
         b.appendChild(c);
         b.addEventListener("click", function () {
           newsFilter = val;
+          newsPage = 1;
           renderNews();
         });
         impbar.appendChild(b);
@@ -1207,12 +1248,22 @@
     }
     list.appendChild(hrow);
 
+    var filtered = [];
+    for (var fi2 = 0; fi2 < pool.length; fi2++) {
+      var lvlF = newsLevel(pool[fi2]);
+      if (newsFilter !== "all" && String(lvlF) !== newsFilter) { continue; }
+      filtered.push(pool[fi2]);
+    }
+    var totalPages = Math.max(1, Math.ceil(filtered.length / NEWS_PAGE_SIZE));
+    if (newsPage > totalPages) { newsPage = totalPages; }
+    var pageStart = (newsPage - 1) * NEWS_PAGE_SIZE;
+    var pageItems = filtered.slice(pageStart, pageStart + NEWS_PAGE_SIZE);
+
     var seenNow = {};
     var shown = 0;
-    for (var ri = 0; ri < pool.length; ri++) {
-      var it = pool[ri];
+    for (var ri = 0; ri < pageItems.length; ri++) {
+      var it = pageItems[ri];
       var lvl2 = newsLevel(it);
-      if (newsFilter !== "all" && String(lvl2) !== newsFilter) { continue; }
       shown += 1;
       seenNow[it.id] = true;
       var row = document.createElement("div");
@@ -1282,6 +1333,56 @@
       none.className = "news-empty";
       none.textContent = "Nothing matches these filters in the mirror.";
       maincol.appendChild(none);
+    } else {
+      var pager = document.createElement("div");
+      pager.className = "pager";
+      function pageBtn(label, page, disabled, on) {
+        var b = document.createElement("button");
+        b.className = "pbtn" + (on ? " on" : "");
+        b.textContent = label;
+        if (disabled) { b.setAttribute("disabled", ""); }
+        else {
+          b.addEventListener("click", function () {
+            newsPage = page;
+            renderNews();
+          });
+        }
+        return b;
+      }
+      pager.appendChild(pageBtn("‹", newsPage - 1, newsPage === 1, false));
+      var windowStart = Math.max(1, Math.min(newsPage - 2, totalPages - 4));
+      var windowEnd = Math.min(totalPages, windowStart + 4);
+      if (windowStart > 1) {
+        pager.appendChild(pageBtn("1", 1, false, newsPage === 1));
+        if (windowStart > 2) {
+          var dots1 = document.createElement("span");
+          dots1.className = "pbtn";
+          dots1.textContent = "…";
+          pager.appendChild(dots1);
+        }
+      }
+      for (var pn = windowStart; pn <= windowEnd; pn++) {
+        pager.appendChild(pageBtn(String(pn), pn, false, pn === newsPage));
+      }
+      if (windowEnd < totalPages) {
+        if (windowEnd < totalPages - 1) {
+          var dots2 = document.createElement("span");
+          dots2.className = "pbtn";
+          dots2.textContent = "…";
+          pager.appendChild(dots2);
+        }
+        pager.appendChild(pageBtn(String(totalPages), totalPages, false,
+          newsPage === totalPages));
+      }
+      pager.appendChild(pageBtn("›", newsPage + 1,
+        newsPage === totalPages, false));
+      var pinfo = document.createElement("span");
+      pinfo.className = "pinfo";
+      pinfo.textContent = (pageStart + 1) + "–" +
+        Math.min(pageStart + NEWS_PAGE_SIZE, filtered.length) +
+        " of " + filtered.length;
+      pager.appendChild(pinfo);
+      maincol.appendChild(pager);
     }
 
     rightcol.appendChild(sourcesBox());
