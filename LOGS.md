@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+OWNER WORD — REVERSE-BASIS BORROW AUTHORIZED 2026-08-15 | capability MEASURED same turn
+word | the owner authorizes borrow for reverse basis (the account power parked unasked since 08-12)
+measured | signed GET-only probe: cross-margin account ACCESSIBLE with the existing key, borrowEnabled=true, marginLevel 999 (no borrows outstanding), margin wallet ~0.00003 BTC | margin TRADE permission of the key remains UNVERIFIED until the first real margin action
+scope | never-list updated: borrow is now permitted FOR REVERSE BASIS ONLY | still forbidden: withdrawal, external transfer, master access, auto-funding | leverage law (2x hard cap, 1x proofs) unchanged
+engine | basis_ladder's reverse gate (borrow_power flag) may open in CONFIG when the ladder integrates into the runtime — after V2 verdicts and audits, through the same job-runner physics as everything else
+
 RESEARCH VERDICT 2026-08-15 | bench day complete, zero live spend | full rows in evidence/research-verdict-2026-08-15.txt
 surge | best possible cell measured: 1h + ladder + maker fees = net -0.029% (3bps under) | tail toxic (24h med -1.07%) — dumps confirmed | fee levers remain: BNB float (owner word) + spot/maker rung (built, audit-ready)
 absorption | tool live, honest refusal on short tape — needs its 21-day baseline | 30-day x 300 tape pulling overnight (klines + aggTrades)
