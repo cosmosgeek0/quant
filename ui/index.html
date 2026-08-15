@@ -230,14 +230,15 @@
   .conn-tile b.bad { color: #cc2f3c; }
   .conn-tile small {
     display: block; margin-top: 1px;
-    font-size: 9.75px; color: var(--faint); line-height: 13px;
+    font-size: 10.5px; color: var(--faint); line-height: 14px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .machine-chip {
     display: inline-flex; align-items: center; gap: 7px;
     height: 28px; padding: 0 11px;
     border: 1px solid var(--line-2); border-radius: 999px;
-    font-size: 11px; font-weight: 640; letter-spacing: 0.04em;
+    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+    text-transform: uppercase;
     font-variant-numeric: tabular-nums;
     color: var(--muted);
   }
@@ -352,7 +353,6 @@
   .fpill.on {
     background: var(--pill);
     color: var(--ink);
-    font-weight: 600;
     box-shadow: inset 0 0 0 1px var(--line-2);
   }
   .fpill .cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }

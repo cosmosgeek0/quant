@@ -20,7 +20,7 @@
   grid-column: 1 / -1;
   margin-top: 20px;
   padding-bottom: 4px;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 9.75px;
   font-weight: 500;
   letter-spacing: .045em;
@@ -217,7 +217,7 @@
   background: var(--panel);
   color: var(--ink);
   font: inherit;
-  font-size: 12px;
+  font-size: 12.5px;
 }
 
 .qnet-cadence-select:focus-visible {
@@ -228,7 +228,7 @@
 .qnet-cadence-fixed {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -253,7 +253,7 @@
 .qnet-uptime {
   color: var(--ink);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }

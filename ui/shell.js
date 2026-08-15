@@ -869,6 +869,22 @@
         : "History arrives from the telemetry recorder.";
     }
     if (netTable) { netTable.update(buildTableModel()); }
+    /* lamp and rows must repaint from the same threshold state —
+       telemetry landing changes measured cadences, so the lamp
+       re-evaluates here too, never one poll behind the table */
+    updateOverallLamp();
+  }
+
+  function updateOverallLamp() {
+    var overallEl = document.getElementById("conn-overall");
+    if (!overallEl) { return; }
+    var worst = connOverallWorst();
+    var od = overallEl.querySelector(".livedot");
+    var ol = overallEl.querySelector("span:last-child");
+    od.className = "livedot" +
+      (worst === 2 ? " dead" : (worst === 1 ? " stale" : ""));
+    ol.textContent = worst === 2 ? "OUTAGE"
+      : (worst === 1 ? "DEGRADED" : "OPERATIONAL");
   }
 
   function connOverallWorst() {
@@ -1073,16 +1089,7 @@
         stamp.textContent = "Assessed " + Math.max(0, Math.round(
           (Date.now() - lastStripAt) / 1000)) + "s ago";
       }
-      var overallEl = document.getElementById("conn-overall");
-      if (overallEl) {
-        var worst = connOverallWorst();
-        var od = overallEl.querySelector(".livedot");
-        var ol = overallEl.querySelector("span:last-child");
-        od.className = "livedot" +
-          (worst === 2 ? " dead" : (worst === 1 ? " stale" : ""));
-        ol.textContent = worst === 2 ? "OUTAGE"
-          : (worst === 1 ? "DEGRADED" : "OPERATIONAL");
-      }
+      updateOverallLamp();
     }
   }
 
@@ -1163,6 +1170,7 @@
       .then(function (d) {
         var prev = newsData && newsData.as_of;
         newsData = d;
+        if ((location.hash || "").slice(1) === "network") { renderSigAll(); }
         if (newsHost && (force || !prev || !d || prev !== d.as_of)) {
           renderNews();
         } else if (newsHost && d && d.as_of) {
