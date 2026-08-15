@@ -1617,9 +1617,13 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
                 head_only, cache_control="no-cache")
             return
         identity_bytes = ("static:%d:%d:%d:" % identity).encode("ascii")
+        # no-cache (not no-store): the browser must revalidate every
+        # request, and the strong ETag turns unchanged files into cheap
+        # 304s. A max-age here made every design iteration serve stale
+        # HTML/JS for up to 60s, which repeatedly misled live review.
         self._send(
             200, content_type, body, head_only,
-            cache_control="max-age=60", etag_prefix=identity_bytes,
+            cache_control="no-cache", etag_prefix=identity_bytes,
             last_modified=(formatdate(modified, usegmt=True), modified))
 
     def do_GET(self):

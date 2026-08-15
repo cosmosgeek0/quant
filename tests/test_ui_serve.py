@@ -259,7 +259,7 @@ class TestBackendHardening(ServerHarness):
             static_headers["ETag"],
             '"%s"' % hashlib.sha256(
                 static_prefix + static_body).hexdigest())
-        self.assertEqual(static_headers["Cache-Control"], "max-age=60")
+        self.assertEqual(static_headers["Cache-Control"], "no-cache")
         self.assertIn("Last-Modified", static_headers)
         for conditional in (
                 {"If-None-Match": static_headers["ETag"]},
@@ -269,7 +269,7 @@ class TestBackendHardening(ServerHarness):
             self.assertEqual(status, 304)
             self.assertEqual(body, b"")
             self.assertEqual(headers["ETag"], static_headers["ETag"])
-            self.assertEqual(headers["Cache-Control"], "max-age=60")
+            self.assertEqual(headers["Cache-Control"], "no-cache")
             self.assertEqual(
                 headers["Last-Modified"], static_headers["Last-Modified"])
             self.assertNotIn("Content-Encoding", headers)

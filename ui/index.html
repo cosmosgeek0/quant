@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
 <style>
-  /* Quant owner shell v2 — owner rejections executed:
-     no topbar, no stacked full-width rules, no status chips.
-     One vertical hairline (rail edge). Everything else floats on white.
-     Rail: mark on top, five thin icons with air below it. */
+  /* Quant owner shell v4 — Dune-grade interactivity on the approved
+     structure: collapsed icon rail by default; the mark itself expands
+     it; an arrow-to-line button (top-right, expanded only) collapses;
+     cmd/ctrl+\ toggles; floating tooltips; every control reacts. */
   @font-face {
     font-family: "InterVariable";
     src: url("fonts/InterVariable.woff2") format("woff2");
@@ -21,8 +21,10 @@
     --muted: #5d5d5d;
     --faint: #b9bbc0;
     --line: rgba(13, 13, 13, 0.07);
+    --line-2: rgba(13, 13, 13, 0.12);
     --pill: #ededed;
     --hover: #f5f5f5;
+    --t: 130ms cubic-bezier(0.2, 0, 0, 1);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #fff; height: 100%; }
@@ -32,81 +34,169 @@
     font-feature-settings: "tnum" 1, "lnum" 1;
   }
   :focus-visible { outline: 2px solid #2557d6; outline-offset: 1px; border-radius: 6px; }
+  button { font: inherit; }
 
   .frame { display: flex; min-height: 100vh; }
 
-  /* the one line on the page: the rail's right edge */
-  .rail {
-    width: 64px;
+  .side {
     flex: none;
     border-right: 1px solid var(--line);
     display: flex;
     flex-direction: column;
-    align-items: center;
-    padding: 18px 0 16px;
+    padding: 14px 0 16px;
+    width: 64px;
+    transition: width 200ms cubic-bezier(0.2, 0, 0, 1);
   }
-  .rail .mark { display: block; height: 32px; width: auto; margin-bottom: 30px; }
-  .rail nav { display: flex; flex-direction: column; gap: 12px; }
-  .nav-ic {
-    width: 40px; height: 40px;
+
+  .side-top { display: flex; align-items: center; justify-content: center; min-height: 40px; }
+  .brand-btn {
+    display: flex; align-items: center; gap: 10px;
+    background: none; border: 0; padding: 4px;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background var(--t), transform var(--t);
+  }
+  .side[data-state="collapsed"] .brand-btn:hover { background: var(--hover); transform: scale(1.04); }
+  .side[data-state="collapsed"] .brand-btn:active { transform: scale(0.97); }
+  .brand-btn .mark { display: block; height: 32px; width: auto; }
+  .brand-btn .word { display: none; height: 14px; width: auto; }
+
+  .side-collapse {
+    display: none;
+    width: 32px; height: 32px;
+    align-items: center; justify-content: center;
+    background: none; border: 0; padding: 0;
+    border-radius: 8px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background var(--t), color var(--t), transform var(--t);
+  }
+  .side-collapse:hover { background: var(--hover); color: var(--ink); }
+  .side-collapse:active { transform: scale(0.94); }
+  .side-collapse svg { width: 17px; height: 17px; stroke-width: 1.5; }
+
+  .side[data-state="expanded"] { width: 224px; }
+  .side[data-state="expanded"] .side-top {
+    justify-content: flex-start;
+    padding: 0 10px 0 14px;
+  }
+  .side[data-state="expanded"] .brand-btn { cursor: default; flex: 1; }
+  .side[data-state="expanded"] .brand-btn .mark { height: 28px; }
+  .side[data-state="expanded"] .brand-btn .word { display: block; }
+  .side[data-state="expanded"] .side-collapse { display: flex; }
+
+  .side nav { display: flex; flex-direction: column; gap: 12px; margin-top: 26px; align-items: center; }
+  .nav-row {
     display: flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px;
     border-radius: 10px;
     color: var(--muted);
+    text-decoration: none;
+    transition: background var(--t), color var(--t), transform var(--t);
   }
-  a.nav-ic:hover { background: var(--hover); color: var(--ink); }
-  .nav-ic.active { background: var(--pill); color: var(--ink); }
-  .nav-ic[aria-disabled="true"] { color: var(--faint); }
-  .nav-ic svg { width: 22px; height: 22px; stroke-width: 1.5; }
+  .nav-row .nm { display: none; font-size: 13.5px; }
+  a.nav-row:hover { background: var(--hover); color: var(--ink); transform: translateX(1px); }
+  a.nav-row:active { transform: scale(0.97); }
+  .nav-row.active { background: var(--pill); color: var(--ink); }
+  .nav-row[aria-disabled="true"] { color: var(--faint); }
+  .nav-row svg { width: 22px; height: 22px; stroke-width: 1.5; flex: none; transition: transform var(--t); }
+  a.nav-row:hover svg { transform: scale(1.06); }
+
+  .side[data-state="expanded"] nav { align-items: stretch; padding: 0 12px; }
+  .side[data-state="expanded"] .nav-row {
+    width: auto;
+    justify-content: flex-start;
+    gap: 11px;
+    padding: 0 11px;
+  }
+  .side[data-state="expanded"] .nav-row .nm { display: inline; }
+  .side[data-state="expanded"] .nav-row.active .nm { font-weight: 500; }
 
   main { flex: 1; min-width: 0; }
-
-  /* floating top zone — no rule under it */
   .canvas-top {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     padding: 22px 24px 0;
   }
-  .canvas-top .word { display: block; height: 14px; width: auto; opacity: 0.92; }
   .canvas-top .clock {
-    margin-left: auto;
     font-size: 13px;
     color: var(--muted);
     font-variant-numeric: tabular-nums lining-nums;
   }
-
-  .empty {
-    padding: 46px 24px;
-    color: var(--muted);
-    font-size: 13.5px;
-  }
+  .empty { padding: 46px 24px; color: var(--muted); font-size: 13.5px; }
   .empty b { color: var(--ink); font-weight: 600; }
+
+  /* floating tooltip (single element, JS-positioned, Dune-style) */
+  #tip {
+    position: fixed;
+    z-index: 50;
+    display: flex; align-items: center; gap: 7px;
+    background: #fff;
+    border: 1px solid var(--line-2);
+    border-radius: 8px;
+    padding: 5px 9px;
+    font-size: 12.5px;
+    color: var(--ink);
+    box-shadow: 0 4px 16px rgba(13, 13, 13, 0.07);
+    pointer-events: none;
+    opacity: 0;
+    transform: translateX(-2px);
+    transition: opacity 120ms ease, transform 120ms ease;
+    white-space: nowrap;
+  }
+  #tip.on { opacity: 1; transform: translateX(0); }
+  #tip .kbd {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 17px; height: 17px;
+    padding: 0 4px;
+    border: 1px solid var(--line-2);
+    border-radius: 5px;
+    font-size: 10.5px;
+    color: var(--muted);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .side, .nav-row, .brand-btn, .side-collapse, .nav-row svg, #tip { transition: none; }
+  }
 </style>
 </head>
 <body>
 <div class="frame">
-  <div class="rail">
-    <img class="mark" src="lockup-mark.png" alt="Quant">
+  <div class="side" id="side" data-state="collapsed">
+    <div class="side-top">
+      <button class="brand-btn" id="brand-btn" aria-label="Expand sidebar" data-tip="Expand" data-kbd="1">
+        <img class="mark" src="lockup-mark.png" alt="">
+        <img class="word" src="lockup-word.png" alt="Quant">
+      </button>
+      <button class="side-collapse" id="side-collapse" aria-label="Collapse sidebar" data-tip="Collapse" data-kbd="1">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19V5"/><path d="m13 6-6 6 6 6"/><path d="M7 12h14"/></svg>
+      </button>
+    </div>
     <nav aria-label="Pages">
-      <a class="nav-ic active" href="#overview" aria-current="page" title="Overview">
+      <a class="nav-row active" href="#overview" aria-current="page" data-tip="Overview">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+        <span class="nm">Overview</span>
       </a>
-      <span class="nav-ic" aria-disabled="true" title="Basis — not built yet">
+      <span class="nav-row" aria-disabled="true" data-tip="Basis — not built yet">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="m19 8 3 8a5 5 0 0 1-6 0zV7"/><path d="M3 7h1a17 17 0 0 0 8-2 17 17 0 0 0 8 2h1"/><path d="m5 8 3 8a5 5 0 0 1-6 0zV7"/><path d="M7 21h10"/></svg>
+        <span class="nm">Basis</span>
       </span>
-      <span class="nav-ic" aria-disabled="true" title="Momentum — not built yet">
+      <span class="nav-row" aria-disabled="true" data-tip="Momentum — not built yet">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M16 7h6v6"/><path d="m22 7-8.5 8.5-5-5L2 17"/></svg>
+        <span class="nm">Momentum</span>
       </span>
-      <span class="nav-ic" aria-disabled="true" title="Machine — not built yet">
+      <span class="nav-row" aria-disabled="true" data-tip="Machine — not built yet">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>
+        <span class="nm">Machine</span>
       </span>
-      <span class="nav-ic" aria-disabled="true" title="Journal — not built yet">
+      <span class="nav-row" aria-disabled="true" data-tip="Journal — not built yet">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V7"/><path d="M16 8h-6a2 2 0 0 0 0 4h4a2 2 0 0 1 0 4H8"/><path d="M4 3a1 1 0 0 1 1-1 1.3 1.3 0 0 1 .7.2l.933.6a1.3 1.3 0 0 0 1.4 0l.934-.6a1.3 1.3 0 0 1 1.4 0l.933.6a1.3 1.3 0 0 0 1.4 0l.933-.6a1.3 1.3 0 0 1 1.4 0l.934.6a1.3 1.3 0 0 0 1.4 0l.933-.6A1.3 1.3 0 0 1 19 2a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1 1.3 1.3 0 0 1-.7-.2l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.934.6a1.3 1.3 0 0 1-1.4 0l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-1.4 0l-.934-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-.7.2 1 1 0 0 1-1-1z"/></svg>
+        <span class="nm">Journal</span>
       </span>
     </nav>
   </div>
   <main>
     <div class="canvas-top">
-      <img class="word" src="lockup-word.png" alt="Quant">
       <span class="clock" id="clock" aria-label="UTC time">—:—:— UTC</span>
     </div>
     <div class="empty">
@@ -115,6 +205,7 @@
     </div>
   </main>
 </div>
+<div id="tip" role="tooltip" aria-hidden="true"></div>
 <script src="shell.js"></script>
 </body>
 </html>
