@@ -1524,7 +1524,7 @@ def api_strip(sources, now=None):
 
 POLL_METRICS = ("server", "mirror", "market", "supervisor", "newsloop",
                 "basiswatch", "basissup", "jobrunner")
-POLL_ALLOWED = (5, 10, 15, 30, 60, 120)
+POLL_ALLOWED = (1, 2, 5, 10, 15, 30, 60, 120)
 POLL_DEFAULT = 15
 
 

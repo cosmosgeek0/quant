@@ -1481,6 +1481,8 @@ class TestPollConfigEndpoint(ServerHarness):
         self.assertFalse(payload["present"])
         self.assertEqual(payload["default_s"], 15)
         self.assertEqual(payload["metrics"]["server"], 15)
+        self.assertIn(1, payload["allowed"])
+        self.assertIn(2, payload["allowed"])
         self.assertIn(5, payload["allowed"])
 
     def test_post_roundtrip(self):
@@ -1488,14 +1490,14 @@ class TestPollConfigEndpoint(ServerHarness):
         base = self.start(self.poll_sources(root))
         status, body = self.request(
             "POST", "/api/poll_config",
-            body=json.dumps({"metrics": {"server": 5, "mirror": 60}}))
+            body=json.dumps({"metrics": {"server": 1, "mirror": 60}}))
         self.assertEqual(status, 200)
         saved = json.loads(body)["saved"]
-        self.assertEqual(saved["metrics"]["server"], 5)
+        self.assertEqual(saved["metrics"]["server"], 1)
         self.assertEqual(saved["metrics"]["mirror"], 60)
         payload = self.get_json(base, "/api/poll_config")
         self.assertTrue(payload["present"])
-        self.assertEqual(payload["metrics"]["server"], 5)
+        self.assertEqual(payload["metrics"]["server"], 1)
         self.assertEqual(payload["metrics"]["mirror"], 60)
         self.assertEqual(payload["metrics"]["market"], 15)
 

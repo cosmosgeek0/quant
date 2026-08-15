@@ -627,7 +627,8 @@
     function unitAxis(scaleName, unitText, side) {
       var axis = {
         scale: scaleName, stroke: muted, font: axisFont,
-        size: cfg.compact ? 40 : 46,
+        size: 52,
+        space: cfg.compact ? 34 : 40,
         values: function (u, splits) {
           var out = [];
           for (var j = 0; j < splits.length; j += 1) {
@@ -644,7 +645,7 @@
     }
     var axes = [
       { stroke: muted, font: axisFont, size: cfg.compact ? 26 : 30,
-        space: cfg.compact ? 96 : 110,
+        space: cfg.compact ? 88 : 78,
         grid: { show: true, stroke: line, width: 1 },
         ticks: { show: false }, border: { show: false } }
     ];
@@ -654,7 +655,7 @@
     var options = {
       width: width,
       height: height,
-      padding: [10, 8, 0, 8],
+      padding: [10, 8, 0, 0],
       legend: { show: false },
       tzDate: function (timestamp) {
         var date = new Date(timestamp * 1000);

@@ -25,7 +25,7 @@ import urllib.request
 BASE = Path(__file__).resolve().parent
 OUT_PATH = BASE / "live" / "telemetry.jsonl"
 POLL_CONFIG_PATH = BASE / "live" / "poll_config.json"
-ALLOWED_INTERVALS = (5, 10, 15, 30, 60, 120)
+ALLOWED_INTERVALS = (1, 2, 5, 10, 15, 30, 60, 120)
 DEFAULT_INTERVAL = 15
 METRIC_FIELDS = {
     "server": ("rtt_ms", "machine"),

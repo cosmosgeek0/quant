@@ -695,41 +695,9 @@
      the see-saw into its honest average staleness level; stride
      sampling (which turned 6H/24H into noise) never touches the
      display path again. */
-  function bucketAvg(ts, vs, spanSec) {
-    if (!ts.length || spanSec <= 0) { return [ts, vs]; }
-    var t0 = ts[0];
-    var buckets = [];
-    for (var i = 0; i < ts.length; i += 1) {
-      var b = Math.floor((ts[i] - t0) / spanSec);
-      if (!buckets[b]) { buckets[b] = { sum: 0, n: 0 }; }
-      if (vs[i] != null) {
-        buckets[b].sum += vs[i];
-        buckets[b].n += 1;
-      }
-    }
-    var bts = [];
-    var bvs = [];
-    for (var j = 0; j < buckets.length; j += 1) {
-      bts.push(Math.round(t0 + (j + 0.5) * spanSec));
-      var cell = buckets[j];
-      bvs.push(cell && cell.n ? cell.sum / cell.n : null);
-    }
-    return [bts, bvs];
-  }
-
   function rangeSeconds() {
     return netTelem.range === "24h" ? 86400
       : netTelem.range === "6h" ? 21600 : 3600;
-  }
-
-  function displaySeries(m, targetPoints) {
-    /* small buckets kill the wide-range aliasing; a light 3-point
-       round-off takes the razor edges. The ups and downs survive —
-       smoothing must never flatten a loop into a straight line. */
-    var sf = seriesFilled(m.field, m.key);
-    var span = Math.max(20, Math.round(rangeSeconds() / targetPoints));
-    var bucketedPair = bucketAvg(sf[0], sf[1], span);
-    return [bucketedPair[0], movAvg(bucketedPair[1], 3)];
   }
 
   var panelCharts = {};
@@ -760,6 +728,9 @@
     head.appendChild(icon);
     head.appendChild(stEl("span", "st-t-name", def.name));
     head.appendChild(stEl("span", "st-spacer"));
+    var cur = stEl("span", "st-t-datum st-val", "\u2014");
+    cur.setAttribute("data-current", def.id);
+    head.appendChild(cur);
     var up = stEl("span", "st-uptime", "\u2014");
     up.setAttribute("data-uptime", def.id);
     head.appendChild(up);
@@ -770,7 +741,9 @@
     var graph = stEl("div", "st-panel-graph");
     graph.setAttribute("data-graph", def.id);
     panel.appendChild(graph);
+
     var foot = stEl("div", "st-panel-foot");
+    foot.appendChild(stEl("span", "st-t-meta", "Poll"));
     var sel = stEl("select", "st-select");
     for (var ai = 0; ai < pollConf.allowed.length; ai += 1) {
       var o = stEl("option", "", pollConf.allowed[ai] + "s");
@@ -785,13 +758,58 @@
       var patch = { metrics: {} };
       patch.metrics[def.id] = parseInt(sel.value, 10);
       postPollConfig(patch, function (ok) {
-        if (!ok) {
-          sel.value = String(pollIntervalFor(def.id));
-        }
+        if (!ok) { sel.value = String(pollIntervalFor(def.id)); }
       });
     });
     foot.appendChild(sel);
+    var stamp = stEl("span", "st-t-meta", "");
+    stamp.setAttribute("data-sampled", def.id);
+    foot.appendChild(stamp);
     foot.appendChild(stEl("span", "st-spacer"));
+    var rfr = stEl("button", "st-ctl-btn", "Refresh");
+    rfr.setAttribute("type", "button");
+    rfr.setAttribute("title", "fetch this loop's reading now");
+    rfr.addEventListener("click", function () {
+      if (def.id === "server" || def.id === "mirror" ||
+          def.id === "market" || def.id === "supervisor") { pollStrip(); }
+      else if (def.id === "newsloop") { fetchNews(true); }
+      else { fetchNetHealth(); }
+      fetchTelemetry();
+    });
+    foot.appendChild(rfr);
+    var raw = stEl("button", "st-ctl-btn", "Raw");
+    raw.setAttribute("type", "button");
+    raw.setAttribute("title", "open the backing telemetry feed");
+    raw.addEventListener("click", function () {
+      window.open("/api/telemetry?range=" + netTelem.range, "_blank");
+    });
+    foot.appendChild(raw);
+    if (def.id !== "server") {
+      var view = stEl("button", "st-ctl-btn", "View");
+      view.setAttribute("type", "button");
+      view.setAttribute("title", "solo this loop in the master graph");
+      view.addEventListener("click", function () {
+        for (var vi = 0; vi < NET_METRICS.length; vi += 1) {
+          var mk = NET_METRICS[vi].key;
+          chipOn[mk] = mk === def.id;
+        }
+        var chipsAll = document.querySelectorAll(".st-chip");
+        for (var cq = 0; cq < chipsAll.length; cq += 1) {
+          var lbl = chipsAll[cq].textContent;
+          var on = false;
+          for (var vj = 0; vj < NET_METRICS.length; vj += 1) {
+            if (NET_METRICS[vj].label === lbl) {
+              on = chipOn[NET_METRICS[vj].key] !== false;
+            }
+          }
+          chipsAll[cq].classList.toggle("off", !on);
+        }
+        syncOverviewShow();
+        var g = document.getElementById("net-overview");
+        if (g) { g.scrollIntoView({ behavior: "smooth", block: "center" }); }
+      });
+      foot.appendChild(view);
+    }
     foot.appendChild(mkSwitch(connState[def.id] !== false, function (on) {
       connState[def.id] = on;
       if (def.id === "server") {
@@ -817,6 +835,7 @@
       var state = off ? 3
         : st.statusCls === "bad" ? 2
         : st.statusCls === "warn" ? 1 : 0;
+      panel.classList.toggle("off", off);
       var icon = panel.querySelector(".st-check");
       if (icon && icon.getAttribute("data-state") !== String(state)) {
         icon.setAttribute("data-state", String(state));
@@ -825,10 +844,33 @@
       }
       var up = panel.querySelector("[data-uptime]");
       if (up) { up.textContent = off ? "Off" : uptimeText(def.id); }
+      var curEl = panel.querySelector("[data-current]");
+      if (curEl) {
+        curEl.textContent = st.value == null ? "\u2014" : String(st.value);
+      }
+      var stampEl = panel.querySelector("[data-sampled]");
+      if (stampEl) {
+        var m2 = netMetric(def.id);
+        var age2 = null;
+        if (m2) {
+          var pts2 = telemPoints();
+          for (var pj = pts2.length - 1; pj >= 0; pj -= 1) {
+            if (telNum(pts2[pj][m2.field]) != null) {
+              var pt2 = Date.parse(pts2[pj].ts);
+              if (isFinite(pt2)) {
+                age2 = Math.max(0, Math.round(
+                  (Date.now() - pt2) / 1000));
+              }
+              break;
+            }
+          }
+        }
+        stampEl.textContent = age2 == null ? ""
+          : "sampled " + age2 + "s ago";
+      }
       var bars = panel.querySelector("[data-bars]");
       if (bars && window.QNet && QNet.bars) {
-        var fit = Math.max(12, Math.floor((bars.clientWidth + 2) / 7));
-        var samples = statusSamples(def.id, Math.min(fit, 90));
+        var samples = statusSamples(def.id, 90);
         if (samples && samples.length) {
           QNet.bars.render(bars, samples);
         } else { bars.textContent = ""; }
@@ -944,6 +986,52 @@
       }
     }
     return [ts, vs];
+  }
+
+  /* ONE shared display grid for every graph on the page: identical
+     x range, identical step, identical point count — a loop sampled
+     at 1s and a loop sampled at 30s land on the same skeleton, so
+     every chart draws the same shape of box (owner symmetry law). */
+  function displayGrid() {
+    /* second-level granularity: 720 grid points per window, floor 4s
+       (1H draws 5s steps; a 1s-polled loop shows near-raw detail) */
+    var span = Math.max(4, Math.round(rangeSeconds() / 720));
+    var t1 = Math.floor(Date.now() / 1000 / span) * span;
+    var t0 = t1 - rangeSeconds();
+    var times = [];
+    for (var t = t0; t <= t1; t += span) { times.push(t); }
+    return { span: span, times: times };
+  }
+
+  function gridSeries(m, grid) {
+    var pts = telemPoints();
+    var tol = Math.max(pollIntervalFor(m.key) * 1.6 + 10, grid.span * 1.5);
+    var isAge = m.field !== "rtt_ms";
+    var samples = [];
+    for (var i = 0; i < pts.length; i += 1) {
+      var t = Date.parse(pts[i].ts);
+      if (!isFinite(t)) { continue; }
+      var raw = telNum(pts[i][m.field]);
+      if (raw != null) { samples.push([Math.round(t / 1000), raw]); }
+    }
+    var out = [];
+    var si = 0;
+    var lastT = null;
+    var lastV = null;
+    for (var g = 0; g < grid.times.length; g += 1) {
+      var gt = grid.times[g];
+      while (si < samples.length && samples[si][0] <= gt) {
+        lastT = samples[si][0];
+        lastV = samples[si][1];
+        si += 1;
+      }
+      if (lastT == null || gt - lastT > tol) {
+        out.push(null);
+      } else {
+        out.push(isAge && gt > lastT ? lastV + (gt - lastT) : lastV);
+      }
+    }
+    return movAvg(out, 3);
   }
 
   /* cadence estimate: an age series saw a tick land wherever the value
@@ -1104,19 +1192,18 @@
       } else if (window.QNet && QNet.chart && QNet.chart.mountMulti) {
         /* overview: the seven age loops, one unit (seconds),
            smoothed for reading — RTT lives in its own panel */
-        var times = null;
+        var grid = displayGrid();
+        var times = grid.times;
         var defs = [];
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
           var m = NET_METRICS[mi];
           if (m.unit !== "s") { continue; }
-          var ds = displaySeries(m, 360);
-          if (!times) { times = ds[0]; }
           defs.push({
             label: m.label,
             unit: "s",
             color: rootCs.getPropertyValue("--st-s" + (mi + 1))
               .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-            values: ds[1]
+            values: gridSeries(m, grid)
           });
         }
         if (times && times.length >= 2) {
@@ -1135,32 +1222,32 @@
       var n = d && d.present ? (d.count || 0) : 0;
       capEl.textContent = n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples \u00b7 " +
-          netTelem.range + " window \u00b7 bucket-averaged \u00b7 UTC"
+          netTelem.range + " window \u00b7 shared grid \u00b7 UTC"
         : "History arrives from the telemetry recorder.";
     }
     /* panel graphs: each loop's own line in its own color */
     if (pts.length >= 2 && window.QNet && QNet.chart &&
         QNet.chart.mountMulti) {
+      var pgrid = displayGrid();
       for (mi = 0; mi < NET_METRICS.length; mi += 1) {
         var pm = NET_METRICS[mi];
         var pHost = document.querySelector(
           "[data-graph=\"" + pm.key + "\"]");
         if (!pHost) { continue; }
-        var psf = displaySeries(pm, 220);
         var pdef = [{
           label: pm.label,
           unit: pm.unit,
           color: rootCs.getPropertyValue("--st-s" + (mi + 1))
             .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-          values: psf[1]
+          values: gridSeries(pm, pgrid)
         }];
-        if (psf[0].length >= 2) {
+        if (pgrid.times.length >= 2) {
           if (panelCharts[pm.key]) {
-            panelCharts[pm.key].setData(psf[0], pdef);
+            panelCharts[pm.key].setData(pgrid.times, pdef);
           } else {
             pHost.textContent = "";
             panelCharts[pm.key] = QNet.chart.mountMulti(pHost, {
-              times: psf[0], series: pdef, height: 150, compact: true
+              times: pgrid.times, series: pdef, height: 150, compact: true
             });
           }
         }
@@ -1268,6 +1355,18 @@
         chips.appendChild(chip);
       })(NET_METRICS[ci2], ci2);
     }
+    var allChip = stEl("button", "st-chip st-chip-all", "All");
+    allChip.setAttribute("type", "button");
+    allChip.setAttribute("title", "show every loop");
+    allChip.addEventListener("click", function () {
+      chipOn = {};
+      var cs2 = chips.querySelectorAll(".st-chip");
+      for (var az = 0; az < cs2.length; az += 1) {
+        cs2[az].classList.remove("off");
+      }
+      syncOverviewShow();
+    });
+    chips.appendChild(allChip);
     graphCard.appendChild(chips);
     var gHost = stEl("div", "st-graph-host");
     gHost.id = "net-overview";
@@ -1364,10 +1463,19 @@
 
     container.appendChild(page);
     fetchPollConfig(function () {
+      /* the allowed list and current values arrive after build —
+         rebuild every select's options from the live config */
       var sels = page.querySelectorAll("[data-poll]");
       for (var pi = 0; pi < sels.length; pi += 1) {
-        sels[pi].value = String(
-          pollIntervalFor(sels[pi].getAttribute("data-poll")));
+        var key2 = sels[pi].getAttribute("data-poll");
+        sels[pi].textContent = "";
+        for (var oi = 0; oi < pollConf.allowed.length; oi += 1) {
+          var opt2 = document.createElement("option");
+          opt2.textContent = pollConf.allowed[oi] + "s";
+          opt2.value = String(pollConf.allowed[oi]);
+          sels[pi].appendChild(opt2);
+        }
+        sels[pi].value = String(pollIntervalFor(key2));
       }
     });
     renderSigAll();

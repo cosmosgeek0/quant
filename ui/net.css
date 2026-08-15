@@ -241,13 +241,20 @@ html[data-theme="dark"] {
   padding: 12px 16px 8px;
 }
 .st-panel-head .st-spacer { flex: 1; }
-.st-panel .st-bars { margin: 0 16px; }
+/* identical value slots in every panel: current right-aligned at a
+   fixed width, uptime right-aligned at a fixed width — numbers land
+   in the same place in all eight boxes */
+.st-val { min-width: 76px; text-align: right; }
+.st-panel-head .st-uptime { min-width: 104px; text-align: right; }
+.st-panel .st-bars { margin: 2px 16px 0; }
 .st-panel-graph { padding: 4px 8px 0 8px; position: relative; }
 .st-panel-foot {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 16px 12px;
+  border-top: 1px solid var(--st-divider);
 }
 .st-panel-foot .st-spacer { flex: 1; }
+.st-panel-foot .st-t-meta { white-space: nowrap; }
 .st-bottom {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
@@ -275,6 +282,9 @@ html[data-theme="dark"] {
 }
 .st-chip.off { color: var(--st-faint); }
 .st-chip.off .st-chip-key { opacity: 0.25; }
+.st-chip-all { color: var(--st-mid); font-weight: 500; }
+.st-panel.off { opacity: 0.55; }
+.st-panel.off .st-panel-graph { filter: grayscale(1); }
 .st-graph-host { padding: 2px 8px 0 8px; position: relative; }
 .st-graph-tip {
   position: absolute; z-index: 5; pointer-events: none;
