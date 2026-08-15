@@ -17,7 +17,7 @@ import sys
 import zipfile
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -45,7 +45,12 @@ MILLISECONDS_PER_DAY = 86_400_000
 SYMBOL_FROM_NAME = re.compile(
     r"^(?P<symbol>.+?)-1m(?:-|\.)", re.IGNORECASE
 )
+AGG_TRADES_FROM_NAME = re.compile(
+    r"^(?P<symbol>.+?)-aggTrades-"
+    r"(?P<day>\d{4}-\d{2}-\d{2})\.zip$"
+)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+EPOCH_DATE = date(1970, 1, 1)
 
 
 class BaselineError(Exception):
@@ -62,6 +67,22 @@ class TapeBar:
     low: Decimal
     close: Decimal
     quote_volume: Decimal
+
+
+@dataclass(frozen=True)
+class TapeTrade:
+    symbol: str
+    aggregate_id: int
+    timestamp_ms: int
+    price: Decimal
+    quantity: Decimal
+    buyer_is_maker: bool
+
+    @property
+    def quote_size(self) -> Decimal:
+        with localcontext() as context:
+            context.prec = 50
+            return self.price * self.quantity
 
 
 def decimal_text(value: Decimal) -> str:
@@ -101,6 +122,25 @@ def _timestamp_ms(raw: Any, source: str) -> int:
     return value
 
 
+def _integer(raw: Any, source: str, *, non_negative: bool) -> int:
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise BaselineError(f"{source} is not an integer") from None
+    if non_negative and value < 0:
+        raise BaselineError(f"{source} is negative")
+    return value
+
+
+def _boolean(raw: Any, source: str) -> bool:
+    normalized = str(raw).strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise BaselineError(f"{source} is not true or false")
+
+
 def utc_text(epoch_ms: int) -> str:
     value = EPOCH + timedelta(milliseconds=epoch_ms)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -116,6 +156,37 @@ def _symbol_from_name(name: str) -> Optional[str]:
         )
     except _SymbolValidationError:
         return None
+
+
+def _agg_trade_name_parts(name: str) -> Optional[Tuple[str, str]]:
+    match = AGG_TRADES_FROM_NAME.fullmatch(name)
+    if match is None:
+        return None
+    candidate = match.group("symbol")
+    try:
+        symbol = validate_symbol(candidate, f"{name} symbol")
+    except _SymbolValidationError:
+        return None
+    if symbol != candidate:
+        return None
+    raw_day = match.group("day")
+    try:
+        parsed_day = date.fromisoformat(raw_day)
+    except ValueError:
+        return None
+    if parsed_day.isoformat() != raw_day:
+        return None
+    return symbol, raw_day
+
+
+def _day_start_ms(raw_day: str) -> int:
+    try:
+        parsed = date.fromisoformat(raw_day)
+    except ValueError:
+        raise BaselineError(f"invalid aggTrades UTC day {raw_day}") from None
+    if parsed.isoformat() != raw_day:
+        raise BaselineError(f"invalid aggTrades UTC day {raw_day}")
+    return (parsed - EPOCH_DATE).days * MILLISECONDS_PER_DAY
 
 
 def _rows_from_member(
@@ -218,6 +289,135 @@ def _read_archive(path: Path) -> Iterable[TapeBar]:
                     )
     except (OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
         raise BaselineError(f"cannot read {path.name}: {error}") from None
+
+
+def _agg_trade_rows(
+    archive: Path,
+    handle: Iterable[str],
+    member_name: str,
+    symbol: str,
+    raw_day: str,
+) -> Iterable[TapeTrade]:
+    source = f"{archive.name}:{member_name}"
+    day_start = _day_start_ms(raw_day)
+    day_end = day_start + MILLISECONDS_PER_DAY
+    try:
+        rows = csv.reader(handle)
+        found = False
+        for line_number, row in enumerate(rows, start=1):
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            first = row[0].strip().lower().replace(" ", "_")
+            if line_number == 1 and first in {
+                "agg_trade_id",
+                "aggregate_trade_id",
+                "aggtradeid",
+            }:
+                continue
+            if len(row) < 7:
+                raise BaselineError(
+                    f"{source}:{line_number} has fewer than seven "
+                    "aggTrades columns"
+                )
+            line_source = f"{source}:{line_number}"
+            aggregate_id = _integer(
+                row[0], f"{line_source} aggregate id", non_negative=True
+            )
+            price = _decimal(
+                row[1], f"{line_source} price", positive=True
+            )
+            quantity = _decimal(
+                row[2], f"{line_source} quantity", positive=True
+            )
+            first_trade_id = _integer(
+                row[3],
+                f"{line_source} first trade id",
+                non_negative=True,
+            )
+            last_trade_id = _integer(
+                row[4],
+                f"{line_source} last trade id",
+                non_negative=True,
+            )
+            if last_trade_id < first_trade_id:
+                raise BaselineError(
+                    f"{line_source} has reversed trade ids"
+                )
+            timestamp_ms = _timestamp_ms(
+                row[5], f"{line_source} transact time"
+            )
+            if not day_start <= timestamp_ms < day_end:
+                raise BaselineError(
+                    f"{line_source} is outside its named UTC day"
+                )
+            buyer_is_maker = _boolean(
+                row[6], f"{line_source} buyer-is-maker"
+            )
+            found = True
+            yield TapeTrade(
+                symbol=symbol,
+                aggregate_id=aggregate_id,
+                timestamp_ms=timestamp_ms,
+                price=price,
+                quantity=quantity,
+                buyer_is_maker=buyer_is_maker,
+            )
+        if not found:
+            raise BaselineError(f"{source} has no aggTrades rows")
+    except csv.Error as error:
+        raise BaselineError(f"{source} has invalid CSV: {error}") from None
+
+
+def _read_agg_trade_archive(
+    path: Path, symbol: str, raw_day: str
+) -> Tuple[TapeTrade, ...]:
+    expected = path.stem + ".csv"
+    try:
+        with zipfile.ZipFile(path) as zipped:
+            members = [
+                member
+                for member in zipped.infolist()
+                if not member.is_dir()
+            ]
+            if len(members) != 1 or members[0].filename != expected:
+                raise BaselineError(
+                    f"{path.name} does not contain only {expected}"
+                )
+            member = members[0]
+            if member.flag_bits & 0x1:
+                raise BaselineError(
+                    f"{path.name}:{member.filename} is encrypted"
+                )
+            with zipped.open(member, "r") as raw:
+                text = (line.decode("utf-8-sig") for line in raw)
+                rows = tuple(
+                    _agg_trade_rows(
+                        path, text, member.filename, symbol, raw_day
+                    )
+                )
+    except (OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+        raise BaselineError(f"cannot read {path.name}: {error}") from None
+
+    by_id: Dict[int, TapeTrade] = {}
+    for trade in rows:
+        existing = by_id.get(trade.aggregate_id)
+        if existing is not None and existing != trade:
+            raise BaselineError(
+                f"conflicting duplicate {symbol} aggTrade "
+                f"{trade.aggregate_id}"
+            )
+        by_id[trade.aggregate_id] = trade
+    ordered = tuple(
+        sorted(
+            by_id.values(),
+            key=lambda trade: (trade.timestamp_ms, trade.aggregate_id),
+        )
+    )
+    if len(ordered) != len(rows):
+        raise BaselineError(
+            f"{path.name} has duplicate aggTrade identifiers"
+        )
+    return ordered
 
 
 def _normalized_symbols(
@@ -570,16 +770,153 @@ def _absorption_symbol_baseline(
     }
 
 
+def _taker_quote_totals(
+    trades: Sequence[TapeTrade],
+) -> Tuple[Decimal, Decimal]:
+    buy_quote = Decimal("0")
+    sell_quote = Decimal("0")
+    with localcontext() as context:
+        context.prec = 50
+        for trade in trades:
+            if trade.buyer_is_maker:
+                sell_quote += trade.quote_size
+            else:
+                buy_quote += trade.quote_size
+    return buy_quote, sell_quote
+
+
+def _taker_imbalance(trades: Sequence[TapeTrade]) -> Optional[Decimal]:
+    buy_quote, sell_quote = _taker_quote_totals(trades)
+    total = buy_quote + sell_quote
+    if total <= 0:
+        return None
+    with localcontext() as context:
+        context.prec = 50
+        return (buy_quote - sell_quote) / total
+
+
+def _absorption_tape_baseline(
+    complete_days: Sequence[Tuple[str, Sequence[TapeTrade]]],
+    window_minutes: int,
+) -> Dict[str, Any]:
+    days = tuple(
+        (raw_day, tuple(day_trades))
+        for raw_day, day_trades in complete_days
+    )
+    trades = tuple(
+        trade for _raw_day, day_trades in days for trade in day_trades
+    )
+    if not trades:
+        raise BaselineError(
+            "cannot derive an absorption tape baseline from no trades"
+        )
+    symbol = trades[0].symbol
+    if any(trade.symbol != symbol for trade in trades):
+        raise BaselineError("aggTrades days contain another symbol")
+
+    window_imbalances: List[Decimal] = []
+    window_size_medians: List[Decimal] = []
+    window_size_p90s: List[Decimal] = []
+    windows_per_day = MINUTES_PER_DAY // window_minutes
+    window_ms = window_minutes * MILLISECONDS_PER_MINUTE
+    for raw_day, day_trades in days:
+        day_start = _day_start_ms(raw_day)
+        if any(
+            not day_start
+            <= trade.timestamp_ms
+            < day_start + MILLISECONDS_PER_DAY
+            for trade in day_trades
+        ):
+            raise BaselineError(
+                f"{symbol} aggTrades are outside their named UTC day"
+            )
+        if any(
+            (current.timestamp_ms, current.aggregate_id)
+            <= (previous.timestamp_ms, previous.aggregate_id)
+            for previous, current in zip(day_trades, day_trades[1:])
+        ):
+            raise BaselineError(
+                f"{symbol} aggTrades are not strictly ordered"
+            )
+        buckets: List[List[TapeTrade]] = [
+            [] for _index in range(windows_per_day)
+        ]
+        for trade in day_trades:
+            bucket = (trade.timestamp_ms - day_start) // window_ms
+            if bucket < windows_per_day:
+                buckets[bucket].append(trade)
+        for window_trades in buckets:
+            if not window_trades:
+                continue
+            imbalance = _taker_imbalance(window_trades)
+            sizes = [trade.quote_size for trade in window_trades]
+            median_size = quantile(sizes, 1, 2)
+            p90_size = quantile(sizes, 9, 10)
+            if (
+                imbalance is None
+                or median_size is None
+                or p90_size is None
+            ):
+                raise BaselineError(
+                    f"{symbol} has an unproved aggTrades window"
+                )
+            window_imbalances.append(imbalance)
+            window_size_medians.append(median_size)
+            window_size_p90s.append(p90_size)
+
+    if not window_imbalances:
+        raise BaselineError("complete aggTrades days have no comparable windows")
+    baseline_imbalance = _taker_imbalance(trades)
+    sizes = [trade.quote_size for trade in trades]
+    baseline_size_median = quantile(sizes, 1, 2)
+    baseline_size_p90 = quantile(sizes, 9, 10)
+    if (
+        baseline_imbalance is None
+        or baseline_size_median is None
+        or baseline_size_p90 is None
+    ):
+        raise BaselineError("complete aggTrades days have no tape baseline")
+    return {
+        "status": "READY",
+        "day_count": len(days),
+        "days_used": [raw_day for raw_day, _day_trades in days],
+        "trade_count": len(trades),
+        "first_timestamp_ms": trades[0].timestamp_ms,
+        "last_timestamp_ms": trades[-1].timestamp_ms,
+        "window_expected_count": len(days) * windows_per_day,
+        "window_sample_count": len(window_imbalances),
+        "baseline_taker_imbalance": decimal_text(baseline_imbalance),
+        "window_taker_imbalance_samples": [
+            decimal_text(value) for value in sorted(window_imbalances)
+        ],
+        "baseline_trade_size_median_quote": decimal_text(
+            baseline_size_median
+        ),
+        "baseline_trade_size_p90_quote": decimal_text(baseline_size_p90),
+        "window_trade_size_median_quote_samples": [
+            decimal_text(value) for value in sorted(window_size_medians)
+        ],
+        "window_trade_size_p90_quote_samples": [
+            decimal_text(value) for value in sorted(window_size_p90s)
+        ],
+    }
+
+
 def derive_absorption_baselines(
     tape: Mapping[str, Sequence[TapeBar]],
     requested_symbols: Sequence[str],
     *,
     window_minutes: int = DEFAULT_ABSORPTION_WINDOW_MINUTES,
     minimum_days: int = DEFAULT_ABSORPTION_MIN_DAYS,
+    minimum_tape_days: Optional[int] = None,
     source_data_dir: Optional[str] = None,
     load_errors: Optional[Mapping[str, str]] = None,
+    trade_days: Optional[
+        Mapping[str, Mapping[str, Sequence[TapeTrade]]]
+    ] = None,
+    trade_load_errors: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Build compact kline baselines and explicit readiness coverage."""
+    """Build compact kline and tape baselines with component readiness."""
     if (
         isinstance(window_minutes, bool)
         or not isinstance(window_minutes, int)
@@ -596,12 +933,24 @@ def derive_absorption_baselines(
         raise BaselineError(
             f"minimum days must be in [1, {MAX_ABSORPTION_DAYS}]"
         )
+    if minimum_tape_days is None:
+        minimum_tape_days = minimum_days
+    if (
+        isinstance(minimum_tape_days, bool)
+        or not isinstance(minimum_tape_days, int)
+        or not 1 <= minimum_tape_days <= MAX_ABSORPTION_DAYS
+    ):
+        raise BaselineError(
+            f"minimum tape days must be in [1, {MAX_ABSORPTION_DAYS}]"
+        )
     normalized = _normalized_symbols(requested_symbols)
     if normalized is None:
         raise BaselineError("absorption baseline requires a symbol list")
 
     ready: Dict[str, Any] = {}
     not_ready: Dict[str, Any] = {}
+    tape_ready_count = 0
+    tape_not_ready_reasons: Dict[str, int] = {}
     used_days = set()
     for symbol in sorted(normalized):
         load_reason = None if load_errors is None else load_errors.get(symbol)
@@ -639,16 +988,95 @@ def derive_absorption_baselines(
         profile = _absorption_symbol_baseline(
             complete_days, window_minutes
         )
+        profile["components"] = {
+            "kline": {
+                "status": "READY",
+                "day_count": len(complete_days),
+                "required_days": minimum_days,
+            }
+        }
+        loaded_trade_days = (
+            {}
+            if trade_days is None
+            else dict(trade_days.get(symbol, {}))
+        )
+        trade_load_reason = (
+            None
+            if trade_load_errors is None
+            else trade_load_errors.get(symbol)
+        )
+        tape_profile: Dict[str, Any]
+        if trade_load_reason is not None:
+            tape_profile = {
+                "status": "NOT-READY",
+                "days_found": 0,
+                "required_days": minimum_tape_days,
+                "reason": trade_load_reason,
+            }
+        elif not loaded_trade_days:
+            tape_profile = {
+                "status": "NOT-READY",
+                "days_found": 0,
+                "required_days": minimum_tape_days,
+                "reason": "no_agg_trades_archives",
+            }
+        else:
+            aligned_trade_days = tuple(
+                (raw_day, loaded_trade_days[raw_day])
+                for raw_day, _day_bars in complete_days
+                if raw_day in loaded_trade_days
+            )
+            if len(aligned_trade_days) < minimum_tape_days:
+                tape_profile = {
+                    "status": "NOT-READY",
+                    "days_found": len(aligned_trade_days),
+                    "archive_days_found": len(loaded_trade_days),
+                    "required_days": minimum_tape_days,
+                    "reason": "insufficient_aligned_complete_days",
+                }
+            else:
+                try:
+                    tape_profile = _absorption_tape_baseline(
+                        aligned_trade_days, window_minutes
+                    )
+                except BaselineError:
+                    tape_profile = {
+                        "status": "NOT-READY",
+                        "days_found": len(aligned_trade_days),
+                        "archive_days_found": len(loaded_trade_days),
+                        "required_days": minimum_tape_days,
+                        "reason": "no_comparable_trade_windows",
+                    }
+                else:
+                    tape_profile["required_days"] = minimum_tape_days
+                    tape_ready_count += 1
+        profile["components"]["tape"] = tape_profile
+        if tape_profile["status"] == "NOT-READY":
+            reason = str(tape_profile["reason"])
+            tape_not_ready_reasons[reason] = (
+                tape_not_ready_reasons.get(reason, 0) + 1
+            )
         ready[symbol] = profile
         used_days.update(profile["days_used"])
     return {
         "schema": ABSORPTION_BASELINE_SCHEMA,
-        "source": {"data_dir": source_data_dir, "tape": "spot_1m_klines"},
+        "source": {
+            "data_dir": source_data_dir,
+            "tape": "spot_1m_klines",
+            "agg_trades": "spot_daily_aggTrades",
+        },
         "window_minutes": window_minutes,
         "minimum_days": minimum_days,
+        "minimum_tape_days": minimum_tape_days,
         "requested_symbol_count": len(normalized),
         "symbol_count": len(ready),
         "not_ready_count": len(not_ready),
+        "tape_symbol_count": tape_ready_count,
+        "tape_not_ready_count": len(ready) - tape_ready_count,
+        "tape_not_ready_reasons": {
+            reason: tape_not_ready_reasons[reason]
+            for reason in sorted(tape_not_ready_reasons)
+        },
         "tape_days": len(used_days),
         "symbols": ready,
         "not_ready": not_ready,
@@ -735,6 +1163,50 @@ def _load_absorption_tape(
     return tape, load_errors
 
 
+def _load_absorption_trade_days(
+    root: Path, requested: Sequence[str]
+) -> Tuple[
+    Dict[str, Dict[str, Tuple[TapeTrade, ...]]], Dict[str, str]
+]:
+    selected = set(requested)
+    by_symbol: Dict[str, List[Tuple[Path, str]]] = {
+        symbol: [] for symbol in requested
+    }
+    for path in root.rglob("*.zip"):
+        if not path.is_file():
+            continue
+        parts = _agg_trade_name_parts(path.name)
+        if parts is None:
+            continue
+        symbol, raw_day = parts
+        if symbol in selected:
+            by_symbol[symbol].append((path, raw_day))
+
+    loaded: Dict[str, Dict[str, Tuple[TapeTrade, ...]]] = {}
+    load_errors: Dict[str, str] = {}
+    for symbol in sorted(requested):
+        archives = sorted(by_symbol[symbol])
+        if not archives:
+            continue
+        try:
+            days: Dict[str, Tuple[TapeTrade, ...]] = {}
+            for archive, raw_day in archives:
+                if raw_day in days:
+                    raise BaselineError(
+                        f"{symbol} has more than one aggTrades archive "
+                        f"for {raw_day}"
+                    )
+                days[raw_day] = _read_agg_trade_archive(
+                    archive, symbol, raw_day
+                )
+            loaded[symbol] = {
+                raw_day: days[raw_day] for raw_day in sorted(days)
+            }
+        except BaselineError:
+            load_errors[symbol] = "invalid_agg_trades_archives"
+    return loaded, load_errors
+
+
 def run_absorption_baselines(
     data_dir: Path,
     output_path: Path,
@@ -742,8 +1214,9 @@ def run_absorption_baselines(
     symbols: Optional[Sequence[str]] = None,
     window_minutes: int = DEFAULT_ABSORPTION_WINDOW_MINUTES,
     minimum_days: int = DEFAULT_ABSORPTION_MIN_DAYS,
+    minimum_tape_days: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Build one absorption baseline file from measured spot kline days."""
+    """Build one absorption baseline from measured spot kline and tape days."""
     source = Path(data_dir).resolve()
     if not source.is_dir():
         raise BaselineError(f"data directory does not exist: {source}")
@@ -766,6 +1239,9 @@ def run_absorption_baselines(
                 f"data directory has no 1m kline zips: {tape_root}"
             )
     tape, load_errors = _load_absorption_tape(tape_root, requested)
+    trade_days, trade_load_errors = _load_absorption_trade_days(
+        tape_root, requested
+    )
     target = Path(output_path)
     try:
         relative_source = os.path.relpath(source, target.parent.resolve())
@@ -777,8 +1253,11 @@ def run_absorption_baselines(
         requested,
         window_minutes=window_minutes,
         minimum_days=minimum_days,
+        minimum_tape_days=minimum_tape_days,
         source_data_dir=relative_source,
         load_errors=load_errors,
+        trade_days=trade_days,
+        trade_load_errors=trade_load_errors,
     )
     _write_json(target, payload)
     return payload
@@ -828,6 +1307,13 @@ def argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ABSORPTION_MIN_DAYS,
         help="minimum complete UTC kline days per symbol (default: 21)",
     )
+    parser.add_argument(
+        "--min-tape-days",
+        type=lambda raw: _bounded_positive(
+            raw, "min-tape-days", MAX_ABSORPTION_DAYS
+        ),
+        help="minimum aligned UTC aggTrades days (default: --min-days)",
+    )
     return parser
 
 
@@ -841,6 +1327,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 symbols=args.symbols,
                 window_minutes=args.window,
                 minimum_days=args.min_days,
+                minimum_tape_days=args.min_tape_days,
             )
         else:
             if args.symbols is not None:
@@ -851,10 +1338,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if args.absorption:
         for symbol, profile in sorted(payload["symbols"].items()):
+            tape = profile["components"]["tape"]
+            tape_days = tape.get("day_count", tape.get("days_found", 0))
+            tape_reason = (
+                ""
+                if tape["status"] == "READY"
+                else f" | tape_reason={tape['reason']}"
+            )
             print(
                 "BASELINES | "
-                f"symbol={symbol} | status=READY | "
-                f"days_used={profile['day_count']}"
+                f"symbol={symbol} | kline=READY | "
+                f"kline_days={profile['day_count']} | "
+                f"tape={tape['status']} | tape_days={tape_days}"
+                f"{tape_reason}"
             )
         for symbol, coverage in sorted(payload["not_ready"].items()):
             print(
@@ -865,8 +1361,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         print(
             "BASELINES | "
-            f"built={payload['symbol_count']} | "
-            f"skipped={payload['not_ready_count']} | output={args.output}"
+            f"kline_built={payload['symbol_count']} | "
+            f"kline_skipped={payload['not_ready_count']} | "
+            f"tape_built={payload['tape_symbol_count']} | "
+            f"tape_skipped={payload['tape_not_ready_count']} | "
+            f"output={args.output}"
         )
         return 0
     print(

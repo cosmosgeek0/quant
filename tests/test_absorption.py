@@ -87,6 +87,47 @@ def accumulation_fixture():
     return baseline_bars, window_bars, baseline_trades, window_trades
 
 
+def historical_baseline(tape):
+    return absorption.HistoricalKlineBaseline(
+        symbol=SYMBOL,
+        window_minutes=4,
+        day_count=21,
+        bar_count=30_240,
+        first_open_ms=BASE_MS - 21 * 86_400_000,
+        last_close_ms=BASE_MS - 1,
+        historical_low=Decimal("99"),
+        historical_high=Decimal("120"),
+        close_q20=Decimal("101"),
+        window_range_samples_pct=(Decimal("1"), Decimal("2")),
+        window_quote_volume_samples=(Decimal("100"), Decimal("200")),
+        tape=tape,
+    )
+
+
+def historical_tape_baseline():
+    return absorption.HistoricalTapeBaseline(
+        day_count=7,
+        trade_count=28,
+        first_timestamp_ms=BASE_MS - 7 * 86_400_000,
+        last_timestamp_ms=BASE_MS - 1,
+        baseline_taker_imbalance=Decimal("-0.25"),
+        window_taker_imbalance_samples=(
+            Decimal("-0.5"),
+            Decimal("0"),
+        ),
+        baseline_trade_size_median_quote=Decimal("10"),
+        baseline_trade_size_p90_quote=Decimal("10"),
+        window_trade_size_median_quote_samples=(
+            Decimal("10"),
+            Decimal("10"),
+        ),
+        window_trade_size_p90_quote_samples=(
+            Decimal("10"),
+            Decimal("10"),
+        ),
+    )
+
+
 def no_float(test, value):
     test.assertNotIsInstance(value, float)
     if isinstance(value, dict):
@@ -319,6 +360,64 @@ class AbsorptionTests(unittest.TestCase):
         self.assertTrue(row["features"]["pumping"])
         self.assertFalse(row["features"]["at_multiweek_lows"])
 
+    def test_historical_tape_baseline_computes_existing_score(self):
+        _baseline_bars, window_bars, _baseline_trades, window_trades = (
+            accumulation_fixture()
+        )
+        row = absorption.score_absorption_window(
+            SYMBOL,
+            (),
+            window_bars,
+            (),
+            window_trades,
+            historical_baseline=historical_baseline(
+                historical_tape_baseline()
+            ),
+        )
+
+        self.assertGreater(Decimal(row["absorption_score"]), Decimal("0"))
+        self.assertEqual(row["unknown_features"], [])
+        self.assertEqual(row["baseline_tape_days"], 7)
+        self.assertEqual(
+            row["features"]["baseline_taker_imbalance"], "-0.25"
+        )
+        self.assertEqual(
+            row["features"]["baseline_trade_size_median_quote"], "10"
+        )
+        self.assertEqual(
+            row["features"]["baseline_trade_size_p90_quote"], "10"
+        )
+        no_float(self, row)
+
+    def test_historical_baseline_without_tape_stays_fail_closed(self):
+        _baseline_bars, window_bars, _baseline_trades, window_trades = (
+            accumulation_fixture()
+        )
+        row = absorption.score_absorption_window(
+            SYMBOL,
+            (),
+            window_bars,
+            (),
+            window_trades,
+            historical_baseline=historical_baseline(None),
+        )
+
+        self.assertEqual(row["absorption_score"], "0")
+        self.assertEqual(
+            row["unknown_features"],
+            ["taker_imbalance_shift", "trade_size_shift"],
+        )
+        self.assertIsNone(row["baseline_tape_days"])
+        self.assertIsNone(
+            row["features"]["baseline_taker_imbalance"]
+        )
+        self.assertIsNone(
+            row["features"]["baseline_trade_size_median_quote"]
+        )
+        self.assertIsNone(
+            row["features"]["baseline_trade_size_p90_quote"]
+        )
+
     def test_zip_tape_emits_jsonl_with_all_forward_horizons(self):
         baseline_bars, window_bars, baseline_trades, window_trades = (
             accumulation_fixture()
@@ -363,7 +462,7 @@ class AbsorptionTests(unittest.TestCase):
         no_float(self, disk)
 
     def test_built_baseline_allows_a_short_tape_to_be_evaluated(self):
-        write_complete_absorption_tape(self.root)
+        _bars, tape_trades = write_complete_absorption_tape(self.root)
         baseline_path = self.root / "out" / "historical-baseline.json"
         baselines.run_absorption_baselines(
             self.root,
@@ -390,7 +489,12 @@ class AbsorptionTests(unittest.TestCase):
         self.assertIsNotNone(
             rows[0]["features"]["baseline_window_volume_floor"]
         )
-        self.assertIn("trade_size_shift", rows[0]["unknown_features"])
+        self.assertEqual(rows[0]["unknown_features"], [])
+        self.assertEqual(rows[0]["baseline_tape_days"], 1)
+        self.assertEqual(
+            Decimal(rows[0]["features"]["baseline_taker_imbalance"]),
+            absorption.taker_imbalance(tape_trades),
+        )
         self.assertTrue(output.is_file())
         no_float(self, rows)
 

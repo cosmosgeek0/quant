@@ -74,6 +74,47 @@ def write_complete_tape(root):
     return data_dir
 
 
+def agg_trade_row(aggregate_id, minute, quote_size, buyer_is_maker):
+    quote_size = Decimal(str(quote_size))
+    timestamp_ms = BASE_MS + minute * 60_000 + aggregate_id
+    return ",".join(
+        (
+            str(aggregate_id),
+            "100",
+            baselines.decimal_text(quote_size / Decimal("100")),
+            str(aggregate_id),
+            str(aggregate_id),
+            str(timestamp_ms),
+            "true" if buyer_is_maker else "false",
+            "true",
+        )
+    )
+
+
+def write_complete_agg_trades(data_dir):
+    archive_dir = (
+        data_dir / "spot" / "daily" / "aggTrades" / SYMBOL
+    )
+    archive_dir.mkdir(parents=True)
+    rows = []
+    aggregate_id = 1
+    for hour in range(24):
+        rows.append(agg_trade_row(aggregate_id, hour * 60, "3", False))
+        aggregate_id += 1
+        rows.append(agg_trade_row(aggregate_id, hour * 60 + 1, "1", True))
+        aggregate_id += 1
+    archive = archive_dir / f"{SYMBOL}-aggTrades-{DAY}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+        zipped.writestr(
+            f"{SYMBOL}-aggTrades-{DAY}.csv",
+            "agg_trade_id,price,quantity,first_trade_id,last_trade_id,"
+            "transact_time,is_buyer_maker,is_best_match\n"
+            + "\n".join(rows)
+            + "\n",
+        )
+    return archive
+
+
 def assert_no_float(test, value):
     test.assertNotIsInstance(value, float)
     if isinstance(value, dict):
@@ -177,7 +218,57 @@ class AdaptiveBaselineTests(unittest.TestCase):
         self.assertEqual(profile["historical_low"], "99.9")
         self.assertEqual(profile["historical_high"], "100.1")
         self.assertEqual(profile["close_q20"], "100")
+        self.assertEqual(
+            profile["components"]["tape"],
+            {
+                "status": "NOT-READY",
+                "days_found": 0,
+                "required_days": 1,
+                "reason": "no_agg_trades_archives",
+            },
+        )
+        self.assertEqual(
+            payload["tape_not_ready_reasons"],
+            {"no_agg_trades_archives": 1},
+        )
         assert_no_float(self, disk)
+
+    def test_absorption_build_uses_exact_agg_trade_math(self):
+        data_dir = write_complete_tape(self.root)
+        write_complete_agg_trades(data_dir)
+        output = self.output_dir / "absorption-tape-baseline.json"
+
+        payload = baselines.run_absorption_baselines(
+            data_dir,
+            output,
+            symbols=[SYMBOL],
+            window_minutes=60,
+            minimum_days=1,
+        )
+
+        tape = payload["symbols"][SYMBOL]["components"]["tape"]
+        self.assertEqual(tape["status"], "READY")
+        self.assertEqual(tape["day_count"], 1)
+        self.assertEqual(tape["trade_count"], 48)
+        self.assertEqual(tape["window_expected_count"], 24)
+        self.assertEqual(tape["window_sample_count"], 24)
+        self.assertEqual(tape["baseline_taker_imbalance"], "0.5")
+        self.assertEqual(
+            set(tape["window_taker_imbalance_samples"]), {"0.5"}
+        )
+        self.assertEqual(
+            tape["baseline_trade_size_median_quote"], "2"
+        )
+        self.assertEqual(tape["baseline_trade_size_p90_quote"], "3")
+        self.assertEqual(
+            set(tape["window_trade_size_median_quote_samples"]), {"2"}
+        )
+        self.assertEqual(
+            set(tape["window_trade_size_p90_quote_samples"]), {"2.8"}
+        )
+        self.assertEqual(payload["tape_symbol_count"], 1)
+        self.assertEqual(payload["tape_not_ready_count"], 0)
+        assert_no_float(self, payload)
 
     def test_absorption_cli_reports_ready_and_not_ready_symbols(self):
         data_dir = write_complete_tape(self.root)
@@ -201,7 +292,9 @@ class AdaptiveBaselineTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn(
-            f"symbol={SYMBOL} | status=READY | days_used=1",
+            f"symbol={SYMBOL} | kline=READY | kline_days=1 | "
+            "tape=NOT-READY | tape_days=0 | "
+            "tape_reason=no_agg_trades_archives",
             stdout.getvalue(),
         )
         self.assertIn(
@@ -230,6 +323,42 @@ class AdaptiveBaselineTests(unittest.TestCase):
                 "reason": "insufficient_complete_days",
                 "required_days": 1,
             },
+        )
+
+    def test_tape_readiness_does_not_change_kline_readiness(self):
+        data_dir = write_complete_tape(self.root)
+        write_complete_agg_trades(data_dir)
+        output = self.output_dir / "component-readiness.json"
+
+        payload = baselines.run_absorption_baselines(
+            data_dir,
+            output,
+            symbols=[SYMBOL],
+            window_minutes=60,
+            minimum_days=1,
+            minimum_tape_days=2,
+        )
+
+        profile = payload["symbols"][SYMBOL]
+        self.assertEqual(
+            profile["components"]["kline"],
+            {"status": "READY", "day_count": 1, "required_days": 1},
+        )
+        self.assertEqual(
+            profile["components"]["tape"],
+            {
+                "status": "NOT-READY",
+                "days_found": 1,
+                "archive_days_found": 1,
+                "required_days": 2,
+                "reason": "insufficient_aligned_complete_days",
+            },
+        )
+        self.assertEqual(payload["symbol_count"], 1)
+        self.assertEqual(payload["tape_symbol_count"], 0)
+        self.assertEqual(
+            payload["tape_not_ready_reasons"],
+            {"insufficient_aligned_complete_days": 1},
         )
 
 

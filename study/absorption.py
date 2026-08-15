@@ -93,6 +93,20 @@ class WindowMetrics:
 
 
 @dataclass(frozen=True)
+class HistoricalTapeBaseline:
+    day_count: int
+    trade_count: int
+    first_timestamp_ms: int
+    last_timestamp_ms: int
+    baseline_taker_imbalance: Decimal
+    window_taker_imbalance_samples: Tuple[Decimal, ...]
+    baseline_trade_size_median_quote: Decimal
+    baseline_trade_size_p90_quote: Decimal
+    window_trade_size_median_quote_samples: Tuple[Decimal, ...]
+    window_trade_size_p90_quote_samples: Tuple[Decimal, ...]
+
+
+@dataclass(frozen=True)
 class HistoricalKlineBaseline:
     symbol: str
     window_minutes: int
@@ -105,6 +119,7 @@ class HistoricalKlineBaseline:
     close_q20: Decimal
     window_range_samples_pct: Tuple[Decimal, ...]
     window_quote_volume_samples: Tuple[Decimal, ...]
+    tape: Optional[HistoricalTapeBaseline] = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +155,16 @@ def _decimal(raw: Any, source: str, *, positive: bool) -> Decimal:
         raise AbsorptionError(
             f"{source} is not a finite {qualifier} Decimal"
         )
+    return value
+
+
+def _signed_decimal(raw: Any, source: str) -> Decimal:
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        raise AbsorptionError(f"{source} is not a Decimal") from None
+    if not value.is_finite():
+        raise AbsorptionError(f"{source} is not a finite Decimal")
     return value
 
 
@@ -485,6 +510,202 @@ def _decimal_samples(raw: Any, source: str) -> Tuple[Decimal, ...]:
     return values
 
 
+def _signed_decimal_samples(
+    raw: Any, source: str
+) -> Tuple[Decimal, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise AbsorptionError(f"{source} is not a non-empty list")
+    values = tuple(
+        _signed_decimal(value, f"{source}[{index}]")
+        for index, value in enumerate(raw)
+    )
+    if values != tuple(sorted(values)):
+        raise AbsorptionError(f"{source} is not ordered")
+    return values
+
+
+def _historical_tape_baseline(
+    raw_profile: Mapping[str, Any],
+    symbol: str,
+    kline_days: Sequence[str],
+    window_minutes: int,
+    minimum_days: int,
+    minimum_tape_days: Optional[int],
+) -> Optional[HistoricalTapeBaseline]:
+    raw_components = raw_profile.get("components")
+    if raw_components is None:
+        return None
+    if not isinstance(raw_components, Mapping):
+        raise AbsorptionError(f"{symbol} components is not an object")
+    raw_kline = raw_components.get("kline")
+    if not isinstance(raw_kline, Mapping):
+        raise AbsorptionError(f"{symbol} kline readiness is missing")
+    if raw_kline.get("status") != "READY":
+        raise AbsorptionError(f"{symbol} kline component is not READY")
+    component_day_count = _integer(
+        raw_kline.get("day_count"),
+        f"{symbol} kline component day_count",
+        non_negative=True,
+    )
+    if component_day_count != len(kline_days):
+        raise AbsorptionError(
+            f"{symbol} kline component day_count does not match"
+        )
+    component_required_days = _integer(
+        raw_kline.get("required_days"),
+        f"{symbol} kline component required_days",
+        non_negative=True,
+    )
+    if component_required_days != minimum_days:
+        raise AbsorptionError(
+            f"{symbol} kline component required_days does not match"
+        )
+
+    raw_tape = raw_components.get("tape")
+    if not isinstance(raw_tape, Mapping):
+        raise AbsorptionError(f"{symbol} tape readiness is missing")
+    if minimum_tape_days is None:
+        raise AbsorptionError("baseline minimum_tape_days is missing")
+    component_tape_required_days = _integer(
+        raw_tape.get("required_days"),
+        f"{symbol} tape required_days",
+        non_negative=True,
+    )
+    if component_tape_required_days != minimum_tape_days:
+        raise AbsorptionError(
+            f"{symbol} tape required_days does not match"
+        )
+    status = raw_tape.get("status")
+    if status == "NOT-READY":
+        reason = raw_tape.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise AbsorptionError(
+                f"{symbol} tape NOT-READY reason is invalid"
+            )
+        _integer(
+            raw_tape.get("days_found"),
+            f"{symbol} tape days_found",
+            non_negative=True,
+        )
+        return None
+    if status != "READY":
+        raise AbsorptionError(f"{symbol} tape status is invalid")
+
+    day_count = _integer(
+        raw_tape.get("day_count"),
+        f"{symbol} tape day_count",
+        non_negative=True,
+    )
+    trade_count = _integer(
+        raw_tape.get("trade_count"),
+        f"{symbol} tape trade_count",
+        non_negative=True,
+    )
+    sample_count = _integer(
+        raw_tape.get("window_sample_count"),
+        f"{symbol} tape window_sample_count",
+        non_negative=True,
+    )
+    expected_count = _integer(
+        raw_tape.get("window_expected_count"),
+        f"{symbol} tape window_expected_count",
+        non_negative=True,
+    )
+    expected_from_days = day_count * (MINUTES_PER_DAY // window_minutes)
+    if (
+        day_count < minimum_tape_days
+        or trade_count <= 0
+        or expected_count != expected_from_days
+        or not 1 <= sample_count <= expected_count
+    ):
+        raise AbsorptionError(f"{symbol} tape coverage is invalid")
+
+    raw_days = raw_tape.get("days_used")
+    if not isinstance(raw_days, list) or len(raw_days) != day_count:
+        raise AbsorptionError(f"{symbol} tape days_used does not match")
+    tape_days: List[str] = []
+    for raw_day in raw_days:
+        if not isinstance(raw_day, str):
+            raise AbsorptionError(f"{symbol} tape days_used is invalid")
+        try:
+            parsed_day = date.fromisoformat(raw_day)
+        except ValueError:
+            raise AbsorptionError(
+                f"{symbol} tape days_used is invalid"
+            ) from None
+        if parsed_day.isoformat() != raw_day:
+            raise AbsorptionError(f"{symbol} tape days_used is invalid")
+        tape_days.append(raw_day)
+    if (
+        tape_days != sorted(set(tape_days))
+        or not set(tape_days).issubset(kline_days)
+    ):
+        raise AbsorptionError(f"{symbol} tape days_used is not aligned")
+
+    imbalances = _signed_decimal_samples(
+        raw_tape.get("window_taker_imbalance_samples"),
+        f"{symbol} window_taker_imbalance_samples",
+    )
+    median_sizes = _decimal_samples(
+        raw_tape.get("window_trade_size_median_quote_samples"),
+        f"{symbol} window_trade_size_median_quote_samples",
+    )
+    p90_sizes = _decimal_samples(
+        raw_tape.get("window_trade_size_p90_quote_samples"),
+        f"{symbol} window_trade_size_p90_quote_samples",
+    )
+    if (
+        len(imbalances) != sample_count
+        or len(median_sizes) != sample_count
+        or len(p90_sizes) != sample_count
+        or any(value < Decimal("-1") or value > Decimal("1") for value in imbalances)
+        or any(value <= 0 for value in median_sizes + p90_sizes)
+    ):
+        raise AbsorptionError(f"{symbol} tape sample coverage is invalid")
+    baseline_imbalance = _signed_decimal(
+        raw_tape.get("baseline_taker_imbalance"),
+        f"{symbol} baseline_taker_imbalance",
+    )
+    baseline_size_median = _decimal(
+        raw_tape.get("baseline_trade_size_median_quote"),
+        f"{symbol} baseline_trade_size_median_quote",
+        positive=True,
+    )
+    baseline_size_p90 = _decimal(
+        raw_tape.get("baseline_trade_size_p90_quote"),
+        f"{symbol} baseline_trade_size_p90_quote",
+        positive=True,
+    )
+    if (
+        baseline_imbalance < Decimal("-1")
+        or baseline_imbalance > Decimal("1")
+        or baseline_size_p90 < baseline_size_median
+    ):
+        raise AbsorptionError(f"{symbol} tape baseline is inconsistent")
+    first_timestamp_ms = _timestamp_ms(
+        raw_tape.get("first_timestamp_ms"),
+        f"{symbol} tape first_timestamp_ms",
+    )
+    last_timestamp_ms = _timestamp_ms(
+        raw_tape.get("last_timestamp_ms"),
+        f"{symbol} tape last_timestamp_ms",
+    )
+    if last_timestamp_ms < first_timestamp_ms:
+        raise AbsorptionError(f"{symbol} tape time bounds are inconsistent")
+    return HistoricalTapeBaseline(
+        day_count=day_count,
+        trade_count=trade_count,
+        first_timestamp_ms=first_timestamp_ms,
+        last_timestamp_ms=last_timestamp_ms,
+        baseline_taker_imbalance=baseline_imbalance,
+        window_taker_imbalance_samples=imbalances,
+        baseline_trade_size_median_quote=baseline_size_median,
+        baseline_trade_size_p90_quote=baseline_size_p90,
+        window_trade_size_median_quote_samples=median_sizes,
+        window_trade_size_p90_quote_samples=p90_sizes,
+    )
+
+
 def load_historical_baselines(
     path: Path,
     *,
@@ -519,11 +740,24 @@ def load_historical_baselines(
     )
     if not 1 <= minimum_days <= MAX_LOOKBACK_DAYS:
         raise AbsorptionError("baseline minimum_days is invalid")
+    raw_minimum_tape_days = payload.get("minimum_tape_days")
+    minimum_tape_days: Optional[int]
+    if raw_minimum_tape_days is None:
+        minimum_tape_days = None
+    else:
+        minimum_tape_days = _integer(
+            raw_minimum_tape_days,
+            "baseline minimum_tape_days",
+            non_negative=True,
+        )
+        if not 1 <= minimum_tape_days <= MAX_LOOKBACK_DAYS:
+            raise AbsorptionError("baseline minimum_tape_days is invalid")
     raw_symbols = payload.get("symbols")
     if not isinstance(raw_symbols, Mapping) or not raw_symbols:
         raise AbsorptionError("baseline file has no ready symbols")
 
     loaded: Dict[str, HistoricalKlineBaseline] = {}
+    observed_tape_not_ready_reasons: Dict[str, int] = {}
     for raw_symbol, raw_profile in sorted(raw_symbols.items()):
         if not isinstance(raw_symbol, str):
             raise AbsorptionError("baseline symbol key is not text")
@@ -629,6 +863,21 @@ def load_historical_baselines(
             raise AbsorptionError(
                 f"{symbol} baseline time bounds are inconsistent"
             )
+        historical_tape = _historical_tape_baseline(
+            raw_profile,
+            symbol,
+            parsed_days,
+            file_window,
+            minimum_days,
+            minimum_tape_days,
+        )
+        if historical_tape is None and raw_profile.get("components") is not None:
+            raw_components = raw_profile["components"]
+            raw_tape = raw_components["tape"]
+            reason = str(raw_tape["reason"])
+            observed_tape_not_ready_reasons[reason] = (
+                observed_tape_not_ready_reasons.get(reason, 0) + 1
+            )
         loaded[symbol] = HistoricalKlineBaseline(
             symbol=symbol,
             window_minutes=file_window,
@@ -641,6 +890,7 @@ def load_historical_baselines(
             close_q20=close_q20,
             window_range_samples_pct=ranges,
             window_quote_volume_samples=volumes,
+            tape=historical_tape,
         )
     declared = _integer(
         payload.get("symbol_count"),
@@ -649,6 +899,50 @@ def load_historical_baselines(
     )
     if declared != len(loaded):
         raise AbsorptionError("baseline symbol_count does not match")
+    if minimum_tape_days is not None:
+        ready_tape_count = sum(
+            profile.tape is not None for profile in loaded.values()
+        )
+        declared_tape_ready = _integer(
+            payload.get("tape_symbol_count"),
+            "baseline tape_symbol_count",
+            non_negative=True,
+        )
+        declared_tape_not_ready = _integer(
+            payload.get("tape_not_ready_count"),
+            "baseline tape_not_ready_count",
+            non_negative=True,
+        )
+        if (
+            declared_tape_ready != ready_tape_count
+            or declared_tape_not_ready != len(loaded) - ready_tape_count
+        ):
+            raise AbsorptionError("baseline tape readiness counts do not match")
+        raw_reasons = payload.get("tape_not_ready_reasons")
+        if not isinstance(raw_reasons, Mapping):
+            raise AbsorptionError(
+                "baseline tape_not_ready_reasons is not an object"
+            )
+        declared_reasons: Dict[str, int] = {}
+        for raw_reason, raw_count in raw_reasons.items():
+            if not isinstance(raw_reason, str) or not raw_reason:
+                raise AbsorptionError(
+                    "baseline tape NOT-READY reason is invalid"
+                )
+            count = _integer(
+                raw_count,
+                f"baseline tape reason {raw_reason}",
+                non_negative=True,
+            )
+            if count <= 0:
+                raise AbsorptionError(
+                    "baseline tape NOT-READY count is invalid"
+                )
+            declared_reasons[raw_reason] = count
+        if declared_reasons != observed_tape_not_ready_reasons:
+            raise AbsorptionError(
+                "baseline tape NOT-READY reasons do not match"
+            )
     return loaded
 
 
@@ -898,33 +1192,55 @@ def score_absorption_window(
         else _clamp01(volume_floor_ratio)
     )
 
-    baseline_trade_index = TradeIndex(
-        tuple(baseline_trades),
-        tuple(trade.timestamp_ms for trade in baseline_trades),
+    historical_tape = (
+        None if historical_baseline is None else historical_baseline.tape
     )
-    baseline_window_imbalances: List[Decimal] = []
-    baseline_window_size_medians: List[Decimal] = []
-    baseline_window_size_p90s: List[Decimal] = []
-    for bars in historical_windows:
-        trades = baseline_trade_index.between(
-            bars[0].open_ms, bars[-1].close_ms
+    if historical_tape is None:
+        baseline_trade_index = TradeIndex(
+            tuple(baseline_trades),
+            tuple(trade.timestamp_ms for trade in baseline_trades),
         )
-        imbalance = taker_imbalance(trades)
-        sizes = [trade.quote_size for trade in trades]
-        median_size = quantile(sizes, 1, 2)
-        p90_size = quantile(sizes, 9, 10)
-        if imbalance is not None:
-            baseline_window_imbalances.append(imbalance)
-        if median_size is not None:
-            baseline_window_size_medians.append(median_size)
-        if p90_size is not None:
-            baseline_window_size_p90s.append(p90_size)
+        baseline_window_imbalances: List[Decimal] = []
+        baseline_window_size_medians: List[Decimal] = []
+        baseline_window_size_p90s: List[Decimal] = []
+        for bars in historical_windows:
+            trades = baseline_trade_index.between(
+                bars[0].open_ms, bars[-1].close_ms
+            )
+            imbalance = taker_imbalance(trades)
+            sizes = [trade.quote_size for trade in trades]
+            median_size = quantile(sizes, 1, 2)
+            p90_size = quantile(sizes, 9, 10)
+            if imbalance is not None:
+                baseline_window_imbalances.append(imbalance)
+            if median_size is not None:
+                baseline_window_size_medians.append(median_size)
+            if p90_size is not None:
+                baseline_window_size_p90s.append(p90_size)
+        baseline_imbalance = taker_imbalance(baseline_trades)
+        baseline_sizes = [trade.quote_size for trade in baseline_trades]
+        baseline_size_median = quantile(baseline_sizes, 1, 2)
+        baseline_size_p90 = quantile(baseline_sizes, 9, 10)
+    else:
+        baseline_window_imbalances = list(
+            historical_tape.window_taker_imbalance_samples
+        )
+        baseline_window_size_medians = list(
+            historical_tape.window_trade_size_median_quote_samples
+        )
+        baseline_window_size_p90s = list(
+            historical_tape.window_trade_size_p90_quote_samples
+        )
+        baseline_imbalance = historical_tape.baseline_taker_imbalance
+        baseline_size_median = (
+            historical_tape.baseline_trade_size_median_quote
+        )
+        baseline_size_p90 = historical_tape.baseline_trade_size_p90_quote
 
     buy_quote, sell_quote, buy_count, sell_count = taker_quote_totals(
         window_trades
     )
     current_imbalance = taker_imbalance(window_trades)
-    baseline_imbalance = taker_imbalance(baseline_trades)
     baseline_imbalance_median = quantile(
         baseline_window_imbalances, 1, 2
     )
@@ -947,11 +1263,7 @@ def score_absorption_window(
         )
     ):
         imbalance_factor = Decimal("0")
-
-    baseline_sizes = [trade.quote_size for trade in baseline_trades]
     current_sizes = [trade.quote_size for trade in window_trades]
-    baseline_size_median = quantile(baseline_sizes, 1, 2)
-    baseline_size_p90 = quantile(baseline_sizes, 9, 10)
     current_size_median = quantile(current_sizes, 1, 2)
     current_size_p90 = quantile(current_sizes, 9, 10)
     median_size_ratio = _ratio(current_size_median, baseline_size_median)
@@ -1065,6 +1377,9 @@ def score_absorption_window(
         "baseline_source": baseline_source,
         "baseline_minutes": baseline_minutes,
         "baseline_days": baseline_days,
+        "baseline_tape_days": (
+            None if historical_tape is None else historical_tape.day_count
+        ),
         "baseline_last_utc": baseline_last_utc,
         "absorption_score": decimal_text(score),
         "score_components": {
