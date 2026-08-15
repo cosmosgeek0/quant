@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -83,6 +83,189 @@ class TapePullTests(unittest.TestCase):
             self.root
             / "spot/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-08-14.zip",
         )
+
+    def test_futures_and_funding_url_and_destination_construction(self):
+        self.assertEqual(
+            tp.kline_url(SYMBOL, DAY, "futures"),
+            "https://data.binance.vision/data/futures/um/daily/klines/"
+            "BTCUSDT/1m/BTCUSDT-1m-2026-08-14.zip",
+        )
+        self.assertEqual(
+            tp.agg_trades_url(SYMBOL, DAY, "perp"),
+            "https://data.binance.vision/data/futures/um/daily/aggTrades/"
+            "BTCUSDT/BTCUSDT-aggTrades-2026-08-14.zip",
+        )
+        self.assertEqual(
+            tp.kline_path(self.root, SYMBOL, DAY, "futures"),
+            self.root
+            / "futures/um/daily/klines/BTCUSDT/1m/"
+            "BTCUSDT-1m-2026-08-14.zip",
+        )
+        start_ms = tp._day_start_ms(DAY)
+        end_ms = start_ms + 86_400_000 - 1
+        funding_url = tp.funding_rate_url(SYMBOL, start_ms, end_ms)
+        self.assertEqual(
+            funding_url,
+            "https://fapi.binance.com/fapi/v1/fundingRate?"
+            "symbol=BTCUSDT&startTime=1786665600000&"
+            "endTime=1786751999999&limit=1000",
+        )
+        tp._validate_public_url(funding_url)
+        self.assertEqual(
+            tp.funding_path(self.root, SYMBOL, DAY, DAY),
+            self.root / "funding/BTCUSDT-fundingRate-2026-08-14-2026-08-14.json",
+        )
+
+    def test_full_universe_unicode_symbol_is_safely_percent_encoded(self):
+        symbol = "币安人生USDT"
+        url = tp.kline_url(symbol, DAY)
+        encoded = "%E5%B8%81%E5%AE%89%E4%BA%BA%E7%94%9FUSDT"
+        self.assertEqual(
+            url,
+            "https://data.binance.vision/data/spot/daily/klines/"
+            f"{encoded}/1m/{encoded}-1m-2026-08-14.zip",
+        )
+        tp._validate_public_url(url)
+        self.assertEqual(
+            tp.kline_path(self.root, symbol, DAY).name,
+            "币安人生USDT-1m-2026-08-14.zip",
+        )
+
+    def test_cli_mode_construction(self):
+        parser = tp.build_parser()
+        cohort = parser.parse_args(["--cohort-file", "cohort.json"])
+        windows = parser.parse_args(["--windows-file", "windows.json"])
+        funding = parser.parse_args(
+            ["--cohort-file", "cohort.json", "--funding"]
+        )
+        self.assertEqual(tp.selected_mode(cohort), "cohort_file")
+        self.assertEqual(tp.selected_mode(windows), "windows_file")
+        self.assertEqual(tp.selected_mode(funding), "funding")
+        with self.assertRaises(tp.InputError):
+            tp.selected_mode(parser.parse_args(["--funding"]))
+
+    def test_cohort_manifest_expands_every_declared_venue(self):
+        entries = tp.parse_cohort_manifest(
+            [
+                {"symbol": "AAAUSDT", "venue_class": "spot_only", "gap_days": []},
+                {
+                    "symbol": "BBBUSDT",
+                    "venue_class": "futures_only",
+                    "gap_days": [],
+                },
+                {"symbol": "CCCUSDT", "venue_class": "both", "gap_days": []},
+            ]
+        )
+        self.assertEqual(
+            tp.cohort_archive_requests(entries, [DAY]),
+            (
+                tp.ArchiveRequest("AAAUSDT", "spot", DAY),
+                tp.ArchiveRequest("BBBUSDT", "futures", DAY),
+                tp.ArchiveRequest("CCCUSDT", "spot", DAY),
+                tp.ArchiveRequest("CCCUSDT", "futures", DAY),
+            ),
+        )
+
+    def test_window_days_are_cross_day_venue_aware_and_deduplicated(self):
+        next_day = DAY + timedelta(days=1)
+        payload = {
+            "windows": [
+                {
+                    "symbol": "AAAUSDT",
+                    "venue_class": "both",
+                    "window_start_utc": "2026-08-14T23:59:00Z",
+                    "window_end_utc": "2026-08-15T00:01:00Z",
+                },
+                {
+                    "symbol": "AAAUSDT",
+                    "venue_class": "both",
+                    "start_ms": tp._day_start_ms(DAY) + 60_000,
+                    "end_ms": tp._day_start_ms(DAY) + 120_000,
+                },
+                {
+                    "symbol": "BBBUSDT",
+                    "venue_class": "futures_only",
+                    "window": {
+                        "start": "2026-08-14T12:00:00+00:00",
+                        "end": "2026-08-14T15:00:00+00:00",
+                    },
+                },
+                {
+                    "symbol": "CCCUSDT",
+                    "venue_class": "spot_only",
+                    "start_utc": "2026-08-14T23:00:00Z",
+                    "end_utc": "2026-08-15T00:00:00Z",
+                },
+            ]
+        }
+        self.assertEqual(
+            tp.window_archive_requests(payload),
+            (
+                tp.ArchiveRequest("AAAUSDT", "spot", DAY),
+                tp.ArchiveRequest("AAAUSDT", "futures", DAY),
+                tp.ArchiveRequest("AAAUSDT", "spot", next_day),
+                tp.ArchiveRequest("AAAUSDT", "futures", next_day),
+                tp.ArchiveRequest("BBBUSDT", "futures", DAY),
+                tp.ArchiveRequest("CCCUSDT", "spot", DAY),
+            ),
+        )
+
+    def test_cohort_gap_days_are_reconciled_for_attempted_days(self):
+        manifest = self.root / "cohort.json"
+        manifest.write_text(
+            json.dumps(
+                [
+                    {
+                        "symbol": SYMBOL,
+                        "venue_class": "both",
+                        "days_available": 2,
+                        "gap_days": ["2026-08-13"],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        attempts = (
+            tp.ArchiveRequest(SYMBOL, "spot", DAY),
+            tp.ArchiveRequest(SYMBOL, "futures", DAY),
+        )
+        tp.update_cohort_gap_days(manifest, attempts, [attempts[1]])
+        first = json.loads(manifest.read_text(encoding="utf-8"))[0]
+        self.assertEqual(first["gap_days"], ["2026-08-13", "2026-08-14"])
+        self.assertEqual(first["days_available"], 1)
+        tp.update_cohort_gap_days(manifest, attempts, [])
+        second = json.loads(manifest.read_text(encoding="utf-8"))[0]
+        self.assertEqual(second["gap_days"], ["2026-08-13"])
+        self.assertEqual(second["days_available"], 2)
+
+    def test_funding_history_download_is_verified_and_idempotent(self):
+        funding_time = tp._day_start_ms(DAY) + 8 * 60 * 60 * 1_000
+        payload = json.dumps(
+            [
+                {
+                    "symbol": SYMBOL,
+                    "fundingTime": funding_time,
+                    "fundingRate": "0.00010000",
+                    "markPrice": "60000.12500000",
+                }
+            ]
+        ).encode("utf-8")
+        requested_urls = []
+
+        def opener(request, timeout):
+            requested_urls.append(request.full_url)
+            return FakeResponse(payload, request.full_url)
+
+        first = tp.download_funding_history(
+            SYMBOL, DAY, DAY, self.root, opener=opener
+        )
+        self.assertEqual(first.status, "DOWNLOADED")
+        self.assertEqual(first.records, 1)
+        self.assertEqual(len(requested_urls), 1)
+        with mock.patch.object(tp, "_open_get", side_effect=AssertionError("network")):
+            second = tp.download_funding_history(SYMBOL, DAY, DAY, self.root)
+        self.assertEqual(second.status, "SKIPPED")
+        self.assertEqual(second.records, 1)
 
     def test_allowlist_rejects_query_and_other_host(self):
         with self.assertRaises(tp.InputError):

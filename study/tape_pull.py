@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Pull verified Binance Vision spot 1m tapes for a spot/perpetual cohort.
+"""Pull verified Binance Vision 1m tapes for explicit V2 manifests.
 
 Only unsigned public GETs are possible here.  The allowed metadata reads are
-the spot and USD-M exchangeInfo documents; archive reads are restricted to
-Binance Vision daily spot kline or aggTrades paths.  This module never imports
-an execution or money-mutation module.
+the spot and USD-M exchangeInfo documents, USD-M funding history, and Binance
+Vision daily spot or USD-M kline and aggTrades paths.  This module never
+imports an execution or money-mutation module.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import csv
 import io
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -26,12 +25,13 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 SPOT_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 FUTURES_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+FUNDING_RATE_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 VISION_BASE_URL = "https://data.binance.vision"
 DEFAULT_DEST = Path(__file__).resolve().parent / "data"
 DEFAULT_COHORT = 100
@@ -44,16 +44,20 @@ MAX_429_RETRIES = 4
 MAX_METADATA_BYTES = 24_000_000
 MAX_ARCHIVE_BYTES = 128_000_000
 MAX_MEMBER_BYTES = 256_000_000
+MAX_MANIFEST_BYTES = 32_000_000
+MAX_MANIFEST_WINDOWS = 1_000_000
+MAX_WINDOW_DURATION_MS = 24 * 60 * 60 * 1_000
+FUNDING_PAGE_LIMIT = 1_000
+MAX_FUNDING_PAGES = 16
 READ_CHUNK_BYTES = 128 * 1024
-SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{5,30}")
-ARCHIVE_PATH_PATTERN = re.compile(
-    r"/data/spot/daily/(?:"
-    r"klines/(?P<kline_symbol>[A-Z0-9]{5,30})/1m/"
-    r"(?P=kline_symbol)-1m-\d{4}-\d{2}-\d{2}\.zip|"
-    r"aggTrades/(?P<trade_symbol>[A-Z0-9]{5,30})/"
-    r"(?P=trade_symbol)-aggTrades-\d{4}-\d{2}-\d{2}\.zip)"
-)
 USER_AGENT = "quant-study-tape-pull/1"
+VENUE_SPOT = "spot"
+VENUE_FUTURES = "futures"
+VENUE_CLASS_VENUES = {
+    "spot_only": (VENUE_SPOT,),
+    "futures_only": (VENUE_FUTURES,),
+    "both": (VENUE_SPOT, VENUE_FUTURES),
+}
 
 
 class TapePullError(Exception):
@@ -87,6 +91,57 @@ class DownloadResult:
     day: date
     path: Path
     size_bytes: int
+    venue: str = VENUE_SPOT
+
+
+@dataclass(frozen=True, order=True)
+class ArchiveRequest:
+    symbol: str
+    venue: str
+    day: date
+
+
+@dataclass(frozen=True)
+class ManifestSymbol:
+    symbol: str
+    venue_class: str
+
+
+@dataclass(frozen=True)
+class WindowSpec:
+    symbol: str
+    venue_class: str
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True)
+class ManifestPullSummary:
+    mode: str
+    symbols: Tuple[str, ...]
+    requests: int
+    downloaded: int
+    skipped: int
+    gaps: Tuple[ArchiveRequest, ...]
+
+
+@dataclass(frozen=True)
+class FundingResult:
+    status: str
+    symbol: str
+    start_day: date
+    end_day: date
+    path: Path
+    size_bytes: int
+    records: int
+
+
+@dataclass(frozen=True)
+class FundingPullSummary:
+    symbols: Tuple[str, ...]
+    downloaded: int
+    skipped: int
+    records: int
 
 
 @dataclass(frozen=True)
@@ -108,6 +163,40 @@ class PullSummary:
     days: Tuple[date, ...]
 
 
+def _archive_path_allowed(path: str) -> bool:
+    decoded = unquote(path)
+    if quote(decoded, safe="/-") != path:
+        return False
+    parts = decoded.split("/")
+    if parts[:3] == ["", "data", "spot"]:
+        tail = parts[3:]
+    elif parts[:4] == ["", "data", "futures", "um"]:
+        tail = parts[4:]
+    else:
+        return False
+    if len(tail) == 5 and tail[:2] == ["daily", "klines"] and tail[3] == "1m":
+        symbol = tail[2]
+        filename = tail[4]
+        marker = "%s-1m-" % symbol
+    elif len(tail) == 4 and tail[:2] == ["daily", "aggTrades"]:
+        symbol = tail[2]
+        filename = tail[3]
+        marker = "%s-aggTrades-" % symbol
+    else:
+        return False
+    try:
+        _validate_symbol(symbol)
+    except InputError:
+        return False
+    if not filename.startswith(marker) or not filename.endswith(".zip"):
+        return False
+    day_text = filename[len(marker) : -4]
+    try:
+        return _coerce_day(day_text).isoformat() == day_text
+    except InputError:
+        return False
+
+
 def _validate_public_url(url: str) -> None:
     parsed = urlsplit(url)
     if (
@@ -115,21 +204,60 @@ def _validate_public_url(url: str) -> None:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.port is not None
-        or parsed.query
         or parsed.fragment
     ):
         raise InputError("public URL is outside the GET allowlist")
-    if parsed.netloc == "api.binance.com" and parsed.path == "/api/v3/exchangeInfo":
+    if (
+        parsed.netloc == "api.binance.com"
+        and parsed.path == "/api/v3/exchangeInfo"
+        and not parsed.query
+    ):
         return
     if (
         parsed.netloc == "fapi.binance.com"
         and parsed.path == "/fapi/v1/exchangeInfo"
+        and not parsed.query
     ):
         return
     if (
         parsed.netloc == "data.binance.vision"
-        and ARCHIVE_PATH_PATTERN.fullmatch(parsed.path) is not None
+        and not parsed.query
+        and _archive_path_allowed(parsed.path)
     ):
+        return
+    if (
+        parsed.netloc == "fapi.binance.com"
+        and parsed.path == "/fapi/v1/fundingRate"
+    ):
+        try:
+            pairs = parse_qsl(
+                parsed.query, keep_blank_values=True, strict_parsing=True
+            )
+        except ValueError as error:
+            raise InputError("public URL is outside the GET allowlist") from error
+        if len(pairs) != 4 or len({key for key, _ in pairs}) != 4:
+            raise InputError("public URL is outside the GET allowlist")
+        values = dict(pairs)
+        if set(values) != {"symbol", "startTime", "endTime", "limit"}:
+            raise InputError("public URL is outside the GET allowlist")
+        _validate_symbol(values["symbol"])
+        if not values["startTime"].isdigit() or not values["endTime"].isdigit():
+            raise InputError("public URL is outside the GET allowlist")
+        start_time = int(values["startTime"])
+        end_time = int(values["endTime"])
+        try:
+            limit = int(values["limit"])
+        except ValueError as error:
+            raise InputError("public URL is outside the GET allowlist") from error
+        if (
+            start_time < 0
+            or end_time < start_time
+            or str(start_time) != values["startTime"]
+            or str(end_time) != values["endTime"]
+            or not 1 <= limit <= FUNDING_PAGE_LIMIT
+            or str(limit) != values["limit"]
+        ):
+            raise InputError("public URL is outside the GET allowlist")
         return
     raise InputError("public URL is outside the GET allowlist")
 
@@ -251,45 +379,155 @@ def _coerce_day(value: Any) -> date:
 
 
 def _validate_symbol(symbol: Any) -> str:
-    if not isinstance(symbol, str) or SYMBOL_PATTERN.fullmatch(symbol) is None:
-        raise InputError("symbol must contain 5-30 uppercase letters or digits")
+    if (
+        not isinstance(symbol, str)
+        or not 5 <= len(symbol) <= 100
+        or not symbol.endswith("USDT")
+        or not symbol.isalnum()
+        or symbol.upper() != symbol
+    ):
+        raise InputError("symbol must be a safe uppercase USDT symbol")
     return symbol
 
 
-def kline_url(symbol: str, day: Any) -> str:
+def _validate_venue(venue: Any) -> str:
+    if venue in {VENUE_FUTURES, "perp", "um"}:
+        return VENUE_FUTURES
+    if venue == VENUE_SPOT:
+        return VENUE_SPOT
+    raise InputError("venue must be spot or futures")
+
+
+def _venue_archive_prefix(venue: Any) -> str:
+    return "spot" if _validate_venue(venue) == VENUE_SPOT else "futures/um"
+
+
+def _venues_for_class(venue_class: Any) -> Tuple[str, ...]:
+    if not isinstance(venue_class, str) or venue_class not in VENUE_CLASS_VENUES:
+        raise InputError(
+            "venue_class must be spot_only, futures_only, or both"
+        )
+    return VENUE_CLASS_VENUES[venue_class]
+
+
+def kline_url(symbol: str, day: Any, venue: str = VENUE_SPOT) -> str:
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
-    filename = "%s-1m-%s.zip" % (symbol, day.isoformat())
-    return "%s/data/spot/daily/klines/%s/1m/%s" % (
+    prefix = _venue_archive_prefix(venue)
+    encoded_symbol = quote(symbol, safe="")
+    filename = "%s-1m-%s.zip" % (encoded_symbol, day.isoformat())
+    return "%s/data/%s/daily/klines/%s/1m/%s" % (
         VISION_BASE_URL,
-        symbol,
+        prefix,
+        encoded_symbol,
         filename,
     )
 
 
-def kline_path(destination: Path, symbol: str, day: Any) -> Path:
+def kline_path(
+    destination: Path,
+    symbol: str,
+    day: Any,
+    venue: str = VENUE_SPOT,
+) -> Path:
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
+    prefix = _venue_archive_prefix(venue)
     filename = "%s-1m-%s.zip" % (symbol, day.isoformat())
-    return Path(destination) / "spot" / "daily" / "klines" / symbol / "1m" / filename
+    return (
+        Path(destination)
+        / prefix
+        / "daily"
+        / "klines"
+        / symbol
+        / "1m"
+        / filename
+    )
 
 
-def agg_trades_url(symbol: str, day: Any) -> str:
+def agg_trades_url(
+    symbol: str, day: Any, venue: str = VENUE_SPOT
+) -> str:
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
-    filename = "%s-aggTrades-%s.zip" % (symbol, day.isoformat())
-    return "%s/data/spot/daily/aggTrades/%s/%s" % (
+    prefix = _venue_archive_prefix(venue)
+    encoded_symbol = quote(symbol, safe="")
+    filename = "%s-aggTrades-%s.zip" % (encoded_symbol, day.isoformat())
+    return "%s/data/%s/daily/aggTrades/%s/%s" % (
         VISION_BASE_URL,
-        symbol,
+        prefix,
+        encoded_symbol,
         filename,
     )
 
 
-def agg_trades_path(destination: Path, symbol: str, day: Any) -> Path:
+def agg_trades_path(
+    destination: Path,
+    symbol: str,
+    day: Any,
+    venue: str = VENUE_SPOT,
+) -> Path:
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
+    prefix = _venue_archive_prefix(venue)
     filename = "%s-aggTrades-%s.zip" % (symbol, day.isoformat())
-    return Path(destination) / "spot" / "daily" / "aggTrades" / symbol / filename
+    return Path(destination) / prefix / "daily" / "aggTrades" / symbol / filename
+
+
+def funding_rate_url(
+    symbol: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    limit: int = FUNDING_PAGE_LIMIT,
+) -> str:
+    symbol = _validate_symbol(symbol)
+    if (
+        isinstance(start_time_ms, bool)
+        or not isinstance(start_time_ms, int)
+        or isinstance(end_time_ms, bool)
+        or not isinstance(end_time_ms, int)
+        or start_time_ms < 0
+        or end_time_ms < start_time_ms
+    ):
+        raise InputError("funding timestamps must be ordered nonnegative integers")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= FUNDING_PAGE_LIMIT
+    ):
+        raise InputError("funding page limit is outside bounds")
+    query = urlencode(
+        (
+            ("symbol", symbol),
+            ("startTime", str(start_time_ms)),
+            ("endTime", str(end_time_ms)),
+            ("limit", str(limit)),
+        )
+    )
+    url = "%s?%s" % (FUNDING_RATE_URL, query)
+    _validate_public_url(url)
+    return url
+
+
+def _day_start_ms(day: Any) -> int:
+    parsed = _coerce_day(day)
+    return (parsed - date(1970, 1, 1)).days * 86_400_000
+
+
+def funding_path(
+    destination: Path, symbol: str, start_day: Any, end_day: Any
+) -> Path:
+    symbol = _validate_symbol(symbol)
+    first = _coerce_day(start_day)
+    last = _coerce_day(end_day)
+    if last < first:
+        raise InputError("funding day range is reversed")
+    filename = "%s-fundingRate-%s-%s.json" % (
+        symbol,
+        first.isoformat(),
+        last.isoformat(),
+    )
+    return Path(destination) / "funding" / filename
 
 
 def _expected_member(symbol: str, day: date) -> str:
@@ -391,16 +629,20 @@ def download_kline(
     day: Any,
     destination: Path,
     *,
+    venue: str = VENUE_SPOT,
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> DownloadResult:
     """Download one archive atomically, or verify and skip an existing one."""
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
-    target = kline_path(Path(destination), symbol, day)
+    venue = _validate_venue(venue)
+    target = kline_path(Path(destination), symbol, day, venue)
     if target.exists():
         verify_kline_zip(target, symbol, day)
-        return DownloadResult("SKIPPED", symbol, day, target, target.stat().st_size)
+        return DownloadResult(
+            "SKIPPED", symbol, day, target, target.stat().st_size, venue
+        )
 
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -408,7 +650,9 @@ def download_kline(
     )
     temporary = Path(temporary_name)
     try:
-        response = _open_get(kline_url(symbol, day), opener=opener, sleep_fn=sleep_fn)
+        response = _open_get(
+            kline_url(symbol, day, venue), opener=opener, sleep_fn=sleep_fn
+        )
         written = 0
         try:
             with os.fdopen(descriptor, "wb") as handle:
@@ -430,9 +674,11 @@ def download_kline(
         verify_kline_zip(temporary, symbol, day)
         if target.exists():
             verify_kline_zip(target, symbol, day)
-            return DownloadResult("SKIPPED", symbol, day, target, target.stat().st_size)
+            return DownloadResult(
+                "SKIPPED", symbol, day, target, target.stat().st_size, venue
+            )
         os.replace(temporary, target)
-        return DownloadResult("DOWNLOADED", symbol, day, target, written)
+        return DownloadResult("DOWNLOADED", symbol, day, target, written, venue)
     except PublicReadError as error:
         if error.status == 404:
             raise ArchiveMissing("daily kline archive is absent", status=404) from error
@@ -451,16 +697,20 @@ def download_agg_trades(
     day: Any,
     destination: Path,
     *,
+    venue: str = VENUE_SPOT,
     opener: Optional[Callable[..., Any]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> DownloadResult:
     """Download one daily aggTrades archive atomically and idempotently."""
     symbol = _validate_symbol(symbol)
     day = _coerce_day(day)
-    target = agg_trades_path(Path(destination), symbol, day)
+    venue = _validate_venue(venue)
+    target = agg_trades_path(Path(destination), symbol, day, venue)
     if target.exists():
         verify_agg_trades_zip(target, symbol, day)
-        return DownloadResult("SKIPPED", symbol, day, target, target.stat().st_size)
+        return DownloadResult(
+            "SKIPPED", symbol, day, target, target.stat().st_size, venue
+        )
 
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -469,7 +719,7 @@ def download_agg_trades(
     temporary = Path(temporary_name)
     try:
         response = _open_get(
-            agg_trades_url(symbol, day), opener=opener, sleep_fn=sleep_fn
+            agg_trades_url(symbol, day, venue), opener=opener, sleep_fn=sleep_fn
         )
         written = 0
         try:
@@ -493,10 +743,10 @@ def download_agg_trades(
         if target.exists():
             verify_agg_trades_zip(target, symbol, day)
             return DownloadResult(
-                "SKIPPED", symbol, day, target, target.stat().st_size
+                "SKIPPED", symbol, day, target, target.stat().st_size, venue
             )
         os.replace(temporary, target)
-        return DownloadResult("DOWNLOADED", symbol, day, target, written)
+        return DownloadResult("DOWNLOADED", symbol, day, target, written, venue)
     except PublicReadError as error:
         if error.status == 404:
             raise ArchiveMissing(
@@ -532,8 +782,7 @@ def _parse_exchange_symbols(payload: Any, venue: str) -> Dict[str, Mapping[str, 
             continue
         if venue == "futures" and entry.get("contractType") != "PERPETUAL":
             continue
-        if SYMBOL_PATTERN.fullmatch(symbol) is None:
-            continue
+        _validate_symbol(symbol)
         if symbol in result:
             raise InputError("%s exchangeInfo repeats %s" % (venue, symbol))
         result[symbol] = entry
@@ -604,13 +853,673 @@ def completed_utc_days(days: int, now: Optional[datetime] = None) -> List[date]:
     return [today - timedelta(days=offset) for offset in range(days, 0, -1)]
 
 
+def _read_json_file(path: Path, label: str) -> Any:
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise InputError("%s could not be read" % label) from error
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise InputError("%s exceeded byte limit" % label)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InputError("%s is not valid UTF-8 JSON" % label) from error
+
+
+def _atomic_write_json(path: Path, payload: Any) -> int:
+    path = Path(path)
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > MAX_MANIFEST_BYTES:
+        raise InputError("JSON output exceeded byte limit")
+    try:
+        if path.exists() and path.read_bytes() == encoded:
+            return len(encoded)
+    except OSError as error:
+        raise InputError("existing JSON output could not be read") from error
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".%s." % path.name, suffix=".part", dir=path.parent
+        )
+    except OSError as error:
+        raise InputError("JSON output could not be created") from error
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except OSError as error:
+        raise InputError("JSON output could not be published") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return len(encoded)
+
+
+def parse_cohort_manifest(payload: Any) -> Tuple[ManifestSymbol, ...]:
+    """Validate the frozen V2 cohort list without discovering extra symbols."""
+    if not isinstance(payload, list) or not payload:
+        raise InputError("cohort manifest must be a nonempty JSON list")
+    if len(payload) > MAX_COHORT:
+        raise InputError("cohort manifest exceeds symbol limit")
+    entries: List[ManifestSymbol] = []
+    seen = set()
+    for row in payload:
+        if not isinstance(row, dict):
+            raise InputError("cohort manifest row is not an object")
+        symbol = _validate_symbol(row.get("symbol"))
+        venue_class = row.get("venue_class")
+        _venues_for_class(venue_class)
+        if symbol in seen:
+            raise InputError("cohort manifest repeats %s" % symbol)
+        seen.add(symbol)
+        gap_days = row.get("gap_days", [])
+        if not isinstance(gap_days, list):
+            raise InputError("cohort gap_days is not a list for %s" % symbol)
+        parsed_gaps = [_coerce_day(gap_day) for gap_day in gap_days]
+        if len(parsed_gaps) != len(set(parsed_gaps)):
+            raise InputError("cohort gap_days repeats a day for %s" % symbol)
+        days_available = row.get("days_available")
+        if days_available is not None and (
+            isinstance(days_available, bool)
+            or not isinstance(days_available, int)
+            or days_available < 0
+        ):
+            raise InputError("cohort days_available is invalid for %s" % symbol)
+        if "listed_since" in row:
+            _coerce_day(row["listed_since"])
+        entries.append(ManifestSymbol(symbol, venue_class))
+    return tuple(entries)
+
+
+def load_cohort_manifest(path: Path) -> Tuple[ManifestSymbol, ...]:
+    return parse_cohort_manifest(_read_json_file(path, "cohort manifest"))
+
+
+def cohort_archive_requests(
+    entries: Iterable[ManifestSymbol], days: Iterable[Any]
+) -> Tuple[ArchiveRequest, ...]:
+    parsed_days = tuple(_coerce_day(day) for day in days)
+    if not parsed_days or len(parsed_days) != len(set(parsed_days)):
+        raise InputError("cohort days must be nonempty and unique")
+    requests: List[ArchiveRequest] = []
+    seen_symbols = set()
+    for entry in entries:
+        if not isinstance(entry, ManifestSymbol):
+            raise InputError("cohort entry is invalid")
+        if entry.symbol in seen_symbols:
+            raise InputError("cohort entries repeat %s" % entry.symbol)
+        seen_symbols.add(entry.symbol)
+        for venue in _venues_for_class(entry.venue_class):
+            for day in parsed_days:
+                requests.append(ArchiveRequest(entry.symbol, venue, day))
+    if not requests:
+        raise InputError("cohort manifest yielded no archive requests")
+    return tuple(requests)
+
+
+def _coerce_window_ms(value: Any) -> int:
+    if isinstance(value, bool):
+        raise InputError("window timestamp is invalid")
+    if isinstance(value, int):
+        parsed_ms = value
+    elif isinstance(value, str) and value.isdigit():
+        parsed_ms = int(value)
+    elif isinstance(value, str):
+        text_value = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(text_value)
+        except ValueError as error:
+            raise InputError("window timestamp is not ISO-8601 or epoch-ms") from error
+        if parsed.tzinfo is None:
+            raise InputError("window timestamp must include a timezone")
+        utc_value = parsed.astimezone(timezone.utc)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        delta = utc_value - epoch
+        parsed_ms = (
+            delta.days * 86_400_000
+            + delta.seconds * 1_000
+            + delta.microseconds // 1_000
+        )
+    else:
+        raise InputError("window timestamp is not ISO-8601 or epoch-ms")
+    if parsed_ms < 0:
+        raise InputError("window timestamp must be nonnegative")
+    return parsed_ms
+
+
+def _window_rows(payload: Any) -> List[Mapping[str, Any]]:
+    rows: Any
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("windows")
+    else:
+        rows = None
+    if not isinstance(rows, list) or not rows:
+        raise InputError("windows manifest must contain a nonempty windows list")
+    if len(rows) > MAX_MANIFEST_WINDOWS:
+        raise InputError("windows manifest exceeds row limit")
+    if any(not isinstance(row, dict) for row in rows):
+        raise InputError("windows manifest row is not an object")
+    return rows
+
+
+def _window_bounds(row: Mapping[str, Any]) -> Tuple[int, int]:
+    sources: List[Mapping[str, Any]] = [row]
+    nested = row.get("window")
+    if isinstance(nested, dict):
+        sources.append(nested)
+    aliases = (
+        ("window_start_ms", "window_end_ms"),
+        ("start_ms", "end_ms"),
+        ("window_start_utc", "window_end_utc"),
+        ("start_utc", "end_utc"),
+        ("window_start", "window_end"),
+        ("start", "end"),
+    )
+    found: List[Tuple[int, int]] = []
+    for source in sources:
+        for start_key, end_key in aliases:
+            has_start = start_key in source
+            has_end = end_key in source
+            if has_start != has_end:
+                raise InputError("window manifest has an incomplete time bound")
+            if has_start:
+                found.append(
+                    (
+                        _coerce_window_ms(source[start_key]),
+                        _coerce_window_ms(source[end_key]),
+                    )
+                )
+    if not found:
+        raise InputError("window manifest row has no explicit time bounds")
+    if any(bounds != found[0] for bounds in found[1:]):
+        raise InputError("window manifest time bounds disagree")
+    start_ms, end_ms = found[0]
+    if end_ms <= start_ms:
+        raise InputError("window manifest time range is empty or reversed")
+    if end_ms - start_ms > MAX_WINDOW_DURATION_MS:
+        raise InputError("window manifest range exceeds the 24-hour safety bound")
+    return start_ms, end_ms
+
+
+def parse_windows_manifest(payload: Any) -> Tuple[WindowSpec, ...]:
+    specs: List[WindowSpec] = []
+    for row in _window_rows(payload):
+        symbol = _validate_symbol(row.get("symbol"))
+        venue_class = row.get("venue_class")
+        _venues_for_class(venue_class)
+        start_ms, end_ms = _window_bounds(row)
+        specs.append(WindowSpec(symbol, venue_class, start_ms, end_ms))
+    return tuple(specs)
+
+
+def _utc_day_from_ms(value: int) -> date:
+    try:
+        return date(1970, 1, 1) + timedelta(days=value // 86_400_000)
+    except OverflowError as error:
+        raise InputError("window timestamp is outside supported range") from error
+
+
+def window_archive_requests(payload: Any) -> Tuple[ArchiveRequest, ...]:
+    """Return stable, deduplicated daily aggTrades requests for explicit windows."""
+    requests: List[ArchiveRequest] = []
+    seen = set()
+    for spec in parse_windows_manifest(payload):
+        first_day = _utc_day_from_ms(spec.start_ms)
+        last_day = _utc_day_from_ms(spec.end_ms - 1)
+        day = first_day
+        while day <= last_day:
+            for venue in _venues_for_class(spec.venue_class):
+                request = ArchiveRequest(spec.symbol, venue, day)
+                if request not in seen:
+                    seen.add(request)
+                    requests.append(request)
+            day += timedelta(days=1)
+    return tuple(requests)
+
+
+def load_window_archive_requests(path: Path) -> Tuple[ArchiveRequest, ...]:
+    return window_archive_requests(_read_json_file(path, "windows manifest"))
+
+
+def _update_gap_days(
+    path: Path,
+    label: str,
+    row_requests: Sequence[Tuple[Mapping[str, Any], Tuple[ArchiveRequest, ...]]],
+    attempted: Iterable[ArchiveRequest],
+    gaps: Iterable[ArchiveRequest],
+    payload: Any,
+) -> None:
+    attempted_set = set(attempted)
+    gap_set = set(gaps)
+    for row, requests in row_requests:
+        relevant = {request for request in requests if request in attempted_set}
+        by_day = {request.day for request in relevant}
+        missing_days = {
+            request.day for request in relevant if request in gap_set
+        }
+        existing_raw = row.get("gap_days", [])
+        if not isinstance(existing_raw, list):
+            raise InputError("%s gap_days is not a list" % label)
+        existing = {_coerce_day(value) for value in existing_raw}
+        old_gap_count = len(existing)
+        existing.difference_update(by_day)
+        existing.update(missing_days)
+        row["gap_days"] = [day.isoformat() for day in sorted(existing)]
+        if "days_available" in row:
+            days_available = row["days_available"]
+            if (
+                isinstance(days_available, bool)
+                or not isinstance(days_available, int)
+                or days_available < 0
+            ):
+                raise InputError("%s days_available is invalid" % label)
+            adjusted = days_available + old_gap_count - len(existing)
+            if adjusted < 0:
+                raise InputError("%s days_available would become negative" % label)
+            row["days_available"] = adjusted
+    _atomic_write_json(path, payload)
+
+
+def update_cohort_gap_days(
+    path: Path,
+    attempted: Iterable[ArchiveRequest],
+    gaps: Iterable[ArchiveRequest],
+) -> None:
+    payload = _read_json_file(path, "cohort manifest")
+    entries = parse_cohort_manifest(payload)
+    attempted_tuple = tuple(attempted)
+    rows = []
+    for row, entry in zip(payload, entries):
+        requests = tuple(
+            request
+            for request in attempted_tuple
+            if request.symbol == entry.symbol
+        )
+        rows.append((row, requests))
+    _update_gap_days(
+        Path(path), "cohort manifest", rows, attempted_tuple, gaps, payload
+    )
+
+
+def update_window_gap_days(
+    path: Path,
+    attempted: Iterable[ArchiveRequest],
+    gaps: Iterable[ArchiveRequest],
+) -> None:
+    payload = _read_json_file(path, "windows manifest")
+    raw_rows = _window_rows(payload)
+    attempted_tuple = tuple(attempted)
+    rows = []
+    for row in raw_rows:
+        requests = window_archive_requests([row])
+        rows.append((row, requests))
+    _update_gap_days(
+        Path(path), "windows manifest", rows, attempted_tuple, gaps, payload
+    )
+
+
 def format_progress(result: DownloadResult) -> str:
-    return "%s | %s | %s | bytes=%d | zip=ok" % (
+    return "%s | %s | %s | venue=%s | bytes=%d | zip=ok" % (
         result.status,
         result.symbol,
         result.day.isoformat(),
+        result.venue,
         result.size_bytes,
     )
+
+
+def _pull_archive_requests(
+    requests: Sequence[ArchiveRequest],
+    destination: Path,
+    downloader: Callable[..., DownloadResult],
+    *,
+    opener: Optional[Callable[..., Any]],
+    sleep_fn: Callable[[float], None],
+    emit: Callable[[str], None],
+) -> Tuple[List[DownloadResult], List[ArchiveRequest]]:
+    results: List[DownloadResult] = []
+    gaps: List[ArchiveRequest] = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                downloader,
+                request.symbol,
+                request.day,
+                destination,
+                venue=request.venue,
+                opener=opener,
+                sleep_fn=sleep_fn,
+            ): request
+            for request in requests
+        }
+        for future in as_completed(futures):
+            request = futures[future]
+            try:
+                result = future.result()
+            except ArchiveMissing:
+                gaps.append(request)
+                emit(
+                    "GAP | %s | %s | venue=%s | reason=archive_absent"
+                    % (request.symbol, request.day.isoformat(), request.venue)
+                )
+                continue
+            results.append(result)
+            emit(format_progress(result))
+    gaps.sort(key=lambda item: (item.day, item.symbol, item.venue))
+    return results, gaps
+
+
+def pull_cohort_file(
+    cohort_file: Path,
+    days: int,
+    destination: Path,
+    *,
+    now: Optional[datetime] = None,
+    opener: Optional[Callable[..., Any]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    emit: Callable[[str], None] = print,
+) -> ManifestPullSummary:
+    """Pull only manifest-declared spot/perpetual kline archives."""
+    entries = load_cohort_manifest(cohort_file)
+    requested_days = completed_utc_days(days, now)
+    requests = cohort_archive_requests(entries, requested_days)
+    emit(
+        "MODE | cohort_file | symbols=%d | requests=%d | workers=%d"
+        % (len(entries), len(requests), MAX_WORKERS)
+    )
+    results, gaps = _pull_archive_requests(
+        requests,
+        Path(destination),
+        download_kline,
+        opener=opener,
+        sleep_fn=sleep_fn,
+        emit=emit,
+    )
+    update_cohort_gap_days(cohort_file, requests, gaps)
+    downloaded = sum(result.status == "DOWNLOADED" for result in results)
+    skipped = sum(result.status == "SKIPPED" for result in results)
+    emit(
+        "DONE | mode=cohort_file | symbols=%d | requests=%d | "
+        "downloaded=%d | skipped=%d | gaps=%d"
+        % (len(entries), len(requests), downloaded, skipped, len(gaps))
+    )
+    return ManifestPullSummary(
+        "cohort_file",
+        tuple(entry.symbol for entry in entries),
+        len(requests),
+        downloaded,
+        skipped,
+        tuple(gaps),
+    )
+
+
+def pull_windows_file(
+    windows_file: Path,
+    destination: Path,
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    emit: Callable[[str], None] = print,
+) -> ManifestPullSummary:
+    """Pull daily aggTrades archives only for days touched by explicit windows."""
+    payload = _read_json_file(windows_file, "windows manifest")
+    requests = window_archive_requests(payload)
+    symbols = tuple(dict.fromkeys(request.symbol for request in requests))
+    emit(
+        "MODE | windows_file | symbols=%d | requests=%d | workers=%d"
+        % (len(symbols), len(requests), MAX_WORKERS)
+    )
+    results, gaps = _pull_archive_requests(
+        requests,
+        Path(destination),
+        download_agg_trades,
+        opener=opener,
+        sleep_fn=sleep_fn,
+        emit=emit,
+    )
+    update_window_gap_days(windows_file, requests, gaps)
+    downloaded = sum(result.status == "DOWNLOADED" for result in results)
+    skipped = sum(result.status == "SKIPPED" for result in results)
+    emit(
+        "DONE | mode=windows_file | symbols=%d | requests=%d | "
+        "downloaded=%d | skipped=%d | gaps=%d"
+        % (len(symbols), len(requests), downloaded, skipped, len(gaps))
+    )
+    return ManifestPullSummary(
+        "windows_file",
+        symbols,
+        len(requests),
+        downloaded,
+        skipped,
+        tuple(gaps),
+    )
+
+
+def _normalize_funding_records(
+    payload: Any, symbol: str, start_time_ms: int, end_time_ms: int
+) -> List[Dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise ArchiveError("funding history response is not a list")
+    records: Dict[int, Dict[str, Any]] = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            raise ArchiveError("funding history row is not an object")
+        if row.get("symbol") != symbol:
+            raise ArchiveError("funding history row has the wrong symbol")
+        funding_time = row.get("fundingTime")
+        if isinstance(funding_time, bool) or not isinstance(funding_time, int):
+            raise ArchiveError("funding history timestamp is invalid")
+        if not start_time_ms <= funding_time <= end_time_ms:
+            raise ArchiveError("funding history timestamp is outside request")
+        raw_rate = row.get("fundingRate")
+        if not isinstance(raw_rate, str):
+            raise ArchiveError("funding rate is not decimal text")
+        try:
+            rate = Decimal(raw_rate)
+        except (InvalidOperation, ValueError) as error:
+            raise ArchiveError("funding rate is not decimal text") from error
+        if not rate.is_finite() or abs(rate) > Decimal("0.1"):
+            raise ArchiveError("funding rate is outside bounds")
+        normalized: Dict[str, Any] = {
+            "symbol": symbol,
+            "fundingTime": funding_time,
+            "fundingRate": raw_rate,
+        }
+        if "markPrice" in row:
+            raw_mark = row["markPrice"]
+            if not isinstance(raw_mark, str):
+                raise ArchiveError("funding mark price is not decimal text")
+            try:
+                mark = Decimal(raw_mark)
+            except (InvalidOperation, ValueError) as error:
+                raise ArchiveError("funding mark price is not decimal text") from error
+            if not mark.is_finite() or mark <= 0:
+                raise ArchiveError("funding mark price is outside bounds")
+            normalized["markPrice"] = raw_mark
+        existing = records.get(funding_time)
+        if existing is not None and existing != normalized:
+            raise ArchiveError("funding history timestamp has conflicting rows")
+        records[funding_time] = normalized
+    return [records[key] for key in sorted(records)]
+
+
+def fetch_funding_history(
+    symbol: str,
+    start_day: Any,
+    end_day: Any,
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> List[Dict[str, Any]]:
+    symbol = _validate_symbol(symbol)
+    first = _coerce_day(start_day)
+    last = _coerce_day(end_day)
+    if last < first:
+        raise InputError("funding day range is reversed")
+    start_time_ms = _day_start_ms(first)
+    end_time_ms = _day_start_ms(last + timedelta(days=1)) - 1
+    cursor = start_time_ms
+    records: List[Dict[str, Any]] = []
+    for page_number in range(MAX_FUNDING_PAGES):
+        payload = fetch_json(
+            funding_rate_url(symbol, cursor, end_time_ms),
+            opener=opener,
+            sleep_fn=sleep_fn,
+        )
+        page = _normalize_funding_records(
+            payload, symbol, cursor, end_time_ms
+        )
+        records.extend(page)
+        if not page or len(payload) < FUNDING_PAGE_LIMIT:
+            break
+        last_time = page[-1]["fundingTime"]
+        if last_time >= end_time_ms:
+            break
+        cursor = last_time + 1
+    else:
+        raise PublicReadError("funding history exceeded pagination bound")
+    return _normalize_funding_records(
+        records, symbol, start_time_ms, end_time_ms
+    )
+
+
+def verify_funding_file(
+    path: Path, symbol: str, start_day: Any, end_day: Any
+) -> int:
+    symbol = _validate_symbol(symbol)
+    first = _coerce_day(start_day)
+    last = _coerce_day(end_day)
+    payload = _read_json_file(path, "funding history")
+    records = _normalize_funding_records(
+        payload,
+        symbol,
+        _day_start_ms(first),
+        _day_start_ms(last + timedelta(days=1)) - 1,
+    )
+    if records != payload:
+        raise ArchiveError("funding history file is not canonical")
+    return len(records)
+
+
+def download_funding_history(
+    symbol: str,
+    start_day: Any,
+    end_day: Any,
+    destination: Path,
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> FundingResult:
+    symbol = _validate_symbol(symbol)
+    first = _coerce_day(start_day)
+    last = _coerce_day(end_day)
+    target = funding_path(destination, symbol, first, last)
+    if target.exists():
+        record_count = verify_funding_file(target, symbol, first, last)
+        return FundingResult(
+            "SKIPPED",
+            symbol,
+            first,
+            last,
+            target,
+            target.stat().st_size,
+            record_count,
+        )
+    records = fetch_funding_history(
+        symbol, first, last, opener=opener, sleep_fn=sleep_fn
+    )
+    if target.exists():
+        record_count = verify_funding_file(target, symbol, first, last)
+        return FundingResult(
+            "SKIPPED",
+            symbol,
+            first,
+            last,
+            target,
+            target.stat().st_size,
+            record_count,
+        )
+    size_bytes = _atomic_write_json(target, records)
+    verify_funding_file(target, symbol, first, last)
+    return FundingResult(
+        "DOWNLOADED",
+        symbol,
+        first,
+        last,
+        target,
+        size_bytes,
+        len(records),
+    )
+
+
+def pull_funding(
+    cohort_file: Path,
+    days: int,
+    destination: Path,
+    *,
+    now: Optional[datetime] = None,
+    opener: Optional[Callable[..., Any]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    emit: Callable[[str], None] = print,
+) -> FundingPullSummary:
+    entries = load_cohort_manifest(cohort_file)
+    requested_days = completed_utc_days(days, now)
+    symbols = tuple(
+        entry.symbol
+        for entry in entries
+        if VENUE_FUTURES in _venues_for_class(entry.venue_class)
+    )
+    emit(
+        "MODE | funding | perp_symbols=%d | days=%d | workers=%d"
+        % (len(symbols), len(requested_days), MAX_WORKERS)
+    )
+    results: List[FundingResult] = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                download_funding_history,
+                symbol,
+                requested_days[0],
+                requested_days[-1],
+                Path(destination),
+                opener=opener,
+                sleep_fn=sleep_fn,
+            ): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            emit(
+                "%s | %s | %s..%s | records=%d | bytes=%d | json=ok"
+                % (
+                    result.status,
+                    result.symbol,
+                    result.start_day.isoformat(),
+                    result.end_day.isoformat(),
+                    result.records,
+                    result.size_bytes,
+                )
+            )
+    downloaded = sum(result.status == "DOWNLOADED" for result in results)
+    skipped = sum(result.status == "SKIPPED" for result in results)
+    record_count = sum(result.records for result in results)
+    emit(
+        "DONE | mode=funding | symbols=%d | downloaded=%d | skipped=%d | records=%d"
+        % (len(symbols), downloaded, skipped, record_count)
+    )
+    return FundingPullSummary(symbols, downloaded, skipped, record_count)
 
 
 def _ranking_archive(
@@ -644,6 +1553,10 @@ def pull_tapes(
     emit: Callable[[str], None] = print,
 ) -> PullSummary:
     """Discover, rank, and materialize one historical tape cohort."""
+    if agg_trades:
+        raise InputError(
+            "indiscriminate aggTrades pulls are disabled; use --windows-file"
+        )
     requested_days = completed_utc_days(days, now)
     if (
         isinstance(cohort, bool)
@@ -762,29 +1675,6 @@ def pull_tapes(
                 results.append(result)
                 emit(format_progress(result))
 
-        if agg_trades:
-            trade_archives = [
-                (symbol, day)
-                for symbol in selected
-                for day in requested_days
-            ]
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {
-                    executor.submit(
-                        download_agg_trades,
-                        symbol,
-                        day,
-                        destination,
-                        opener=opener,
-                        sleep_fn=sleep_fn,
-                    ): (symbol, day)
-                    for symbol, day in trade_archives
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
-                emit(format_progress(result))
-
     downloaded = sum(result.status == "DOWNLOADED" for result in results)
     skipped = sum(result.status == "SKIPPED" for result in results)
     gaps.sort(key=lambda item: (item[1], item[0]))
@@ -817,7 +1707,18 @@ def _bounded_positive(value: str, name: str, maximum: int) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Pull verified Binance Vision spot 1m daily tapes."
+        description="Pull verified Binance Vision V2 historical tapes."
+    )
+    manifest_group = parser.add_mutually_exclusive_group()
+    manifest_group.add_argument(
+        "--cohort-file",
+        type=Path,
+        help="V2 cohort manifest; pull exactly its venue-aware symbols",
+    )
+    manifest_group.add_argument(
+        "--windows-file",
+        type=Path,
+        help="V2 windows manifest; pull aggTrades only for its UTC days",
     )
     parser.add_argument(
         "--cohort",
@@ -840,20 +1741,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--agg-trades",
         action="store_true",
-        help="also pull verified daily spot aggTrades archives",
+        help="deprecated; explicit --windows-file is required for aggTrades",
+    )
+    parser.add_argument(
+        "--funding",
+        action="store_true",
+        help="with --cohort-file, pull public history for each perp symbol",
     )
     return parser
+
+
+def selected_mode(arguments: argparse.Namespace) -> str:
+    if arguments.funding:
+        if arguments.cohort_file is None or arguments.windows_file is not None:
+            raise InputError("--funding requires --cohort-file")
+        if arguments.agg_trades:
+            raise InputError("--funding cannot be combined with --agg-trades")
+        return "funding"
+    if arguments.windows_file is not None:
+        return "windows_file"
+    if arguments.cohort_file is not None:
+        if arguments.agg_trades:
+            raise InputError("use --windows-file for manifest-scoped aggTrades")
+        return "cohort_file"
+    return "ranked"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
-        pull_tapes(
-            arguments.cohort,
-            arguments.days,
-            arguments.dest,
-            agg_trades=arguments.agg_trades,
-        )
+        mode = selected_mode(arguments)
+        if mode == "cohort_file":
+            pull_cohort_file(
+                arguments.cohort_file, arguments.days, arguments.dest
+            )
+        elif mode == "windows_file":
+            pull_windows_file(arguments.windows_file, arguments.dest)
+        elif mode == "funding":
+            pull_funding(arguments.cohort_file, arguments.days, arguments.dest)
+        else:
+            pull_tapes(
+                arguments.cohort,
+                arguments.days,
+                arguments.dest,
+                agg_trades=arguments.agg_trades,
+            )
     except TapePullError as error:
         print("ERROR | %s | %s" % (type(error).__name__, error), file=sys.stderr)
         return 1
