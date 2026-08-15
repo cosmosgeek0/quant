@@ -451,6 +451,17 @@ def _decision_rows_equivalent(
         {k: v for k, v in b.items() if k not in strip}
 
 
+def _is_fresh_redecision(
+    existing: Mapping[str, Any], new: Mapping[str, Any]
+) -> bool:
+    """Same deterministic id over a NEW observation: a re-decision of the
+    same lifecycle step on fresh data — benign, newest wins. Only a content
+    mismatch over the SAME observation is corruption."""
+    old_obs = existing.get("observation_id")
+    new_obs = new.get("observation_id")
+    return bool(old_obs) and bool(new_obs) and old_obs != new_obs
+
+
 def _index_decision(index: _DecisionIndex, row: Mapping[str, Any]) -> None:
     copied = dict(row)
     decision_id = copied.get("decision_id")
@@ -458,7 +469,16 @@ def _index_decision(index: _DecisionIndex, row: Mapping[str, Any]) -> None:
         existing = index.rows_by_id.get(decision_id)
         if existing is not None:
             if not _decision_rows_equivalent(existing, copied):
-                raise MomentumLiveError(f"decision id conflict: {decision_id}")
+                if not _is_fresh_redecision(existing, copied):
+                    keys = sorted(
+                        k for k in set(existing) | set(copied)
+                        if k not in _DECISION_VOLATILE_FIELDS
+                        and existing.get(k) != copied.get(k)
+                    )
+                    raise MomentumLiveError(
+                        f"decision id conflict: {decision_id} fields={keys}"
+                    )
+                index.rows_by_id[decision_id] = copied
             return
         index.rows_by_id[decision_id] = copied
     symbol = copied.get("symbol")
@@ -920,8 +940,17 @@ def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
     index = _decision_index(path)
     existing = index.rows_by_id.get(decision_id)
     if existing is not None:
-        if not _decision_rows_equivalent(existing, dict(row)):
-            raise MomentumLiveError(f"decision id conflict: {decision_id}")
+        fresh_row = dict(row)
+        if not _decision_rows_equivalent(existing, fresh_row) \
+                and not _is_fresh_redecision(existing, fresh_row):
+            keys = sorted(
+                k for k in set(existing) | set(fresh_row)
+                if k not in _DECISION_VOLATILE_FIELDS
+                and existing.get(k) != fresh_row.get(k)
+            )
+            raise MomentumLiveError(
+                f"decision id conflict: {decision_id} fields={keys}"
+            )
         repaired = False
         if index.backup_repair is not None:
             _replace_decision_payload(
