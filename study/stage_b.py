@@ -29,6 +29,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+try:
+    from study.windows import validate_symbol
+    from study.windows import WindowError as SymbolValidationError
+except ModuleNotFoundError as error:
+    if error.name != "study":
+        raise
+    from windows import validate_symbol
+    from windows import WindowError as SymbolValidationError
+
+
 STUDY_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = STUDY_DIR / "data"
 DEFAULT_MANIFEST = STUDY_DIR / "out" / "v2" / "windows_manifest.json"
@@ -39,13 +49,12 @@ FROZEN_PRE_MINUTES = 60
 FROZEN_POST_MINUTES = 120
 MAX_MEMBER_BYTES = 512_000_000
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{5,30}")
 AGG_ARCHIVE = re.compile(
-    r"^(?P<symbol>[A-Z0-9]{5,30})-aggTrades-"
+    r"^(?P<symbol>.+)-aggTrades-"
     r"(?P<day>\d{4}-\d{2}-\d{2})\.zip$"
 )
 KLINE_ARCHIVE = re.compile(
-    r"^(?P<symbol>[A-Z0-9]{5,30})-1m-"
+    r"^(?P<symbol>.+)-1m-"
     r"(?P<day>\d{4}-\d{2}-\d{2})\.zip$"
 )
 QUANTILES = (
@@ -281,9 +290,10 @@ def _window_spec(raw: Mapping[str, Any], index: int) -> WindowSpec:
     symbol_raw = _lookup(raw, ("symbol",))
     if not isinstance(symbol_raw, str):
         raise StageBError(f"window {index} has no symbol")
-    symbol = symbol_raw.strip().upper()
-    if SYMBOL_PATTERN.fullmatch(symbol) is None:
-        raise StageBError(f"window {index} has an invalid symbol")
+    try:
+        symbol = validate_symbol(symbol_raw, f"window {index} symbol")
+    except SymbolValidationError:
+        raise StageBError(f"window {index} has an invalid symbol") from None
 
     venue_class_raw = _lookup(raw, ("venue_class", "venueClass"))
     venue_raw = _lookup(raw, ("tape_venue", "venue", "market_type"))
@@ -638,10 +648,24 @@ def _single_zip_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]
     return archive, member
 
 
-def _archive_day(path: Path, pattern: re.Pattern) -> date:
+def _archive_name_match(
+    path: Path, pattern: re.Pattern
+) -> Optional[Tuple[re.Match, str]]:
     match = pattern.fullmatch(path.name)
     if match is None:
+        return None
+    try:
+        symbol = validate_symbol(match.group("symbol"), f"{path.name} symbol")
+    except SymbolValidationError:
+        return None
+    return match, symbol
+
+
+def _archive_day(path: Path, pattern: re.Pattern) -> date:
+    parsed = _archive_name_match(path, pattern)
+    if parsed is None:
         raise StageBError(f"archive name is not recognized: {path.name}")
+    match, _ = parsed
     try:
         parsed = date.fromisoformat(match.group("day"))
     except ValueError:
@@ -655,8 +679,8 @@ def _agg_trade_rows(
     start_ms: int,
     end_ms: int,
 ) -> Iterable[AggTrade]:
-    match = AGG_ARCHIVE.fullmatch(path.name)
-    if match is None or match.group("symbol") != symbol:
+    parsed = _archive_name_match(path, AGG_ARCHIVE)
+    if parsed is None or parsed[1] != symbol:
         raise StageBError(f"aggTrades archive does not match {symbol}: {path.name}")
     archive_day = _archive_day(path, AGG_ARCHIVE)
     expected = path.stem + ".csv"
@@ -1047,8 +1071,8 @@ def _kline_rows(
     start_ms: int,
     end_ms: int,
 ) -> Iterable[KlineBar]:
-    match = KLINE_ARCHIVE.fullmatch(path.name)
-    if match is None or match.group("symbol") != symbol:
+    parsed = _archive_name_match(path, KLINE_ARCHIVE)
+    if parsed is None or parsed[1] != symbol:
         raise StageBError(f"kline archive does not match {symbol}: {path.name}")
     archive_day = _archive_day(path, KLINE_ARCHIVE)
     expected = path.stem + ".csv"

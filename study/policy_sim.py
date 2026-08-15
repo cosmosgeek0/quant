@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,11 +26,20 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+try:
+    from study.windows import validate_symbol
+    from study.windows import WindowError as SymbolValidationError
+except ModuleNotFoundError as error:
+    if error.name != "study":
+        raise
+    from windows import validate_symbol
+    from windows import WindowError as SymbolValidationError
+
+
 STUDY_DIR = Path(__file__).resolve().parent
 DEFAULT_EVENTS_PATH = STUDY_DIR / "out" / "v2" / "events.jsonl"
 DEFAULT_TAPE_PATH = STUDY_DIR / "out" / "v2" / "tape_prices.jsonl"
 DEFAULT_OUTPUT_PATH = STUDY_DIR / "out" / "v2" / "trades.jsonl"
-SYMBOL = re.compile(r"[A-Z0-9]{5,30}")
 VENUE_CLASSES = ("spot_only", "futures_only", "both")
 MINUTE_MS = 60_000
 PERCENT_QUANTUM = Decimal("0.000000000000000001")
@@ -322,8 +330,11 @@ class LabelledEvent:
     def __post_init__(self) -> None:
         if type(self.event_id) is not str or not self.event_id:
             raise PolicySimError("event_id must be non-empty text")
-        if type(self.symbol) is not str or SYMBOL.fullmatch(self.symbol) is None:
-            raise PolicySimError("event symbol is invalid")
+        try:
+            symbol = validate_symbol(self.symbol, "event symbol")
+        except SymbolValidationError:
+            raise PolicySimError("event symbol is invalid") from None
+        object.__setattr__(self, "symbol", symbol)
         if type(self.label) is not str or not self.label:
             raise PolicySimError("event label must be non-empty text")
         if self.venue_class not in VENUE_CLASSES:
@@ -354,8 +365,11 @@ class TapePrice:
     price: Decimal
 
     def __post_init__(self) -> None:
-        if type(self.symbol) is not str or SYMBOL.fullmatch(self.symbol) is None:
-            raise PolicySimError("tape symbol is invalid")
+        try:
+            symbol = validate_symbol(self.symbol, "tape symbol")
+        except SymbolValidationError:
+            raise PolicySimError("tape symbol is invalid") from None
+        object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "venue", _normalize_venue(self.venue, "tape venue"))
         timestamp_ms = _timestamp_ms(self.timestamp_ms, "tape timestamp_ms")
         object.__setattr__(self, "timestamp_ms", timestamp_ms)

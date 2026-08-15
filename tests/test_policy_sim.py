@@ -14,12 +14,17 @@ from study import validate
 
 BASE_MS = 1_767_225_600_000
 SYMBOL = "RUNUSDT"
+FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "stage_a_line197191_event.json"
+)
 
 
-def event(*, venue_class="spot_only", venue=None):
+def event(*, symbol=SYMBOL, venue_class="spot_only", venue=None):
     return sim.LabelledEvent(
         event_id="runner-1",
-        symbol=SYMBOL,
+        symbol=symbol,
         label="GenuineRunner",
         venue_class=venue_class,
         event_time_ms=BASE_MS,
@@ -28,9 +33,9 @@ def event(*, venue_class="spot_only", venue=None):
     )
 
 
-def price(minute, value, *, venue="spot"):
+def price(minute, value, *, symbol=SYMBOL, venue="spot"):
     return sim.TapePrice(
-        symbol=SYMBOL,
+        symbol=symbol,
         venue=venue,
         timestamp_ms=BASE_MS + minute * sim.MINUTE_MS,
         price=Decimal(value),
@@ -62,6 +67,55 @@ def assert_no_float(test, value):
     elif isinstance(value, (list, tuple)):
         for nested in value:
             assert_no_float(test, nested)
+
+
+class PolicySymbolValidationTests(unittest.TestCase):
+    def test_fixture_and_plain_ascii_symbols_pass_value_validation(self):
+        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        fixture_symbol = fixture["symbol"]
+
+        self.assertEqual(event(symbol=fixture_symbol).symbol, fixture_symbol)
+        self.assertEqual(price(0, "1", symbol=fixture_symbol).symbol, fixture_symbol)
+        self.assertEqual(event().symbol, SYMBOL)
+        self.assertEqual(price(0, "1").symbol, SYMBOL)
+
+    def test_traversal_symbol_keeps_policy_error_types_and_messages(self):
+        with self.assertRaisesRegex(
+            sim.PolicySimError, "^event symbol is invalid$"
+        ):
+            event(symbol="../RUNUSDT")
+        with self.assertRaisesRegex(
+            sim.PolicySimError, "^tape symbol is invalid$"
+        ):
+            price(0, "1", symbol="../RUNUSDT")
+
+    def test_fixture_symbol_loads_from_synthetic_data_files(self):
+        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        symbol = fixture["symbol"]
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        events_path = root / f"{symbol}-events.jsonl"
+        tape_path = root / f"{symbol}-tape.jsonl"
+        events_path.write_text(json.dumps(fixture) + "\n", encoding="utf-8")
+        tape_path.write_text(
+            json.dumps(
+                {
+                    "symbol": symbol,
+                    "venue": "spot",
+                    "timestamp_ms": fixture["open_ms"],
+                    "price": "1",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        loaded_event = sim.load_events(events_path)[0]
+        loaded_price = sim.load_tape_prices(tape_path)[0]
+
+        self.assertEqual(loaded_event.symbol, symbol)
+        self.assertEqual(loaded_price.symbol, symbol)
 
 
 class PolicySimulationTests(unittest.TestCase):

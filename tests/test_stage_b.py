@@ -15,6 +15,11 @@ from study import stage_b
 BASE_MS = 1_767_225_600_000
 DAY = "2026-01-01"
 SYMBOL = "AAAUSDT"
+FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "stage_a_line197191_event.json"
+)
 
 
 def trade(
@@ -114,6 +119,82 @@ def no_float(test, value):
             no_float(test, item)
     else:
         test.assertNotIsInstance(value, float)
+
+
+class StageBSymbolValidationTests(unittest.TestCase):
+    @staticmethod
+    def window(symbol):
+        return stage_b._window_spec(
+            {
+                "window_id": "symbol-check",
+                "symbol": symbol,
+                "venue_class": "spot_only",
+                "venue": "spot",
+                "window_start_ms": BASE_MS,
+                "event_ms": BASE_MS + 60_000,
+                "window_end_ms": BASE_MS + 120_000,
+            },
+            0,
+        )
+
+    def test_fixture_and_plain_ascii_symbols_pass_value_validation(self):
+        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(self.window(fixture["symbol"]).symbol, fixture["symbol"])
+        self.assertEqual(self.window(SYMBOL).symbol, SYMBOL)
+        self.assertEqual(self.window(SYMBOL.lower()).symbol, SYMBOL)
+
+    def test_traversal_symbol_is_refused_by_value_and_filename_validation(self):
+        with self.assertRaisesRegex(
+            stage_b.StageBError, "^window 0 has an invalid symbol$"
+        ):
+            self.window("../AAAUSDT")
+
+        filename_cases = (
+            (stage_b.AGG_ARCHIVE, f"AAA..USDT-aggTrades-{DAY}.zip"),
+            (stage_b.KLINE_ARCHIVE, f"AAA..USDT-1m-{DAY}.zip"),
+        )
+        for pattern, filename in filename_cases:
+            with self.subTest(filename=filename):
+                self.assertIsNone(
+                    stage_b._archive_name_match(Path(filename), pattern)
+                )
+                self.assertIsNone(
+                    stage_b._archive_name_match(Path("unrelated.zip"), pattern)
+                )
+
+    def test_fixture_symbol_is_extracted_from_both_archive_filenames(self):
+        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        symbol = fixture["symbol"]
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        agg_path = write_agg_zip(
+            root,
+            symbol,
+            (trade(1, 0, "1", buyer_is_maker=False),),
+        )
+        kline_path = write_kline_zip(root, symbol, (("101", "100"),))
+
+        agg_match = stage_b._archive_name_match(
+            agg_path, stage_b.AGG_ARCHIVE
+        )
+        kline_match = stage_b._archive_name_match(
+            kline_path, stage_b.KLINE_ARCHIVE
+        )
+        self.assertIsNotNone(agg_match)
+        self.assertIsNotNone(kline_match)
+        self.assertEqual(agg_match[1], symbol)
+        self.assertEqual(kline_match[1], symbol)
+
+        trades = stage_b.load_agg_trades(
+            (agg_path,), symbol, BASE_MS, BASE_MS + 60_000
+        )
+        bars = stage_b.load_klines(
+            (kline_path,), symbol, BASE_MS, BASE_MS + 60_000
+        )
+        self.assertEqual(trades[0].symbol, symbol)
+        self.assertEqual(bars[0].symbol, symbol)
 
 
 class StageBFeatureTests(unittest.TestCase):
