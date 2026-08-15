@@ -67,6 +67,9 @@
     padding: 14px 0 14px;
     width: 64px;
     transition: width 200ms cubic-bezier(0.2, 0, 0, 1);
+    position: sticky;
+    top: 0;
+    height: 100vh;
   }
 
   .side-top { display: flex; align-items: center; justify-content: center; min-height: 40px; }
@@ -191,6 +194,9 @@
     align-items: center;
     padding: 12px 0;
     gap: 10px;
+    position: sticky;
+    top: 0;
+    height: 100vh;
   }
   .rbtn {
     width: 36px; height: 36px;
@@ -262,9 +268,9 @@
   /* News v4 — decongested top, two-column body: list left, dedicated
      Sources box + Activity box on the right (owner-sanctioned boxes:
      functional containers, 1px line, small radius). */
-  .news-page { max-width: none; margin: 0; padding: 32px 40px 56px; }
+  .news-page { max-width: none; margin: 0; padding: 40px 40px 56px; }
   .news-head { display: flex; align-items: center; gap: 14px; }
-  .news-title { font-size: 22px; font-weight: 650; color: var(--ink); letter-spacing: -0.01em; }
+  .news-title { font-size: 26px; font-weight: 650; color: var(--ink); letter-spacing: -0.015em; }
   .news-live { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
   .news-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
   .refresh-btn {
@@ -281,7 +287,7 @@
   .refresh-btn.busy svg { animation: spin 900ms linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .news-upd { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums lining-nums; }
-  .news-upd.stale { color: #ca8a04; }
+  .news-upd.stale { color: #d4a406; }
   .bar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
   .master-wrap { display: flex; align-items: center; gap: 8px; }
   .master-wrap .mlabel { font-size: 12.5px; color: var(--muted); }
@@ -291,8 +297,8 @@
     border: 1px solid var(--line-2);
     border-radius: 12px;
     background: none;
-    padding: 10px 17px 11px;
-    min-width: 102px;
+    padding: 11px 18px 12px;
+    min-width: 122px;
     cursor: pointer;
     text-align: left;
     transition: background var(--t), border-color var(--t);
@@ -301,9 +307,12 @@
   .day.on { background: var(--pill); border-color: transparent; }
   .day.dim { opacity: 0.45; }
   .day .d1 { display: block; font-size: 13px; font-weight: 600; color: var(--ink); }
-  .day .d2 { display: block; font-size: 11.5px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums lining-nums; }
-  .day .d2 .hh { color: #16a34a; font-weight: 600; }
-  .day .d2 .mm { color: #3b82f6; font-weight: 600; }
+  .day .d2 { display: flex; gap: 9px; font-size: 11px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums lining-nums; align-items: baseline; }
+  .day .d2 .lt { font-size: 12.5px; font-weight: 650; }
+  .day .d2 .lt.h { color: #16a34a; }
+  .day .d2 .lt.m { color: #3b82f6; }
+  .day .d2 .lt.l { color: #d4a406; }
+  .day .d2 .nm2 { font-size: 10.5px; color: var(--muted); margin-left: 2px; }
 
   .pillbar { display: flex; align-items: center; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
   .fpill {
@@ -328,7 +337,7 @@
   .bars rect { fill: var(--faint); }
   .bars.b3 rect { fill: #16a34a; }
   .bars.b2 rect.r1, .bars.b2 rect.r2 { fill: #3b82f6; }
-  .bars.b1 rect.r1 { fill: #ca8a04; }
+  .bars.b1 rect.r1 { fill: #eab308; }
 
   .news-cols { display: flex; gap: 32px; margin-top: 22px; align-items: flex-start; }
   .news-maincol { flex: 1; min-width: 0; }

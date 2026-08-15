@@ -564,8 +564,8 @@
   var newsPage = 1;
 
   function newsPageSize() {
-    var rows = Math.floor((window.innerHeight - 470) / 41);
-    return Math.max(15, Math.min(45, rows));
+    /* sized so the pager lands level with the right column's last box */
+    return 28;
   }
   var newsResizeTimer = null;
   window.addEventListener("resize", function () {
@@ -718,7 +718,7 @@
     t.textContent = "Activity · 24h";
     var lgwrap = document.createElement("span");
     lgwrap.className = "rbox-sub act-h";
-    var defs = [["H", "#16a34a"], ["M", "#3b82f6"], ["L", "#ca8a04"]];
+    var defs = [["H", "#16a34a"], ["M", "#3b82f6"], ["L", "#eab308"]];
     for (var li2 = 0; li2 < defs.length; li2++) {
       var lg = document.createElement("span");
       lg.className = "lg";
@@ -764,7 +764,7 @@
       var hourLabel = ((nowHour - (23 - x)) % 24 + 24) % 24;
       var col = svgEl("g", {});
       var y = baseY;
-      var segs = [["l", "#ca8a04"], ["m", "#3b82f6"], ["h", "#16a34a"]];
+      var segs = [["l", "#eab308"], ["m", "#3b82f6"], ["h", "#16a34a"]];
       for (var s2 = 0; s2 < segs.length; s2++) {
         var n = bkt[segs[s2][0]];
         if (!n) { continue; }
@@ -1002,13 +1002,6 @@
     title.className = "news-title";
     title.textContent = "News";
     head.appendChild(title);
-    var liveLbl = document.createElement("span");
-    liveLbl.className = "news-live";
-    liveLbl.textContent = board.present
-      ? board.available + " sources · " + board.live + " live" +
-        (board.pending ? " · " + board.pending + " pending" : "")
-      : "";
-    head.appendChild(liveLbl);
     var right = document.createElement("div");
     right.className = "news-right";
     var masterWrap = document.createElement("span");
@@ -1061,14 +1054,16 @@
     var byDay = {};
     for (var bi = 0; bi < items.length; bi++) {
       var dkey = utcDate(items[bi].ts);
-      if (!byDay[dkey]) { byDay[dkey] = { n: 0, h: 0, m: 0 }; }
+      if (!byDay[dkey]) { byDay[dkey] = { n: 0, h: 0, m: 0, l: 0 }; }
       byDay[dkey].n += 1;
       var lv = newsLevel(items[bi]);
       if (lv === 3) { byDay[dkey].h += 1; }
-      if (lv === 2) { byDay[dkey].m += 1; }
+      else if (lv === 2) { byDay[dkey].m += 1; }
+      else { byDay[dkey].l += 1; }
     }
     var now2 = new Date();
-    var dayDefs = [{ key: "all", label: "All", sub: items.length + " items" }];
+    var dayDefs = [{ key: "all", label: "All",
+      sub: items.length + " · 7d" }];
     for (var dd = 6; dd >= 0; dd--) {
       var dt = new Date(now2.getTime() - dd * 86400000);
       var key = dt.toISOString().slice(0, 10);
@@ -1076,7 +1071,7 @@
         key: key,
         label: (dd === 0 ? "Today" :
           dayNames[dt.getUTCDay()] + " " + dt.getUTCDate()),
-        stats: byDay[key] || { n: 0, h: 0, m: 0 }
+        stats: byDay[key] || { n: 0, h: 0, m: 0, l: 0 }
       });
     }
     for (var di = 0; di < dayDefs.length; di++) {
@@ -1090,14 +1085,20 @@
         var l2 = document.createElement("span");
         l2.className = "d2";
         if (def.stats) {
-          l2.textContent = def.stats.n + " · ";
-          var hh = document.createElement("span");
-          hh.className = "hh"; hh.textContent = "H" + def.stats.h;
-          var mm = document.createElement("span");
-          mm.className = "mm"; mm.textContent = "M" + def.stats.m;
-          l2.appendChild(hh);
-          l2.appendChild(document.createTextNode(" "));
-          l2.appendChild(mm);
+          var trio = [["h", def.stats.h], ["m", def.stats.m],
+            ["l", def.stats.l]];
+          for (var ti = 0; ti < trio.length; ti++) {
+            var grp = document.createElement("span");
+            var lt = document.createElement("span");
+            lt.className = "lt " + trio[ti][0];
+            lt.textContent = trio[ti][0].toUpperCase();
+            var nm2 = document.createElement("span");
+            nm2.className = "nm2";
+            nm2.textContent = String(trio[ti][1]);
+            grp.appendChild(lt);
+            grp.appendChild(nm2);
+            l2.appendChild(grp);
+          }
         } else {
           l2.textContent = def.sub;
         }

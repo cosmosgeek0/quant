@@ -40,7 +40,7 @@ USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "Chrome/126.0.0.0 Safari/537.36")
 FETCH_TIMEOUT = 8
 CYCLE_WORKERS = 16
-MAX_ITEMS = 800
+MAX_ITEMS = 2000
 MAX_AGE_DAYS = 7
 MAX_TITLE_CHARS = 300
 
