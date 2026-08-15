@@ -89,6 +89,55 @@ class LeverageTransport:
         raise AssertionError("unexpected leverage transport call")
 
 
+class MarginTransport:
+    def __init__(self):
+        self.calls = []
+        self.operation = None
+        self.post_kind = "ok"
+        self.post_payload = {"tranId": 7301}
+        self.history_kind = "ok"
+        self.history_payload = None
+        self.account_kind = "ok"
+        self.account_payload = None
+
+    def __call__(self, method, base_url, path, params=None, signed=False):
+        params = dict(params or {})
+        call = (method, base_url, path, params, signed)
+        self.calls.append(call)
+        if base_url != jr.basis_executor.SPOT.base_url or not signed:
+            raise AssertionError("margin request was not a signed Spot call")
+        if method == "POST" and path == jr.MARGIN_ENDPOINT_PATH:
+            self.operation = dict(params)
+            return self.post_kind, self.post_payload
+        if method == "GET" and path == jr.MARGIN_ENDPOINT_PATH:
+            if self.history_payload is not None:
+                return self.history_kind, self.history_payload
+            transaction_id = str(
+                self.post_payload.get(
+                    "tranId", self.post_payload.get("txId", "")
+                )
+            )
+            return self.history_kind, {"rows": [{
+                "txId": transaction_id,
+                "asset": self.operation["asset"],
+                "principal": self.operation["amount"],
+                "interest": "0",
+                "status": "CONFIRMED",
+                "type": self.operation["type"],
+            }]}
+        if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
+            if self.account_payload is not None:
+                return self.account_kind, self.account_payload
+            borrowed = self.operation["amount"] \
+                if self.operation["type"] == "BORROW" else "0"
+            return self.account_kind, {"userAssets": [{
+                "asset": self.operation["asset"],
+                "borrowed": borrowed,
+                "interest": "0",
+            }]}
+        raise AssertionError("unexpected margin request")
+
+
 class MomentumReadTransport:
     """Serve complete signed momentum snapshots at the HTTP boundary."""
 
@@ -155,6 +204,7 @@ class JobRunnerTests(unittest.TestCase):
         self.hand_verdict = "CLOSED"
         self.hand_exit = 0
         self.leverage = LeverageTransport(self.events)
+        self.margin = MarginTransport()
         self.momentum_reads = MomentumReadTransport(self.events)
         self.momentum_intents = []
         self.momentum_order = None
@@ -257,6 +307,34 @@ class JobRunnerTests(unittest.TestCase):
             json.dump(value, handle)
         return path
 
+    def margin_job(self, job_id, op="MARGIN_BORROW", **overrides):
+        value = {
+            "job_id": job_id,
+            "op": op,
+            "asset": "USDT",
+            "principal": "3",
+            "created_utc": utc(NOW - timedelta(minutes=1)),
+            "expires_utc": utc(NOW + timedelta(minutes=10)),
+            "requested_by": "lead",
+            "operator_token": "lead",
+        }
+        explicit_tag = overrides.pop("client_tag", None)
+        value.update(overrides)
+        if explicit_tag is None:
+            try:
+                value["client_tag"] = jr.margin_ops.deterministic_client_tag(
+                    value["op"], value["asset"], value["principal"],
+                    value["expires_utc"],
+                )
+            except ValueError:
+                value["client_tag"] = "mrg-" + ("0" * 24)
+        else:
+            value["client_tag"] = explicit_tag
+        path = os.path.join(self.jobs_dir, "job-%s.json" % job_id)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        return path
+
     def write_operator(self, operator="lead"):
         path = os.path.join(self.receipt_dir, "OPERATOR")
         with open(path, "w", encoding="utf-8") as handle:
@@ -311,8 +389,12 @@ class JobRunnerTests(unittest.TestCase):
             json.dump({"verdict": "CLOSED"}, handle)
         return 0
 
-    def tick(self):
-        return jr.tick(receipt_dir=self.receipt_dir, now=NOW)
+    def tick(self, **kwargs):
+        return jr.tick(receipt_dir=self.receipt_dir, now=NOW, **kwargs)
+
+    def margin_tick(self, mutation_now=NOW, request=None):
+        with mock.patch.object(jr, "_utc_now", return_value=mutation_now):
+            return self.tick(margin_request=request or self.margin)
 
     def results(self):
         path = os.path.join(self.jobs_dir, "results.jsonl")
@@ -324,6 +406,14 @@ class JobRunnerTests(unittest.TestCase):
     def reason(self, row):
         with open(row["receipt_path"], encoding="utf-8") as handle:
             return json.load(handle)["reason"]
+
+    def margin_source(self, row):
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner_receipt = json.load(handle)
+        with open(
+                runner_receipt["source_receipt_path"],
+                encoding="utf-8") as handle:
+            return json.load(handle)
 
     def result_events(self, kind):
         return [row for row in self.results() if row.get("kind") == kind]
@@ -605,7 +695,10 @@ class JobRunnerTests(unittest.TestCase):
                 with self.subTest(marker=marker, op=op):
                     sequence += 1
                     job_id = "stopped-%s" % sequence
-                    self.job(job_id, op=op)
+                    if op in jr.MARGIN_OPS:
+                        self.margin_job(job_id, op=op)
+                    else:
+                        self.job(job_id, op=op)
                     for name in ("STOP", "STOP-JOBS"):
                         try:
                             os.unlink(os.path.join(self.receipt_dir, name))
@@ -619,8 +712,11 @@ class JobRunnerTests(unittest.TestCase):
                     row = self.results()[-1]
                     self.assertEqual(row["job_id"], job_id)
                     self.assertEqual(row["verdict"], "REFUSED")
+                    expected_reason = "STOP_JOBS_SEALED" \
+                        if marker == "STOP-JOBS" and op in jr.MARGIN_OPS \
+                        else "ENTRY_BLOCKED_NOT_ACCEPTED"
                     self.assertEqual(
-                        self.reason(row), "ENTRY_BLOCKED_NOT_ACCEPTED"
+                        self.reason(row), expected_reason
                     )
                     self.assertTrue(os.path.isfile(os.path.join(
                         self.jobs_dir, "claims", "job-%s.claim" % job_id
@@ -628,6 +724,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.hand_calls, [])
         self.assertEqual(self.basis_calls, [])
         self.assertEqual(self.momentum_intents, [])
+        self.assertEqual(self.margin.calls, [])
         self.assertEqual(self.governor_budget_calls, [])
 
     def test_accept_one_allows_sealed_entry_and_is_claimed_on_fill(self):
@@ -752,6 +849,200 @@ class JobRunnerTests(unittest.TestCase):
                     accept + ".claimed-" + job_id
                 ))
         self.assertEqual(self.hand_calls, [])
+        self.assertEqual(self.governor_budget_calls, [])
+
+    def test_margin_whitelist_accepts_exact_borrow_and_repay_jobs(self):
+        for op in sorted(jr.MARGIN_OPS):
+            with self.subTest(op=op):
+                job_id = "margin-shape-" + op.lower().replace("_", "-")
+                path = self.margin_job(job_id, op=op)
+                raw = jr._load_job(path)
+
+                job = jr._validate_job(
+                    raw, job_id, NOW, self.receipt_dir
+                )
+
+                self.assertEqual(job.op, op)
+                self.assertEqual(job.symbol, "USDT")
+                self.assertEqual(job.requested_max_notional, Decimal("3"))
+                self.assertEqual(job.effective_notional, Decimal("3"))
+                self.assertEqual(job.margin_operation["verdict"], "READY")
+                self.assertEqual(set(raw), jr.MARGIN_JOB_FIELDS)
+
+    def test_margin_runner_clamp_refuses_before_request(self):
+        self.margin_job("margin-cap", principal="3.01")
+
+        self.assertEqual(self.margin_tick(), 2)
+
+        self.assertEqual(jr.MARGIN_RUNNER_NOTIONAL_CAP, Decimal("3"))
+        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]),
+            "PRINCIPAL_CEILING_EXCEEDED",
+        )
+
+    def test_margin_trading_fields_are_forbidden(self):
+        cases = {
+            "leverage": "1",
+            "max_notional": "3",
+            "symbol": "TSTUSDT",
+            "venue": "spot",
+        }
+        for index, (field, value) in enumerate(sorted(cases.items())):
+            with self.subTest(field=field):
+                job_id = "margin-field-%s" % index
+                self.margin_job(job_id, **{field: value})
+
+                self.assertEqual(self.margin_tick(), 2)
+
+                row = self.results()[-1]
+                self.assertEqual(row["symbol"], "USDT")
+                self.assertEqual(self.reason(row), "FORBIDDEN_FIELD")
+        self.assertEqual(self.margin.calls, [])
+
+    def test_margin_expiry_at_mutation_refuses_without_post(self):
+        self.margin_job("margin-mutation-expiry")
+
+        code = self.margin_tick(
+            mutation_now=NOW + timedelta(minutes=10)
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(self.reason(self.results()[0]), "EXPIRED")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+        self.assertEqual(len(self.governor_releases), 1)
+
+    def test_margin_borrow_operator_token_must_match_owner(self):
+        self.margin_job("margin-owner", operator_token="another-operator")
+
+        self.assertEqual(self.margin_tick(), 2)
+
+        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            self.reason(self.results()[0]), "OPERATOR_MISMATCH"
+        )
+        self.assertEqual(self.governor_budget_calls, [])
+
+    def test_confirmed_margin_borrow_posts_once_and_claims_ticket(self):
+        self.margin_job("margin-borrow")
+
+        self.assertEqual(self.margin_tick(), 0)
+        self.assertEqual(self.margin_tick(), 0)
+
+        result = self.results()[0]
+        self.assertEqual((result["verdict"], result["symbol"]),
+                         ("OPEN", "USDT"))
+        posts = [call for call in self.margin.calls if call[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][3], {
+            "asset": "USDT", "amount": "3", "type": "BORROW",
+        })
+        self.assertEqual(self.leverage.calls, [])
+        source = self.margin_source(result)
+        self.assertEqual(source["mutation_attempts"], 1)
+        self.assertEqual(
+            source["ledger_confirmation"],
+            source["ready"]["expected_ledger_confirmation"],
+        )
+        self.assertEqual(source["account_liability"], {
+            "asset": "USDT", "borrowed": "3", "interest": "0",
+            "total_liability": "3",
+        })
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE.claimed-margin-borrow"
+        )))
+
+    def test_margin_history_disagreement_freezes_without_repost(self):
+        self.margin.history_payload = {"rows": [{
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "2",
+            "interest": "0",
+            "status": "CONFIRMED",
+            "type": "BORROW",
+        }]}
+        self.margin_job("margin-disagree-a")
+        self.margin_job("margin-disagree-b")
+
+        self.assertEqual(self.margin_tick(), 4)
+        self.assertEqual(self.margin_tick(), 3)
+
+        self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(self.results()[0]), "MARGIN_CONFIRMATION_MISMATCH"
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
+
+    def test_unreadable_margin_history_freezes(self):
+        self.margin.history_kind = "unclear"
+        self.margin.history_payload = {"http": 502}
+        self.margin_job("margin-history-read")
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        self.assertEqual(
+            self.reason(self.results()[0]),
+            "MARGIN_CONFIRMATION_UNREADABLE",
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_margin_repay_closes_only_after_explicit_zero_liability(self):
+        self.margin_job("margin-repay-zero", op="MARGIN_REPAY")
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        zero_result = self.results()[0]
+        self.assertEqual(zero_result["verdict"], "CLOSED")
+        self.assertEqual(
+            self.margin_source(zero_result)["account_liability"][
+                "total_liability"
+            ],
+            "0",
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+        self.assertEqual(self.governor_budget_calls, [])
+
+        nonzero = MarginTransport()
+        nonzero.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0.01", "interest": "0",
+        }]}
+        self.margin_job("margin-repay-open", op="MARGIN_REPAY",
+                        principal="0.01")
+
+        self.assertEqual(self.margin_tick(request=nonzero), 4)
+
+        open_result = self.results()[-1]
+        self.assertEqual(open_result["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(open_result), "MARGIN_LIABILITY_MISMATCH"
+        )
+
+    def test_stop_jobs_seals_both_margin_directions(self):
+        Path(os.path.join(self.receipt_dir, "STOP-JOBS")).touch()
+        self.margin_job("margin-seal-borrow", op="MARGIN_BORROW")
+        self.margin_job("margin-seal-repay", op="MARGIN_REPAY")
+
+        self.assertEqual(self.margin_tick(), 2)
+        self.assertEqual(self.margin_tick(), 2)
+
+        self.assertEqual(
+            [self.reason(row) for row in self.results()],
+            ["STOP_JOBS_SEALED", "STOP_JOBS_SEALED"],
+        )
+        self.assertEqual(self.margin.calls, [])
         self.assertEqual(self.governor_budget_calls, [])
 
     def test_unknown_touches_stop_and_blocks_next_job(self):

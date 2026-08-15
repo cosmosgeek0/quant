@@ -20,28 +20,37 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import basis_cycle
 import basis_executor
 import futures_hand
 import limits
+import margin_ops
 import set_leverage_1x
 import spot_roundtrip
 
 
-JOB_REQUIRED_FIELDS = {
+COMMON_JOB_REQUIRED_FIELDS = {
     "job_id",
     "op",
-    "symbol",
-    "max_notional",
     "created_utc",
     "expires_utc",
     "requested_by",
 }
-JOB_OPTIONAL_FIELDS = {"venue"}
-JOB_FIELDS = JOB_REQUIRED_FIELDS | JOB_OPTIONAL_FIELDS
+TRADING_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {
+    "symbol", "max_notional",
+}
+TRADING_JOB_OPTIONAL_FIELDS = {"venue"}
+TRADING_JOB_FIELDS = TRADING_JOB_REQUIRED_FIELDS | TRADING_JOB_OPTIONAL_FIELDS
+MARGIN_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {
+    "asset", "principal", "client_tag", "operator_token",
+}
+MARGIN_JOB_FIELDS = MARGIN_JOB_REQUIRED_FIELDS
+JOB_REQUIRED_FIELDS = TRADING_JOB_REQUIRED_FIELDS
+JOB_OPTIONAL_FIELDS = TRADING_JOB_OPTIONAL_FIELDS
+JOB_FIELDS = TRADING_JOB_FIELDS
 ACCEPT_ONE_FIELDS = {
     "operator", "created_utc", "expires_utc", "max_notional",
 }
@@ -53,14 +62,25 @@ MOMENTUM_LEDGER_FIELDS = {"fills", "fees", "realized"}
 MOMENTUM_RESULT_FIELDS = RESULT_FIELDS | MOMENTUM_LEDGER_FIELDS
 ADVERSE_STOP_REFUSAL_FIELDS = {"kind", "error", "symbol", "utc"}
 ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
-OPS = {
+TRADING_OPS = {
     "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
     "MOMENTUM_OPEN", "MOMENTUM_EXIT",
 }
-ENTRY_OPS = OPS - {"MOMENTUM_EXIT"}
+MARGIN_OPS = margin_ops.MARGIN_OPERATIONS
+OPS = TRADING_OPS | MARGIN_OPS
+ENTRY_OPS = {
+    "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
+    "MOMENTUM_OPEN", margin_ops.MARGIN_BORROW,
+}
 MOMENTUM_OPS = {"MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT"}
 MOMENTUM_STANDING = {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}
 MAX_JOB_AGE = timedelta(minutes=15)
+MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
+MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
+MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
+MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
+MARGIN_DECIMAL_TEXT_MAX = 64
+MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
@@ -101,6 +121,8 @@ class Job:
     expires_utc: datetime
     requested_by: str
     venue: str = "futures"
+    operator_token: str = ""
+    margin_operation: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +152,13 @@ def _utc_text(value: datetime) -> str:
 
 def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _canonical_decimal_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
 
 
 def _empty_momentum_ledger() -> Dict[str, Any]:
@@ -254,8 +283,130 @@ def _load_operator(path: str) -> Optional[str]:
     return raw["operator"]
 
 
+def _margin_job_projection(raw: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        name: raw[name]
+        for name in (
+            "op", "asset", "principal", "client_tag", "expires_utc",
+            "operator_token",
+        )
+    }
+
+
+def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
+                         now: datetime) -> Job:
+    unknown = set(raw) - MARGIN_JOB_FIELDS
+    if unknown:
+        trading_fields = TRADING_JOB_FIELDS | set(
+            margin_ops.FORBIDDEN_JOB_FIELDS
+        )
+        reason = "FORBIDDEN_FIELD" if unknown & trading_fields \
+            else "UNKNOWN_FIELD"
+        raise JobRefusal(reason)
+    missing = MARGIN_JOB_REQUIRED_FIELDS - set(raw)
+    if missing:
+        raise JobRefusal("MISSING_FIELD")
+
+    common_string_fields = (
+        "job_id", "op", "created_utc", "expires_utc", "requested_by"
+    )
+    if any(type(raw[name]) is not str for name in common_string_fields):
+        raise JobRefusal("BAD_TYPE")
+    if not JOB_ID_RE.fullmatch(raw["job_id"]) \
+            or raw["job_id"] != filename_id:
+        raise JobRefusal("BAD_JOB_ID")
+    if raw["op"] not in MARGIN_OPS:
+        raise JobRefusal("BAD_OP")
+    if not raw["requested_by"].strip() \
+            or len(raw["requested_by"]) > 128:
+        raise JobRefusal("BAD_REQUESTER")
+
+    created = _timestamp(raw["created_utc"])
+    expires = _timestamp(raw["expires_utc"])
+    if expires <= created or expires - created > MAX_JOB_AGE:
+        raise JobRefusal("BAD_EXPIRY_WINDOW")
+    if now >= expires:
+        raise JobRefusal("EXPIRED")
+
+    try:
+        operation = margin_ops.build_margin_operation(
+            _margin_job_projection(raw), MARGIN_ASSET_WHITELIST, now
+        )
+    except Exception:
+        raise JobRefusal("MARGIN_VALIDATION_UNKNOWN") from None
+    if not isinstance(operation, dict):
+        raise JobRefusal("MARGIN_VALIDATION_UNKNOWN")
+    if operation.get("verdict") == "REFUSED":
+        reason = operation.get("reason")
+        if type(reason) is not str or not reason:
+            reason = "MARGIN_VALIDATION_UNKNOWN"
+        raise JobRefusal(reason)
+    try:
+        requested = Decimal(raw["principal"])
+    except (ArithmeticError, TypeError, ValueError):
+        raise JobRefusal("BAD_PRINCIPAL") from None
+    if not requested.is_finite() or requested <= 0:
+        raise JobRefusal("BAD_PRINCIPAL")
+    if requested > MARGIN_RUNNER_NOTIONAL_CAP:
+        raise JobRefusal("PRINCIPAL_CEILING_EXCEEDED")
+
+    principal = _canonical_decimal_text(requested)
+    request_type = "BORROW" if raw["op"] == margin_ops.MARGIN_BORROW \
+        else "REPAY"
+    expected_confirmation = {
+        "asset": raw["asset"],
+        "principal": principal,
+        "interest": "0",
+        "status": request_type + "_CONFIRMED",
+    }
+    if set(operation) != {
+            "verdict", "op", "client_tag", "expires_utc",
+            "endpoint_path", "params", "expected_ledger_confirmation",
+            "evidence"} \
+            or operation.get("verdict") != "READY" \
+            or operation.get("op") != raw["op"] \
+            or operation.get("client_tag") != raw["client_tag"] \
+            or operation.get("expires_utc") != _utc_text(expires) \
+            or operation.get("endpoint_path") != MARGIN_ENDPOINT_PATH \
+            or operation.get("params") != {
+                "asset": raw["asset"],
+                "amount": principal,
+                "type": request_type,
+            } \
+            or operation.get("expected_ledger_confirmation") \
+            != expected_confirmation \
+            or not isinstance(operation.get("evidence"), list):
+        raise JobRefusal("MARGIN_VALIDATION_UNKNOWN")
+    return Job(
+        job_id=raw["job_id"],
+        op=raw["op"],
+        symbol=raw["asset"],
+        requested_max_notional=requested,
+        effective_notional=requested,
+        created_utc=created,
+        expires_utc=expires,
+        requested_by=raw["requested_by"],
+        operator_token=raw["operator_token"],
+        margin_operation=operation,
+    )
+
+
 def _validate_job(raw: Dict[str, Any], filename_id: str,
                   now: datetime, receipt_dir: str = "") -> Job:
+    if type(raw.get("op")) is str and raw["op"] in MARGIN_OPS:
+        identifier = raw.get("job_id")
+        malformed_borrow = raw["op"] == margin_ops.MARGIN_BORROW \
+            and set(raw) != MARGIN_JOB_FIELDS
+        exact_identity = type(identifier) is str \
+            and JOB_ID_RE.fullmatch(identifier) is not None \
+            and identifier == filename_id
+        if malformed_borrow and exact_identity and receipt_dir \
+                and not os.path.isfile(os.path.join(
+                    receipt_dir, "ACCEPT-ONE"
+                )):
+            raise JobRefusal("ENTRY_BLOCKED_NOT_ACCEPTED")
+        return _validate_margin_job(raw, filename_id, now)
+
     unknown = set(raw) - JOB_FIELDS
     if unknown:
         raise JobRefusal("UNKNOWN_FIELD")
@@ -362,6 +513,9 @@ def _entry_ticket_refusal(job: Job, paths: Dict[str, str],
     operator = _load_operator(paths["operator"])
     if operator is None or job.requested_by != operator \
             or acceptance.operator != operator:
+        return "OPERATOR_MISMATCH"
+    if job.op == margin_ops.MARGIN_BORROW \
+            and job.operator_token != operator:
         return "OPERATOR_MISMATCH"
     if job.requested_max_notional > acceptance.max_notional:
         return "ACCEPT_ONE_NOTIONAL_EXCEEDED"
@@ -2719,12 +2873,320 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
     return job_id, op, position["symbol"], outcome, governor_token
 
 
+def _persist_margin_source(path: str, payload: Dict[str, Any],
+                           create: bool = False) -> None:
+    encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if create:
+        descriptor = os.open(
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return
+    temporary = path + ".tmp-" + secrets.token_hex(6)
+    try:
+        with open(temporary, "xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _margin_transaction_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    values = []
+    for name in ("tranId", "txId"):
+        if name not in payload:
+            continue
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return ""
+        text = str(value)
+        if not text or len(text) > 128:
+            return ""
+        values.append(text)
+    if not values or len(set(values)) != 1:
+        return ""
+    return values[0]
+
+
+def _margin_decimal_text(value: Any) -> Optional[str]:
+    if type(value) is not str or not value \
+            or len(value) > MARGIN_DECIMAL_TEXT_MAX \
+            or MARGIN_DECIMAL_RE.fullmatch(value) is None:
+        return None
+    try:
+        parsed = Decimal(value)
+    except (ArithmeticError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return _canonical_decimal_text(parsed)
+
+
+def _margin_history_confirmation(payload: Any, transaction_id: str,
+                                 expected: Dict[str, Any],
+                                 request_type: str) \
+        -> Optional[Dict[str, str]]:
+    if not isinstance(payload, dict) or not isinstance(
+            payload.get("rows"), list):
+        return None
+    matches = [
+        row for row in payload["rows"]
+        if isinstance(row, dict)
+        and _margin_transaction_id(row) == transaction_id
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    if row.get("asset") != expected["asset"]:
+        return None
+    if "type" in row and row.get("type") != request_type:
+        return None
+    principal = _margin_decimal_text(row.get("principal"))
+    interest = _margin_decimal_text(row.get("interest"))
+    status = row.get("status")
+    normalized_status = request_type + "_CONFIRMED" \
+        if status == "CONFIRMED" else status
+    confirmation = {
+        "asset": row["asset"],
+        "principal": principal,
+        "interest": interest,
+        "status": normalized_status,
+    }
+    if principal is None or interest is None or confirmation != expected:
+        return None
+    return confirmation
+
+
+def _margin_account_liability(payload: Any, asset: str) \
+        -> Optional[Dict[str, str]]:
+    if not isinstance(payload, dict) or not isinstance(
+            payload.get("userAssets"), list):
+        return None
+    matches = [
+        row for row in payload["userAssets"]
+        if isinstance(row, dict) and row.get("asset") == asset
+    ]
+    if len(matches) != 1:
+        return None
+    borrowed = _margin_decimal_text(matches[0].get("borrowed"))
+    interest = _margin_decimal_text(matches[0].get("interest"))
+    if borrowed is None or interest is None:
+        return None
+    with localcontext() as context:
+        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+        total = Decimal(borrowed) + Decimal(interest)
+    return {
+        "asset": asset,
+        "borrowed": borrowed,
+        "interest": interest,
+        "total_liability": _canonical_decimal_text(total),
+    }
+
+
+def _finish_margin_source(receipt: Dict[str, Any], path: str,
+                          verdict: str, exit_code: int, reason: str,
+                          now: datetime,
+                          confirmation: Optional[Dict[str, str]] = None,
+                          liability: Optional[Dict[str, str]] = None) \
+        -> Outcome:
+    receipt.update({
+        "verdict": verdict,
+        "reason": reason,
+        "finished_utc": _utc_text(now),
+    })
+    if confirmation is not None:
+        receipt["ledger_confirmation"] = confirmation
+    if liability is not None:
+        receipt["account_liability"] = liability
+    try:
+        _persist_margin_source(path, receipt)
+    except Exception:
+        return Outcome(
+            "UNKNOWN", 4, path, "MARGIN_RECEIPT_PERSISTENCE_FAILED"
+        )
+    return Outcome(verdict, exit_code, path, reason)
+
+
+def _run_margin_operation(
+        job: Job, paths: Dict[str, str],
+        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+    fresh_now = _utc_now()
+    principal = _canonical_decimal_text(job.requested_max_notional)
+    projection = {
+        "op": job.op,
+        "asset": job.symbol,
+        "principal": principal,
+        "client_tag": (
+            job.margin_operation.get("client_tag", "")
+            if isinstance(job.margin_operation, dict) else ""
+        ),
+        "expires_utc": _utc_text(job.expires_utc),
+        "operator_token": job.operator_token,
+    }
+    try:
+        operation = margin_ops.build_margin_operation(
+            projection, MARGIN_ASSET_WHITELIST, fresh_now
+        )
+    except Exception:
+        return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
+    if not isinstance(operation, dict):
+        return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
+    if operation.get("verdict") == "REFUSED":
+        reason = operation.get("reason")
+        if type(reason) is not str or not reason:
+            reason = "MARGIN_VALIDATION_UNKNOWN"
+        return Outcome("REFUSED", 2, "", reason)
+    if job.requested_max_notional > MARGIN_RUNNER_NOTIONAL_CAP \
+            or operation != job.margin_operation:
+        return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
+
+    source_path = os.path.join(
+        paths["receipts"], "margin-%s.json" % job.job_id
+    )
+    receipt = {
+        "kind": "margin_operation",
+        "job_id": job.job_id,
+        "ready": operation,
+        "mutation_attempts": 0,
+        "verdict": "READY",
+        "reason": "",
+        "started_utc": _utc_text(fresh_now),
+    }
+    try:
+        _persist_margin_source(source_path, receipt, create=True)
+        receipt["mutation_attempts"] = 1
+        receipt["mutation_started_utc"] = _utc_text(fresh_now)
+        _persist_margin_source(source_path, receipt)
+    except Exception:
+        return Outcome(
+            "UNKNOWN", 4,
+            source_path if os.path.isfile(source_path) else "",
+            "MARGIN_READY_PERSISTENCE_FAILED",
+        )
+
+    base_url = basis_executor.SPOT.base_url
+    try:
+        transport = request or basis_executor.live_request_factory(
+            os.environ.get("BINANCE_API_KEY", ""),
+            os.environ.get("BINANCE_API_SECRET", ""),
+        )
+        post_result = transport(
+            "POST", base_url, operation["endpoint_path"],
+            dict(operation["params"]), True,
+        )
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_POST_UNREADABLE", fresh_now,
+        )
+    if type(post_result) is not tuple or len(post_result) != 2:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_POST_UNREADABLE", fresh_now,
+        )
+    post_kind, post_payload = post_result
+    transaction_id = _margin_transaction_id(post_payload) \
+        if post_kind == "ok" else ""
+    receipt["submission"] = {
+        "kind": post_kind if type(post_kind) is str else "unreadable",
+        "transaction_id": transaction_id,
+    }
+    try:
+        _persist_margin_source(source_path, receipt)
+    except Exception:
+        return Outcome(
+            "UNKNOWN", 4, source_path,
+            "MARGIN_RECEIPT_PERSISTENCE_FAILED",
+        )
+    if not transaction_id:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_TRANSACTION_MISSING", fresh_now,
+        )
+
+    params = operation["params"]
+    history_params = {
+        "asset": params["asset"],
+        "type": params["type"],
+        "txId": transaction_id,
+    }
+    try:
+        history_result = transport(
+            "GET", base_url, operation["endpoint_path"],
+            history_params, True,
+        )
+        account_result = transport(
+            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
+        )
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+    if type(history_result) is not tuple or len(history_result) != 2 \
+            or type(account_result) is not tuple \
+            or len(account_result) != 2 \
+            or history_result[0] != "ok" or account_result[0] != "ok":
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+
+    expected = operation["expected_ledger_confirmation"]
+    confirmation = _margin_history_confirmation(
+        history_result[1], transaction_id, expected, params["type"]
+    )
+    liability = _margin_account_liability(
+        account_result[1], expected["asset"]
+    )
+    if confirmation is None or liability is None:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
+        )
+    if job.op == margin_ops.MARGIN_BORROW:
+        confirmed = liability["borrowed"] == expected["principal"] \
+            and liability["interest"] == expected["interest"]
+        verdict = "OPEN"
+    else:
+        confirmed = liability["borrowed"] == "0" \
+            and liability["interest"] == "0" \
+            and liability["total_liability"] == "0"
+        verdict = "CLOSED"
+    if not confirmed:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_LIABILITY_MISMATCH", fresh_now,
+            confirmation, liability,
+        )
+    return _finish_margin_source(
+        receipt, source_path, verdict, 0, expected["status"], fresh_now,
+        confirmation, liability,
+    )
+
+
 def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
              futures_entry: Optional[Callable[[], Any]],
              basis_entry: Optional[Callable[[Any], Any]],
              now: datetime, governor_token: str = "",
              momentum_measurement: Optional[Dict[str, Any]] = None,
              spot_request: Optional[
+                 Callable[..., Tuple[str, Any]]
+             ] = None,
+             margin_request: Optional[
                  Callable[..., Tuple[str, Any]]
              ] = None) -> Outcome:
     sha = os.environ.get("QUANT_SHA", "").lower()
@@ -2739,6 +3201,8 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
         basis_proof = _basis_proof_passed(paths)
         if not os.path.isfile(paths["proof"]) or not basis_proof:
             return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
+    if job.op in MARGIN_OPS:
+        return _run_margin_operation(job, paths, margin_request)
 
     values = {
         "SYMBOL": job.symbol,
@@ -3014,6 +3478,9 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
          basis_entry: Optional[Callable[[Any], Any]] = None,
          spot_request: Optional[
              Callable[..., Tuple[str, Any]]
+         ] = None,
+         margin_request: Optional[
+             Callable[..., Tuple[str, Any]]
          ] = None) -> int:
     """Consume at most one due job and return its factual exit code."""
     receipt_dir = os.path.abspath(os.path.expanduser(
@@ -3085,10 +3552,17 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                 return 0
             if refusal:
                 op = _safe_text(raw, "op")
-                symbol = _safe_text(raw, "symbol")
+                symbol = _safe_text(raw, "asset") if op in MARGIN_OPS \
+                    else _safe_text(raw, "symbol")
                 outcome = Outcome("REFUSED", 2, "", refusal)
                 return _finish_claimed(
                     paths, receipt_dir, filename_id, op, symbol, outcome, now
+                )
+            if job.op in MARGIN_OPS and os.path.isfile(paths["stop"]):
+                outcome = Outcome("REFUSED", 2, "", "STOP_JOBS_SEALED")
+                return _finish_claimed(
+                    paths, receipt_dir, job.job_id, job.op,
+                    job.symbol, outcome, now
                 )
             if job.op in ENTRY_OPS:
                 refusal = _entry_ticket_refusal(job, paths, now)
@@ -3111,6 +3585,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                         basis_entry, now, governor_token,
                         momentum_measurement=standing_measurement,
                         spot_request=spot_request,
+                        margin_request=margin_request,
                     )
             else:
                 outcome = _execute(
@@ -3118,6 +3593,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     basis_entry, now,
                     momentum_measurement=standing_measurement,
                     spot_request=spot_request,
+                    margin_request=margin_request,
                 )
             code = _finish_claimed(
                 paths, receipt_dir, job.job_id, job.op, job.symbol,
