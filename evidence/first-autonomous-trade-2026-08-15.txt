@@ -1,0 +1,10 @@
+FIRST FULLY AUTONOMOUS TRADE — cradle to grave, zero human presses (release 18b193f)
+signal | OPENUSDT ignition found by the machine's own funnel (one of 19 at the 3x bar)
+entry  | MOMENTUM_OPEN 05:39:03Z | 43 OPENUSDT @ 0.1857 (~7.98 USDT, 1x, capped 8) | trade 125346086 | fee 0.00399255 USDT
+hold   | held through the controller tick cadence (entry->exit 2 minutes, >=1 HOLD tick)
+exit   | MOMENTUM_EXIT 05:41:03Z | 43 @ 0.1856 reduce-only | trade 125346286 | realized -0.0043 | fee 0.00399040 USDT
+net    | -0.01228295 USDT total (position pnl + both fees) — about 1.2 cents for the proof the system works end to end
+after  | verdict CLOSED | first_autonomous_close_passed written (cap escalation to 32 unlocked per physics)
+flat   | signed read: positions 0, open orders 0 both venues | USD-M 10.97436273 | spot USDT 84.33368920
+seals  | machine resealed itself on flat (STOP-JOBS) | ticket consumed on fill, single-use proven
+chain  | every stage of the protocol executed by the deployed runtime alone: signal -> publish -> ticket -> governor -> fill -> hold -> exit -> reconcile -> reseal

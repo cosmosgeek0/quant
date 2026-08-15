@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+FIRST AUTONOMOUS TRADE 2026-08-15T05:41Z | OPENUSDT | CLOSED | net -0.0123 USDT | zero presses, zero interventions
+the machine | found its own signal (funnel: 19 ignitions at the 3x bar), published, passed ticket+governor, filled 43 @ 0.1857 (~7.98 USDT, 1x), held >=1 tick, exited reduce-only 43 @ 0.1856, reconciled flat, resealed itself
+receipts | entry trade 125346086, exit trade 125346286 | fees 0.00798295 total | evidence/first-autonomous-trade-2026-08-15.txt + both runner receipts on host
+markers | ACCEPT-ONE consumed on fill (single-use proven live) | first_autonomous_close_passed written -> 32 cap unlocked per physics | seal-on-flat proven live
+meaning | the commander protocol is satisfied end to end: the system works; profit was never the requirement of this receipt
+
 FUNNEL + TUNER + STUDY LIVE 2026-08-15 | release 18b193f deployed hash-gated | 940/940 (Lead-run; all four workers died pre-report, disk-verified)
 first light | ONE tick at the 3x bar: universe 656 -> fresh 153 -> baseline 76 -> IGNITED 19 -> eligible 0 -> entered 0 | the bar is not the constraint; candidates die at eligibility (2-pass persistence + freshness coverage + warming baselines)
 built | per-tick funnel rows naming the starving stage | hourly bounded knob tuner (knobs.env, limits clamps, ticket-domain advisory-only) | public-archive tape puller (100-token cohort running on the Mac) | current-detector replay harness with 5/15/60m forward returns
