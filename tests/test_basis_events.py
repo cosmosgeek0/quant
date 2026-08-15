@@ -2,7 +2,8 @@
 
 import sys
 import unittest
-from dataclasses import fields
+from dataclasses import fields, replace
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from basis_events import (  # noqa: E402
     DetectionThresholds,
     DislocationDetector,
     detect_dislocations,
+    validate_actionable,
 )
 
 
@@ -146,6 +148,75 @@ class BasisEventsTests(unittest.TestCase):
     def test_thresholds_are_one_documented_dataclass(self):
         configured = DetectionThresholds()
         self.assertTrue(all(item.metadata.get("why") for item in fields(configured)))
+
+    def test_actionable_validator_rechecks_detector_thresholds_and_age(self):
+        event = detect_dislocations(SYMBOL, gap_spike_series())[0]
+        now_ms = int(datetime.fromisoformat(
+            event.utc.replace("Z", "+00:00")).timestamp() * 1000)
+
+        self.assertIsNone(validate_actionable(event, now_ms))
+        self.assertEqual(
+            validate_actionable(replace(event, kind="quiet_gap"), now_ms),
+            "DISLOCATION_EVENT_KIND_NOT_ACTIONABLE",
+        )
+        self.assertEqual(
+            validate_actionable(event, now_ms + 5001),
+            "DISLOCATION_EVENT_UTC_STALE",
+        )
+        self.assertEqual(
+            validate_actionable(
+                replace(event, entry_gap_pct=D("0.2")), now_ms),
+            "DISLOCATION_EVENT_GAP_BELOW_THRESHOLD",
+        )
+        self.assertEqual(
+            validate_actionable(
+                replace(event, freshness_ms=D("5001")), now_ms),
+            "DISLOCATION_EVENT_FRESHNESS_EXCEEDED",
+        )
+
+    def test_ir2_a4_validator_shares_continuity_and_gap_derivation(self):
+        event = detect_dislocations(SYMBOL, gap_spike_series())[0]
+        now_ms = int(datetime.fromisoformat(
+            event.utc.replace("Z", "+00:00")).timestamp() * 1000)
+
+        self.assertEqual(
+            validate_actionable(
+                replace(event, observation_gap_ms=999_999), now_ms),
+            "DISLOCATION_EVENT_CONTINUITY_EXCEEDED",
+        )
+        self.assertEqual(
+            validate_actionable(
+                replace(
+                    event,
+                    spot_bid=D("102"),
+                    spot_ask=D("102"),
+                    perp_bid=D("102"),
+                    perp_ask=D("102"),
+                ),
+                now_ms,
+            ),
+            "DISLOCATION_EVENT_GAP_NOT_DERIVABLE",
+        )
+
+    def test_ir3_r5_growth_exceeding_current_gap_is_refused(self):
+        detected = detect_dislocations(SYMBOL, gap_spike_series())[0]
+        event = replace(
+            detected,
+            entry_gap_pct=D("1.2"),
+            exit_gap_pct=D("1.2"),
+            gap_growth_pct=D("2"),
+            spot_bid=D("100"),
+            spot_ask=D("100"),
+            perp_bid=D("101.2"),
+            perp_ask=D("101.2"),
+        )
+        now_ms = int(datetime.fromisoformat(
+            event.utc.replace("Z", "+00:00")).timestamp() * 1000)
+
+        self.assertEqual(
+            validate_actionable(event, now_ms),
+            "DISLOCATION_EVENT_GROWTH_INCONSISTENT",
+        )
 
 
 if __name__ == "__main__":
