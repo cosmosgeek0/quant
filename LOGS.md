@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+REPLAY STUDY 2026-08-15 | 3-day 100-token real tape through the CURRENT detector | abundant signals, zero raw edge
+numbers | bar 3: ~413 ignitions/day, forward returns a coin flip (5m med +0.01%, 15m/60m ~0.000%, win 47-50%) | bar 10: same coin flip, fewer catches | all medians far below the 0.30% measured fees
+verdict | surge-alone is fee-negative noise at any bar — the bar filters quantity, not quality | serial igniters dominate the tape (JST x55...)
+mandate | the owner's vault product vision (adaptive per-token baselines + learned noise filter + entry ladder) is the data-mandated next build; study bench + tape + replay harness are ready for it
+posture | machine sealed with the first receipt banked; re-arm before the filter = knowingly fee-negative (governor-bounded); awaiting the owner's word on build-first vs hunt-anyway
+
 FIRST AUTONOMOUS TRADE 2026-08-15T05:41Z | OPENUSDT | CLOSED | net -0.0123 USDT | zero presses, zero interventions
 the machine | found its own signal (funnel: 19 ignitions at the 3x bar), published, passed ticket+governor, filled 43 @ 0.1857 (~7.98 USDT, 1x), held >=1 tick, exited reduce-only 43 @ 0.1856, reconciled flat, resealed itself
 receipts | entry trade 125346086, exit trade 125346286 | fees 0.00798295 total | evidence/first-autonomous-trade-2026-08-15.txt + both runner receipts on host

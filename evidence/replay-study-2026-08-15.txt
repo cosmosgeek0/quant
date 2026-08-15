@@ -1,0 +1,8 @@
+REPLAY STUDY — current detector over 3 days x 100-token real tape (public archive; study/out/replay-2026-08-15.jsonl, Lead-summarized)
+BAR 3  | 1240 ignitions (~413/day) | fwd 5m med +0.010% win 50% | 15m med +0.000% win 47% | 60m med +0.000% win 48%
+BAR 10 | subset 1053 (~351/day)    | fwd 5m med +0.003% win 50% | 15m med +0.000% win 47% | 60m med +0.000% win 47%
+fees   | measured round trip 0.30% — every median above is far below fees at every bar and horizon
+verdict| the RAW surge signal is fee-negative noise at ANY bar: the bar filters quantity, never quality
+repeat | serial igniters dominate (JSTUSDT x55, ZAMAUSDT x40, ZROUSDT x34...) — exactly the spam a learned noise filter must eat
+meaning| the owner's product vision (per-token adaptive baselines, learned noise filter, tape learning, entry ladder — vault spec 2026-08-15) is now DATA-MANDATED, not taste: it is the layer that turns abundant signals into positive-expectancy entries
+posture| machine sealed post-receipt; governor would bound re-armed losses (~10 x ~1.2c/day worst-typical) but re-arming before the filter is knowingly fee-negative — owner's call
