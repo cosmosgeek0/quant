@@ -235,7 +235,44 @@
 
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
-  .conn-page { max-width: 720px; margin: 0 auto; padding: 40px 32px 56px; }
+  .conn-page { max-width: 1180px; margin: 0; padding: 40px 40px 56px; }
+  .conn-cols { display: flex; gap: 32px; align-items: flex-start; margin-top: 22px; }
+  .conn-main { flex: 1; min-width: 0; max-width: 720px; }
+  .conn-side { width: 344px; flex: none; display: flex; flex-direction: column; gap: 20px; }
+  .poll-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .poll-row:last-child { border-bottom: 0; }
+  .poll-main { flex: 1; min-width: 0; }
+  .poll-name { font-size: 13px; font-weight: 500; color: var(--ink); }
+  .poll-sub { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+  .poll-sel {
+    height: 30px;
+    border: 1px solid var(--line-2);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--ink);
+    font: inherit; font-size: 12.5px;
+    padding: 0 8px;
+  }
+  .poll-fixed { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .poll-go {
+    width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    background: none; border: 0; border-radius: 8px;
+    color: var(--muted); cursor: pointer;
+    transition: background var(--t), color var(--t);
+  }
+  .poll-go:hover { background: var(--hover); color: var(--ink); }
+  .poll-go svg { width: 13px; height: 13px; stroke-width: 1.7; }
+  .poll-go.kick svg { animation: spin 600ms cubic-bezier(0.2, 0, 0.2, 1); }
+  .conn-defaults {
+    height: 30px; padding: 0 12px;
+    border: 1px solid var(--line-2); border-radius: 8px;
+    background: none; color: var(--muted);
+    font: inherit; font-size: 12.5px; font-weight: 500;
+    cursor: pointer;
+    transition: background var(--t), color var(--t);
+  }
+  .conn-defaults:hover { background: var(--hover); color: var(--ink); }
   .conn-title { font-size: 16px; font-weight: 600; color: var(--ink); }
   .conn-sub { margin-top: 4px; font-size: 13px; color: var(--muted); }
   .conn-note { margin-top: 2px; font-size: 12.5px; color: var(--faint); }
@@ -551,17 +588,24 @@
   .sigrow .v.ok { color: #2ebd85; }
   .sigrow .v.warn { color: #99640a; }
   .sigrow .v.bad { color: #cc2f3c; }
-  .canvas-top {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    padding: 22px 24px 0;
-  }
-  .canvas-top .clock {
-    font-size: 13px;
-    color: var(--muted);
+  .canvas-top { display: none; }
+  .clockpill {
+    position: fixed;
+    top: 12px;
+    right: 64px;
+    z-index: 45;
+    display: flex; align-items: center; gap: 7px;
+    height: 30px;
+    padding: 0 12px;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    background: var(--panel);
+    font-size: 12.5px;
+    color: var(--ink);
     font-variant-numeric: tabular-nums lining-nums;
   }
+  .clockpill svg { width: 13px; height: 13px; stroke-width: 1.7; color: var(--muted); }
+  .clockpill .utc { color: #16a34a; font-weight: 600; font-size: 11.5px; }
   .empty { padding: 46px 24px; color: var(--muted); font-size: 13.5px; }
   .empty b { color: var(--ink); font-weight: 600; }
 
@@ -709,8 +753,10 @@
     </button>
   </div>
   <main>
-    <div class="canvas-top">
-      <span class="clock" id="clock" aria-label="UTC time">—:—:— UTC</span>
+    <div class="clockpill" aria-label="UTC time">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="10" x2="14" y1="2" y2="2"/><line x1="12" x2="15" y1="14" y2="11"/><circle cx="12" cy="14" r="8"/></svg>
+      <span id="clock">—:—</span>
+      <span class="utc">UTC</span>
     </div>
     <div class="empty" id="page"></div>
   </main>

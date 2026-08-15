@@ -12,12 +12,10 @@
 
   function tickClock() {
     var d = new Date();
-    clockEl.textContent =
-      two(d.getUTCHours()) + ":" + two(d.getUTCMinutes()) + ":" +
-      two(d.getUTCSeconds()) + " UTC";
+    clockEl.textContent = two(d.getUTCHours()) + ":" + two(d.getUTCMinutes());
   }
   tickClock();
-  setInterval(tickClock, 1000);
+  setInterval(tickClock, 5000);
 
   /* ---- elements ---- */
   var side = document.getElementById("side");
@@ -206,6 +204,26 @@
   var sigBtn = document.getElementById("rb-signal");
   var lastStrip = null;
 
+  var POLL_DEFAULTS = { strip: 10, news: 20 };
+  var pollCfg = { strip: 10, news: 20, paused: false };
+  try {
+    var rawPoll = localStorage.getItem("quant.poll");
+    if (rawPoll) {
+      var parsedPoll = JSON.parse(rawPoll);
+      if (parsedPoll && typeof parsedPoll === "object") {
+        if (parsedPoll.strip > 0) { pollCfg.strip = parsedPoll.strip; }
+        if (parsedPoll.news > 0) { pollCfg.news = parsedPoll.news; }
+        pollCfg.paused = !!parsedPoll.paused;
+      }
+    }
+  } catch (e) { /* private mode */ }
+
+  function savePollCfg() {
+    try {
+      localStorage.setItem("quant.poll", JSON.stringify(pollCfg));
+    } catch (e) { /* private mode */ }
+  }
+
   function setOnline(ok) {
     avatarEl.classList.toggle("on", !!ok);
   }
@@ -241,8 +259,16 @@
         renderSigAll();
       });
   }
+  var stripTimer = null;
+
+  function restartStripPoll() {
+    if (stripTimer) { clearInterval(stripTimer); }
+    stripTimer = setInterval(function () {
+      if (!pollCfg.paused) { pollStrip(); }
+    }, pollCfg.strip * 1000);
+  }
   pollStrip();
-  setInterval(pollStrip, 10000);
+  restartStripPoll();
 
   /* ---- right rail panels (TradingView pattern) ---- */
   var rpanel = document.getElementById("rpanel");
@@ -316,21 +342,43 @@
      cannot measure are honestly "not wired". Toggles are visual until
      the shutdown wiring lands (separate build, owner-sanctioned). */
   var CONNECTIONS = [
-    { id: "server", name: "Web server", detail: "dashboard ↔ data plane", live: true },
-    { id: "mirror", name: "Data mirror", detail: "host → this machine", live: true },
-    { id: "market", name: "Market feed", detail: "exchange stream pass", live: true },
-    { id: "supervisor", name: "Supervisor", detail: "machine heartbeat", live: true },
-    { id: "host", name: "EC2 host", detail: "AWS runtime", live: false },
-    { id: "binance", name: "Binance API", detail: "exchange account", live: false },
-    { id: "news", name: "News source", detail: "no source wired", live: false },
-    { id: "calendar", name: "Calendar source", detail: "no source wired", live: false }
+    { id: "server", name: "Web server",
+      detail: "this dashboard ↔ serve.py · toggle pauses all polling here",
+      live: true, control: "pause" },
+    { id: "mirror", name: "Data mirror",
+      detail: "EC2 host → this Mac · SSM pull loop (Lead-run)",
+      live: true, control: "wiring" },
+    { id: "market", name: "Market feed",
+      detail: "exchange stream pass on the host", live: true,
+      control: "wiring" },
+    { id: "supervisor", name: "Supervisor",
+      detail: "machine heartbeat on the host", live: true,
+      control: "wiring" },
+    { id: "binance", name: "Binance API",
+      detail: "host ↔ exchange · not measurable from this browser",
+      live: false, control: "wiring" },
+    { id: "newsloop", name: "News fetch loop",
+      detail: "this Mac → 104 public sources · bound to the News master",
+      live: "news", control: "news" },
+    { id: "host", name: "EC2 host",
+      detail: "AWS runtime · reached via SSM only", live: false,
+      control: "wiring" }
   ];
   var connState = {};
   for (var ci = 0; ci < CONNECTIONS.length; ci++) {
     connState[CONNECTIONS[ci].id] = true;
   }
+  connState.server = !pollCfg.paused;
+  connState.newsloop = newsMaster;
 
   function connLive(id) {
+    if (id === "newsloop") {
+      if (newsData && newsData.as_of) {
+        var na = (Date.now() - Date.parse(newsData.as_of)) / 1000;
+        return { cls: na < 300 ? "ok" : "warn", val: ageText2(na) };
+      }
+      return { cls: "", val: "no mirror read yet" };
+    }
     if (!lastStrip) {
       return { cls: "bad", val: id === "server" ? "unreachable" : "—" };
     }
@@ -352,7 +400,7 @@
       var st = sv2.reported_status ? " · " + sv2.reported_status : "";
       return { cls: ageCls(s2, 240, 600).replace("v ", ""), val: ageText2(s2) + st };
     }
-    return { cls: "", val: "not wired" };
+    return { cls: "", val: "via host" };
   }
 
   function refreshConnRows() {
@@ -370,7 +418,8 @@
       rows2[i].classList.toggle("off", !on);
       if (!on) {
         dot.className = "conn-dot";
-        val.textContent = "off";
+        val.textContent = def && def.control === "pause"
+          ? "polling paused" : "off";
         continue;
       }
       if (def && def.live) {
@@ -379,7 +428,7 @@
         val.textContent = lv.val;
       } else {
         dot.className = "conn-dot";
-        val.textContent = "not wired";
+        val.textContent = def && def.id === "binance" ? "via host" : "not wired";
       }
     }
   }
@@ -398,10 +447,17 @@
     var note = document.createElement("div");
     note.className = "conn-note";
     note.textContent =
-      "Toggles are visual for now — shutdown wiring lands in a separate build.";
+      "Web server and News loop toggles act now (client side). " +
+      "Host-side toggles stay visual until the control endpoint lands.";
     page.appendChild(t);
     page.appendChild(sub);
     page.appendChild(note);
+    var cols = document.createElement("div");
+    cols.className = "conn-cols";
+    var mainCol = document.createElement("div");
+    mainCol.className = "conn-main";
+    var sideCol = document.createElement("div");
+    sideCol.className = "conn-side";
     var list = document.createElement("div");
     list.className = "conn-list";
     for (var i = 0; i < CONNECTIONS.length; i++) {
@@ -430,6 +486,13 @@
         sw.appendChild(knob);
         sw.addEventListener("click", function () {
           connState[def.id] = !connState[def.id];
+          if (def.control === "pause") {
+            pollCfg.paused = !connState[def.id];
+            savePollCfg();
+          }
+          if (def.control === "news") {
+            setMaster(connState[def.id]);
+          }
           sw.setAttribute("aria-checked",
             connState[def.id] ? "true" : "false");
           refreshConnRows();
@@ -441,9 +504,114 @@
         list.appendChild(row);
       })(CONNECTIONS[i]);
     }
-    page.appendChild(list);
+    mainCol.appendChild(list);
+    cols.appendChild(mainCol);
+    sideCol.appendChild(pollingBox());
+    cols.appendChild(sideCol);
+    page.appendChild(cols);
     container.appendChild(page);
     refreshConnRows();
+  }
+
+  function pollingBox() {
+    var box = document.createElement("div");
+    box.className = "rbox";
+    var head = document.createElement("div");
+    head.className = "rbox-h";
+    var t = document.createElement("span");
+    t.className = "rbox-title";
+    t.textContent = "Polling cadence";
+    var def = document.createElement("button");
+    def.className = "conn-defaults";
+    def.textContent = "Defaults";
+    def.addEventListener("click", function () {
+      pollCfg.strip = POLL_DEFAULTS.strip;
+      pollCfg.news = POLL_DEFAULTS.news;
+      savePollCfg();
+      restartStripPoll();
+      if (newsTimer) { startNewsPoll(); }
+      buildConnectionsPage(pageEl.parentNode ? pageEl : pageEl);
+      if ((location.hash || "").slice(1) === "connections") {
+        pageEl.textContent = "";
+        buildConnectionsPage(pageEl);
+      }
+    });
+    var spacer = document.createElement("span");
+    spacer.className = "rbox-sub";
+    spacer.appendChild(def);
+    head.appendChild(t);
+    head.appendChild(spacer);
+    box.appendChild(head);
+
+    function selRow(name, subText, key, options, onchange, fixedText) {
+      var row = document.createElement("div");
+      row.className = "poll-row";
+      var main = document.createElement("div");
+      main.className = "poll-main";
+      var nm = document.createElement("div");
+      nm.className = "poll-name";
+      nm.textContent = name;
+      var sb = document.createElement("div");
+      sb.className = "poll-sub";
+      sb.textContent = subText;
+      main.appendChild(nm);
+      main.appendChild(sb);
+      row.appendChild(main);
+      if (fixedText) {
+        var fx = document.createElement("span");
+        fx.className = "poll-fixed";
+        fx.textContent = fixedText;
+        row.appendChild(fx);
+        return row;
+      }
+      var sel = document.createElement("select");
+      sel.className = "poll-sel";
+      for (var i = 0; i < options.length; i++) {
+        var opt = document.createElement("option");
+        opt.value = String(options[i]);
+        opt.textContent = options[i] + "s";
+        if (pollCfg[key] === options[i]) { opt.selected = true; }
+        sel.appendChild(opt);
+      }
+      sel.addEventListener("change", function () {
+        pollCfg[key] = parseInt(sel.value, 10);
+        savePollCfg();
+        onchange();
+      });
+      row.appendChild(sel);
+      var go = document.createElement("button");
+      go.className = "poll-go";
+      go.setAttribute("aria-label", "Refresh now");
+      go.setAttribute("data-tip", "Refresh now");
+      var gs = svgEl("svg", { viewBox: "0 0 24 24", fill: "none",
+        stroke: "currentColor", "stroke-linecap": "round",
+        "stroke-linejoin": "round" });
+      gs.appendChild(svgEl("path", {
+        d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }));
+      gs.appendChild(svgEl("path", { d: "M3 3v5h5" }));
+      go.appendChild(gs);
+      go.addEventListener("click", function () {
+        go.classList.add("kick");
+        setTimeout(function () { go.classList.remove("kick"); }, 650);
+        if (key === "strip") { pollStrip(); }
+        if (key === "news") { fetchNews(true); }
+      });
+      row.appendChild(go);
+      return row;
+    }
+
+    box.appendChild(selRow("Machine status",
+      "strip · avatar dot · Signal tint", "strip", [5, 10, 30, 60],
+      restartStripPoll));
+    box.appendChild(selRow("News mirror read",
+      "list refresh while on the News page", "news", [10, 20, 60, 120],
+      function () { if (newsTimer) { startNewsPoll(); } }));
+    box.appendChild(selRow("News fetch loop",
+      "process-set · becomes a control with the wiring build", null, null,
+      null, "120s"));
+    box.appendChild(selRow("Mirror pull (host → Mac)",
+      "Lead's SSM loop · read-only here", null, null, null, "~30–60s"));
+    return box;
   }
 
   function renderSigAll() {
@@ -643,9 +811,10 @@
 
   function startNewsPoll() {
     if (newsMaster) { fetchNews(true); } else { renderNews(); }
-    if (!newsTimer) {
-      newsTimer = setInterval(function () { fetchNews(false); }, 20000);
-    }
+    if (newsTimer) { clearInterval(newsTimer); }
+    newsTimer = setInterval(function () {
+      if (!pollCfg.paused) { fetchNews(false); }
+    }, pollCfg.news * 1000);
   }
 
   function stopNewsPoll() {
