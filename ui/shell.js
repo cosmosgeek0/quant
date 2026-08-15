@@ -66,6 +66,7 @@
     themeChoice = choice;
     try { localStorage.setItem(THEME_KEY, choice); } catch (e) { /* ok */ }
     applyTheme();
+    if ((location.hash || "").slice(1) === "network") { route(); }
   }
 
   if (mql.addEventListener) {
@@ -159,9 +160,12 @@
     }
     pageEl.textContent = "";
     stopNewsPoll();
+    stopNetHealthPoll();
+    destroyNetCharts();
     if (h === "network") {
       sigPage = pageEl;
       buildNetworkPage(pageEl);
+      startNetHealthPoll();
       fetchNews(false);
     } else if (h === "news") {
       sigPage = null;
@@ -265,6 +269,35 @@
 
   var lastRtt = null;
 
+  /* Network telemetry — this-session series, one sample per strip
+     poll, nulls for missed polls (honest gaps). ~1h at 10s cadence. */
+  var TEL = { t: [], rtt: [], mirror: [], market: [], supervisor: [],
+    news: [] };
+  var TEL_CAP = 360;
+
+  function telNum(v) {
+    var n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+
+  function telPush(d) {
+    TEL.t.push(Math.round(Date.now() / 1000));
+    TEL.rtt.push(d ? telNum(lastRtt) : null);
+    TEL.mirror.push(d && d.pull ? telNum(d.pull.age_seconds) : null);
+    TEL.market.push(d && d.market_pass
+      ? telNum(d.market_pass.age_seconds) : null);
+    TEL.supervisor.push(d && d.supervisor
+      ? telNum(d.supervisor.age_seconds) : null);
+    var na = (newsData && newsData.as_of)
+      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
+    TEL.news.push(na != null && isFinite(na) ? Math.round(na) : null);
+    if (TEL.t.length > TEL_CAP) {
+      for (var k in TEL) {
+        if (Object.prototype.hasOwnProperty.call(TEL, k)) { TEL[k].shift(); }
+      }
+    }
+  }
+
   function pollStrip() {
     var t0 = performance.now();
     fetch("/api/strip", { cache: "no-store" })
@@ -273,6 +306,7 @@
         lastRtt = Math.round(performance.now() - t0);
         lastStrip = d;
         lastStripAt = Date.now();
+        telPush(d);
         setOnline(!!d);
         if (!d) { sigClass("sig-bad"); renderSigAll(); return; }
         var age = d.pull && d.pull.age_seconds;
@@ -286,6 +320,7 @@
       .catch(function () {
         lastRtt = null;
         lastStrip = null;
+        telPush(null);
         setOnline(false);
         sigClass("sig-bad");
         renderSigAll();
@@ -340,6 +375,15 @@
     { id: "supervisor", name: "Supervisor", group: "path",
       detail: "machine heartbeat on the host", live: true,
       control: "wiring" },
+    { id: "basiswatch", name: "Basis watch", group: "machine",
+      detail: "stream-fed basis pass loop on the host",
+      live: "health", healthKey: "basis_watch", control: "wiring" },
+    { id: "basissup", name: "Basis supervisor", group: "machine",
+      detail: "position supervision tick on the host",
+      live: "health", healthKey: "basis_supervisor", control: "wiring" },
+    { id: "jobrunner", name: "Job runner", group: "machine",
+      detail: "restricted job runner · one-minute host cron",
+      live: "health", healthKey: "jobs", control: "wiring" },
     { id: "newsloop", name: "News fetch loop", group: "sources",
       detail: "this Mac → 104 public sources · bound to the News master",
       live: "news", control: "news" },
@@ -352,6 +396,7 @@
   ];
   var CONN_GROUPS = [
     ["path", "Control path"],
+    ["machine", "Machine loops"],
     ["sources", "Sources"],
     ["boundary", "Owner boundaries"]
   ];
@@ -367,7 +412,70 @@
   connState.server = !pollCfg.paused;
   connState.newsloop = newsMaster;
 
+  var netHealth = null;
+  var netHealthTimer = null;
+
+  function fetchNetHealth() {
+    fetch("/api/health", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        netHealth = d;
+        if ((location.hash || "").slice(1) === "network") { renderSigAll(); }
+      })
+      .catch(function () { netHealth = null; });
+  }
+
+  function startNetHealthPoll() {
+    fetchNetHealth();
+    if (netHealthTimer) { clearInterval(netHealthTimer); }
+    netHealthTimer = setInterval(function () {
+      if (!pollCfg.paused) { fetchNetHealth(); }
+    }, pollCfg.strip * 1000);
+  }
+
+  function stopNetHealthPoll() {
+    if (netHealthTimer) {
+      clearInterval(netHealthTimer);
+      netHealthTimer = null;
+    }
+  }
+
+  function healthService(key) {
+    var list = (netHealth && netHealth.services) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].service === key) { return list[i]; }
+    }
+    return null;
+  }
+
   function connLive(id) {
+    var hdef = null;
+    for (var hi = 0; hi < CONNECTIONS.length; hi++) {
+      if (CONNECTIONS[hi].id === id) { hdef = CONNECTIONS[hi]; }
+    }
+    if (hdef && hdef.live === "health") {
+      if (!netHealth || !netHealth.present) {
+        return { cls: "", val: "no health read yet" };
+      }
+      var lvl = null;
+      var hage = null;
+      var hstatus = "";
+      if (hdef.healthKey === "jobs") {
+        var jl = netHealth.jobs_log || {};
+        lvl = jl.level || null;
+        hage = telNum(jl.last_tick_age_seconds);
+      } else {
+        var svc = healthService(hdef.healthKey);
+        if (!svc) { return { cls: "", val: "not in health file" }; }
+        lvl = svc.level || null;
+        hage = telNum(svc.last_seen_age_seconds);
+        hstatus = svc.reported_status ? " · " + svc.reported_status : "";
+      }
+      var hcls = lvl === "green" ? "ok"
+        : lvl === "amber" ? "warn"
+        : lvl === "red" ? "bad" : "";
+      return { cls: hcls, val: ageText2(hage) + hstatus };
+    }
     if (id === "newsloop") {
       if (newsData && newsData.as_of) {
         var na = (Date.now() - Date.parse(newsData.as_of)) / 1000;
@@ -444,59 +552,136 @@
     }
   }
 
-  function buildConnTiles() {
-    var tiles = document.createElement("div");
-    tiles.className = "conn-tiles";
-    tiles.id = "conn-tiles";
-    function tile(label, valueText, cls, smallText) {
-      var cell = document.createElement("div");
-      cell.className = "conn-tile";
-      var em = document.createElement("em");
-      em.textContent = label;
-      var b = document.createElement("b");
-      b.textContent = valueText;
-      if (cls) { b.className = cls; }
-      var sm = document.createElement("small");
-      sm.textContent = smallText;
-      cell.appendChild(em);
-      cell.appendChild(b);
-      cell.appendChild(sm);
-      return cell;
+  /* telemetry panels — five live line charts over the session series,
+     drawn with the vendored uPlot (TradingView-class canvas engine). */
+  var TEL_DEFS = [
+    { key: "rtt", label: "Server RTT", unit: "ms", color: "#3b82f6",
+      cls: function (v) {
+        return v == null ? "bad" : (v >= 800 ? "bad" : (v >= 350 ? "warn" : "ok"));
+      } },
+    { key: "mirror", label: "Mirror age", unit: "s", color: "#16a34a",
+      cls: function (v) {
+        var wb = mirrorWarnBad();
+        return v == null ? "bad" : (v > wb[1] ? "bad" : (v > wb[0] ? "warn" : "ok"));
+      } },
+    { key: "market", label: "Feed age", unit: "s", color: "#d4a406",
+      cls: function (v) {
+        return v == null ? "bad" : (v > 120 ? "bad" : (v > 45 ? "warn" : "ok"));
+      } },
+    { key: "supervisor", label: "Supervisor age", unit: "s", color: "#8b5cf6",
+      cls: function (v) {
+        return v == null ? "bad" : (v > 600 ? "bad" : (v > 240 ? "warn" : "ok"));
+      } },
+    { key: "news", label: "News loop age", unit: "s", color: "#2ebd85",
+      cls: function (v) {
+        return v == null ? "" : (v > 900 ? "bad" : (v > 300 ? "warn" : "ok"));
+      } }
+  ];
+  var netCharts = [];
+
+  function telLast(key) {
+    var arr = TEL[key];
+    for (var i = arr.length - 1; i >= 0; i--) {
+      if (arr[i] != null) { return arr[i]; }
     }
-    var d0 = lastStrip || {};
-    var pull0 = d0.pull || {};
-    var mp0 = d0.market_pass || {};
-    var sv0 = d0.supervisor || {};
-    var machineVal = d0.machine || "—";
-    tiles.appendChild(tile("Machine", machineVal,
-      machineVal === "ARMED" ? "ok" : (machineVal === "—" ? "" : "warn"),
-      "STOP flags mirrored · authoritative"));
-    tiles.appendChild(tile("Server RTT",
-      lastStrip ? (lastRtt == null ? "answering" : lastRtt + " ms")
-        : "unreachable",
-      lastStrip ? "ok" : "bad", "direct serve.py probe"));
-    var wbT = mirrorWarnBad();
-    tiles.appendChild(tile("Mirror continuity",
-      ageText2(pull0.age_seconds),
-      ageCls(pull0.age_seconds, wbT[0], wbT[1]).replace("v ", ""),
-      "pull every " + (pull0.interval_ms
-        ? Math.round(pull0.interval_ms / 1000) + "s" : "—")));
-    tiles.appendChild(tile("Feed freshness",
-      ageText2(mp0.age_seconds),
-      ageCls(mp0.age_seconds, 45, 120).replace("v ", ""),
-      "market pass on the host"));
-    tiles.appendChild(tile("Supervisor",
-      (sv0.reported_status || "—"),
-      ageCls(sv0.age_seconds, 240, 600).replace("v ", ""),
-      "heartbeat " + ageText2(sv0.age_seconds) + " ago"));
-    var newsAgeTile = (newsData && newsData.as_of)
-      ? (Date.now() - Date.parse(newsData.as_of)) / 1000 : null;
-    tiles.appendChild(tile("News loop",
-      newsAgeTile == null ? "no read yet" : ageText2(newsAgeTile),
-      newsAgeTile == null ? "" : (newsAgeTile < 300 ? "ok" : "warn"),
-      "104 public sources"));
-    return tiles;
+    return null;
   }
+
+  function destroyNetCharts() {
+    for (var i = 0; i < netCharts.length; i++) {
+      if (netCharts[i].u) { netCharts[i].u.destroy(); }
+    }
+    netCharts = [];
+  }
+
+  function buildNetGrid() {
+    destroyNetCharts();
+    var grid = document.createElement("div");
+    grid.className = "net-grid";
+    var css = getComputedStyle(document.documentElement);
+    var axisInk = css.getPropertyValue("--muted").trim() || "#5d5d5d";
+    var gridLn = css.getPropertyValue("--line").trim() || "rgba(0,0,0,0.07)";
+    for (var i = 0; i < TEL_DEFS.length; i++) {
+      (function (def) {
+        var panel = document.createElement("div");
+        panel.className = "net-panel";
+        var head = document.createElement("div");
+        head.className = "net-panel-h";
+        var em = document.createElement("em");
+        em.textContent = def.label;
+        var val = document.createElement("b");
+        val.textContent = "—";
+        head.appendChild(em);
+        head.appendChild(val);
+        var plot = document.createElement("div");
+        plot.className = "net-plot";
+        panel.appendChild(head);
+        panel.appendChild(plot);
+        grid.appendChild(panel);
+        netCharts.push({ def: def, valEl: val, plotEl: plot, u: null,
+          axisInk: axisInk, gridLn: gridLn });
+      })(TEL_DEFS[i]);
+    }
+    return grid;
+  }
+
+  function mountNetCharts() {
+    if (typeof uPlot === "undefined") { return; }
+    for (var i = 0; i < netCharts.length; i++) {
+      (function (c) {
+        if (c.u || !c.plotEl.isConnected) { return; }
+        var w = Math.max(220, c.plotEl.clientWidth);
+        c.u = new uPlot({
+          width: w,
+          height: 96,
+          padding: [6, 4, 0, 0],
+          cursor: { y: false },
+          legend: { show: false },
+          scales: { x: { time: true } },
+          series: [
+            {},
+            { stroke: c.def.color, width: 1.5, spanGaps: false,
+              points: { show: false } }
+          ],
+          axes: [
+            { stroke: c.axisInk, size: 26,
+              font: "9.5px InterVariable, sans-serif",
+              ticks: { show: false }, grid: { show: false } },
+            { stroke: c.axisInk, size: 34,
+              font: "9.5px InterVariable, sans-serif",
+              ticks: { show: false },
+              grid: { stroke: c.gridLn, width: 1 } }
+          ]
+        }, [TEL.t, TEL[c.def.key]], c.plotEl);
+      })(netCharts[i]);
+    }
+  }
+
+  function updateNetCharts() {
+    for (var i = 0; i < netCharts.length; i++) {
+      var c = netCharts[i];
+      if (!c.plotEl.isConnected) { continue; }
+      if (c.u) { c.u.setData([TEL.t, TEL[c.def.key]]); }
+      var v = telLast(c.def.key);
+      c.valEl.textContent = v == null ? "—"
+        : Math.round(v) + " " + c.def.unit;
+      c.valEl.className = c.def.cls(v);
+    }
+  }
+
+  var netResizeTimer = null;
+  window.addEventListener("resize", function () {
+    if (netResizeTimer) { clearTimeout(netResizeTimer); }
+    netResizeTimer = setTimeout(function () {
+      for (var i = 0; i < netCharts.length; i++) {
+        var c = netCharts[i];
+        if (c.u && c.plotEl.isConnected) {
+          c.u.setSize({ width: Math.max(220, c.plotEl.clientWidth),
+            height: 96 });
+        }
+      }
+    }, 180);
+  });
 
   function connOverallWorst() {
     /* worst-of across measured rows: 0 ok, 1 degraded, 2 outage */
@@ -524,6 +709,13 @@
     var t = document.createElement("div");
     t.className = "news-title";
     t.textContent = "Network";
+    var mchip = document.createElement("span");
+    mchip.className = "machine-chip";
+    mchip.id = "net-machine";
+    mchip.appendChild(document.createTextNode("MACHINE"));
+    var mval = document.createElement("b");
+    mval.textContent = "—";
+    mchip.appendChild(mval);
     var overall = document.createElement("span");
     overall.className = "conn-overall";
     overall.id = "conn-overall";
@@ -534,6 +726,7 @@
     overall.appendChild(odot);
     overall.appendChild(olbl);
     headRow.appendChild(t);
+    headRow.appendChild(mchip);
     headRow.appendChild(overall);
     var sub = document.createElement("div");
     sub.className = "page-sub";
@@ -547,8 +740,13 @@
     page.appendChild(headRow);
     page.appendChild(sub);
     page.appendChild(note);
-    var tiles = buildConnTiles();
-    page.appendChild(tiles);
+    page.appendChild(buildNetGrid());
+    var telNote = document.createElement("div");
+    telNote.className = "net-note";
+    telNote.textContent = "This session · one sample per status poll (" +
+      pollCfg.strip + "s) · gaps are missed polls · durable history " +
+      "arrives with a telemetry contract.";
+    page.appendChild(telNote);
 
     var cols = document.createElement("div");
     cols.className = "conn-cols";
@@ -669,7 +867,10 @@
     cols.appendChild(sideCol);
     page.appendChild(cols);
     container.appendChild(page);
+    mountNetCharts();
+    updateNetCharts();
     refreshConnRows();
+    renderSigAll();
   }
 
   function pollingBox() {
@@ -775,9 +976,13 @@
   function renderSigAll() {
     if ((location.hash || "").slice(1) === "network" && sigPage) {
       refreshConnRows();
-      var oldTiles = document.getElementById("conn-tiles");
-      if (oldTiles && oldTiles.parentNode) {
-        oldTiles.parentNode.replaceChild(buildConnTiles(), oldTiles);
+      updateNetCharts();
+      var mchipEl = document.getElementById("net-machine");
+      if (mchipEl) {
+        var mb = mchipEl.querySelector("b");
+        var mv = (lastStrip && lastStrip.machine) || "—";
+        mb.textContent = mv;
+        mb.className = mv === "ARMED" ? "ok" : (mv === "—" ? "" : "warn");
       }
       var stamp = document.querySelector(".conn-assessed");
       if (stamp && lastStripAt) {

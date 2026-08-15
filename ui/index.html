@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
+<link rel="stylesheet" href="vendor/uPlot.min.css">
 <style>
   /* Quant owner shell v5 — adds the bottom profile + account popup
      (platform.openai.com pattern): hover the avatar for the popup
@@ -204,34 +205,54 @@
 
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
-  .conn-page { max-width: 1180px; margin: 0; padding: 72px 40px 56px; }
-  .conn-tiles {
-    display: flex; gap: 0; margin-top: 22px;
-    border: 1px solid var(--line-2); border-radius: 14px;
-    overflow: hidden;
+  .conn-page { max-width: none; margin: 0; padding: 72px 40px 56px; }
+  /* Network telemetry — live uPlot line panels (this-session series,
+     sampled at the strip cadence). Panels are functional containers:
+     1px line, small radius — sanctioned. */
+  .net-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 14px;
+    margin-top: 22px;
   }
-  .conn-tile { flex: 1; padding: 13px 16px; border-right: 1px solid var(--line); min-width: 0; }
-  .conn-tile:last-child { border-right: 0; }
-  .conn-tile em {
-    display: block; font-style: normal;
+  .net-panel {
+    border: 1px solid var(--line-2);
+    border-radius: 14px;
+    padding: 13px 14px 8px;
+    background: var(--panel);
+    min-width: 0;
+  }
+  .net-panel-h { display: flex; align-items: baseline; gap: 8px; }
+  .net-panel-h em {
+    font-style: normal;
     font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
-    text-transform: uppercase; color: var(--muted); line-height: 13px;
+    text-transform: uppercase; color: var(--muted);
   }
-  .conn-tile b {
-    display: block; margin-top: 2px;
+  .net-panel-h b {
+    margin-left: auto;
     font-family: var(--mono);
-    font-size: 17px; font-weight: 400; color: var(--ink);
-    line-height: 24px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 15px; font-weight: 400; color: var(--ink);
+    font-variant-numeric: tabular-nums lining-nums;
+    white-space: nowrap;
   }
-  .conn-tile b.ok { color: #16a34a; }
-  .conn-tile b.warn { color: #d4a406; }
-  .conn-tile b.bad { color: #cc2f3c; }
-  .conn-tile small {
-    display: block; margin-top: 1px;
-    font-size: 9.75px; color: var(--faint); line-height: 13px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  .net-panel-h b.ok { color: #16a34a; }
+  .net-panel-h b.warn { color: #d4a406; }
+  .net-panel-h b.bad { color: #cc2f3c; }
+  .net-plot { margin-top: 6px; height: 96px; }
+  .net-plot .u-legend { display: none; }
+  .net-note { margin-top: 12px; font-size: 10.5px; color: var(--faint); }
+  .machine-chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    height: 28px; padding: 0 11px;
+    border: 1px solid var(--line-2); border-radius: 999px;
+    font-size: 11px; font-weight: 640; letter-spacing: 0.04em;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
   }
+  .machine-chip b { font-family: var(--mono); font-weight: 400; font-size: 12.5px; }
+  .machine-chip b.ok { color: #16a34a; }
+  .machine-chip b.warn { color: #d4a406; }
+  .machine-chip b.bad { color: #cc2f3c; }
   .conn-assessed { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .conn-recover {
     width: 28px; height: 28px; flex: none;
@@ -246,7 +267,7 @@
   .conn-recover svg { width: 13px; height: 13px; stroke-width: 1.7; }
   .conn-recover.kick svg { animation: spin 600ms cubic-bezier(0.2, 0, 0.2, 1); }
   .conn-cols { display: flex; gap: 32px; align-items: flex-start; margin-top: 22px; }
-  .conn-main { flex: 1; min-width: 0; max-width: 720px; }
+  .conn-main { flex: 1; min-width: 0; }
   .conn-side { width: 344px; flex: none; display: flex; flex-direction: column; gap: 20px; }
   .poll-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
   .poll-row:last-child { border-bottom: 0; }
@@ -744,7 +765,7 @@
      (measured 208x38 r9999) — deliberately a size bigger, per owner. */
   .qsearch {
     position: relative;
-    width: min(440px, 30vw);
+    width: 264px;
   }
   .qsearch-box {
     position: relative;
@@ -1002,7 +1023,7 @@
   .ssr-empty { padding: 10px; font-size: 11.5px; color: var(--muted); }
   /* one page grid: every page's title sits exactly where News's
      title sits (72px down, 40px in) — no page moves. */
-  .page-shell { max-width: 1180px; padding: 72px 40px 56px; }
+  .page-shell { max-width: none; padding: 72px 40px 56px; }
   .page-sub { margin-top: 8px; font-size: 13.5px; color: var(--muted); }
 
   /* floating tooltip */
@@ -1223,6 +1244,7 @@
 </div>
 
 <div id="tip" role="tooltip" aria-hidden="true"></div>
+<script src="vendor/uPlot.iife.min.js"></script>
 <script src="shell.js"></script>
 </body>
 </html>
