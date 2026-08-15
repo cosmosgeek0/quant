@@ -1364,5 +1364,108 @@ class TestNewsEndpoint(ServerHarness):
         self.assertIsNotNone(payload["as_of"])
 
 
+class TestTelemetryEndpoint(ServerHarness):
+
+    def telemetry_sources(self, root):
+        sources = self.empty_sources(root / "missing")
+        sources["telemetry"] = root / "telemetry.jsonl"
+        return sources
+
+    def test_range_filters_and_sorts_points_ascending(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(minutes=15)), "value": 3},
+            {"ts": self.utc_text(now - timedelta(hours=7)), "value": 1},
+            {"ts": self.utc_text(now - timedelta(hours=5)), "value": 2},
+            {"ts": self.utc_text(now + timedelta(minutes=1)), "value": 4},
+        ]
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=6h")
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["read_only"])
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["range"], "6h")
+        self.assertEqual([row["value"] for row in payload["points"]], [2, 3])
+        self.assertEqual(payload["as_of"], rows[0]["ts"])
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["parse_errors"], 0)
+        self.assertFalse(payload["truncated"])
+
+    def test_downsamples_by_stride_and_always_keeps_newest(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(seconds=1600 - index)),
+             "value": index}
+            for index in range(1601)
+        ]
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(self.start(sources), "/api/telemetry")
+
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["stride"], 2)
+        self.assertEqual(payload["count"], 1601)
+        self.assertEqual(len(payload["points"]), 801)
+        self.assertEqual(payload["points"][0]["value"], 0)
+        self.assertEqual(payload["points"][-1]["value"], 1600)
+
+    def test_malformed_lines_and_unparseable_timestamps_are_counted(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        valid = {"ts": self.utc_text(now - timedelta(minutes=1)), "value": 7}
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "not json\n[]\n{\"value\":1}\n{\"ts\":\"junk\"}\n" +
+            json.dumps(valid) + "\n", encoding="utf-8")
+
+        payload = self.get_json(self.start(sources), "/api/telemetry")
+
+        self.assertEqual(payload["points"], [valid])
+        self.assertEqual(payload["parse_errors"], 4)
+
+    def test_absent_file_is_honest_empty(self):
+        root = self.tempdir()
+        sources = self.telemetry_sources(root)
+
+        payload = self.get_json(self.start(sources), "/api/telemetry")
+
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["source"], str(sources["telemetry"]))
+        self.assertEqual(payload["points"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertIsNone(payload["as_of"])
+        self.assertEqual(payload["parse_errors"], 0)
+        self.assertFalse(payload["truncated"])
+
+    def test_junk_range_defaults_to_one_hour(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(hours=2)), "value": 1},
+            {"ts": self.utc_text(now - timedelta(minutes=30)), "value": 2},
+        ]
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=junk")
+
+        self.assertEqual(payload["range"], "1h")
+        self.assertEqual([row["value"] for row in payload["points"]], [2])
+
+
 if __name__ == "__main__":
     unittest.main()

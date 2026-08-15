@@ -4,7 +4,7 @@
    qnet-status-warn, qnet-status-bad, qnet-value, qnet-trend, qnet-faint,
    qnet-cadence, qnet-cadence-select, qnet-cadence-fixed,
    qnet-refresh-cell, qnet-refresh, qnet-spin-kick, qnet-active,
-   qnet-gated; house classes: switch, knob. */
+   qnet-uptime, qnet-gated; house classes: switch, knob. */
 "use strict";
 
 (function () {
@@ -75,7 +75,7 @@
     var table = document.createElement("div");
     var header = document.createElement("div");
     var headings = ["COMPONENT", "STATUS", "LAST TICK", "TREND",
-      "CADENCE", "", "ACTIVE"];
+      "UPTIME", "CADENCE", "", "ACTIVE"];
     var groups = model && model.groups ? model.groups : [];
     var i;
 
@@ -100,6 +100,10 @@
       record.statusText.textContent = text(row.statusText);
       record.value.textContent = text(row.value);
       renderTrend(record.trend, row.bars);
+      record.uptime.className = "qnet-uptime" +
+        (row.uptime == null ? " qnet-faint" : "");
+      record.uptime.textContent = row.uptime == null
+        ? "\u2014" : row.uptime.toFixed(row.uptime >= 99.95 ? 0 : 1) + "%";
       record.refresh.hidden = !row.canRefresh;
       record.refresh.setAttribute("aria-hidden", row.canRefresh ? "false" : "true");
       record.toggle.setAttribute("aria-checked", row.active ? "true" : "false");
@@ -191,6 +195,7 @@
 
       record.value = makeCell("qnet-value");
       record.trend = makeCell("qnet-trend");
+      record.uptime = makeCell("qnet-uptime");
       record.cadence = makeCell("qnet-cadence");
       makeCadence(row, record);
 
@@ -238,6 +243,7 @@
       rowEl.appendChild(record.status);
       rowEl.appendChild(record.value);
       rowEl.appendChild(record.trend);
+      rowEl.appendChild(record.uptime);
       rowEl.appendChild(record.cadence);
       rowEl.appendChild(record.refreshCell);
       rowEl.appendChild(record.active);

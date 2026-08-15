@@ -14,6 +14,7 @@ the files written beneath RECEIPT_DIR:
   /api/health      service ticks, job-log tail, stop flags, and tick ages
   /api/decisions   recent momentum decisions with recorded signal evidence
   /api/failures    recent REFUSED/UNKNOWN job results and recorded reasons
+  /api/telemetry   recent timestamped UI telemetry, range-filtered and sampled
 
 Missing sources are honest empty responses. Malformed input is counted, never
 repaired. GET and HEAD are the only accepted methods. The server never writes a
@@ -30,13 +31,13 @@ import stat as stat_module
 import sys
 import threading
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 UI_DIR = Path(__file__).resolve().parent
 ROOT_DIR = UI_DIR.parent
@@ -107,6 +108,8 @@ RECENT_DECISIONS = 50
 RECENT_NEWS = 2000
 RECENT_FAILURES = 50
 FAILURE_SCAN_RECORDS = 250
+TELEMETRY_MAX_POINTS = 1600
+TELEMETRY_RANGE_HOURS = {"1h": 1, "6h": 6, "24h": 24}
 TAIL_BYTES = 1024 * 1024
 SOURCE_PARSE_CACHE_ENTRIES = 512
 GZIP_MIN_BYTES = 512
@@ -200,6 +203,7 @@ def default_sources():
         "manifest": LIVE_DIR / "pull_manifest.json",
         "news": LIVE_DIR / "news.jsonl",
         "news_sources": LIVE_DIR / "news_sources.json",
+        "telemetry": LIVE_DIR / "telemetry.jsonl",
     }
 
 
@@ -1100,7 +1104,12 @@ def api_health(sources, now=None):
         "stop_jobs": flags["STOP-JOBS"]["present"],
         "parse_errors": parse_errors + jobs["parse_errors"],
         "tail_truncated": truncated,
-        "sources": {name: str(source) for name, source in sources.items()},
+        # Telemetry is presentation history served by its own endpoint, not
+        # part of health's established operational-source inventory.
+        "sources": {
+            name: str(source) for name, source in sources.items()
+            if name != "telemetry"
+        },
     }
 
 
@@ -1169,6 +1178,61 @@ def api_news(sources):
         "parse_errors": parse_errors,
         "tail_truncated": truncated,
     }
+
+
+def api_telemetry(sources, range_name="1h", now=None):
+    path = sources["telemetry"]
+    if range_name not in TELEMETRY_RANGE_HOURS:
+        range_name = "1h"
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    window_start = now - timedelta(hours=TELEMETRY_RANGE_HOURS[range_name])
+
+    # _read_jsonl_tail bounds the byte read with TAIL_BYTES first. The same
+    # value as its line cap retains every non-empty line that can fit in that
+    # bounded tail without ever slurping an indefinitely growing source.
+    present, raw_records, parse_errors, tail_truncated = _read_jsonl_tail(
+        path, TAIL_BYTES, scan_limit=TAIL_BYTES)
+    kept = []
+    for record in raw_records:
+        if not isinstance(record, dict):
+            parse_errors += 1
+            continue
+        parsed = _parse_utc(record.get("ts"))
+        if parsed is None:
+            parse_errors += 1
+            continue
+        if window_start <= parsed <= now:
+            kept.append((parsed, record))
+    kept.sort(key=lambda item: item[0])
+
+    records = [record for _, record in kept]
+    kept_count = len(records)
+    truncated = tail_truncated
+    stride = None
+    if kept_count > TELEMETRY_MAX_POINTS:
+        stride = (kept_count + TELEMETRY_MAX_POINTS - 1) \
+            // TELEMETRY_MAX_POINTS
+        sampled = records[::stride]
+        if (kept_count - 1) % stride:
+            sampled.append(records[-1])
+        records = sampled
+        truncated = True
+
+    payload = {
+        "ok": True,
+        "read_only": True,
+        "source": str(path),
+        "present": present,
+        "range": range_name,
+        "as_of": records[-1]["ts"] if records else None,
+        "count": kept_count,
+        "parse_errors": parse_errors,
+        "truncated": truncated,
+        "points": records,
+    }
+    if stride is not None:
+        payload["stride"] = stride
+    return payload
 
 
 def _failure_verdict(record):
@@ -1469,6 +1533,7 @@ API_ROUTES = {
     "/api/fees": api_fees,
     "/api/pnl": api_pnl,
     "/api/news": api_news,
+    "/api/telemetry": api_telemetry,
 }
 
 
@@ -1628,7 +1693,8 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
 
     def _handle(self, head_only):
         try:
-            path = unquote(urlsplit(self.path).path)
+            parsed_url = urlsplit(self.path)
+            path = unquote(parsed_url.path)
         except ValueError:
             self._send(
                 404, "text/plain; charset=utf-8", b"not found\n",
@@ -1636,8 +1702,14 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
             return
         route = API_ROUTES.get(path)
         if route is not None:
+            if route is api_telemetry:
+                query = parse_qs(parsed_url.query, keep_blank_values=True)
+                range_name = query.get("range", ["1h"])[0]
+                payload = route(type(self).sources, range_name)
+            else:
+                payload = route(type(self).sources)
             self._send_json(
-                200, route(type(self).sources), head_only,
+                200, payload, head_only,
                 cache_control="no-cache")
             return
         if path.startswith("/api/"):

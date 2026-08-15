@@ -205,7 +205,34 @@
 
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
-  .conn-page { max-width: none; margin: 0; padding: 72px 40px 56px; }
+  .conn-page { max-width: 1280px; margin: 0; padding: 72px 40px 56px; }
+  .conn-tiles {
+    display: flex; gap: 0; margin-top: 22px;
+    border: 1px solid var(--line-2); border-radius: 14px;
+    overflow: hidden;
+  }
+  .conn-tile { flex: 1; padding: 13px 16px; border-right: 1px solid var(--line); min-width: 0; }
+  .conn-tile:last-child { border-right: 0; }
+  .conn-tile em {
+    display: block; font-style: normal;
+    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+    text-transform: uppercase; color: var(--muted); line-height: 13px;
+  }
+  .conn-tile b {
+    display: block; margin-top: 2px;
+    font-family: var(--mono);
+    font-size: 17px; font-weight: 400; color: var(--ink);
+    line-height: 24px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .conn-tile b.ok { color: #16a34a; }
+  .conn-tile b.warn { color: #d4a406; }
+  .conn-tile b.bad { color: #cc2f3c; }
+  .conn-tile small {
+    display: block; margin-top: 1px;
+    font-size: 9.75px; color: var(--faint); line-height: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .machine-chip {
     display: inline-flex; align-items: center; gap: 7px;
     height: 28px; padding: 0 11px;
@@ -1126,7 +1153,7 @@
 
 <div id="tip" role="tooltip" aria-hidden="true"></div>
 <script src="vendor/uPlot.iife.min.js"></script>
-<script src="net_spark.js"></script>
+<script src="net_chart.js"></script>
 <script src="net_bars.js"></script>
 <script src="net_table.js"></script>
 <script src="shell.js"></script>

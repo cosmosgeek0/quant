@@ -72,7 +72,7 @@
 
 .qnet-table {
   display: grid;
-  grid-template-columns: minmax(210px, 1.2fr) 110px minmax(90px, auto) minmax(160px, 1fr) 110px 34px 44px;
+  grid-template-columns: minmax(200px, 1.1fr) 108px minmax(90px, auto) minmax(150px, 1fr) 64px 104px 34px 44px;
   column-gap: 18px;
   width: 100%;
 }
@@ -368,3 +368,37 @@ html[data-theme="dark"] .qnet-stat-plot {
     animation: none;
   }
 }
+
+
+/* ---- v2: uptime column, taller status-page trend bars, chart card ---- */
+.qnet-uptime {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.qnet-trend,
+.qnet-bars { height: 20px; }
+
+.qnet-chartcard {
+  margin-top: 18px;
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  padding: 14px 16px 10px;
+  background: var(--panel);
+}
+
+.qnet-chart-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.qnet-chart-tools .pillbar { margin-top: 0; }
+
+.qnet-chart-ranges { margin-left: auto; }
+
+.qnet-chart { margin-top: 10px; min-height: 220px; position: relative; }
