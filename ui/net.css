@@ -252,7 +252,12 @@ html[data-theme="dark"] {
 }
 .st-panel-foot .st-spacer { flex: 1; }
 .st-panel-foot .st-t-meta { white-space: nowrap; }
-.st-logcol { position: sticky; top: 72px; }
+.st-logcol { min-width: 0; }
+.st-activity { padding: 4px 14px 10px; }
+.st-activity canvas { display: block; }
+.st-grid-wide { margin-top: 0; }
+.st-logcol .st-card { margin-top: 16px; }
+.st-logcol .st-card:first-child { margin-top: 16px; }
 @media (max-width: 1200px) {
   .st-cols { grid-template-columns: minmax(0, 1fr); }
   .st-logcol { position: static; }

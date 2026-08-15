@@ -162,6 +162,7 @@
     stopNewsPoll();
     stopNetHealthPoll();
     stopNetTelemetry();
+    stopActivity();
     if (netChart) { netChart.destroy(); netChart = null; }
     if (h === "network") {
       sigPage = pageEl;
@@ -697,6 +698,131 @@
   }
 
   var panelCharts = {};
+  var actTimer = null;
+  var actData = null;
+
+  function fetchActivity() {
+    fetch("/api/telemetry?range=24h", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        actData = d && d.present ? (d.points || []) : [];
+        renderActivity();
+      })
+      .catch(function () { actData = null; });
+  }
+
+  function startActivity() {
+    fetchActivity();
+    if (actTimer) { clearInterval(actTimer); }
+    actTimer = setInterval(function () {
+      if (!pollCfg.paused) { fetchActivity(); }
+    }, 60000);
+  }
+
+  function stopActivity() {
+    if (actTimer) { clearInterval(actTimer); actTimer = null; }
+  }
+
+  function activityBuckets() {
+    /* one stacked column per hour, 24 back from now: transitions
+       into bad (H), into warn (M), recoveries to ok (L) */
+    var buckets = [];
+    for (var b = 0; b < 24; b += 1) {
+      buckets.push({ h: 0, m: 0, l: 0 });
+    }
+    if (!actData || actData.length < 2) { return buckets; }
+    var t0 = Date.now() - 24 * 3600 * 1000;
+    for (var mi = 0; mi < NET_METRICS.length; mi += 1) {
+      var m = NET_METRICS[mi];
+      var thr = thrFor(m.key);
+      if (!thr) { continue; }
+      var prev = null;
+      for (var i = 0; i < actData.length; i += 1) {
+        var v = telNum(actData[i][m.field]);
+        if (v == null) { continue; }
+        var cur = v >= thr.bad ? "bad"
+          : v >= thr.warn ? "warn" : "ok";
+        if (prev !== null && cur !== prev) {
+          var ts = Date.parse(actData[i].ts);
+          if (isFinite(ts) && ts >= t0) {
+            var at = Math.min(23, Math.max(0,
+              Math.floor((ts - t0) / 3600000)));
+            if (cur === "bad") { buckets[at].h += 1; }
+            else if (cur === "warn") { buckets[at].m += 1; }
+            else { buckets[at].l += 1; }
+          }
+        }
+        prev = cur;
+      }
+    }
+    return buckets;
+  }
+
+  function renderActivity() {
+    var host = document.getElementById("net-activity");
+    if (!host) { return; }
+    var buckets = activityBuckets();
+    var canvas = host.querySelector("canvas");
+    if (!canvas) {
+      host.textContent = "";
+      canvas = document.createElement("canvas");
+      host.appendChild(canvas);
+    }
+    var w = Math.max(120, host.clientWidth);
+    var h = 96;
+    var ratio = Math.max(1, window.devicePixelRatio || 1);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    canvas.width = Math.round(w * ratio);
+    canvas.height = Math.round(h * ratio);
+    var ctx = canvas.getContext("2d");
+    if (!ctx) { return; }
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    var plotH = h - 18;
+    var maxN = 3;
+    for (var i = 0; i < 24; i += 1) {
+      var tot = buckets[i].h + buckets[i].m + buckets[i].l;
+      if (tot > maxN) { maxN = tot; }
+    }
+    var slot = w / 24;
+    var bw = slot * 0.72;
+    var colors = { l: "#24c19a", m: "#fbbf24", h: "#f87171" };
+    for (var b2 = 0; b2 < 24; b2 += 1) {
+      var x = b2 * slot + (slot - bw) / 2;
+      var y = plotH;
+      var parts = ["l", "m", "h"];
+      for (var p = 0; p < parts.length; p += 1) {
+        var n = buckets[b2][parts[p]];
+        if (!n) { continue; }
+        var bh = Math.max(2, (n / maxN) * (plotH - 6));
+        y -= bh;
+        ctx.fillStyle = colors[parts[p]];
+        ctx.fillRect(x, y, bw, bh);
+        y -= 1;
+      }
+    }
+    /* baseline + sparse hour labels, UTC */
+    var styles = getComputedStyle(host);
+    ctx.fillStyle = styles.getPropertyValue("--st-faint").trim() ||
+      "#95959d";
+    ctx.strokeStyle = styles.getPropertyValue("--st-divider").trim() ||
+      "#f0f0f2";
+    ctx.beginPath();
+    ctx.moveTo(0, plotH + 0.5);
+    ctx.lineTo(w, plotH + 0.5);
+    ctx.stroke();
+    ctx.font = "11px " + (styles.getPropertyValue("--sans").trim() ||
+      "InterVariable, sans-serif");
+    var nowH = new Date().getUTCHours();
+    for (var lb = 0; lb < 24; lb += 1) {
+      var hourAt = (nowH - 23 + lb + 48) % 24;
+      if (hourAt % 6 !== 0) { continue; }
+      var tx = lb * slot + slot / 2;
+      var txt = (hourAt < 10 ? "0" : "") + hourAt;
+      ctx.fillText(txt, tx - 6, h - 4);
+    }
+  }
 
   /* theme flips repaint tokens instantly but canvases keep their
      mount-time colors — remount the page's charts on the flip */
@@ -1519,7 +1645,6 @@
       "History arrives from the telemetry recorder.");
     cap.id = "net-chart-cap";
     graphCard.appendChild(cap);
-    page.appendChild(graphCard);
 
     /* section line: one common Defaults that resets everything */
     var secHead = stEl("div", "st-sec-head");
@@ -1553,21 +1678,37 @@
       });
     });
     secHead.appendChild(dfl);
-    page.appendChild(secHead);
 
-    /* panels 2-wide on the left; the network log rides the right
-       column so no wall of white space survives */
+    /* the master graph left, the network log right — one row
+       directly under the banner; panels take the full width below */
     var cols = stEl("div", "st-cols");
     var colL = stEl("div", "");
     var colR = stEl("div", "st-logcol");
     cols.appendChild(colL);
     cols.appendChild(colR);
-    var grid = stEl("div", "st-grid");
-    for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
-      if (CONNECTIONS[ri].group === "boundary") { continue; }
-      grid.appendChild(buildPanel(CONNECTIONS[ri], ri));
+    colL.appendChild(graphCard);
+    page.appendChild(cols);
+
+    /* activity: the log column's own 24h severity histogram */
+    var actCard = stEl("div", "st-card");
+    var actHead = stEl("div", "st-card-head");
+    actHead.appendChild(stEl("div", "st-t-h", "Activity \u00b7 24h"));
+    actHead.appendChild(stEl("span", "st-spacer"));
+    var lg = stEl("span", "st-t-meta", "");
+    var lgDefs = [["#f87171", "H"], ["#fbbf24", "M"], ["#24c19a", "L"]];
+    for (var lgi = 0; lgi < lgDefs.length; lgi += 1) {
+      var dot = stEl("span", "st-chip-key");
+      dot.style.background = lgDefs[lgi][0];
+      dot.style.marginLeft = lgi ? "8px" : "0";
+      lg.appendChild(dot);
+      lg.appendChild(document.createTextNode(" " + lgDefs[lgi][1]));
     }
-    colL.appendChild(grid);
+    actHead.appendChild(lg);
+    actCard.appendChild(actHead);
+    var actHost = stEl("div", "st-activity");
+    actHost.id = "net-activity";
+    actCard.appendChild(actHost);
+    colR.appendChild(actCard);
 
     var bottom = colR;
     var evCard = stEl("div", "st-card");
@@ -1607,9 +1748,18 @@
       "loops run on the host.");
     bCard.appendChild(bFoot);
     bottom.appendChild(bCard);
-    page.appendChild(cols);
+
+    /* panels: full width, 4 by 2, under the graph row */
+    page.appendChild(secHead);
+    var grid = stEl("div", "st-grid st-grid-wide");
+    for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
+      if (CONNECTIONS[ri].group === "boundary") { continue; }
+      grid.appendChild(buildPanel(CONNECTIONS[ri], ri));
+    }
+    page.appendChild(grid);
 
     container.appendChild(page);
+    startActivity();
     fetchPollConfig(function () {
       /* the allowed list and current values arrive after build —
          rebuild every select's options from the live config */
