@@ -6,8 +6,10 @@
   var BAR_HEIGHT = 14;
   var BAR_RADIUS = 1;
   var CAPACITY = 90;
+  /* nominal history ticks stay quiet (DESIGN.md §2.4) so deviation
+     ticks are the loud ones */
   var COLORS = {
-    ok: "#16a34a",
+    ok: "#57b47a",
     warn: "#d4a406",
     bad: "#cc2f3c"
   };

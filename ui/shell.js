@@ -342,34 +342,34 @@
      control endpoint lands (owner-sanctioned). */
   var CONNECTIONS = [
     { id: "server", name: "Web server", group: "path",
-      detail: "this dashboard ↔ serve.py · toggle pauses all polling here",
+      detail: "serve.py · loopback probe",
       live: true, control: "pause" },
     { id: "mirror", name: "Data mirror", group: "path",
-      detail: "EC2 host → this Mac · SSM pull loop (Lead-run)",
+      detail: "host → Mac · SSM pull",
       live: true, control: "wiring" },
     { id: "market", name: "Market feed", group: "path",
-      detail: "exchange stream pass on the host", live: true,
+      detail: "exchange stream pass · host", live: true,
       control: "wiring" },
     { id: "supervisor", name: "Supervisor", group: "path",
-      detail: "machine heartbeat on the host", live: true,
+      detail: "machine heartbeat · host", live: true,
       control: "wiring" },
     { id: "basiswatch", name: "Basis watch", group: "machine",
-      detail: "stream-fed basis pass loop on the host",
+      detail: "basis pass loop · host",
       live: "health", healthKey: "basis_watch", control: "wiring" },
     { id: "basissup", name: "Basis supervisor", group: "machine",
-      detail: "position supervision tick on the host",
+      detail: "position supervision · host",
       live: "health", healthKey: "basis_supervisor", control: "wiring" },
     { id: "jobrunner", name: "Job runner", group: "machine",
-      detail: "restricted job runner · one-minute host cron",
+      detail: "restricted jobs · 1m cron",
       live: "health", healthKey: "jobs", control: "wiring" },
     { id: "newsloop", name: "News fetch loop", group: "sources",
-      detail: "this Mac → 104 public sources · bound to the News master",
+      detail: "104 public sources · News master",
       live: "news", control: "news" },
     { id: "binance", name: "Binance API", group: "boundary",
-      detail: "host ↔ exchange · signed reads never touch this browser",
+      detail: "signed reads · host only",
       live: false, control: "wiring" },
     { id: "host", name: "EC2 host", group: "boundary",
-      detail: "AWS runtime · reached via SSM only", live: false,
+      detail: "AWS runtime · SSM only", live: false,
       control: "wiring" }
   ];
   var CONN_GROUPS = [
@@ -514,7 +514,7 @@
         options: [5, 10, 30, 60] };
     }
     if (def.id === "newsloop") {
-      return { kind: "fixed", text: "120s · process-set" };
+      return { kind: "fixed", text: "120s · fixed" };
     }
     if (def.id === "mirror") {
       var iv = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
@@ -546,6 +546,7 @@
           canRefresh: def.id === "server" || def.id === "newsloop" ||
             def.live === "health",
           active: !!connState[def.id],
+          hasControl: def.control === "pause" || def.control === "news",
           gated: def.group === "boundary"
         });
       }

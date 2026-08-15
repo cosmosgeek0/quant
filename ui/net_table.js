@@ -4,7 +4,7 @@
    qnet-status-warn, qnet-status-bad, qnet-value, qnet-trend, qnet-faint,
    qnet-cadence, qnet-cadence-select, qnet-cadence-fixed,
    qnet-refresh-cell, qnet-refresh, qnet-spin-kick, qnet-active,
-   qnet-uptime, qnet-gated; house classes: switch, knob. */
+   qnet-uptime; house classes: switch, knob. */
 "use strict";
 
 (function () {
@@ -106,13 +106,9 @@
         ? "\u2014" : row.uptime.toFixed(row.uptime >= 99.95 ? 0 : 1) + "%";
       record.refresh.hidden = !row.canRefresh;
       record.refresh.setAttribute("aria-hidden", row.canRefresh ? "false" : "true");
-      record.toggle.setAttribute("aria-checked", row.active ? "true" : "false");
-      record.toggle.disabled = !!row.gated;
-      record.toggle.className = "switch" + (row.gated ? " qnet-gated" : "");
-      if (row.gated) {
-        record.toggle.title = "Owner gated \u2014 control endpoint pending";
-      } else {
-        record.toggle.removeAttribute("title");
+      if (record.toggle) {
+        record.toggle.setAttribute("aria-checked",
+          row.active ? "true" : "false");
       }
     }
 
@@ -221,23 +217,27 @@
       record.refreshCell.appendChild(refresh);
 
       record.active = makeCell("qnet-active");
-      toggle.className = "switch";
-      toggle.type = "button";
-      toggle.setAttribute("role", "switch");
-      toggle.setAttribute("aria-label", text(row.name) + " active");
-      knob.className = "knob";
-      toggle.appendChild(knob);
-      toggle.addEventListener("click", function () {
-        var on;
-        if (toggle.disabled) { return; }
-        on = toggle.getAttribute("aria-checked") !== "true";
-        toggle.setAttribute("aria-checked", on ? "true" : "false");
-        if (typeof callbacks.onToggle === "function") {
-          callbacks.onToggle(record.id, on);
-        }
-      });
-      record.toggle = toggle;
-      record.active.appendChild(toggle);
+      /* a switch exists only where flipping it does something real
+         today (DESIGN.md §4) — other rows leave the cell empty */
+      if (row.hasControl) {
+        toggle.className = "switch";
+        toggle.type = "button";
+        toggle.setAttribute("role", "switch");
+        toggle.setAttribute("aria-label", text(row.name) + " active");
+        knob.className = "knob";
+        toggle.appendChild(knob);
+        toggle.addEventListener("click", function () {
+          var on = toggle.getAttribute("aria-checked") !== "true";
+          toggle.setAttribute("aria-checked", on ? "true" : "false");
+          if (typeof callbacks.onToggle === "function") {
+            callbacks.onToggle(record.id, on);
+          }
+        });
+        record.toggle = toggle;
+        record.active.appendChild(toggle);
+      } else {
+        record.toggle = null;
+      }
 
       rowEl.appendChild(record.component);
       rowEl.appendChild(record.status);
