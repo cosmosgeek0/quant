@@ -158,19 +158,26 @@ class KnobTunerTests(unittest.TestCase):
             "utc": self.health_rows()[0]["utc"],
         }])
 
-    def test_runtime_tick_sources_exported_knobs_before_first_stage(self):
+    def test_runtime_tick_parses_knobs_strictly_before_first_stage(self):
         source = RUNTIME_TICK.read_text(encoding="utf-8")
 
         self.assertIn('KNOBS_FILE="$DEPLOY_DIR/knobs.env"', source)
-        self.assertLess(
-            source.index("  set -a\n"),
-            source.index('  . "$KNOBS_FILE"\n'),
+        # Auditor note-a: strict KEY=decimal parsing, never `.`-sourced —
+        # shell content in knobs.env must be ignored, not executed.
+        self.assertNotIn('. "$KNOBS_FILE"', source)
+        parse_at = source.index('done < "$KNOBS_FILE"')
+        self.assertIn("QUANT_[A-Z_]*=[0-9]*", source)
+        self.assertLess(parse_at, source.index("run_stage feed"))
+        probe = subprocess.run(
+            ["bash", "-c",
+             'tmp=$(mktemp); printf "QUANT_IGNITION_SURGE=2.5\\nrm -rf /tmp/nope; echo pwned\\n" > "$tmp"; '
+             'KNOBS_FILE=$tmp; while IFS= read -r knob_line; do case "$knob_line" in '
+             'QUANT_[A-Z_]*=[0-9]*|QUANT_[A-Z_]*=[0-9]*.[0-9]*) export "${knob_line%%=*}=${knob_line#*=}";; esac; '
+             'done < "$KNOBS_FILE"; echo "$QUANT_IGNITION_SURGE"'],
+            capture_output=True, text=True,
         )
-        self.assertLess(
-            source.index('  . "$KNOBS_FILE"\n'),
-            source.index("  set +a\n"),
-        )
-        self.assertLess(source.index("  set +a\n"), source.index("run_stage feed"))
+        self.assertEqual(probe.stdout.strip(), "2.5")
+        self.assertNotIn("pwned", probe.stdout)
 
 
 if __name__ == "__main__":
