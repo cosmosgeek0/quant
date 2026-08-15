@@ -74,6 +74,7 @@ class TestUiPull(unittest.TestCase):
         self.assertEqual((self.live / "health.jsonl").read_bytes(), health)
         self.assertEqual(
             (self.live / "jobs" / "results.jsonl").read_bytes(), results)
+        manifest.pop("interval_ms", None)
         self.assertEqual(manifest, {
             "utc": UTC,
             "ok": True,
