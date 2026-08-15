@@ -123,12 +123,12 @@ html[data-theme="dark"] {
   background: none;
   border: 0;
   border-radius: 0;
-  margin-top: 20px;
+  margin-top: 9px;
   overflow: visible;
 }
 .st-card-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 14px 16px 12px 19px;
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 16px 12px 19px;
 }
 .st-card-head .st-spacer { flex: 1; }
 

@@ -540,7 +540,7 @@
         var ctx2 = u.ctx;
         var g = ctx2.createLinearGradient(0, u.bbox.top, 0,
           u.bbox.top + u.bbox.height);
-        g.addColorStop(0, alphaColor(color, strong ? 0.20 : 0.06));
+        g.addColorStop(0, alphaColor(color, strong ? 0.22 : 0.13));
         g.addColorStop(1, alphaColor(color, 0.005));
         return g;
       };

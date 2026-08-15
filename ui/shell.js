@@ -712,35 +712,6 @@
     });
     head.appendChild(rfr);
 
-    if (def.id !== "server") {
-      var view = stEl("button", "st-ctl-btn", "View");
-      view.setAttribute("type", "button");
-      view.setAttribute("title", "solo this loop in the master graph");
-      view.addEventListener("click", function () {
-        for (var vi = 0; vi < NET_METRICS.length; vi += 1) {
-          var mk = NET_METRICS[vi].key;
-          chipOn[mk] = mk === def.id;
-        }
-        var chipsAll = document.querySelectorAll(".st-chip");
-        for (var cq = 0; cq < chipsAll.length; cq += 1) {
-          var lbl = chipsAll[cq].textContent;
-          var on = false;
-          for (var vj = 0; vj < NET_METRICS.length; vj += 1) {
-            if (NET_METRICS[vj].label === lbl) {
-              on = chipOn[NET_METRICS[vj].key] !== false;
-            }
-          }
-          chipsAll[cq].classList.toggle("off", !on);
-        }
-        syncOverviewShow();
-        var g = document.getElementById("net-overview");
-        if (g) {
-          g.scrollIntoView({ behavior: "smooth", block: "center" });
-        }
-      });
-      head.appendChild(view);
-    }
-
     head.appendChild(mkSwitch(connState[def.id] !== false, function (on) {
       connState[def.id] = on;
       if (def.id === "server") {
@@ -779,7 +750,8 @@
       }
       var curEl = panel.querySelector("[data-current]");
       if (curEl) {
-        curEl.textContent = st.value == null ? "\u2014" : String(st.value);
+        curEl.textContent = st.value == null ? "\u2014"
+          : String(st.value).replace(/\s*\u00b7\s*[A-Z_]+\s*$/, "");
       }
     }
   }
@@ -1337,27 +1309,12 @@
 
     var head = stEl("div", "st-head");
     head.appendChild(stEl("div", "st-t-title", "Network"));
-    head.appendChild(stEl("span", "st-spacer"));
-    var master = stEl("span", "st-master" +
-      (pollCfg.paused ? " stopped" : ""));
-    master.appendChild(stEl("span", "st-t-mid",
-      pollCfg.paused ? "Network stopped" : "Network live"));
-    master.appendChild(mkSwitch(!pollCfg.paused, function (on) {
-      pollCfg.paused = !on;
-      savePollCfg();
-      master.classList.toggle("stopped", !on);
-      master.querySelector(".st-t-mid").textContent =
-        on ? "Network live" : "Network stopped";
-      page.classList.toggle("paused", !on);
-      renderSigAll();
-    }));
-    head.appendChild(master);
     page.appendChild(head);
 
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
     var gHead = stEl("div", "st-card-head");
-    gHead.appendChild(stEl("div", "st-t-h", "Loop lag"));
+    gHead.appendChild(stEl("div", "st-t-h", "Latency"));
     gHead.appendChild(stEl("span", "st-spacer"));
     var seg = stEl("div", "st-seg");
     var rdefs = ["1h", "6h", "24h"];
@@ -1380,6 +1337,40 @@
       })(rdefs[si]);
     }
     gHead.appendChild(seg);
+
+    var gRefresh = stEl("button", "st-iconbtn");
+    gRefresh.setAttribute("type", "button");
+    gRefresh.setAttribute("title", "refresh everything now");
+    var gsvg = document.createElementNS(SVG_NS, "svg");
+    gsvg.setAttribute("width", "13");
+    gsvg.setAttribute("height", "13");
+    gsvg.setAttribute("viewBox", "0 0 16 16");
+    var gpath = document.createElementNS(SVG_NS, "path");
+    gpath.setAttribute("d", REFRESH_ICON);
+    gpath.setAttribute("fill", "currentColor");
+    gsvg.appendChild(gpath);
+    gRefresh.appendChild(gsvg);
+    gRefresh.addEventListener("click", function () {
+      pollStrip();
+      fetchNetHealth();
+      fetchTelemetry();
+    });
+    gHead.appendChild(gRefresh);
+
+    var master = stEl("span", "st-master" +
+      (pollCfg.paused ? " stopped" : ""));
+    master.appendChild(stEl("span", "st-t-mid",
+      pollCfg.paused ? "Network stopped" : "Network live"));
+    master.appendChild(mkSwitch(!pollCfg.paused, function (on) {
+      pollCfg.paused = !on;
+      savePollCfg();
+      master.classList.toggle("stopped", !on);
+      master.querySelector(".st-t-mid").textContent =
+        on ? "Network live" : "Network stopped";
+      page.classList.toggle("paused", !on);
+      renderSigAll();
+    }));
+    gHead.appendChild(master);
     graphCard.appendChild(gHead);
     var chips = stEl("div", "st-chips");
     for (var ci2 = 0; ci2 < NET_METRICS.length; ci2 += 1) {
@@ -2517,6 +2508,17 @@
   var qsInput = document.getElementById("qsearch-input");
   var qsKbd = document.getElementById("qsearch-k");
   var qsPop = document.getElementById("qsearch-pop");
+  var qsDim = document.getElementById("qsearch-dim");
+  if (qsDim) {
+    qsDim.addEventListener("mousedown", function (ev) {
+      ev.preventDefault();
+      qsQ = "";
+      qsInput.value = "";
+      qsFocused = false;
+      qsInput.blur();
+      qsRender();
+    });
+  }
   var qsQ = "";
   var qsSel = 0;
   var qsTab = "top";
@@ -2641,17 +2643,17 @@
     var index = qsIndex();
     var ql = qsQ.trim().toLowerCase();
     if (!ql) {
-      /* pre-typing board: what's moving now, then the pages — the old
-         room also showed its markets before a query existed. */
+      /* pre-typing board: the PAGES first, then live sources —
+         symbols appear only once a query narrows them (owner order:
+         suggestions, not a token dump) */
       var idle = index.filter(function (e) {
-        return qsInTab(e) && (e.kind === "symbol" || e.kind === "page");
+        return qsInTab(e) && (e.kind === "page" || e.kind === "source");
       });
       idle.sort(function (a, b) {
-        if (a.kind !== b.kind) { return a.kind === "symbol" ? -1 : 1; }
-        if (a.kind === "symbol") { return (b.surge || 0) - (a.surge || 0); }
-        return 0;
+        if (a.kind !== b.kind) { return a.kind === "page" ? -1 : 1; }
+        return (b.count || 0) - (a.count || 0);
       });
-      return idle.slice(0, 8);
+      return idle.slice(0, 12);
     }
     var RANK = { page: 0, symbol: 1, news: 2, source: 3 };
     var scored = [];
@@ -2783,8 +2785,13 @@
     qsWrap.classList.toggle("open", open);
     qsBox.classList.toggle("on", qsFocused || qsQ.length > 0);
     qsInput.setAttribute("aria-expanded", open ? "true" : "false");
-    if (!open) { qsPop.hidden = true; return; }
+    if (!open) {
+      qsPop.hidden = true;
+      if (qsDim) { qsDim.hidden = true; }
+      return;
+    }
     qsPop.hidden = false;
+    if (qsDim) { qsDim.hidden = false; }
     qsResults = qsCompute();
     if (qsSel >= qsResults.length) {
       qsSel = Math.max(0, qsResults.length - 1);

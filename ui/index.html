@@ -678,7 +678,7 @@
      (measured 208x38 r9999) — deliberately a size bigger, per owner. */
   .qsearch {
     position: relative;
-    width: 264px;
+    width: clamp(420px, 40vw, 1040px);
   }
   .qsearch-box {
     position: relative;
@@ -828,18 +828,28 @@
   /* results panel — old .snav-search-pop, opaque by their owner-fix
      law (never backdrop-filter), grouped rows in our tokens. */
   .qsearch-pop {
-    position: absolute;
-    top: calc(100% + 7px);
-    left: 0;
-    right: 0;
-    z-index: 90;
+    position: fixed;
+    top: 88px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(880px, 74vw);
+    z-index: 95;
     background: var(--panel);
     border: 1px solid var(--line-2);
-    border-radius: 12px;
-    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.12);
-    padding: 5px;
-    max-height: min(520px, 70vh);
+    border-radius: 14px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.22);
+    padding: 6px;
+    max-height: min(66vh, 720px);
     overflow-y: auto;
+  }
+  .qsearch-dim {
+    position: fixed;
+    inset: 0;
+    z-index: 94;
+    background: rgba(13, 13, 13, 0.32);
+  }
+  html[data-theme="dark"] .qsearch-dim {
+    background: rgba(0, 0, 0, 0.5);
   }
   .ssr-tabs {
     display: flex;
@@ -1118,6 +1128,7 @@
           <button class="qsearch-k" id="qsearch-k" tabindex="-1" title="Focus search (⌘K)">⌘K</button>
         </div>
         <span class="search-beam" aria-hidden="true"></span>
+        <div class="qsearch-dim" id="qsearch-dim" hidden></div>
         <div class="qsearch-pop" id="qsearch-pop" hidden></div>
       </div>
     </div>
