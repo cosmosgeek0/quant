@@ -167,35 +167,13 @@ class ServerHarness(unittest.TestCase):
 class TestStaticServing(ServerHarness):
 
     def test_runtime_page_and_assets_serve_over_http(self):
+        # Front-end is a blank page by owner order (2026-08-15); the
+        # data layer keeps serving. Markers return when a UI returns.
         base = self.start({})
         for path, kind, markers in (
-                ("/", "text/html", (b"Overview", b"Basis", b"Volume",
-                                    b"Quant", b"Journal", b"QUANT",
-                                    b'id="sidebar"')),
+                ("/", "text/html", (b"<!doctype html", b"<title>Quant",)),
                 ("/index.html", "text/html",
-                 (b'id="topbar"', b'id="sidenav"',
-                  b'id="sidebottom"', b'id="pageband"',
-                  b'id="pageroot"', b'id="searchfield"',
-                  b'id="clockchip"', b'src="tabs/overview.js',
-                  b'src="tabs/journal.js',
-                  b"cannot trade, pause, or arm")),
-                ("/app.js", "text/javascript",
-                 (b'"/api/health"', b'"/api/decisions"', b'"/api/failures"',
-                  b'"/api/stream"', b'"/api/candidates"', b'"/api/pnl"',
-                  b'"/api/strip"', b'"/api/position"', b'"/api/momentum"',
-                  b"Unavailable", b"executionPhase", b"QuantTabs")),
-                ("/tabs/overview.js", "text/javascript",
-                 (b"Ledger incomplete", b"QuantTabs.overview")),
-                ("/tabs/basis.js", "text/javascript",
-                 (b"basis_gap", b"Not evaluated", b"QuantTabs.basis")),
-                ("/tabs/volume.js", "text/javascript",
-                 (b"top_surge", b"Observe only", b"QuantTabs.volume")),
-                ("/tabs/quant.js", "text/javascript",
-                 (b"Activity detail unavailable", b"QuantTabs.quant")),
-                ("/tabs/journal.js", "text/javascript",
-                 (b"QuantTabs.journal",)),
-                ("/style.css", "text/css", (b"--red", b"--amber",
-                                            b"--green", b"#sidebar")),
+                 (b"<!doctype html", b"<title>Quant",)),
                 ("/fixtures/events.jsonl", "text/plain", (b'"run_id"',))):
             status, headers, body = self.get(base, path)
             self.assertEqual(status, 200, path)
@@ -206,10 +184,8 @@ class TestStaticServing(ServerHarness):
     def test_page_has_no_browser_exchange_fetch_or_legacy_live_sections(self):
         base = self.start({})
         _, _, html = self.get(base, "/index.html")
-        _, _, javascript = self.get(base, "/app.js")
-        joined = html + javascript
-        self.assertNotIn(b"api.binance.com", joined)
-        self.assertNotIn(b"PRICE_URL", joined)
+        self.assertNotIn(b"api.binance.com", html)
+        self.assertNotIn(b"PRICE_URL", html)
         for legacy in ("/api/basis", "/api/futures", "/api/volume"):
             payload = self.get_json(base, legacy, expect_status=404)
             self.assertEqual(payload["error"], "not found")
@@ -271,11 +247,11 @@ class TestBackendHardening(ServerHarness):
         self.assertNotIn("Content-Encoding", headers)
 
         static_status, static_headers, static_body = self.get(
-            base, "/style.css")
+            base, "/index.html")
         self.assertEqual(static_status, 200)
         self.assertTrue(static_body)
         self.assertRegex(static_headers["ETag"], r'^"[0-9a-f]{64}"$')
-        static_facts = (UI_DIR / "style.css").stat()
+        static_facts = (UI_DIR / "index.html").stat()
         static_prefix = ("static:%d:%d:%d:" % (
             static_facts.st_mtime_ns, static_facts.st_size,
             static_facts.st_ino)).encode("ascii")
@@ -289,7 +265,7 @@ class TestBackendHardening(ServerHarness):
                 {"If-None-Match": static_headers["ETag"]},
                 {"If-Modified-Since": static_headers["Last-Modified"]}):
             status, headers, body = self.get(
-                base, "/style.css", headers=conditional)
+                base, "/index.html", headers=conditional)
             self.assertEqual(status, 304)
             self.assertEqual(body, b"")
             self.assertEqual(headers["ETag"], static_headers["ETag"])
@@ -395,7 +371,7 @@ class TestBackendHardening(ServerHarness):
     def test_security_headers_cover_static_and_api(self):
         root = self.tempdir()
         base = self.start(self.empty_sources(root / "missing"))
-        for path in ("/style.css", "/api/fees"):
+        for path in ("/index.html", "/api/fees"):
             status, headers, _ = self.get(base, path)
             self.assertEqual(status, 200)
             self.assert_security_headers(headers)

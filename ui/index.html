@@ -4,69 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
-<link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
-
-<header id="topbar">
-  <div class="brand">
-    <img class="brand-mark" src="brand-mark.png" alt="">
-    <span class="brand-text">
-      <span class="brand-name">QUANT</span>
-      <span class="brand-sub">OWNER ROOM</span>
-    </span>
-  </div>
-  <button id="searchfield" type="button" aria-label="Search (Cmd K)">
-    <span class="ic sf-ic" style="--ic:url(vendor/icons/search.svg)"></span>
-    <span class="sf-ph">Search markets, records…</span>
-    <kbd class="sf-key">⌘K</kbd>
-  </button>
-  <div id="topright">
-    <span id="statuschips"></span>
-    <span id="clockchip" title="Owner clock">
-      <span class="ic ck-ic" style="--ic:url(vendor/icons/clock.svg)"></span>
-      <span id="clocktime">--:--:--</span>
-      <span class="ck-dot"></span>
-      <span id="clockzone">UTC</span>
-    </span>
-  </div>
-</header>
-
-<div id="connbar" role="status"></div>
-
-<div id="body">
-  <aside id="sidebar">
-    <nav id="sidenav" aria-label="Pages">
-      <p class="nav-eyebrow">Overview</p>
-      <button class="nav-item" type="button" role="tab" id="tab-overview" aria-selected="true"><span class="ic" style="--ic:url(vendor/icons/gauge.svg)"></span><span class="lbl">Overview</span></button>
-      <p class="nav-eyebrow">Engine</p>
-      <button class="nav-item" type="button" role="tab" id="tab-basis" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/scale.svg)"></span><span class="lbl">Basis</span></button>
-      <button class="nav-item" type="button" role="tab" id="tab-volume" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/chart-line.svg)"></span><span class="lbl">Volume</span></button>
-      <p class="nav-eyebrow">Control</p>
-      <button class="nav-item" type="button" role="tab" id="tab-quant" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/activity.svg)"></span><span class="lbl">Quant</span></button>
-      <p class="nav-eyebrow">Records</p>
-      <button class="nav-item" type="button" role="tab" id="tab-journal" aria-selected="false"><span class="ic" style="--ic:url(vendor/icons/file-text.svg)"></span><span class="lbl">Journal</span></button>
-    </nav>
-    <div id="sidebottom"></div>
-  </aside>
-
-  <main id="main">
-    <div id="pageband"></div>
-    <div id="pageroot"></div>
-  </main>
-</div>
-
-<footer id="foot">
-  <p>Every value on this page comes from the machine&rsquo;s own recorded
-  files. Missing data renders as unavailable &mdash; never as zero, never
-  as a sample. This page reads; it cannot trade, pause, or arm.</p>
-</footer>
-
-<script src="app.js?v=2"></script>
-<script src="tabs/overview.js?v=2"></script>
-<script src="tabs/basis.js?v=2"></script>
-<script src="tabs/volume.js?v=2"></script>
-<script src="tabs/quant.js?v=2"></script>
-<script src="tabs/journal.js?v=2"></script>
 </body>
 </html>
