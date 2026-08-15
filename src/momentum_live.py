@@ -46,6 +46,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DECISIONS_PATH = ROOT / "decisions.jsonl"
 DECISIONS_ROTATE_BYTES = 4 * 1024 * 1024
+DECISION_LEDGER_QUARANTINE_TYPE = "momentum_decision_ledger_quarantine"
 HARD_MAX_NOTIONAL = PER_LEG_CAP_USDT
 DEFAULT_INITIAL_NOTIONAL = Decimal("8")
 DEFAULT_JOB_TTL = timedelta(minutes=10)
@@ -102,9 +103,12 @@ class _DecisionIndex:
     rows_by_id: Dict[str, Dict[str, Any]]
     ignition_by_symbol: Dict[str, str]
     job_rows: List[Dict[str, Any]]
+    current_repair: Optional[bytes] = None
+    backup_repair: Optional[bytes] = None
 
 
 _DECISION_INDEXES: Dict[str, _DecisionIndex] = {}
+_DECISION_QUARANTINES: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
 def default_jobs_dir() -> Path:
@@ -323,32 +327,113 @@ def _decision_signature(path: Path) -> Tuple[Any, ...]:
     )
 
 
-def _read_decision_file(path: Path) -> List[Dict[str, Any]]:
+def _quarantine_decision_line(
+    path: Path,
+    ledger_key: str,
+    line_number: int,
+    raw_line: bytes,
+    reason: str,
+) -> None:
+    digest = hashlib.sha256(raw_line.rstrip(b"\r\n")).hexdigest()
+    identity = (ledger_key, digest)
+    if identity in _DECISION_QUARANTINES:
+        return
+    event = {
+        "type": DECISION_LEDGER_QUARANTINE_TYPE,
+        "ledger": ledger_key,
+        "segment": os.path.abspath(str(path)),
+        "line": line_number,
+        "reason": reason,
+        "sha256": digest,
+    }
+    _DECISION_QUARANTINES[identity] = event
+    print(json.dumps(event, sort_keys=True), file=sys.stderr)
+
+
+def _read_decision_file(
+    path: Path,
+    *,
+    ledger_key: Optional[str] = None,
+    repair_payloads: Optional[Dict[str, bytes]] = None,
+) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
         raise MomentumLiveError(f"decision ledger is unreadable: {path}") from None
+    resolved_ledger_key = ledger_key or os.path.abspath(str(path))
     rows: List[Dict[str, Any]] = []
-    for line in lines:
-        if not line.strip():
+    clean_lines: List[bytes] = []
+    quarantined = False
+    for line_number, raw_line in enumerate(data.splitlines(keepends=True), 1):
+        terminated = raw_line.endswith((b"\n", b"\r"))
+        content = raw_line.rstrip(b"\r\n")
+        if not content.strip():
+            if terminated:
+                clean_lines.append(raw_line)
+            elif content:
+                quarantined = True
+            continue
+        if not terminated:
+            quarantined = True
+            _quarantine_decision_line(
+                path,
+                resolved_ledger_key,
+                line_number,
+                content,
+                "truncated",
+            )
             continue
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
+            row = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            quarantined = True
+            _quarantine_decision_line(
+                path,
+                resolved_ledger_key,
+                line_number,
+                content,
+                "unparseable",
+            )
             continue
-        if isinstance(row, dict):
-            rows.append(row)
+        if not isinstance(row, dict):
+            quarantined = True
+            _quarantine_decision_line(
+                path,
+                resolved_ledger_key,
+                line_number,
+                content,
+                "not_object",
+            )
+            continue
+        rows.append(row)
+        clean_lines.append(raw_line)
+    if quarantined and repair_payloads is not None:
+        repair_payloads[os.path.abspath(str(path))] = b"".join(clean_lines)
     return rows
 
 
-def _read_decisions(path: Path) -> List[Dict[str, Any]]:
+def _read_decisions(
+    path: Path,
+    *,
+    repair_payloads: Optional[Dict[str, bytes]] = None,
+) -> List[Dict[str, Any]]:
     """Read the two bounded decision segments, oldest first."""
     path = Path(path)
+    ledger_key = os.path.abspath(str(path))
     return (
-        _read_decision_file(_decision_backup_path(path))
-        + _read_decision_file(path)
+        _read_decision_file(
+            _decision_backup_path(path),
+            ledger_key=ledger_key,
+            repair_payloads=repair_payloads,
+        )
+        + _read_decision_file(
+            path,
+            ledger_key=ledger_key,
+            repair_payloads=repair_payloads,
+        )
     )
 
 
@@ -391,30 +476,113 @@ def _decision_index(path: Path) -> _DecisionIndex:
     cached = _DECISION_INDEXES.get(key)
     if cached is not None and cached.signature == signature:
         return cached
-    index = _DecisionIndex(signature, {}, {}, [])
-    for row in _read_decisions(path):
+    repair_payloads: Dict[str, bytes] = {}
+    rows = _read_decisions(path, repair_payloads=repair_payloads)
+    index = _DecisionIndex(
+        signature,
+        {},
+        {},
+        [],
+        repair_payloads.get(_decision_cache_key(path)),
+        repair_payloads.get(_decision_cache_key(_decision_backup_path(path))),
+    )
+    for row in rows:
         _index_decision(index, row)
     index.signature = _decision_signature(path)
     _DECISION_INDEXES[key] = index
     return index
 
 
-def _rotate_decisions(path: Path, incoming_bytes: int) -> bool:
+def _stage_decision_payload(path: Path, payload: bytes) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("decision write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        return temporary
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _replace_decision_payload(path: Path, payload: bytes) -> None:
+    temporary = _stage_decision_payload(path, payload)
+    try:
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _rotate_decisions(
+    path: Path,
+    incoming: bytes,
+    current_payload: Optional[bytes] = None,
+) -> bool:
     if DECISIONS_ROTATE_BYTES <= 0:
         raise MomentumLiveError("decision rotation threshold must be positive")
-    try:
-        size = path.stat().st_size
-    except FileNotFoundError:
+    if current_payload is None:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise MomentumLiveError(
+                f"decision ledger is unreadable: {path}"
+            ) from None
+        if size == 0 or size + len(incoming) <= DECISIONS_ROTATE_BYTES:
+            return False
+        try:
+            current_payload = path.read_bytes()
+        except OSError:
+            raise MomentumLiveError(
+                f"decision ledger is unreadable: {path}"
+            ) from None
+    if not current_payload \
+            or len(current_payload) + len(incoming) <= DECISIONS_ROTATE_BYTES:
         return False
-    except OSError:
-        raise MomentumLiveError(f"decision ledger is unreadable: {path}") from None
-    if size == 0 or size + incoming_bytes <= DECISIONS_ROTATE_BYTES:
-        return False
+    remainder_temporary: Optional[Path] = None
+    backup_temporary: Optional[Path] = None
     try:
-        os.replace(path, _decision_backup_path(path))
+        remainder_temporary = _stage_decision_payload(path, incoming)
+        backup_path = _decision_backup_path(path)
+        backup_temporary = _stage_decision_payload(
+            backup_path, current_payload
+        )
+        os.replace(backup_temporary, backup_path)
+        backup_temporary = None
+        _fsync_directory(path.parent)
+        os.replace(remainder_temporary, path)
+        remainder_temporary = None
         _fsync_directory(path.parent)
     except OSError:
         raise MomentumLiveError(f"decision ledger rotation failed: {path}") from None
+    finally:
+        for temporary in (remainder_temporary, backup_temporary):
+            if temporary is None:
+                continue
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     _DECISION_INDEXES.pop(_decision_cache_key(path), None)
     return True
 
@@ -740,24 +908,43 @@ def append_decision(path: Path, row: Mapping[str, Any]) -> bool:
     if existing is not None:
         if existing != dict(row):
             raise MomentumLiveError(f"decision id conflict: {decision_id}")
+        repaired = False
+        if index.backup_repair is not None:
+            _replace_decision_payload(
+                _decision_backup_path(path), index.backup_repair
+            )
+            repaired = True
+        if index.current_repair is not None:
+            _replace_decision_payload(path, index.current_repair)
+            repaired = True
+        if repaired:
+            _DECISION_INDEXES.pop(_decision_cache_key(path), None)
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = (
         json.dumps(dict(row), sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    needs_separator = False
-    if path.exists() and path.stat().st_size:
-        with open(path, "rb") as check:
-            check.seek(-1, os.SEEK_END)
-            needs_separator = check.read(1) != b"\n"
-    if _rotate_decisions(path, len(encoded) + int(needs_separator)):
-        index = _decision_index(path)
-        needs_separator = False
+    if index.backup_repair is not None:
+        _replace_decision_payload(
+            _decision_backup_path(path), index.backup_repair
+        )
+        index.backup_repair = None
+        index.signature = _decision_signature(path)
+    if index.current_repair is not None:
+        clean_payload = index.current_repair
+        if _rotate_decisions(path, encoded, clean_payload):
+            _decision_index(path)
+            return True
+        _replace_decision_payload(path, clean_payload + encoded)
+        _DECISION_INDEXES.pop(_decision_cache_key(path), None)
+        _decision_index(path)
+        return True
+    if _rotate_decisions(path, encoded):
+        _decision_index(path)
+        return True
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
     descriptor = os.open(str(path), flags, 0o600)
     try:
-        if needs_separator:
-            os.write(descriptor, b"\n")
         offset = 0
         while offset < len(encoded):
             written = os.write(descriptor, encoded[offset:])

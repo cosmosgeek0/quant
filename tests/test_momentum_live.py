@@ -415,6 +415,100 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertEqual(replay.written_job_ids, ())
         self.assertEqual(len(self.job_paths()), 1)
 
+    def test_torn_final_decision_is_logged_once_skipped_and_rewritten(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        row = self.decision_rows()[0]
+        torn = json.dumps(
+            dict(row, reason="parseable but unterminated tail"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.decisions.write_bytes(torn)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertTrue(live.append_decision(self.decisions, row))
+            self.assertFalse(live.append_decision(self.decisions, row))
+
+        events = [
+            json.loads(line) for line in stderr.getvalue().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            events[0]["type"], live.DECISION_LEDGER_QUARANTINE_TYPE
+        )
+        self.assertEqual(events[0]["reason"], "truncated")
+        self.assertEqual(events[0]["line"], 1)
+        self.assertTrue(self.decisions.read_bytes().endswith(b"\n"))
+        self.assertEqual(self.decision_rows(), [row])
+
+    def test_valid_decision_id_conflict_remains_fatal(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        row = self.decision_rows()[0]
+        conflicting = dict(row, reason="different complete decision")
+
+        with self.assertRaisesRegex(
+            live.MomentumLiveError,
+            f"decision id conflict: {row['decision_id']}",
+        ):
+            live.append_decision(self.decisions, conflicting)
+        self.assertEqual(self.decision_rows(), [row])
+
+    def test_recovery_over_parseable_torn_tail_stays_exactly_once(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        self.tick(
+            stream_payload(
+                1, "105", "70", "7000", "1050", spread_pct="0.008"
+            )
+        )
+
+        def killed(_jobs_dir, _payload):
+            raise SimulatedKill("killed before job publication")
+
+        payload = stream_payload(
+            2, "108", "75", "7600", "1070", spread_pct="0.007"
+        )
+        with self.assertRaises(SimulatedKill):
+            self.tick(payload, job_writer=killed)
+        job_row = next(
+            row for row in self.decision_rows() if row["job"] is not None
+        )
+        with open(self.decisions, "ab") as handle:
+            handle.write(json.dumps(
+                dict(job_row, reason="parseable torn duplicate"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+
+        created = []
+
+        def counting_writer(jobs_dir, job):
+            published = live.write_job_record(jobs_dir, job)
+            if published:
+                created.append(job["job_id"])
+            return published
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            recovered = self.tick(payload, job_writer=counting_writer)
+            replay = self.tick(payload, job_writer=counting_writer)
+
+        expected = job_row["job"]["job_id"]
+        self.assertEqual(recovered.recovered_job_ids, (expected,))
+        self.assertEqual(replay.recovered_job_ids, ())
+        self.assertEqual(replay.written_job_ids, ())
+        self.assertEqual(created, [expected])
+        self.assertEqual(len(self.job_paths()), 1)
+        self.assertTrue(self.decisions.read_bytes().endswith(b"\n"))
+        self.assertEqual(
+            sum(
+                row.get("decision_id") == job_row["decision_id"]
+                for row in self.decision_rows()
+            ),
+            1,
+        )
+
     def test_crash_after_job_publication_before_save_state_is_idempotent(self):
         clock = AdvancingClock()
         self.tick(
@@ -1045,6 +1139,63 @@ class MomentumLiveTests(unittest.TestCase):
         self.assertLessEqual(max(read_counts[2:]) - min(read_counts[2:]), 2)
         self.assertEqual(len(set(decision_times)), 12)
         self.assertLess(len(live._decision_index(self.decisions).rows_by_id), 600)
+
+    def test_rotation_installs_complete_remainder_atomically(self):
+        self.tick(stream_payload(0, "100", "2", "100", "1000"))
+        first = self.decision_rows()[0]
+        second = dict(
+            first,
+            decision_id="dec-" + "f" * 24,
+            decision_utc="2026-08-14T12:01:00.000Z",
+            reason="rotation remainder",
+        )
+        encoded = (
+            json.dumps(second, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        original = self.decisions.read_bytes()
+        threshold = len(original) + len(encoded) - 1
+        original_replace = live.os.replace
+        saw_complete_stage = []
+
+        def kill_before_remainder_rename(source, target):
+            if Path(target) == self.decisions:
+                staged = Path(source).read_bytes()
+                self.assertTrue(staged.endswith(b"\n"))
+                self.assertEqual([json.loads(line) for line in staged.splitlines()], [second])
+                saw_complete_stage.append(True)
+                raise SimulatedKill("between remainder write and rename")
+            return original_replace(source, target)
+
+        with mock.patch.object(
+            live, "DECISIONS_ROTATE_BYTES", threshold
+        ):
+            with mock.patch.object(
+                live.os, "replace", side_effect=kill_before_remainder_rename
+            ):
+                with self.assertRaises(SimulatedKill):
+                    live.append_decision(self.decisions, second)
+
+            self.assertEqual(saw_complete_stage, [True])
+            self.assertEqual(self.decisions.read_bytes(), original)
+            self.assertTrue(
+                all(
+                    json.loads(line)
+                    for path in (
+                        self.decisions,
+                        self.decisions.with_name(self.decisions.name + ".1"),
+                    )
+                    for line in path.read_bytes().splitlines()
+                )
+            )
+            self.assertEqual(
+                list(self.root.glob(".decisions.jsonl.*.tmp")), []
+            )
+            self.assertTrue(live.append_decision(self.decisions, second))
+
+        self.assertEqual(
+            [row["decision_id"] for row in live._read_decisions(self.decisions)],
+            [first["decision_id"], second["decision_id"]],
+        )
 
     def test_runtime_caps_remain_decimal_only(self):
         self.stream.write_text("{}", encoding="utf-8")
