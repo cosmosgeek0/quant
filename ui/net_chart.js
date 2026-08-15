@@ -633,6 +633,20 @@
       tooltip.style.top = Math.max(6, Math.round(y)) + "px";
     }
 
+    function resetXRange() {
+      var times = data[0];
+      var min = null;
+      var max = null;
+      for (var j = 0; j < times.length; j += 1) {
+        if (!isFinite(times[j])) { continue; }
+        min = min == null ? times[j] : Math.min(min, times[j]);
+        max = max == null ? times[j] : Math.max(max, times[j]);
+      }
+      if (min != null && max != null) {
+        plot.setScale("x", { min: min, max: max });
+      }
+    }
+
     var hasS = false;
     var hasMs = false;
     for (var ud = 0; ud < defs.length; ud += 1) {
@@ -671,6 +685,7 @@
       height: height,
       padding: [10, 14, 0, 0],
       legend: { show: false },
+      focus: { alpha: 0.25 },
       tzDate: function (timestamp) {
         var date = new Date(timestamp * 1000);
         return typeof root.uPlot.tzDate === "function"
@@ -679,7 +694,12 @@
       cursor: {
         show: true, x: true, y: false,
         points: { show: false },
-        drag: { x: false, y: false, setScale: false }
+        drag: { x: true, y: false, setScale: true },
+        focus: { prox: -1 },
+        /* one hover, every chart answers: shared crosshair channel
+           (research digest: cursor.sync) — all charts ride the same
+           time grid so positions line up exactly */
+        sync: { key: "qnet-x" }
       },
       scales: {
         x: { time: true },
@@ -691,6 +711,7 @@
       hooks: {
         ready: [function (u) {
           u.over.parentNode.appendChild(tooltip);
+          u.over.addEventListener("dblclick", resetXRange);
           u.over.addEventListener("mouseleave", function () {
             tooltip.style.display = "none";
           });
@@ -722,9 +743,23 @@
       setShow: function (idx, on) {
         plot.setSeries(idx + 1, { show: !!on });
       },
+      setFocus: function (idx) {
+        var q;
+        for (q = 0; q < defs.length; q += 1) {
+          if (idx == null || q !== idx) {
+            plot.setSeries(q + 1, { focus: false });
+          }
+        }
+        if (idx != null) {
+          plot.setSeries(idx + 1, { focus: true });
+        }
+      },
       destroy: function () {
         destroyed = true;
         root.removeEventListener("resize", handleResize);
+        if (plot && plot.over) {
+          plot.over.removeEventListener("dblclick", resetXRange);
+        }
         if (tooltip.parentNode) {
           tooltip.parentNode.removeChild(tooltip);
         }

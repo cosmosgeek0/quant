@@ -978,7 +978,7 @@
     if (netTelemTimer) { clearInterval(netTelemTimer); }
     netTelemTimer = setInterval(function () {
       if (!pollCfg.paused) { fetchTelemetry(); }
-    }, 30000);
+    }, netTelem.range === "1h" ? 10000 : 30000);
   }
 
   function stopNetTelemetry() {
@@ -1056,6 +1056,18 @@
       if (!isFinite(t)) { continue; }
       var raw = telNum(pts[i][m.field]);
       if (raw != null) { samples.push([Math.round(t / 1000), raw]); }
+    }
+    if (samples.length >= 3) {
+      /* eras sampled slower than today's setting must not tear into
+         holes: learn the metric's median spacing and widen tolerance
+         to cover it (a truly dead recorder still breaks the line) */
+      var gaps = [];
+      for (var gi2 = 1; gi2 < samples.length; gi2 += 1) {
+        gaps.push(samples[gi2][0] - samples[gi2 - 1][0]);
+      }
+      gaps.sort(function (a, b) { return a - b; });
+      var medGap = gaps[Math.floor(gaps.length / 2)];
+      if (medGap > 0) { tol = Math.max(tol, medGap * 2.2 + 5); }
     }
     var out = [];
     var si = 0;
@@ -1273,9 +1285,21 @@
     }
     if (capEl) {
       var n = d && d.present ? (d.count || 0) : 0;
-      capEl.textContent = n
-        ? "Live \u00b7 " + netTelem.range + " \u00b7 UTC"
-        : "History arrives from the telemetry recorder.";
+      var newestAge = null;
+      if (pts.length) {
+        var lastTs = Date.parse(pts[pts.length - 1].ts);
+        if (isFinite(lastTs)) {
+          newestAge = Math.round((Date.now() - lastTs) / 1000);
+        }
+      }
+      var silent = newestAge != null && newestAge > 60;
+      capEl.textContent = !n
+        ? "History arrives from the telemetry recorder."
+        : silent
+          ? "Recorder silent " + newestAge + "s \u00b7 " +
+            netTelem.range + " \u00b7 UTC"
+          : "Live \u00b7 " + netTelem.range + " \u00b7 UTC";
+      capEl.style.color = silent ? "var(--st-warn-text)" : "";
       capEl.setAttribute("title", n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples"
         : "");
@@ -1385,7 +1409,7 @@
             bs[q].classList.toggle("on",
               bs[q].textContent === rg.toUpperCase());
           }
-          fetchTelemetry();
+          startNetTelemetry();
         });
         seg.appendChild(rb);
       })(rdefs[si]);
@@ -1407,6 +1431,23 @@
           chipOn[m.key] = !cur;
           chip.classList.toggle("off", cur);
           syncOverviewShow();
+        });
+        chip.addEventListener("mouseenter", function () {
+          if (!netOverview || !netOverview.setFocus) { return; }
+          var at = 0;
+          for (var fx = 0; fx < NET_METRICS.length; fx += 1) {
+            if (NET_METRICS[fx].unit !== "s") { continue; }
+            if (NET_METRICS[fx].key === m.key) {
+              netOverview.setFocus(at);
+              return;
+            }
+            at += 1;
+          }
+        });
+        chip.addEventListener("mouseleave", function () {
+          if (netOverview && netOverview.setFocus) {
+            netOverview.setFocus(null);
+          }
         });
         chips.appendChild(chip);
       })(NET_METRICS[ci2], ci2);
