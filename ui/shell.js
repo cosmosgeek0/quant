@@ -529,7 +529,8 @@
     c.setAttribute("cx", "8");
     c.setAttribute("cy", "8");
     c.setAttribute("r", "8");
-    c.setAttribute("fill", state === 2 ? "#f87171"
+    c.setAttribute("fill", state === 3 ? "#c9cbd1"
+      : state === 2 ? "#f87171"
       : state === 1 ? "#fbbf24" : "#24c19a");
     svg.appendChild(c);
     var p = document.createElementNS(SVG_NS, "path");
@@ -540,6 +541,8 @@
     if (state === 0) {
       p.setAttribute("d", "M4.6 8.4l2.2 2.2 4.6-4.8");
       p.setAttribute("stroke-linejoin", "round");
+    } else if (state === 3) {
+      p.setAttribute("d", "M5 8h6");
     } else {
       p.setAttribute("d", "M8 4.4v4.4m0 2.6v.2");
     }
@@ -573,9 +576,12 @@
       for (var i = 0; i < CONNECTIONS.length; i++) {
         if (CONNECTIONS[i].live && connState[CONNECTIONS[i].id]) { n += 1; }
       }
+      var ago = lastStripAt ? Math.max(0, Math.round(
+        (Date.now() - lastStripAt) / 1000)) : null;
       return { worst: 0, title: "All connections operational",
         sub: "Every measured loop is inside its cadence \u00b7 " + n +
-          " loops measured through the host mirror." };
+          " loops measured through the host mirror" +
+          (ago == null ? "." : " \u00b7 assessed " + ago + "s ago.") };
     }
     var names = [];
     for (var j = 0; j < CONNECTIONS.length; j += 1) {
@@ -602,6 +608,11 @@
     var sig = st.worst + "|" + st.title + "|" + st.sub;
     if (card.getAttribute("data-sig") === sig) { return; }
     card.setAttribute("data-sig", sig);
+    var plate = document.getElementById("net-plate");
+    if (plate) {
+      plate.className = "st-plate" +
+        (st.worst === 2 ? " bad" : st.worst === 1 ? " warn" : "");
+    }
     card.textContent = "";
     var band = stEl("div", "st-banner-band" +
       (st.worst === 2 ? " bad" : st.worst === 1 ? " warn" : ""));
@@ -613,26 +624,142 @@
     card.appendChild(sub);
   }
 
+  function uptimeText(compKey) {
+    var pct = uptimePct(compKey);
+    if (pct == null) { return "\u2014"; }
+    if (pct >= 99.995) { return "100% uptime"; }
+    return (Math.round(pct * 100) / 100).toFixed(2) + "% uptime";
+  }
+
+  function cadenceText(def) {
+    if (def.id === "server") { return pollCfg.strip + "s poll"; }
+    if (def.id === "newsloop") { return "120s fixed"; }
+    if (def.id === "mirror") {
+      var iv = lastStrip && lastStrip.pull && lastStrip.pull.interval_ms;
+      return (typeof iv === "number" && iv > 0)
+        ? Math.round(iv / 1000) + "s pull" : null;
+    }
+    if (def.id === "jobrunner") { return "1m cron"; }
+    return null;
+  }
+
+  var expandCharts = {};
+
+  function closeExpandChart(id) {
+    if (expandCharts[id]) {
+      expandCharts[id].destroy();
+      delete expandCharts[id];
+    }
+  }
+
+  function fillExpand(def, row) {
+    var body = row.querySelector(".st-expand");
+    if (!body) { return; }
+    body.textContent = "";
+    var st = rowStatus(def);
+    var grid = stEl("div", "st-expand-grid");
+    var kv1 = stEl("div", "st-kv");
+    kv1.appendChild(stEl("span", "st-t-meta", "Source"));
+    kv1.appendChild(stEl("span", "st-t-metamid", def.detail));
+    grid.appendChild(kv1);
+    var kv2 = stEl("div", "st-kv");
+    kv2.appendChild(stEl("span", "st-t-meta", "Current"));
+    var cur = stEl("span", "st-t-datum",
+      st.value == null ? "\u2014" : String(st.value));
+    if (st.statusCls === "warn" || st.statusCls === "bad") {
+      cur.className += " " + st.statusCls;
+    }
+    kv2.appendChild(cur);
+    grid.appendChild(kv2);
+    var kv3 = stEl("div", "st-kv");
+    kv3.appendChild(stEl("span", "st-t-meta", "State"));
+    var sw = stEl("span", "st-word" +
+      (st.statusCls === "bad" ? " bad"
+        : st.statusCls === "warn" ? " warn" : ""),
+      st.statusText || "Measuring");
+    sw.style.fontSize = "12px";
+    kv3.appendChild(sw);
+    grid.appendChild(kv3);
+    var cad = cadenceText(def);
+    if (cad) {
+      var kv4 = stEl("div", "st-kv");
+      kv4.appendChild(stEl("span", "st-t-meta", "Cadence"));
+      kv4.appendChild(stEl("span", "st-t-metamid", cad));
+      grid.appendChild(kv4);
+    }
+    body.appendChild(grid);
+    var m = netMetric(def.id);
+    if (m) {
+      var host = stEl("div", "st-expand-chart");
+      body.appendChild(host);
+      var series = telemSeries(m.field);
+      if (series[0].length >= 2 && window.QNet && QNet.chart) {
+        closeExpandChart(def.id);
+        expandCharts[def.id] = QNet.chart.mount(host, {
+          points: series,
+          unit: m.unit,
+          height: 120,
+          thresholds: thrFor(def.id) || { warn: null, bad: null }
+        });
+      } else {
+        host.appendChild(stEl("div", "st-t-meta",
+          "History still filling for this loop."));
+      }
+    }
+    var canRefresh = def.id === "server" || def.id === "newsloop" ||
+      def.live === "health";
+    if (canRefresh) {
+      var act = stEl("div", "st-expand-actions");
+      var rb = stEl("button", "st-ctl-btn", "Refresh reading");
+      rb.setAttribute("type", "button");
+      rb.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        if (def.id === "server") { pollStrip(); }
+        else if (def.id === "newsloop") { fetchNews(true); }
+        else { fetchNetHealth(); }
+      });
+      act.appendChild(rb);
+      body.appendChild(act);
+    }
+  }
+
+  function toggleRow(def, row) {
+    var open = row.classList.toggle("open");
+    var chev = row.querySelector(".st-chev");
+    if (chev) { chev.textContent = open ? "\u25b2" : "\u25bc"; }
+    if (open) { fillExpand(def, row); }
+    else { closeExpandChart(def.id); }
+  }
+
   function buildStatusRow(def) {
     var row = stEl("div", "st-row");
     row.id = "strow-" + def.id;
-    var line = stEl("div", "st-row-line");
-    line.appendChild(stEl("span", "st-dot"));
+    var gated = def.group === "boundary";
+    var line = stEl("button", "st-rowline-btn");
+    line.setAttribute("type", "button");
+    var icon = stEl("span", "st-check");
+    icon.appendChild(stIcon(gated ? 3 : 0));
+    line.appendChild(icon);
     line.appendChild(stEl("span", "st-t-name", def.name));
     line.appendChild(stEl("span", "st-spacer"));
-    line.appendChild(stEl("span", "st-t-datum"));
-    line.appendChild(stEl("span", "st-word"));
+    if (gated) {
+      line.appendChild(stEl("span", "st-word off", "Owner gated"));
+      line.disabled = true;
+    } else {
+      var up = stEl("span", "st-uptime", "\u2014");
+      up.setAttribute("data-uptime", def.id);
+      line.appendChild(up);
+      line.appendChild(stEl("span", "st-chev", "\u25bc"));
+      line.addEventListener("click", function () {
+        toggleRow(def, row);
+      });
+    }
     row.appendChild(line);
-    row.appendChild(stEl("div", "st-detail st-t-meta", def.detail));
-    if (def.group !== "boundary") {
+    if (!gated) {
       var bars = stEl("div", "st-bars");
       bars.setAttribute("data-bars", def.id);
       row.appendChild(bars);
-      var foot = stEl("div", "st-row-foot");
-      var up = stEl("span", "st-t-metamid", "uptime \u2014");
-      up.setAttribute("data-uptime", def.id);
-      foot.appendChild(up);
-      row.appendChild(foot);
+      row.appendChild(stEl("div", "st-expand"));
     }
     return row;
   }
@@ -642,21 +769,20 @@
       var def = CONNECTIONS[i];
       var row = document.getElementById("strow-" + def.id);
       if (!row) { continue; }
+      if (def.group === "boundary") { continue; }
       var st = rowStatus(def);
-      var off = def.group === "boundary" || !connState[def.id];
-      var cls = st.statusCls === "bad" ? " bad"
-        : st.statusCls === "warn" ? " warn" : "";
-      row.querySelector(".st-dot").className =
-        "st-dot" + (off ? " off" : cls);
-      var datum = row.querySelector(".st-t-datum");
-      datum.textContent = st.value == null ? "\u2014" : String(st.value);
-      datum.className = "st-t-datum" + cls;
-      var word = row.querySelector(".st-word");
-      word.textContent = def.group === "boundary" ? "Owner gated"
-        : (!connState[def.id] ? (st.value === "polling paused"
-            ? "Paused" : "Off")
-          : (st.statusText || "Measuring"));
-      word.className = "st-word" + (off ? " off" : cls);
+      var off = !connState[def.id];
+      var state = off ? 3
+        : st.statusCls === "bad" ? 2
+        : st.statusCls === "warn" ? 1 : 0;
+      var icon = row.querySelector(".st-check");
+      if (icon && icon.getAttribute("data-state") !== String(state)) {
+        icon.setAttribute("data-state", String(state));
+        icon.textContent = "";
+        icon.appendChild(stIcon(state));
+      }
+      var up = row.querySelector("[data-uptime]");
+      if (up) { up.textContent = off ? "Off" : uptimeText(def.id); }
       var bars = row.querySelector("[data-bars]");
       if (bars && window.QNet && QNet.bars) {
         var fit = Math.max(12, Math.floor((bars.clientWidth + 2) / 7));
@@ -665,13 +791,7 @@
           QNet.bars.render(bars, samples);
         } else { bars.textContent = ""; }
       }
-      var up = row.querySelector("[data-uptime]");
-      if (up) {
-        var pct = uptimePct(def.id);
-        up.textContent = pct == null
-          ? "uptime \u2014 \u00b7 history still thin"
-          : "uptime " + (Math.round(pct * 10) / 10) + "%";
-      }
+      if (row.classList.contains("open")) { fillExpand(def, row); }
     }
   }
 
@@ -861,10 +981,27 @@
     if (!m) { return null; }
     var vs = telemSeries(m.field)[1];
     if (!vs.length) { return null; }
+    /* grade each sample against cadence thresholds AND the window's
+       own median — real spikes (a slow pull, an RTT jump) appear as
+       amber ticks even below the hard threshold. Measured variance,
+       never decoration. */
+    var t = thrFor(compKey);
+    var clean = [];
+    for (var c = 0; c < vs.length; c += 1) {
+      if (vs[c] != null) { clean.push(vs[c]); }
+    }
+    if (!clean.length) { return null; }
+    clean.sort(function (a, b) { return a - b; });
+    var med = clean[Math.floor(clean.length / 2)];
     var stride = Math.max(1, Math.ceil(vs.length / maxN));
     var out = [];
     for (var i = 0; i < vs.length; i += stride) {
-      out.push(vs[i] == null ? null : thrCls(compKey, vs[i]) || null);
+      var v = vs[i];
+      if (v == null) { out.push(null); continue; }
+      if (t && t.bad != null && v >= t.bad) { out.push("bad"); continue; }
+      if ((t && t.warn != null && v >= t.warn) ||
+          (med > 0 && v > med * 2.5)) { out.push("warn"); continue; }
+      out.push("ok");
     }
     return out;
   }
@@ -961,14 +1098,13 @@
 
   function buildNetworkPage(container) {
     container.textContent = "";
-    /* re-sync controllable rows from their single sources of truth */
     connState.server = !pollCfg.paused;
     connState.newsloop = newsMaster;
+    expandCharts = {};
 
     var page = stEl("div", "st-page");
 
-    /* header: title + machine authority chip. No lamp here — the
-       banner below is the single overall-state announcement. */
+    /* header: title left; authority + one real dark action right */
     var head = stEl("div", "st-head");
     head.appendChild(stEl("div", "st-t-title", "Network"));
     head.appendChild(stEl("span", "st-spacer"));
@@ -977,48 +1113,59 @@
     authority.appendChild(document.createTextNode("Machine \u00b7 "));
     authority.appendChild(stEl("b", "", "\u2014"));
     head.appendChild(authority);
+    var rawBtn = stEl("button", "st-btn-dark", "Raw telemetry");
+    rawBtn.setAttribute("type", "button");
+    rawBtn.addEventListener("click", function () {
+      window.open("/api/telemetry?range=" + netTelem.range, "_blank");
+    });
+    head.appendChild(rawBtn);
     page.appendChild(head);
 
-    /* banner card (their anatomy: tinted band + white sub, one card) */
+    /* banner: white card on a state plate (the measured 1px rim) */
+    var plate = stEl("div", "st-plate");
+    plate.id = "net-plate";
     var banner = stEl("div", "st-card");
     banner.id = "net-banner";
-    page.appendChild(banner);
+    plate.appendChild(banner);
+    page.appendChild(plate);
 
-    /* system status card: grouped rows with real uptime bars */
+    /* system status: flat rows, whisper dividers, window pager */
     var statusCard = stEl("div", "st-card");
     var sHead = stEl("div", "st-card-head");
     sHead.appendChild(stEl("div", "st-t-h", "System status"));
-    sHead.appendChild(stEl("span", "st-spacer"));
-    var assessed = stEl("span", "st-t-meta", "Connecting");
-    assessed.id = "net-assessed";
-    sHead.appendChild(assessed);
-    statusCard.appendChild(sHead);
-    for (var gi = 0; gi < CONN_GROUPS.length; gi += 1) {
-      var g = CONN_GROUPS[gi];
-      var any = false;
-      for (var ci = 0; ci < CONNECTIONS.length; ci += 1) {
-        if (CONNECTIONS[ci].group === g[0]) { any = true; }
-      }
-      if (!any) { continue; }
-      statusCard.appendChild(stEl("div", "st-group", g[1]));
-      for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
-        if (CONNECTIONS[ri].group === g[0]) {
-          statusCard.appendChild(buildStatusRow(CONNECTIONS[ri]));
-        }
-      }
+    var pager = stEl("div", "st-pager");
+    var pgPrev = stEl("button", "", "\u2039");
+    pgPrev.setAttribute("type", "button");
+    var pgLbl = stEl("span", "", netTelem.range + " window");
+    var pgNext = stEl("button", "", "\u203a");
+    pgNext.setAttribute("type", "button");
+    var RANGES = ["1h", "6h", "24h"];
+    function cycleRange(dir) {
+      var at = RANGES.indexOf(netTelem.range);
+      var nx = Math.min(RANGES.length - 1, Math.max(0, at + dir));
+      if (RANGES[nx] === netTelem.range) { return; }
+      netTelem.range = RANGES[nx];
+      pgLbl.textContent = netTelem.range + " window";
+      fetchTelemetry();
     }
-    var sFoot = stEl("div", "st-card-foot st-t-meta",
-      "History: ui/live/telemetry.jsonl \u00b7 owner-gated rows carry " +
-      "no telemetry \u2014 signed reads live on the host only.");
-    statusCard.appendChild(sFoot);
+    pgPrev.addEventListener("click", function () { cycleRange(-1); });
+    pgNext.addEventListener("click", function () { cycleRange(1); });
+    pager.appendChild(pgPrev);
+    pager.appendChild(pgLbl);
+    pager.appendChild(pgNext);
+    sHead.appendChild(pager);
+    sHead.appendChild(stEl("span", "st-spacer"));
+    statusCard.appendChild(sHead);
+    for (var ri = 0; ri < CONNECTIONS.length; ri += 1) {
+      statusCard.appendChild(buildStatusRow(CONNECTIONS[ri]));
+    }
     page.appendChild(statusCard);
 
-    /* chart card: ONE instrument, data-fitted axis, metric select */
+    /* the one full-width instrument */
     var chartCard = stEl("div", "st-card");
     var cHead = stEl("div", "st-card-head");
     cHead.appendChild(stEl("div", "st-t-h", "Loop timing"));
     cHead.appendChild(stEl("span", "st-spacer"));
-    var tools = stEl("div", "st-chart-tools");
     var sel = stEl("select", "st-select");
     for (var mi = 0; mi < NET_METRICS.length; mi += 1) {
       var opt = stEl("option", "", NET_METRICS[mi].label);
@@ -1031,28 +1178,7 @@
       if (netChart) { netChart.destroy(); netChart = null; }
       renderTelemetry();
     });
-    tools.appendChild(sel);
-    var seg = stEl("div", "st-seg");
-    var rdefs = ["1h", "6h", "24h"];
-    for (var si = 0; si < rdefs.length; si += 1) {
-      (function (rg) {
-        var rb = stEl("button", netTelem.range === rg ? "on" : "",
-          rg.toUpperCase());
-        rb.setAttribute("type", "button");
-        rb.addEventListener("click", function () {
-          netTelem.range = rg;
-          var bs = seg.querySelectorAll("button");
-          for (var q = 0; q < bs.length; q += 1) {
-            bs[q].classList.toggle("on",
-              bs[q].textContent === rg.toUpperCase());
-          }
-          fetchTelemetry();
-        });
-        seg.appendChild(rb);
-      })(rdefs[si]);
-    }
-    tools.appendChild(seg);
-    cHead.appendChild(tools);
+    cHead.appendChild(sel);
     chartCard.appendChild(cHead);
     var legend = stEl("div", "st-legend");
     legend.appendChild(stEl("span", "st-key"));
@@ -1073,7 +1199,7 @@
     chartCard.appendChild(cap);
     page.appendChild(chartCard);
 
-    /* controls card: only switches that do something real today */
+    /* controls: only switches that do something real today */
     var ctl = stEl("div", "st-card");
     var ctlHead = stEl("div", "st-card-head");
     ctlHead.appendChild(stEl("div", "st-t-h", "Controls"));
@@ -1094,7 +1220,6 @@
     });
     ctlHead.appendChild(dfl);
     ctl.appendChild(ctlHead);
-
     var r1 = stEl("div", "st-row");
     var r1l = stEl("div", "st-row-line");
     r1l.appendChild(stEl("span", "st-t-name", "Web server poll"));
@@ -1126,7 +1251,6 @@
     r1.appendChild(stEl("div", "st-detail st-t-meta",
       "strip cadence \u00b7 pause stops this page\u2019s polling only"));
     ctl.appendChild(r1);
-
     var r2 = stEl("div", "st-row");
     var r2l = stEl("div", "st-row-line");
     r2l.appendChild(stEl("span", "st-t-name", "News master"));
@@ -1141,15 +1265,15 @@
     r2.appendChild(stEl("div", "st-detail st-t-meta",
       "client-side master for the news fetch loop"));
     ctl.appendChild(r2);
-
     var ctlFoot = stEl("div", "st-card-foot st-t-meta",
       "Host-side rows stay read-only until the signed control " +
       "endpoint lands.");
     ctl.appendChild(ctlFoot);
     page.appendChild(ctl);
 
-    /* state changes: transitions computed from the telemetry file */
+    /* state changes: the honest incident history */
     var evCard = stEl("div", "st-card");
+    evCard.id = "net-evcard";
     var evHead = stEl("div", "st-card-head");
     evHead.appendChild(stEl("div", "st-t-h", "State changes"));
     evHead.appendChild(stEl("span", "st-spacer"));
@@ -1161,6 +1285,17 @@
     evHost.id = "net-events";
     evCard.appendChild(evHost);
     page.appendChild(evCard);
+
+    /* their centered footer action, wired to something real */
+    var foot = stEl("div", "st-foot-center");
+    var vh = stEl("button", "st-btn-outline", "View history");
+    vh.setAttribute("type", "button");
+    vh.addEventListener("click", function () {
+      var target = document.getElementById("net-evcard");
+      if (target) { target.scrollIntoView({ behavior: "smooth" }); }
+    });
+    foot.appendChild(vh);
+    page.appendChild(foot);
 
     container.appendChild(page);
     renderSigAll();
