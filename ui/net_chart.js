@@ -540,8 +540,8 @@
         var ctx2 = u.ctx;
         var g = ctx2.createLinearGradient(0, u.bbox.top, 0,
           u.bbox.top + u.bbox.height);
-        g.addColorStop(0, alphaColor(color, strong ? 0.22 : 0.13));
-        g.addColorStop(1, alphaColor(color, 0.005));
+        g.addColorStop(0, alphaColor(color, strong ? 0.24 : 0.22));
+        g.addColorStop(1, alphaColor(color, 0.01));
         return g;
       };
     }
@@ -716,11 +716,7 @@
         show: true, x: true, y: false,
         points: { show: false },
         drag: { x: true, y: false, setScale: true },
-        focus: { prox: -1 },
-        /* one hover, every chart answers: shared crosshair channel
-           (research digest: cursor.sync) — all charts ride the same
-           time grid so positions line up exactly */
-        sync: { key: "qnet-x" }
+        focus: { prox: -1 }
       },
       scales: {
         x: { time: true },

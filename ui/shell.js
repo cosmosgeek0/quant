@@ -266,7 +266,6 @@
 
   function sigClass(cls) {
     navNet.classList.remove("sig-ok", "sig-stale", "sig-bad");
-    if (cls && cls !== "sig-ok") { navNet.classList.add(cls); }
   }
 
   var lastRtt = null;
@@ -1309,6 +1308,7 @@
 
     var head = stEl("div", "st-head");
     head.appendChild(stEl("div", "st-t-title", "Network"));
+    head.appendChild(stEl("span", "st-spacer"));
     page.appendChild(head);
 
     /* THE graph — big, one unit, smoothed, every loop a color */
@@ -1337,6 +1337,7 @@
       })(rdefs[si]);
     }
     gHead.appendChild(seg);
+    graphCard.appendChild(gHead);
 
     var gRefresh = stEl("button", "st-iconbtn");
     gRefresh.setAttribute("type", "button");
@@ -1355,7 +1356,7 @@
       fetchNetHealth();
       fetchTelemetry();
     });
-    gHead.appendChild(gRefresh);
+    head.appendChild(gRefresh);
 
     var master = stEl("span", "st-master" +
       (pollCfg.paused ? " stopped" : ""));
@@ -1370,8 +1371,7 @@
       page.classList.toggle("paused", !on);
       renderSigAll();
     }));
-    gHead.appendChild(master);
-    graphCard.appendChild(gHead);
+    head.appendChild(master);
     var chips = stEl("div", "st-chips");
     for (var ci2 = 0; ci2 < NET_METRICS.length; ci2 += 1) {
       if (NET_METRICS[ci2].unit !== "s") { continue; }
@@ -1383,9 +1383,30 @@
         chip.appendChild(key);
         chip.appendChild(document.createTextNode(m.label));
         chip.addEventListener("click", function () {
-          var cur = chipOn[m.key] !== false;
-          chipOn[m.key] = !cur;
-          chip.classList.toggle("off", cur);
+          /* owner order: click a name = SEE that loop alone; click
+             it again = everything back */
+          var aloneAlready = chipOn[m.key] !== false &&
+            NET_METRICS.every(function (mm) {
+              return mm.unit !== "s" || mm.key === m.key ||
+                chipOn[mm.key] === false;
+            });
+          for (var ci3 = 0; ci3 < NET_METRICS.length; ci3 += 1) {
+            var kk = NET_METRICS[ci3].key;
+            chipOn[kk] = aloneAlready ? true : (kk === m.key);
+          }
+          var cs3 = chips.querySelectorAll(".st-chip");
+          for (var cq3 = 0; cq3 < cs3.length; cq3 += 1) {
+            var lbl3 = cs3[cq3].textContent;
+            var on3 = true;
+            for (var vj3 = 0; vj3 < NET_METRICS.length; vj3 += 1) {
+              if (NET_METRICS[vj3].label === lbl3) {
+                on3 = chipOn[NET_METRICS[vj3].key] !== false;
+              }
+            }
+            if (lbl3 !== "All") {
+              cs3[cq3].classList.toggle("off", !on3);
+            }
+          }
           syncOverviewShow();
         });
         chip.addEventListener("mouseenter", function () {
@@ -2018,15 +2039,11 @@
     masterWrap.appendChild(mlabel);
     masterWrap.appendChild(msw);
     right.appendChild(masterWrap);
+    /* owner order 2026-08-15: refresh + Live + News-on ride the
+       title row far right — the same slot Network's live toggle
+       holds. The old below-the-title row is retired. */
+    head.appendChild(right);
     newsHost.appendChild(head);
-    /* owner order: title inline with Overview's start; refresh + Live +
-       News-on live BELOW the title row, never at the topbar boundary.
-       The controls row always renders so News can be switched back on
-       even when the mirror is empty or the page is off. */
-    var stripRow = document.createElement("div");
-    stripRow.className = "strip-row";
-    stripRow.appendChild(right);
-    newsHost.appendChild(stripRow);
 
     if (newsData && newsData.as_of) {
       var liveAge = (Date.now() - Date.parse(newsData.as_of)) / 1000;

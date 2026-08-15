@@ -89,8 +89,8 @@ html[data-theme="dark"] {
   letter-spacing: -0.39px; line-height: 39px; color: var(--st-ink); }
 .st-t-h { font-size: 16px; font-weight: 500; letter-spacing: -0.2px;
   line-height: 24px; color: var(--st-ink); }
-.st-t-name { font-size: 14px; font-weight: 500; letter-spacing: -0.07px;
-  line-height: 20px; color: var(--st-ink); }
+.st-t-name { font-size: 15px; font-weight: 600; letter-spacing: -0.1px;
+  line-height: 21px; color: var(--st-ink); }
 .st-t-body { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
   line-height: 20px; color: var(--st-ink); }
 .st-t-mid { font-size: 14px; font-weight: 400; letter-spacing: -0.07px;
@@ -228,8 +228,8 @@ html[data-theme="dark"] {
 }
 .st-sec-head .st-t-h,
 .st-card-head .st-t-h {
-  font-size: 13px; font-weight: 600; letter-spacing: 0;
-  line-height: 18px;
+  font-size: 16px; font-weight: 650; letter-spacing: -0.2px;
+  line-height: 22px;
 }
 .st-sec-head .st-spacer { flex: 1; }
 .st-grid {
