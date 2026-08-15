@@ -2041,9 +2041,12 @@
     right.appendChild(masterWrap);
     /* owner order 2026-08-15: refresh + Live + News-on ride the
        title row far right — the same slot Network's live toggle
-       holds. The old below-the-title row is retired. */
+       holds. The day strip keeps its own row below. */
     head.appendChild(right);
     newsHost.appendChild(head);
+    var stripRow = document.createElement("div");
+    stripRow.className = "strip-row";
+    newsHost.appendChild(stripRow);
 
     if (newsData && newsData.as_of) {
       var liveAge = (Date.now() - Date.parse(newsData.as_of)) / 1000;
@@ -2151,7 +2154,7 @@
         strip.appendChild(cell);
       })(dayDefs[di]);
     }
-    stripRow.insertBefore(strip, right);
+    stripRow.appendChild(strip);
 
     /* pools */
     var dayPool = [];

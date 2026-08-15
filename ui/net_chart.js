@@ -551,8 +551,13 @@
       series.push({
         label: defs[d].label,
         stroke: defs[d].color,
-        fill: shadeFill(defs[d].color, defs.length === 1),
-        width: defs.length === 1 ? 1.8 : 1.4,
+        /* many translucent fills all painting down to zero stack
+           into grey mud — the multi chart draws crisp colored LINES
+           (the LayerZero grammar); single-series panels keep the
+           rich gradient (the owner's reference graph) */
+        fill: defs.length === 1
+          ? shadeFill(defs[d].color, true) : null,
+        width: defs.length === 1 ? 1.8 : 1.6,
         scale: defs[d].unit === "ms" ? "ms" : "s",
         /* bridge sampling holes so the ribbon reads continuous —
            outages still show in the bars, the banner and the log */
