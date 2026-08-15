@@ -869,6 +869,24 @@
         : "History arrives from the telemetry recorder.";
     }
     if (netTable) { netTable.update(buildTableModel()); }
+    var evHost2 = document.getElementById("net-events");
+    if (evHost2 && window.QNet && QNet.events) {
+      var evDefs = [];
+      for (var ei = 0; ei < NET_METRICS.length; ei++) {
+        evDefs.push({ key: NET_METRICS[ei].key,
+          field: NET_METRICS[ei].field,
+          label: NET_METRICS[ei].label,
+          thr: thrFor(NET_METRICS[ei].key) });
+      }
+      var evRows = QNet.events.compute(telemPoints(), evDefs);
+      QNet.events.render(evHost2, evRows);
+      var evCap2 = document.getElementById("net-events-cap");
+      if (evCap2) {
+        evCap2.textContent = evRows.length
+          ? evRows.length + " in the " + netTelem.range + " window"
+          : netTelem.range + " window";
+      }
+    }
     /* lamp and rows must repaint from the same threshold state —
        telemetry landing changes measured cadences, so the lamp
        re-evaluates here too, never one poll behind the table */
@@ -1040,6 +1058,25 @@
       "control endpoint lands · the Web server and News loop switches " +
       "act client-side today.";
     page.appendChild(tblNote);
+
+    /* state-change log — transitions computed from the telemetry file,
+       the page's honest incident history */
+    var evHead = document.createElement("div");
+    evHead.className = "conn-head-row";
+    evHead.style.marginTop = "26px";
+    var evTitle = document.createElement("div");
+    evTitle.className = "conn-title";
+    evTitle.textContent = "State changes";
+    var evCap = document.createElement("span");
+    evCap.className = "conn-overall";
+    evCap.id = "net-events-cap";
+    evCap.textContent = "";
+    evHead.appendChild(evTitle);
+    evHead.appendChild(evCap);
+    page.appendChild(evHead);
+    var evHost = document.createElement("div");
+    evHost.id = "net-events";
+    page.appendChild(evHost);
     if (window.QNet && QNet.table) {
       netTable = QNet.table.build(tableEl, buildTableModel());
       netTableHasCadence = !!(lastStrip && lastStrip.pull &&
