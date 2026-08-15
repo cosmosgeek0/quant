@@ -533,12 +533,26 @@
       return [0, hi];
     }
 
+    function shadeFill(color, strong) {
+      /* the reference graph's grammar: colour fading to nothing
+         under each line */
+      return function (u, si) {
+        var ctx2 = u.ctx;
+        var g = ctx2.createLinearGradient(0, u.bbox.top, 0,
+          u.bbox.top + u.bbox.height);
+        g.addColorStop(0, alphaColor(color, strong ? 0.20 : 0.06));
+        g.addColorStop(1, alphaColor(color, 0.005));
+        return g;
+      };
+    }
+
     var series = [{}];
     for (var d = 0; d < defs.length; d += 1) {
       series.push({
         label: defs[d].label,
         stroke: defs[d].color,
-        width: 1.4,
+        fill: shadeFill(defs[d].color, defs.length === 1),
+        width: defs.length === 1 ? 1.8 : 1.4,
         scale: defs[d].unit === "ms" ? "ms" : "s",
         spanGaps: false,
         points: { show: false }
@@ -644,7 +658,7 @@
       return axis;
     }
     var axes = [
-      { stroke: muted, font: axisFont, size: cfg.compact ? 26 : 30,
+      { stroke: muted, font: axisFont, size: cfg.compact ? 38 : 42,
         space: cfg.compact ? 88 : 78,
         grid: { show: true, stroke: line, width: 1 },
         ticks: { show: false }, border: { show: false } }
@@ -655,7 +669,7 @@
     var options = {
       width: width,
       height: height,
-      padding: [10, 8, 0, 0],
+      padding: [10, 14, 0, 0],
       legend: { show: false },
       tzDate: function (timestamp) {
         var date = new Date(timestamp * 1000);

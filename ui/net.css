@@ -94,7 +94,7 @@ html[data-theme="dark"] {
    (the banner is the only overall-state announcement) ---- */
 .st-head {
   display: flex; align-items: baseline; gap: 12px;
-  padding: 26px 0 14px;
+  padding: 18px 2px 10px;
 }
 .st-head .st-spacer { flex: 1; }
 .st-authority { font-size: 12px; font-weight: 400; line-height: 16px;
@@ -311,6 +311,21 @@ html[data-theme="dark"] {
   font-size: 12px; color: var(--st-ink);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- stat strip: four real numbers over the master graph ---- */
+.st-stats {
+  display: flex; gap: 0;
+  border: 1px solid var(--st-line);
+  border-radius: 7px;
+  margin: 4px 16px 6px;
+  overflow: hidden;
+}
+.st-stat {
+  flex: 1; padding: 8px 14px 9px;
+  border-left: 1px solid var(--st-line);
+}
+.st-stat:first-child { border-left: 0; }
+.st-stat-val { font-size: 16px; line-height: 22px; }
 
 /* ---- head pager (their date-range grammar, cycling the window) ---- */
 .st-pager { display: flex; align-items: center; gap: 8px; }

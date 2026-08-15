@@ -576,12 +576,8 @@
       for (var i = 0; i < CONNECTIONS.length; i++) {
         if (CONNECTIONS[i].live && connState[CONNECTIONS[i].id]) { n += 1; }
       }
-      var ago = lastStripAt ? Math.max(0, Math.round(
-        (Date.now() - lastStripAt) / 1000)) : null;
       return { worst: 0, title: "All connections operational",
-        sub: "Every measured loop is inside its cadence \u00b7 " + n +
-          " loops measured through the host mirror" +
-          (ago == null ? "." : " \u00b7 assessed " + ago + "s ago.") };
+        sub: "All " + n + " loops are reporting normally." };
     }
     var names = [];
     for (var j = 0; j < CONNECTIONS.length; j += 1) {
@@ -824,6 +820,53 @@
     return panel;
   }
 
+  function statTile(label, value) {
+    var t = stEl("div", "st-stat");
+    t.appendChild(stEl("div", "st-t-meta", label));
+    t.appendChild(stEl("div", "st-t-datum st-stat-val", value));
+    return t;
+  }
+
+  function updateStats() {
+    var host = document.getElementById("net-stats");
+    if (!host) { return; }
+    var pts = telemPoints();
+    var rtts = [];
+    var worstKey = null;
+    var worstRatio = 0;
+    for (var i = 0; i < pts.length; i += 1) {
+      var r = telNum(pts[i].rtt_ms);
+      if (r != null) { rtts.push(r); }
+    }
+    rtts.sort(function (a, b) { return a - b; });
+    var p50 = rtts.length
+      ? rtts[Math.floor(rtts.length / 2)] + " ms" : "\u2014";
+    for (var mi2 = 0; mi2 < NET_METRICS.length; mi2 += 1) {
+      var mm = NET_METRICS[mi2];
+      if (mm.unit !== "s" || connState[mm.key] === false) { continue; }
+      var cur2 = currentVal(mm.key);
+      var cad2 = cadenceEst(mm.field);
+      if (cur2 != null && cad2) {
+        var ratio = cur2 / cad2;
+        if (ratio > worstRatio) {
+          worstRatio = ratio;
+          worstKey = mm.label;
+        }
+      }
+    }
+    var evCap3 = document.getElementById("net-events-cap");
+    var changes = evCap3 && /^(\d+)/.test(evCap3.textContent)
+      ? evCap3.textContent.match(/^(\d+)/)[1] : "0";
+    host.textContent = "";
+    host.appendChild(statTile("Server RTT p50", p50));
+    host.appendChild(statTile("Slowest vs rhythm",
+      worstKey ? worstKey + " \u00d7" +
+        (Math.round(worstRatio * 10) / 10) : "\u2014"));
+    host.appendChild(statTile("Samples in window",
+      String(pts.length)));
+    host.appendChild(statTile("State changes", changes));
+  }
+
   function updatePanels() {
     for (var i = 0; i < CONNECTIONS.length; i += 1) {
       var def = CONNECTIONS[i];
@@ -1031,7 +1074,17 @@
         out.push(isAge && gt > lastT ? lastV + (gt - lastT) : lastV);
       }
     }
-    return movAvg(out, 3);
+    /* soften each loop against its OWN rhythm (~0.7 of a tooth):
+       fast loops keep fine detail, slow loops roll like the owner's
+       reference — waves, never razors, never flat lines */
+    var cad = cadenceEst(m.field);
+    var w = 3;
+    if (cad) {
+      w = Math.round((cad * 0.7) / grid.span);
+      if (w % 2 === 0) { w += 1; }
+      w = Math.max(3, Math.min(31, w));
+    }
+    return movAvg(out, w);
   }
 
   /* cadence estimate: an age series saw a tick land wherever the value
@@ -1221,9 +1274,11 @@
     if (capEl) {
       var n = d && d.present ? (d.count || 0) : 0;
       capEl.textContent = n
-        ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples \u00b7 " +
-          netTelem.range + " window \u00b7 shared grid \u00b7 UTC"
+        ? "Live \u00b7 " + netTelem.range + " \u00b7 UTC"
         : "History arrives from the telemetry recorder.";
+      capEl.setAttribute("title", n
+        ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples"
+        : "");
     }
     /* panel graphs: each loop's own line in its own color */
     if (pts.length >= 2 && window.QNet && QNet.chart &&
@@ -1254,6 +1309,7 @@
       }
     }
     updatePanels();
+    updateStats();
     var evHost2 = document.getElementById("net-events");
     if (evHost2 && window.QNet && QNet.events) {
       var evDefs = [];
@@ -1368,6 +1424,9 @@
     });
     chips.appendChild(allChip);
     graphCard.appendChild(chips);
+    var stats = stEl("div", "st-stats");
+    stats.id = "net-stats";
+    graphCard.appendChild(stats);
     var gHost = stEl("div", "st-graph-host");
     gHost.id = "net-overview";
     graphCard.appendChild(gHost);
