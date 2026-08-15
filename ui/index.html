@@ -37,7 +37,7 @@
 
   /* the one line on the page: the rail's right edge */
   .rail {
-    width: 56px;
+    width: 64px;
     flex: none;
     border-right: 1px solid var(--line);
     display: flex;
@@ -45,18 +45,18 @@
     align-items: center;
     padding: 18px 0 16px;
   }
-  .rail .mark { display: block; height: 26px; width: auto; margin-bottom: 30px; }
-  .rail nav { display: flex; flex-direction: column; gap: 10px; }
+  .rail .mark { display: block; height: 32px; width: auto; margin-bottom: 30px; }
+  .rail nav { display: flex; flex-direction: column; gap: 12px; }
   .nav-ic {
-    width: 36px; height: 36px;
+    width: 40px; height: 40px;
     display: flex; align-items: center; justify-content: center;
-    border-radius: 9px;
+    border-radius: 10px;
     color: var(--muted);
   }
   a.nav-ic:hover { background: var(--hover); color: var(--ink); }
   .nav-ic.active { background: var(--pill); color: var(--ink); }
   .nav-ic[aria-disabled="true"] { color: var(--faint); }
-  .nav-ic svg { width: 19px; height: 19px; stroke-width: 1.5; }
+  .nav-ic svg { width: 22px; height: 22px; stroke-width: 1.5; }
 
   main { flex: 1; min-width: 0; }
 
