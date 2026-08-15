@@ -1,7 +1,8 @@
-/* Quant shell — clock, Dune-grade collapsible sidebar, tooltips.
-   Collapsed (default): clicking the mark expands. Expanded: the
-   arrow-to-line button collapses. cmd/ctrl+\ toggles from anywhere.
-   One floating tooltip element serves every data-tip control. */
+/* Quant shell — clock, collapsible sidebar, tooltips, router, and the
+   account popup (hover the bottom avatar; click it for #settings).
+   Theme: system/light/dark, persisted, system tracked live. Log out is
+   real on the hosted site (Cloudflare Access endpoint) and honestly
+   disabled on this Mac where no session exists. */
 "use strict";
 
 (function () {
@@ -18,16 +19,59 @@
   tickClock();
   setInterval(tickClock, 1000);
 
-  /* ---- sidebar state ---- */
+  /* ---- elements ---- */
   var side = document.getElementById("side");
   var brandBtn = document.getElementById("brand-btn");
   var collapseBtn = document.getElementById("side-collapse");
   var tip = document.getElementById("tip");
+  var pop = document.getElementById("pop");
+  var profile = document.getElementById("profile");
+  var logoutRow = document.getElementById("pop-logout");
   var tipTimer = null;
   var KEY = "quant.side";
+  var THEME_KEY = "quant.theme";
   var isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform);
   var KBD = isMac ? "⌘" : "Ctrl";
 
+  /* ---- theme: system | light | dark ---- */
+  var mql = window.matchMedia("(prefers-color-scheme: dark)");
+  var themeChoice = "system";
+  try {
+    var t = localStorage.getItem(THEME_KEY);
+    if (t === "light" || t === "dark" || t === "system") { themeChoice = t; }
+  } catch (e) { /* private mode */ }
+
+  function applyTheme() {
+    var resolved = themeChoice === "system"
+      ? (mql.matches ? "dark" : "light") : themeChoice;
+    document.documentElement.setAttribute("data-theme", resolved);
+    var btns = pop.querySelectorAll(".tbtn");
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle(
+        "on", btns[i].getAttribute("data-theme-set") === themeChoice);
+    }
+  }
+
+  function setTheme(choice) {
+    themeChoice = choice;
+    try { localStorage.setItem(THEME_KEY, choice); } catch (e) { /* ok */ }
+    applyTheme();
+  }
+
+  if (mql.addEventListener) {
+    mql.addEventListener("change", function () {
+      if (themeChoice === "system") { applyTheme(); }
+    });
+  }
+  applyTheme();
+
+  pop.addEventListener("click", function (ev) {
+    var btn = ev.target && ev.target.closest
+      ? ev.target.closest("[data-theme-set]") : null;
+    if (btn) { setTheme(btn.getAttribute("data-theme-set")); }
+  });
+
+  /* ---- sidebar state ---- */
   function state() { return side.getAttribute("data-state"); }
 
   function apply(next) {
@@ -37,6 +81,7 @@
     if (expanded) { brandBtn.removeAttribute("data-tip"); }
     else { brandBtn.setAttribute("data-tip", "Expand"); }
     hideTip();
+    closePop();
   }
 
   function toggle() {
@@ -60,9 +105,10 @@
       ev.preventDefault();
       toggle();
     }
+    if (ev.key === "Escape") { closePop(); }
   });
 
-  /* ---- router: five pages, each honest about its state ---- */
+  /* ---- router: pages honest about their state ---- */
   var pageEl = document.getElementById("page");
   var rows = document.querySelectorAll(".nav-row[data-page]");
   var PAGES = {
@@ -70,7 +116,8 @@
     basis: ["Basis", "Not built yet — it arrives when you order it."],
     momentum: ["Momentum", "Not built yet — it arrives when you order it."],
     machine: ["Machine", "Not built yet — it arrives when you order it."],
-    journal: ["Journal", "Not built yet — it arrives when you order it."]
+    journal: ["Journal", "Not built yet — it arrives when you order it."],
+    settings: ["Settings", "Not built yet — it arrives when you order it."]
   };
 
   function route() {
@@ -87,10 +134,67 @@
     pageEl.textContent = "";
     pageEl.appendChild(b);
     pageEl.appendChild(document.createTextNode(" " + PAGES[h][1]));
+    closePop();
   }
 
   window.addEventListener("hashchange", route);
   route();
+
+  /* ---- account popup: hover opens, click goes to settings ---- */
+  var popTimer = null;
+
+  function openPop() {
+    if (popTimer) { clearTimeout(popTimer); popTimer = null; }
+    if (!pop.hidden) { return; }
+    pop.hidden = false;
+    var r = profile.getBoundingClientRect();
+    var w = pop.offsetWidth;
+    var h = pop.offsetHeight;
+    var left = Math.min(Math.max(8, Math.round(r.left - 4)),
+      window.innerWidth - w - 8);
+    var top = Math.max(8, Math.round(r.top - h - 10));
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+    profile.setAttribute("aria-expanded", "true");
+    requestAnimationFrame(function () { pop.classList.add("on"); });
+  }
+
+  function closePop() {
+    if (popTimer) { clearTimeout(popTimer); popTimer = null; }
+    if (pop.hidden) { return; }
+    pop.classList.remove("on");
+    profile.setAttribute("aria-expanded", "false");
+    pop.hidden = true;
+  }
+
+  function scheduleClose() {
+    if (popTimer) { clearTimeout(popTimer); }
+    popTimer = setTimeout(closePop, 150);
+  }
+
+  profile.addEventListener("mouseenter", openPop);
+  profile.addEventListener("mouseleave", scheduleClose);
+  pop.addEventListener("mouseenter", function () {
+    if (popTimer) { clearTimeout(popTimer); popTimer = null; }
+  });
+  pop.addEventListener("mouseleave", scheduleClose);
+  profile.addEventListener("click", function () {
+    location.hash = "#settings";
+  });
+  document.addEventListener("mousedown", function (ev) {
+    if (!pop.hidden && !pop.contains(ev.target) &&
+        !profile.contains(ev.target)) { closePop(); }
+  });
+
+  /* log out: real endpoint on the hosted site only */
+  var local = location.hostname === "127.0.0.1" ||
+    location.hostname === "localhost";
+  if (local) {
+    logoutRow.classList.add("inert");
+    logoutRow.removeAttribute("href");
+    logoutRow.setAttribute("title",
+      "No session on this Mac — live on the hosted site");
+  }
 
   /* ---- one floating tooltip for every [data-tip] ---- */
   function showTip(el) {
@@ -108,7 +212,6 @@
     tip.style.left = Math.round(r.right + 10) + "px";
     tip.style.top = "0px";
     tip.setAttribute("aria-hidden", "false");
-    /* measure after content set, then center vertically */
     var h = tip.offsetHeight;
     tip.style.top = Math.round(r.top + r.height / 2 - h / 2) + "px";
     tip.classList.add("on");
