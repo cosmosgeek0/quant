@@ -553,8 +553,7 @@
         stroke: defs[d].color,
         fill: shadeFill(defs[d].color, defs.length === 1),
         width: defs.length === 1 ? 1.8 : 1.4,
-        scale: defs[d].unit === "ms" ? "ms"
-          : defs[d].unit === "%" ? "pct" : "s",
+        scale: defs[d].unit === "ms" ? "ms" : "s",
         /* bridge sampling holes so the ribbon reads continuous —
            outages still show in the bars, the banner and the log */
         spanGaps: true,
@@ -660,11 +659,8 @@
 
     var hasS = false;
     var hasMs = false;
-    var hasPct = false;
     for (var ud = 0; ud < defs.length; ud += 1) {
-      if (defs[ud].unit === "ms") { hasMs = true; }
-      else if (defs[ud].unit === "%") { hasPct = true; }
-      else { hasS = true; }
+      if (defs[ud].unit === "ms") { hasMs = true; } else { hasS = true; }
     }
     function unitAxis(scaleName, unitText, side) {
       var axis = {
@@ -702,9 +698,8 @@
         grid: { show: true, stroke: line, width: 1 },
         ticks: { show: false }, border: { show: false } }
     ];
-    if (hasPct) { axes.push(unitAxis("pct", "%", false)); }
-    if (hasS) { axes.push(unitAxis("s", "s", hasPct)); }
-    if (hasMs) { axes.push(unitAxis("ms", "ms", hasPct || hasS)); }
+    if (hasS) { axes.push(unitAxis("s", "s", false)); }
+    if (hasMs) { axes.push(unitAxis("ms", "ms", hasS)); }
 
     var options = {
       width: width,
@@ -729,14 +724,10 @@
       },
       scales: {
         x: { time: true },
-        /* health graphs share one FIXED frame: 0 dead .. 100 fresh */
-        pct: { range: function () { return [0, 105]; } },
-        s: cfg.linearScale
-          ? { range: rangeUp }
-          : { distr: 4, asinh: 60, range: rangeUp },
-        ms: cfg.linearScale
-          ? { range: rangeUp }
-          : { distr: 4, asinh: 8, range: rangeUp }
+        /* proper linear scales, fitted to the data with headroom —
+           a spike grows the frame, the frame never crushes the line */
+        s: { range: rangeUp },
+        ms: { range: rangeUp }
       },
       axes: axes,
       series: series,

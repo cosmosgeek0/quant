@@ -120,11 +120,11 @@ html[data-theme="dark"] {
 
 /* ---- cards: one anatomy, measured (radius 7, hairline, white) ---- */
 .st-card {
-  background: var(--st-card);
-  border: 1px solid var(--st-line);
-  border-radius: 7px;
-  margin-top: 16px;
-  overflow: hidden;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  margin-top: 20px;
+  overflow: visible;
 }
 .st-card-head {
   display: flex; align-items: center; gap: 10px;
@@ -230,8 +230,9 @@ html[data-theme="dark"] {
 .st-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 0 16px;
+  gap: 8px 36px;
 }
+.st-panel { border-top: 1px solid var(--st-divider); margin-top: 8px; }
 @media (min-width: 1700px) {
   .st-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -318,14 +319,13 @@ html[data-theme="dark"] {
 /* ---- stat strip: four real numbers over the master graph ---- */
 .st-stats {
   display: flex; gap: 0;
-  border: 1px solid var(--st-line);
-  border-radius: 7px;
+  border-top: 1px solid var(--st-divider);
+  border-bottom: 1px solid var(--st-divider);
   margin: 4px 16px 6px;
-  overflow: hidden;
 }
 .st-stat {
   flex: 1; padding: 8px 14px 9px;
-  border-left: 1px solid var(--st-line);
+  border-left: 1px solid var(--st-divider);
 }
 .st-stat:first-child { border-left: 0; }
 .st-stat-val { font-size: 16px; line-height: 22px; }
@@ -388,6 +388,11 @@ html[data-theme="dark"] .st-btn-dark { color: #101418; }
 .qevents-state.qe-bad { color: var(--st-bad-text); }
 .qevents-empty { padding: 10px 16px 12px; font-size: 12px;
   color: var(--st-faint); }
+
+/* ---- global network master: red means stopped ---- */
+.st-master { display: inline-flex; align-items: center; gap: 10px; }
+.st-master.stopped .st-t-mid { color: var(--st-bad-text); }
+.st-master.stopped .switch { background: var(--st-bar-bad) !important; }
 
 /* ---- shared switch, sized to the quiet page ---- */
 .st-page .switch { transform: scale(0.92); transform-origin: right center; }

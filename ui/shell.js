@@ -706,9 +706,6 @@
       });
     });
     foot.appendChild(sel);
-    var stamp = stEl("span", "st-t-meta", "");
-    stamp.setAttribute("data-sampled", def.id);
-    foot.appendChild(stamp);
     foot.appendChild(stEl("span", "st-spacer"));
     var rfr = stEl("button", "st-ctl-btn", "Refresh");
     rfr.setAttribute("type", "button");
@@ -782,6 +779,9 @@
     var rtts = [];
     var worstKey = null;
     var worstRatio = 0;
+    var worstLagS = null;
+    var okLoops = 0;
+    var ageLoops = 0;
     for (var i = 0; i < pts.length; i += 1) {
       var r = telNum(pts[i].rtt_ms);
       if (r != null) { rtts.push(r); }
@@ -789,28 +789,62 @@
     rtts.sort(function (a, b) { return a - b; });
     var p50 = rtts.length
       ? rtts[Math.floor(rtts.length / 2)] + " ms" : "\u2014";
+    var p95 = rtts.length
+      ? rtts[Math.floor(rtts.length * 0.95)] + " ms" : "\u2014";
     for (var mi2 = 0; mi2 < NET_METRICS.length; mi2 += 1) {
       var mm = NET_METRICS[mi2];
       if (mm.unit !== "s" || connState[mm.key] === false) { continue; }
+      ageLoops += 1;
       var cur2 = currentVal(mm.key);
+      var t2 = thrFor(mm.key);
+      var clean2 = [];
+      var sv2 = seriesFilled(mm.field, mm.key)[1];
+      for (var ci2 = 0; ci2 < sv2.length; ci2 += 1) {
+        if (sv2[ci2] != null) { clean2.push(sv2[ci2]); }
+      }
+      clean2.sort(function (a, b) { return a - b; });
+      var med2 = clean2.length
+        ? clean2[Math.floor(clean2.length / 2)] : 0;
+      if (cur2 != null && t2 &&
+          gradeValue(cur2, t2, med2) === "ok") { okLoops += 1; }
       var cad2 = cadenceEst(mm.field);
       if (cur2 != null && cad2) {
         var ratio = cur2 / cad2;
         if (ratio > worstRatio) {
           worstRatio = ratio;
           worstKey = mm.label;
+          worstLagS = cur2;
         }
       }
     }
-    var changes = String(netEvCount);
+    var newestAge2 = "\u2014";
+    if (pts.length) {
+      var lts2 = Date.parse(pts[pts.length - 1].ts);
+      if (isFinite(lts2)) {
+        newestAge2 = Math.max(0, Math.round(
+          (Date.now() - lts2) / 1000)) + "s";
+      }
+    }
+    var spanTxt2 = "\u2014";
+    if (pts.length >= 2) {
+      var f2 = Date.parse(pts[0].ts);
+      var l2 = Date.parse(pts[pts.length - 1].ts);
+      if (isFinite(f2) && isFinite(l2)) {
+        spanTxt2 = (Math.round((l2 - f2) / 360000) / 10) + "h";
+      }
+    }
     host.textContent = "";
-    host.appendChild(statTile("Server RTT p50", p50));
-    host.appendChild(statTile("Slowest vs rhythm",
-      worstKey ? worstKey + " \u00d7" +
+    host.appendChild(statTile("Ping p50", p50));
+    host.appendChild(statTile("Ping p95", p95));
+    host.appendChild(statTile("Worst lag",
+      worstKey ? worstKey + " " + Math.round(worstLagS) + "s \u00d7" +
         (Math.round(worstRatio * 10) / 10) : "\u2014"));
-    host.appendChild(statTile("Samples in window",
-      String(pts.length)));
-    host.appendChild(statTile("State changes", changes));
+    host.appendChild(statTile("Loops on rhythm",
+      okLoops + "/" + ageLoops));
+    host.appendChild(statTile("Samples", String(pts.length)));
+    host.appendChild(statTile("History held", spanTxt2));
+    host.appendChild(statTile("Freshest sample", newestAge2));
+    host.appendChild(statTile("State changes", String(netEvCount)));
   }
 
   function updatePanels() {
@@ -835,39 +869,9 @@
       if (up) { up.textContent = off ? "Off" : uptimeText(def.id); }
       var curEl = panel.querySelector("[data-current]");
       if (curEl) {
-        var m3 = netMetric(def.id);
-        if (m3 && m3.unit === "s") {
-          var age3 = currentVal(def.id);
-          var norm3 = healthNorm(def.id);
-          curEl.textContent = (age3 != null && norm3)
-            ? Math.round(Math.max(0, Math.min(100,
-                100 * (1 - age3 / norm3)))) + "%"
-            : "\u2014";
-        } else {
-          curEl.textContent = st.value == null
-            ? "\u2014" : String(st.value);
-        }
+        curEl.textContent = st.value == null ? "\u2014" : String(st.value);
       }
-      var stampEl = panel.querySelector("[data-sampled]");
-      if (stampEl) {
-        var m2 = netMetric(def.id);
-        var age2 = null;
-        if (m2) {
-          var pts2 = telemPoints();
-          for (var pj = pts2.length - 1; pj >= 0; pj -= 1) {
-            if (telNum(pts2[pj][m2.field]) != null) {
-              var pt2 = Date.parse(pts2[pj].ts);
-              if (isFinite(pt2)) {
-                age2 = Math.max(0, Math.round(
-                  (Date.now() - pt2) / 1000));
-              }
-              break;
-            }
-          }
-        }
-        stampEl.textContent = age2 == null ? ""
-          : "sampled " + age2 + "s ago";
-      }
+
       var bars = panel.querySelector("[data-bars]");
       if (bars && window.QNet && QNet.bars) {
         var samples = statusSamples(def.id, 90);
@@ -901,9 +905,6 @@
   var netChart = null;
   var netOverview = null;
   var chipOn = {};
-  var netScaleMode = "expand";
-  var netSmooth = "soft";
-
   function destroyAllCharts() {
     if (netOverview) { netOverview.destroy(); netOverview = null; }
     var keys = Object.keys(panelCharts);
@@ -1016,23 +1017,6 @@
      x range, identical step, identical point count — a loop sampled
      at 1s and a loop sampled at 30s land on the same skeleton, so
      every chart draws the same shape of box (owner symmetry law). */
-  function healthNorm(key) {
-    /* the limit where a loop counts as silent: its bad threshold
-       (4x measured rhythm, or the honest fallback) */
-    var t = thrFor(key);
-    return t && t.bad ? t.bad : null;
-  }
-
-  function healthSeries(values, norm) {
-    var out = [];
-    for (var i = 0; i < values.length; i += 1) {
-      if (values[i] == null || !norm) { out.push(null); continue; }
-      out.push(Math.max(0, Math.min(100,
-        100 * (1 - values[i] / norm))));
-    }
-    return out;
-  }
-
   function displayGrid() {
     /* second-level granularity: 720 grid points per window, floor 4s
        (1H draws 5s steps; a 1s-polled loop shows near-raw detail) */
@@ -1055,9 +1039,6 @@
       var raw = telNum(pts[i][m.field]);
       if (raw != null) { samples.push([Math.round(t / 1000), raw]); }
     }
-    if (netSmooth === "raw") {
-      /* fall through: no averaging at all in raw mode */
-    }
     if (samples.length >= 3) {
       /* eras sampled slower than today's setting must not tear into
          holes: learn the metric's median spacing and widen tolerance
@@ -1076,12 +1057,23 @@
     var lastV = null;
     for (var g = 0; g < grid.times.length; g += 1) {
       var gt = grid.times[g];
+      var cellSum = 0;
+      var cellN = 0;
       while (si < samples.length && samples[si][0] <= gt) {
         lastT = samples[si][0];
         lastV = samples[si][1];
+        /* every real sample inside this grid cell joins its mean —
+           probing one instant of a sawtooth at wide spans is
+           aliasing, the enemy this grid exists to kill */
+        if (samples[si][0] > gt - grid.span) {
+          cellSum += samples[si][1];
+          cellN += 1;
+        }
         si += 1;
       }
-      if (lastT == null || gt - lastT > tol) {
+      if (cellN > 0) {
+        out.push(cellSum / cellN);
+      } else if (lastT == null || gt - lastT > tol) {
         out.push(null);
       } else {
         out.push(isAge && gt > lastT ? lastV + (gt - lastT) : lastV);
@@ -1090,14 +1082,17 @@
     /* soften each loop against its OWN rhythm (~0.7 of a tooth):
        fast loops keep fine detail, slow loops roll like the owner's
        reference — waves, never razors, never flat lines */
-    if (netSmooth === "raw") { return out; }
+    /* the owner's law of scale: 1H shows the ripple, 6H a small
+       zigzag, 24H approaches a line — smoothing widens with the
+       window so aggregation, not clutter, is what zooming out means */
     var cad = cadenceEst(m.field);
     var w = 3;
     if (cad) {
-      var factor = netSmooth === "silk" ? 1.8 : 0.7;
+      var factor = netTelem.range === "24h" ? 2.4
+        : netTelem.range === "6h" ? 1.3 : 0.35;
       w = Math.round((cad * factor) / grid.span);
       if (w % 2 === 0) { w += 1; }
-      w = Math.max(3, Math.min(61, w));
+      w = Math.max(3, Math.min(91, w));
     }
     return movAvg(out, w);
   }
@@ -1291,22 +1286,19 @@
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
           var m = NET_METRICS[mi];
           if (m.unit !== "s") { continue; }
-          var rawVals = gridSeries(m, grid);
           defs.push({
             label: m.label,
-            unit: "%",
+            unit: "s",
             color: rootCs.getPropertyValue("--st-s" + (mi + 1))
               .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-            values: healthSeries(rawVals, healthNorm(m.key)),
-            raw: rawVals
+            values: gridSeries(m, grid)
           });
         }
         if (times && times.length >= 2) {
           if (!netOverview) {
             host.textContent = "";
             netOverview = QNet.chart.mountMulti(host,
-              { times: times, series: defs, height: 400,
-                linearScale: netScaleMode === "linear" });
+              { times: times, series: defs, height: 400 });
           } else {
             netOverview.setData(times, defs);
           }
@@ -1343,7 +1335,8 @@
           ? "Recorder silent " + newestAge + "s \u00b7 " +
             spanTxt + " \u00b7 UTC"
           : "Live \u00b7 " + spanTxt + " \u00b7 UTC \u00b7 " +
-            "100 = fresh heartbeat, 0 = silent past its limit";
+            "seconds since each loop's last heartbeat \u2014 " +
+            "higher is later, a dead loop climbs";
       capEl.style.color = silent ? "var(--st-warn-text)" : "";
       capEl.setAttribute("title", n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples"
@@ -1358,15 +1351,12 @@
         var pHost = document.querySelector(
           "[data-graph=\"" + pm.key + "\"]");
         if (!pHost) { continue; }
-        var pRaw = gridSeries(pm, pgrid);
         var pdef = [{
           label: pm.label,
-          unit: pm.unit === "s" ? "%" : pm.unit,
+          unit: pm.unit,
           color: rootCs.getPropertyValue("--st-s" + (mi + 1))
             .replace(/^\s+|\s+$/g, "") || "#3b82f6",
-          values: pm.unit === "s"
-            ? healthSeries(pRaw, healthNorm(pm.key)) : pRaw,
-          raw: pm.unit === "s" ? pRaw : null
+          values: gridSeries(pm, pgrid)
         }];
         if (pgrid.times.length >= 2) {
           if (panelCharts[pm.key]) {
@@ -1375,7 +1365,7 @@
             pHost.textContent = "";
             panelCharts[pm.key] = QNet.chart.mountMulti(pHost, {
               times: pgrid.times, series: pdef, height: 150,
-              compact: true, linearScale: netScaleMode === "linear"
+              compact: true
             });
           }
         }
@@ -1433,12 +1423,26 @@
 
     var head = stEl("div", "st-head");
     head.appendChild(stEl("div", "st-t-title", "Network"));
+    head.appendChild(stEl("span", "st-spacer"));
+    var master = stEl("span", "st-master" +
+      (pollCfg.paused ? " stopped" : ""));
+    master.appendChild(stEl("span", "st-t-mid",
+      pollCfg.paused ? "Network stopped" : "Network live"));
+    master.appendChild(mkSwitch(!pollCfg.paused, function (on) {
+      pollCfg.paused = !on;
+      savePollCfg();
+      master.classList.toggle("stopped", !on);
+      master.querySelector(".st-t-mid").textContent =
+        on ? "Network live" : "Network stopped";
+      renderSigAll();
+    }));
+    head.appendChild(master);
     page.appendChild(head);
 
     /* THE graph — big, one unit, smoothed, every loop a color */
     var graphCard = stEl("div", "st-card");
     var gHead = stEl("div", "st-card-head");
-    gHead.appendChild(stEl("div", "st-t-h", "Loop health"));
+    gHead.appendChild(stEl("div", "st-t-h", "Loop lag"));
     gHead.appendChild(stEl("span", "st-spacer"));
     var seg = stEl("div", "st-seg");
     var rdefs = ["1h", "6h", "24h"];
@@ -1461,31 +1465,6 @@
       })(rdefs[si]);
     }
     gHead.appendChild(seg);
-    function miniSeg(defs2, current, onPick) {
-      var wrap = stEl("div", "st-seg");
-      for (var di2 = 0; di2 < defs2.length; di2 += 1) {
-        (function (d2) {
-          var b2 = stEl("button", current === d2[0] ? "on" : "",
-            d2[1]);
-          b2.setAttribute("type", "button");
-          b2.addEventListener("click", function () {
-            var bs2 = wrap.querySelectorAll("button");
-            for (var q2 = 0; q2 < bs2.length; q2 += 1) {
-              bs2[q2].classList.toggle("on", bs2[q2] === b2);
-            }
-            onPick(d2[0]);
-          });
-          wrap.appendChild(b2);
-        })(defs2[di2]);
-      }
-      return wrap;
-    }
-    gHead.appendChild(miniSeg(
-      [["expand", "Expand"], ["linear", "Linear"]], netScaleMode,
-      function (v) { netScaleMode = v; remountCharts(); }));
-    gHead.appendChild(miniSeg(
-      [["raw", "Raw"], ["soft", "Soft"], ["silk", "Silk"]], netSmooth,
-      function (v) { netSmooth = v; remountCharts(); }));
     graphCard.appendChild(gHead);
     var chips = stEl("div", "st-chips");
     for (var ci2 = 0; ci2 < NET_METRICS.length; ci2 += 1) {
