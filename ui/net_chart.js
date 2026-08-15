@@ -692,7 +692,7 @@
       var axis = {
         scale: scaleName, stroke: muted, font: axisFont,
         size: 52,
-        side: 1,
+        side: 3,
         space: cfg.compact ? 34 : 40,
         values: function (u, splits) {
           var out = [];
@@ -728,7 +728,7 @@
     var options = {
       width: width,
       height: height,
-      padding: [10, 2, 0, 0],
+      padding: [10, 14, 0, 0],
       legend: { show: false },
       focus: { alpha: 0.25 },
       tzDate: function (timestamp) {
@@ -792,9 +792,9 @@
         for (var q = 0; q < defsNext.length; q += 1) {
           data.push(defsNext[q].values);
         }
-        var nb = levelBands();
-        if (plot.setBands) { plot.setBands(nb); }
-        else { plot.bands = nb; }
+        /* bands stay mount-static: uPlot 1.6.32 has no setBands and
+           raw plot.bands assignment silently corrupts the draw (the
+           blank-master bug: charts died on the first 10s refresh) */
         /* audit F: a pinned readout must never describe replaced
            data — refresh releases the pin */
         pinned = false;

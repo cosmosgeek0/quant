@@ -279,15 +279,15 @@ html[data-theme="dark"] {
   margin-left: -6px;
 }
 .st-chip {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 7px;
   border: 0; background: none; cursor: pointer;
-  font-family: inherit; font-size: 12px; font-weight: 400;
-  line-height: 16px; color: var(--st-mid);
-  padding: 3px 6px; border-radius: 6px;
+  font-family: inherit; font-size: 14px; font-weight: 500;
+  line-height: 19px; color: var(--st-mid);
+  padding: 4px 8px; border-radius: 6px;
 }
 .st-chip:hover { background: var(--st-hover); }
 .st-chip-key {
-  width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+  width: 9px; height: 9px; border-radius: 2px; display: inline-block;
 }
 .st-chip.off { color: var(--st-faint); }
 .st-chip.off .st-chip-key { opacity: 0.25; }
