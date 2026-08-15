@@ -273,6 +273,9 @@
   var lastRtt = null;
 
   function telNum(v) {
+    /* audit F: Number(null) and Number("") are 0 — a FAILED reading
+       must never render as perfect freshness */
+    if (v == null || v === "" || typeof v === "boolean") { return null; }
     var n = Number(v);
     return isFinite(n) ? n : null;
   }
@@ -1073,13 +1076,17 @@
   var netScaleMode = "expand";
   var netSmooth = "soft";
 
-  function remountCharts() {
+  function destroyAllCharts() {
     if (netOverview) { netOverview.destroy(); netOverview = null; }
     var keys = Object.keys(panelCharts);
     for (var ki = 0; ki < keys.length; ki += 1) {
       panelCharts[keys[ki]].destroy();
     }
     panelCharts = {};
+  }
+
+  function remountCharts() {
+    destroyAllCharts();
     renderTelemetry();
   }
 
@@ -1099,16 +1106,22 @@
     return null;
   }
 
+  var netFetchSeq = 0;
+
   function fetchTelemetry() {
+    var seq = ++netFetchSeq;
     fetch("/api/telemetry?range=" + netTelem.range, { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
+        if (seq !== netFetchSeq) { return; }
         netTelem.data = d;
         if ((location.hash || "").slice(1) === "network") {
           renderTelemetry();
         }
       })
-      .catch(function () { netTelem.data = null; });
+      .catch(function () {
+        if (seq === netFetchSeq) { netTelem.data = null; }
+      });
   }
 
   function startNetTelemetry() {
@@ -1246,12 +1259,17 @@
      drops; the value just before each drop ≈ that loop's interval.
      Median of those, sane-clamped. Measured, never configured. */
   function cadenceEst(field) {
+    /* audit F: sparse rows interleave metrics — compare the metric's
+       own consecutive non-null samples, not adjacent rows */
     var sv = telemSeries(field)[1];
     var pre = [];
-    for (var i = 1; i < sv.length; i++) {
-      if (sv[i] != null && sv[i - 1] != null && sv[i] < sv[i - 1] * 0.5) {
-        pre.push(sv[i - 1]);
+    var prevV = null;
+    for (var i = 0; i < sv.length; i += 1) {
+      if (sv[i] == null) { continue; }
+      if (prevV != null && sv[i] < prevV * 0.5) {
+        pre.push(prevV);
       }
+      prevV = sv[i];
     }
     if (pre.length < 2) { return null; }
     pre.sort(function (a, b) { return a - b; });
@@ -1335,31 +1353,45 @@
   }
 
   function uptimePct(compKey) {
+    /* audit F: uptime uses the SAME grade as the bars — a bucket the
+       bars call amber can no longer read 100% */
     var m = netMetric(compKey);
     if (!m) { return null; }
     var t = thrFor(compKey);
     if (!t) { return null; }
     var vs = seriesFilled(m.field, compKey)[1];
-    var meas = 0;
-    var okc = 0;
-    for (var i = 0; i < vs.length; i++) {
-      if (vs[i] == null) { continue; }
-      meas += 1;
-      if (vs[i] < t.warn) { okc += 1; }
+    var clean = [];
+    var i;
+    for (i = 0; i < vs.length; i += 1) {
+      if (vs[i] != null) { clean.push(vs[i]); }
     }
-    if (meas < 5) { return null; }
-    return 100 * okc / meas;
+    if (clean.length < 5) { return null; }
+    var sorted = clean.slice().sort(function (a, b) { return a - b; });
+    var med = sorted[Math.floor(sorted.length / 2)];
+    var okc = 0;
+    for (i = 0; i < clean.length; i += 1) {
+      if (gradeValue(clean[i], t, med) === "ok") { okc += 1; }
+    }
+    return 100 * okc / clean.length;
+  }
+
+  function gradeValue(v, t, med) {
+    if (v == null) { return null; }
+    if (t && t.bad != null && v >= t.bad) { return "bad"; }
+    if ((t && t.warn != null && v >= t.warn) ||
+        (med > 0 && v > med * 2.5)) { return "warn"; }
+    return "ok";
   }
 
   function statusSamples(compKey, maxN) {
+    /* audit F: equal-TIME buckets keeping the WORST state — index
+       striding hid spikes between strides and let density lie */
     var m = netMetric(compKey);
     if (!m) { return null; }
-    var vs = seriesFilled(m.field, compKey)[1];
+    var sf = seriesFilled(m.field, compKey);
+    var ts = sf[0];
+    var vs = sf[1];
     if (!vs.length) { return null; }
-    /* grade each sample against cadence thresholds AND the window's
-       own median — real spikes (a slow pull, an RTT jump) appear as
-       amber ticks even below the hard threshold. Measured variance,
-       never decoration. */
     var t = thrFor(compKey);
     var clean = [];
     for (var c = 0; c < vs.length; c += 1) {
@@ -1368,15 +1400,20 @@
     if (!clean.length) { return null; }
     clean.sort(function (a, b) { return a - b; });
     var med = clean[Math.floor(clean.length / 2)];
-    var stride = Math.max(1, Math.ceil(vs.length / maxN));
+    var rank = { ok: 0, warn: 1, bad: 2 };
+    var t1 = ts[ts.length - 1];
+    var t0 = t1 - rangeSeconds();
+    var span = (t1 - t0) / maxN;
+    if (!(span > 0)) { return null; }
     var out = [];
-    for (var i = 0; i < vs.length; i += stride) {
-      var v = vs[i];
-      if (v == null) { out.push(null); continue; }
-      if (t && t.bad != null && v >= t.bad) { out.push("bad"); continue; }
-      if ((t && t.warn != null && v >= t.warn) ||
-          (med > 0 && v > med * 2.5)) { out.push("warn"); continue; }
-      out.push("ok");
+    for (var b = 0; b < maxN; b += 1) { out.push(null); }
+    for (var i = 0; i < ts.length; i += 1) {
+      if (ts[i] < t0) { continue; }
+      var at = Math.min(maxN - 1,
+        Math.max(0, Math.floor((ts[i] - t0) / span)));
+      var g = gradeValue(vs[i], t, med);
+      if (g == null) { continue; }
+      if (out[at] == null || rank[g] > rank[out[at]]) { out[at] = g; }
     }
     return out;
   }
@@ -1387,10 +1424,11 @@
     var capEl = document.getElementById("net-chart-cap");
     var pts = telemPoints();
     var rootCs = getComputedStyle(document.documentElement);
+    var sharedGrid = pts.length >= 2 ? displayGrid() : null;
     var mi;
     if (host) {
       if (!d || !d.present || pts.length < 2) {
-        if (netOverview) { netOverview.destroy(); netOverview = null; }
+        destroyAllCharts();
         host.textContent = "";
         var emptyMsg = stEl("div", "st-t-meta",
           !d ? "Telemetry endpoint unreachable."
@@ -1400,7 +1438,7 @@
       } else if (window.QNet && QNet.chart && QNet.chart.mountMulti) {
         /* overview: the seven age loops, one unit (seconds),
            smoothed for reading — RTT lives in its own panel */
-        var grid = displayGrid();
+        var grid = sharedGrid;
         var times = grid.times;
         var defs = [];
         for (mi = 0; mi < NET_METRICS.length; mi += 1) {
@@ -1437,12 +1475,25 @@
         }
       }
       var silent = newestAge != null && newestAge > 60;
+      var spanTxt = netTelem.range;
+      if (pts.length >= 2) {
+        var sFirst = Date.parse(pts[0].ts);
+        var sLast = Date.parse(pts[pts.length - 1].ts);
+        if (isFinite(sFirst) && isFinite(sLast)) {
+          var covered = (sLast - sFirst) / 3600000;
+          var wanted = rangeSeconds() / 3600;
+          if (d && d.truncated && covered < wanted * 0.98) {
+            spanTxt = "last " + (Math.round(covered * 10) / 10) +
+              "h of " + netTelem.range;
+          }
+        }
+      }
       capEl.textContent = !n
         ? "History arrives from the telemetry recorder."
         : silent
           ? "Recorder silent " + newestAge + "s \u00b7 " +
-            netTelem.range + " \u00b7 UTC"
-          : "Live \u00b7 " + netTelem.range + " \u00b7 UTC";
+            spanTxt + " \u00b7 UTC"
+          : "Live \u00b7 " + spanTxt + " \u00b7 UTC";
       capEl.style.color = silent ? "var(--st-warn-text)" : "";
       capEl.setAttribute("title", n
         ? "ui/live/telemetry.jsonl \u00b7 " + n + " samples"
@@ -1451,7 +1502,7 @@
     /* panel graphs: each loop's own line in its own color */
     if (pts.length >= 2 && window.QNet && QNet.chart &&
         QNet.chart.mountMulti) {
-      var pgrid = displayGrid();
+      var pgrid = sharedGrid || displayGrid();
       for (mi = 0; mi < NET_METRICS.length; mi += 1) {
         var pm = NET_METRICS[mi];
         var pHost = document.querySelector(
@@ -1518,8 +1569,7 @@
     container.textContent = "";
     connState.server = !pollCfg.paused;
     connState.newsloop = newsMaster;
-    panelCharts = {};
-    netOverview = null;
+    destroyAllCharts();
 
     var page = stEl("div", "st-page");
 

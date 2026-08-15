@@ -1401,24 +1401,27 @@ class TestTelemetryEndpoint(ServerHarness):
     def test_downsamples_by_stride_and_always_keeps_newest(self):
         root = self.tempdir()
         now = datetime.now(timezone.utc)
+        cap = serve.TELEMETRY_MAX_POINTS
+        total = cap + 1
         rows = [
-            {"ts": self.utc_text(now - timedelta(seconds=1600 - index)),
+            {"ts": self.utc_text(now - timedelta(seconds=total - 1 - index)),
              "value": index}
-            for index in range(1601)
+            for index in range(total)
         ]
         sources = self.telemetry_sources(root)
         sources["telemetry"].write_text(
             "\n".join(json.dumps(row) for row in rows) + "\n",
             encoding="utf-8")
 
-        payload = self.get_json(self.start(sources), "/api/telemetry")
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=6h")
 
         self.assertTrue(payload["truncated"])
         self.assertEqual(payload["stride"], 2)
-        self.assertEqual(payload["count"], 1601)
-        self.assertEqual(len(payload["points"]), 801)
+        self.assertEqual(payload["count"], total)
+        self.assertEqual(len(payload["points"]), cap // 2 + 1)
         self.assertEqual(payload["points"][0]["value"], 0)
-        self.assertEqual(payload["points"][-1]["value"], 1600)
+        self.assertEqual(payload["points"][-1]["value"], total - 1)
 
     def test_malformed_lines_and_unparseable_timestamps_are_counted(self):
         root = self.tempdir()
@@ -1512,6 +1515,18 @@ class TestPollConfigEndpoint(ServerHarness):
         status, body = self.request(
             "POST", "/api/poll_config",
             body=json.dumps({"metrics": {"nope": 5}}))
+        self.assertEqual(status, 400)
+
+    def test_post_rejects_booleans_and_bad_lengths(self):
+        root = self.tempdir()
+        self.start(self.poll_sources(root))
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"server": True}}))
+        self.assertEqual(status, 400)
+        status, _, _ = self.request_full(
+            "POST", "/api/poll_config", body="",
+            headers={"Content-Length": "0"})
         self.assertEqual(status, 400)
 
     def test_post_other_paths_still_refused(self):

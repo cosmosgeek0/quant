@@ -43,8 +43,8 @@ NEWS_SOURCES_PATH = BASE / "live" / "news_sources.json"
 STRIP_URL = "http://127.0.0.1:8899/api/strip"
 HEALTH_URL = "http://127.0.0.1:8899/api/health"
 FETCH_TIMEOUT = 4
-TRIM_AT_LINES = 46000
-KEEP_LINES = 40000
+TRIM_AT_LINES = 220000
+KEEP_LINES = 200000
 
 DOUBLE_FAILURE_FIELDS = (
     "rtt_ms",
@@ -280,23 +280,30 @@ def trim_file(path, max_lines=TRIM_AT_LINES, keep_lines=KEEP_LINES):
     return True
 
 
+_APPENDS_SINCE_TRIM = {"n": 0}
+
+
 def append_row(row, path=OUT_PATH):
-    """Append exactly one flushed JSON line, then enforce the history bound."""
+    """Append one flushed JSON line; bound the history every 200 rows
+    (a full-file line scan per append cannot survive 1s sampling)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
     with open(path, "a", encoding="utf-8") as output:
         output.write(encoded + "\n")
         output.flush()
-    trim_file(path)
+    _APPENDS_SINCE_TRIM["n"] += 1
+    if _APPENDS_SINCE_TRIM["n"] >= 200:
+        _APPENDS_SINCE_TRIM["n"] = 0
+        trim_file(path)
 
 
 def is_double_failure_row(row):
-    """A row whose attempted strip/health observations all came back empty."""
+    """A row carrying no observation at all (every field beyond ts None)."""
     if not isinstance(row, dict):
         return False
-    attempted = [field for field in DOUBLE_FAILURE_FIELDS if field in row]
-    return bool(attempted) and all(row[field] is None for field in attempted)
+    fields = [k for k in row if k != "ts"]
+    return bool(fields) and all(row[k] is None for k in fields)
 
 
 def last_row_was_double_failure(path=OUT_PATH):
@@ -347,14 +354,22 @@ def main():
             return 1
         return 0
 
-    # --loop N keeps its meaning as the scheduler floor; each metric
-    # samples on its own owner-set interval from poll_config.json.
-    floor_tick = max(1, args.loop)
+    # Owner intervals rule; --loop is only the sleep granularity floor.
+    # Fixed-rate scheduling: deadlines advance from the PREVIOUS
+    # deadline, so fetch latency does not stretch every interval, and
+    # a lowered interval takes effect within one wake.
     next_due = {}
+    prev_intervals = {}
     try:
         while True:
             intervals = load_poll_config()
             now = time.monotonic()
+            for m in METRIC_FIELDS:
+                if prev_intervals.get(m) != intervals[m]:
+                    limit = now + intervals[m]
+                    if m not in next_due or next_due[m] > limit:
+                        next_due[m] = min(next_due.get(m, now), limit)
+                    prev_intervals[m] = intervals[m]
             due = [m for m in METRIC_FIELDS
                    if next_due.get(m, 0) <= now]
             if due:
@@ -367,10 +382,13 @@ def main():
                           file=sys.stderr)
                 after = time.monotonic()
                 for m in due:
-                    next_due[m] = after + max(
-                        intervals[m], floor_tick)
+                    base = next_due.get(m, after)
+                    target = base + intervals[m]
+                    if target <= after:
+                        target = after + intervals[m]
+                    next_due[m] = target
             wake = min(next_due.values()) if next_due else (
-                time.monotonic() + floor_tick)
+                time.monotonic() + 1)
             remaining = wake - time.monotonic()
             if remaining > 0:
                 time.sleep(min(remaining, 120))

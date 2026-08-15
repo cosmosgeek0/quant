@@ -758,19 +758,21 @@
         for (var q = 0; q < defsNext.length; q += 1) {
           data.push(defsNext[q].values);
         }
+        /* audit F: a pinned readout must never describe replaced
+           data — refresh releases the pin */
+        pinned = false;
+        tooltip.style.display = "none";
         plot.setData(data);
       },
       setShow: function (idx, on) {
         plot.setSeries(idx + 1, { show: !!on });
       },
       setFocus: function (idx) {
-        var q;
-        for (q = 0; q < defs.length; q += 1) {
-          if (idx == null || q !== idx) {
-            plot.setSeries(q + 1, { focus: false });
-          }
-        }
-        if (idx != null) {
+        /* audit F: uPlot keys focus off the series INDEX whenever a
+           focus field is present — clearing needs the null index */
+        if (idx == null) {
+          plot.setSeries(null, { focus: true });
+        } else {
           plot.setSeries(idx + 1, { focus: true });
         }
       },

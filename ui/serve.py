@@ -109,7 +109,7 @@ RECENT_DECISIONS = 50
 RECENT_NEWS = 2000
 RECENT_FAILURES = 50
 FAILURE_SCAN_RECORDS = 250
-TELEMETRY_MAX_POINTS = 1600
+TELEMETRY_MAX_POINTS = 7200
 TELEMETRY_RANGE_HOURS = {"1h": 1, "6h": 6, "24h": 24}
 TAIL_BYTES = 1024 * 1024
 SOURCE_PARSE_CACHE_ENTRIES = 512
@@ -1182,6 +1182,9 @@ def api_news(sources):
     }
 
 
+TELEMETRY_TAIL_BYTES = 16 * 1024 * 1024
+
+
 def api_telemetry(sources, range_name="1h", now=None):
     path = sources["telemetry"]
     if range_name not in TELEMETRY_RANGE_HOURS:
@@ -1193,7 +1196,7 @@ def api_telemetry(sources, range_name="1h", now=None):
     # value as its line cap retains every non-empty line that can fit in that
     # bounded tail without ever slurping an indefinitely growing source.
     present, raw_records, parse_errors, tail_truncated = _read_jsonl_tail(
-        path, TAIL_BYTES, scan_limit=TAIL_BYTES)
+        path, TELEMETRY_TAIL_BYTES, scan_limit=TELEMETRY_TAIL_BYTES)
     kept = []
     for record in raw_records:
         if not isinstance(record, dict):
@@ -1522,6 +1525,7 @@ def api_strip(sources, now=None):
     }
 
 
+POLL_WRITE_LOCK = threading.Lock()
 POLL_METRICS = ("server", "mirror", "market", "supervisor", "newsloop",
                 "basiswatch", "basissup", "jobrunner")
 POLL_ALLOWED = (1, 2, 5, 10, 15, 30, 60, 120)
@@ -1538,13 +1542,15 @@ def _read_poll_config(path):
 
 def _resolve_poll_config(payload):
     default = payload.get("default_s")
-    if default not in POLL_ALLOWED:
+    if isinstance(default, bool) or default not in POLL_ALLOWED:
         default = POLL_DEFAULT
     metrics_in = payload.get("metrics")
     metrics_in = metrics_in if isinstance(metrics_in, dict) else {}
     metrics = {}
     for key in POLL_METRICS:
         value = metrics_in.get(key)
+        if isinstance(value, bool):
+            value = None
         metrics[key] = value if value in POLL_ALLOWED else default
     return {"default_s": default, "metrics": metrics}
 
@@ -1570,10 +1576,15 @@ def write_poll_config(sources, body):
     """
     if not isinstance(body, dict):
         return None, "body must be a JSON object"
+    with POLL_WRITE_LOCK:
+        return _write_poll_config_locked(sources, body)
+
+
+def _write_poll_config_locked(sources, body):
     current, _ = _read_poll_config(sources["poll_config"])
     resolved = _resolve_poll_config(current)
     default = body.get("default_s", resolved["default_s"])
-    if default not in POLL_ALLOWED:
+    if isinstance(default, bool) or default not in POLL_ALLOWED:
         return None, "default_s must be one of %s" % (list(POLL_ALLOWED),)
     metrics_in = body.get("metrics", {})
     if not isinstance(metrics_in, dict):
@@ -1582,7 +1593,7 @@ def write_poll_config(sources, body):
     for key, value in metrics_in.items():
         if key not in POLL_METRICS:
             return None, "unknown metric %r" % (key,)
-        if value not in POLL_ALLOWED:
+        if isinstance(value, bool) or value not in POLL_ALLOWED:
             return None, "interval for %r must be one of %s" % (
                 key, list(POLL_ALLOWED))
         merged[key] = value
@@ -1851,12 +1862,16 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = -1
-        if length < 0 or length > 4096:
+        if length < 1 or length > 4096:
             self._send_json(400, {"ok": False,
-                                  "error": "body must be 0-4096 bytes"})
+                                  "error": "body must be 1-4096 bytes"})
+            return
+        raw_body = self.rfile.read(length)
+        if len(raw_body) != length:
+            self._send_json(400, {"ok": False, "error": "short body"})
             return
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(raw_body)
         except (ValueError, UnicodeError):
             self._send_json(400, {"ok": False,
                                   "error": "body must be valid JSON"})
