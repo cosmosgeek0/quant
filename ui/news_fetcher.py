@@ -9,9 +9,10 @@ Impact scoring and category classification are ported in essence from
 the previous project's newsContext service (owner-permitted item),
 rewritten stdlib-only. No keys, one public GET, atomic write.
 
-Run:  python3 ui/news_fetcher.py [--limit 200] [-q]
-Scheduling is a separate, later wiring step — running this by hand is
-the honest state until then.
+Run once:  python3 ui/news_fetcher.py [--limit 500] [-q]
+Live loop: python3 ui/news_fetcher.py --loop 60   (refetch forever)
+Formal scheduling (launchd) still belongs to the wiring build; the
+loop flag is the honest live mode until then.
 """
 
 import argparse
@@ -20,6 +21,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,14 +187,9 @@ def normalize(item):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("-q", "--quiet", action="store_true")
-    args = parser.parse_args()
-
+def fetch_once(limit, quiet):
     request = urllib.request.Request(
-        TREE_URL.format(limit=max(1, min(args.limit, 500))),
+        TREE_URL.format(limit=max(1, min(limit, 1000))),
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as resp:
         payload = json.load(resp)
@@ -227,12 +224,32 @@ def main():
             pass
         raise
 
-    if not args.quiet:
+    if not quiet:
         high = sum(1 for entry in items if entry["impact"] == 3)
         medium = sum(1 for entry in items if entry["impact"] == 2)
         print("news_fetcher: wrote %d items (%d high, %d medium) -> %s"
               % (len(items), high, medium, OUT_PATH))
     return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--loop", type=int, default=0,
+                        help="refetch every N seconds (0 = run once)")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    args = parser.parse_args()
+
+    if args.loop <= 0:
+        return fetch_once(args.limit, args.quiet)
+
+    interval = max(20, args.loop)
+    while True:
+        try:
+            fetch_once(args.limit, args.quiet)
+        except Exception as error:  # keep the loop alive on bad fetches
+            print("news_fetcher: fetch failed: %s" % error, file=sys.stderr)
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

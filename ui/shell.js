@@ -553,12 +553,21 @@
       "No session on this Mac — live on the hosted site");
   }
 
-  /* ---- News page: /api/news, filter pills, dense list ---- */
+  /* ---- News page: wide live layout — day strip, impact bars,
+     sources rail with display toggles, refresh, fresh-row pulse ---- */
   var newsBtn = document.getElementById("rb-news");
   var newsData = null;
   var newsFilter = "all";
+  var newsDay = "all";
   var newsTimer = null;
   var newsHost = null;
+  var newsSeen = null;
+  var newsSrcOff = {};
+  var NEWS_SRC_KEY = "quant.news.srcoff";
+  try {
+    var rawOff = localStorage.getItem(NEWS_SRC_KEY);
+    if (rawOff) { newsSrcOff = JSON.parse(rawOff) || {}; }
+  } catch (e) { newsSrcOff = {}; }
 
   newsBtn.addEventListener("click", function () {
     location.hash = "#news";
@@ -569,111 +578,244 @@
     var then = Date.parse(asOf);
     if (!isFinite(then)) { return "—"; }
     var sec = Math.max(0, Math.round((Date.now() - then) / 1000));
-    if (sec < 90) { return "Updated " + sec + "s ago"; }
+    if (sec < 90) { return "updated " + sec + "s ago"; }
     var min = Math.round(sec / 60);
-    if (min < 90) { return "Updated " + min + "m ago"; }
-    return "Updated " + Math.round(min / 60) + "h ago";
+    if (min < 90) { return "updated " + min + "m ago"; }
+    return "updated " + Math.round(min / 60) + "h ago";
   }
 
-  function fetchNews() {
+  function fetchNews(force) {
+    var btn = newsHost ? newsHost.querySelector(".refresh-btn") : null;
+    if (btn) { btn.classList.add("busy"); }
     fetch("/api/news", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         var prev = newsData && newsData.as_of;
         newsData = d;
-        if (newsHost && (!prev || !d || prev !== d.as_of)) {
+        if (newsHost && (force || !prev || !d || prev !== d.as_of)) {
           renderNews();
         } else if (newsHost) {
           var upd = newsHost.querySelector(".news-upd");
           if (upd && d) { upd.textContent = newsAgeText(d.as_of); }
         }
+        if (btn) { btn.classList.remove("busy"); }
       })
       .catch(function () {
         newsData = null;
+        if (btn) { btn.classList.remove("busy"); }
         if (newsHost) { renderNews(); }
       });
   }
 
   function startNewsPoll() {
-    fetchNews();
-    if (!newsTimer) { newsTimer = setInterval(fetchNews, 60000); }
+    fetchNews(true);
+    if (!newsTimer) {
+      newsTimer = setInterval(function () { fetchNews(false); }, 20000);
+    }
   }
 
   function stopNewsPoll() {
     if (newsTimer) { clearInterval(newsTimer); newsTimer = null; }
     newsHost = null;
+    newsSeen = null;
   }
 
-  function newsCounts(items) {
-    var c = { 3: 0, 2: 0, 1: 0 };
-    for (var i = 0; i < items.length; i++) {
-      var lvl = items[i].impact === 3 ? 3 : (items[i].impact === 2 ? 2 : 1);
-      c[lvl] += 1;
+  function utcDate(ts) {
+    return (typeof ts === "string" && ts.length >= 10) ? ts.slice(0, 10) : "";
+  }
+
+  function barsSvg(level) {
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 13 12");
+    svg.setAttribute("class", "bars b" + level);
+    var dims = [[0, 8, 3, 4, "r1"], [5, 5, 3, 7, "r2"], [10, 2, 3, 10, "r3"]];
+    for (var i = 0; i < dims.length; i++) {
+      var r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      r.setAttribute("x", dims[i][0]);
+      r.setAttribute("y", dims[i][1]);
+      r.setAttribute("width", dims[i][2]);
+      r.setAttribute("height", dims[i][3]);
+      r.setAttribute("rx", 1);
+      r.setAttribute("class", dims[i][4]);
+      svg.appendChild(r);
     }
-    return c;
+    return svg;
+  }
+
+  function newsLevel(item) {
+    return item.impact === 3 ? 3 : (item.impact === 2 ? 2 : 1);
   }
 
   function renderNews() {
     if (!newsHost) { return; }
+    var prevSeen = newsSeen;
     newsHost.textContent = "";
-    var head = document.createElement("div");
-    head.className = "news-head";
-    var title = document.createElement("span");
-    title.className = "news-title";
-    title.textContent = "News";
+
+    /* top row: eyebrow · day strip · refresh + age */
+    var top = document.createElement("div");
+    top.className = "news-top";
+    var eyebrow = document.createElement("span");
+    eyebrow.className = "news-eyebrow";
+    eyebrow.textContent = "News";
+    top.appendChild(eyebrow);
+
+    var items = (newsData && newsData.present && newsData.items) || [];
+
+    var strip = document.createElement("div");
+    strip.className = "daystrip";
+    var dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    var byDay = {};
+    for (var bi = 0; bi < items.length; bi++) {
+      var dkey = utcDate(items[bi].ts);
+      if (!byDay[dkey]) { byDay[dkey] = { n: 0, h: 0, m: 0 }; }
+      byDay[dkey].n += 1;
+      var lv = newsLevel(items[bi]);
+      if (lv === 3) { byDay[dkey].h += 1; }
+      if (lv === 2) { byDay[dkey].m += 1; }
+    }
+    var now = new Date();
+    var dayDefs = [{ key: "all", label: "All", sub: items.length + " items" }];
+    for (var dd = 6; dd >= 0; dd--) {
+      var dt = new Date(now.getTime() - dd * 86400000);
+      var key = dt.toISOString().slice(0, 10);
+      var stats = byDay[key] || { n: 0, h: 0, m: 0 };
+      dayDefs.push({
+        key: key,
+        label: (dd === 0 ? "Today" :
+          dayNames[dt.getUTCDay()] + " " + dt.getUTCDate()),
+        stats: stats
+      });
+    }
+    for (var di = 0; di < dayDefs.length; di++) {
+      (function (def) {
+        var cell = document.createElement("button");
+        cell.className = "day" + (newsDay === def.key ? " on" : "") +
+          (def.stats && def.stats.n === 0 ? " dim" : "");
+        var l1 = document.createElement("span");
+        l1.className = "d1";
+        l1.textContent = def.label;
+        var l2 = document.createElement("span");
+        l2.className = "d2";
+        if (def.stats) {
+          l2.textContent = def.stats.n + " · ";
+          var hh = document.createElement("span");
+          hh.className = "hh"; hh.textContent = "H" + def.stats.h;
+          var sep = document.createTextNode(" ");
+          var mm = document.createElement("span");
+          mm.className = "mm"; mm.textContent = "M" + def.stats.m;
+          l2.appendChild(hh); l2.appendChild(sep); l2.appendChild(mm);
+        } else {
+          l2.textContent = def.sub;
+        }
+        cell.appendChild(l1);
+        cell.appendChild(l2);
+        cell.addEventListener("click", function () {
+          newsDay = def.key;
+          renderNews();
+        });
+        strip.appendChild(cell);
+      })(dayDefs[di]);
+    }
+    top.appendChild(strip);
+
+    var right = document.createElement("div");
+    right.className = "news-right";
+    var refresh = document.createElement("button");
+    refresh.className = "refresh-btn";
+    refresh.setAttribute("aria-label", "Refresh");
+    refresh.setAttribute("data-tip", "Refresh");
+    var rsvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    rsvg.setAttribute("viewBox", "0 0 24 24");
+    rsvg.setAttribute("fill", "none");
+    rsvg.setAttribute("stroke", "currentColor");
+    rsvg.setAttribute("stroke-linecap", "round");
+    rsvg.setAttribute("stroke-linejoin", "round");
+    var rp1 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    rp1.setAttribute("d", "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8");
+    var rp2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    rp2.setAttribute("d", "M3 3v5h5");
+    rsvg.appendChild(rp1); rsvg.appendChild(rp2);
+    refresh.appendChild(rsvg);
+    refresh.addEventListener("click", function () { fetchNews(true); });
     var upd = document.createElement("span");
     upd.className = "news-upd";
-    head.appendChild(title);
-    head.appendChild(upd);
-    newsHost.appendChild(head);
+    right.appendChild(refresh);
+    right.appendChild(upd);
+    top.appendChild(right);
+    newsHost.appendChild(top);
 
     if (!newsData || !newsData.present) {
       upd.textContent = "—";
       var empty = document.createElement("div");
       empty.className = "news-empty";
       empty.textContent = newsData
-        ? "No news mirrored yet — run ui/news_fetcher.py once; scheduling arrives with the wiring build."
+        ? "No news in the mirror yet — the fetch loop fills ui/live/news.jsonl."
         : "Server unreachable.";
       newsHost.appendChild(empty);
+      newsSeen = null;
       return;
     }
 
     upd.textContent = newsAgeText(newsData.as_of);
     var ageSec = (Date.now() - Date.parse(newsData.as_of)) / 1000;
-    upd.classList.toggle("stale", isFinite(ageSec) && ageSec > 900);
+    upd.classList.toggle("stale", isFinite(ageSec) && ageSec > 300);
 
-    var items = newsData.items || [];
-    var counts = newsCounts(items);
+    /* day + source filtered pools */
+    var dayPool = [];
+    for (var i0 = 0; i0 < items.length; i0++) {
+      if (newsDay === "all" || utcDate(items[i0].ts) === newsDay) {
+        dayPool.push(items[i0]);
+      }
+    }
+    var srcCounts = {};
+    for (var i1 = 0; i1 < dayPool.length; i1++) {
+      var nm = dayPool[i1].source || "—";
+      srcCounts[nm] = (srcCounts[nm] || 0) + 1;
+    }
+    var pool = [];
+    for (var i2 = 0; i2 < dayPool.length; i2++) {
+      if (!newsSrcOff[dayPool[i2].source || "—"]) { pool.push(dayPool[i2]); }
+    }
 
-    var pills = document.createElement("div");
-    pills.className = "pillrow";
-    var defs = [
-      ["all", "All"], ["3", "High"], ["2", "Medium"], ["1", "Low"]];
-    for (var pi = 0; pi < defs.length; pi++) {
-      (function (val, label) {
+    /* impact pills with counts */
+    var counts = { 3: 0, 2: 0, 1: 0 };
+    for (var ci = 0; ci < pool.length; ci++) { counts[newsLevel(pool[ci])] += 1; }
+    var filters = document.createElement("div");
+    filters.className = "news-filters";
+    var defs = [["all", "All", null],
+      ["3", "High", 3], ["2", "Medium", 2], ["1", "Low", 1]];
+    for (var fi = 0; fi < defs.length; fi++) {
+      (function (val, label, lvl) {
         var b = document.createElement("button");
         b.className = "fpill" + (newsFilter === val ? " on" : "");
-        b.textContent = label;
+        if (lvl) { b.appendChild(barsSvg(lvl)); }
+        b.appendChild(document.createTextNode(label));
+        var c = document.createElement("span");
+        c.className = "cnt";
+        c.textContent = lvl ? String(counts[lvl]) : String(pool.length);
+        b.appendChild(c);
         b.addEventListener("click", function () {
           newsFilter = val;
           renderNews();
         });
-        pills.appendChild(b);
-      })(defs[pi][0], defs[pi][1]);
+        filters.appendChild(b);
+      })(defs[fi][0], defs[fi][1], defs[fi][2]);
     }
-    newsHost.appendChild(pills);
+    var total = document.createElement("span");
+    total.className = "news-total";
+    total.textContent = "UTC";
+    filters.appendChild(total);
+    newsHost.appendChild(filters);
 
-    var sum = document.createElement("div");
-    sum.className = "news-sum";
-    sum.textContent = items.length + " items · " + counts[3] + " High · " +
-      counts[2] + " Medium · " + counts[1] + " Low · UTC";
-    newsHost.appendChild(sum);
-
+    /* body: list + sources rail */
+    var body = document.createElement("div");
+    body.className = "news-body";
+    var main = document.createElement("div");
+    main.className = "news-main";
     var list = document.createElement("div");
-    list.className = "news-list";
     var hrow = document.createElement("div");
     hrow.className = "news-hrow";
-    var labels = ["Time", "Source", "!", "Headline", "Category"];
+    var labels = ["Time", "", "Source", "Headline", "Category"];
     for (var li = 0; li < labels.length; li++) {
       var hcell = document.createElement("span");
       hcell.textContent = labels[li];
@@ -681,24 +823,26 @@
     }
     list.appendChild(hrow);
 
+    var seenNow = {};
     var shown = 0;
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      var lvl = it.impact === 3 ? 3 : (it.impact === 2 ? 2 : 1);
-      if (newsFilter !== "all" && String(lvl) !== newsFilter) { continue; }
+    for (var ri = 0; ri < pool.length; ri++) {
+      var it = pool[ri];
+      var lvl2 = newsLevel(it);
+      if (newsFilter !== "all" && String(lvl2) !== newsFilter) { continue; }
       shown += 1;
+      seenNow[it.id] = true;
       var row = document.createElement("div");
-      row.className = "news-row";
+      row.className = "news-row" +
+        (prevSeen && !prevSeen[it.id] ? " fresh" : "");
       var tm = document.createElement("span");
       tm.className = "n-time";
       tm.textContent = (typeof it.ts === "string" && it.ts.length >= 16)
         ? it.ts.slice(11, 16) : "—";
+      var impCell = document.createElement("span");
+      impCell.appendChild(barsSvg(lvl2));
       var src = document.createElement("span");
       src.className = "n-src";
       src.textContent = it.source || "—";
-      var imp = document.createElement("span");
-      imp.className = "n-imp i" + lvl;
-      imp.textContent = lvl === 3 ? "H" : (lvl === 2 ? "M" : "L");
       var hd = document.createElement("span");
       hd.className = "n-head";
       var link;
@@ -717,19 +861,73 @@
       cat.className = "n-cat";
       cat.textContent = it.category || "—";
       row.appendChild(tm);
+      row.appendChild(impCell);
       row.appendChild(src);
-      row.appendChild(imp);
       row.appendChild(hd);
       row.appendChild(cat);
       list.appendChild(row);
     }
-    newsHost.appendChild(list);
+    main.appendChild(list);
     if (!shown) {
       var none = document.createElement("div");
       none.className = "news-empty";
-      none.textContent = "Nothing at this impact level in the mirror.";
-      newsHost.appendChild(none);
+      none.textContent = "Nothing matches these filters in the mirror.";
+      main.appendChild(none);
     }
+    body.appendChild(main);
+
+    /* sources rail */
+    var side = document.createElement("div");
+    side.className = "news-side";
+    var sh = document.createElement("div");
+    sh.className = "side-h";
+    sh.textContent = "Sources";
+    side.appendChild(sh);
+    var srcNames = Object.keys(srcCounts).sort(function (a, b) {
+      return srcCounts[b] - srcCounts[a];
+    }).slice(0, 14);
+    for (var si = 0; si < srcNames.length; si++) {
+      (function (name) {
+        var rowS = document.createElement("div");
+        rowS.className = "src-row" + (newsSrcOff[name] ? " off" : "");
+        var nm2 = document.createElement("span");
+        nm2.className = "src-name";
+        nm2.textContent = name;
+        nm2.title = name;
+        var cn = document.createElement("span");
+        cn.className = "src-cnt";
+        cn.textContent = String(srcCounts[name]);
+        var sw = document.createElement("button");
+        sw.className = "switch sm";
+        sw.setAttribute("role", "switch");
+        sw.setAttribute("aria-checked", newsSrcOff[name] ? "false" : "true");
+        sw.setAttribute("aria-label", name + " feed");
+        var knob = document.createElement("span");
+        knob.className = "knob";
+        sw.appendChild(knob);
+        sw.addEventListener("click", function () {
+          if (newsSrcOff[name]) { delete newsSrcOff[name]; }
+          else { newsSrcOff[name] = true; }
+          try {
+            localStorage.setItem(NEWS_SRC_KEY, JSON.stringify(newsSrcOff));
+          } catch (e) { /* private mode */ }
+          renderNews();
+        });
+        rowS.appendChild(nm2);
+        rowS.appendChild(cn);
+        rowS.appendChild(sw);
+        side.appendChild(rowS);
+      })(srcNames[si]);
+    }
+    var note = document.createElement("div");
+    note.className = "side-note";
+    note.textContent =
+      "Toggles filter this feed. Upstream shutdown per source lands with the wiring build.";
+    side.appendChild(note);
+    body.appendChild(side);
+    newsHost.appendChild(body);
+
+    newsSeen = seenNow;
   }
 
   function buildNewsPage(container) {
