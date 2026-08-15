@@ -981,13 +981,14 @@ def _service_name(record):
     return None
 
 
-def _jobs_log_summary(path, now):
+def _jobs_log_summary(path, now, pull_age=None):
     present, lines, encoding_errors, truncated = _read_tail_lines(
         path, RECENT_JOB_LOG_LINES)
     if not present:
         return {
             "source": str(path), "present": False, "as_of": None,
             "last_tick_utc": None, "last_tick_age_seconds": None,
+            "capture_age_seconds": None,
             "last_tick_basis": None, "level": None, "level_basis": None,
             "tail": [], "line_count": 0, "parse_errors": 0,
             "tail_truncated": False,
@@ -1011,12 +1012,17 @@ def _jobs_log_summary(path, now):
         reported = "ERROR"
     elif any(word in text for word in ("WARNING", "WARN", "BUSY", "STOPPED")):
         reported = "WARNING"
+    capture_age = _capture_age_seconds(age, pull_age)
+    # Attribution: grade the runner on its own lag when the transport
+    # term is known — the pull row carries transport staleness itself.
     level, _, basis = _health_level(
-        {"status": reported}, age,
+        {"status": reported},
+        capture_age if capture_age is not None else age,
         JOB_AMBER_AFTER_SECONDS, JOB_RED_AFTER_SECONDS)
     return {
         "source": str(path), "present": True, "as_of": file_as_of,
         "last_tick_utc": last_seen, "last_tick_age_seconds": age,
+        "capture_age_seconds": capture_age,
         "last_tick_basis": "log_timestamp" if tick_utc else "file_mtime",
         "level": level, "level_basis": basis, "tail": lines,
         "line_count": len(lines), "parse_errors": encoding_errors,
@@ -1048,7 +1054,12 @@ def api_health(sources, now=None):
         record_as_of = _record_as_of(record)
         last_seen = record_as_of or file_as_of
         age = _age_seconds(last_seen, now)
-        level, reported, basis = _health_level(record, age)
+        capture_age = _capture_age_seconds(age, pull_age)
+        # Grade on the loop's OWN lag when attribution is possible — a
+        # stale mirror pull must not paint every host service amber; the
+        # pull row carries its own staleness.
+        level, reported, basis = _health_level(
+            record, capture_age if capture_age is not None else age)
         services.append({
             "service": name,
             "level": level,
@@ -1056,14 +1067,12 @@ def api_health(sources, now=None):
             "reported_status": reported,
             "last_seen_utc": last_seen,
             "last_seen_age_seconds": age,
-            "capture_age_seconds": _capture_age_seconds(age, pull_age),
+            "capture_age_seconds": capture_age,
             "last_seen_basis": "record" if record_as_of else "file_mtime",
             "record": record,
         })
 
-    jobs = _jobs_log_summary(sources["jobs_log"], now)
-    jobs["capture_age_seconds"] = _capture_age_seconds(
-        jobs.get("last_tick_age_seconds"), pull_age)
+    jobs = _jobs_log_summary(sources["jobs_log"], now, pull_age)
     flags = {}
     for label, source_name in (("STOP", "stop"), ("STOP-JOBS", "stop_jobs")):
         flag_path = sources[source_name]
@@ -1206,6 +1215,22 @@ TRUE_LAG_FIELDS = {
 }
 TRUE_LAG_MIRROR_CARRY_SECONDS = 240
 
+# Beat representation: every loop's graphable truth is the interval
+# between its real works (write timestamps recovered as sample_ts - age,
+# which stay constant between pulls). Healthy = a flat line at the loop's
+# own rhythm; a late loop's line RISES with its real silence; a stalled
+# transport freezes the view (None) instead of faking lateness.
+BEAT_FIELDS = {
+    "mirror_s": ("mirror_beat_s", False),
+    "news_s": ("news_beat_s", False),
+    "market_s": ("market_beat_s", True),
+    "supervisor_s": ("supervisor_beat_s", True),
+    "basis_watch_s": ("basis_watch_beat_s", True),
+    "basis_sup_s": ("basis_sup_beat_s", True),
+    "jobs_s": ("jobs_beat_s", True),
+}
+BEAT_NEW_WRITE_SECONDS = 2.5
+
 
 def _capture_age_seconds(age, pull_age):
     """Loop lag at the mirror's snapshot instant: observed minus transport,
@@ -1225,6 +1250,7 @@ def _derive_true_lags(records):
     window the derived field is honestly None."""
     last_mirror = None
     last_mirror_ts = None
+    beat_state = {}
     for record in records:
         ts = _parse_utc(record.get("ts"))
         mirror = record.get("mirror_s")
@@ -1246,6 +1272,42 @@ def _derive_true_lags(records):
                 record[true_key] = _capture_age_seconds(value, carried)
             else:
                 record[true_key] = None
+        _derive_beats(record, ts, beat_state)
+
+
+def _derive_beats(record, ts, state):
+    """Add *_beat_s: max(last completed beat, current open interval).
+    Write timestamps derive from sample_ts - age and are pull-phase
+    stable; a new write farther than BEAT_NEW_WRITE_SECONDS advances the
+    beat. Warm-up (no beat yet) and frozen-transport rows stay None."""
+    for raw_key, (out_key, hosted) in BEAT_FIELDS.items():
+        if raw_key not in record:
+            continue
+        value = record.get(raw_key)
+        if (ts is None or isinstance(value, bool)
+                or not isinstance(value, (int, float))):
+            record[out_key] = None
+            continue
+        write_ts = ts - timedelta(seconds=float(value))
+        st = state.setdefault(raw_key, {"write": None, "beat": None})
+        if st["write"] is None:
+            st["write"] = write_ts
+        else:
+            delta = (write_ts - st["write"]).total_seconds()
+            if delta > BEAT_NEW_WRITE_SECONDS:
+                st["beat"] = delta
+                st["write"] = write_ts
+            elif delta < -BEAT_NEW_WRITE_SECONDS:
+                # rotation/out-of-order artifact: re-anchor, keep the beat
+                st["write"] = write_ts
+        if hosted:
+            open_s = record.get(TRUE_LAG_FIELDS[raw_key])
+        else:
+            open_s = float(value)
+        if st["beat"] is None or open_s is None:
+            record[out_key] = None
+        else:
+            record[out_key] = round(max(st["beat"], open_s), 3)
 
 
 def api_telemetry(sources, range_name="1h", now=None):

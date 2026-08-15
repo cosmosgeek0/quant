@@ -441,12 +441,14 @@
       if (hdef.healthKey === "jobs") {
         var jl = netHealth.jobs_log || {};
         lvl = jl.level || null;
-        hage = telNum(jl.last_tick_age_seconds);
+        hage = telNum(jl.capture_age_seconds);
+        if (hage == null) { hage = telNum(jl.last_tick_age_seconds); }
       } else {
         var svc = healthService(hdef.healthKey);
         if (!svc) { return { cls: "", val: "not in health file" }; }
         lvl = svc.level || null;
-        hage = telNum(svc.last_seen_age_seconds);
+        hage = telNum(svc.capture_age_seconds);
+        if (hage == null) { hage = telNum(svc.last_seen_age_seconds); }
         hstatus = svc.reported_status ? " · " + svc.reported_status : "";
       }
       var hcls = lvl === "green" ? "ok"
@@ -478,12 +480,14 @@
         val: ageText2(a) };
     }
     if (id === "market") {
-      var m = d.market_pass && d.market_pass.age_seconds;
+      var m = d.market_pass && d.market_pass.capture_age_seconds;
+      if (m == null) { m = d.market_pass && d.market_pass.age_seconds; }
       return { cls: ageCls(m, 45, 120).replace("v ", ""), val: ageText2(m) };
     }
     if (id === "supervisor") {
       var sv2 = d.supervisor || {};
-      var s2 = sv2.age_seconds;
+      var s2 = sv2.capture_age_seconds != null
+        ? sv2.capture_age_seconds : sv2.age_seconds;
       var st = sv2.reported_status ? " · " + sv2.reported_status : "";
       return { cls: ageCls(s2, 240, 600).replace("v ", ""), val: ageText2(s2) + st };
     }
@@ -759,20 +763,35 @@
      (recorder writes ui/live/telemetry.jsonl every 15s). All chart
      data, uptime %, trend bars, and thresholds come from HERE — the
      page never invents a series again. ---- */
+  /* Attribution law: host loops draw their *_true_s series — the loop's
+     real lag at the mirror's snapshot instant, transport removed. The
+     mirror row alone carries the transport; its sawtooth is the pull
+     cycle itself and belongs to no one else. */
   var NET_METRICS = [
-    { key: "server", field: "rtt_ms", label: "Server ping", unit: "ms" },
-    { key: "mirror", field: "mirror_s", label: "Mirror", unit: "s" },
-    { key: "market", field: "market_s", label: "Feed", unit: "s" },
-    { key: "supervisor", field: "supervisor_s", label: "Supervisor",
-      unit: "s" },
-    { key: "newsloop", field: "news_s", label: "News loop", unit: "s" },
-    { key: "basiswatch", field: "basis_watch_s", label: "Basis watch",
-      unit: "s" },
-    { key: "basissup", field: "basis_sup_s", label: "Basis sup",
-      unit: "s" },
-    { key: "jobrunner", field: "jobs_s", label: "Job runner",
-      unit: "s" }
+    { key: "server", field: "rtt_ms", label: "Server ping", unit: "ms",
+      tier: "MAC" },
+    { key: "mirror", field: "mirror_beat_s", label: "Mirror pull",
+      unit: "s", tier: "TRANSPORT" },
+    { key: "market", field: "market_beat_s", label: "Feed", unit: "s",
+      tier: "HOST" },
+    { key: "supervisor", field: "supervisor_beat_s", label: "Supervisor",
+      unit: "s", tier: "HOST" },
+    { key: "newsloop", field: "news_beat_s", label: "News loop", unit: "s",
+      tier: "MAC" },
+    { key: "basiswatch", field: "basis_watch_beat_s", label: "Basis watch",
+      unit: "s", tier: "HOST" },
+    { key: "basissup", field: "basis_sup_beat_s", label: "Basis sup",
+      unit: "s", tier: "HOST" },
+    { key: "jobrunner", field: "jobs_beat_s", label: "Job runner",
+      unit: "s", tier: "HOST" }
   ];
+  /* Only wall-clock ages grow between samples. TRUE lag is a fact about
+     the last snapshot — it carries flat until the next pull; a stalled
+     transport must NOT paint the loops as dying (the mirror row and the
+     hero carry that alarm). */
+  function fieldExtrapolates(field) {
+    return field === "mirror_s" || field === "news_s";
+  }
   var netTelem = { range: "1h", data: null };
   var netTelemTimer = null;
   var netChart = null;
@@ -865,7 +884,7 @@
   function seriesFilled(field, key) {
     var pts = telemPoints();
     var tol = pollIntervalFor(key) * 1.6 + 10;
-    var isAge = field !== "rtt_ms";
+    var isAge = fieldExtrapolates(field);
     var ts = [];
     var vs = [];
     var lastT = null;
@@ -904,7 +923,7 @@
   function gridSeries(m, grid, boost) {
     var pts = telemPoints();
     var tol = Math.max(pollIntervalFor(m.key) * 1.6 + 10, grid.span * 1.5);
-    var isAge = m.field !== "rtt_ms";
+    var isAge = fieldExtrapolates(m.field);
     var samples = [];
     for (var i = 0; i < pts.length; i += 1) {
       var t = Date.parse(pts[i].ts);
@@ -986,7 +1005,20 @@
       }
       prevV = sv[i];
     }
-    if (pre.length < 2) { return null; }
+    if (pre.length < 2) {
+      /* beat series never saw-drop: healthy beats ARE the rhythm, so
+         their median is the cadence (a rising late-tail barely moves a
+         median). */
+      var all = [];
+      for (var ai = 0; ai < sv.length; ai += 1) {
+        if (sv[ai] != null) { all.push(sv[ai]); }
+      }
+      if (all.length < 5) { return null; }
+      all.sort(function (a, b) { return a - b; });
+      var amed = all[Math.floor(all.length / 2)];
+      if (!(amed >= 5) || amed > 3600) { return null; }
+      return amed;
+    }
     pre.sort(function (a, b) { return a - b; });
     var med = pre[Math.floor(pre.length / 2)];
     if (!(med >= 5) || med > 3600) { return null; }
@@ -1030,10 +1062,10 @@
     if (compKey === "server") { return telNum(lastRtt); }
     if (compKey === "mirror") { return telNum(d.pull && d.pull.age_seconds); }
     if (compKey === "market") {
-      return telNum(d.market_pass && d.market_pass.age_seconds);
+      return telNum(d.market_pass && d.market_pass.capture_age_seconds);
     }
     if (compKey === "supervisor") {
-      return telNum(d.supervisor && d.supervisor.age_seconds);
+      return telNum(d.supervisor && d.supervisor.capture_age_seconds);
     }
     if (compKey === "newsloop") {
       /* disk truth first: the recorder measures the mirror's real age
@@ -1055,13 +1087,13 @@
     if (netHealth && netHealth.present) {
       if (compKey === "jobrunner") {
         return telNum(netHealth.jobs_log &&
-          netHealth.jobs_log.last_tick_age_seconds);
+          netHealth.jobs_log.capture_age_seconds);
       }
       var svcKey = compKey === "basiswatch" ? "basis_watch"
         : compKey === "basissup" ? "basis_supervisor" : null;
       if (svcKey) {
         var svc = healthService(svcKey);
-        return svc ? telNum(svc.last_seen_age_seconds) : null;
+        return svc ? telNum(svc.capture_age_seconds) : null;
       }
     }
     return null;
