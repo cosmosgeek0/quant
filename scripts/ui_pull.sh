@@ -356,6 +356,7 @@ cycle_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
 manifest = {
     "utc": manifest_utc,
     "ok": not errors,
+    "interval_ms": int(os.environ.get("SYNC_INTERVAL_MS", "45000")),
     "cycle_ms": cycle_ms,
     "files": written_files,
     "errors": errors,
