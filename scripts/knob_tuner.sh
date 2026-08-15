@@ -328,6 +328,13 @@ def main() -> int:
     if before <= SURGE_FLOOR:
         return append_noop(now, "surge_floor_reached", **common)
     after = max(SURGE_FLOOR, before - SURGE_STEP)
+    if (KNOBS.parent / "TUNER_ADVISORY").exists():
+        # Owner governance word: advisory-only — recommend, never mutate.
+        append_health(health_row(
+            now, action="advisory", reason="tuner_advisory_mode",
+            recommended_from=decimal_text(before),
+            recommended_to=decimal_text(after), **common))
+        return 0
     values["QUANT_IGNITION_SURGE"] = decimal_text(after)
     try:
         write_knobs(values)

@@ -180,5 +180,22 @@ class KnobTunerTests(unittest.TestCase):
         self.assertNotIn("pwned", probe.stdout)
 
 
+    def test_advisory_marker_recommends_without_mutating(self):
+        (self.deploy / "TUNER_ADVISORY").touch()
+        self.knobs.write_text(ORIGINAL_KNOBS, encoding="ascii")
+        self.write_funnel(self.funnel_row("ignited"))
+
+        self.run_tuner()
+
+        self.assertEqual(
+            self.knobs.read_text(encoding="ascii"), ORIGINAL_KNOBS
+        )
+        row = self.health_rows()[-1]
+        self.assertEqual(row["action"], "advisory")
+        self.assertEqual(row["reason"], "tuner_advisory_mode")
+        self.assertEqual(row["recommended_from"], "1.75")
+        self.assertEqual(row["recommended_to"], "1.5")
+
+
 if __name__ == "__main__":
     unittest.main()
