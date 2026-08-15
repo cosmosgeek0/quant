@@ -1558,5 +1558,352 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(row["receipt_path"]))
 
 
+class SpotMomentumJobRunnerTests(unittest.TestCase):
+    """Spot-only momentum uses the proven basis spot leg, entirely offline."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.receipt_dir = temporary.name
+        self.jobs_dir = os.path.join(self.receipt_dir, "jobs")
+        os.makedirs(self.jobs_dir)
+        Path(os.path.join(
+            self.jobs_dir, "futures_proof_passed"
+        )).touch()
+        Path(os.path.join(
+            self.jobs_dir, "basis_proof_passed"
+        )).touch()
+        with open(os.path.join(
+                self.receipt_dir, "OPERATOR"
+        ), "w", encoding="utf-8") as handle:
+            json.dump({"operator": "lead"}, handle)
+        self.write_accept_one()
+
+        self.base_free = Decimal("5")
+        self.quote_free = Decimal("100")
+        self.spot_bid = Decimal("99")
+        self.spot_ask = Decimal("100")
+        self.posts = []
+        self.orders = {}
+        self.unknown_submission = False
+        self.governor_acquires = []
+        self.governor_releases = []
+
+        class FakeGovernorRefusal(Exception):
+            def __init__(inner_self, reason):
+                super().__init__(reason)
+                inner_self.reason = reason
+
+        governor = types.ModuleType("account_governor")
+        governor.GovernorRefusal = FakeGovernorRefusal
+        governor.budgets_allow = lambda receipt_dir: (True, "")
+
+        def acquire(op, symbol, receipt_dir):
+            self.governor_acquires.append((op, symbol, receipt_dir))
+            return "spot-governor-token"
+
+        def release(token, receipt_dir):
+            self.governor_releases.append((token, receipt_dir))
+
+        governor.acquire_entry_slot = acquire
+        governor.release_entry_slot = release
+        governor.record_realized = lambda *_args: None
+        governor_patch = mock.patch.dict(
+            sys.modules, {"account_governor": governor}
+        )
+        governor_patch.start()
+        self.addCleanup(governor_patch.stop)
+
+        env = mock.patch.dict(os.environ, {
+            "RECEIPT_DIR": self.receipt_dir,
+            "QUANT_SHA": SHA,
+            "BINANCE_API_KEY": "offline-key",
+            "BINANCE_API_SECRET": "offline-secret",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+
+        def deny(*_args, **_kwargs):
+            raise AssertionError("spot momentum test attempted network")
+
+        for target, name in ((urllib.request, "urlopen"),
+                             (socket, "socket"),
+                             (socket, "create_connection")):
+            patcher = mock.patch.object(target, name, deny)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write_accept_one(self, maximum="32"):
+        path = os.path.join(self.receipt_dir, "ACCEPT-ONE")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "operator": "lead",
+                "created_utc": utc(NOW - timedelta(minutes=1)),
+                "expires_utc": utc(NOW + timedelta(minutes=10)),
+                "max_notional": maximum,
+            }, handle)
+
+    def job(self, job_id, op="MOMENTUM_OPEN", maximum=20, spot=False):
+        payload = {
+            "job_id": job_id,
+            "op": op,
+            "symbol": "TSTUSDT",
+            "max_notional": maximum,
+            "created_utc": utc(NOW - timedelta(minutes=1)),
+            "expires_utc": utc(NOW + timedelta(minutes=10)),
+            "requested_by": "lead",
+        }
+        if spot:
+            payload["venue"] = "spot"
+        with open(os.path.join(
+                self.jobs_dir, "job-%s.json" % job_id
+        ), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    @staticmethod
+    def spot_info():
+        return {
+            "symbol": "TSTUSDT",
+            "status": "TRADING",
+            "isSpotTradingAllowed": True,
+            "baseAsset": "TST",
+            "quoteAsset": "USDT",
+            "baseAssetPrecision": 8,
+            "quoteAssetPrecision": 8,
+            "orderTypes": ["MARKET"],
+            "quoteOrderQtyMarketAllowed": True,
+            "filters": [
+                {
+                    "filterType": "LOT_SIZE",
+                    "stepSize": "0.001",
+                    "minQty": "0.001",
+                },
+                {
+                    "filterType": "MARKET_LOT_SIZE",
+                    "stepSize": "0.001",
+                    "minQty": "0.001",
+                },
+                {
+                    "filterType": "MIN_NOTIONAL",
+                    "minNotional": "5",
+                    "applyToMarket": True,
+                },
+            ],
+        }
+
+    def spot_request(self, method, base_url, path, params=None,
+                     signed=False):
+        self.assertEqual(base_url, jr.basis_executor.SPOT.base_url)
+        params = dict(params or {})
+        if method == "GET" and path == "/api/v3/exchangeInfo":
+            self.assertFalse(signed)
+            return "ok", {"symbols": [self.spot_info()]}
+        if method == "GET" and path == "/api/v3/ticker/bookTicker":
+            self.assertFalse(signed)
+            return "ok", {
+                "symbol": "TSTUSDT",
+                "bidPrice": str(self.spot_bid),
+                "askPrice": str(self.spot_ask),
+            }
+        if method == "GET" and path == "/api/v3/account":
+            self.assertTrue(signed)
+            return "ok", {
+                "canTrade": True,
+                "balances": [
+                    {"asset": "TST", "free": str(self.base_free)},
+                    {"asset": "USDT", "free": str(self.quote_free)},
+                ],
+            }
+        if method == "GET" and path == "/api/v3/openOrders":
+            self.assertTrue(signed)
+            return "ok", []
+        if method == "POST" and path == "/api/v3/order":
+            self.assertTrue(signed)
+            self.posts.append(params)
+            if self.unknown_submission:
+                return "unclear", {"http": 502}
+            side = params["side"]
+            if side == "BUY":
+                quote = Decimal(params["quoteOrderQty"])
+                quantity = quote / self.spot_ask
+                commission = Decimal("0.001")
+                commission_asset = "TST"
+                price = self.spot_ask
+                self.base_free += quantity - commission
+                self.quote_free -= quote
+            else:
+                quantity = Decimal(params["quantity"])
+                price = self.spot_bid
+                quote = quantity * price
+                commission = Decimal("0.001")
+                commission_asset = "USDT"
+                self.base_free -= quantity
+                self.quote_free += quote - commission
+            order_id = str(len(self.posts))
+            order = {
+                "symbol": "TSTUSDT",
+                "status": "FILLED",
+                "side": side,
+                "clientOrderId": params["newClientOrderId"],
+                "orderId": order_id,
+                "executedQty": str(quantity),
+                "cummulativeQuoteQty": str(quote),
+            }
+            fill = {
+                "id": order_id,
+                "orderId": order_id,
+                "qty": str(quantity),
+                "price": str(price),
+                "commission": str(commission),
+                "commissionAsset": commission_asset,
+            }
+            self.orders[params["newClientOrderId"]] = dict(order)
+            return "ok", {**order, "fills": [fill]}
+        if method == "GET" and path == "/api/v3/order":
+            self.assertTrue(signed)
+            if self.unknown_submission:
+                return "api_error", {"code": -1003, "msg": "offline"}
+            return "ok", dict(self.orders[params["origClientOrderId"]])
+        raise AssertionError("unexpected spot request %s %s" % (
+            method, path,
+        ))
+
+    def tick(self, **kwargs):
+        return jr.tick(
+            receipt_dir=self.receipt_dir,
+            now=NOW,
+            spot_request=self.spot_request,
+            **kwargs,
+        )
+
+    def state(self):
+        with open(os.path.join(
+                self.receipt_dir, "momentum-position.json"
+        ), encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def results(self):
+        with open(os.path.join(
+                self.jobs_dir, "results.jsonl"
+        ), encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle]
+
+    def open_spot(self, job_id="spot-open"):
+        self.job(job_id, spot=True)
+        with mock.patch.object(
+                jr, "_ensure_leverage_1x",
+                side_effect=AssertionError("spot path attempted Futures")):
+            self.assertEqual(self.tick(), 0)
+
+    def test_spot_open_routes_proven_leg_through_ticket_governor_and_clamp(self):
+        self.open_spot()
+
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.posts[0]["side"], "BUY")
+        self.assertEqual(self.posts[0]["quoteOrderQty"], "8.00000000")
+        self.assertEqual(self.governor_acquires, [(
+            "MOMENTUM_OPEN", "TSTUSDT", self.receipt_dir,
+        )])
+        self.assertEqual(self.governor_releases, [(
+            "spot-governor-token", self.receipt_dir,
+        )])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE.claimed-spot-open"
+        )))
+        state = self.state()
+        self.assertEqual(state["venue"], "spot")
+        self.assertEqual(state["state"], "OPEN")
+        self.assertEqual(state["measured_qty"], "0.07900000")
+
+    def test_default_momentum_open_remains_on_futures_path(self):
+        self.job("futures-default", maximum=6)
+        measured = {"qty": Decimal("0.03"), "price": Decimal("200"),
+                    "open_orders": 0, "leverage": 1}
+        order = {
+            "status": "FILLED",
+            "clientOrderId": "unused",
+            "orderId": "77",
+            "executedQty": "0.03",
+            "cumQuote": "6",
+            "avgPrice": "200",
+            "reduceOnly": False,
+        }
+
+        def submit(intent):
+            order["clientOrderId"] = intent["newClientOrderId"]
+            fill = {
+                "id": "1", "orderId": "77", "qty": "0.03",
+                "price": "200", "commission": "0.003",
+                "commissionAsset": "USDT", "realizedPnl": "0",
+            }
+            return "terminal", dict(order), [fill], "ok"
+
+        with mock.patch.object(jr, "_ensure_leverage_1x", return_value=True), \
+                mock.patch.object(jr, "_momentum_open_plan", return_value={
+                    "quantity": Decimal("0.03"),
+                    "limit_price": Decimal("200"),
+                    "current_leverage": 1,
+                }), \
+                mock.patch.object(jr, "_momentum_submit", side_effect=submit), \
+                mock.patch.object(jr, "_momentum_measure", return_value=measured), \
+                mock.patch.object(jr, "_run_spot_momentum_open") as spot_path:
+            self.assertEqual(self.tick(), 0)
+
+        spot_path.assert_not_called()
+        self.assertEqual(self.state()["venue"], "futures")
+        self.assertEqual(self.results()[0]["verdict"], "OPEN")
+        self.assertEqual(self.posts, [])
+
+    def test_spot_exit_sells_only_net_acquired_not_existing_balance(self):
+        self.open_spot("spot-net-open")
+        self.job("spot-net-exit", op="MOMENTUM_EXIT", maximum=6)
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual(len(self.posts), 2)
+        sell = self.posts[1]
+        self.assertEqual(sell["side"], "SELL")
+        self.assertEqual(sell["quantity"], "0.079")
+        self.assertNotEqual(sell["quantity"], "5.079")
+        self.assertEqual(self.base_free, Decimal("5.000"))
+        state = self.state()
+        self.assertEqual(state["state"], "CLOSED")
+        self.assertEqual(state["exit"]["submitted_qty"], "0.079")
+
+    def test_spot_adverse_stop_uses_the_same_net_acquired_exit(self):
+        self.open_spot("spot-adverse-open")
+        self.spot_bid = Decimal("97")
+        self.spot_ask = Decimal("98")
+
+        self.assertEqual(self.tick(), 0)
+
+        self.assertEqual([row["side"] for row in self.posts], ["BUY", "SELL"])
+        self.assertEqual(self.posts[-1]["quantity"], "0.079")
+        self.assertEqual(self.state()["state"], "CLOSED")
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "first_autonomous_close_passed"
+        )))
+
+    def test_spot_unknown_submission_freezes_without_retry(self):
+        self.unknown_submission = True
+        self.job("spot-unknown", spot=True)
+
+        self.assertEqual(self.tick(), 4)
+
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.state()["state"], "UNKNOWN")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "ACCEPT-ONE"
+        )))
+        self.assertEqual(self.governor_releases, [])
+        self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
+
+
 if __name__ == "__main__":
     unittest.main()

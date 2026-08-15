@@ -73,7 +73,7 @@ RUNNER_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 RUNNER_UTC_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
-JOB_FIELDS = frozenset(
+JOB_REQUIRED_FIELDS = frozenset(
     {
         "job_id",
         "op",
@@ -84,6 +84,8 @@ JOB_FIELDS = frozenset(
         "requested_by",
     }
 )
+JOB_OPTIONAL_FIELDS = frozenset({"venue"})
+JOB_FIELDS = JOB_REQUIRED_FIELDS | JOB_OPTIONAL_FIELDS
 
 
 class MomentumLiveError(Exception):
@@ -106,6 +108,7 @@ class RunnerPosition:
     exit_job_id: Optional[str]
     quantity: Optional[Decimal]
     entry_price: Optional[Decimal]
+    venue: str = "futures"
 
 
 @dataclass
@@ -211,7 +214,9 @@ def _json_with_decimal(payload: Mapping[str, Any]) -> bytes:
 
 
 def _validate_job_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    if not isinstance(payload, Mapping) or set(payload) != JOB_FIELDS:
+    if not isinstance(payload, Mapping) \
+            or not JOB_REQUIRED_FIELDS.issubset(payload) \
+            or not set(payload).issubset(JOB_FIELDS):
         raise MomentumLiveError("job payload does not match the runner schema")
     strings = (
         "job_id",
@@ -231,6 +236,11 @@ def _validate_job_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         raise MomentumLiveError("symbol does not fit the runner schema")
     if payload["op"] not in JOB_OPS:
         raise MomentumLiveError("job op is not a momentum OPEN or EXIT")
+    if "venue" in payload and (
+            type(payload["venue"]) is not str
+            or payload["venue"] != "spot"
+            or payload["op"] != JOB_OPEN_OP):
+        raise MomentumLiveError("job venue does not fit the runner schema")
     requester = payload["requested_by"]
     if not requester.strip() or len(requester) > 128:
         raise MomentumLiveError("requested_by does not fit the runner schema")
@@ -259,7 +269,7 @@ def _read_existing_job(path: Path) -> Dict[str, Any]:
 
 
 def _same_job(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return all(left[name] == right[name] for name in JOB_FIELDS)
+    return dict(left) == dict(right)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -713,6 +723,9 @@ def read_runner_position(path: Path) -> Optional[RunnerPosition]:
     state = aliases.get(runner_state, runner_state)
     if state not in {"FLAT", "OPEN", "EXIT_PENDING", "OPEN_PENDING", "UNKNOWN"}:
         raise MomentumLiveError("momentum position state has invalid status")
+    venue = raw.get("venue", "futures")
+    if venue not in {"futures", "spot"}:
+        raise MomentumLiveError("momentum position state has invalid venue")
     symbol = raw.get("symbol")
     if symbol is not None and (
         not isinstance(symbol, str) or RUNNER_SYMBOL_RE.fullmatch(symbol) is None
@@ -756,7 +769,7 @@ def read_runner_position(path: Path) -> Optional[RunnerPosition]:
     elif quantity is not None and quantity != 0:
         raise MomentumLiveError("non-open momentum position has non-zero quantity")
     return RunnerPosition(
-        state, symbol, open_job_id, exit_job_id, quantity, entry_price
+        state, symbol, open_job_id, exit_job_id, quantity, entry_price, venue
     )
 
 
@@ -922,7 +935,13 @@ def reconcile_runner_truth(
         if result is None:
             raise MomentumLiveError("runner position stands without an OPEN ledger result")
         quantity, price, fill_prices = _open_fill_from_result(result)
-        if position.quantity != quantity:
+        if position.venue == "spot":
+            if position.quantity is None or position.quantity > quantity:
+                raise MomentumLiveError(
+                    "runner spot position exceeds its OPEN ledger fill"
+                )
+            quantity = position.quantity
+        elif position.quantity != quantity:
             raise MomentumLiveError("runner position and OPEN ledger quantity conflict")
         if position.entry_price is not None:
             if not _within_fill_rounding(
@@ -1410,9 +1429,12 @@ def _job_eligibility(
         )
     if action != lifecycle.ACTION_ENTER_SMALL:
         return False, "lifecycle action has no runner job", None
-    if record is None or record.venues not in {"perp", "both"}:
-        return False, "token has no perpetual venue", None
-    if record.perp_bid is None or record.perp_ask is None:
+    if record is None or record.venues not in {"spot", "perp", "both"}:
+        return False, "token has no executable venue", None
+    if record.venues == "spot":
+        if record.spot_bid is None or record.spot_ask is None:
+            return False, "token has no executable spot quote", None
+    elif record.perp_bid is None or record.perp_ask is None:
         return False, "token has no executable perpetual quote", None
     if RUNNER_SYMBOL_RE.fullmatch(record.symbol) is None:
         return False, "symbol does not fit the runner schema", None
@@ -1423,7 +1445,8 @@ def _job_eligibility(
         return False, "entry notional is not positive", None
     if requested > max_job_notional or requested > HARD_MAX_NOTIONAL:
         return False, "entry notional exceeds the runner cap", requested
-    return True, "perpetual entry fits the runner cap", requested
+    venue = "spot" if record.venues == "spot" else "futures"
+    return True, "%s entry fits the runner cap" % venue, requested
 
 
 def _decision_id(
@@ -1474,11 +1497,19 @@ def _decision_row(
             "expires_utc": _utc_text(created + job_ttl),
             "requested_by": requested_by,
         }
+        if op == JOB_OPEN_OP and record is not None \
+                and record.venues == "spot":
+            job["venue"] = "spot"
         _validate_job_payload(job)
+    identity_action = str(decision.get("action", ""))
+    if job is not None and job.get("venue") == "spot":
+        # Keep the endorsed spot widening distinct from a pre-widen decision
+        # that durably recorded the same receipt as futures-ineligible.
+        identity_action += ":spot"
     row = {
         "decision_id": _decision_id(
             token["symbol"],
-            str(decision.get("action", "")),
+            identity_action,
             evidence["observation_id"],
             None if decision_only else decision.get("receipt_id"),
             decision_utc,

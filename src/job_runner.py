@@ -28,9 +28,10 @@ import basis_executor
 import futures_hand
 import limits
 import set_leverage_1x
+import spot_roundtrip
 
 
-JOB_FIELDS = {
+JOB_REQUIRED_FIELDS = {
     "job_id",
     "op",
     "symbol",
@@ -39,6 +40,8 @@ JOB_FIELDS = {
     "expires_utc",
     "requested_by",
 }
+JOB_OPTIONAL_FIELDS = {"venue"}
+JOB_FIELDS = JOB_REQUIRED_FIELDS | JOB_OPTIONAL_FIELDS
 ACCEPT_ONE_FIELDS = {
     "operator", "created_utc", "expires_utc", "max_notional",
 }
@@ -97,6 +100,7 @@ class Job:
     created_utc: datetime
     expires_utc: datetime
     requested_by: str
+    venue: str = "futures"
 
 
 @dataclass(frozen=True)
@@ -255,7 +259,7 @@ def _validate_job(raw: Dict[str, Any], filename_id: str,
     unknown = set(raw) - JOB_FIELDS
     if unknown:
         raise JobRefusal("UNKNOWN_FIELD")
-    missing = JOB_FIELDS - set(raw)
+    missing = JOB_REQUIRED_FIELDS - set(raw)
     if missing:
         raise JobRefusal("MISSING_FIELD")
 
@@ -270,6 +274,12 @@ def _validate_job(raw: Dict[str, Any], filename_id: str,
         raise JobRefusal("BAD_JOB_ID")
     if raw["op"] not in OPS:
         raise JobRefusal("BAD_OP")
+    venue = raw.get("venue", "futures")
+    if type(venue) is not str:
+        raise JobRefusal("BAD_TYPE")
+    if "venue" in raw and (
+            raw["op"] != "MOMENTUM_OPEN" or venue != "spot"):
+        raise JobRefusal("BAD_VENUE")
     if not SYMBOL_RE.fullmatch(raw["symbol"]):
         raise JobRefusal("BAD_SYMBOL")
     if not raw["requested_by"].strip() or len(raw["requested_by"]) > 128:
@@ -297,6 +307,7 @@ def _validate_job(raw: Dict[str, Any], filename_id: str,
         created_utc=created,
         expires_utc=expires,
         requested_by=raw["requested_by"],
+        venue=venue,
     )
 
 
@@ -788,6 +799,8 @@ def _load_momentum_position(paths: Dict[str, str]) \
     if value.get("state") not in {
             "NONE", "OPENING", "OPEN", "CLOSING", "CLOSED", "UNKNOWN"}:
         raise MomentumStateError("momentum position state is invalid")
+    if value.get("venue", "futures") not in {"futures", "spot"}:
+        raise MomentumStateError("momentum position venue is invalid")
     revision = value.get("revision")
     if type(revision) is not int or revision < 1:
         raise MomentumStateError("momentum position revision is invalid")
@@ -807,6 +820,13 @@ def _load_momentum_position(paths: Dict[str, str]) \
                 or not isinstance(pending.get("intent"), dict):
             raise MomentumStateError("momentum pending intent is invalid")
     return value
+
+
+def _momentum_venue(position: Dict[str, Any]) -> str:
+    venue = position.get("venue", "futures")
+    if venue not in {"futures", "spot"}:
+        raise MomentumStateError("momentum position venue is invalid")
+    return venue
 
 
 def _save_momentum_position(paths: Dict[str, str],
@@ -1157,6 +1177,454 @@ def _momentum_ledger(fills: List[Dict[str, str]],
         realized["net_usdt"] = _decimal_text(
             gross - totals.get("USDT", Decimal(0))
         )
+    return {"fills": fills, "fees": fees, "realized": realized}
+
+
+def _spot_request_factory() -> Callable[..., Tuple[str, Any]]:
+    return basis_executor.live_request_factory(
+        os.environ.get("BINANCE_API_KEY", ""),
+        os.environ.get("BINANCE_API_SECRET", ""),
+    )
+
+
+def _spot_state(symbol: str, sha: str, receipt_dir: str, run_id: str,
+                request: Optional[Callable[..., Tuple[str, Any]]] = None) \
+        -> basis_executor.RunState:
+    config = basis_executor.ExecutorConfig(
+        symbol=symbol,
+        sha=sha,
+        receipt_dir=receipt_dir,
+        run_id=run_id,
+    )
+    state = basis_executor.make_state(
+        config,
+        request or _spot_request_factory(),
+        basis_executor.time.sleep,
+        receipted=False,
+    )
+    state.receipt = {"legs": []}
+    return state
+
+
+def _spot_balances(account: Any, *assets: str) -> Dict[str, Decimal]:
+    if not isinstance(account, dict) \
+            or not isinstance(account.get("balances"), list) \
+            or any(not isinstance(row, dict)
+                   for row in account.get("balances", [])):
+        raise MomentumStateError("Spot account balances are unreadable")
+    rows = account["balances"]
+    for asset in assets:
+        matches = [row for row in rows if row.get("asset") == asset]
+        if len(matches) != 1 or matches[0].get("free") is None:
+            raise MomentumStateError(
+                "Spot account has no unique free balance for %s" % asset
+            )
+    try:
+        balances = spot_roundtrip.balances_of(account, *assets)
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        raise MomentumStateError("Spot account balances are unreadable") \
+            from None
+    if any(not value.is_finite() or value < 0 for value in balances.values()):
+        raise MomentumStateError("Spot account balance is outside its range")
+    return balances
+
+
+def _spot_market_context(state: basis_executor.RunState,
+                         effective: Decimal) -> Dict[str, Any]:
+    """Proven spot-hand preflight, limited to a quote-bounded BUY."""
+    try:
+        raw_info = basis_executor.public_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT.exchange_info_path, "Spot exchangeInfo",
+        )
+        info = basis_executor.one_symbol(
+            raw_info, state.cfg.symbol, "Spot exchangeInfo"
+        )
+        if info.get("status") != "TRADING" \
+                or info.get("isSpotTradingAllowed") is not True:
+            raise basis_executor.Refusal(
+                "symbol is not live for Spot trading"
+            )
+        if "MARKET" not in info.get("orderTypes", []) \
+                or info.get("quoteOrderQtyMarketAllowed") is not True:
+            raise basis_executor.Refusal(
+                "MARKET quoteOrderQty orders not enabled for symbol"
+            )
+        if info.get("quoteAsset") != "USDT" \
+                or type(info.get("baseAsset")) is not str \
+                or not info["baseAsset"]:
+            raise basis_executor.Refusal(
+                "momentum Spot entry requires a USDT quote asset"
+            )
+        filters = {
+            row["filterType"]: row for row in info.get("filters", [])
+        }
+        lot = filters["LOT_SIZE"]
+        market_lot = filters.get("MARKET_LOT_SIZE", {})
+        lot_step = _momentum_decimal(lot.get("stepSize"), "spot lot step")
+        market_step = _momentum_decimal(
+            market_lot.get("stepSize", "0"), "spot market step",
+            allow_zero=True,
+        )
+        step = lot_step if market_step == 0 else basis_executor.common_step(
+            lot_step, market_step
+        )
+        min_qty = max(
+            _momentum_decimal(
+                lot.get("minQty"), "spot minimum quantity", allow_zero=True
+            ),
+            _momentum_decimal(
+                market_lot.get("minQty", "0"),
+                "spot market minimum quantity", allow_zero=True,
+            ),
+        )
+        notional_filter = filters.get("NOTIONAL") \
+            or filters.get("MIN_NOTIONAL") or {}
+        if not isinstance(notional_filter, dict) \
+                or notional_filter.get("minNotional") in (None, ""):
+            raise basis_executor.Refusal(
+                "Spot minimum-notional filter is unavailable"
+            )
+        min_notional = _momentum_decimal(
+            notional_filter.get("minNotional", "0"),
+            "spot minimum notional", allow_zero=True,
+        )
+        apply_min_raw = notional_filter.get(
+            "applyMinToMarket",
+            notional_filter.get("applyToMarket", True),
+        )
+        if type(apply_min_raw) is not bool:
+            raise basis_executor.Refusal(
+                "Spot minimum-notional market rule is invalid"
+            )
+        apply_min = apply_min_raw
+        base_precision = info.get("baseAssetPrecision")
+        quote_precision = info.get(
+            "quoteAssetPrecision", info.get("quotePrecision")
+        )
+        if isinstance(base_precision, bool) \
+                or not isinstance(base_precision, int) \
+                or not 0 <= base_precision <= 30 \
+                or isinstance(quote_precision, bool) \
+                or not isinstance(quote_precision, int) \
+                or not 0 <= quote_precision <= 30:
+            raise basis_executor.Refusal(
+                "Spot asset precision is unavailable or invalid"
+            )
+        quote_quantum = Decimal(1).scaleb(-quote_precision)
+        quote_spend = spot_roundtrip.floor_step(effective, quote_quantum)
+        if quote_spend <= 0 \
+                or (apply_min and quote_spend < min_notional):
+            raise basis_executor.Refusal(
+                "effective quote cap is below the Spot minimum"
+            )
+
+        account = basis_executor.signed_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT_ACCOUNT_PATH, None, "Spot account read",
+        )
+        can_trade = account.get("canTrade") \
+            if isinstance(account, dict) else None
+        if can_trade is not True:
+            raise basis_executor.PreflightRefusal(
+                "Spot account canTrade is not true"
+            )
+        balances = _spot_balances(
+            account, info["baseAsset"], info["quoteAsset"]
+        )
+        if balances[info["quoteAsset"]] < quote_spend:
+            raise basis_executor.PreflightRefusal(
+                "Spot quote balance is below the effective cap"
+            )
+        orders = basis_executor.signed_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT_OPEN_ORDERS_PATH,
+            {"symbol": state.cfg.symbol}, "Spot open-orders read",
+        )
+        if not isinstance(orders, list):
+            raise basis_executor.PreflightRefusal(
+                "Spot open-orders response is not a list"
+            )
+        if orders:
+            raise basis_executor.PreflightRefusal(
+                "Spot open order already stands on the momentum symbol"
+            )
+        book = basis_executor.public_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT_BOOK_PATH, "Spot book",
+        )
+        if not isinstance(book, dict) \
+                or book.get("symbol", state.cfg.symbol) != state.cfg.symbol:
+            raise basis_executor.Refusal("Spot book is invalid")
+        bid = _momentum_decimal(book.get("bidPrice"), "spot bid")
+        ask = _momentum_decimal(book.get("askPrice"), "spot ask")
+        if bid > ask:
+            raise basis_executor.Refusal("Spot book is crossed")
+        estimated_net = basis_cycle.quantize_down(
+            quote_spend / ask * (Decimal(1) - basis_cycle.FEE_BUFFER),
+            step,
+        )
+        if estimated_net < min_qty \
+                or (apply_min and estimated_net * bid < min_notional):
+            raise basis_executor.Refusal(
+                "effective cap cannot acquire a sellable Spot quantity"
+            )
+    except basis_executor.PreflightRefusal as error:
+        raise JobRefusal("MOMENTUM_SPOT_PREFLIGHT: %s" % error) from None
+    except (basis_executor.Refusal, MomentumStateError, ArithmeticError,
+            KeyError, TypeError, ValueError) as error:
+        raise JobRefusal("MOMENTUM_SPOT_PREFLIGHT: %s" % error) from None
+    return {
+        "base": info["baseAsset"],
+        "quote": info["quoteAsset"],
+        "step": step,
+        "min_qty": min_qty,
+        "min_notional": min_notional,
+        "apply_min": apply_min,
+        "quote_spend": quote_spend,
+        "starting_base_free": balances[info["baseAsset"]],
+        "starting_quote_free": balances[info["quoteAsset"]],
+        "base_tolerance": Decimal(1).scaleb(-base_precision),
+        "bid": bid,
+        "ask": ask,
+    }
+
+
+def _spot_plan(symbol: str, quote_spend: Decimal) -> basis_cycle.CyclePlan:
+    return basis_cycle.CyclePlan(
+        symbol=symbol,
+        entry_gap_bps=Decimal(0),
+        exit_gap_bps=Decimal(0),
+        funding_rate=Decimal(0),
+        spot_quantity=Decimal(0),
+        short_quantity=Decimal(0),
+        spot_quote_cap=quote_spend,
+        short_notional=Decimal(0),
+        leverage=1,
+        reason="spot-only momentum leg",
+    )
+
+
+def _spot_persisted_market(position: Dict[str, Any]) -> Dict[str, Any]:
+    raw = position.get("spot_market")
+    if not isinstance(raw, dict):
+        raise MomentumStateError("persisted Spot market context is missing")
+    base = raw.get("base")
+    quote = raw.get("quote")
+    if type(base) is not str or not base \
+            or type(quote) is not str or not quote:
+        raise MomentumStateError("persisted Spot assets are invalid")
+    return {
+        "base": base,
+        "quote": quote,
+        "step": _momentum_decimal(raw.get("step"), "persisted Spot step"),
+        "min_qty": _momentum_decimal(
+            raw.get("min_qty"), "persisted Spot minimum quantity",
+            allow_zero=True,
+        ),
+        "min_notional": _momentum_decimal(
+            raw.get("min_notional"), "persisted Spot minimum notional",
+            allow_zero=True,
+        ),
+        "apply_min": raw.get("apply_min") is True,
+        "starting_base_free": _momentum_decimal(
+            raw.get("starting_base_free"), "persisted starting base balance",
+            allow_zero=True,
+        ),
+        "base_tolerance": _momentum_decimal(
+            raw.get("base_tolerance"), "persisted base tolerance"
+        ),
+    }
+
+
+def _spot_measure(position: Dict[str, Any], receipt_dir: str,
+                  request: Optional[Callable[..., Tuple[str, Any]]] = None) \
+        -> Dict[str, Any]:
+    market = _spot_persisted_market(position)
+    sha = str(position.get("sha", ""))
+    state = _spot_state(
+        position["symbol"], sha, receipt_dir,
+        str(position.get("run_id", "spot-measure")), request,
+    )
+    try:
+        account = basis_executor.signed_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT_ACCOUNT_PATH, None, "Spot account read",
+        )
+        balances = _spot_balances(
+            account, market["base"], market["quote"]
+        )
+        orders = basis_executor.signed_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT_OPEN_ORDERS_PATH,
+            {"symbol": position["symbol"]}, "Spot open-orders read",
+        )
+        book = basis_executor.public_read(
+            state, basis_executor.SPOT.base_url,
+            basis_executor.SPOT_BOOK_PATH, "Spot book",
+        )
+        if not isinstance(orders, list) or not isinstance(book, dict) \
+                or book.get("symbol", position["symbol"]) \
+                != position["symbol"]:
+            raise MomentumStateError("Spot measurement response is invalid")
+        price = _momentum_decimal(book.get("bidPrice"), "current Spot bid")
+        quantity = balances[market["base"]] - market["starting_base_free"]
+        if quantity < -market["base_tolerance"]:
+            raise MomentumStateError(
+                "Spot balance fell below the pre-entry baseline"
+            )
+        if quantity.copy_abs() <= market["base_tolerance"]:
+            quantity = Decimal(0)
+    except (basis_executor.PreflightRefusal, basis_executor.Refusal,
+            MomentumStateError, ArithmeticError, KeyError, TypeError,
+            ValueError) as error:
+        if isinstance(error, MomentumStateError):
+            raise
+        raise MomentumStateError(
+            "momentum Spot state is unreadable: %s" % error
+        ) from None
+    can_trade = account.get("canTrade") \
+        if isinstance(account, dict) else None
+    return {
+        "qty": quantity,
+        "price": price,
+        "open_orders": len(orders),
+        "can_trade": can_trade is True,
+        "base_free": balances[market["base"]],
+    }
+
+
+def _spot_order_facts(order: Any, client_id: str,
+                      side: str) -> Dict[str, Any]:
+    if not isinstance(order, dict) \
+            or order.get("status") not in basis_executor.TERMINAL:
+        raise MomentumStateError("Spot momentum order is not terminal")
+    if order.get("clientOrderId") != client_id:
+        raise MomentumStateError("Spot momentum order client id mismatches")
+    if order.get("symbol", os.environ.get("SYMBOL")) \
+            != os.environ.get("SYMBOL"):
+        raise MomentumStateError("Spot momentum order symbol mismatches")
+    if order.get("side", side) != side:
+        raise MomentumStateError("Spot momentum order side mismatches")
+    order_id = str(order.get("orderId", ""))
+    if not order_id:
+        raise MomentumStateError("Spot momentum exchange order id is missing")
+    quantity = _momentum_decimal(
+        order.get("executedQty"), "Spot order executedQty", allow_zero=True
+    )
+    quote = _momentum_decimal(
+        order.get(basis_executor.SPOT.quote_field),
+        "Spot order cumulative quote", allow_zero=True,
+    )
+    price = Decimal(0)
+    if quantity > 0:
+        if quote <= 0:
+            raise MomentumStateError("filled Spot momentum order has no quote")
+        price = quote / quantity
+    return {
+        "status": str(order["status"]),
+        "order_id": order_id,
+        "client_id": client_id,
+        "qty": quantity,
+        "quote": quote,
+        "price": price,
+    }
+
+
+def _normalise_spot_fills(raw_fills: Any, order_id: str,
+                          executed: Decimal) -> List[Dict[str, str]]:
+    if not isinstance(raw_fills, list) or not raw_fills:
+        raise MomentumStateError("exchange returned no Spot momentum fills")
+    normalised: List[Dict[str, str]] = []
+    covered = Decimal(0)
+    seen_ids = set()
+    for raw in raw_fills:
+        if not isinstance(raw, dict):
+            raise MomentumStateError("exchange Spot fill is not an object")
+        raw_order_id = raw.get("orderId")
+        if raw_order_id is not None and str(raw_order_id) != order_id:
+            raise MomentumStateError("Spot fill order id mismatches")
+        quantity = _momentum_decimal(raw.get("qty"), "Spot fill qty")
+        price = _momentum_decimal(raw.get("price"), "Spot fill price")
+        commission = _momentum_decimal(
+            raw.get("commission"), "Spot fill commission", allow_zero=True
+        )
+        asset = raw.get("commissionAsset")
+        if type(asset) is not str or not asset.strip():
+            raise MomentumStateError("Spot fill commission asset is missing")
+        trade_id = str(raw.get("id", raw.get("tradeId", "")))
+        if trade_id:
+            if trade_id in seen_ids:
+                raise MomentumStateError("duplicate Spot momentum trade id")
+            seen_ids.add(trade_id)
+        normalised.append({
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "price": _decimal_text(price),
+            "qty": _decimal_text(quantity),
+            "realized_pnl": "0",
+            "commission": _decimal_text(commission),
+            "commission_asset": asset,
+        })
+        covered += quantity
+    if covered != executed:
+        raise MomentumStateError(
+            "Spot fills do not cover the exchange order quantity"
+        )
+    return normalised
+
+
+def _spot_fills(state: basis_executor.RunState, order: Dict[str, Any],
+                response_fills: List[Dict[str, Any]]) \
+        -> List[Dict[str, str]]:
+    order_id = str(order.get("orderId", ""))
+    executed = _momentum_decimal(
+        order.get("executedQty"), "Spot order executedQty"
+    )
+    try:
+        trades, covered = basis_executor.spot_trades(
+            state, order_id, executed, response_fills
+        )
+    except Exception as error:
+        raise MomentumStateError(
+            "Spot fill/commission data is unreadable: %s" %
+            type(error).__name__
+        ) from None
+    if covered != executed:
+        raise MomentumStateError(
+            "Spot fill/commission data does not cover the order"
+        )
+    return _normalise_spot_fills(trades, order_id, executed)
+
+
+def _spot_momentum_ledger(
+        fills: List[Dict[str, str]],
+        entry_fees: Optional[List[Dict[str, str]]] = None,
+        entry_quote: Optional[Decimal] = None,
+        exit_quote: Optional[Decimal] = None) -> Dict[str, Any]:
+    fees = _fees_from_fills(fills)
+    all_fees = list(entry_fees or []) + fees
+    totals: Dict[str, Decimal] = {}
+    for fee in all_fees:
+        asset = fee["commission_asset"]
+        totals[asset] = totals.get(asset, Decimal(0)) + Decimal(
+            fee["commission"]
+        )
+    realized: Dict[str, Any] = {
+        "gross_usdt": "UNKNOWN",
+        "net_usdt": "UNKNOWN",
+        "commission_by_asset": {
+            asset: _decimal_text(value)
+            for asset, value in sorted(totals.items())
+        },
+    }
+    if entry_quote is not None and exit_quote is not None:
+        gross = exit_quote - entry_quote
+        realized["gross_usdt"] = _decimal_text(gross)
+        if set(totals).issubset({"USDT"}):
+            realized["net_usdt"] = _decimal_text(
+                gross - totals.get("USDT", Decimal(0))
+            )
     return {"fills": fills, "fees": fees, "realized": realized}
 
 
@@ -1518,9 +1986,469 @@ def _resolve_momentum_exit(paths: Dict[str, str],
     return Outcome("CLOSED", 0, "", outcome_reason, ledger)
 
 
+def _spot_market_payload(market: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "base": market["base"],
+        "quote": market["quote"],
+        "step": _decimal_text(market["step"]),
+        "min_qty": _decimal_text(market["min_qty"]),
+        "min_notional": _decimal_text(market["min_notional"]),
+        "apply_min": market["apply_min"],
+        "starting_base_free": _decimal_text(
+            market["starting_base_free"]
+        ),
+        "starting_quote_free": _decimal_text(
+            market["starting_quote_free"]
+        ),
+        "base_tolerance": _decimal_text(market["base_tolerance"]),
+    }
+
+
+def _spot_base_fee(fills: List[Dict[str, str]], base: str) -> Decimal:
+    return sum((
+        Decimal(fill["commission"])
+        for fill in fills if fill["commission_asset"] == base
+    ), Decimal(0))
+
+
+def _resolve_spot_momentum_open(
+        paths: Dict[str, str], receipt_dir: str,
+        position: Dict[str, Any], state: basis_executor.RunState,
+        query_state: str, order: Any,
+        response_fills: List[Dict[str, Any]], now: datetime,
+        request: Optional[Callable[..., Tuple[str, Any]]] = None,
+        recovering: bool = False) -> Outcome:
+    if query_state in {"rejected", "not_found"}:
+        try:
+            measured = _spot_measure(position, receipt_dir, request)
+        except MomentumStateError as error:
+            return _momentum_unknown(
+                paths, position,
+                "SPOT_OPEN_NOT_FOUND_STATE_UNKNOWN: %s" % error, now,
+            )
+        if measured["qty"] != 0 or measured["open_orders"] != 0:
+            return _momentum_unknown(
+                paths, position,
+                "SPOT_OPEN_NOT_FOUND_BUT_ACCOUNT_CHANGED", now,
+            )
+        position.update({
+            "state": "NONE",
+            "pending_intent": None,
+            "measured_qty": "0",
+            "failure_reason": "",
+        })
+        _save_momentum_position(paths, position, now)
+        return Outcome(
+            "REFUSED", 2, "", "MOMENTUM_SPOT_OPEN_NOT_ACCEPTED",
+            _empty_momentum_ledger(),
+        )
+    if query_state != "terminal":
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_OPEN_%s" % query_state.upper(), now,
+        )
+    pending = position["pending_intent"]
+    client_id = pending["client_id"]
+    try:
+        facts = _spot_order_facts(order, client_id, "BUY")
+    except MomentumStateError as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_OPEN_ORDER_UNKNOWN: %s" % error, now,
+        )
+    if facts["qty"] == 0:
+        try:
+            measured = _spot_measure(position, receipt_dir, request)
+        except MomentumStateError as error:
+            return _momentum_unknown(
+                paths, position,
+                "ZERO_SPOT_OPEN_STATE_UNKNOWN: %s" % error, now,
+            )
+        if measured["qty"] != 0 or measured["open_orders"] != 0:
+            return _momentum_unknown(
+                paths, position, "ZERO_SPOT_OPEN_BUT_ACCOUNT_CHANGED", now
+            )
+        position.update({
+            "state": "NONE",
+            "pending_intent": None,
+            "measured_qty": "0",
+        })
+        _save_momentum_position(paths, position, now)
+        return Outcome(
+            "OPEN_NOT_FILLED", 2, "", "MOMENTUM_SPOT_OPEN_ZERO_FILL",
+            _empty_momentum_ledger(),
+        )
+    cap = _momentum_decimal(
+        position.get("effective_notional"), "persisted effective notional"
+    )
+    if cap > limits.PER_LEG_CAP_USDT or facts["quote"] > cap:
+        position["observed_order"] = {
+            key: _decimal_text(value) if isinstance(value, Decimal) else value
+            for key, value in facts.items()
+        }
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_OPEN_HARD_CAP_BREACH", now,
+            verdict="OPEN_EXPOSURE", code=3,
+        )
+    try:
+        fills = _spot_fills(state, order, response_fills)
+        market = _spot_persisted_market(position)
+        base_fee = _spot_base_fee(fills, market["base"])
+        net_base = facts["qty"] - base_fee
+        if net_base <= 0:
+            raise MomentumStateError(
+                "Spot BUY acquired no positive base after fees"
+            )
+        sell_quantity = basis_cycle.quantize_down(net_base, market["step"])
+        if sell_quantity < market["min_qty"] \
+                or (market["apply_min"] and
+                    sell_quantity * facts["price"] < market["min_notional"]):
+            raise MomentumStateError(
+                "Spot BUY did not acquire a sellable net quantity"
+            )
+        ledger = _spot_momentum_ledger(fills)
+        entry = {
+            "side": "LONG",
+            "venue": "spot",
+            "qty": _decimal_text(facts["qty"]),
+            "net_base_acquired": _decimal_text(net_base),
+            "sell_quantity": _decimal_text(sell_quantity),
+            "price": _decimal_text(facts["price"]),
+            "quote": _decimal_text(facts["quote"]),
+            "order_id": facts["order_id"],
+            "client_id": facts["client_id"],
+            "status": facts["status"],
+            "fills": list(fills),
+            "fees": list(ledger["fees"]),
+            "opened_utc": _utc_text(now),
+        }
+        position["entry"] = entry
+        measured = _spot_measure(position, receipt_dir, request)
+    except MomentumStateError as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_OPEN_TRUTH_UNKNOWN: %s" % error, now,
+            verdict="OPEN_EXPOSURE", code=3,
+        )
+    if measured["open_orders"] != 0 \
+            or (measured["qty"] - net_base).copy_abs() \
+            > market["base_tolerance"]:
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_OPEN_POSITION_MISMATCH", now,
+            verdict="OPEN_EXPOSURE", code=3,
+        )
+    position.update({
+        "state": "OPEN",
+        "pending_intent": None,
+        "measured_qty": _decimal_text(net_base),
+        "entry": entry,
+        "failure_reason": "",
+    })
+    _save_momentum_position(paths, position, now)
+    return Outcome("OPEN", 0, "", "", ledger)
+
+
+def _run_spot_momentum_open(
+        job: Job, receipt_dir: str, paths: Dict[str, str], now: datetime,
+        governor_token: str, prior: Optional[Dict[str, Any]],
+        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+    run_id = "mom" + secrets.token_hex(8)
+    state = _spot_state(
+        job.symbol, os.environ["QUANT_SHA"], receipt_dir, run_id, request
+    )
+    try:
+        market = _spot_market_context(state, job.effective_notional)
+    except JobRefusal as error:
+        return Outcome(
+            "REFUSED", 2, "", error.reason, _empty_momentum_ledger()
+        )
+    plan = _spot_plan(job.symbol, market["quote_spend"])
+    client_id = basis_cycle.client_id(basis_cycle.ENTER_SPOT, run_id)
+    intent = basis_cycle.leg_intent(
+        basis_cycle.ENTER_SPOT, plan, run_id
+    )
+    position: Dict[str, Any] = {
+        "version": MOMENTUM_STATE_VERSION,
+        "revision": prior["revision"] if prior is not None else 0,
+        "state": "OPENING",
+        "venue": "spot",
+        "symbol": job.symbol,
+        "job_id": job.job_id,
+        "sha": os.environ["QUANT_SHA"],
+        "run_id": run_id,
+        "effective_notional": _decimal_text(job.effective_notional),
+        "planned_qty": _decimal_text(
+            basis_cycle.quantize_down(
+                market["quote_spend"] / market["ask"], market["step"]
+            )
+        ),
+        "spot_market": _spot_market_payload(market),
+        "pending_intent": {
+            "action": "OPEN",
+            "client_id": client_id,
+            "intent": dict(intent),
+            "persisted_utc": _utc_text(now),
+            "governor_token": governor_token,
+        },
+        "entry": None,
+        "exit": None,
+        "created_utc": _utc_text(now),
+    }
+    _save_momentum_position(paths, position, now)
+    try:
+        query_state, order, fills = basis_executor.settle_leg(
+            state, basis_cycle.ENTER_SPOT, plan
+        )
+    except Exception as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_OPEN_EXECUTOR_EXCEPTION: %s" %
+            type(error).__name__, now,
+        )
+    return _resolve_spot_momentum_open(
+        paths, receipt_dir, position, state, query_state, order, fills, now,
+        request,
+    )
+
+
+def _resolve_spot_momentum_exit(
+        paths: Dict[str, str], receipt_dir: str,
+        position: Dict[str, Any], state: basis_executor.RunState,
+        query_state: str, order: Any,
+        response_fills: List[Dict[str, Any]], now: datetime,
+        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+    pending = position["pending_intent"]
+    outcome_reason = pending.get("reason", "")
+    if type(outcome_reason) is not str:
+        outcome_reason = ""
+    measured_before = _momentum_decimal(
+        pending.get("measured_qty"), "persisted Spot exit measurement"
+    )
+    submitted = _momentum_decimal(
+        pending.get("sell_quantity"), "persisted Spot sell quantity"
+    )
+    market = _spot_persisted_market(position)
+    if query_state in {"rejected", "not_found"}:
+        try:
+            measured = _spot_measure(position, receipt_dir, request)
+        except MomentumStateError as error:
+            return _momentum_unknown(
+                paths, position,
+                "SPOT_EXIT_NOT_FOUND_STATE_UNKNOWN: %s" % error, now,
+            )
+        if measured["open_orders"] != 0 \
+                or (measured["qty"] - measured_before).copy_abs() \
+                > market["base_tolerance"]:
+            return _momentum_unknown(
+                paths, position, "SPOT_EXIT_NOT_FOUND_POSITION_CHANGED", now
+            )
+        position.update({
+            "state": "OPEN",
+            "pending_intent": None,
+            "measured_qty": _decimal_text(measured["qty"]),
+            "failure_reason": "",
+        })
+        _save_momentum_position(paths, position, now)
+        return Outcome(
+            "REFUSED", 2, "", "MOMENTUM_SPOT_EXIT_NOT_ACCEPTED",
+            _empty_momentum_ledger(),
+        )
+    if query_state != "terminal":
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_EXIT_%s" % query_state.upper(), now,
+        )
+    try:
+        facts = _spot_order_facts(order, pending["client_id"], "SELL")
+    except MomentumStateError as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_EXIT_ORDER_UNKNOWN: %s" % error, now,
+        )
+    if facts["qty"] == 0:
+        try:
+            measured = _spot_measure(position, receipt_dir, request)
+        except MomentumStateError as error:
+            return _momentum_unknown(
+                paths, position,
+                "ZERO_SPOT_EXIT_STATE_UNKNOWN: %s" % error, now,
+            )
+        if measured["open_orders"] != 0 \
+                or (measured["qty"] - measured_before).copy_abs() \
+                > market["base_tolerance"]:
+            return _momentum_unknown(
+                paths, position, "ZERO_SPOT_EXIT_POSITION_CHANGED", now
+            )
+        position.update({
+            "state": "OPEN",
+            "pending_intent": None,
+            "measured_qty": _decimal_text(measured["qty"]),
+        })
+        _save_momentum_position(paths, position, now)
+        return Outcome(
+            "EXIT_NOT_FILLED", 2, "", "MOMENTUM_SPOT_EXIT_ZERO_FILL",
+            _empty_momentum_ledger(),
+        )
+    if facts["qty"] > submitted:
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_EXIT_EXCEEDED_ACQUISITION", now,
+            verdict="OPEN_EXPOSURE", code=3,
+        )
+    try:
+        fills = _spot_fills(state, order, response_fills)
+        sell_base_fee = _spot_base_fee(fills, market["base"])
+        residual = measured_before - facts["qty"] - sell_base_fee
+        if residual < -market["base_tolerance"]:
+            raise MomentumStateError(
+                "Spot SELL consumed pre-existing base holdings"
+            )
+        measured_after = _spot_measure(position, receipt_dir, request)
+    except MomentumStateError as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_EXIT_TRUTH_UNKNOWN: %s" % error, now,
+            verdict="OPEN_EXPOSURE", code=3,
+        )
+    if measured_after["open_orders"] != 0 \
+            or (measured_after["qty"] - residual).copy_abs() \
+            > market["base_tolerance"] \
+            or facts["qty"] != submitted \
+            or residual >= market["step"]:
+        position["measured_qty"] = _decimal_text(measured_after["qty"])
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_EXIT_NOT_FLAT", now,
+            verdict="OPEN_EXPOSURE", code=3,
+        )
+    entry = position.get("entry")
+    entry_fees = entry.get("fees") if isinstance(entry, dict) else None
+    if not isinstance(entry_fees, list):
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_ENTRY_FEES_MISSING", now
+        )
+    try:
+        entry_quote = _momentum_decimal(
+            entry.get("quote"), "persisted Spot entry quote"
+        )
+    except MomentumStateError as error:
+        return _momentum_unknown(paths, position, str(error), now)
+    ledger = _spot_momentum_ledger(
+        fills, entry_fees, entry_quote, facts["quote"]
+    )
+    position.update({
+        "state": "CLOSED",
+        "pending_intent": None,
+        "measured_qty": "0",
+        "exit": {
+            "venue": "spot",
+            "qty": _decimal_text(facts["qty"]),
+            "submitted_qty": _decimal_text(submitted),
+            "residual_base": _decimal_text(max(residual, Decimal(0))),
+            "price": _decimal_text(facts["price"]),
+            "quote": _decimal_text(facts["quote"]),
+            "order_id": facts["order_id"],
+            "client_id": facts["client_id"],
+            "status": facts["status"],
+            "fills": list(fills),
+            "fees": list(ledger["fees"]),
+            "closed_utc": _utc_text(now),
+        },
+        "realized": dict(ledger["realized"]),
+        "failure_reason": "",
+    })
+    _save_momentum_position(paths, position, now)
+    return Outcome("CLOSED", 0, "", outcome_reason, ledger)
+
+
+def _run_spot_momentum_exit(
+        job: Job, receipt_dir: str, paths: Dict[str, str], now: datetime,
+        position: Dict[str, Any], persisted_qty: Decimal,
+        measurement: Optional[Dict[str, Any]] = None,
+        outcome_reason: str = "",
+        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+    market = _spot_persisted_market(position)
+    try:
+        measured = measurement or _spot_measure(
+            position, receipt_dir, request
+        )
+    except MomentumStateError as error:
+        return _momentum_unknown(paths, position, str(error), now)
+    if measured.get("can_trade") is not True:
+        return _momentum_unknown(
+            paths, position, "SPOT_TRADING_UNPROVEN", now
+        )
+    if measured["open_orders"] != 0 \
+            or (measured["qty"] - persisted_qty).copy_abs() \
+            > market["base_tolerance"]:
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_POSITION_MEASUREMENT_MISMATCH",
+            now,
+        )
+    entry = position.get("entry")
+    if not isinstance(entry, dict):
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_ENTRY_MISSING", now
+        )
+    try:
+        sell_quantity = _momentum_decimal(
+            entry.get("sell_quantity"), "persisted Spot sell quantity"
+        )
+    except MomentumStateError as error:
+        return _momentum_unknown(paths, position, str(error), now)
+    expected_sell = basis_cycle.quantize_down(
+        persisted_qty, market["step"]
+    )
+    if sell_quantity != expected_sell or sell_quantity > persisted_qty \
+            or sell_quantity < market["min_qty"] \
+            or (market["apply_min"] and
+                sell_quantity * measured["price"] < market["min_notional"]):
+        return _momentum_unknown(
+            paths, position, "MOMENTUM_SPOT_SELL_QUANTITY_UNPROVEN", now
+        )
+    run_id = "mom" + secrets.token_hex(8)
+    state = _spot_state(
+        job.symbol, os.environ["QUANT_SHA"], receipt_dir, run_id, request
+    )
+    plan = _spot_plan(job.symbol, Decimal(0))
+    client_id = basis_cycle.client_id(basis_cycle.EXIT_SPOT, run_id)
+    intent = basis_cycle.leg_intent(
+        basis_cycle.EXIT_SPOT, plan, run_id, sell_quantity
+    )
+    position["state"] = "CLOSING"
+    position["job_id"] = job.job_id
+    position["run_id"] = run_id
+    position["pending_intent"] = {
+        "action": "EXIT",
+        "client_id": client_id,
+        "measured_qty": _decimal_text(measured["qty"]),
+        "sell_quantity": _decimal_text(sell_quantity),
+        "intent": dict(intent),
+        "persisted_utc": _utc_text(now),
+    }
+    if outcome_reason:
+        position["pending_intent"]["reason"] = outcome_reason
+    _save_momentum_position(paths, position, now)
+    try:
+        query_state, order, fills = basis_executor.settle_leg(
+            state, basis_cycle.EXIT_SPOT, plan, sell_quantity
+        )
+    except Exception as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_EXIT_EXECUTOR_EXCEPTION: %s" %
+            type(error).__name__, now,
+        )
+    return _resolve_spot_momentum_exit(
+        paths, receipt_dir, position, state, query_state, order, fills, now,
+        request,
+    )
+
+
 def _run_momentum_open(job: Job, receipt_dir: str,
                        paths: Dict[str, str], now: datetime,
-                       governor_token: str = "") -> Outcome:
+                       governor_token: str = "",
+                       spot_request: Optional[
+                           Callable[..., Tuple[str, Any]]
+                       ] = None) -> Outcome:
     try:
         prior = _load_momentum_position(paths)
     except MomentumStateError as error:
@@ -1536,6 +2464,11 @@ def _run_momentum_open(job: Job, receipt_dir: str,
         return Outcome(
             "REFUSED", 2, "", "MOMENTUM_POSITION_ALREADY_STANDS",
             _empty_momentum_ledger(),
+        )
+    if job.venue == "spot":
+        return _run_spot_momentum_open(
+            job, receipt_dir, paths, now, governor_token, prior,
+            spot_request,
         )
     if not _ensure_leverage_1x(job.symbol):
         return Outcome("UNKNOWN", 4, "", "LEVERAGE_UNPROVEN",
@@ -1555,6 +2488,7 @@ def _run_momentum_open(job: Job, receipt_dir: str,
         "version": MOMENTUM_STATE_VERSION,
         "revision": prior["revision"] if prior is not None else 0,
         "state": "OPENING",
+        "venue": "futures",
         "symbol": job.symbol,
         "job_id": job.job_id,
         "sha": os.environ["QUANT_SHA"],
@@ -1588,7 +2522,10 @@ def _run_momentum_open(job: Job, receipt_dir: str,
 def _run_momentum_exit(job: Job, receipt_dir: str,
                        paths: Dict[str, str], now: datetime,
                        measurement: Optional[Dict[str, Any]] = None,
-                       outcome_reason: str = "") -> Outcome:
+                       outcome_reason: str = "",
+                       spot_request: Optional[
+                           Callable[..., Tuple[str, Any]]
+                       ] = None) -> Outcome:
     try:
         position = _load_momentum_position(paths)
     except MomentumStateError as error:
@@ -1615,6 +2552,15 @@ def _run_momentum_exit(job: Job, receipt_dir: str,
         )
     except MomentumStateError as error:
         return _momentum_unknown(paths, position, str(error), now)
+    try:
+        venue = _momentum_venue(position)
+    except MomentumStateError as error:
+        return _momentum_unknown(paths, position, str(error), now)
+    if venue == "spot":
+        return _run_spot_momentum_exit(
+            job, receipt_dir, paths, now, position, persisted_qty,
+            measurement, outcome_reason, spot_request,
+        )
     if measurement is None:
         if not _ensure_leverage_1x(job.symbol):
             return _momentum_unknown(
@@ -1679,7 +2625,10 @@ def _momentum_roundtrip_allowed(paths: Dict[str, str]) -> Optional[Outcome]:
 
 
 def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
-                              result_ids: set, now: datetime) \
+                              result_ids: set, now: datetime,
+                              spot_request: Optional[
+                                  Callable[..., Tuple[str, Any]]
+                              ] = None) \
         -> Optional[Tuple[str, str, str, Outcome, str]]:
     try:
         position = _load_momentum_position(paths)
@@ -1719,26 +2668,54 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
         "RECEIPT_DIR": receipt_dir,
     }
     with _environment(values):
-        _configure_futures_hand(receipt_dir)
-        try:
-            query_state, order = _momentum_query(pending["client_id"])
-        except Exception as error:
-            outcome = _momentum_unknown(
-                paths, position,
-                "MOMENTUM_RECOVERY_EXCEPTION: %s" %
-                type(error).__name__, now,
+        venue = _momentum_venue(position)
+        if venue == "spot":
+            state = _spot_state(
+                position["symbol"], sha, receipt_dir,
+                str(position.get("run_id", "spot-recovery")), spot_request,
             )
-        else:
-            if action == "OPEN":
-                outcome = _resolve_momentum_open(
-                    paths, position, query_state, order, [], "recovery", now,
-                    recovering=True,
+            try:
+                query_state, order = basis_executor.query_client_order(
+                    state, basis_executor.SPOT, pending["client_id"]
+                )
+            except Exception as error:
+                outcome = _momentum_unknown(
+                    paths, position,
+                    "MOMENTUM_SPOT_RECOVERY_EXCEPTION: %s" %
+                    type(error).__name__, now,
                 )
             else:
-                outcome = _resolve_momentum_exit(
-                    paths, position, query_state, order, [], "recovery", now,
-                    recovering=True,
+                if action == "OPEN":
+                    outcome = _resolve_spot_momentum_open(
+                        paths, receipt_dir, position, state, query_state,
+                        order, [], now, spot_request, recovering=True,
+                    )
+                else:
+                    outcome = _resolve_spot_momentum_exit(
+                        paths, receipt_dir, position, state, query_state,
+                        order, [], now, spot_request,
+                    )
+        else:
+            _configure_futures_hand(receipt_dir)
+            try:
+                query_state, order = _momentum_query(pending["client_id"])
+            except Exception as error:
+                outcome = _momentum_unknown(
+                    paths, position,
+                    "MOMENTUM_RECOVERY_EXCEPTION: %s" %
+                    type(error).__name__, now,
                 )
+            else:
+                if action == "OPEN":
+                    outcome = _resolve_momentum_open(
+                        paths, position, query_state, order, [], "recovery",
+                        now, recovering=True,
+                    )
+                else:
+                    outcome = _resolve_momentum_exit(
+                        paths, position, query_state, order, [], "recovery",
+                        now, recovering=True,
+                    )
     return job_id, op, position["symbol"], outcome, governor_token
 
 
@@ -1746,7 +2723,10 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
              futures_entry: Optional[Callable[[], Any]],
              basis_entry: Optional[Callable[[Any], Any]],
              now: datetime, governor_token: str = "",
-             momentum_measurement: Optional[Dict[str, Any]] = None) -> Outcome:
+             momentum_measurement: Optional[Dict[str, Any]] = None,
+             spot_request: Optional[
+                 Callable[..., Tuple[str, Any]]
+             ] = None) -> Outcome:
     sha = os.environ.get("QUANT_SHA", "").lower()
     if not SHA_RE.fullmatch(sha):
         return Outcome("REFUSED", 2, "", "BAD_QUANT_SHA")
@@ -1769,12 +2749,13 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
     with _environment(values):
         if job.op == "MOMENTUM_OPEN":
             return _run_momentum_open(
-                job, receipt_dir, paths, now, governor_token
+                job, receipt_dir, paths, now, governor_token, spot_request
             )
         if job.op == "MOMENTUM_EXIT":
             return _run_momentum_exit(
                 job, receipt_dir, paths, now,
                 measurement=momentum_measurement,
+                spot_request=spot_request,
             )
         if job.op == "MOMENTUM_ROUNDTRIP":
             blocked = _momentum_roundtrip_allowed(paths)
@@ -1893,7 +2874,10 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
 
 
 def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
-                      now: datetime) \
+                      now: datetime,
+                      spot_request: Optional[
+                          Callable[..., Tuple[str, Any]]
+                      ] = None) \
         -> Tuple[Optional[int], Optional[Dict[str, Any]], bool]:
     try:
         position = _load_momentum_position(paths)
@@ -1941,9 +2925,15 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
         "RECEIPT_DIR": receipt_dir,
     }
     with _environment(values):
-        _configure_futures_hand(receipt_dir)
         try:
-            measured = _momentum_measure(position["symbol"])
+            venue = _momentum_venue(position)
+            if venue == "spot":
+                measured = _spot_measure(
+                    position, receipt_dir, spot_request
+                )
+            else:
+                _configure_futures_hand(receipt_dir)
+                measured = _momentum_measure(position["symbol"])
         except Exception as error:
             _touch_stop(paths["stop"])
             _append_adverse_stop_event(
@@ -2006,10 +2996,12 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
             created_utc=now,
             expires_utc=now + MAX_JOB_AGE,
             requested_by="job-runner",
+            venue=venue,
         )
         outcome = _run_momentum_exit(
             job, receipt_dir, paths, now, measurement=measured,
             outcome_reason="max_adverse_stop",
+            spot_request=spot_request,
         )
     code = _finish_claimed(
         paths, receipt_dir, job.job_id, job.op, job.symbol, outcome, now
@@ -2019,7 +3011,10 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
 
 def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
          futures_entry: Optional[Callable[[], Any]] = None,
-         basis_entry: Optional[Callable[[Any], Any]] = None) -> int:
+         basis_entry: Optional[Callable[[Any], Any]] = None,
+         spot_request: Optional[
+             Callable[..., Tuple[str, Any]]
+         ] = None) -> int:
     """Consume at most one due job and return its factual exit code."""
     receipt_dir = os.path.abspath(os.path.expanduser(
         receipt_dir or os.environ.get("RECEIPT_DIR", "~/quant_receipts")
@@ -2047,7 +3042,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
             return 3
         recovery = _recover_pending_momentum(
-            paths, receipt_dir, result_ids, now
+            paths, receipt_dir, result_ids, now, spot_request
         )
         if recovery is not None:
             job_id, op, symbol, outcome, governor_token = recovery
@@ -2066,7 +3061,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             return 3
         adverse_code, standing_measurement, adverse_blocked_unknown = \
             _max_adverse_stop(
-                paths, receipt_dir, now
+                paths, receipt_dir, now, spot_request
             )
 
         for path in sorted(glob.glob(os.path.join(paths["jobs"], "job-*.json"))):
@@ -2115,12 +3110,14 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                         job, receipt_dir, paths, futures_entry,
                         basis_entry, now, governor_token,
                         momentum_measurement=standing_measurement,
+                        spot_request=spot_request,
                     )
             else:
                 outcome = _execute(
                     job, receipt_dir, paths, futures_entry,
                     basis_entry, now,
                     momentum_measurement=standing_measurement,
+                    spot_request=spot_request,
                 )
             code = _finish_claimed(
                 paths, receipt_dir, job.job_id, job.op, job.symbol,
