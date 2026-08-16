@@ -929,21 +929,21 @@ def _basis_gap(spot_ask: Optional[str], perp_bid: Optional[str]) -> Optional[str
 
 def _coherent_basis_gap(
     record: Mapping[str, Any],
-    observations: Mapping[str, Tuple[str, int, int]],
+    observations: Mapping[str, Tuple[str, str, int, int]],
     now_ms: int,
     max_age_ms: int,
     max_skew_ms: int,
 ) -> Optional[str]:
-    """Compute basis only from fresh legs observed by one source near in time."""
+    """Compute basis only from fresh legs in one source snapshot."""
     if record.get("venues") != "both":
         return None
     spot_observation = observations.get("spot")
     perp_observation = observations.get("perp")
     if spot_observation is None or perp_observation is None:
         return None
-    spot_source, spot_earliest_ms, spot_latest_ms = spot_observation
-    perp_source, perp_earliest_ms, perp_latest_ms = perp_observation
-    if spot_source != perp_source:
+    spot_source, spot_snapshot, spot_earliest_ms, spot_latest_ms = spot_observation
+    perp_source, perp_snapshot, perp_earliest_ms, perp_latest_ms = perp_observation
+    if (spot_source, spot_snapshot) != (perp_source, perp_snapshot):
         return None
     max_possible_skew_ms = max(
         spot_latest_ms - perp_earliest_ms,
@@ -1341,9 +1341,7 @@ class MarketStream:
             self._merge_feed_windows(feed_snapshot, universe)
 
         records: Dict[str, Dict[str, Any]] = {}
-        feed_ticker_ages: Dict[str, int] = {}
-        book_observed_ms: Dict[str, int] = {}
-        complete_pairs = set()
+        scores: Dict[str, Decimal] = {}
         for symbol in universe:
             venue = venue_for(symbol, spot, perp)
             records[symbol] = self._base_record(
@@ -1355,11 +1353,7 @@ class MarketStream:
                 spot_metadata.get(symbol),
                 perp_metadata.get(symbol),
             )
-            observations: Dict[str, Tuple[str, int, int]] = {}
-            if records[symbol]["spot_ask"] is not None:
-                observations["spot"] = ("rest", spot_book_ms, spot_book_ms)
-            if records[symbol]["perp_bid"] is not None:
-                observations["perp"] = ("rest", perp_book_ms, perp_book_ms)
+            score_record = records[symbol]
             if feed_snapshot is not None:
                 feed_record = feed_snapshot.symbols.get(symbol)
                 if feed_record is not None:
@@ -1378,41 +1372,9 @@ class MarketStream:
                         total_age is not None
                         and total_age <= self.feed_max_age_ms
                     ):
-                        merged_venues = self._merge_feed_ticker(
-                            records[symbol], feed_record
-                        )
-                        if merged_venues:
-                            feed_ticker_ages[symbol] = total_age
-                            earliest_ms = feed_snapshot.written_ms - source_age
-                            for merged_venue in merged_venues:
-                                observations[merged_venue] = (
-                                    "feed",
-                                    earliest_ms,
-                                    feed_snapshot.written_ms,
-                                )
-            records[symbol]["basis_gap_pct"] = _coherent_basis_gap(
-                records[symbol],
-                observations,
-                feed_now_ms,
-                self.feed_max_age_ms,
-                self.basis_max_skew_ms,
-            )
-            observation_times: List[int] = []
-            for venue_name in ("spot", "perp"):
-                observation = observations.get(venue_name)
-                if observation is None:
-                    continue
-                source, earliest_ms, _ = observation
-                observation_times.append(
-                    feed_now_ms - feed_ticker_ages[symbol] if source == "feed" else earliest_ms)
-            if observation_times:
-                book_observed_ms[symbol] = min(observation_times)
-            if len(observation_times) == 2:
-                complete_pairs.add(symbol)
-        scores = {
-            symbol: move_score(records[symbol], self.state.get(symbol))
-            for symbol in universe
-        }
+                        score_record = dict(score_record)
+                        self._merge_feed_ticker(score_record, feed_record)
+            scores[symbol] = move_score(score_record, self.state.get(symbol))
         selection = select_focus(
             universe,
             scores,
@@ -1428,13 +1390,59 @@ class MarketStream:
             for record in records.values():
                 record["surge_ratio"] = None
 
+        late_now_ms = self.ms_fn() if self.feed_state_path is not None else feed_now_ms
+        late_feed_load = load_fresh_feed_state(
+            self.feed_state_path, late_now_ms, self.feed_max_age_ms
+        )
+        late_feed = late_feed_load.snapshot
+        if late_feed is not None:
+            late_now_ms = max(late_now_ms, late_feed.written_ms)
+        book_observations: Dict[
+            str, Dict[str, Tuple[str, str, int, int]]
+        ] = {}
+        for symbol, record in records.items():
+            observations = {}
+            if record["spot_ask"] is not None:
+                observations["spot"] = (
+                    "rest", "rest", spot_book_ms, spot_book_ms
+                )
+            if record["perp_bid"] is not None:
+                observations["perp"] = (
+                    "rest", "rest", perp_book_ms, perp_book_ms
+                )
+            feed_record = None if late_feed is None else late_feed.symbols.get(symbol)
+            if feed_record is not None and feed_record.get("freshness_ms") is not None:
+                source_age = int(feed_record["freshness_ms"])
+                if _clamped_age_ms(
+                    late_now_ms, late_feed.written_ms, source_age
+                ) <= self.feed_max_age_ms:
+                    earliest_ms = late_feed.written_ms - source_age
+                    for merged_venue in self._merge_feed_ticker(
+                        record, feed_record
+                    ):
+                        observations[merged_venue] = (
+                            "feed", "late", earliest_ms, late_feed.written_ms
+                        )
+            book_observations[symbol] = observations
+
         completed_ms = self.ms_fn()
         completed_utc = self.utc_fn()
-        ref_ms = max(pass_start_ms, spot_book_ms, perp_book_ms, feed_now_ms, focus_now_ms, completed_ms)
+        ref_ms = max(pass_start_ms, spot_book_ms, perp_book_ms, feed_now_ms, focus_now_ms, late_now_ms, completed_ms)
         pass_duration_ms = max(0, ref_ms - pass_start_ms)
         for symbol, record in records.items():
             meta = self.sidecar["symbols"].get(symbol, {})
-            leg_age = max(0, ref_ms - book_observed_ms[symbol]) if symbol in book_observed_ms else None
+            observations = book_observations[symbol]
+            record["basis_gap_pct"] = _coherent_basis_gap(
+                record, observations, ref_ms,
+                self.feed_max_age_ms, self.basis_max_skew_ms,
+            )
+            book_observed_ms = min(
+                (item[2] for item in observations.values()), default=None
+            )
+            complete_pair = len(observations) == 2
+            leg_age = None if book_observed_ms is None else max(
+                0, ref_ms - book_observed_ms
+            )
             ages = [pass_duration_ms] + ([] if leg_age is None else [leg_age])
             if record["vol_1m_quote"] is not None and meta.get("last_volume_close_ms"):
                 ages.append(max(0, ref_ms - int(meta["last_volume_close_ms"])))
@@ -1442,7 +1450,7 @@ class MarketStream:
                 ages.append(max(0, ref_ms - int(meta["last_oi_ms"])))
             record["utc"] = completed_utc
             record["freshness_ms"] = str(max(ages))
-            record["book_age_ms"] = str(leg_age) if symbol in complete_pairs else None
+            record["book_age_ms"] = str(leg_age) if complete_pair else None
             # Construction order and key set are frozen for downstream consumers.
             records[symbol] = {field: record[field] for field in STATE_FIELDS}
 
@@ -1522,8 +1530,8 @@ class MarketStream:
             window_min_coverage_pct=decimal_string(
                 self.window_min_coverage_pct
             ),
-            feed_used=feed_snapshot is not None,
-            feed_reason=feed_load.reason,
+            feed_used=late_feed is not None,
+            feed_reason=late_feed_load.reason,
             top_surges=tuple(ranked_surges[:5]),
         )
 

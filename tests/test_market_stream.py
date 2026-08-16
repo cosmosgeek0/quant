@@ -604,6 +604,7 @@ class LiveFeedMergeTests(OfflineCase):
                 FIXED_MS + 12_000,
                 FIXED_MS + 12_000,
                 FIXED_MS + 13_000,
+                FIXED_MS + 13_000,
             )
         )
 
@@ -633,6 +634,201 @@ class LiveFeedMergeTests(OfflineCase):
         self.assertEqual(state["BBBUSDT"]["book_age_ms"], "12000")
         self.assertEqual(state["BBBUSDT"]["freshness_ms"], "13000")
 
+    def test_post_focus_feed_read_publishes_current_books(self):
+        closes = (1_000_000, 1_060_000, 1_120_000)
+        early_pair = feed_row("spot", "10", "11")
+        early_pair.update({
+            "venues": "both",
+            "perp_bid": "12",
+            "perp_ask": "13",
+            "freshness_ms": "200",
+            "book_age_ms": "200",
+        })
+        self.write_feed(
+            {
+                "AAAUSDT": early_pair,
+                "BBBUSDT": feed_row(
+                    "spot", "20", "21", zip(closes, ("10", "20", "90"))
+                ),
+            },
+            written_ms=FIXED_MS + 1_500,
+        )
+        late_pair = feed_row("spot", "99", "100")
+        late_pair.update({
+            "venues": "both",
+            "perp_bid": "101",
+            "perp_ask": "102",
+            "freshness_ms": "200",
+            "book_age_ms": "200",
+        })
+        fixture = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
+            perp=[book("AAAUSDT", "5", "6")],
+            premiums=[premium("AAAUSDT", "5")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        def reader(base_url, path, params):
+            payload = fixture(base_url, path, params)
+            if path == ms.FAPI_OI_PATH:
+                self.write_feed(
+                    {"AAAUSDT": late_pair}, written_ms=FIXED_MS + 9_600
+                )
+            return payload
+
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 500,
+            FIXED_MS + 1_000,
+            FIXED_MS + 1_500,
+            FIXED_MS + 1_600,
+            FIXED_MS + 9_600,
+            FIXED_MS + 10_000,
+        ))
+        stats = self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        state = self.read_state()
+        record = state["AAAUSDT"]
+        watch_now_ms = gap_watch._utc_ms(record["utc"])
+        rows, accepted, summary = gap_watch.build_rows(state, watch_now_ms)
+
+        self.assertTrue(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "accepted")
+        self.assertEqual(
+            (record["spot_bid"], record["spot_ask"],
+             record["perp_bid"], record["perp_ask"]),
+            ("99", "100", "101", "102"),
+        )
+        self.assertEqual(record["book_age_ms"], "600")
+        self.assertEqual(record["basis_gap_pct"], "1.00")
+        self.assertEqual(state["BBBUSDT"]["surge_ratio"], "4.5")
+        self.assertEqual(rows[0]["result"], "OK")
+        self.assertEqual((len(accepted), summary.computed), (1, 1))
+
+    def test_partial_late_feed_uses_rest_for_the_missing_leg(self):
+        early_pair = feed_row("spot", "10", "11")
+        early_pair.update({
+            "venues": "both",
+            "perp_bid": "12",
+            "perp_ask": "13",
+            "freshness_ms": "200",
+            "book_age_ms": "200",
+        })
+        self.write_feed(
+            {"AAAUSDT": early_pair}, written_ms=FIXED_MS + 9_000
+        )
+        late_spot = feed_row("spot", "99", "100")
+        late_spot.update({"freshness_ms": "200", "book_age_ms": "200"})
+        fixture = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2")],
+            perp=[book("AAAUSDT", "5", "6")],
+            premiums=[premium("AAAUSDT", "5")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        def reader(base_url, path, params):
+            payload = fixture(base_url, path, params)
+            if path == ms.FAPI_OI_PATH:
+                self.write_feed(
+                    {"AAAUSDT": late_spot}, written_ms=FIXED_MS + 9_600
+                )
+            return payload
+
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 500,
+            FIXED_MS + 1_000,
+            FIXED_MS + 9_000,
+            FIXED_MS + 9_100,
+            FIXED_MS + 9_600,
+            FIXED_MS + 10_000,
+        ))
+        stats = self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        rows, accepted, summary = gap_watch.build_rows(
+            {"AAAUSDT": record}, gap_watch._utc_ms(record["utc"])
+        )
+
+        self.assertTrue(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "accepted")
+        self.assertEqual(
+            (record["spot_bid"], record["spot_ask"],
+             record["perp_bid"], record["perp_ask"]),
+            ("99", "100", "5", "6"),
+        )
+        self.assertIsNone(record["basis_gap_pct"])
+        self.assertEqual(record["book_age_ms"], "9000")
+        self.assertEqual(accepted, ())
+        self.assertEqual(summary.refused_stale, 1)
+        self.assertIn(rows[0]["result"], gap_watch.STALE_REASONS)
+
+    def test_unreadable_late_feed_publishes_rest_books(self):
+        early_pair = feed_row("spot", "10", "11")
+        early_pair.update({
+            "venues": "both",
+            "perp_bid": "12",
+            "perp_ask": "13",
+            "freshness_ms": "200",
+            "book_age_ms": "200",
+        })
+        self.write_feed(
+            {"AAAUSDT": early_pair}, written_ms=FIXED_MS + 1_500
+        )
+        fixture = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2")],
+            perp=[book("AAAUSDT", "5", "6")],
+            premiums=[premium("AAAUSDT", "5")],
+            kline_batches={"AAAUSDT": [klines(
+                ("1", "1", "1"), first_close=FIXED_MS - 118_401
+            )]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        def reader(base_url, path, params):
+            payload = fixture(base_url, path, params)
+            if path == ms.FAPI_OI_PATH:
+                self.feed_path.write_text("{", encoding="utf-8")
+            return payload
+
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 500,
+            FIXED_MS + 1_000,
+            FIXED_MS + 1_500,
+            FIXED_MS + 1_600,
+            FIXED_MS + 9_600,
+            FIXED_MS + 10_000,
+        ))
+        stats = self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+
+        self.assertFalse(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "unreadable")
+        self.assertEqual(
+            (record["spot_bid"], record["spot_ask"],
+             record["perp_bid"], record["perp_ask"]),
+            ("1", "2", "5", "6"),
+        )
+        self.assertIsNone(record["basis_gap_pct"])
+        self.assertEqual(record["book_age_ms"], "9500")
+        self.assertEqual(record["freshness_ms"], "10000")
+
     def test_single_feed_leg_remains_in_composite_freshness(self):
         feed_spot = feed_row("spot", "89", "90")
         feed_spot.update({"freshness_ms": "4000", "book_age_ms": "4000"})
@@ -645,6 +841,7 @@ class LiveFeedMergeTests(OfflineCase):
             FIXED_MS,
             FIXED_MS + 1_000,
             FIXED_MS + 1_000,
+            FIXED_MS + 2_000,
             FIXED_MS + 2_000,
         ))
         reader = FixtureReader(
@@ -687,6 +884,7 @@ class LiveFeedMergeTests(OfflineCase):
             FIXED_MS,
             FIXED_MS + 10_000,
             FIXED_MS + 10_000,
+            FIXED_MS + 8_000,
             FIXED_MS + 8_000,
         ))
         reader = FixtureReader(
@@ -735,6 +933,7 @@ class LiveFeedMergeTests(OfflineCase):
             FIXED_MS,
             feed_now_ms,
             feed_written_ms,
+            FIXED_MS + 2_000,
             FIXED_MS + 2_000,
         ))
         reader = FixtureReader(
