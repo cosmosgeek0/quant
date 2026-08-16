@@ -3516,64 +3516,135 @@ def _margin_history_confirmation(payload: Any, transaction_id: str,
                                  expected: Dict[str, Any],
                                  request_type: str) \
         -> Optional[Dict[str, str]]:
-    if not isinstance(payload, dict) or not isinstance(
-            payload.get("rows"), list):
-        return None
-    matches = []
-    for row in payload["rows"]:
-        if not isinstance(row, dict):
-            continue
-        aliases = _margin_identity_aliases(row)
-        if aliases is None:
+    try:
+        if type(payload) is not dict or type(transaction_id) is not str \
+                or not transaction_id or type(expected) is not dict \
+                or type(request_type) is not str \
+                or request_type not in {"BORROW", "REPAY"}:
             return None
-        if aliases and aliases[0] == transaction_id:
-            matches.append(row)
-    if len(matches) != 1:
+        rows = payload.get("rows")
+        expected_asset = expected.get("asset")
+        expected_principal = expected.get("principal")
+        expected_interest = expected.get("interest")
+        expected_status = expected.get("status")
+        if type(rows) is not list or any(
+                type(value) is not str for value in (
+                    expected_asset, expected_principal,
+                    expected_interest, expected_status,
+                )):
+            return None
+        matches = []
+        for row in rows:
+            if type(row) is not dict:
+                continue
+            aliases = _margin_identity_aliases(row)
+            if aliases is None:
+                return None
+            if aliases and aliases[0] == transaction_id:
+                matches.append(row)
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        asset = row.get("asset")
+        origin_type = row.get("type")
+        principal_value = row.get("principal")
+        status = row.get("status")
+        if any(type(value) is not str for value in (
+                asset, origin_type, principal_value, status)):
+            return None
+        if asset != expected_asset \
+                or origin_type not in MARGIN_HISTORY_ORIGIN_TYPES:
+            return None
+        principal = _margin_decimal_text(principal_value)
+        if principal is None or status != "CONFIRMED":
+            return None
+        confirmation = {
+            "asset": asset,
+            "principal": principal,
+            "interest": "0",
+            "status": request_type + "_CONFIRMED",
+        }
+        if confirmation != expected:
+            return None
+        return confirmation
+    except Exception:
         return None
-    row = matches[0]
-    if row.get("asset") != expected["asset"]:
-        return None
-    if row.get("type") not in MARGIN_HISTORY_ORIGIN_TYPES:
-        return None
-    principal = _margin_decimal_text(row.get("principal"))
-    status = row.get("status")
-    if principal is None or status != "CONFIRMED":
-        return None
-    confirmation = {
-        "asset": row["asset"],
-        "principal": principal,
-        "interest": "0",
-        "status": request_type + "_CONFIRMED",
-    }
-    if confirmation != expected:
-        return None
-    return confirmation
 
 
 def _margin_account_liability(payload: Any, asset: str) \
         -> Optional[Dict[str, str]]:
-    if not isinstance(payload, dict) or not isinstance(
-            payload.get("userAssets"), list):
+    try:
+        if type(payload) is not dict or type(asset) is not str or not asset:
+            return None
+        rows = payload.get("userAssets")
+        if type(rows) is not list:
+            return None
+        matches = []
+        for row in rows:
+            if type(row) is not dict:
+                return None
+            row_asset = row.get("asset")
+            if type(row_asset) is not str:
+                return None
+            if row_asset == asset:
+                matches.append(row)
+        if len(matches) != 1:
+            return None
+        borrowed_value = matches[0].get("borrowed")
+        interest_value = matches[0].get("interest")
+        if type(borrowed_value) is not str \
+                or type(interest_value) is not str:
+            return None
+        borrowed = _margin_decimal_text(borrowed_value)
+        interest = _margin_decimal_text(interest_value)
+        if borrowed is None or interest is None:
+            return None
+        with localcontext() as context:
+            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+            total = Decimal(borrowed) + Decimal(interest)
+        return {
+            "asset": asset,
+            "borrowed": borrowed,
+            "interest": interest,
+            "total_liability": _canonical_decimal_text(total),
+        }
+    except Exception:
         return None
-    matches = [
-        row for row in payload["userAssets"]
-        if isinstance(row, dict) and row.get("asset") == asset
-    ]
-    if len(matches) != 1:
-        return None
-    borrowed = _margin_decimal_text(matches[0].get("borrowed"))
-    interest = _margin_decimal_text(matches[0].get("interest"))
-    if borrowed is None or interest is None:
-        return None
-    with localcontext() as context:
-        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-        total = Decimal(borrowed) + Decimal(interest)
-    return {
-        "asset": asset,
-        "borrowed": borrowed,
-        "interest": interest,
-        "total_liability": _canonical_decimal_text(total),
-    }
+
+
+def _margin_liability_direction_confirmed(
+        before: Any, after: Any, principal: Any, request_type: Any) -> bool:
+    try:
+        if type(before) is not dict or type(after) is not dict \
+                or type(principal) is not str \
+                or type(request_type) is not str \
+                or request_type not in {"BORROW", "REPAY"}:
+            return False
+        before_asset = before.get("asset")
+        after_asset = after.get("asset")
+        before_borrowed = before.get("borrowed")
+        after_borrowed = after.get("borrowed")
+        if any(type(value) is not str for value in (
+                before_asset, after_asset,
+                before_borrowed, after_borrowed)) \
+                or before_asset != after_asset:
+            return False
+        canonical_principal = _margin_decimal_text(principal)
+        canonical_before = _margin_decimal_text(before_borrowed)
+        canonical_after = _margin_decimal_text(after_borrowed)
+        if canonical_principal is None or canonical_before is None \
+                or canonical_after is None:
+            return False
+        with localcontext() as context:
+            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+            amount = Decimal(canonical_principal)
+            change = Decimal(canonical_after) - Decimal(canonical_before)
+        if amount <= 0:
+            return False
+        expected_change = amount if request_type == "BORROW" else -amount
+        return change == expected_change
+    except Exception:
+        return False
 
 
 def _finish_margin_source(receipt: Dict[str, Any], path: str,
@@ -3846,6 +3917,46 @@ def _run_margin_operation(
             authority_refusal, authority_now,
         )
 
+    params = operation["params"]
+    try:
+        account_before_result = transport(
+            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
+        )
+        account_before_readable = type(account_before_result) is tuple \
+            and len(account_before_result) == 2 \
+            and account_before_result[0] == "ok"
+        liability_before = _margin_account_liability(
+            account_before_result[1], params["asset"]
+        ) if account_before_readable else None
+    except Exception:
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", authority_now,
+        )
+    if not account_before_readable:
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", authority_now,
+        )
+    if liability_before is None:
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_MISMATCH", authority_now,
+        )
+
+    authority_refusal, authority_now, authority_digests, stop_present = \
+        _margin_post_authority(
+            job, paths, operation, post_params, validated_job_digest
+        )
+    receipt["authority_checked_utc"] = _utc_text(authority_now)
+    receipt["authority_digests"] = authority_digests
+    receipt["authority_stop_jobs_present"] = stop_present
+    if authority_refusal:
+        return _finish_margin_before_post(
+            receipt, source_path, "REFUSED", 2,
+            authority_refusal, authority_now,
+        )
+
     intent_id = operation["intent_id"]
     try:
         intent_claimed = _claim_margin_intent(
@@ -3866,6 +3977,7 @@ def _run_margin_operation(
         receipt["execution_mode"] = "STOP_JOBS_REPAY"
     receipt["mutation_attempts"] = 1
     receipt["mutation_started_utc"] = _utc_text(authority_now)
+    receipt["account_liability_before"] = liability_before
     try:
         _persist_margin_source(source_path, receipt)
     except Exception:
@@ -3891,13 +4003,19 @@ def _run_margin_operation(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_POST_UNREADABLE", fresh_now,
         )
-    post_kind, post_payload = post_result
-    transaction_id = _margin_transaction_id(post_payload) \
-        if post_kind == "ok" else ""
-    receipt["submission"] = {
-        "kind": post_kind if type(post_kind) is str else "unreadable",
-        "transaction_id": transaction_id,
-    }
+    try:
+        post_kind, post_payload = post_result
+        transaction_id = _margin_transaction_id(post_payload) \
+            if post_kind == "ok" else ""
+        receipt["submission"] = {
+            "kind": post_kind if type(post_kind) is str else "unreadable",
+            "transaction_id": transaction_id,
+        }
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
     try:
         _persist_margin_source(source_path, receipt)
     except Exception:
@@ -3911,7 +4029,6 @@ def _run_margin_operation(
             "MARGIN_TRANSACTION_MISSING", fresh_now,
         )
 
-    params = operation["params"]
     history_params = {
         "asset": params["asset"],
         "type": params["type"],
@@ -3925,47 +4042,53 @@ def _run_margin_operation(
         account_result = transport(
             "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
         )
+        confirmation_results_readable = type(history_result) is tuple \
+            and len(history_result) == 2 \
+            and type(account_result) is tuple \
+            and len(account_result) == 2 \
+            and history_result[0] == "ok" and account_result[0] == "ok"
     except Exception:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
         )
-    if type(history_result) is not tuple or len(history_result) != 2 \
-            or type(account_result) is not tuple \
-            or len(account_result) != 2 \
-            or history_result[0] != "ok" or account_result[0] != "ok":
+    if not confirmation_results_readable:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
         )
 
-    expected = operation["expected_ledger_confirmation"]
-    confirmation = _margin_history_confirmation(
-        history_result[1], transaction_id, expected, params["type"]
-    )
-    liability = _margin_account_liability(
-        account_result[1], expected["asset"]
-    )
+    try:
+        expected = operation["expected_ledger_confirmation"]
+        confirmation = _margin_history_confirmation(
+            history_result[1], transaction_id, expected, params["type"]
+        )
+        liability = _margin_account_liability(
+            account_result[1], expected["asset"]
+        )
+        direction_confirmed = _margin_liability_direction_confirmed(
+            liability_before, liability, expected["principal"],
+            params["type"],
+        )
+        repay_cleared = job.op != margin_ops.MARGIN_REPAY \
+            or liability is not None and liability.get("borrowed") == "0"
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
     if confirmation is None or liability is None:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
         )
-    if job.op == margin_ops.MARGIN_BORROW:
-        confirmed = liability["borrowed"] == expected["principal"] \
-            and liability["interest"] == expected["interest"]
-        verdict = "OPEN"
-    else:
-        confirmed = liability["borrowed"] == "0" \
-            and liability["interest"] == "0" \
-            and liability["total_liability"] == "0"
-        verdict = "CLOSED"
-    if not confirmed:
+    if not direction_confirmed or not repay_cleared:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_LIABILITY_MISMATCH", fresh_now,
             confirmation, liability,
         )
+    verdict = "OPEN" if job.op == margin_ops.MARGIN_BORROW else "CLOSED"
     success_reason = expected["status"]
     if sealed_repay:
         success_reason = "REPAY_CONFIRMED_UNDER_STOP_JOBS"
@@ -4291,6 +4414,7 @@ def _validate_known_margin_artifact_fields(
         "SOURCE_RECEIPT": {
             "ready": dict,
             "submission": dict, "ledger_confirmation": dict,
+            "account_liability_before": dict,
             "account_liability": dict, "authority_digests": dict,
             "authority_stop_jobs_present": bool,
         },
@@ -4801,7 +4925,7 @@ def _attest_stuck_margin_lock(
         if result["verdict"] == "OPEN":
             source_fields |= {
                 "mutation_started_utc", "submission", "ledger_confirmation",
-                "account_liability",
+                "account_liability_before", "account_liability",
             }
         _release_require(set(source) == source_fields,
                          "SOURCE_RECEIPT_SHAPE_MISMATCH")
@@ -4864,10 +4988,6 @@ def _attest_stuck_margin_lock(
             expected_facts = {
                 "mutation_attempts": 1,
                 "ledger_confirmation": ready["expected_ledger_confirmation"],
-                "account_liability": {
-                    "asset": validated.symbol, "borrowed": principal,
-                    "interest": "0", "total_liability": principal,
-                },
             }
             _validate_artifact_types_like(
                 source["ledger_confirmation"],
@@ -4875,11 +4995,36 @@ def _attest_stuck_margin_lock(
                 "SOURCE_RECEIPT", "ledger_confirmation", job_id,
             )
             _validate_artifact_types_like(
+                source["account_liability_before"],
+                {
+                    "asset": validated.symbol, "borrowed": "",
+                    "interest": "", "total_liability": "",
+                },
+                "SOURCE_RECEIPT", "account_liability_before", job_id,
+            )
+            _validate_artifact_types_like(
                 source["account_liability"],
-                expected_facts["account_liability"],
+                {
+                    "asset": validated.symbol, "borrowed": "",
+                    "interest": "", "total_liability": "",
+                },
                 "SOURCE_RECEIPT", "account_liability", job_id,
             )
             _release_compare("SOURCE", source, expected_facts)
+            before_liability = source["account_liability_before"]
+            after_liability = source["account_liability"]
+            _release_require(
+                _margin_account_liability({
+                    "userAssets": [before_liability]
+                }, validated.symbol) == before_liability
+                and _margin_account_liability({
+                    "userAssets": [after_liability]
+                }, validated.symbol) == after_liability
+                and _margin_liability_direction_confirmed(
+                    before_liability, after_liability, principal, "BORROW"
+                ),
+                "SOURCE_ACCOUNT_LIABILITY_MISMATCH",
+            )
             _validate_artifact_types_like(
                 submission, {"kind": "ok", "transaction_id": ""},
                 "SOURCE_RECEIPT", "submission", job_id,

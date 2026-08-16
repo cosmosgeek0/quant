@@ -101,6 +101,7 @@ class MarginTransport:
         self.history_kind = "ok"
         self.history_payload = None
         self.account_kind = "ok"
+        self.account_before_payload = None
         self.account_payload = None
 
     def __call__(self, method, base_url, path, params=None, signed=False):
@@ -127,6 +128,14 @@ class MarginTransport:
                 "type": "MANUAL",
             }]}
         if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
+            if self.operation is None:
+                if self.account_before_payload is not None:
+                    return self.account_kind, self.account_before_payload
+                return self.account_kind, {"userAssets": [{
+                    "asset": "USDT",
+                    "borrowed": "0",
+                    "interest": "0",
+                }]}
             if self.account_payload is not None:
                 return self.account_kind, self.account_payload
             borrowed = self.operation["amount"] \
@@ -405,8 +414,10 @@ class JobRunnerTests(unittest.TestCase):
         return jr.tick(receipt_dir=self.receipt_dir, now=NOW, **kwargs)
 
     def margin_tick(self, mutation_now=NOW, request=None):
+        transport = request or self.margin
+        transport.operation = None
         with mock.patch.object(jr, "_utc_now", return_value=mutation_now):
-            return self.tick(margin_request=request or self.margin)
+            return self.tick(margin_request=transport)
 
     def results(self):
         path = os.path.join(self.jobs_dir, "results.jsonl")
@@ -1496,6 +1507,10 @@ class JobRunnerTests(unittest.TestCase):
             "asset": "USDT", "borrowed": "3", "interest": "0",
             "total_liability": "3",
         })
+        self.assertEqual(source["account_liability_before"], {
+            "asset": "USDT", "borrowed": "0", "interest": "0",
+            "total_liability": "0",
+        })
         self.assertTrue(os.path.isfile(os.path.join(
             self.receipt_dir, "ACCEPT-ONE.claimed-margin-borrow"
         )))
@@ -1730,6 +1745,9 @@ class JobRunnerTests(unittest.TestCase):
 
     def test_same_margin_intent_refuses_across_job_tag_and_expiry_changes(self):
         intent_id = "mrgintent-" + ("b" * 24)
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "3", "interest": "0",
+        }]}
         first_path = self.margin_job(
             "margin-intent-a", op="MARGIN_REPAY", intent_id=intent_id,
             expires_utc=utc(NOW + timedelta(minutes=9)),
@@ -1994,6 +2012,180 @@ class JobRunnerTests(unittest.TestCase):
             {"rows": [row]}, "401344857108", expected, "BORROW"
         ))
 
+    def test_margin_confirmation_readers_are_total_for_non_text_fields(self):
+        expected = {
+            "asset": "USDT",
+            "principal": "2.5",
+            "interest": "0",
+            "status": "BORROW_CONFIRMED",
+        }
+        row = {
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        row_cases = (
+            dict(row, asset=[]),
+            dict(row, principal={}),
+            dict(row, status=[]),
+            dict(row, type=[]),
+            dict(row, type={}),
+        )
+        for candidate in row_cases:
+            with self.subTest(history_field=next(
+                    name for name in row if candidate[name] != row[name]
+            )):
+                self.assertIsNone(jr._margin_history_confirmation(
+                    {"rows": [candidate]}, "7301", expected, "BORROW"
+                ))
+        for field, value in (
+                ("asset", []), ("principal", {}),
+                ("interest", []), ("status", {})):
+            with self.subTest(expected_field=field):
+                self.assertIsNone(jr._margin_history_confirmation(
+                    {"rows": [row]}, "7301",
+                    dict(expected, **{field: value}), "BORROW",
+                ))
+        self.assertIsNone(jr._margin_history_confirmation(
+            {"rows": [row]}, [], expected, "BORROW"
+        ))
+        self.assertIsNone(jr._margin_history_confirmation(
+            {"rows": [row]}, "7301", expected, {}
+        ))
+
+        liability = {
+            "asset": "USDT", "borrowed": "2.5", "interest": "0",
+        }
+        for field, value in (
+                ("asset", []), ("borrowed", {}), ("interest", [])):
+            with self.subTest(account_field=field):
+                self.assertIsNone(jr._margin_account_liability(
+                    {"userAssets": [dict(liability, **{field: value})]},
+                    "USDT",
+                ))
+        self.assertIsNone(jr._margin_account_liability(
+            {"userAssets": [liability]}, []
+        ))
+
+    def test_non_text_margin_origin_publishes_unknown_receipt(self):
+        self.margin.history_payload = {"rows": [{
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "3",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": [],
+        }]}
+        self.margin_job("margin-origin-shape")
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertIs(type(result["exit_code"]), int)
+        self.assertEqual(
+            self.reason(result), "MARGIN_CONFIRMATION_MISMATCH"
+        )
+        source = self.margin_source(result)
+        self.assertEqual(source["verdict"], "UNKNOWN")
+        self.assertIs(type(source["reason"]), str)
+        self.assertEqual(source["mutation_attempts"], 1)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_unexpected_margin_confirmation_error_is_contained(self):
+        self.margin_job("margin-confirmation-guard")
+
+        with mock.patch.object(
+                jr, "_margin_history_confirmation",
+                side_effect=RuntimeError("offline confirmation check")):
+            self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(result), "MARGIN_CONFIRMATION_UNREADABLE"
+        )
+        source = self.margin_source(result)
+        self.assertEqual(source["verdict"], "UNKNOWN")
+        self.assertEqual(source["mutation_attempts"], 1)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_margin_borrow_refuses_opposite_liability_change(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "5", "interest": "0.001",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5", "interest": "0.002",
+        }]}
+        self.margin_job("margin-opposite-change", principal="2.5")
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(result), "MARGIN_LIABILITY_MISMATCH"
+        )
+        source = self.margin_source(result)
+        self.assertEqual(source["account_liability_before"]["borrowed"], "5")
+        self.assertEqual(source["account_liability"]["borrowed"], "2.5")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_margin_borrow_confirms_manual_row_and_exact_positive_change(self):
+        self.margin.post_payload = {"tranId": 401344857108}
+        self.margin.history_payload = {"rows": [{
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }]}
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "1.25", "interest": "0.001",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "3.75", "interest": "0.002",
+        }]}
+        self.margin_job("margin-positive-change", principal="2.5")
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("OPEN", "BORROW_CONFIRMED"),
+        )
+        source = self.margin_source(result)
+        self.assertEqual(source["account_liability_before"], {
+            "asset": "USDT", "borrowed": "1.25", "interest": "0.001",
+            "total_liability": "1.251",
+        })
+        self.assertEqual(source["account_liability"], {
+            "asset": "USDT", "borrowed": "3.75", "interest": "0.002",
+            "total_liability": "3.752",
+        })
+        account_indexes = [
+            index for index, call in enumerate(self.margin.calls)
+            if call[0] == "GET" and call[2] == jr.MARGIN_ACCOUNT_PATH
+        ]
+        post_index = next(
+            index for index, call in enumerate(self.margin.calls)
+            if call[0] == "POST"
+        )
+        self.assertEqual(len(account_indexes), 2)
+        self.assertLess(account_indexes[0], post_index)
+        self.assertGreater(account_indexes[1], post_index)
+
     def test_margin_history_identity_conflict_freezes_unknown(self):
         valid = {
             "txId": "7301",
@@ -2035,6 +2227,9 @@ class JobRunnerTests(unittest.TestCase):
         )))
 
     def test_margin_repay_closes_only_after_explicit_zero_liability(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "3", "interest": "0",
+        }]}
         self.margin_job("margin-repay-zero", op="MARGIN_REPAY")
 
         self.assertEqual(self.margin_tick(), 0)
@@ -2053,6 +2248,9 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.governor_budget_calls, [])
 
         nonzero = MarginTransport()
+        nonzero.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0.02", "interest": "0",
+        }]}
         nonzero.account_payload = {"userAssets": [{
             "asset": "USDT", "borrowed": "0.01", "interest": "0",
         }]}
@@ -2069,6 +2267,9 @@ class JobRunnerTests(unittest.TestCase):
 
     def test_stop_jobs_seals_borrow_and_allows_repay_without_ticket_claim(self):
         Path(os.path.join(self.receipt_dir, "STOP-JOBS")).touch()
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "3", "interest": "0",
+        }]}
         self.margin_job("margin-seal-borrow", op="MARGIN_BORROW")
         self.margin_job("margin-seal-repay", op="MARGIN_REPAY")
 
