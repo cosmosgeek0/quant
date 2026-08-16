@@ -100,6 +100,8 @@ class MarginTransport:
         self.post_payload = {"tranId": 7301}
         self.history_kind = "ok"
         self.history_payload = None
+        self.history_before_payloads = {}
+        self.history_after_payloads = {}
         self.account_kind = "ok"
         self.account_before_payload = None
         self.account_payload = None
@@ -114,8 +116,26 @@ class MarginTransport:
             self.operation = dict(params)
             return self.post_kind, self.post_payload
         if method == "GET" and path == jr.MARGIN_ENDPOINT_PATH:
+            request_type = params.get("type")
+            if request_type not in {"BORROW", "REPAY"}:
+                raise AssertionError("margin history direction was missing")
+            if self.operation is None:
+                payload = self.history_before_payloads.get(
+                    request_type, {"rows": []}
+                )
+                return self.history_kind, payload
+            if request_type in self.history_after_payloads:
+                return (
+                    self.history_kind,
+                    self.history_after_payloads[request_type],
+                )
             if self.history_payload is not None:
-                return self.history_kind, self.history_payload
+                payload = self.history_payload \
+                    if request_type == self.operation["type"] \
+                    else {"rows": []}
+                return self.history_kind, payload
+            if request_type != self.operation["type"]:
+                return self.history_kind, {"rows": []}
             transaction_id = self.post_payload.get(
                 "tranId", self.post_payload.get("txId", "")
             )
@@ -1815,6 +1835,100 @@ class JobRunnerTests(unittest.TestCase):
             1,
         )
 
+    def test_mrv11_concurrent_activity_guard_is_typed(self):
+        self.assertEqual(
+            jr._margin_history_fence_status(
+                [7200, 7201, 7301], "7301", 7201
+            ),
+            "CONFIRMED",
+        )
+        self.assertEqual(
+            jr._margin_history_fence_status(
+                [7200, 7201, 7301, 7302], "7301", 7201
+            ),
+            "CONCURRENT_MARGIN_ACTIVITY",
+        )
+
+    def test_mrv11_target_history_row_alone_confirms(self):
+        old_borrow = {"txId": "7200", "asset": "USDT"}
+        old_repay = {"txId": "7201", "asset": "USDT"}
+        target = {
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "3",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        self.margin.history_before_payloads = {
+            "BORROW": {"rows": [old_borrow]},
+            "REPAY": {"rows": [old_repay]},
+        }
+        self.margin.history_after_payloads = {
+            "BORROW": {"rows": [old_borrow, target]},
+            "REPAY": {"rows": [old_repay]},
+        }
+        self.margin_job("mrv11-target-alone")
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("OPEN", "BORROW_CONFIRMED"),
+        )
+
+    def test_mrv11_later_unrelated_repay_row_is_unknown(self):
+        old_borrow = {"txId": "7200", "asset": "USDT"}
+        old_repay = {"txId": "7201", "asset": "USDT"}
+        target = {
+            "txId": "7301",
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        unrelated_repay = {
+            "txId": "7302",
+            "asset": "USDT",
+            "principal": "5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        self.margin.history_before_payloads = {
+            "BORROW": {"rows": [old_borrow]},
+            "REPAY": {"rows": [old_repay]},
+        }
+        self.margin.history_after_payloads = {
+            "BORROW": {"rows": [old_borrow]},
+            "REPAY": {
+                "rows": [old_repay, target, unrelated_repay],
+            },
+        }
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5", "interest": "0",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0", "interest": "0",
+        }]}
+        self.margin_job(
+            "mrv11-later-repay", op="MARGIN_REPAY", principal="2.5"
+        )
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("UNKNOWN", "CONCURRENT_MARGIN_ACTIVITY"),
+        )
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
+
     def test_margin_history_confirms_real_binance_row_shape(self):
         expected = {
             "asset": "USDT",
@@ -1861,12 +1975,13 @@ class JobRunnerTests(unittest.TestCase):
             call for call in self.margin.calls
             if call[0] == "GET" and call[2] == jr.MARGIN_ENDPOINT_PATH
         ]
-        self.assertEqual(len(history_calls), 1)
-        self.assertEqual(history_calls[0][3], {
-            "asset": "USDT",
-            "type": "BORROW",
-            "txId": "401344857108",
-        })
+        self.assertEqual(len(history_calls), 4)
+        self.assertEqual([call[3] for call in history_calls], [
+            {"asset": "USDT", "type": "BORROW"},
+            {"asset": "USDT", "type": "REPAY"},
+            {"asset": "USDT", "type": "BORROW"},
+            {"asset": "USDT", "type": "REPAY"},
+        ])
 
     def test_margin_history_rejects_target_identity_conflicts_and_duplicates(
             self):
@@ -2270,6 +2385,134 @@ class JobRunnerTests(unittest.TestCase):
             "",
         )
 
+    def test_mrv11_relative_dust_is_strict_for_small_principals(self):
+        standing_before = {
+            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
+            "total_liability": "2.500005",
+        }
+        standing_after = {
+            "asset": "USDT", "borrowed": "0", "interest": "0.000001",
+            "total_liability": "0.000001",
+        }
+        small_before = {
+            "asset": "USDT", "borrowed": "0.00004",
+            "interest": "0.00001", "total_liability": "0.00005",
+        }
+        small_partial = {
+            "asset": "USDT", "borrowed": "0",
+            "interest": "0.000049", "total_liability": "0.000049",
+        }
+        relative_boundary_before = {
+            "asset": "USDT", "borrowed": "0.05",
+            "interest": "0.00005", "total_liability": "0.05005",
+        }
+        relative_boundary_after = {
+            "asset": "USDT", "borrowed": "0",
+            "interest": "0.00005", "total_liability": "0.00005",
+        }
+
+        self.assertEqual(
+            jr._margin_repay_close_verdict(
+                standing_before, standing_after, "2.5"
+            ),
+            "CLOSED-WITH-DUST",
+        )
+        self.assertEqual(
+            jr._margin_repay_close_verdict(
+                small_before, small_partial, "0.00005"
+            ),
+            "",
+        )
+        self.assertEqual(
+            jr._margin_repay_close_verdict(
+                relative_boundary_before, relative_boundary_after, "0.05"
+            ),
+            "",
+        )
+
+    def test_mrv11_small_principal_partial_repay_is_unknown(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0.00004",
+            "interest": "0.00001",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0",
+            "interest": "0.000049",
+        }]}
+        self.margin_job(
+            "mrv11-small-partial", op="MARGIN_REPAY",
+            principal="0.00005",
+        )
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("UNKNOWN", "MARGIN_LIABILITY_MISMATCH"),
+        )
+
+    def test_mrv11_residual_in_borrowed_is_unknown(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0.000001", "interest": "0",
+        }]}
+        self.margin_job(
+            "mrv11-borrowed-residual", op="MARGIN_REPAY",
+            principal="2.5",
+        )
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("UNKNOWN", "MARGIN_LIABILITY_MISMATCH"),
+        )
+
+    def test_mrv11_rejected_margin_post_stays_unknown(self):
+        self.margin.post_kind = "api_error"
+        self.margin.post_payload = {
+            "code": -1, "msg": "request was not accepted",
+        }
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "3", "interest": "0",
+        }]}
+        self.margin_job("mrv11-rejected", op="MARGIN_REPAY")
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("UNKNOWN", "MARGIN_TRANSACTION_MISSING"),
+        )
+        self.assertEqual(self.margin_source(result)["mutation_attempts"], 1)
+        self.assertEqual(self.margin.calls[-1][0], "POST")
+
+    def test_mrv11_above_liability_repay_refuses_before_post(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "1", "interest": "0",
+        }]}
+        self.margin_job(
+            "mrv11-above-liability", op="MARGIN_REPAY",
+            principal="1.001",
+        )
+
+        self.assertEqual(self.margin_tick(), 2)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("REFUSED", "PRINCIPAL_EXCEEDS_LIABILITY"),
+        )
+        self.assertEqual(self.margin_source(result)["mutation_attempts"], 0)
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
+
     def test_margin_repay_measured_total_closes_cleanly(self):
         self.margin.account_before_payload = {"userAssets": [{
             "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
@@ -2329,7 +2572,7 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "STOP-JOBS"
         )))
 
-    def test_margin_post_snapshot_follows_identity_binding(self):
+    def test_margin_history_snapshots_bracket_account_delta(self):
         self.margin.account_before_payload = {
             "updateTime": "1000",
             "userAssets": [{
@@ -2343,37 +2586,27 @@ class JobRunnerTests(unittest.TestCase):
             }],
         }
         self.margin_job("margin-snapshot-order")
-        identity_bound = {"value": False}
-        confirm = jr._margin_history_confirmation
 
-        def bind_identity(*args, **kwargs):
-            value = confirm(*args, **kwargs)
-            identity_bound["value"] = value is not None
-            return value
-
-        def ordered_request(method, base_url, path, params=None,
-                            signed=False):
-            if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH \
-                    and self.margin.operation is not None \
-                    and not identity_bound["value"]:
-                raise RuntimeError("post snapshot preceded identity binding")
-            return self.margin(method, base_url, path, params, signed)
-
-        with mock.patch.object(
-                jr, "_margin_history_confirmation",
-                side_effect=bind_identity):
-            self.assertEqual(self.margin_tick(request=ordered_request), 0)
+        self.assertEqual(self.margin_tick(), 0)
 
         calls = self.margin.calls
-        history_index = next(
+        history_indexes = [
             index for index, call in enumerate(calls)
             if call[0] == "GET" and call[2] == jr.MARGIN_ENDPOINT_PATH
-        )
+        ]
         account_indexes = [
             index for index, call in enumerate(calls)
             if call[0] == "GET" and call[2] == jr.MARGIN_ACCOUNT_PATH
         ]
-        self.assertLess(history_index, account_indexes[1])
+        post_index = next(
+            index for index, call in enumerate(calls)
+            if call[0] == "POST"
+        )
+        self.assertEqual(len(history_indexes), 4)
+        self.assertLess(history_indexes[1], account_indexes[0])
+        self.assertLess(account_indexes[0], post_index)
+        self.assertLess(post_index, account_indexes[1])
+        self.assertLess(account_indexes[1], history_indexes[2])
         self.assertEqual(
             self.margin_source(self.results()[0])["snapshot_time_note"],
             jr.MARGIN_SNAPSHOT_TIME_VERIFIED,

@@ -109,14 +109,16 @@ MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
 MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
-# A zero-borrow residual strictly below this USDT bound is recorded for an
-# interest-only follow-up; it is never described as a fully closed liability.
+# A zero-borrow residual must stay below both this USDT ceiling and the
+# relative share below before it can be recorded for interest-only follow-up.
 MARGIN_REPAY_DUST_BOUND = Decimal("0.0001")
+MARGIN_REPAY_RELATIVE_DUST_RATE = Decimal("0.001")
 MARGIN_SNAPSHOT_TIME_VERIFIED = "SNAPSHOT_TIME_VERIFIED"
 MARGIN_SNAPSHOT_TIME_UNVERIFIED = "SNAPSHOT_TIME_UNVERIFIED"
 MARGIN_IDENTITY_KEY_RE = re.compile(
     r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$"
 )
+MARGIN_TRANSACTION_ID_RE = re.compile(r"^[1-9][0-9]*$")
 # Identity evidence is ambiguous once a response walk exceeds this node budget.
 MARGIN_IDENTITY_MAX_NODES = 4096
 # Bound the encoded response material examined by one identity walk to 1 MiB.
@@ -3503,6 +3505,90 @@ def _margin_transaction_id(payload: Any) -> str:
     return aliases[0]
 
 
+def _margin_transaction_number(value: Any) -> Optional[int]:
+    if type(value) is not str or len(value) > 128 \
+            or MARGIN_TRANSACTION_ID_RE.fullmatch(value) is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _margin_history_transaction_ids(payload: Any, asset: Any) \
+        -> Optional[List[int]]:
+    try:
+        if type(payload) is not dict or type(asset) is not str or not asset:
+            return None
+        rows = payload.get("rows")
+        if type(rows) is not list:
+            return None
+        identifiers = []
+        for row in rows:
+            if type(row) is not dict or type(row.get("asset")) is not str \
+                    or row["asset"] != asset:
+                return None
+            aliases = _margin_identity_aliases(row)
+            if aliases is None or not aliases:
+                return None
+            identifier = _margin_transaction_number(aliases[0])
+            if identifier is None:
+                return None
+            identifiers.append(identifier)
+        return identifiers
+    except Exception:
+        return None
+
+
+def _margin_history_snapshot(
+        transport: Callable[..., Tuple[str, Any]], base_url: str,
+        endpoint_path: str, asset: str) \
+        -> Tuple[str, Dict[str, Any], List[int]]:
+    payloads = {}
+    identifiers = []
+    try:
+        for request_type in ("BORROW", "REPAY"):
+            result = transport(
+                "GET", base_url, endpoint_path,
+                {"asset": asset, "type": request_type}, True,
+            )
+            if type(result) is not tuple or len(result) != 2 \
+                    or result[0] != "ok":
+                return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
+            current = _margin_history_transaction_ids(result[1], asset)
+            if current is None:
+                return "MARGIN_CONFIRMATION_MISMATCH", {}, []
+            payloads[request_type] = result[1]
+            identifiers.extend(current)
+        return "", payloads, identifiers
+    except Exception:
+        return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
+
+
+def _margin_history_fence_status(
+        identifiers: Any, transaction_id: Any, watermark: Any) -> str:
+    try:
+        if type(identifiers) is not list \
+                or any(type(value) is not int or value <= 0
+                       for value in identifiers) \
+                or type(watermark) is not int or watermark < 0:
+            return ""
+        target = _margin_transaction_number(transaction_id)
+        if target is None:
+            return ""
+        newer = {value for value in identifiers if value > watermark}
+        if any(value != target for value in newer):
+            return "CONCURRENT_MARGIN_ACTIVITY"
+        if target <= watermark or identifiers.count(target) != 1:
+            return ""
+        # Account and history reads are not atomic. An actor exactly mirroring
+        # our POST timing with an identical amount can remain indistinguishable
+        # until its separate transaction id becomes visible.
+        return "CONFIRMED"
+    except Exception:
+        return ""
+
+
 def _margin_decimal_text(value: Any) -> Optional[str]:
     if type(value) is not str or not value \
             or len(value) > MARGIN_DECIMAL_TEXT_MAX \
@@ -3681,6 +3767,32 @@ def _margin_liability_decimals(value: Any) \
         return None
 
 
+def _margin_repay_dust_bound(principal: Any) -> Optional[Decimal]:
+    canonical = _margin_decimal_text(principal)
+    if canonical is None:
+        return None
+    amount = Decimal(canonical)
+    if amount <= Decimal("0"):
+        return None
+    with localcontext() as context:
+        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+        relative = amount * MARGIN_REPAY_RELATIVE_DUST_RATE
+    return min(MARGIN_REPAY_DUST_BOUND, relative)
+
+
+def _margin_repay_principal_above_liability(
+        liability: Any, principal: Any) -> Optional[bool]:
+    values = _margin_liability_decimals(liability)
+    canonical = _margin_decimal_text(principal)
+    dust_bound = _margin_repay_dust_bound(principal)
+    if values is None or canonical is None or dust_bound is None:
+        return None
+    with localcontext() as context:
+        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+        maximum = values[3] + dust_bound
+    return Decimal(canonical) > maximum
+
+
 def _margin_repay_proof_values(before: Any, after: Any, principal: Any) \
         -> Optional[Tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]:
     try:
@@ -3724,14 +3836,15 @@ def _margin_liability_confirmation_status(
             return ""
         if request_type == "REPAY":
             proof = _margin_repay_proof_values(before, after, principal)
-            if proof is None:
+            dust_bound = _margin_repay_dust_bound(principal)
+            if proof is None or dust_bound is None:
                 return ""
             amount, expected_borrowed, after_borrowed, _after_interest, \
                 liability_decrease = proof
             zero = Decimal("0")
             with localcontext() as context:
                 context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-                minimum_decrease = amount - MARGIN_REPAY_DUST_BOUND
+                minimum_decrease = amount - dust_bound
             enough_decrease = liability_decrease > zero \
                 and liability_decrease >= minimum_decrease
             if enough_decrease and after_borrowed == expected_borrowed:
@@ -3771,26 +3884,24 @@ def _margin_repay_close_verdict(before: Any, after: Any,
                                 principal: Any) -> str:
     proof = _margin_repay_proof_values(before, after, principal)
     values = _margin_liability_decimals(after)
+    dust_bound = _margin_repay_dust_bound(principal)
     zero = Decimal("0")
-    if proof is None or values is None or values[1] != zero:
+    if proof is None or values is None or dust_bound is None \
+            or values[1] != zero:
         return ""
     if values[2] == zero:
         status = _margin_liability_confirmation_status(
             before, after, principal, "REPAY"
         )
         return "CLOSED" if status == "REPAY_CONFIRMED" else ""
-    amount, expected_borrowed, after_borrowed, _after_interest, \
+    amount, _expected_borrowed, _after_borrowed, _after_interest, \
         liability_decrease = proof
     with localcontext() as context:
         context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-        minimum_decrease = amount - MARGIN_REPAY_DUST_BOUND
+        minimum_decrease = amount - dust_bound
     enough_decrease = liability_decrease > zero \
         and liability_decrease >= minimum_decrease
-    borrowed_matches = after_borrowed == expected_borrowed
-    bounded_borrowed_dust = after_borrowed == zero \
-        and zero < expected_borrowed < MARGIN_REPAY_DUST_BOUND
-    if values[2] < MARGIN_REPAY_DUST_BOUND and enough_decrease \
-            and (borrowed_matches or bounded_borrowed_dust):
+    if values[2] < dust_bound and enough_decrease:
         return "CLOSED-WITH-DUST"
     return ""
 
@@ -4075,6 +4186,18 @@ def _run_margin_operation(
         )
 
     params = operation["params"]
+    history_reason, _history_before, history_ids_before = \
+        _margin_history_snapshot(
+            transport, base_url, operation["endpoint_path"],
+            params["asset"],
+        )
+    if history_reason:
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            history_reason, authority_now,
+        )
+    history_watermark = max(history_ids_before, default=0)
+
     try:
         account_before_result = transport(
             "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
@@ -4100,6 +4223,21 @@ def _run_margin_operation(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_MISMATCH", authority_now,
         )
+    if job.op == margin_ops.MARGIN_REPAY:
+        principal_above_liability = \
+            _margin_repay_principal_above_liability(
+                liability_before, principal
+            )
+        if principal_above_liability is None:
+            return _finish_margin_before_post(
+                receipt, source_path, "UNKNOWN", 4,
+                "MARGIN_CONFIRMATION_MISMATCH", authority_now,
+            )
+        if principal_above_liability:
+            return _finish_margin_before_post(
+                receipt, source_path, "REFUSED", 2,
+                "PRINCIPAL_EXCEEDS_LIABILITY", authority_now,
+            )
 
     authority_refusal, authority_now, authority_digests, stop_present = \
         _margin_post_authority(
@@ -4186,45 +4324,9 @@ def _run_margin_operation(
             "MARGIN_TRANSACTION_MISSING", fresh_now,
         )
 
-    history_params = {
-        "asset": params["asset"],
-        "type": params["type"],
-        "txId": transaction_id,
-    }
-    try:
-        expected = operation["expected_ledger_confirmation"]
-        history_result = transport(
-            "GET", base_url, operation["endpoint_path"],
-            history_params, True,
-        )
-    except Exception:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
-    if type(history_result) is not tuple or len(history_result) != 2 \
-            or history_result[0] != "ok":
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
-
-    try:
-        confirmation = _margin_history_confirmation(
-            history_result[1], transaction_id, expected, params["type"]
-        )
-    except Exception:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
-    if confirmation is None:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
-        )
-
-    # The identity-bearing history row binds before this post-state read.
+    expected = operation["expected_ledger_confirmation"]
+    # The post-state account read stays inside the two history snapshots so
+    # visible activity contributing to its delta is checked by the fence.
     try:
         account_result = transport(
             "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
@@ -4239,6 +4341,45 @@ def _run_margin_operation(
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+
+    history_reason, history_after, history_ids_after = \
+        _margin_history_snapshot(
+            transport, base_url, operation["endpoint_path"],
+            params["asset"],
+        )
+    if history_reason:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            history_reason, fresh_now,
+        )
+    fence_status = _margin_history_fence_status(
+        history_ids_after, transaction_id, history_watermark
+    )
+    if fence_status == "CONCURRENT_MARGIN_ACTIVITY":
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "CONCURRENT_MARGIN_ACTIVITY", fresh_now,
+        )
+    if fence_status != "CONFIRMED":
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
+        )
+    try:
+        confirmation = _margin_history_confirmation(
+            history_after[params["type"]], transaction_id, expected,
+            params["type"],
+        )
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+    if confirmation is None:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
         )
 
     try:
