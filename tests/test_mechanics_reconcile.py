@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import mechanics_reconcile  # noqa: E402
+from execution import binance_futures, binance_http, binance_spot  # noqa: E402
 
 
 SYMBOL = "TSTUSDT"
@@ -54,6 +55,9 @@ def futures_trades(open_fee="0.020", close_fee="0.019", asset="USDT"):
             "id": 501,
             "orderId": 101,
             "side": "BUY",
+            "buyer": True,
+            "maker": False,
+            "time": 1786663265000,
             "qty": "2",
             "price": "10",
             "quoteQty": "20",
@@ -66,6 +70,9 @@ def futures_trades(open_fee="0.020", close_fee="0.019", asset="USDT"):
             "id": 502,
             "orderId": 102,
             "side": "SELL",
+            "buyer": False,
+            "maker": False,
+            "time": 1786663266000,
             "qty": "2",
             "price": "9.5",
             "quoteQty": "19",
@@ -84,6 +91,8 @@ def income_rows(open_fee="0.020", close_fee="0.019", asset="USDT"):
             "income": "-" + open_fee,
             "asset": asset,
             "tradeId": 501,
+            "tranId": 801,
+            "time": 1786663265000,
         },
         {
             "symbol": SYMBOL,
@@ -91,6 +100,8 @@ def income_rows(open_fee="0.020", close_fee="0.019", asset="USDT"):
             "income": "-" + close_fee,
             "asset": asset,
             "tradeId": 502,
+            "tranId": 802,
+            "time": 1786663266000,
         },
         {
             "symbol": SYMBOL,
@@ -98,6 +109,8 @@ def income_rows(open_fee="0.020", close_fee="0.019", asset="USDT"):
             "income": "-1",
             "asset": "USDT",
             "tradeId": 502,
+            "tranId": 803,
+            "time": 1786663266000,
         },
     ]
 
@@ -111,14 +124,16 @@ class ScriptedTransport:
 
     def __call__(self, method, base_url, path, params=None, signed=False):
         self.calls.append((method, base_url, path, dict(params or {}), signed))
-        if path == mechanics_reconcile.SPOT_TRADES_PATH:
+        if path == binance_spot.SPOT_MY_TRADES_PATH:
             if self.spot_trades is None:
                 raise AssertionError("unexpected Spot endpoint")
-            return "ok", self.spot_trades
-        if path == mechanics_reconcile.USDM_TRADES_PATH:
-            return "ok", self.trades
-        if path == mechanics_reconcile.USDM_INCOME_PATH:
-            return "ok", self.income
+            return binance_http.HttpResult(
+                "ok", self.spot_trades, None, None
+            )
+        if path == binance_futures.FUTURES_USER_TRADES_PATH:
+            return binance_http.HttpResult("ok", self.trades, None, None)
+        if path == binance_futures.FUTURES_INCOME_PATH:
+            return binance_http.HttpResult("ok", self.income, None, None)
         raise AssertionError("unexpected endpoint " + path)
 
 
@@ -154,8 +169,8 @@ class MechanicsReconcileTests(unittest.TestCase):
         self.assertTrue(all(call[4] is True for call in transport.calls))
         self.assertEqual(
             [call[2] for call in transport.calls],
-            [mechanics_reconcile.USDM_TRADES_PATH,
-             mechanics_reconcile.USDM_INCOME_PATH],
+            [binance_futures.FUTURES_USER_TRADES_PATH,
+             binance_futures.FUTURES_INCOME_PATH],
         )
 
     def test_sanitized_last_four_order_ids_match_one_order_each(self):
@@ -201,31 +216,38 @@ class MechanicsReconcileTests(unittest.TestCase):
             json.dump(receipt, handle)
         spot = [
             {"symbol": SYMBOL, "id": 601, "orderId": 201,
-             "isBuyer": True, "qty": "2", "price": "10",
+             "isBuyer": True, "isMaker": False,
+             "time": 1786659605000, "qty": "2", "price": "10",
              "quoteQty": "20", "commission": "0.020",
              "commissionAsset": "USDT"},
             {"symbol": SYMBOL, "id": 602, "orderId": 202,
-             "isBuyer": False, "qty": "2", "price": "9.5",
+             "isBuyer": False, "isMaker": False,
+             "time": 1786659608000, "qty": "2", "price": "9.5",
              "quoteQty": "19", "commission": "0.019",
              "commissionAsset": "USDT"},
         ]
         futures = [
             {"symbol": SYMBOL, "id": 701, "orderId": 301, "side": "SELL",
+             "buyer": False, "maker": False, "time": 1786659606000,
              "qty": "2", "price": "10", "quoteQty": "20",
              "commission": "0.008", "commissionAsset": "USDT",
              "realizedPnl": "0"},
             {"symbol": SYMBOL, "id": 702, "orderId": 302, "side": "BUY",
+             "buyer": True, "maker": False, "time": 1786659607000,
              "qty": "2", "price": "10.5", "quoteQty": "21",
              "commission": "0.0084", "commissionAsset": "USDT",
              "realizedPnl": "-1"},
         ]
         income = [
             {"symbol": SYMBOL, "incomeType": "COMMISSION",
-             "income": "-0.008", "asset": "USDT", "tradeId": 701},
+             "income": "-0.008", "asset": "USDT", "tradeId": 701,
+             "tranId": 901, "time": 1786659606000},
             {"symbol": SYMBOL, "incomeType": "COMMISSION",
-             "income": "-0.0084", "asset": "USDT", "tradeId": 702},
+             "income": "-0.0084", "asset": "USDT", "tradeId": 702,
+             "tranId": 902, "time": 1786659607000},
             {"symbol": SYMBOL, "incomeType": "REALIZED_PNL",
-             "income": "-1", "asset": "USDT", "tradeId": 702},
+             "income": "-1", "asset": "USDT", "tradeId": 702,
+             "tranId": 903, "time": 1786659607000},
         ]
         transport = ScriptedTransport(futures, income, spot)
         result = mechanics_reconcile.reconcile_directory(
@@ -235,9 +257,9 @@ class MechanicsReconcileTests(unittest.TestCase):
         self.assertEqual(str(result.total_cost_usdt), "2.0554")
         self.assertEqual(
             [call[2] for call in transport.calls],
-            [mechanics_reconcile.SPOT_TRADES_PATH,
-             mechanics_reconcile.USDM_TRADES_PATH,
-             mechanics_reconcile.USDM_INCOME_PATH],
+            [binance_spot.SPOT_MY_TRADES_PATH,
+             binance_futures.FUTURES_USER_TRADES_PATH,
+             binance_futures.FUTURES_INCOME_PATH],
         )
 
     def test_commission_mismatch_reports_exact_delta(self):
@@ -279,19 +301,6 @@ class MechanicsReconcileTests(unittest.TestCase):
         self.assertIn("asset=BNB", output)
         self.assertIn("measured_round_trip_cost_usdt=UNKNOWN", output)
         self.assertNotIn("measured_round_trip_cost_usdt=0 ", output)
-
-    def test_get_only_wrapper_refuses_post_before_delegate(self):
-        calls = []
-
-        def delegate(*args):
-            calls.append(args)
-            return "ok", {}
-
-        wrapped = mechanics_reconcile.get_only_transport(delegate)
-        with self.assertRaises(AssertionError):
-            wrapped("POST", mechanics_reconcile.USDM_BASE_URL,
-                    "/fapi/v1/order", {}, True)
-        self.assertEqual(calls, [])
 
     def test_default_mode_is_local_only_and_prints_claims(self):
         self.write_receipt(futures_receipt())

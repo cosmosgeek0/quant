@@ -2,44 +2,27 @@
 """Read mechanics receipts and reconcile them against signed exchange truth.
 
 Without ``--signed`` this module only reads local receipt JSON.  Signed mode
-uses an injected GET-only transport for Spot trades, USD-M trades, and the
-USD-M income ledger.  It never owns an order or account mutation.
+uses shared GET-only readers for Spot trades, USD-M trades, and the USD-M
+income ledger.  It never owns an order or account mutation.
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
-import hmac
 import json
 import os
 import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from execution import binance_futures, binance_http, binance_spot
 
-SPOT_BASE_URL = "https://api.binance.com"
-USDM_BASE_URL = "https://fapi.binance.com"
-SPOT_TRADES_PATH = "/api/v3/myTrades"
-USDM_TRADES_PATH = "/fapi/v1/userTrades"
-USDM_INCOME_PATH = "/fapi/v1/income"
-RECV_WINDOW = "5000"
-HTTP_TIMEOUT = 15
 WINDOW_PAD_MS = 5000
-QUERY_LIMIT = "1000"
 SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")
 ASSET_RE = re.compile(r"[A-Z0-9]{1,20}")
-
-Transport = Callable[
-    [str, str, str, Optional[Dict[str, str]], bool], Tuple[str, Any]
-]
 
 
 class ReceiptError(ValueError):
@@ -100,27 +83,6 @@ class Reconciliation:
     verdict: str
     total_cost_usdt: Optional[Decimal]
     rows: Tuple[str, ...]
-
-
-class GetOnlyTransport:
-    """Reject a mutation before the underlying transport can observe it."""
-
-    def __init__(self, request: Transport):
-        self.request = request
-
-    def __call__(self, method: str, base_url: str, path: str,
-                 params: Optional[Dict[str, str]] = None,
-                 signed: bool = False) -> Tuple[str, Any]:
-        if method != "GET":
-            raise AssertionError(
-                "mechanics reconciliation attempted a non-GET call"
-            )
-        return self.request(method, base_url, path, params, signed)
-
-
-def get_only_transport(request: Transport) -> GetOnlyTransport:
-    """Public constructor used by callers and tests."""
-    return GetOnlyTransport(request)
 
 
 def fmt(value: Decimal) -> str:
@@ -474,28 +436,14 @@ def offline_reconciliation(receipt: ReceiptClaim) -> Reconciliation:
     return Reconciliation(receipt.name, "UNKNOWN", None, tuple(rows))
 
 
-def _trade_side(row: Dict[str, Any], market: str) -> Optional[str]:
-    side = row.get("side")
-    if isinstance(side, str) and side.upper() in ("BUY", "SELL"):
-        return side.upper()
-    if market == "spot" and type(row.get("isBuyer")) is bool:
-        return "BUY" if row["isBuyer"] else "SELL"
-    return None
-
-
-def _matches_trade(row: Any, leg: LegClaim, symbol: str) -> bool:
-    if not isinstance(row, dict):
+def _matches_trade(fill: binance_http.Fill, leg: LegClaim) -> bool:
+    if not isinstance(fill, binance_http.Fill) or fill.side != leg.side:
         return False
-    if row.get("symbol") not in (None, symbol):
-        return False
-    if _trade_side(row, leg.market) != leg.side:
-        return False
-    order_id = row.get("orderId")
+    order_id = fill.order_id
     if leg.order_id:
-        return order_id is not None and str(order_id) == leg.order_id
+        return str(order_id) == leg.order_id
     if leg.order_id_last4:
-        return order_id is not None \
-            and str(order_id).endswith(leg.order_id_last4)
+        return str(order_id).endswith(leg.order_id_last4)
     return True
 
 
@@ -505,24 +453,20 @@ def _base_asset(symbol: str) -> Optional[str]:
     return None
 
 
-def _measure_leg(leg: LegClaim, symbol: str, payload: Optional[List[Any]],
+def _measure_leg(leg: LegClaim, symbol: str,
+                 payload: Optional[Tuple[binance_http.Fill, ...]],
                  used: set) -> FillMeasurement:
     if payload is None:
         return FillMeasurement(leg, None, None, None, None, None, ())
     indexes = [
-        index for index, row in enumerate(payload)
-        if index not in used and _matches_trade(row, leg, symbol)
+        index for index, fill in enumerate(payload)
+        if index not in used and _matches_trade(fill, leg)
     ]
     if not indexes:
         return FillMeasurement(leg, None, None, None, None, None, ())
-    rows = [payload[index] for index in indexes]
+    fills = [payload[index] for index in indexes]
     used.update(indexes)
-    order_ids = {
-        str(row.get("orderId")) for row in rows
-        if row.get("orderId") not in (None, "")
-    }
-    if len(order_ids) != 1 or any(
-            row.get("orderId") in (None, "") for row in rows):
+    if len({fill.order_id for fill in fills}) != 1:
         return FillMeasurement(leg, None, None, None, None, None, ())
     quantity = Decimal(0)
     quote = Decimal(0)
@@ -533,24 +477,20 @@ def _measure_leg(leg: LegClaim, symbol: str, payload: Optional[List[Any]],
     trade_ids: List[str] = []
     seen_ids = set()
     base_asset = _base_asset(symbol)
-    for row in rows:
-        qty = _nonnegative(row.get("qty"))
-        price = _nonnegative(row.get("price"))
-        raw_quote = row.get("quoteQty")
-        one_quote = _nonnegative(raw_quote)
-        if one_quote is None and qty is not None and price is not None:
-            one_quote = qty * price
-        commission = _nonnegative(row.get("commission"))
-        asset = row.get("commissionAsset")
+    for fill in fills:
+        qty = _nonnegative(fill.quantity)
+        price = _nonnegative(fill.price)
+        one_quote = _nonnegative(fill.quote_quantity)
+        commission = _nonnegative(fill.fee.amount)
+        asset = fill.fee.asset
         if not isinstance(asset, str) or not ASSET_RE.fullmatch(asset.upper()):
             asset = None
-        one_realized = Decimal(0)
-        if leg.market == "usdm":
-            one_realized = _decimal(row.get("realizedPnl"))
+        one_realized = Decimal(0) if leg.market == "spot" \
+            else _decimal(fill.realized_pnl)
         if qty is None or one_quote is None or commission is None \
                 or asset is None or one_realized is None:
             return FillMeasurement(leg, None, None, None, None, None, ())
-        trade_id = str(row.get("id", row.get("tradeId", "")))
+        trade_id = "" if fill.trade_id is None else str(fill.trade_id)
         if leg.market == "usdm" and not trade_id:
             return FillMeasurement(leg, None, None, None, None, None, ())
         if trade_id:
@@ -578,17 +518,18 @@ def _measure_leg(leg: LegClaim, symbol: str, payload: Optional[List[Any]],
     )
 
 
-def _relevant_income(row: Dict[str, Any], symbol: str,
+def _relevant_income(row: binance_futures.Income, symbol: str,
                      trade_ids: set) -> bool:
-    if row.get("symbol") not in (None, "", symbol):
+    if row.symbol != symbol:
         return False
-    trade_id = row.get("tradeId")
-    if trade_ids and trade_id not in (None, "", 0, "0"):
+    trade_id = row.trade_id
+    if trade_ids and trade_id not in (None, 0):
         return str(trade_id) in trade_ids
     return True
 
 
-def _measure_income(payload: Optional[List[Any]], symbol: str,
+def _measure_income(payload: Optional[Tuple[binance_futures.Income, ...]],
+                    symbol: str,
                     trade_ids: set) -> IncomeMeasurement:
     if payload is None:
         return IncomeMeasurement(None, None, None, False, False)
@@ -598,22 +539,20 @@ def _measure_income(payload: Optional[List[Any]], symbol: str,
     commission_present = False
     realized_present = False
     for row in payload:
-        if not isinstance(row, dict):
-            continue
-        income_type = row.get("incomeType")
+        income_type = row.income_type
         if income_type not in ("COMMISSION", "REALIZED_PNL", "FUNDING_FEE"):
             continue
-        trade_id = row.get("tradeId")
+        trade_id = row.trade_id
         if trade_ids and income_type in ("COMMISSION", "REALIZED_PNL") \
-                and trade_id in (None, "", 0, "0"):
+                and trade_id in (None, 0):
             return IncomeMeasurement(None, None, None, False, False)
         if not _relevant_income(row, symbol, trade_ids):
             continue
-        value = _decimal(row.get("income"))
+        value = _decimal(row.amount)
         if value is None:
             return IncomeMeasurement(None, None, None, False, False)
         if income_type == "COMMISSION":
-            asset = row.get("asset")
+            asset = row.asset
             if not isinstance(asset, str) \
                     or not ASSET_RE.fullmatch(asset.upper()):
                 return IncomeMeasurement(None, None, None, False, False)
@@ -621,28 +560,18 @@ def _measure_income(payload: Optional[List[Any]], symbol: str,
             commissions[asset] = commissions.get(asset, Decimal(0)) - value
             commission_present = True
         elif income_type == "REALIZED_PNL":
-            if row.get("asset") != "USDT":
+            if row.asset != "USDT":
                 return IncomeMeasurement(None, None, None, False, False)
             realized += value
             realized_present = True
         else:
-            if row.get("asset") != "USDT":
+            if row.asset != "USDT":
                 return IncomeMeasurement(None, None, None, False, False)
             funding += value
     return IncomeMeasurement(
         commissions, realized, funding,
         commission_present, realized_present,
     )
-
-
-def _request_list(request: GetOnlyTransport, base_url: str, path: str,
-                  params: Dict[str, str]) -> Optional[List[Any]]:
-    kind, payload = request("GET", base_url, path, params, True)
-    if kind != "ok" or not isinstance(payload, list) \
-            or len(payload) >= int(QUERY_LIMIT) \
-            or any(not isinstance(row, dict) for row in payload):
-        return None
-    return payload
 
 
 def _sum_measure_fees(measurements: Sequence[FillMeasurement],
@@ -696,32 +625,45 @@ def _covered_fee_totals(measurements: Sequence[FillMeasurement]) \
     return claimed, exchange
 
 
+def _read_value(reader: Callable[..., binance_http.ReadResult[Any]],
+                *args: Any, **kwargs: Any) -> Any:
+    try:
+        result = reader(*args, **kwargs)
+    except binance_http.AdapterRefusal:
+        return None
+    if not isinstance(result, binance_http.ReadResult) or result.kind != "ok":
+        return None
+    return result.value
+
+
 def signed_reconciliation(receipt: ReceiptClaim,
-                          request: Transport) -> Reconciliation:
+                          request: binance_http.Transport) -> Reconciliation:
     rows: List[str] = []
     mismatch = False
     unknown = bool(receipt.issues) or receipt.receipt_verdict != "CLOSED"
-    transport = get_only_transport(request)
     if receipt.started_ms is None or receipt.finished_ms is None:
         spot_payload = None
         usdm_payload = None
         income_payload = None
     else:
-        params = {
-            "symbol": receipt.symbol,
-            "startTime": str(max(0, receipt.started_ms - WINDOW_PAD_MS)),
-            "endTime": str(receipt.finished_ms + WINDOW_PAD_MS),
-            "limit": QUERY_LIMIT,
-        }
-        spot_payload = _request_list(
-            transport, SPOT_BASE_URL, SPOT_TRADES_PATH, params
-        ) if any(leg.market == "spot" for leg in receipt.legs) else []
-        usdm_payload = _request_list(
-            transport, USDM_BASE_URL, USDM_TRADES_PATH, params
-        ) if any(leg.market == "usdm" for leg in receipt.legs) else []
-        income_payload = _request_list(
-            transport, USDM_BASE_URL, USDM_INCOME_PATH, params
-        ) if any(leg.market == "usdm" for leg in receipt.legs) else []
+        start_ms = max(0, receipt.started_ms - WINDOW_PAD_MS)
+        end_ms = receipt.finished_ms + WINDOW_PAD_MS
+        has_spot = any(leg.market == "spot" for leg in receipt.legs)
+        has_usdm = any(leg.market == "usdm" for leg in receipt.legs)
+        spot_payload = _read_value(
+            binance_spot.read_my_trades, request,
+            binance_http.SPOT_BASE_URL, receipt.symbol,
+            start_ms=start_ms, end_ms=end_ms,
+        ) if has_spot else ()
+        usdm_payload = _read_value(
+            binance_futures.read_user_trades, request,
+            binance_http.FUTURES_BASE_URL, receipt.symbol,
+            start_ms=start_ms, end_ms=end_ms,
+        ) if has_usdm else ()
+        income_payload = _read_value(
+            binance_futures.read_income, request,
+            binance_http.FUTURES_BASE_URL, receipt.symbol, start_ms, end_ms,
+        ) if has_usdm else ()
 
     used = {"spot": set(), "usdm": set()}
     measurements: List[FillMeasurement] = []
@@ -952,7 +894,7 @@ def unreadable_reconciliation(path: str) -> Reconciliation:
 
 
 def reconcile_directory(receipt_dir: str, signed: bool = False,
-                        request: Optional[Transport] = None) \
+                        request: Optional[binance_http.Transport] = None) \
         -> List[Reconciliation]:
     results: List[Reconciliation] = []
     for path in receipt_paths(receipt_dir):
@@ -970,69 +912,8 @@ def reconcile_directory(receipt_dir: str, signed: bool = False,
     return results
 
 
-def live_request_factory(api_key: str, api_secret: str,
-                         timeout: float = HTTP_TIMEOUT) -> Transport:
-    """Build the house-style signed transport, restricted to GET."""
-    offsets: Dict[str, int] = {}
-
-    def sync(base_url: str) -> None:
-        path = "/api/v3/time" if base_url == SPOT_BASE_URL \
-            else "/fapi/v1/time"
-        kind, payload = request("GET", base_url, path, None, False)
-        if kind == "ok" and isinstance(payload, dict) \
-                and isinstance(payload.get("serverTime"), int):
-            offsets[base_url] = payload["serverTime"] - int(time.time() * 1000)
-        else:
-            offsets[base_url] = 0
-
-    def request(method: str, base_url: str, path: str,
-                params: Optional[Dict[str, str]] = None,
-                signed: bool = False) -> Tuple[str, Any]:
-        if method != "GET":
-            raise AssertionError(
-                "mechanics reconciliation attempted a non-GET call"
-            )
-        values = dict(params or {})
-        if signed:
-            if base_url not in offsets:
-                sync(base_url)
-            values["timestamp"] = str(
-                int(time.time() * 1000) + offsets.get(base_url, 0)
-            )
-            values["recvWindow"] = RECV_WINDOW
-            query = urllib.parse.urlencode(values)
-            signature = hmac.new(
-                api_secret.encode(), query.encode(), hashlib.sha256
-            ).hexdigest()
-            query += "&signature=" + signature
-        else:
-            query = urllib.parse.urlencode(values)
-        http_request = urllib.request.Request(
-            base_url + path + ("?" + query if query else ""), method="GET"
-        )
-        if api_key:
-            http_request.add_header("X-MBX-APIKEY", api_key)
-        try:
-            with urllib.request.urlopen(http_request, timeout=timeout) as response:
-                return "ok", json.loads(response.read().decode())
-        except urllib.error.HTTPError as error:
-            if error.code >= 500 or error.code in (408, 409):
-                return "unclear", {"http": error.code}
-            try:
-                payload = json.loads(error.read().decode(errors="replace"))
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict) and "code" in payload:
-                return "api_error", {"code": payload.get("code")}
-            return "unclear", {"http": error.code}
-        except Exception as error:  # never stringify an exception with its URL
-            return "unclear", {"error": type(error).__name__}
-
-    return request
-
-
 def run(receipt_dir: str, signed: bool = False,
-        request: Optional[Transport] = None,
+        request: Optional[binance_http.Transport] = None,
         emit: Callable[[str], None] = print) -> int:
     results = reconcile_directory(receipt_dir, signed=signed, request=request)
     if not results:
@@ -1067,7 +948,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "BINANCE_API_KEY / BINANCE_API_SECRET"
             )
             return 2
-        request = live_request_factory(api_key, api_secret)
+        request = binance_http.BinanceHttp(
+            api_key, api_secret,
+            timeout_seconds=binance_http.HTTP_TIMEOUT_SECONDS,
+        )
+        request.sync_time(binance_http.SPOT_BASE_URL, "/api/v3/time")
+        request.sync_time(binance_http.FUTURES_BASE_URL, "/fapi/v1/time")
     return run(args.receipt_dir, signed=args.signed, request=request)
 
 
