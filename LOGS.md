@@ -7,6 +7,11 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+DASHBOARD V5 ON THE BOX 2026-08-16 13:28Z | arbitrage.cosmosgeek.org now serves Network V5 (lane/ui-network-v5 0cd1dfa + test fix 12f49cc) — the version the owner reviewed at :8901 | first deploy at 12:45Z had put UI 4.0 (Desktop main) on the site by mistake; corrected
+files | net_v5.css, net_v5.js, shell.js, serve.py, index.html — five xfers, all XFER_VERIFIED; quant-ui restarted; index 200 47049B, /api/grace answers, /net_v5.js 200 40013B; telemetry 177 rows, news 884 rows on the box
+seen | owner's Chrome, hard reload: 7/7 loops on rhythm, heatmap all green, Data mirror 12 s (local 5-s mirror), zero state changes — the Mac copy's job-runner Degraded flapping is absent on the box, as predicted (transport artifact)
+tests | tests.test_ui_serve green after adding the V5 grace source to the exact read-only list (test lagged the landing); ui/DASHBOARD.md updated to V5
+
 DASHBOARD LIVE ON THE BOX 2026-08-16 | arbitrage.cosmosgeek.org now serves the latest UI (ce43cd1 + 47655ef) from the execution host | evidence/dashboard-deploy-2026-08-16.txt · ui/DASHBOARD.md
 host | quant-ui.service restarted 12:45:18Z (backend was 2 days old); NEW quant-ui-telemetry.service (recorder, 15 s, QUANT_UI_URL=127.0.0.1:8080) and quant-ui-news.service (fetcher, 120 s) created + enabled; tunnel, Access, receipt mirror, machine directories untouched
 verify | GET / → 200 46973B (= local index.html) · /api/strip ok, ENTRY-SEALED, market pass live · all five services active | MEASURED on the box

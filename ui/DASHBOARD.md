@@ -34,7 +34,7 @@ the layout again.
 - Services (systemd, all `User=ssm-user`, `WorkingDirectory=/home/ssm-user/quant-ui`):
   | service | does | since |
   |---|---|---|
-  | `quant-ui.service` | `python3 ui/serve.py --port 8080` (loopback) | restarted 2026-08-16 12:45Z with the latest code |
+  | `quant-ui.service` | `python3 ui/serve.py --port 8080` (loopback) | restarted 2026-08-16 13:28Z serving Network V5 (lane/ui-network-v5, the version the owner reviewed on the Mac at :8901) |
   | `quant-ui-mirror.service` | `local_mirror.sh`: every 5 s copies the machine's receipt files into `ui/live/` (see §4) | 2026-08-15 |
   | `quant-ui-telemetry.service` | `python3 ui/telemetry_recorder.py --loop 15 -q` with `QUANT_UI_URL=http://127.0.0.1:8080` → `ui/live/telemetry.jsonl` | created 2026-08-16 12:45Z |
   | `quant-ui-news.service` | `python3 ui/news_fetcher.py --loop 120 -q` → `ui/live/news.jsonl`, `news_sources.json` | created 2026-08-16 12:45Z |
@@ -47,9 +47,12 @@ the layout again.
   News (first fetch within ~2 minutes) start from that moment.
 
 ## 3. The Mac side (legacy viewer — still running on 2026-08-16, not the truth)
-- `Desktop/quant/ui/` = the UI seat's working copy (local `main`, pushed to
-  GitHub as branch `lane/ui-4`; the operational Lead's lanes come from
-  `origin/main` and do not contain the UI 3.0/4.0 commits).
+- The newest UI is the lane `lane/ui-network-v5` (worktree
+  `Desktop/worktrees/net-v5`) — Network V5: schedule heatmap, control path,
+  worst-first table, state changes, per-loop grace via `/api/grace`. It is
+  what the site serves. `Desktop/quant/ui/` (local `main`, GitHub branch
+  `lane/ui-4`) is UI 4.0, one step older. The operational Lead's lanes come
+  from `origin/main` and contain neither.
 - Two local servers: `serve.py` on 8899 (the Mac recorder samples it) and on
   8901 (the owner's local view). Both read `Desktop/quant/ui/live/`.
 - `scripts/ui_pull.sh` pulls the box's receipt files over SSM into the Mac's
