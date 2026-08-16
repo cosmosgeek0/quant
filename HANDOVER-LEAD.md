@@ -1,75 +1,49 @@
-# HANDOVER-LEAD.md — seat transfer, 2026-08-15 ~11:20Z (outgoing operational Lead)
+# HANDOVER-LEAD.md — seat transfer, 2026-08-16 ~07:50Z (outgoing operational Lead → worker 4.0)
 
-## SHAs / releases
-- repo main == origin/main == 71ccd26 (this handover commit lands on top; verify with git log).
-- Host RELEASE: 4ba03977a0cc71eb5fdac651fd91aae4f25b70f3 (recorder deploy, hash-gated x4,
-  transcript evidence/…; funnel release 18b193f preceded it). accept_one.py FROZEN pinned to 4ba0397.
-- Suite at handover: 1032/1032 (Lead-run, this hour). Worktree clean at 71ccd26.
+You are the operational Lead now. Boot: CLAUDE.md (auto-loads) → NOW.md → newest LOGS.md rows → this file → lane-logs/cards/. Disk beats anything a chat remembers.
 
-## Machine / seals / money
-- SEALED + FLAT since the OPENUSDT receipt (evidence/first-autonomous-trade-2026-08-15.txt).
-  Both interlocks present; ACCEPT-ONE consumed/expired — none standing; first_autonomous_close_passed
-  EXISTS → 32 cap unlocked per physics. Governor knobs live: 10/day, 2.00 USDT, ignition 3 (env-clamped).
-- Tuner advisory-only (marker TUNER_ADVISORY on host + code honors it). Aliveness watchdog cron */2 live.
-- OWNER WORD today: reverse-basis borrow AUTHORIZED; capability MEASURED (borrowEnabled true, margin
-  account accessible; key margin-TRADE permission UNVERIFIED until first real margin action).
-  Never-list narrowed for reverse basis only. LOGS row 727b279.
-- Re-arm criterion standing: a config must clear fees+slippage on replay with margin → smallest cap same hour.
+## 1. The one method that worked all day — grind exactly like this
+- YOU NEVER GRIND. Codex grinds. `codex exec --skip-git-repo-check -s workspace-write -C <worktree> -c sandbox_workspace_write.network_access=false < lane-logs/cards/<ID>-task.txt > lane-logs/<ID>.log 2>&1` in the background. Drop the network flag ONLY for cards that name public data.binance.vision GETs. Every card starts with `/fast`.
+- CARD SHAPE (copy any file in lane-logs/cards/): one worker, one narrow ~15-20 min scope, EXACT files it may modify, the defect or question in one sentence with the measured fact that motivates it, hard boundaries, "run yourself" test line, "REPORT lane-logs/<ID>-report.txt max N rows". Language section of AGENTS.md binds every worker (clean, soft — the owner's hard law).
+- FLEET LAW: the PreToolUse hook (~/.claude/hooks/fleet-reminder.sh) counts live codex before every Bash/Write/Edit and tells you when it is lean (<4). When it says lean, DISPATCH before doing anything else. The owner has said this eight times; the hook now says it for him. Aim for 6-9 live; the day peaked at 9.
+- VERIFY WITH YOUR OWN HANDS: a worker report is a hypothesis. Before ANY commit: run the named tests yourself (`python3 -m unittest <modules>` — the exit-checked gate pattern: capture the summary line, `grep -q "^OK"` or refuse to commit), read the diff for money files, then commit with a message that states what was measured. Push lane branch; push to main only what has passed review.
+- MONEY FILES (src/job_runner.py, src/basis_position.py, src/margin_ops.py, src/basis_*.py) NEVER reach main on one pair of eyes: worker builds → you verify → fresh-eyes codex reviewer (card pattern: MRV*/BR* — attack list, CONFIRMED/SUSPECTED/PASS with file:line + trigger, MERGE-SAFE or FINDINGS-BLOCK) → repair card from the findings → re-review. Convergence signal: findings shrink round over round (6→3→1→0). Divergence signal (6→6→6): the SHAPE is wrong — stop patching, redesign (the additive position schema was shelved this way; the ledger rebuild converged in three rounds).
+- DEPLOY (host = EC2 via aws-connect/ssmrun.sh + xfer.sh; PTY drops heredocs — always xfer a script then run it): stage files under scratchpad, manifest rows `sha256 relpath [mode]` (ONE space, D2 tool), xfer to /home/ssm-user/deploy-stageN/, run /home/ssm-user/host_deploy_atomic.sh <staging> /home/ssm-user/quant-run/wave2-validate-h2 <manifest> <sha> — it gates the tick, renames atomically, verifies hashes AND modes, writes RELEASE last. Then verify RELEASE-NOW and hashes in the transcript. Never deploy multi-file without the tool (the tick raced a bare transfer once; a bare rename dropped an executable bit once — both scars are in evidence/).
+- WAITING LAW: never block a turn on a wait; background it and let the notification wake you. Foreground SSM calls with sleeps time out at 2 min — background them.
+- REPORT TO OWNER: plain words, numbers, MEASURED/INFERRED labels, and a progress bar block at every stop (format below). No victory tone. State limits out loud.
 
-## V2 pipeline (commander milestone) — exact stage
-- Tape COMPLETE: full-universe cohort 659 (358 both / 169 futures-only / 132 spot-only), 30d klines,
-  gaps=459 honest (study/out/v2/cohort_manifest.json;  21,052 pulled + 8,999 reused this round).
-- Stage A DONE 11:16:23Z on the FULL tape: 659 symbols, 27,781,995 minutes, 199,095 labelled
-  events -> study/out/v2/events.jsonl (935 MB, on the Mac, gitignored).
-- WINDOWS stage CRASHED at start: "events.jsonl line 197191 symbol is invalid" — one Stage-A
-  row carries a symbol the windower's validator rejects (almost certainly the non-ASCII listing
-  in the cohort; the tape pull logged it as a futures venue symbol). Precise, small: either
-  widen the windower's symbol charset or make Stage A emit an exchange-safe alias. NOT fixed —
-  frozen per the handover order. Pipeline script: /tmp/v2-pipeline.sh (stages gated, restart
-  from WINDOWS; Stage A output is good and need not rerun).
-- Remaining stages after that fix: windows -> selective aggTrades pull (tape_pull
-  --windows-file) -> stage_b -> policy_sim -> validate -> v2_result.json + evidence report.
-  The commander's deliverable rules are in study/ORDER-VOLUME-V2.txt; interface in
-  study/INTERFACE-V2.txt.
+## 2. Live state at handover (MEASURED)
+- MACHINE: SEALED (STOP-JOBS present), FLAT. Host RELEASE = fe4445b (MEASURED at 07:48Z: HOST-DEPLOY OK, runner sha 36403137…, mode 644, job_tick.sh -rwx------, D2 tool live). No governor lock stands.
+- OPEN RECEIPT LOOP (the ONE residual of the margin act): repay job mproofr-2c2a3027d877 posted (txId 401382497303) and the account is flat, but its receipt stands UNKNOWN; reconcile-margin returned RECONCILE_UNCONFIRMED MARGIN_CONFIRMATION_MISMATCH at 07:48Z even on release fe4445b. Root cause NOT yet diagnosed — first probe for you: run a signed GET-only history read filtered type=REPAY (script /home/ssm-user/margin-truth.py — add a REPAY-filtered call) and compare the row's fields to the receipt's expected_ledger_confirmation; the likely culprits, in order: (a) the repay history row's `principal` field is the amount incl. interest (2.5000387) vs the runner's expected principal-only form, (b) the row's origin/type field, (c) the reconcile evaluator's REPAY branch requiring a pre-snapshot delta the receipt cannot satisfy against a now-flat account. Whichever it is: repair card MJ17 (src/job_runner.py + tests, pattern of MJ9-MJ16), fresh-eyes verify, one-file deploy via the atomic tool, reconcile-margin again. This is receipt hygiene, NOT money risk — the exchange shows liability 0.
+- FIRST MARGIN ACT: CLOSED. Exchange truth: borrowed 0, interest 0, liability 0. Evidence: evidence/margin-proof-attempt1-2026-08-16.txt (b51224f). Cost 0.0000387 USDT. Margin key proven both directions.
+- MAIN = origin/main at ffad36e+ (records) with d79ecb3 (AB28) on top. Worktree lead2-v2fix carries lane commits; branch lane/lead2-v2fix. Canonical Desktop/quant is DIVERGED (UI seat's local commits) — never run pipelines from canonical; use the worktree.
+- CODEX LIVE at handover: B11 (BUILD-04 the ADD transition, src/basis_position.py — money-adjacent, needs BR-review before merge), BF2 (basis lock-in step 1: src/executable_gap.py, new file), plus the V2 volume chain (policy_sim → validate; output study/out/v2/v2_result.json when done — commit it + evidence + LOGS row; read it as a blind-spot map per the engine-completeness law). Their reports land in lane-logs/<ID>-report.txt.
+- HOOK: ~/.claude/hooks/fleet-reminder.sh wired in ~/.claude/settings.json PreToolUse Bash|Write|Edit. Leave it.
 
-## Basis engine state
-- src/basis_ladder.py + src/basis_events.py landed and green (laddered rungs, LIFO unwind,
-  reverse gated on borrow_power; violent-move dislocation events; intents only, no execution).
-  NOT integrated into the runtime; integration must honor the 16 DO-NOT-REBUILD gates
-  (study/donor/MINE-LESSONS.txt), especially: held state advances only on reconciled fills;
-  one execution path, never forked money truth; borrow capability is not reverse readiness.
-- Donor digests committed: study/donor/MINE-{BASIS,VOLUME,LESSONS}.txt. 12-item pull-permit
-  menu awaits the owner's per-item numbers (9 basis, 3 volume; candidates + costs inside).
+## 3. The design words (owner's to say — you carry the numbers)
+- BASIS: BUILD, REVERSE-FIRST. Measured: 524 executable lock-ins net median +0.51% after fees+slippage, 94% positive, indifferent to held/collapsed; 522/546 were REVERSE (spot above perp during pumps → short spot borrowed + long perp). Spec: study/design/BASIS-LOCKIN-SPEC.txt (123 rows). Assets: src/reverse_basis_lifecycle.py (14 states, reviewed), src/margin_ops.py + runner margin ops (live-proven), src/basis_ladder.py + basis_events.py (landed), BF2's executable_gap.py (in flight). Build order after BF2: executable-gap live reader wired to the stream → reverse rung intent → margin borrow (runner op, proven) → both legs through the canonical entry chain → LIFO unwind on gap close → repay. Each step tiny-live at ≤8 USDT through the job runner IN THE SAME CARD (money-first law). The reverse gate in basis_ladder opens ONLY on the owner's explicit word.
+- VOLUME: PARK vs ONE PROBE — the owner decides from study/design/VOLUME-VERDICT.txt (76 rows). Every entry surface loses at 1m-candle exits (OF3: 0/9 cells positive; best p99 R3 = -0.0108 pp/symbol-day). The one untested door: seconds-resolution tape exits on the OF2 p99 fire set. Do NOT run more volume studies without the owner's word — the record explicitly says so.
 
-## Live plumbing / rails / loops
-- Host rails: aws-connect ssmrun sleep=10 committed (baac939). PTY drops bulk paste — files
-  >32KB go as tgz bundles <32KB or 8KB chunks with host-side assembly + sha gates. sudoers
-  use_pty drains buffered stdin after the first sudo — batch privileged steps into ONE
-  root-side script, always xfer scripts then run, never inline heredocs.
-- Mac loops ui_sync.sh (Desktop/quant ui/ -> host, live-edit zone) and ui_pull.sh (host ->
-  ui/live, interval_ms declared) are DEAD as of handover (app restarts kill nohup children).
-  Restart both from /Users/cosmosgeek/Desktop/quant:
-    HOST_UI_ROOT=/home/ssm-user/quant-ui/ui nohup bash scripts/ui_sync.sh &
-    nohup bash scripts/ui_pull.sh &
-- Host services: quant-ui (8080, behind the owner's Cloudflare Access), quant-ui-mirror (5s),
-  cloudflared, cron runtime_tick */3 + job_tick 1m + aliveness */2 + knob_tuner hourly
-  (advisory). Old cosmos app in /opt/trash-cosmos-app-2026-08-14 (restore = move back+enable).
+## 4. Open work, in priority order (cards exist or are one line from existing)
+1. Finish the M2 receipt loop: confirm swap6 landed, repay receipt CLOSED, lock absent, evidence updated (add a CLOSE-2 line), NOW.md limitation row removed.
+2. B11 → verify → BR8 review card (copy BR6/BR7 shape: attack the ADD — double-execution on crash, STOP refusal, dust/stale-reconcile refusals, cap from schedule) → repair loop → merge BUILD-04.
+3. BF2 → verify → land; then BF3 (wire executable_gap to the live stream, read-only) → BF4 (reverse rung intent, offline) → BF5 (first tiny live reverse lock-in through the runner — needs the owner's reverse word AND a dislocation event; the machine hunts sealed until then).
+4. V2 chain result → commit + evidence + LOGS.
+5. Records: LOGS row per landing; NOW.md rewrite at each state change (N1 card shape).
+6. Owner words still open: permit numbers vs study/donor/PORT-PLANS.txt (2 ready, 9 heavy, 1 redesign), BNB fee float, re-arm criterion, both design words.
 
-## Monitors / background (this session's, all end with the session)
-- Pipeline monitor ended after reporting the WINDOWS crash. No live monitors carry over —
-  the successor arms its own. The deep-tape and pipeline logs live in this worktree's
-  lane-logs/ (gitignored): v2-tape.log, v2-pipeline.log, MINE-*.txt originals.
+## 5. Scars to never repeat (all recorded in evidence/ or LOGS)
+tick raced a multi-file bare transfer (deploy race); atomic rename dropped executable bit (mode regression); receipts from older releases lack newer fields (legacy shape → frozen field set + stricter substitute proof, never loosened checks); Binance history row "type" = origin class MANUAL/AUTO, direction is the query param; history rows lag the account by seconds (retry envelope 1/2/4s); relative-path launches from the Desktop cwd (always absolute paths in background commands); a study whose result looks too good (99% win) is conditional on something — find the survivorship before banking it.
 
-## Open owner words / queue
-- Permit menu numbers (12 donor pulls). BNB fee-float purchase (live buy — owner act only).
-  Re-arm word (bound by the standing criterion). Tuner stays advisory until changed.
-- In another seat's flight per its own message: R1 margin/borrow reconciliation core.
+## 6. Progress bar format (print at every stop)
+```
+MARGIN PROOF   ████████████████████ 100%
+POSITION RAIL  ██████████████████░░  88%  BUILD-04 building
+BASIS BUILD    ██░░░░░░░░░░░░░░░░░░  10%  step 1 (BF2) building — reverse-first
+VOLUME         ████████████████████ 100%  answered; owner's park/probe word open
+DESIGN WORDS   ███████████████████░  95%
+──────────────────────────────────────────
+OVERALL        ███████████████████░  ~95%   fleet: N codex live
+```
 
-## Worker-fleet operations note
-- codex workers die at report time under account rotation but their disk work has been
-  complete and green in every wave this session: verify from disk (compile + own test runs +
-  full suite), then commit with "workers died pre-report, Lead-verified" honesty. Detect true
-  completion by "tokens used" within the LAST 120 bytes of the lane log — prompt echo lies.
-
-Outgoing Lead: frozen after this push. Machine sealed; no dispatches, writes, or messages
-from the old seat. History questions welcome.
+Outgoing Lead: frozen after this push. History questions welcome via the record.
