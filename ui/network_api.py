@@ -635,8 +635,9 @@ def _receipt_id(now_ms):
 def _config_request(body):
     if not isinstance(body, dict): return None, "body must be a JSON object"
     key = body.get("key")
-    if key in CONFIG_ALLOWED and set(body) == {"key", "value"}:
+    if key in CONFIG_ALLOWED and set(body) in ({"key", "value"}, {"key", "value", "group"}):
         group, allowed = CONFIG_ALLOWED[key]
+        if "group" in body and body["group"] != group: return None, "%s belongs to group %s" % (key, group)
         value = body["value"]
         if not isinstance(value, int) or isinstance(value, bool) or value not in allowed: return None, "%s must be one of %s" % (key, list(allowed))
         return (key, group, value), None

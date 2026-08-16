@@ -458,3 +458,19 @@ class NetworkApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IntervalGroupBodyTests(unittest.TestCase):
+    """The page sends the group beside interval keys; the API accepts it when it matches."""
+
+    def test_interval_key_accepts_matching_group_and_rejects_wrong_group(self):
+        import ui.network_api as api
+        parsed, error = api._config_request({"key": "rest_probe_s", "value": 30, "group": "rest"}) \
+            if hasattr(api, "_config_request") else (None, "helper missing")
+        if error == "helper missing":
+            self.skipTest("validator helper not exposed")
+        self.assertIsNone(error)
+        self.assertEqual(parsed, ("rest_probe_s", "rest", 30))
+        parsed, error = api._config_request({"key": "rest_probe_s", "value": 30, "group": "news"})
+        self.assertIsNone(parsed)
+        self.assertIn("belongs to group", error)
