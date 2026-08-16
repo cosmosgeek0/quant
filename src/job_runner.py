@@ -105,6 +105,8 @@ MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
 MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
 MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
 MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
+# Margin history type records request origin, not BORROW or REPAY direction.
+MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 MARGIN_IDENTITY_KEY_RE = re.compile(
@@ -3531,20 +3533,19 @@ def _margin_history_confirmation(payload: Any, transaction_id: str,
     row = matches[0]
     if row.get("asset") != expected["asset"]:
         return None
-    if "type" not in row or row.get("type") != request_type:
+    if row.get("type") not in MARGIN_HISTORY_ORIGIN_TYPES:
         return None
     principal = _margin_decimal_text(row.get("principal"))
-    interest = _margin_decimal_text(row.get("interest"))
     status = row.get("status")
-    normalized_status = request_type + "_CONFIRMED" \
-        if status == "CONFIRMED" else status
+    if principal is None or status != "CONFIRMED":
+        return None
     confirmation = {
         "asset": row["asset"],
         "principal": principal,
-        "interest": interest,
-        "status": normalized_status,
+        "interest": "0",
+        "status": request_type + "_CONFIRMED",
     }
-    if principal is None or interest is None or confirmation != expected:
+    if confirmation != expected:
         return None
     return confirmation
 

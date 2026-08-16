@@ -115,18 +115,16 @@ class MarginTransport:
         if method == "GET" and path == jr.MARGIN_ENDPOINT_PATH:
             if self.history_payload is not None:
                 return self.history_kind, self.history_payload
-            transaction_id = str(
-                self.post_payload.get(
-                    "tranId", self.post_payload.get("txId", "")
-                )
+            transaction_id = self.post_payload.get(
+                "tranId", self.post_payload.get("txId", "")
             )
             return self.history_kind, {"rows": [{
                 "txId": transaction_id,
                 "asset": self.operation["asset"],
                 "principal": self.operation["amount"],
-                "interest": "0",
                 "status": "CONFIRMED",
-                "type": self.operation["type"],
+                "clientTag": "",
+                "type": "MANUAL",
             }]}
         if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
             if self.account_payload is not None:
@@ -1777,9 +1775,9 @@ class JobRunnerTests(unittest.TestCase):
             "txId": "7301",
             "asset": "USDT",
             "principal": "2",
-            "interest": "0",
             "status": "CONFIRMED",
-            "type": "BORROW",
+            "clientTag": "",
+            "type": "MANUAL",
         }]}
         self.margin_job("margin-disagree-a")
         self.margin_job("margin-disagree-b")
@@ -1799,6 +1797,59 @@ class JobRunnerTests(unittest.TestCase):
             1,
         )
 
+    def test_margin_history_confirms_real_binance_row_shape(self):
+        expected = {
+            "asset": "USDT",
+            "principal": "2.5",
+            "interest": "0",
+            "status": "BORROW_CONFIRMED",
+        }
+        real_row = {
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+
+        self.assertEqual(
+            jr._margin_history_confirmation(
+                {"rows": [real_row]}, "401344857108", expected, "BORROW"
+            ),
+            expected,
+        )
+        self.assertEqual(
+            jr._margin_history_confirmation(
+                {"rows": [dict(real_row, type="AUTO")]},
+                "401344857108", expected, "BORROW",
+            ),
+            expected,
+        )
+
+        self.margin.post_payload = {"tranId": 401344857108}
+        self.margin.history_payload = {"rows": [real_row]}
+        self.margin_job("margin-real-history", principal="2.5")
+
+        self.assertEqual(self.margin_tick(), 0)
+        result = self.results()[0]
+        self.assertEqual((result["verdict"], self.reason(result)), (
+            "OPEN", "BORROW_CONFIRMED",
+        ))
+        self.assertEqual(
+            self.margin_source(result)["ledger_confirmation"], expected
+        )
+        history_calls = [
+            call for call in self.margin.calls
+            if call[0] == "GET" and call[2] == jr.MARGIN_ENDPOINT_PATH
+        ]
+        self.assertEqual(len(history_calls), 1)
+        self.assertEqual(history_calls[0][3], {
+            "asset": "USDT",
+            "type": "BORROW",
+            "txId": "401344857108",
+        })
+
     def test_margin_history_rejects_target_identity_conflicts_and_duplicates(
             self):
         expected = {
@@ -1811,9 +1862,9 @@ class JobRunnerTests(unittest.TestCase):
             "txId": "7301",
             "asset": "USDT",
             "principal": "3",
-            "interest": "0",
             "status": "CONFIRMED",
-            "type": "BORROW",
+            "clientTag": "",
+            "type": "MANUAL",
         }
         cases = {
             "conflict": [
@@ -1839,9 +1890,9 @@ class JobRunnerTests(unittest.TestCase):
             "txId": "7301",
             "asset": "USDT",
             "principal": "3",
-            "interest": "0",
             "status": "CONFIRMED",
-            "type": "BORROW",
+            "clientTag": "",
+            "type": "MANUAL",
         }
         cases = {
             "near_miss": [dict(valid, tranID="7301")],
@@ -1917,20 +1968,40 @@ class JobRunnerTests(unittest.TestCase):
             "interest": "0",
             "status": "CONFIRMED",
         }
-        with_near_miss = dict(without_type, typ="BORROW")
+        with_near_miss = dict(without_type, typ="MANUAL")
         for row in (without_type, with_near_miss):
             self.assertIsNone(jr._margin_history_confirmation(
                 {"rows": [row]}, "7301", expected, "BORROW"
             ))
+
+    def test_margin_history_refuses_unknown_origin_type(self):
+        expected = {
+            "asset": "USDT",
+            "principal": "2.5",
+            "interest": "0",
+            "status": "BORROW_CONFIRMED",
+        }
+        row = {
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "BORROW",
+        }
+
+        self.assertIsNone(jr._margin_history_confirmation(
+            {"rows": [row]}, "401344857108", expected, "BORROW"
+        ))
 
     def test_margin_history_identity_conflict_freezes_unknown(self):
         valid = {
             "txId": "7301",
             "asset": "USDT",
             "principal": "3",
-            "interest": "0",
             "status": "CONFIRMED",
-            "type": "BORROW",
+            "clientTag": "",
+            "type": "MANUAL",
         }
         self.margin.history_payload = {"rows": [
             valid,
