@@ -10,9 +10,9 @@ from urllib.error import HTTPError, URLError; from urllib.parse import quote, un
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
-    from study import pull_daily_klines as house; from study import pump_census as census; from study import tape_pull
+    from study import pull_daily_klines as house; from study import pump_census as census; from study import stage_a, tape_pull
 except ImportError:
-    import pull_daily_klines as house; import pump_census as census; import tape_pull  # type: ignore
+    import pull_daily_klines as house; import pump_census as census; import stage_a, tape_pull  # type: ignore
 
 ROOT = Path(__file__).resolve().parents[1]; BASE = "https://data.binance.vision"
 DEST = ROOT / "study/data-1m-history"; RECENT = Path("/Users/cosmosgeek/Desktop/quant/study/data")
@@ -22,7 +22,7 @@ START_MS = int(datetime(2026, 2, 15, tzinfo=timezone.utc).timestamp() * 1000); C
 END_MS = int(datetime(2026, 8, 15, tzinfo=timezone.utc).timestamp() * 1000)
 # Six monthly 1m archives can be substantial, but 256 MiB per archive and
 # member is the acquisition's deliberate local boundary.
-MAX_BYTES, DISK_LIMIT, WORKERS = 268_435_456, 60_000_000_000, 4
+MAX_BYTES, DISK_LIMIT, COMPLEMENT_DISK_LIMIT, WORKERS = 268_435_456, 60_000_000_000, 20_000_000_000, 4
 
 
 class Missing(house.PullError): pass
@@ -157,6 +157,31 @@ def _pull(records: Mapping[str, Mapping[str, Any]], root: Path) -> Tuple[List[Re
     return results, completed, stopped
 
 
+def _pull_complements(records: Mapping[str, Mapping[str, Any]], root: Path) -> Tuple[List[Result], bool, int]:
+    jobs = [Job(name, row["venue"], month) for month in MONTHS for name, row in sorted(records.items())]
+    results: List[Result] = []; stopped = False; new_bytes = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        for start in range(0, len(jobs), WORKERS):
+            batch = jobs[start:start + WORKERS]
+            possible_new = sum(not job.path(root).exists() for job in batch) * MAX_BYTES
+            if new_bytes + possible_new > COMPLEMENT_DISK_LIMIT:
+                stopped = True
+                print(f"DISK_BOUNDARY | requests={len(results)}/{len(jobs)} | new_bytes={new_bytes} | bound={COMPLEMENT_DISK_LIMIT}", flush=True)
+                break
+            futures = [executor.submit(_download, job, root) for job in batch]
+            for future in as_completed(futures):
+                result = future.result(); results.append(result)
+                if result.status == "DOWNLOADED": new_bytes += result.size
+                if result.status in {"GAP", "REFUSED", "ERROR"}: print(_progress(result), flush=True)
+                ordinal = len(results)
+                if ordinal % 100 == 0 or ordinal == len(jobs):
+                    counts = Counter(row.status for row in results)
+                    print(f"PROGRESS | requests={ordinal}/{len(jobs)} | downloaded={counts['DOWNLOADED']} | "
+                          f"skipped={counts['SKIPPED']} | gaps={counts['GAP']} | refused={counts['REFUSED']} | "
+                          f"errors={counts['ERROR']} | new_bytes={new_bytes}", flush=True)
+    return results, stopped, new_bytes
+
+
 def _scan_one(item: Tuple[str, Mapping[str, Any], Path, Path, Tuple[str, ...]]) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
     symbol, record, root, recent, months = item; prefix = "spot" if record["venue"] == "spot" else "futures/um"
     paths = [root / prefix / "monthly/klines" / symbol / "1m" / f"{symbol}-1m-{month}.zip" for month in months] + sorted((recent / prefix / "daily/klines" / symbol / "1m").glob(f"{symbol}-1m-*.zip"))
@@ -226,11 +251,22 @@ def _payload(metadata: Mapping[str, Any], results: Sequence[Result], months: Seq
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--dest", type=Path, default=DEST); parser.add_argument("--recent-data", type=Path, default=RECENT)
     parser.add_argument("--long-lows", type=Path, default=LOWS); parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument("--missing-both-venues", action="store_true")
     args = parser.parse_args(argv)
     try:
         metadata, records = census._metadata(args.long_lows)
         if len(records) != 659: raise census.CensusError(f"AB5 universe has {len(records)} symbols, expected 659")
         for name in records: house.symbol(name)
+        if args.missing_both_venues:
+            both = {row.symbol for row in stage_a.discover_market_tapes(args.recent_data) if row.venue_class == "both"}
+            if not both or not both <= records.keys(): raise census.CensusError("both-venue selection differs from the census universe")
+            complements = {name: {**records[name], "venue": "futures" if records[name]["venue"] == "spot" else "spot"}
+                           for name in both}
+            print(f"SELECTION | both_symbols={len(complements)} | requests={len(complements) * len(MONTHS)} | workers={WORKERS}", flush=True)
+            results, stopped, new_bytes = _pull_complements(complements, args.dest); counts = Counter(row.status for row in results)
+            print(f"DONE | both_symbols={len(complements)} | downloaded={counts['DOWNLOADED']} | skipped={counts['SKIPPED']} | "
+                  f"gaps={counts['GAP']} | refused={counts['REFUSED']} | errors={counts['ERROR']} | new_bytes={new_bytes}", flush=True)
+            return 0 if not stopped and counts["REFUSED"] == counts["ERROR"] == 0 else 2
         results, months, stopped = _pull(records, args.dest)
         episodes, scan = _scan(records, args.dest, args.recent_data, months)
         if not episodes: raise census.CensusError("census found no proved pump episodes")
@@ -238,7 +274,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         counts = Counter(row.status for row in results)
         print(f"DONE | symbols={len(records)} | episodes={len(episodes)} | downloaded={counts['DOWNLOADED']} | skipped={counts['SKIPPED']} | gaps={counts['GAP']} | refused={counts['REFUSED']} | errors={counts['ERROR']}", flush=True)
         return 0 if not stopped and counts["REFUSED"] == counts["ERROR"] == 0 else 2
-    except (OSError, UnicodeError, ValueError, house.PullError, census.CensusError, census.absorption.AbsorptionError) as error:
+    except (OSError, UnicodeError, ValueError, house.PullError, census.CensusError, census.absorption.AbsorptionError, stage_a.StageAError) as error:
         print(f"census pull: {error}", file=sys.stderr); return 1
 
 
