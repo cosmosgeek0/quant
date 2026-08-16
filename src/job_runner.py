@@ -2023,22 +2023,16 @@ def _position_mark_price(rows: Any, symbol: str) -> Optional[Decimal]:
         return None
 
 
-def _momentum_measure(symbol: str) -> Dict[str, Any]:
+def _momentum_measure(symbol: str, require_target_leverage: bool = True) -> Dict[str, Any]:
+    leverage = None
     try:
-        risks = futures_hand.signed_read(
-            "/fapi/v3/positionRisk", {"symbol": symbol},
-            "momentum position-risk read",
-        )
-        account = futures_hand.signed_read(
-            "/fapi/v3/account", None, "momentum account-position read"
-        )
-        orders = futures_hand.signed_read(
-            "/fapi/v1/openOrders", {"symbol": symbol},
-            "momentum open-orders read",
-        )
-        _configuration, leverage = futures_hand.read_symbol_configuration()
-    except (futures_hand.CapabilityBlocked,
-            futures_hand.PreflightError) as error:
+        risks = futures_hand.signed_read("/fapi/v3/positionRisk", {"symbol": symbol}, "momentum position-risk read")
+        account = futures_hand.signed_read("/fapi/v3/account", None, "momentum account-position read")
+        orders = futures_hand.signed_read("/fapi/v1/openOrders",
+            {"symbol": symbol}, "momentum open-orders read")
+        if require_target_leverage:
+            _configuration, leverage = futures_hand.read_symbol_configuration()
+    except (futures_hand.CapabilityBlocked, futures_hand.PreflightError) as error:
         raise MomentumStateError(
             "momentum exchange state is unreadable: %s" % error
         ) from None
@@ -2053,7 +2047,7 @@ def _momentum_measure(symbol: str) -> Dict[str, Any]:
     if not isinstance(orders, list) or any(
             not isinstance(order, dict) for order in orders):
         raise MomentumStateError("momentum open-orders response is invalid")
-    if type(leverage) is not int or leverage != futures_hand.TARGET_LEVERAGE:
+    if require_target_leverage and (type(leverage) is not int or leverage != futures_hand.TARGET_LEVERAGE):
         raise MomentumStateError("momentum leverage is not proven 1x")
     return {
         "qty": risk_qty,
@@ -5488,8 +5482,7 @@ def _reverse_exposure_reason(
     return "OPEN_EXPOSURE:" + (",".join(standing) if standing else "KNOWN")
 
 
-def _run_reverse_mechanics(
-        job: Job, paths: Dict[str, str],
+def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
         request: Optional[Callable[..., Tuple[str, Any]]],
         governor_token: str, sha: str, validated_job_digest: str) -> Outcome:
     source_path = os.path.join(paths["receipts"], "reverse-%s.json" % job.job_id)
@@ -5500,92 +5493,70 @@ def _run_reverse_mechanics(
         "intent_id": job.intent_id, "client_tag": job.client_tag, "sha": sha,
         "started_utc": _utc_text(_utc_now()), "mutation_attempts": 0,
         "verdict": "PREFLIGHT", "reason": "", "plan": None, "market": {},
-        "ladder_actions": [], "legs": [],
-    }
+        "ladder_actions": [], "legs": []}
     if governor_token:
-        receipt.update({"governor_token": governor_token,
-                        "governor_release": "PENDING"})
+        receipt.update({"governor_token": governor_token, "governor_release": "PENDING"})
     try:
         _persist_margin_source(source_path, receipt, create=True)
     except Exception:
-        return Outcome("UNKNOWN", 4, source_path if os.path.isfile(source_path)
-                       else "", "REVERSE_READY_PERSISTENCE_FAILED")
+        return Outcome("UNKNOWN", 4, source_path if os.path.isfile(source_path) else "", "REVERSE_READY_PERSISTENCE_FAILED")
     trade_fills: List[Dict[str, str]] = []
 
     def finish(verdict: str, code: int, reason: str) -> Outcome:
-        result = _finish_margin_source(
-            receipt, source_path, verdict, code, reason, _utc_now())
+        result = _finish_margin_source(receipt, source_path, verdict, code, reason, _utc_now())
         return Outcome(
             result.verdict, result.exit_code, result.receipt_path, result.reason,
             _momentum_ledger(trade_fills, closed=result.verdict == "CLOSED"))
 
     try:
         transport = request or basis_executor.live_request_factory(
-            os.environ.get("BINANCE_API_KEY", ""),
-            os.environ.get("BINANCE_API_SECRET", ""))
+            os.environ.get("BINANCE_API_KEY", ""), os.environ.get("BINANCE_API_SECRET", ""))
     except Exception:
         return finish("UNKNOWN", 4, "REVERSE_TRANSPORT_UNREADABLE")
 
     previous_http = futures_hand.http
 
     def reverse_http(method, path, params=None, signed=False):
-        return transport(method, basis_executor.USDM.base_url, path,
-                         params or {}, signed)
+        return transport(method, basis_executor.USDM.base_url, path, params or {}, signed)
 
     futures_hand.http = reverse_http
     try:
         try:
-            spot = _spot_market_context(_spot_state(
-                job.symbol, sha, paths["receipts"], "reverse-" + job.job_id,
-                transport), job.effective_notional, margin_required=True)
+            spot = _spot_market_context(_spot_state(job.symbol, sha,
+                paths["receipts"], "reverse-" + job.job_id, transport),
+                job.effective_notional, margin_required=True)
             account = _reverse_read(
-                transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH,
-                {}, True, "REVERSE_MARGIN_ACCOUNT")
+                transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH, {}, True, "REVERSE_MARGIN_ACCOUNT")
             liability = _margin_account_liability(account, job.borrow_asset)
             balances = _spot_balances(account, job.borrow_asset)
             rows = account.get("userAssets") if isinstance(account, dict) else ()
-            matches = [row for row in rows if isinstance(row, dict)
-                       and row.get("asset") == job.borrow_asset]
+            matches = [row for row in rows if isinstance(row, dict) and row.get("asset") == job.borrow_asset]
             if liability is None or len(matches) != 1:
                 raise ReverseReadUnknown("REVERSE_MARGIN_ACCOUNT_UNREADABLE")
             asset_row = matches[0]
             borrowable = [_momentum_decimal(asset_row[name], "reverse borrowable")
-                          for name in ("maxBorrowable", "borrowable",
-                                      "maxBorrowableAmount")
-                          if name in asset_row]
-            interest = [_momentum_decimal(
-                asset_row[name], "reverse hourly interest", allow_zero=True)
-                for name in ("interestRateHourly", "hourlyInterestRate",
-                             "interestRate") if name in asset_row]
+                          for name in ("maxBorrowable", "borrowable", "maxBorrowableAmount") if name in asset_row]
+            interest = [_momentum_decimal(asset_row[name], "reverse hourly interest", allow_zero=True)
+                for name in ("interestRateHourly", "hourlyInterestRate", "interestRate") if name in asset_row]
             if not borrowable or len(set(borrowable)) != 1 \
                     or not interest or len(set(interest)) != 1:
                 raise ReverseReadUnknown("REVERSE_BORROW_FACTS_UNREADABLE")
             _configure_futures_hand(paths["receipts"])
             try:
-                hand_plan = futures_hand.preflight(
-                    job.effective_notional,
+                hand_plan = futures_hand.preflight(job.effective_notional,
                     Decimal(os.environ.get("MAX_SLIPPAGE_BPS", "10")), "BUY")
             except futures_hand.CapabilityBlocked as error:
-                raise ReverseReadUnknown(
-                    "REVERSE_FUTURES_PREFLIGHT_UNREADABLE") from error
+                raise ReverseReadUnknown("REVERSE_FUTURES_PREFLIGHT_UNREADABLE") from error
             except futures_hand.PreflightError as error:
-                raise JobRefusal("REVERSE_FUTURES_PREFLIGHT: %s" % error) \
-                    from None
-            if hand_plan.get("current_leverage") != futures_hand.TARGET_LEVERAGE:
-                raise JobRefusal("REVERSE_FUTURES_LEVERAGE_REFUSED")
-            plan_result = plan_reverse_mechanics(
-                job.symbol, job.effective_notional,
-                {"step": spot["step"], "min_notional": spot["min_notional"],
-                 "price": spot["ask"]},
-                {"step": hand_plan["step"],
-                 "min_notional": hand_plan["min_notional"],
-                 "price": hand_plan["limit_price"]},
-                job.borrow_asset, borrowable[0], interest[0], job.intent_id,
-                job.client_tag, limits)
+                raise JobRefusal("REVERSE_FUTURES_PREFLIGHT: %s" % error) from None
+            plan_result = plan_reverse_mechanics(job.symbol, job.effective_notional,
+                {"step": spot["step"], "min_notional": spot["min_notional"], "price": spot["ask"]},
+                {"step": hand_plan["step"], "min_notional": hand_plan["min_notional"],
+                 "price": hand_plan["limit_price"]}, job.borrow_asset, borrowable[0],
+                interest[0], job.intent_id, job.client_tag, limits)
             if not isinstance(plan_result, reverse_mechanics.ReversePlan):
                 reason = getattr(plan_result, "reason", "REVERSE_PLAN_REFUSED")
-                raise JobRefusal(reason if type(reason) is str
-                                 else "REVERSE_PLAN_REFUSED")
+                raise JobRefusal(reason if type(reason) is str else "REVERSE_PLAN_REFUSED")
             plan = plan_result
             if plan.base_qty > hand_plan["quantity"]:
                 raise JobRefusal("REVERSE_FUTURES_QUANTITY_REFUSED")
@@ -5601,76 +5572,60 @@ def _run_reverse_mechanics(
 
         initial_base_free = balances[job.borrow_asset]
         hand_plan = dict(hand_plan)
-        hand_plan.update({
-            "quantity": plan.base_qty,
-            "max_fill_notional": plan.base_qty * hand_plan["limit_price"],
-        })
-        receipt["market"] = {
-            "spot_bid": _decimal_text(spot["bid"]),
-            "spot_ask": _decimal_text(spot["ask"]),
-            "spot_step": _decimal_text(spot["step"]),
+        hand_plan["quantity"] = plan.base_qty
+        hand_plan["max_fill_notional"] = plan.base_qty * hand_plan["limit_price"]
+        receipt["market"] = {"spot_bid": _decimal_text(spot["bid"]),
+            "spot_ask": _decimal_text(spot["ask"]), "spot_step": _decimal_text(spot["step"]),
             "spot_min_notional": _decimal_text(spot["min_notional"]),
-            "futures_limit_price": _decimal_text(hand_plan["limit_price"]),
-        }
+            "futures_limit_price": _decimal_text(hand_plan["limit_price"])}
         try:
             _persist_margin_source(source_path, receipt)
         except Exception:
-            return Outcome("UNKNOWN", 4, source_path,
-                           "REVERSE_RECEIPT_PERSISTENCE_FAILED")
+            return Outcome("UNKNOWN", 4, source_path, "REVERSE_RECEIPT_PERSISTENCE_FAILED")
 
         def exchange_truth():
-            current = _reverse_read(
-                transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH,
-                {}, True, "REVERSE_MARGIN_ACCOUNT")
-            current_liability = _margin_account_liability(
-                current, job.borrow_asset)
+            current = _reverse_read(transport, basis_executor.SPOT.base_url,
+                MARGIN_ACCOUNT_PATH, {}, True, "REVERSE_MARGIN_ACCOUNT")
+            current_liability = _margin_account_liability(current, job.borrow_asset)
             if current_liability is None:
                 raise ReverseReadUnknown("REVERSE_MARGIN_ACCOUNT_UNREADABLE")
-            current_free = _spot_balances(
-                current, job.borrow_asset)[job.borrow_asset]
+            current_free = _spot_balances(current, job.borrow_asset)[job.borrow_asset]
             try:
-                futures = _momentum_measure(job.symbol)
+                futures = _momentum_measure(job.symbol, any(
+                    isinstance(row, dict) and row.get("leg") == reverse_mechanics.FUTURES_LONG_OPEN
+                    and row.get("mutation_attempts") == 1
+                    for row in receipt["legs"]))
             except MomentumStateError as error:
-                raise ReverseReadUnknown(
-                    "REVERSE_FUTURES_POSITION_UNREADABLE") from error
+                raise ReverseReadUnknown("REVERSE_FUTURES_POSITION_UNREADABLE") from error
             spot_orders = _reverse_read(
-                transport, basis_executor.SPOT.base_url,
-                basis_executor.SPOT_OPEN_ORDERS_PATH, {"symbol": job.symbol},
-                True, "REVERSE_SPOT_OPEN_ORDERS")
+                transport, basis_executor.SPOT.base_url, basis_executor.SPOT_OPEN_ORDERS_PATH,
+                {"symbol": job.symbol}, True, "REVERSE_SPOT_OPEN_ORDERS")
             if not isinstance(spot_orders, list):
-                raise ReverseReadUnknown(
-                    "REVERSE_SPOT_OPEN_ORDERS_UNREADABLE")
+                raise ReverseReadUnknown("REVERSE_SPOT_OPEN_ORDERS_UNREADABLE")
             return reverse_mechanics.ExchangeTruth(
                 Decimal(current_liability["total_liability"]),
-                current_free - initial_base_free, futures["qty"]), {
-                "spot_open_orders": len(spot_orders),
-                "futures_open_orders": futures["open_orders"],
-            }
+                current_free - initial_base_free, futures["qty"]), {"spot_open_orders": len(spot_orders),
+                "futures_open_orders": futures["open_orders"]}
 
         def final_authority(row, leg, params):
-            reason, checked, digests, stopped = _margin_post_authority(
-                job, paths, {"params": dict(params)}, dict(params),
-                validated_job_digest,
-                reverse_entry=leg.name in REVERSE_ENTRY_LEGS)
+            reason, checked, digests, stopped = _margin_post_authority(job, paths,
+                {"params": dict(params)}, dict(params),
+                validated_job_digest, reverse_entry=leg is None or leg.name in REVERSE_ENTRY_LEGS)
             authority = {
                 "authority_checked_utc": _utc_text(checked),
                 "authority_digests": digests,
-                "authority_stop_jobs_present": stopped,
-            }
+                "authority_stop_jobs_present": stopped}
             row.update(authority)
             receipt.update(authority)
             return reason
 
-        def close_leg(row, status, reason, amounts=(), fills=None, fees=None,
-                      net=None):
+        def close_leg(row, status, reason, amounts=(), fills=None, fees=None, net=None):
             if isinstance(net, Decimal):
                 row["net_base_after_fees"] = _decimal_text(net)
-            authority_names = ("authority_checked_utc", "authority_digests",
-                               "authority_stop_jobs_present")
+            authority_names = ("authority_checked_utc", "authority_digests", "authority_stop_jobs_present")
             if "authority_checked_utc" in row:
                 receipt.update({name: row[name] for name in authority_names})
-            _reverse_finish_leg(
-                receipt, source_path, row, status, reason, fills, fees)
+            _reverse_finish_leg(receipt, source_path, row, status, reason, fills, fees)
             return status, tuple(amounts), reason
 
         def margin_mutation(leg):
@@ -5809,32 +5764,73 @@ def _run_reverse_mechanics(
         def futures_order(leg):
             try:
                 if leg.name == reverse_mechanics.FUTURES_LONG_OPEN:
-                    order_plan = dict(hand_plan)
-                    notional = leg.base_qty * order_plan["limit_price"]
+                    order_plan = dict(hand_plan); notional = leg.base_qty * order_plan["limit_price"]
                     if leg.base_qty > order_plan["quantity"] \
                             or notional < order_plan["min_notional"] \
                             or notional > plan.quote_cap:
-                        raise futures_hand.PreflightError(
-                            "reverse long quantity is outside its bounds")
+                        raise futures_hand.PreflightError("reverse long quantity is outside its bounds")
                     order_plan["quantity"] = leg.base_qty
-                    intent = futures_hand.open_intent(
-                        "BUY", order_plan, leg.client_id_seed)
+                    intent = futures_hand.open_intent("BUY", order_plan, leg.client_id_seed)
                 else:
-                    intent = futures_hand.close_intent(
-                        "SELL", leg.base_qty, leg.client_id_seed)
-            except (ArithmeticError, futures_hand.PreflightError,
-                    TypeError, ValueError):
-                row = _reverse_start_leg(
-                    receipt, source_path, leg.name, leg.client_id_seed)
-                return close_leg(row, reverse_mechanics.FAILED,
-                                 "FUTURES_ORDER_REFUSED")
-            row = _reverse_start_leg(
-                receipt, source_path, leg.name, leg.client_id_seed, intent)
+                    intent = futures_hand.close_intent("SELL", leg.base_qty, leg.client_id_seed)
+            except (ArithmeticError, futures_hand.PreflightError, TypeError, ValueError):
+                row = _reverse_start_leg(receipt, source_path, leg.name, leg.client_id_seed)
+                return close_leg(row, reverse_mechanics.FAILED, "FUTURES_ORDER_REFUSED")
+            row = _reverse_start_leg(receipt, source_path, leg.name, leg.client_id_seed, intent)
+            if leg.name == reverse_mechanics.FUTURES_LONG_OPEN:
+                target = futures_hand.TARGET_LEVERAGE; leverage_params = {"symbol": job.symbol, "leverage": str(target)}
+                leverage = {"target": target, "mutation_attempts": 0,
+                    "intent": {"method": "POST", "path": "/fapi/v1/leverage",
+                               "params": dict(leverage_params)}}
+                receipt["leverage"] = leverage
+                def leverage_request(method, base_url, path, params=None, signed=False):
+                    values = dict(params or {})
+                    if method == "POST":
+                        refusal = final_authority(leverage, None, values)
+                        if refusal:
+                            leverage.update({"verdict": "REFUSED", "reason": refusal}); raise JobRefusal(refusal)
+                        leverage.update({"mutation_attempts": 1,
+                            "mutation_started_utc": _utc_text(_utc_now())})
+                        receipt["mutation_attempts"] += 1; _persist_margin_source(source_path, receipt)
+                    try:
+                        result = transport(method, base_url, path, values, signed)
+                    except BaseException:
+                        result = ("unclear", {})
+                    kind, payload = result if type(result) is tuple and len(result) == 2 else ("unreadable", {})
+                    if method == "POST":
+                        reported = payload.get("leverage", "UNKNOWN") if isinstance(payload, dict) else "UNKNOWN"
+                        leverage["submission"] = {"kind": kind if type(kind) is str else "unreadable", "reported_leverage": reported}
+                        leverage.update({"verdict": "SUBMITTED" if kind == "ok" else "UNKNOWN",
+                                         "reason": "" if kind == "ok" else "LEVERAGE_UNPROVEN"})
+                    else:
+                        measured, error = set_leverage_1x.read_leverage(lambda *_args: (kind, payload), job.symbol)
+                        known = measured if measured is not None else "UNKNOWN"; proven = measured == target
+                        if "before" not in leverage:
+                            leverage.update({"before": known, "read_reason": error,
+                                "after": known if proven else "UNKNOWN",
+                                "verdict": "PROVEN" if proven else "UNKNOWN",
+                                "reason": "" if proven else "LEVERAGE_UNPROVEN"})
+                        else:
+                            leverage["confirmation"] = {"leverage": known, "reason": error, "checked_utc": _utc_text(_utc_now())}
+                            leverage.update({"verdict": "PROVEN" if proven else ("UNKNOWN" if measured is None else "REFUSED"),
+                                "reason": "" if proven else ("LEVERAGE_UNPROVEN" if measured is None else "LEVERAGE_NOT_1X")})
+                    _persist_margin_source(source_path, receipt)
+                    return kind, payload
+                try:
+                    leverage_code = set_leverage_1x.run(job.symbol, leverage_request)
+                except JobRefusal as error:
+                    return close_leg(row, reverse_mechanics.FAILED, error.reason)
+                except BaseException:
+                    leverage.update({"verdict": "UNKNOWN", "reason": "LEVERAGE_UNPROVEN"}); return close_leg(row, reverse_mechanics.UNKNOWN, leverage["reason"])
+                if leverage_code:
+                    status = reverse_mechanics.FAILED if leverage.get("verdict") == "REFUSED" else reverse_mechanics.UNKNOWN
+                    return close_leg(row, status, leverage["reason"])
             refusal = final_authority(row, leg, intent)
             if refusal:
+                if leg.name == reverse_mechanics.FUTURES_LONG_OPEN:
+                    receipt["leverage"].update({"verdict": "REFUSED", "reason": refusal})
                 return close_leg(row, reverse_mechanics.FAILED, refusal)
-            row.update({"mutation_attempts": 1,
-                        "submitted_utc": _utc_text(_utc_now())})
+            row.update({"mutation_attempts": 1, "submitted_utc": _utc_text(_utc_now())})
             _persist_margin_source(source_path, receipt)
             query, order, response_fills, post_kind = _momentum_submit(intent)
             if query != "terminal":
@@ -5926,6 +5922,9 @@ def _run_reverse_mechanics(
                     "spot_open_orders": 0, "futures_open_orders": 0,
                     "dust": _canonical_decimal_text(plan.dust),
                 }
+                if entry_failure and receipt.get("leverage", {}).get(
+                        "verdict") == "REFUSED":
+                    return finish("REFUSED", 2, entry_failure)
                 if entry_failure and not entry_completed:
                     return finish("REFUSED", 2, entry_failure)
                 reason = "REVERSE_MECHANICS_CLOSED" if not entry_failure \
@@ -5957,7 +5956,8 @@ def _run_reverse_mechanics(
                 status, amounts, reason = margin_order(leg)
             else:
                 status, amounts, reason = futures_order(leg)
-            receipt["mutation_attempts"] = sum(
+            receipt["mutation_attempts"] = int(
+                receipt.get("leverage", {}).get("mutation_attempts", 0)) + sum(
                 int(row.get("mutation_attempts", 0)) for row in receipt["legs"]
                 if isinstance(row, dict))
             ledger_row: Dict[str, Any] = {
@@ -6035,13 +6035,13 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
             blocked = _momentum_roundtrip_allowed(paths)
             if blocked is not None:
                 return blocked
-        if not _ensure_leverage_1x(job.symbol):
-            return Outcome("UNKNOWN", 4, "", "LEVERAGE_UNPROVEN")
         if job.op == REVERSE_OP:
             return _run_reverse_mechanics(
                 job, paths, margin_request, governor_token, sha,
                 validated_job_digest,
             )
+        if not _ensure_leverage_1x(job.symbol):
+            return Outcome("UNKNOWN", 4, "", "LEVERAGE_UNPROVEN")
         if job.op == "FUTURES_ROUNDTRIP":
             return _run_futures(receipt_dir, futures_entry)
         if job.op == "MOMENTUM_ROUNDTRIP":

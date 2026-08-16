@@ -236,6 +236,11 @@ class ReverseTransport:
         self.preflight_fault = ""
         self.final_open_venue = ""
         self.stop_on_history_get = False
+        self.stop_on_symbol_config_read = 0
+        self.symbol_config_reads = 0
+        self.symbol_config_script = []
+        self.current_leverage = 1
+        self.leverage_post_applies = True
         self.price = Decimal("100")
         self.free = Decimal("0.5")
         self.borrowed = Decimal("0")
@@ -436,7 +441,19 @@ class ReverseTransport:
             return "ok", ([{"symbol": "TSTUSDT"}]
                           if preflight or final else [])
         if method == "GET" and path == "/fapi/v1/symbolConfig":
-            return "ok", [{"symbol": "TSTUSDT", "leverage": "1"}]
+            self.symbol_config_reads += 1
+            if self.stop_on_symbol_config_read == self.symbol_config_reads \
+                    and self.stop_path:
+                Path(self.stop_path).touch()
+            leverage = self.symbol_config_script.pop(0) \
+                if self.symbol_config_script else self.current_leverage
+            if leverage == "unclear":
+                return "unclear", {}
+            if leverage == "interrupt":
+                raise KeyboardInterrupt
+            return "ok", [{
+                "symbol": "TSTUSDT", "leverage": str(leverage),
+            }]
         if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
             return "ok", self.account()
         if method == "GET" and path == jr.basis_executor.USDM_POSITION_PATH:
@@ -464,6 +481,11 @@ class ReverseTransport:
             )
         if method == "POST" and path == jr.basis_executor.USDM.order_path:
             return self.futures_order(params)
+        if method == "POST" and path == "/fapi/v1/leverage" \
+                and params.get("leverage") == "1":
+            if self.leverage_post_applies:
+                self.current_leverage = 1
+            return "ok", {"leverage": 1}
         if method == "GET" and path == jr.basis_executor.USDM.order_path:
             order = self.futures_orders.get(params["origClientOrderId"])
             return ("ok", order) if order is not None else (
@@ -5643,6 +5665,149 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(source["legs"][0]["submission"]["transaction_id"])
         self.assertTrue(source["legs"][-1]["submission"]["transaction_id"])
         self.assertEqual(source["governor_release"], "RELEASED")
+
+    def test_reverse_leverage_step_uses_final_authority_before_post(self):
+        cases = (
+            ("sealed", [1, 5], 2, 2),
+            ("already-one", [], 0, 0),
+            ("change-to-one", [1, 5], 0, 0),
+        )
+        for name, script, stop_read, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-leverage-" + name, root)
+                stop_path = os.path.join(root, "STOP-JOBS")
+                transport = ReverseTransport(stop_path)
+                transport.symbol_config_script = list(script)
+                transport.stop_on_symbol_config_read = stop_read
+
+                self.assertEqual(self.reverse_tick(transport, root), expected)
+
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                source = self.reverse_source(result, root)
+                posts = [call for call in transport.calls
+                         if call[0] == "POST"]
+                leverage_posts = [call for call in posts
+                                  if call[2] == "/fapi/v1/leverage"]
+                entry_posts = [call for call in posts
+                               if call[2] == jr.basis_executor.USDM.order_path
+                               and str(call[3].get("reduceOnly", "")).lower()
+                               != "true"]
+                leverage = source["leverage"]
+                if stop_read:
+                    self.assertEqual(leverage_posts, [])
+                    self.assertEqual(entry_posts, [])
+                    self.assertTrue(os.path.isfile(stop_path))
+                    self.assertEqual(result["verdict"], "REFUSED")
+                    self.assertEqual(result["exit_code"], 2)
+                    self.assertEqual(
+                        self.reason(result), "STOP_JOBS_SEALED")
+                    self.assertEqual(source["reason"], "STOP_JOBS_SEALED")
+                    self.assertEqual(leverage["mutation_attempts"], 0)
+                    self.assertEqual(leverage["verdict"], "REFUSED")
+                    self.assertEqual(
+                        [row["leg"] for row in source["legs"]],
+                        ["BORROW", "MARGIN_SELL", "FUTURES_LONG_OPEN",
+                         "MARGIN_BUY", "REPAY"])
+                    self.assertTrue(source["authority_stop_jobs_present"])
+                elif not script:
+                    self.assertEqual(leverage_posts, [])
+                    self.assertEqual(leverage["mutation_attempts"], 0)
+                    self.assertEqual((leverage["before"], leverage["after"]),
+                                     (1, 1))
+                    self.assertEqual(
+                        [row["leg"] for row in source["legs"]],
+                        list(jr.reverse_mechanics.LEG_ORDER))
+                    self.assertEqual(len(posts), 6)
+                else:
+                    self.assertEqual(len(leverage_posts), 1)
+                    self.assertEqual(len(entry_posts), 1)
+                    paths = [call[2] for call in posts]
+                    self.assertLess(paths.index(jr.MARGIN_ENDPOINT_PATH),
+                                    paths.index("/fapi/v1/leverage"))
+                    self.assertLess(paths.index(
+                        jr.margin_orders.MARGIN_ORDER_PATH),
+                        paths.index("/fapi/v1/leverage"))
+                    self.assertLess(paths.index("/fapi/v1/leverage"),
+                                    paths.index(jr.basis_executor.USDM.order_path))
+                    leverage_index = next(index for index, call in enumerate(
+                        transport.calls) if call[0] == "POST"
+                        and call[2] == "/fapi/v1/leverage")
+                    entry_index = next(index for index, call in enumerate(
+                        transport.calls) if call[0] == "POST"
+                        and call[2] == jr.basis_executor.USDM.order_path
+                        and str(call[3].get("reduceOnly", "")).lower() != "true")
+                    self.assertEqual(
+                        [(transport.calls[index][0], transport.calls[index][2])
+                         for index in range(leverage_index - 1, entry_index + 1)],
+                        [("GET", "/fapi/v1/symbolConfig"),
+                         ("POST", "/fapi/v1/leverage"),
+                         ("GET", "/fapi/v1/symbolConfig"),
+                         ("POST", jr.basis_executor.USDM.order_path)])
+                    self.assertEqual(leverage["mutation_attempts"], 1)
+                    self.assertEqual(leverage["submission"]["kind"], "ok")
+                    self.assertEqual(leverage["confirmation"]["leverage"], 1)
+                    self.assertEqual(len(posts), 7)
+                    self.assertEqual(transport.current_leverage, 1)
+
+    def test_reverse_leverage_confirmation_interruption_stays_unknown(self):
+        for event in ("unclear", "interrupt"):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-leverage-confirm-" + event, root)
+                transport = ReverseTransport(os.path.join(root, "STOP-JOBS"))
+                transport.symbol_config_script = [1, 5, event]
+
+                self.assertEqual(self.reverse_tick(transport, root), 4)
+
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                source = self.reverse_source(result, root)
+                leverage = source["leverage"]
+                self.assertEqual(result["verdict"], "UNKNOWN")
+                self.assertEqual(leverage["mutation_attempts"], 1)
+                self.assertEqual(leverage["submission"]["kind"], "ok")
+                self.assertEqual(leverage["confirmation"]["leverage"], "UNKNOWN")
+                self.assertEqual(leverage["verdict"], "UNKNOWN")
+                self.assertTrue(leverage["authority_checked_utc"])
+                self.assertEqual(source["mutation_attempts"], 3)
+                self.assertEqual(source["governor_release"], "PENDING")
+                self.assertFalse(any(
+                    call[0] == "POST"
+                    and call[2] == jr.basis_executor.USDM.order_path
+                    for call in transport.calls))
+
+    def test_reverse_leverage_not_confirmed_unwinds_without_entry(self):
+        self.reverse_job("reverse-leverage-not-confirmed")
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"))
+        transport.current_leverage = 5
+        transport.leverage_post_applies = False
+        transport.symbol_config_script = [1, 5, 5]
+
+        self.assertEqual(self.reverse_tick(transport), 2)
+
+        result = self.results()[0]
+        source = self.reverse_source(result)
+        leverage = source["leverage"]
+        self.assertEqual(result["verdict"], "REFUSED")
+        self.assertEqual(self.reason(result), "LEVERAGE_NOT_1X")
+        self.assertEqual(leverage["mutation_attempts"], 1)
+        self.assertEqual(leverage["submission"]["kind"], "ok")
+        self.assertEqual(leverage["confirmation"]["leverage"], 5)
+        self.assertEqual(leverage["verdict"], "REFUSED")
+        self.assertFalse(any(
+            call[0] == "POST" and call[2] == jr.basis_executor.USDM.order_path
+            for call in transport.calls))
+        self.assertEqual(
+            [row["leg"] for row in source["legs"]],
+            ["BORROW", "MARGIN_SELL", "FUTURES_LONG_OPEN",
+             "MARGIN_BUY", "REPAY"])
+        self.assertEqual(source["legs"][2]["status"], "FAILED")
+        self.assertEqual(source["mutation_attempts"], 5)
 
     def test_reverse_proven_futures_preflight_is_complete(self):
         cases = (("can_trade", 4), ("one_way", 2), ("open_orders", 2),
