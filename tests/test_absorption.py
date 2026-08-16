@@ -340,6 +340,114 @@ class AbsorptionTests(unittest.TestCase):
             "reason=invalid_symbol_filename",
         )
 
+    def test_large_kline_and_agg_members_use_shared_stream(self):
+        declared_size = 512_000_001
+        paths_and_rows = (
+            (
+                self.root / f"{SYMBOL}-1m-{DAY}.zip",
+                absorption._kline_rows,
+                (kline_csv_row(bar(0, "100")) + "\n").encode("utf-8"),
+            ),
+            (
+                self.root / f"{SYMBOL}-aggTrades-{DAY}.zip",
+                absorption._agg_trade_rows,
+                (
+                    agg_trade_csv_row(
+                        trade(1, 0, "10", buyer_is_maker=False)
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            ),
+        )
+
+        class SyntheticArchive:
+            def __init__(self, archive_path, mode):
+                self.member = zipfile.ZipInfo(Path(archive_path).stem + ".csv")
+                self.member.file_size = declared_size
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, error_type, error, traceback):
+                return False
+
+            def close(self):
+                return None
+
+            def infolist(self):
+                return [self.member]
+
+        with mock.patch.object(
+            absorption.zipfile, "ZipFile", SyntheticArchive
+        ), mock.patch.object(
+            absorption.tape_pull,
+            "stream_verified_member",
+            side_effect=(iter([row]) for _path, _reader, row in paths_and_rows),
+        ) as shared_reader:
+            loaded = [
+                tuple(reader(path, SYMBOL))
+                for path, reader, _row in paths_and_rows
+            ]
+
+        self.assertEqual(len(loaded[0]), 1)
+        self.assertEqual(len(loaded[1]), 1)
+        self.assertEqual(shared_reader.call_count, 2)
+        for call in shared_reader.call_args_list:
+            archive, member, bound = call.args
+            self.assertIsInstance(archive, SyntheticArchive)
+            self.assertEqual(member.file_size, declared_size)
+            self.assertEqual(bound, absorption.tape_pull.MAX_MEMBER_BYTES)
+
+    def test_shared_ceiling_refusals_include_full_member_identity(self):
+        ceiling = absorption.tape_pull.MAX_MEMBER_BYTES
+        paths_and_readers = (
+            (
+                self.root / f"{SYMBOL}-1m-{DAY}.zip",
+                absorption._kline_rows,
+            ),
+            (
+                self.root / f"{SYMBOL}-aggTrades-{DAY}.zip",
+                absorption._agg_trade_rows,
+            ),
+        )
+
+        class SyntheticArchive:
+            def __init__(self, archive_path, mode):
+                self.member = zipfile.ZipInfo(Path(archive_path).stem + ".csv")
+                self.member.file_size = ceiling + 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, error_type, error, traceback):
+                return False
+
+            def close(self):
+                return None
+
+            def infolist(self):
+                return [self.member]
+
+            def open(self, member, mode):
+                raise AssertionError("member opening was not expected")
+
+        with mock.patch.object(
+            absorption.zipfile, "ZipFile", SyntheticArchive
+        ):
+            for path, reader in paths_and_readers:
+                expected = path.stem + ".csv"
+                with self.subTest(path=path.name):
+                    with self.assertRaises(absorption.AbsorptionError) as raised:
+                        tuple(reader(path, SYMBOL))
+
+                    message = str(raised.exception)
+                    self.assertIn(f"{path.name}:{expected}", message)
+                    self.assertIn(
+                        "archive member size is outside bounds", message
+                    )
+                    self.assertIn(f"measured={ceiling + 1}", message)
+                    self.assertIn(f"bound={ceiling}", message)
+
     def test_taker_imbalance_math_is_exact(self):
         trades = (
             trade(1, 0, "3", buyer_is_maker=False),

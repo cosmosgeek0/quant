@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 from study import replay_detector as replay
@@ -151,6 +152,47 @@ class ReplayDetectorTests(unittest.TestCase):
         self.assertEqual(rows[0]["ignitions_per_day_bar_3"], "0")
         self.assertEqual(rows[0]["ignitions_bar_10"], 0)
         self.assertEqual(rows[0]["ignitions_per_day_bar_10"], "0")
+
+    def test_archive_member_uses_shared_verified_reader(self):
+        data_dir = write_tape(self.root, surge=False)
+        shared_reader = replay.tape_pull.stream_verified_member
+
+        with mock.patch.object(
+            replay.tape_pull,
+            "stream_verified_member",
+            wraps=shared_reader,
+        ) as verified_reader:
+            tape = replay.load_tape(data_dir)
+
+        self.assertEqual(len(tape[SYMBOL]), 301)
+        archive, member, bound = verified_reader.call_args.args
+        self.assertIsInstance(archive, zipfile.ZipFile)
+        self.assertEqual(member.filename, f"{SYMBOL}-1m-{DAY}.csv")
+        self.assertEqual(bound, replay.tape_pull.MAX_MEMBER_BYTES)
+
+    def test_shared_ceiling_refusal_has_archive_and_member_identity(self):
+        data_dir = write_tape(self.root, surge=False)
+        ceiling = replay.tape_pull.MAX_MEMBER_BYTES
+        shared_error = replay.tape_pull.ArchiveError(
+            "archive member size is outside bounds",
+            measured_value=ceiling + 1,
+            bound=ceiling,
+        )
+
+        with mock.patch.object(
+            replay.tape_pull,
+            "stream_verified_member",
+            side_effect=shared_error,
+        ):
+            with self.assertRaises(replay.ReplayError) as raised:
+                replay.load_tape(data_dir)
+
+        identity = f"{SYMBOL}-1m-{DAY}.zip:{SYMBOL}-1m-{DAY}.csv"
+        message = str(raised.exception)
+        self.assertIn(identity, message)
+        self.assertIn("archive member size is outside bounds", message)
+        self.assertIn(f"measured={ceiling + 1}", message)
+        self.assertIn(f"bound={ceiling}", message)
 
 
 if __name__ == "__main__":

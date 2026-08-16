@@ -25,9 +25,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
+    from study import tape_pull
     from study.windows import WindowError as _SymbolValidationError
     from study.windows import validate_symbol
-except ImportError:
+except ModuleNotFoundError as error:
+    if error.name != "study":
+        raise
+    import tape_pull  # type: ignore
     from windows import WindowError as _SymbolValidationError
     from windows import validate_symbol
 
@@ -270,6 +274,36 @@ def _spot_tape_root(root: Path) -> Path:
     return root
 
 
+class _ChunkStream(io.RawIOBase):
+    """Expose shared verified chunks as a buffered-reader source."""
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+        self._pending = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target: Any) -> int:
+        view = memoryview(target)
+        while len(self._pending) == 0:
+            try:
+                self._pending = memoryview(next(self._chunks))
+            except StopIteration:
+                return 0
+        size = min(len(view), len(self._pending))
+        view[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+    def close(self) -> None:
+        close_chunks = getattr(self._chunks, "close", None)
+        if callable(close_chunks):
+            close_chunks()
+        super().close()
+
+
 def _archive_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]:
     try:
         archive = zipfile.ZipFile(path, "r")
@@ -287,72 +321,83 @@ def _archive_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]:
 
 def _kline_rows(path: Path, symbol: str) -> Iterable[KlineBar]:
     expected = path.stem + ".csv"
+    identity = f"{path.name}:{expected}"
     archive, member = _archive_member(path, expected)
     found = False
     try:
         with archive:
-            with archive.open(member, "r") as raw:
-                with io.TextIOWrapper(
-                    raw, encoding="utf-8-sig", newline=""
-                ) as handle:
-                    for line_number, row in enumerate(
-                        csv.reader(handle), start=1
+            chunks = tape_pull.stream_verified_member(
+                archive, member, tape_pull.MAX_MEMBER_BYTES
+            )
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with io.TextIOWrapper(
+                raw, encoding="utf-8-sig", newline=""
+            ) as handle:
+                for line_number, row in enumerate(
+                    csv.reader(handle), start=1
+                ):
+                    if not row or not any(cell.strip() for cell in row):
+                        continue
+                    first = row[0].strip().lower().replace(" ", "_")
+                    if line_number == 1 and first in {
+                        "open_time",
+                        "opentime",
+                    }:
+                        continue
+                    source = f"{path.name}:{expected}:{line_number}"
+                    if len(row) < 8:
+                        raise AbsorptionError(
+                            f"{source} has fewer than eight kline columns"
+                        )
+                    open_ms = _timestamp_ms(row[0], f"{source} open time")
+                    close_ms = _timestamp_ms(
+                        row[6], f"{source} close time"
+                    )
+                    if close_ms - open_ms not in {59_999, 60_000}:
+                        raise AbsorptionError(
+                            f"{source} is not a proved one-minute kline"
+                        )
+                    open_price = _decimal(
+                        row[1], f"{source} open", positive=True
+                    )
+                    high = _decimal(
+                        row[2], f"{source} high", positive=True
+                    )
+                    low = _decimal(
+                        row[3], f"{source} low", positive=True
+                    )
+                    close = _decimal(
+                        row[4], f"{source} close", positive=True
+                    )
+                    quote_volume = _decimal(
+                        row[7],
+                        f"{source} quote volume",
+                        positive=False,
+                    )
+                    if high < max(open_price, low, close) or low > min(
+                        open_price, high, close
                     ):
-                        if not row or not any(cell.strip() for cell in row):
-                            continue
-                        first = row[0].strip().lower().replace(" ", "_")
-                        if line_number == 1 and first in {
-                            "open_time",
-                            "opentime",
-                        }:
-                            continue
-                        source = f"{path.name}:{expected}:{line_number}"
-                        if len(row) < 8:
-                            raise AbsorptionError(
-                                f"{source} has fewer than eight kline columns"
-                            )
-                        open_ms = _timestamp_ms(row[0], f"{source} open time")
-                        close_ms = _timestamp_ms(
-                            row[6], f"{source} close time"
+                        raise AbsorptionError(
+                            f"{source} has inconsistent OHLC"
                         )
-                        if close_ms - open_ms not in {59_999, 60_000}:
-                            raise AbsorptionError(
-                                f"{source} is not a proved one-minute kline"
-                            )
-                        open_price = _decimal(
-                            row[1], f"{source} open", positive=True
-                        )
-                        high = _decimal(
-                            row[2], f"{source} high", positive=True
-                        )
-                        low = _decimal(
-                            row[3], f"{source} low", positive=True
-                        )
-                        close = _decimal(
-                            row[4], f"{source} close", positive=True
-                        )
-                        quote_volume = _decimal(
-                            row[7],
-                            f"{source} quote volume",
-                            positive=False,
-                        )
-                        if high < max(open_price, low, close) or low > min(
-                            open_price, high, close
-                        ):
-                            raise AbsorptionError(
-                                f"{source} has inconsistent OHLC"
-                            )
-                        found = True
-                        yield KlineBar(
-                            symbol,
-                            open_ms,
-                            close_ms,
-                            open_price,
-                            high,
-                            low,
-                            close,
-                            quote_volume,
-                        )
+                    found = True
+                    yield KlineBar(
+                        symbol,
+                        open_ms,
+                        close_ms,
+                        open_price,
+                        high,
+                        low,
+                        close,
+                        quote_volume,
+                    )
+    except tape_pull.ArchiveError as error:
+        details = ""
+        if error.measured_value is not None:
+            details += f" | measured={error.measured_value}"
+        if error.bound is not None:
+            details += f" | bound={error.bound}"
+        raise AbsorptionError(f"{identity} {error}{details}") from None
     except (OSError, UnicodeError, csv.Error, zipfile.BadZipFile) as error:
         raise AbsorptionError(f"cannot parse {path.name}: {error}") from None
     if not found:
@@ -361,69 +406,80 @@ def _kline_rows(path: Path, symbol: str) -> Iterable[KlineBar]:
 
 def _agg_trade_rows(path: Path, symbol: str) -> Iterable[AggTrade]:
     expected = path.stem + ".csv"
+    identity = f"{path.name}:{expected}"
     archive, member = _archive_member(path, expected)
     found = False
     try:
         with archive:
-            with archive.open(member, "r") as raw:
-                with io.TextIOWrapper(
-                    raw, encoding="utf-8-sig", newline=""
-                ) as handle:
-                    for line_number, row in enumerate(
-                        csv.reader(handle), start=1
-                    ):
-                        if not row or not any(cell.strip() for cell in row):
-                            continue
-                        first = row[0].strip().lower().replace(" ", "_")
-                        if line_number == 1 and first in {
-                            "agg_trade_id",
-                            "aggregate_trade_id",
-                            "aggtradeid",
-                        }:
-                            continue
-                        source = f"{path.name}:{expected}:{line_number}"
-                        if len(row) < 7:
-                            raise AbsorptionError(
-                                f"{source} has fewer than seven aggTrades columns"
-                            )
-                        aggregate_id = _integer(
-                            row[0], f"{source} aggregate id", non_negative=True
+            chunks = tape_pull.stream_verified_member(
+                archive, member, tape_pull.MAX_MEMBER_BYTES
+            )
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with io.TextIOWrapper(
+                raw, encoding="utf-8-sig", newline=""
+            ) as handle:
+                for line_number, row in enumerate(
+                    csv.reader(handle), start=1
+                ):
+                    if not row or not any(cell.strip() for cell in row):
+                        continue
+                    first = row[0].strip().lower().replace(" ", "_")
+                    if line_number == 1 and first in {
+                        "agg_trade_id",
+                        "aggregate_trade_id",
+                        "aggtradeid",
+                    }:
+                        continue
+                    source = f"{path.name}:{expected}:{line_number}"
+                    if len(row) < 7:
+                        raise AbsorptionError(
+                            f"{source} has fewer than seven aggTrades columns"
                         )
-                        price = _decimal(
-                            row[1], f"{source} price", positive=True
+                    aggregate_id = _integer(
+                        row[0], f"{source} aggregate id", non_negative=True
+                    )
+                    price = _decimal(
+                        row[1], f"{source} price", positive=True
+                    )
+                    quantity = _decimal(
+                        row[2], f"{source} quantity", positive=True
+                    )
+                    first_trade_id = _integer(
+                        row[3],
+                        f"{source} first trade id",
+                        non_negative=True,
+                    )
+                    last_trade_id = _integer(
+                        row[4],
+                        f"{source} last trade id",
+                        non_negative=True,
+                    )
+                    if last_trade_id < first_trade_id:
+                        raise AbsorptionError(
+                            f"{source} has reversed trade ids"
                         )
-                        quantity = _decimal(
-                            row[2], f"{source} quantity", positive=True
-                        )
-                        first_trade_id = _integer(
-                            row[3],
-                            f"{source} first trade id",
-                            non_negative=True,
-                        )
-                        last_trade_id = _integer(
-                            row[4],
-                            f"{source} last trade id",
-                            non_negative=True,
-                        )
-                        if last_trade_id < first_trade_id:
-                            raise AbsorptionError(
-                                f"{source} has reversed trade ids"
-                            )
-                        timestamp_ms = _timestamp_ms(
-                            row[5], f"{source} transact time"
-                        )
-                        buyer_is_maker = _boolean(
-                            row[6], f"{source} buyer-is-maker"
-                        )
-                        found = True
-                        yield AggTrade(
-                            symbol,
-                            aggregate_id,
-                            timestamp_ms,
-                            price,
-                            quantity,
-                            buyer_is_maker,
-                        )
+                    timestamp_ms = _timestamp_ms(
+                        row[5], f"{source} transact time"
+                    )
+                    buyer_is_maker = _boolean(
+                        row[6], f"{source} buyer-is-maker"
+                    )
+                    found = True
+                    yield AggTrade(
+                        symbol,
+                        aggregate_id,
+                        timestamp_ms,
+                        price,
+                        quantity,
+                        buyer_is_maker,
+                    )
+    except tape_pull.ArchiveError as error:
+        details = ""
+        if error.measured_value is not None:
+            details += f" | measured={error.measured_value}"
+        if error.bound is not None:
+            details += f" | bound={error.bound}"
+        raise AbsorptionError(f"{identity} {error}{details}") from None
     except (OSError, UnicodeError, csv.Error, zipfile.BadZipFile) as error:
         raise AbsorptionError(f"cannot parse {path.name}: {error}") from None
     if not found:

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -30,11 +31,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 try:
+    from study import tape_pull
     from study.windows import validate_symbol
     from study.windows import WindowError as SymbolValidationError
 except ModuleNotFoundError as error:
     if error.name != "study":
         raise
+    import tape_pull  # type: ignore
     from windows import validate_symbol
     from windows import WindowError as SymbolValidationError
 
@@ -47,7 +50,7 @@ SCHEMA = "volume-dataset-v2-stage-b"
 MINUTE_MS = 60_000
 FROZEN_PRE_MINUTES = 60
 FROZEN_POST_MINUTES = 120
-MAX_MEMBER_BYTES = 512_000_000
+PROGRESS_WINDOW_INTERVAL = 250
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 AGG_ARCHIVE = re.compile(
     r"^(?P<symbol>.+)-aggTrades-"
@@ -70,6 +73,36 @@ QUANTILES = (
 
 class StageBError(Exception):
     """A Stage-B input or result cannot be proved from local data."""
+
+
+class _ChunkStream(io.RawIOBase):
+    """Expose shared verified chunks as a buffered-reader source."""
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+        self._pending = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target: Any) -> int:
+        view = memoryview(target)
+        while len(self._pending) == 0:
+            try:
+                self._pending = memoryview(next(self._chunks))
+            except StopIteration:
+                return 0
+        size = min(len(view), len(self._pending))
+        view[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+    def close(self) -> None:
+        close_chunks = getattr(self._chunks, "close", None)
+        if callable(close_chunks):
+            close_chunks()
+        super().close()
 
 
 @dataclass(frozen=True)
@@ -621,7 +654,9 @@ def _daily_sources(
     return tuple(paths), tuple(missing)
 
 
-def _single_zip_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]:
+def _single_zip_member(
+    path: Path, expected: str
+) -> Tuple[zipfile.ZipFile, zipfile.ZipInfo]:
     try:
         archive = zipfile.ZipFile(path, "r")
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
@@ -634,18 +669,27 @@ def _single_zip_member(path: Path, expected: str) -> Tuple[zipfile.ZipFile, Any]
     if member.flag_bits & 0x1:
         archive.close()
         raise StageBError(f"{path.name}:{expected} is encrypted")
-    if member.file_size <= 0 or member.file_size > MAX_MEMBER_BYTES:
-        archive.close()
-        raise StageBError(f"{path.name}:{expected} size is outside bounds")
-    try:
-        bad_member = archive.testzip()
-    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
-        archive.close()
-        raise StageBError(f"cannot verify {path.name}: {error}") from None
-    if bad_member is not None:
-        archive.close()
-        raise StageBError(f"{path.name}:{bad_member} failed CRC")
     return archive, member
+
+
+def _verified_member_chunks(
+    path: Path,
+    archive: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+) -> Iterable[bytes]:
+    try:
+        yield from tape_pull.stream_verified_member(
+            archive, member, tape_pull.MAX_MEMBER_BYTES
+        )
+    except tape_pull.ArchiveError as error:
+        details = ""
+        if error.measured_value is not None:
+            details += f" | measured={error.measured_value}"
+        if error.bound is not None:
+            details += f" | bound={error.bound}"
+        raise StageBError(
+            f"{path.name}:{member.filename} {error}{details}"
+        ) from None
 
 
 def _archive_name_match(
@@ -688,7 +732,9 @@ def _agg_trade_rows(
     found = False
     try:
         with archive:
-            with archive.open(member, "r") as raw:
+            chunks = _verified_member_chunks(path, archive, member)
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with raw:
                 with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as handle:
                     for line_number, row in enumerate(csv.reader(handle), start=1):
                         if not row or not any(cell.strip() for cell in row):
@@ -1080,7 +1126,9 @@ def _kline_rows(
     found = False
     try:
         with archive:
-            with archive.open(member, "r") as raw:
+            chunks = _verified_member_chunks(path, archive, member)
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with raw:
                 with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as handle:
                     for line_number, row in enumerate(csv.reader(handle), start=1):
                         if not row or not any(cell.strip() for cell in row):
@@ -1232,12 +1280,9 @@ def _read_context_file(path: Path) -> List[Mapping[str, Any]]:
             for member in members:
                 if member.flag_bits & 0x1:
                     raise StageBError(f"{path.name}:{member.filename} is encrypted")
-                if member.file_size <= 0 or member.file_size > MAX_MEMBER_BYTES:
-                    raise StageBError(
-                        f"{path.name}:{member.filename} size is outside bounds"
-                    )
-                with archive.open(member, "r") as handle:
-                    text = handle.read().decode("utf-8-sig")
+                text = b"".join(
+                    _verified_member_chunks(path, archive, member)
+                ).decode("utf-8-sig")
                 rows.extend(_context_records(member.filename, text))
             return rows
     except (OSError, UnicodeError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
@@ -1681,6 +1726,13 @@ def _assert_no_float(value: Any, source: str = "output") -> None:
             _assert_no_float(item, f"{source}[{index}]")
 
 
+def _jsonl_line(row: Mapping[str, Any]) -> str:
+    _assert_no_float(row)
+    return json.dumps(
+        dict(row), sort_keys=True, separators=(",", ":")
+    ) + "\n"
+
+
 def write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1688,11 +1740,7 @@ def write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     try:
         with open(temporary, "w", encoding="utf-8") as handle:
             for row in rows:
-                _assert_no_float(row)
-                handle.write(
-                    json.dumps(dict(row), sort_keys=True, separators=(",", ":"))
-                )
-                handle.write("\n")
+                handle.write(_jsonl_line(row))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
@@ -1705,6 +1753,68 @@ def write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             from None
 
 
+def _checkpoint_path(output_path: Path) -> Path:
+    target = Path(output_path)
+    return target.with_name(target.name + ".checkpoint")
+
+
+def _checkpoint_rows(
+    path: Path, specs: Sequence[WindowSpec]
+) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise StageBError(f"cannot read Stage-B checkpoint {path}: {error}") \
+            from None
+    complete_bytes = raw.rfind(b"\n") + 1
+    complete = raw[:complete_bytes]
+    if complete_bytes != len(raw):
+        try:
+            with open(path, "r+b") as handle:
+                handle.truncate(complete_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as error:
+            raise StageBError(
+                f"cannot repair Stage-B checkpoint {path}: {error}"
+            ) from None
+    try:
+        lines = complete.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise StageBError(f"Stage-B checkpoint {path} is not UTF-8: {error}") \
+            from None
+    if len(lines) > len(specs):
+        raise StageBError("Stage-B checkpoint has more rows than the manifest")
+    rows: List[Dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise StageBError(
+                f"Stage-B checkpoint row {index} is not valid JSON: {error.msg}"
+            ) from None
+        if not isinstance(row, Mapping):
+            raise StageBError(f"Stage-B checkpoint row {index} is not an object")
+        expected = _base_row(specs[index])
+        if any(row.get(key) != value for key, value in expected.items()):
+            raise StageBError(
+                f"Stage-B checkpoint row {index} does not match the manifest"
+            )
+        expected_keys = set(_skip_row(specs[index], "checkpoint"))
+        if (
+            set(row) != expected_keys
+            or row.get("status") not in ("ok", "skipped")
+        ):
+            raise StageBError(
+                f"Stage-B checkpoint row {index} has an invalid schema"
+            )
+        _assert_no_float(row, f"checkpoint[{index}]")
+        rows.append(dict(row))
+    return rows
+
+
 def run_stage_b(
     manifest_path: Path = DEFAULT_MANIFEST,
     data_dir: Path = DEFAULT_DATA_DIR,
@@ -1712,9 +1822,44 @@ def run_stage_b(
 ) -> Tuple[Dict[str, Any], ...]:
     specs = load_manifest(Path(manifest_path))
     root = Path(data_dir)
-    rows = tuple(process_window(spec, root) for spec in specs)
-    write_jsonl(Path(output_path), rows)
-    return rows
+    target = Path(output_path)
+    checkpoint = _checkpoint_path(target)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise StageBError(f"cannot prepare Stage-B output {target}: {error}") \
+            from None
+    rows = _checkpoint_rows(checkpoint, specs)
+    started_ns = time.monotonic_ns()
+    try:
+        with open(checkpoint, "a", encoding="utf-8") as handle:
+            for index in range(len(rows), len(specs)):
+                spec = specs[index]
+                row = process_window(spec, root)
+                handle.write(_jsonl_line(row))
+                handle.flush()
+                os.fsync(handle.fileno())
+                rows.append(row)
+                done = index + 1
+                if done % PROGRESS_WINDOW_INTERVAL == 0:
+                    elapsed_seconds = (
+                        time.monotonic_ns() - started_ns
+                    ) // 1_000_000_000
+                    print(
+                        "STAGE-B-PROGRESS | "
+                        f"done={done}/{len(specs)} | "
+                        f"elapsed_seconds={elapsed_seconds} | "
+                        f"symbol={spec.symbol}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(checkpoint, target)
+    except (OSError, TypeError, ValueError) as error:
+        raise StageBError(f"cannot write Stage-B output {target}: {error}") \
+            from None
+    return tuple(rows)
 
 
 def argument_parser() -> argparse.ArgumentParser:

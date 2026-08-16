@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 from study import stage_a
@@ -205,6 +206,32 @@ class StageAFeatureTests(unittest.TestCase):
 
         self.assertFalse(analyses[-1].labels["DeadRegime"])
         self.assertIsNone(analyses[-1].state["flat_candle_pct"]["24h"])
+
+    def test_shared_ceiling_refusal_has_archive_and_member_identity(self):
+        data_dir = _write_tape(self.root, [_kline(0, "100", "10", 1)])
+        market = stage_a.discover_market_tapes(data_dir)[0]
+        archive = market.archives[0]
+        member = archive.stem + ".csv"
+        ceiling = stage_a.tape_pull.MAX_MEMBER_BYTES
+        shared_error = stage_a.tape_pull.ArchiveError(
+            "archive member size is outside bounds",
+            measured_value=ceiling + 1,
+            bound=ceiling,
+        )
+
+        with mock.patch.object(
+            stage_a.tape_pull,
+            "stream_verified_member",
+            side_effect=shared_error,
+        ):
+            with self.assertRaises(stage_a.StageAError) as raised:
+                stage_a.read_market_bars(market)
+
+        message = str(raised.exception)
+        self.assertIn(f"{archive.name}:{member}", message)
+        self.assertIn("archive member size is outside bounds", message)
+        self.assertIn(f"measured={ceiling + 1}", message)
+        self.assertIn(f"bound={ceiling}", message)
 
 
 if __name__ == "__main__":

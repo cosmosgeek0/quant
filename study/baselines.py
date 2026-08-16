@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import re
@@ -23,9 +24,11 @@ from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
+    from study import tape_pull
     from study.windows import WindowError as _SymbolValidationError
     from study.windows import validate_symbol
 except ImportError:
+    import tape_pull  # type: ignore
     from windows import WindowError as _SymbolValidationError
     from windows import validate_symbol
 
@@ -83,6 +86,36 @@ class TapeTrade:
         with localcontext() as context:
             context.prec = 50
             return self.price * self.quantity
+
+
+class _ChunkStream(io.RawIOBase):
+    """Expose shared verified chunks as a buffered-reader source."""
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+        self._pending = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target: Any) -> int:
+        view = memoryview(target)
+        while len(self._pending) == 0:
+            try:
+                self._pending = memoryview(next(self._chunks))
+            except StopIteration:
+                return 0
+        size = min(len(view), len(self._pending))
+        view[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+    def close(self) -> None:
+        close_chunks = getattr(self._chunks, "close", None)
+        if callable(close_chunks):
+            close_chunks()
+        super().close()
 
 
 def decimal_text(value: Decimal) -> str:
@@ -249,6 +282,7 @@ def _rows_from_member(
 
 def _read_archive(path: Path) -> Iterable[TapeBar]:
     archive_symbol = _symbol_from_name(path.name)
+    identity = path.name
     try:
         with zipfile.ZipFile(path) as zipped:
             members = sorted(
@@ -263,9 +297,10 @@ def _read_archive(path: Path) -> Iterable[TapeBar]:
             if not members:
                 raise BaselineError(f"{path.name} has no CSV member")
             for member in members:
+                identity = f"{path.name}:{member.filename}"
                 if member.flag_bits & 0x1:
                     raise BaselineError(
-                        f"{path.name}:{member.filename} is encrypted"
+                        f"{identity} is encrypted"
                     )
                 member_symbol = _symbol_from_name(member.filename)
                 symbol = member_symbol or archive_symbol
@@ -282,12 +317,29 @@ def _read_archive(path: Path) -> Iterable[TapeBar]:
                     raise BaselineError(
                         f"symbol mismatch in {path.name}:{member.filename}"
                     )
-                with zipped.open(member, "r") as raw:
-                    text = (line.decode("utf-8-sig") for line in raw)
+                chunks = tape_pull.stream_verified_member(
+                    zipped, member, tape_pull.MAX_MEMBER_BYTES
+                )
+                raw = io.BufferedReader(_ChunkStream(chunks))
+                with io.TextIOWrapper(
+                    raw, encoding="utf-8-sig", newline=""
+                ) as text:
                     yield from _rows_from_member(
                         path, text, member.filename, symbol
                     )
-    except (OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+    except tape_pull.ArchiveError as error:
+        details = ""
+        if error.measured_value is not None:
+            details += f" | measured={error.measured_value}"
+        if error.bound is not None:
+            details += f" | bound={error.bound}"
+        raise BaselineError(f"{identity} {error}{details}") from None
+    except (
+        OSError,
+        UnicodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
         raise BaselineError(f"cannot read {path.name}: {error}") from None
 
 
@@ -372,6 +424,7 @@ def _read_agg_trade_archive(
     path: Path, symbol: str, raw_day: str
 ) -> Tuple[TapeTrade, ...]:
     expected = path.stem + ".csv"
+    identity = f"{path.name}:{expected}"
     try:
         with zipfile.ZipFile(path) as zipped:
             members = [
@@ -384,18 +437,34 @@ def _read_agg_trade_archive(
                     f"{path.name} does not contain only {expected}"
                 )
             member = members[0]
+            identity = f"{path.name}:{member.filename}"
             if member.flag_bits & 0x1:
-                raise BaselineError(
-                    f"{path.name}:{member.filename} is encrypted"
-                )
-            with zipped.open(member, "r") as raw:
-                text = (line.decode("utf-8-sig") for line in raw)
+                raise BaselineError(f"{identity} is encrypted")
+            chunks = tape_pull.stream_verified_member(
+                zipped, member, tape_pull.MAX_MEMBER_BYTES
+            )
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with io.TextIOWrapper(
+                raw, encoding="utf-8-sig", newline=""
+            ) as text:
                 rows = tuple(
                     _agg_trade_rows(
                         path, text, member.filename, symbol, raw_day
                     )
                 )
-    except (OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+    except tape_pull.ArchiveError as error:
+        details = ""
+        if error.measured_value is not None:
+            details += f" | measured={error.measured_value}"
+        if error.bound is not None:
+            details += f" | bound={error.bound}"
+        raise BaselineError(f"{identity} {error}{details}") from None
+    except (
+        OSError,
+        UnicodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
         raise BaselineError(f"cannot read {path.name}: {error}") from None
 
     by_id: Dict[int, TapeTrade] = {}

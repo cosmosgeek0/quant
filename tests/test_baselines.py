@@ -9,6 +9,7 @@ import zipfile
 from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 from study import baselines
@@ -125,6 +126,25 @@ def assert_no_float(test, value):
             assert_no_float(test, nested)
 
 
+def synthetic_archive(declared_size):
+    class SyntheticArchive:
+        def __init__(self, archive_path, *args, **kwargs):
+            expected = Path(archive_path).stem + ".csv"
+            self.member = zipfile.ZipInfo(expected)
+            self.member.file_size = declared_size
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, error_type, error, traceback):
+            return False
+
+        def infolist(self):
+            return [self.member]
+
+    return SyntheticArchive
+
+
 class AdaptiveBaselineTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -151,6 +171,73 @@ class AdaptiveBaselineTests(unittest.TestCase):
         self.assertIsNone(
             baselines._symbol_from_name(f"../{SYMBOL}-1m-{DAY}.zip")
         )
+
+    def test_members_above_retired_private_bound_use_shared_stream(self):
+        declared_size = 512_000_001
+        kline_path = self.root / f"{SYMBOL}-1m-{DAY}.zip"
+        agg_path = self.root / f"{SYMBOL}-aggTrades-{DAY}.zip"
+        kline_bytes = (",".join(kline(0, "10")) + "\n").encode()
+        agg_bytes = (agg_trade_row(1, 0, "3", False) + "\n").encode()
+
+        with mock.patch.object(
+            baselines.zipfile,
+            "ZipFile",
+            synthetic_archive(declared_size),
+        ), mock.patch.object(
+            baselines.tape_pull,
+            "stream_verified_member",
+            side_effect=(iter([kline_bytes]), iter([agg_bytes])),
+        ) as shared_reader:
+            bars = tuple(baselines._read_archive(kline_path))
+            trades = baselines._read_agg_trade_archive(
+                agg_path, SYMBOL, DAY
+            )
+
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].quote_volume, Decimal("10"))
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].quote_size, Decimal("3"))
+        self.assertEqual(shared_reader.call_count, 2)
+        for call in shared_reader.call_args_list:
+            archive, member, bound = call.args
+            self.assertEqual(member.file_size, declared_size)
+            self.assertIs(member, archive.member)
+            self.assertEqual(bound, baselines.tape_pull.MAX_MEMBER_BYTES)
+
+    def test_shared_ceiling_refusals_include_member_identity(self):
+        ceiling = baselines.tape_pull.MAX_MEMBER_BYTES
+        kline_path = self.root / f"{SYMBOL}-1m-{DAY}.zip"
+        agg_path = self.root / f"{SYMBOL}-aggTrades-{DAY}.zip"
+        cases = (
+            (
+                kline_path,
+                lambda: tuple(baselines._read_archive(kline_path)),
+            ),
+            (
+                agg_path,
+                lambda: baselines._read_agg_trade_archive(
+                    agg_path, SYMBOL, DAY
+                ),
+            ),
+        )
+
+        for path, read_archive in cases:
+            expected = path.stem + ".csv"
+            with self.subTest(archive=path.name), mock.patch.object(
+                baselines.zipfile,
+                "ZipFile",
+                synthetic_archive(ceiling + 1),
+            ):
+                with self.assertRaises(baselines.BaselineError) as raised:
+                    read_archive()
+
+            message = str(raised.exception)
+            self.assertIn(f"{path.name}:{expected}", message)
+            self.assertIn(
+                "archive member size is outside bounds", message
+            )
+            self.assertIn(f"measured={ceiling + 1}", message)
+            self.assertIn(f"bound={ceiling}", message)
 
     def test_synthetic_tape_derives_token_regimes_and_seasonality(self):
         output = self.output_dir / "baselines.json"

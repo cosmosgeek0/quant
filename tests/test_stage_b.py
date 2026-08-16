@@ -9,6 +9,7 @@ import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 from study import stage_b
@@ -333,6 +334,139 @@ class StageBFeatureTests(unittest.TestCase):
         self.assertEqual(disk[1]["skip_reason"], "missing_agg_trades_zip")
         self.assertEqual(len(disk[1]["missing_files"]), 1)
         no_float(self, disk)
+
+    def test_shared_reader_refusal_keeps_archive_identity_and_bounds(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        archive_path = write_agg_zip(
+            root,
+            SYMBOL,
+            (trade(1, 0, "1", buyer_is_maker=False),),
+        )
+        refusal = stage_b.tape_pull.ArchiveError(
+            "archive member size is outside bounds",
+            measured_value=stage_b.tape_pull.MAX_MEMBER_BYTES + 1,
+            bound=stage_b.tape_pull.MAX_MEMBER_BYTES,
+        )
+
+        with mock.patch.object(
+            stage_b.tape_pull,
+            "stream_verified_member",
+            side_effect=refusal,
+        ) as shared_reader:
+            with self.assertRaises(stage_b.StageBError) as raised:
+                stage_b.load_agg_trades(
+                    (archive_path,), SYMBOL, BASE_MS, BASE_MS + 60_000
+                )
+
+        message = str(raised.exception)
+        self.assertIn(archive_path.name, message)
+        self.assertIn(archive_path.stem + ".csv", message)
+        self.assertIn(
+            f"measured={stage_b.tape_pull.MAX_MEMBER_BYTES + 1}", message
+        )
+        self.assertIn(
+            f"bound={stage_b.tape_pull.MAX_MEMBER_BYTES}", message
+        )
+        self.assertEqual(shared_reader.call_count, 1)
+        self.assertEqual(
+            shared_reader.call_args.args[2], stage_b.tape_pull.MAX_MEMBER_BYTES
+        )
+
+    def test_progress_row_is_emitted_after_250_completed_windows(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        manifest = root / "windows_manifest.json"
+        output = root / "features.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "windows": [
+                        {
+                            "window_id": f"progress-{index:03d}",
+                            "symbol": SYMBOL,
+                            "venue_class": "spot_only",
+                            "venue": "spot",
+                            "event_ms": BASE_MS + 60_000,
+                        }
+                        for index in range(250)
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            rows = stage_b.run_stage_b(manifest, root / "missing", output)
+
+        self.assertEqual(len(rows), 250)
+        self.assertRegex(
+            stderr.getvalue(),
+            r"^STAGE-B-PROGRESS \| done=250/250 \| "
+            r"elapsed_seconds=\d+ \| symbol=AAAUSDT\n$",
+        )
+
+    def test_checkpoint_resumes_after_interruption_without_reprocessing(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        manifest = root / "windows_manifest.json"
+        output = root / "features.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "windows": [
+                        {
+                            "window_id": f"resume-{index}",
+                            "symbol": SYMBOL,
+                            "venue_class": "spot_only",
+                            "venue": "spot",
+                            "event_ms": BASE_MS + index * 60_000,
+                        }
+                        for index in range(4)
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        completed = []
+        real_process_window = stage_b.process_window
+
+        def process_then_pause(spec, data_dir):
+            if len(completed) == 2:
+                raise KeyboardInterrupt
+            row = real_process_window(spec, data_dir)
+            completed.append(spec.window_id)
+            return row
+
+        with mock.patch.object(
+            stage_b, "process_window", side_effect=process_then_pause
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                stage_b.run_stage_b(manifest, root / "missing", output)
+
+        checkpoint = output.with_name(output.name + ".checkpoint")
+        self.assertFalse(output.exists())
+        self.assertEqual(len(checkpoint.read_text(encoding="utf-8").splitlines()), 2)
+        with open(checkpoint, "ab") as handle:
+            handle.write(b'{"incomplete"')
+
+        with mock.patch.object(
+            stage_b, "process_window", wraps=real_process_window
+        ) as resumed_process:
+            rows = stage_b.run_stage_b(manifest, root / "missing", output)
+
+        expected_bytes = "".join(
+            json.dumps(dict(row), sort_keys=True, separators=(",", ":")) + "\n"
+            for row in rows
+        ).encode("utf-8")
+        self.assertEqual(resumed_process.call_count, 2)
+        self.assertEqual(len(rows), 4)
+        self.assertFalse(checkpoint.exists())
+        self.assertEqual(output.read_bytes(), expected_bytes)
 
     def test_available_kline_funding_and_oi_context_are_emitted(self):
         temporary = tempfile.TemporaryDirectory()

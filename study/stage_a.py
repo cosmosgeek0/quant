@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import io
 import json
 import os
 import re
@@ -39,6 +40,14 @@ from typing import (
     Sequence,
     Tuple,
 )
+
+
+try:
+    from study import tape_pull
+except ModuleNotFoundError as error:
+    if error.name != "study":
+        raise
+    import tape_pull  # type: ignore
 
 
 try:
@@ -315,9 +324,39 @@ def _rows_from_member(
         raise StageAError(f"{source} has invalid CSV: {error}") from None
 
 
+class _ChunkStream(io.RawIOBase):
+    """Expose shared verified chunks as a buffered-reader source."""
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+        self._pending = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target: Any) -> int:
+        view = memoryview(target)
+        while len(self._pending) == 0:
+            try:
+                self._pending = memoryview(next(self._chunks))
+            except StopIteration:
+                return 0
+        size = min(len(view), len(self._pending))
+        view[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+    def close(self) -> None:
+        close_chunks = getattr(self._chunks, "close", None)
+        if callable(close_chunks):
+            close_chunks()
+        super().close()
+
+
 def _read_archive(path: Path, symbol: str, venue: str) -> Iterator[Kline]:
     try:
-        with zipfile.ZipFile(path) as zipped:
+        with zipfile.ZipFile(path, "r") as zipped:
             members = sorted(
                 (
                     member
@@ -340,12 +379,35 @@ def _read_archive(path: Path, symbol: str, venue: str) -> Iterator[Kline]:
                     raise StageAError(
                         f"{path.name}:{member.filename} does not match {symbol}"
                     )
-                with zipped.open(member, "r") as raw:
-                    text = (line.decode("utf-8-sig") for line in raw)
-                    yield from _rows_from_member(
-                        path, member.filename, text, symbol, venue
+                identity = f"{path.name}:{member.filename}"
+                try:
+                    chunks = tape_pull.stream_verified_member(
+                        zipped, member, tape_pull.MAX_MEMBER_BYTES
                     )
-    except (OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+                    raw = io.BufferedReader(_ChunkStream(chunks))
+                    with io.TextIOWrapper(
+                        raw, encoding="utf-8-sig", newline=""
+                    ) as handle:
+                        yield from _rows_from_member(
+                            path, member.filename, handle, symbol, venue
+                        )
+                except tape_pull.ArchiveError as error:
+                    details = ""
+                    if error.measured_value is not None:
+                        details += f" | measured={error.measured_value}"
+                    if error.bound is not None:
+                        details += f" | bound={error.bound}"
+                    raise StageAError(
+                        f"{identity} {error}{details}"
+                    ) from None
+    except StageAError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
         raise StageAError(f"cannot read {path.name}: {error}") from None
 
 
