@@ -92,7 +92,18 @@ from futures_hand import (
     fmt,
     parse_trade_capability,
 )
-from spot_roundtrip import fees_by_asset
+
+
+def fees_by_asset(*trade_lists):
+    """TEMPORARY (Lead, W1 landed): the proof module spot_roundtrip no longer
+    exports this; W4 replaces the whole leg path with execution.binance_spot
+    (fees_by_asset -> tuple[Fee]) and deletes this shim (map rows 006, 007)."""
+    agg = {}
+    for trades in trade_lists:
+        for t in trades:
+            a = t.get("commissionAsset", "?")
+            agg[a] = fmt(d(agg.get(a, "0")) + d(t["commission"]))
+    return agg
 
 ALL_STAGES = (ENTER_SPOT, ENTER_SHORT, EXIT_SHORT, EXIT_SPOT, UNWIND_SPOT)
 RECV_WINDOW = "5000"
