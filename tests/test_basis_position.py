@@ -1394,6 +1394,18 @@ class VersionTwoPersistenceTests(unittest.TestCase):
                 "futures_wallet_balance": "100",
             })
 
+    @staticmethod
+    def bind_reconcile_observation(observation):
+        return bp.new_v2_reconcile_observed_event(
+            reconcile_id=observation["reconcile_id"],
+            observed_at_ms=observation["observed_at_ms"],
+            source=observation["source"],
+            baseline=observation["baseline"],
+            positions=observation["positions"],
+            open_orders=observation["open_orders"],
+            own_orders=observation["own_orders"],
+            balances=observation["balances"])
+
     def resume_v2(self, observation):
         with mock.patch.object(
                 bp, "default_now_ms",
@@ -2219,6 +2231,109 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         self.assertEqual(self.state_path.read_bytes(), before_position)
         self.assertEqual(self.head_path.read_bytes(), before_head)
 
+    def assert_reconcile_age(self, age_ms, accepted):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-age-%d" % age_ms)
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        append_time = observation["observed_at_ms"] + age_ms
+        clock = mock.Mock(return_value=append_time)
+        with mock.patch.object(bp, "default_now_ms", clock):
+            if accepted:
+                derived = bp.derive_resume(
+                    self.current(), observation,
+                    receipt_dir=self.receipt_dir)
+            else:
+                with self.assertRaisesRegex(
+                        bp.PositionError, "STALE_RECONCILE_READ"):
+                    bp.derive_resume(
+                        self.current(), observation,
+                        receipt_dir=self.receipt_dir)
+        self.assertEqual(clock.call_count, 1)
+        if accepted:
+            self.assertEqual(derived["reconciliation_status"],
+                             "CONFIRMED")
+            event = self.current()["ledger"][-1]
+            self.assertEqual(event["read_received_at"], append_time)
+            self.assertEqual(event["read_digest"],
+                             observation["read_digest"])
+        else:
+            self.assertEqual(self.state_path.read_bytes(), before_position)
+            self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_b10_reconcile_read_age_59999_accepts(self):
+        self.assert_reconcile_age(59_999, accepted=True)
+
+    def test_b10_reconcile_read_age_60000_accepts(self):
+        self.assert_reconcile_age(60_000, accepted=True)
+
+    def test_b10_reconcile_read_age_60001_refuses(self):
+        self.assert_reconcile_age(60_001, accepted=False)
+
+    def test_b10_reconcile_read_relabel_refuses(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-relabel")
+        original_time = observation["observed_at_ms"]
+        append_time = original_time + 60_001
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=append_time):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "STALE_RECONCILE_READ"):
+                bp.derive_resume(
+                    self.current(), observation,
+                    receipt_dir=self.receipt_dir)
+        observation["observed_at_ms"] = original_time + 1
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=append_time):
+            with self.assertRaisesRegex(bp.PositionError, "read digest"):
+                bp.derive_resume(
+                    self.current(), observation,
+                    receipt_dir=self.receipt_dir)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_b10_reconcile_read_fact_change_refuses(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-fact-change")
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        observation["balances"]["spot_quote_free_quantity"] = "99"
+        with mock.patch.object(
+                bp, "default_now_ms",
+                return_value=observation["observed_at_ms"]):
+            with self.assertRaisesRegex(bp.PositionError, "read digest"):
+                bp.derive_resume(
+                    self.current(), observation,
+                    receipt_dir=self.receipt_dir)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_b10_future_reconcile_read_refuses(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-future-read")
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        with mock.patch.object(
+                bp, "default_now_ms",
+                return_value=observation["observed_at_ms"] - 1):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "FUTURE_RECONCILE_READ"):
+                bp.derive_resume(
+                    self.current(), observation,
+                    receipt_dir=self.receipt_dir)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
     def test_br6_terminal_status_drift_freezes_with_both_statuses(self):
         self.ready()
         self.append(self.filled(1))
@@ -2247,6 +2362,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         observation = self.reconcile_observation(
             "reconcile-balance-conflict")
         observation["balances"]["spot_base_free_quantity"] = "0.09"
+        observation = self.bind_reconcile_observation(observation)
         derived = self.resume_v2(observation)
         self.assertEqual(derived["top_state"], "FROZEN")
         self.assertEqual(derived["freeze_reasons"], ["BALANCE_MISMATCH"])
@@ -2333,6 +2449,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         observation["balances"]["futures_wallet_balance"] = None
         observation["open_orders"][
             "spot_algorithmic_client_order_ids"] = ["foreign-spot-order"]
+        observation = self.bind_reconcile_observation(observation)
         derived = self.resume_v2(observation)
         self.assertEqual(derived["top_state"], "FROZEN")
         self.assertTrue(derived["flat_proved_blocked"])
@@ -2349,6 +2466,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         observation = self.reconcile_observation(
             "reconcile-" + field.replace("_client_order_ids", ""))
         observation["open_orders"][field] = ["external-order"]
+        observation = self.bind_reconcile_observation(observation)
         derived = self.resume_v2(observation)
         self.assertEqual(derived["top_state"], "FROZEN")
         self.assertEqual(derived["freeze_reasons"],
@@ -2385,6 +2503,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         observation = self.reconcile_observation(
             "reconcile-moved-baseline", spot_position="0.2")
         observation["baseline"]["spot_base_quantity"] = "0.1"
+        observation = self.bind_reconcile_observation(observation)
         frozen = self.resume_v2(observation)
         self.assertEqual(frozen["top_state"], "FROZEN")
         self.assertIn("BASELINE_MISMATCH", frozen["freeze_reasons"])

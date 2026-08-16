@@ -185,7 +185,8 @@ V2_MIN_EPOCH_MS = 946684800000
 # matching the program's existing public-market future-time allowance.
 V2_EVENT_FUTURE_SKEW_MS = 2000
 # A private reconcile read may be at most one minute old at append time;
-# older account truth cannot confirm the current ledger state.
+# observed_at_ms is read-digest-bound and read_received_at is the append
+# clock, so older account truth cannot be relabelled as current ledger truth.
 V2_RECONCILE_READ_MAX_AGE_MS = 60_000
 # Event zero uses a fixed in-range cut so its digest remains config-bound;
 # every later event must advance beyond this sentinel.
@@ -816,9 +817,15 @@ _V2_RUNG_REDUCED_FIELDS = frozenset({
 _V2_REDUCTION_AMOUNT_FIELDS = frozenset({
     "spot_quantity", "short_quantity",
 })
-_V2_RECONCILE_FIELDS = frozenset({
+_V2_RECONCILE_FACT_FIELDS = frozenset({
     "reconcile_id", "observed_at_ms", "source", "baseline",
     "positions", "open_orders", "own_orders", "balances",
+})
+_V2_RECONCILE_READ_FIELDS = _V2_RECONCILE_FACT_FIELDS | frozenset({
+    "read_digest",
+})
+_V2_RECONCILE_FIELDS = _V2_RECONCILE_READ_FIELDS | frozenset({
+    "read_received_at",
 })
 _V2_RECONCILE_POSITION_FIELDS = frozenset({
     "spot_base_quantity", "futures_position_quantity",
@@ -851,6 +858,9 @@ _V2_EVENT_PAYLOAD_FIELDS = {
 }
 _V2_EVENT_PAYLOAD_FIELDS["RungFilled"] = (
     _V2_EVENT_PAYLOAD_FIELDS["RungFilled"] | {"cut_ms"})
+_V2_EVENT_PAYLOAD_FIELDS["ReconcileObserved"] = (
+    _V2_EVENT_PAYLOAD_FIELDS["ReconcileObserved"]
+    - {"read_received_at"})
 _V2_SHAPE_SENTINELS = frozenset({
     "schema_version", "ledger", "event_type", "previous_digest",
     "event_digest", "receipt_digest",
@@ -1370,7 +1380,7 @@ def _normalize_v2_reconcile_balances(
 def _normalize_v2_reconcile_observation(
         value: Any, require_canonical: bool) -> Dict[str, Any]:
     path = "ReconcileObserved"
-    _v2_exact_fields(value, _V2_RECONCILE_FIELDS, path)
+    _v2_exact_fields(value, _V2_RECONCILE_FACT_FIELDS, path)
     return {
         "reconcile_id": _v2_id(
             value["reconcile_id"], path + ".reconcile_id"),
@@ -1395,12 +1405,28 @@ def _normalize_v2_reconcile_observation(
     }
 
 
+def _v2_reconcile_read_digest(value: Dict[str, Any]) -> str:
+    return _canonical_json_sha256(
+        {field: value[field]
+         for field in sorted(_V2_RECONCILE_FACT_FIELDS)},
+        "reconcile read")
+
+
+def _validate_v2_reconcile_read_digest(value: Dict[str, Any],
+                                       path: str) -> None:
+    supplied = _v2_digest(
+        value["read_digest"], path + ".read_digest")
+    if supplied != _v2_reconcile_read_digest(value):
+        raise PositionError(
+            "version-2 reconcile read digest does not match its facts")
+
+
 def new_v2_reconcile_observed_event(
         reconcile_id: str, observed_at_ms: int, source: str,
         baseline: Dict[str, Any], positions: Dict[str, Any],
         open_orders: Dict[str, Any], own_orders: List[Dict[str, Any]],
         balances: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one typed private-read observation for a resume CAS append."""
+    """Return a typed private read with its facts and source time bound."""
     normalized = _normalize_v2_reconcile_observation({
         "reconcile_id": reconcile_id,
         "observed_at_ms": observed_at_ms,
@@ -1411,6 +1437,7 @@ def new_v2_reconcile_observed_event(
         "own_orders": own_orders,
         "balances": balances,
     }, require_canonical=False)
+    normalized["read_digest"] = _v2_reconcile_read_digest(normalized)
     return {"event_type": "ReconcileObserved", **normalized}
 
 
@@ -1751,15 +1778,27 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
                 "version-2 RungReduced amounts are not canonical")
     elif event_type == "ReconcileObserved":
         normalized_observation = _normalize_v2_reconcile_observation(
-            {key: event[key] for key in _V2_RECONCILE_FIELDS},
+            {key: event[key] for key in _V2_RECONCILE_FACT_FIELDS},
             require_canonical=True)
         if normalized_observation != {
-                key: event[key] for key in _V2_RECONCILE_FIELDS}:
+                key: event[key] for key in _V2_RECONCILE_FACT_FIELDS}:
             raise PositionError(
                 "version-2 ReconcileObserved facts are not canonical")
+        _validate_v2_reconcile_read_digest(event, path)
         if cut != event["observed_at_ms"]:
             raise PositionError(
                 "version-2 ReconcileObserved cut does not match observation")
+        read_received_at = _v2_epoch_ms(
+            event["read_received_at"], path + ".read_received_at")
+        if event["observed_at_ms"] > read_received_at:
+            raise PositionError(
+                "FUTURE_RECONCILE_READ: version-2 reconcile observation "
+                "is later than its append clock")
+        if read_received_at - event["observed_at_ms"] \
+                > V2_RECONCILE_READ_MAX_AGE_MS:
+            raise PositionError(
+                "STALE_RECONCILE_READ: version-2 reconcile observation "
+                "exceeds the documented maximum age")
     else:
         _v2_id(event["receipt_id"], path + ".receipt_id")
         module_time = _v2_epoch_ms(
@@ -2809,6 +2848,17 @@ def _seal_v2_event_payload(
         _v2_exact_fields(
             copied, _V2_EVENT_PAYLOAD_FIELDS[event_type],
             event_type + " payload")
+        if event_type == "ReconcileObserved":
+            reconcile_facts = {
+                key: copied[key] for key in _V2_RECONCILE_FACT_FIELDS
+            }
+            normalized_reconcile = _normalize_v2_reconcile_observation(
+                reconcile_facts, require_canonical=True)
+            if normalized_reconcile != reconcile_facts:
+                raise PositionError(
+                    "version-2 ReconcileObserved facts are not canonical")
+            _validate_v2_reconcile_read_digest(
+                copied, "ReconcileObserved")
         if event_type == "ConfigSnapshot":
             cut = V2_GENESIS_CUT_MS
         elif event_type in ("ReceiptObserved", "ReconcileObserved"):
@@ -2824,6 +2874,10 @@ def _seal_v2_event_payload(
             # advances one millisecond and still passes the append-clock gate.
             cut = _v2_epoch_ms(
                 previous_cut + 1, "RungReduced.cut_ms")
+    if event_type == "ReconcileObserved" and cut > module_now:
+        raise PositionError(
+            "FUTURE_RECONCILE_READ: version-2 reconcile observation "
+            "is later than the append clock")
     if cut > module_now + V2_EVENT_FUTURE_SKEW_MS:
         raise PositionError(
             "version-2 event cut exceeds the documented future skew bound")
@@ -2835,6 +2889,8 @@ def _seal_v2_event_payload(
         raise PositionError(
             "STALE_RECONCILE_READ: version-2 reconcile observation "
             "exceeds the documented maximum age")
+    if event_type == "ReconcileObserved":
+        copied["read_received_at"] = module_now
     copied["cut_ms"] = cut
     copied["previous_digest"] = previous_digest
     copied["event_digest"] = V2_GENESIS_DIGEST
@@ -4486,8 +4542,17 @@ def _v2_resume_observation_payload(
     if event_type != "ReconcileObserved":
         raise PositionError(
             "version-2 resume requires a ReconcileObserved event")
+    _v2_exact_fields(
+        copied, _V2_RECONCILE_READ_FIELDS,
+        "ReconcileObserved read")
+    reconcile_facts = {
+        key: copied[key] for key in _V2_RECONCILE_FACT_FIELDS
+    }
     normalized = _normalize_v2_reconcile_observation(
-        copied, require_canonical=False)
+        reconcile_facts, require_canonical=False)
+    _validate_v2_reconcile_read_digest(
+        {**normalized, "read_digest": copied["read_digest"]},
+        "ReconcileObserved")
     expected = {}
     for event in position["ledger"]:
         if event["event_type"] != "RungFilled":
@@ -4511,6 +4576,7 @@ def _v2_resume_observation_payload(
     normalized["own_orders"] = _normalize_v2_reconcile_own_orders(
         completed, "ReconcileObserved.own_orders",
         require_canonical=False)
+    normalized["read_digest"] = _v2_reconcile_read_digest(normalized)
     return {"event_type": "ReconcileObserved", **normalized}
 
 
