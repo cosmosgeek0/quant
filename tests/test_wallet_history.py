@@ -16,15 +16,24 @@ if str(SRC) not in sys.path:
 
 import limits  # noqa: E402
 import wallet  # noqa: E402
+from execution import binance_http, binance_transfer  # noqa: E402
 
 
-def client_with(pages):
-    """A BinanceClient whose reads are scripted; time already synced."""
-    client = wallet.BinanceClient("k", "s")
-    client.offsets[wallet.SPOT_BASE] = 0
+def history_read(pages):
     feed = list(pages)
-    client.read = lambda *args, **kwargs: feed.pop(0)
-    return client
+
+    def transport(*_args):
+        return binance_http.HttpResult("ok", feed.pop(0), None, None)
+
+    return binance_transfer.read_transfer_history(
+        transport, "https://spot.invalid", "MAIN_UMFUTURE", 0, 1
+    )
+
+
+def complete_row():
+    return {"tranId": 1, "asset": "USDT", "amount": "2",
+            "status": "CONFIRMED", "timestamp": 1700000000000,
+            "type": "MAIN_UMFUTURE"}
 
 
 class TransferHistoryShapeTests(unittest.TestCase):
@@ -38,34 +47,29 @@ class TransferHistoryShapeTests(unittest.TestCase):
             wallet.validated_transfer_amount("USDT", "32.00000001")
 
     def test_total_only_empty_window_is_a_valid_empty_baseline(self):
-        client = client_with([("ok", {"total": 0})])
-        kind, rows = client.transfer_history("MAIN_UMFUTURE", 0, 1)
-        self.assertEqual(kind, "ok")
-        self.assertEqual(rows, [])
+        result = history_read([{"total": 0}])
+        self.assertEqual((result.kind, result.value), ("ok", ()))
 
     def test_rows_present_still_parse(self):
-        page = {"total": 1, "rows": [{"tranId": 1, "asset": "USDT"}]}
-        client = client_with([("ok", page)])
-        kind, rows = client.transfer_history("MAIN_UMFUTURE", 0, 1)
-        self.assertEqual(kind, "ok")
-        self.assertEqual(len(rows), 1)
+        result = history_read([{"total": 1, "rows": [complete_row()]}])
+        self.assertEqual(result.kind, "ok")
+        self.assertEqual(result.value, (binance_transfer.TransferRow(
+            "MAIN_UMFUTURE", "USDT", Decimal("2"), 1, "CONFIRMED",
+            1700000000000),))
 
     def test_null_rows_treated_as_empty(self):
-        client = client_with([("ok", {"total": 0, "rows": None})])
-        kind, rows = client.transfer_history("MAIN_UMFUTURE", 0, 1)
-        self.assertEqual(kind, "ok")
-        self.assertEqual(rows, [])
+        result = history_read([{"total": 0, "rows": None}])
+        self.assertEqual((result.kind, result.value), ("ok", ()))
 
     def test_non_list_rows_still_a_schema_error(self):
-        client = client_with([("ok", {"total": 1, "rows": "junk"})])
-        kind, payload = client.transfer_history("MAIN_UMFUTURE", 0, 1)
-        self.assertEqual(kind, "schema_error")
-        self.assertEqual(payload["error"], "InvalidTransferHistory")
+        result = history_read([{"total": 1, "rows": "invalid"}])
+        self.assertEqual((result.kind, result.value), ("unclear", None))
+        self.assertEqual(result.error.msg, "transfer_history_schema")
 
     def test_non_dict_payload_still_a_schema_error(self):
-        client = client_with([("ok", ["junk"])])
-        kind, _ = client.transfer_history("MAIN_UMFUTURE", 0, 1)
-        self.assertEqual(kind, "schema_error")
+        result = history_read([["invalid"]])
+        self.assertEqual((result.kind, result.value), ("unclear", None))
+        self.assertEqual(result.error.msg, "transfer_history_schema")
 
 
 if __name__ == "__main__":

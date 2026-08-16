@@ -1,4 +1,4 @@
-"""Offline characterization tests for wallet transfer and read behavior."""
+"""Offline integration tests for wallet receipt and transfer policy."""
 
 import json
 import sys
@@ -13,55 +13,57 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import wallet  # noqa: E402
+from execution import binance_http as http  # noqa: E402
+from execution import binance_transfer as transfer  # noqa: E402
 
 
-SPOT_BALANCES = {
-    "balances": [
-        {"asset": "USDT", "free": "8.2500"},
-        {"asset": "BTC", "free": "0.1"},
-    ]
-}
+SHA = "a" * 40
+SPOT_BALANCES = {"balances": [
+    {"asset": "USDT", "free": "8.2500"},
+    {"asset": "BTC", "free": "0.1"},
+]}
 FUTURES_BALANCES = [
     {"asset": "USDT", "availableBalance": "7.500"},
     {"asset": "BTC", "availableBalance": "0.2"},
 ]
 
 
-def history_row(tran_id="101", status="CONFIRMED"):
-    return {
-        "tranId": tran_id,
-        "asset": "USDT",
-        "amount": "2",
-        "status": status,
-        "timestamp": 1700000000000,
-        "type": "MAIN_UMFUTURE",
-    }
+def http_result(kind, payload=None, code=None, msg=None):
+    return http.HttpResult(kind, payload, code, msg)
+
+
+def history_row(tran_id=101, status="CONFIRMED"):
+    return {"tranId": tran_id, "asset": "USDT", "amount": "2",
+            "status": status, "timestamp": 1700000000000,
+            "type": "MAIN_UMFUTURE"}
+
+
+def typed_row(tran_id=101, status="CONFIRMED"):
+    return transfer.TransferRow(
+        "MAIN_UMFUTURE", "USDT", Decimal("2"), tran_id, status,
+        1700000000000,
+    )
+
+
+def balance_result():
+    return http.ReadResult("ok", transfer.TransferBalances(
+        "USDT", Decimal("8.2500"), Decimal("7.500")), None)
 
 
 def transfer_receipt(request_id, submission_kind=None):
+    intent = transfer.build_transfer(
+        "spot_to_usdm", "USDT", Decimal("2"), request_id, SHA
+    )
     receipt = {
-        "kind": "internal_transfer",
-        "request_id": request_id,
-        "direction": "spot-to-usdm",
-        "transfer_type": "MAIN_UMFUTURE",
-        "asset": "USDT",
-        "amount": "2",
-        "history_start_ms": 0,
-        "baseline_tran_ids": [],
-        "state": "PREPARED",
-        "mutation_attempts": 1,
+        "kind": "internal_transfer", "request_id": request_id, "sha": SHA,
+        "direction": "spot-to-usdm", "transfer_type": "MAIN_UMFUTURE",
+        "asset": "USDT", "amount": "2", "history_start_ms": 0,
+        "baseline_tran_ids": [], "state": "PREPARED",
+        "mutation_attempts": 1, "intent": wallet._intent_record(intent),
     }
     if submission_kind is not None:
         receipt["submission_kind"] = submission_kind
     return receipt
-
-
-def scripted_client(*responses):
-    client = wallet.BinanceClient("offline-key", "offline-secret")
-    client.offsets.update({wallet.SPOT_BASE: 0, wallet.FUTURES_BASE: 0})
-    transport = mock.Mock(side_effect=list(responses))
-    client._once = transport
-    return client, transport
 
 
 def locked_receipt(root, marker="a", submission_kind=None):
@@ -80,209 +82,184 @@ class RecordingStore(wallet.ReceiptStore):
 
 
 class WalletTransferTests(unittest.TestCase):
-    def test_signed_once_before_time_sync_sends_nothing(self):
-        client = wallet.BinanceClient("offline-key", "offline-secret")
-        with mock.patch.object(wallet.urllib.request, "urlopen") as urlopen:
-            result = client._once(
-                "GET", wallet.SPOT_BASE, "/private", signed=True
+    def test_intent_writer_syncs_file_and_directory_and_keeps_order(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = wallet.ReceiptStore(root)
+            request_id = "l3w" + "1" * 20
+            receipt = transfer_receipt(request_id)
+            receipt.pop("intent")
+            receipt["mutation_attempts"] = 0
+            store.acquire_lock(request_id)
+            path = store.create("transfer", request_id, receipt)
+            intent = transfer.build_transfer(
+                "spot_to_usdm", "USDT", Decimal("2"), request_id, SHA
             )
-        self.assertEqual(
-            result, ("unclear", {"error": "TimeNotSynchronized"})
-        )
-        urlopen.assert_not_called()
-
-    def test_read_retries_only_unclear_with_one_and_two_second_waits(self):
-        client, transport = scripted_client(
-            ("unclear", {"error": "TimeoutError"}),
-            ("unclear", {"http": 503}),
-            ("ok", {"value": "ready"}),
-        )
-        with mock.patch.object(wallet.time, "sleep") as sleep:
-            result = client.read(wallet.SPOT_BASE, "/read", signed=True)
-        self.assertEqual(result, ("ok", {"value": "ready"}))
-        self.assertEqual(transport.call_count, 3)
-        self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(2)])
-
-    def test_read_stops_on_ok_or_api_error(self):
-        for kind, payload in (
-            ("ok", {"value": "ready"}),
-            ("api_error", {"code": -2015}),
-        ):
-            with self.subTest(kind=kind):
-                client, transport = scripted_client((kind, payload))
-                with mock.patch.object(wallet.time, "sleep") as sleep:
-                    result = client.read(wallet.SPOT_BASE, "/read", tries=3)
-                self.assertEqual(result, (kind, payload))
-                self.assertEqual(transport.call_count, 1)
-                sleep.assert_not_called()
-
-    def test_submit_transfer_uses_one_signed_post(self):
-        client, transport = scripted_client(
-            ("unclear", {"error": "TimeoutError"})
-        )
-        result = client.submit_transfer("MAIN_UMFUTURE", "USDT", "2")
-        self.assertEqual(result[0], "unclear")
-        transport.assert_called_once_with(
-            "POST",
-            wallet.SPOT_BASE,
-            "/sapi/v1/asset/transfer",
-            {"type": "MAIN_UMFUTURE", "asset": "USDT", "amount": "2"},
-            signed=True,
-        )
+            real_fsync = wallet.os.fsync
+            with mock.patch.object(wallet.os, "fsync", wraps=real_fsync) as sync:
+                store.intent_writer(path, receipt)(intent)
+            saved = json.loads(Path(path).read_text())
+        self.assertEqual(sync.call_count, 2)
+        self.assertEqual(saved["mutation_attempts"], 1)
+        self.assertEqual(saved["intent"]["params"],
+                         [list(pair) for pair in intent.params])
 
     def test_execute_transfer_persists_attempt_before_post_and_tran_id(self):
         with tempfile.TemporaryDirectory() as root:
             store = RecordingStore(root)
-            client = wallet.BinanceClient("offline-key", "offline-secret")
-            client.offsets.update(
-                {wallet.SPOT_BASE: 0, wallet.FUTURES_BASE: 0}
-            )
             calls, post_receipt = [], {}
             history_reads = 0
 
-            def transport(method, base, path, params=None, signed=False):
+            def transport(method, base, path, params, signed):
                 nonlocal history_reads
                 calls.append((method, base, path, params, signed))
                 if method == "POST":
                     receipt_path = next(Path(root).glob("transfer-*.json"))
                     post_receipt.update(json.loads(receipt_path.read_text()))
-                    return "ok", {"tranId": 321}
+                    return http_result("ok", {"tranId": 321})
                 if path == "/api/v3/account":
-                    return "ok", SPOT_BALANCES
+                    return http_result("ok", SPOT_BALANCES)
                 if path == "/fapi/v3/balance":
-                    return "ok", FUTURES_BALANCES
+                    return http_result("ok", FUTURES_BALANCES)
                 if path == "/sapi/v1/asset/transfer":
                     history_reads += 1
-                    if history_reads == 1:
-                        return "ok", {"total": 0}
-                    return "ok", {"total": 1, "rows": [history_row("321")]}
+                    payload = {"total": 0} if history_reads == 1 else {
+                        "total": 1, "rows": [history_row(321)]}
+                    return http_result("ok", payload)
                 raise AssertionError("unexpected offline transport call")
 
-            client._once = transport
             path, receipt = wallet.execute_transfer(
-                store, client, "spot-to-usdm", "USDT", "2", "abcdef1",
-                query_attempts=1,
+                store, transport, "spot-to-usdm", "USDT", "2", SHA,
+                sleep=lambda _seconds: None,
             )
             saved = json.loads(Path(path).read_text())
 
         self.assertEqual(store.created["state"], "PREPARED")
         self.assertEqual(store.created["mutation_attempts"], 0)
-        self.assertEqual(post_receipt["state"], "PREPARED")
         self.assertEqual(post_receipt["mutation_attempts"], 1)
+        self.assertEqual(post_receipt["intent"]["git_sha"], SHA)
         self.assertEqual(sum(call[0] == "POST" for call in calls), 1)
         self.assertEqual(receipt["tran_id"], "321")
         self.assertEqual(saved["tran_id"], "321")
-
-    def test_query_receipt_classifies_match_ambiguity_error_and_exhaustion(self):
-        one = {"total": 1, "rows": [history_row("201")]}
-        many = {
-            "total": 2,
-            "rows": [history_row("201"), history_row("202")],
-        }
-        empty = ("ok", {"total": 0})
-        cases = (
-            ("one", [("ok", one)], 1, "found", 1, []),
-            ("many", [("ok", many)], 1, "ambiguous", 1, []),
-            ("api", [("api_error", {"code": -2015})], 3,
-             "api_error", 1, []),
-            ("empty", [empty, empty], 2, "not_found", 2, [mock.call(2.0)]),
-        )
-        for label, responses, attempts, expected, count, waits in cases:
-            with self.subTest(case=label):
-                client, transport = scripted_client(*responses)
-                with mock.patch.object(wallet.time, "sleep") as sleep:
-                    state, payload = wallet.query_receipt(
-                        client, transfer_receipt("l3w" + "b" * 20), attempts
-                    )
-                self.assertEqual(state, expected)
-                self.assertEqual(transport.call_count, count)
-                self.assertEqual(sleep.call_args_list, waits)
-                if state == "found":
-                    self.assertEqual(payload["tranId"], "201")
-                if state == "ambiguous":
-                    self.assertEqual(payload, {"matches": 2})
 
     def test_reconcile_terminal_rows_release_lock(self):
         for marker, status in (("c", "CONFIRMED"), ("d", "FAILED")):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as root:
                 store, path, receipt = locked_receipt(root, marker)
-                client, _ = scripted_client(
-                    ("ok", {"total": 1,
-                            "rows": [history_row("301", status)]}),
-                    ("ok", SPOT_BALANCES),
-                    ("ok", FUTURES_BALANCES),
-                )
-                _, result = wallet.reconcile_transfer(
-                    store, path, receipt, client, attempts=1
-                )
+                query = transfer.TransferQuery(
+                    "found", typed_row(301, status), None)
+                with mock.patch.object(
+                        wallet.binance_transfer, "query_transfer",
+                        return_value=query), mock.patch.object(
+                        wallet, "_transfer_balances", return_value=balance_result()):
+                    _, result = wallet.reconcile_transfer(
+                        store, path, receipt, mock.Mock())
                 self.assertEqual(result["state"], status)
                 self.assertEqual(result["exchange"]["status"], status)
+                self.assertEqual(result["after"]["source"]["free"], "8.2500")
+                self.assertEqual(result["after"]["destination"]["free"], "7.500")
                 self.assertFalse(Path(store.lock_path).exists())
+
+    def test_terminal_history_keeps_truth_when_after_balances_are_unproved(self):
+        with tempfile.TemporaryDirectory() as root:
+            store, path, receipt = locked_receipt(root, "8")
+            query = transfer.TransferQuery("found", typed_row(302), None)
+            unclear = http_result("unclear", msg="transfer_balance_schema")
+            unreadable = http.ReadResult("unclear", None, unclear)
+            with mock.patch.object(
+                    wallet.binance_transfer, "query_transfer",
+                    return_value=query), mock.patch.object(
+                    wallet, "_transfer_balances", return_value=unreadable):
+                _, result = wallet.reconcile_transfer(
+                    store, path, receipt, mock.Mock())
+            self.assertEqual(result["state"], "CONFIRMED")
+            self.assertEqual(result["after"]["source"]["status"], "UNKNOWN")
+            self.assertIn("first_failure", result)
+            self.assertFalse(Path(store.lock_path).exists())
 
     def test_reconcile_rejected_post_without_row_releases_lock(self):
         with tempfile.TemporaryDirectory() as root:
             store, path, receipt = locked_receipt(root, "e", "api_error")
-            client, _ = scripted_client(("ok", {"total": 0}))
-            _, result = wallet.reconcile_transfer(
-                store, path, receipt, client, attempts=1
-            )
+            with mock.patch.object(
+                    wallet.binance_transfer, "query_transfer",
+                    return_value=transfer.TransferQuery(
+                        "not_found", None, None)):
+                _, result = wallet.reconcile_transfer(
+                    store, path, receipt, mock.Mock())
             self.assertEqual(result["state"], "REJECTED")
             self.assertFalse(Path(store.lock_path).exists())
 
     def test_reconcile_unresolved_history_keeps_lock(self):
-        responses = (
-            ("ambiguous", ("ok", {
-                "total": 2,
-                "rows": [history_row("401"), history_row("402")],
-            })),
-            ("unreadable", ("ok", [])),
+        error = http_result("api_error", code=-2015, msg="permission refused")
+        cases = (
+            transfer.TransferQuery("ambiguous", None, None),
+            transfer.TransferQuery("pending", None, None),
+            transfer.TransferQuery("error", None, error),
+            transfer.TransferQuery("found", typed_row(401, "PENDING"), None),
         )
-        for index, (label, response) in enumerate(responses):
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as root:
-                store, path, receipt = locked_receipt(root, "f" if not index else "a")
-                client, _ = scripted_client(response)
-                _, result = wallet.reconcile_transfer(
-                    store, path, receipt, client, attempts=1
-                )
+        for index, query in enumerate(cases):
+            with self.subTest(kind=query.kind), tempfile.TemporaryDirectory() as root:
+                marker = format(index + 10, "x")[-1]
+                store, path, receipt = locked_receipt(root, marker)
+                with mock.patch.object(
+                        wallet.binance_transfer, "query_transfer",
+                        return_value=query):
+                    _, result = wallet.reconcile_transfer(
+                        store, path, receipt, mock.Mock())
                 self.assertEqual(result["state"], "UNKNOWN")
                 self.assertTrue(Path(store.lock_path).exists())
 
     def test_validated_transfer_amount_refuses_out_of_policy_values(self):
-        cases = (
-            ("BTC", "1"),
-            ("USDT", "0"),
-            ("USDT", "-1"),
-            ("USDT", wallet.TRANSFER_HARD_CEILING + Decimal("0.01")),
-        )
+        cases = (("BTC", "1"), ("USDT", "0"), ("USDT", "-1"),
+                 ("USDT", wallet.TRANSFER_HARD_CEILING + Decimal("0.01")))
         for asset, amount in cases:
             with self.subTest(asset=asset, amount=str(amount)):
                 with self.assertRaises(ValueError):
                     wallet.validated_transfer_amount(asset, amount)
 
-    def test_balance_for_asset_parses_spot_and_futures(self):
-        client, _ = scripted_client(("ok", SPOT_BALANCES))
-        self.assertEqual(
-            wallet.balance_for_asset(client, "spot", "USDT"),
-            {"status": "OK", "account": "spot", "asset": "USDT",
-             "free": "8.2500"},
+    def test_transfer_balance_failures_map_blocked_and_unknown_without_post(self):
+        cases = (
+            (http_result("api_error", code=-2015, msg="permission refused"),
+             "BLOCKED"),
+            (http_result("ok", {"balances": "invalid"}), "UNKNOWN"),
         )
-        client, _ = scripted_client(("ok", FUTURES_BALANCES))
-        self.assertEqual(
-            wallet.balance_for_asset(client, "usd_m", "USDT"),
-            {"status": "OK", "account": "usd_m", "asset": "USDT",
-             "free": "7.500"},
-        )
+        for index, (reply, status) in enumerate(cases):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as root:
+                calls = []
 
-    def test_balance_for_asset_maps_blocked_and_unknown(self):
-        client, _ = scripted_client(("api_error", {"code": -2015}))
-        blocked = wallet.balance_for_asset(client, "spot", "USDT")
-        self.assertEqual(blocked["status"], "BLOCKED")
-        self.assertEqual(blocked["code"], -2015)
+                def transport(method, base, path, params, signed):
+                    calls.append((method, path))
+                    return reply
 
-        client, _ = scripted_client(("ok", {"balances": "unreadable"}))
-        unknown = wallet.balance_for_asset(client, "spot", "USDT")
-        self.assertEqual(unknown["status"], "UNKNOWN")
-        self.assertEqual(unknown["kind"], "schema_error")
+                _, receipt = wallet.execute_transfer(
+                    wallet.ReceiptStore(root), transport, "spot-to-usdm",
+                    "USDT", "2", SHA, sleep=lambda _seconds: None)
+                self.assertEqual(receipt["state"], "BLOCKED")
+                self.assertEqual(receipt["before"]["source"]["status"], status)
+                self.assertNotIn("POST", [call[0] for call in calls])
+
+    def test_time_sync_failure_gates_signed_transport(self):
+        wire = mock.Mock(return_value=http_result("ok", {}))
+        failure = http_result("unclear", msg="time unavailable")
+        transport = wallet._gated_transport(
+            wire, {"spot": failure, "usd_m": http_result("ok", {})})
+        self.assertIs(transport(
+            "GET", wallet.SPOT_BASE, "/private", None, True), failure)
+        wire.assert_not_called()
+        transport("GET", wallet.SPOT_BASE, "/public", None, False)
+        wire.assert_called_once()
+
+    def test_incomplete_legacy_receipt_stays_unknown_without_query(self):
+        with tempfile.TemporaryDirectory() as root:
+            store, path, receipt = locked_receipt(root, "9")
+            receipt.pop("intent")
+            store.save(path, receipt)
+            with mock.patch.object(
+                    wallet.binance_transfer, "query_transfer") as query:
+                _, result = wallet.reconcile_transfer(
+                    store, path, receipt, mock.Mock())
+            self.assertEqual(result["state"], "UNKNOWN")
+            self.assertTrue(Path(store.lock_path).exists())
+            query.assert_not_called()
 
 
 if __name__ == "__main__":
