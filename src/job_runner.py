@@ -5466,7 +5466,7 @@ def _reverse_action_row(action: Any, now: datetime) -> Dict[str, Any]:
 def _reverse_exposure_reason(
         truth: reverse_mechanics.ExchangeTruth,
         plan: reverse_mechanics.ReversePlan,
-        spot_open_orders: int = 0, futures_open_orders: int = 0) -> str:
+        cross_margin_open_orders: int = 0, futures_open_orders: int = 0) -> str:
     standing = []
     if truth.futures_position and truth.futures_position > Decimal("0"):
         standing.append(reverse_mechanics.FUTURES_CLOSE)
@@ -5475,8 +5475,8 @@ def _reverse_exposure_reason(
         standing.append("BASE_BALANCE_DELTA")
     if truth.liability and truth.liability > Decimal("0"):
         standing.append(reverse_mechanics.REPAY)
-    if spot_open_orders:
-        standing.append("SPOT_OPEN_ORDERS")
+    if cross_margin_open_orders:
+        standing.append("CROSS_MARGIN_OPEN_ORDERS")
     if futures_open_orders:
         standing.append("FUTURES_OPEN_ORDERS")
     return "OPEN_EXPOSURE:" + (",".join(standing) if standing else "KNOWN")
@@ -5596,16 +5596,21 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
                     and row.get("mutation_attempts") == 1
                     for row in receipt["legs"]))
             except MomentumStateError as error:
-                raise ReverseReadUnknown("REVERSE_FUTURES_POSITION_UNREADABLE") from error
-            spot_orders = _reverse_read(
-                transport, basis_executor.SPOT.base_url, basis_executor.SPOT_OPEN_ORDERS_PATH,
-                {"symbol": job.symbol}, True, "REVERSE_SPOT_OPEN_ORDERS")
-            if not isinstance(spot_orders, list):
-                raise ReverseReadUnknown("REVERSE_SPOT_OPEN_ORDERS_UNREADABLE")
+                raise ReverseReadUnknown(
+                    "REVERSE_FUTURES_POSITION_UNREADABLE") from error
+            cross_margin_orders = _reverse_read(
+                transport, basis_executor.SPOT.base_url, "/sapi/v1/margin/openOrders",
+                {"symbol": job.symbol, "isIsolated": "FALSE"}, True,
+                "REVERSE_CROSS_MARGIN_OPEN_ORDERS")
+            if not isinstance(cross_margin_orders, list):
+                raise ReverseReadUnknown(
+                    "REVERSE_CROSS_MARGIN_OPEN_ORDERS_UNREADABLE")
             return reverse_mechanics.ExchangeTruth(
                 Decimal(current_liability["total_liability"]),
-                current_free - initial_base_free, futures["qty"]), {"spot_open_orders": len(spot_orders),
-                "futures_open_orders": futures["open_orders"]}
+                current_free - initial_base_free, futures["qty"]), {
+                "cross_margin_open_orders": len(cross_margin_orders),
+                "futures_open_orders": futures["open_orders"],
+            }
 
         def final_authority(row, leg, params):
             reason, checked, digests, stopped = _margin_post_authority(job, paths,
@@ -5896,7 +5901,7 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
             except Exception:
                 return Outcome("UNKNOWN", 4, source_path,
                                "REVERSE_RECEIPT_PERSISTENCE_FAILED")
-            open_counts = (detail["spot_open_orders"],
+            open_counts = (detail["cross_margin_open_orders"],
                            detail["futures_open_orders"])
             if isinstance(action, reverse_mechanics.Freeze):
                 if action.reason in {"TERMINAL_TRUTH_NOT_FLAT",
@@ -5909,19 +5914,19 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
                 flat = truth.liability == truth.futures_position == 0 \
                     and abs(truth.base_balance_delta) < plan.dust \
                     and sum(open_counts) == 0
-                if not flat:
-                    return finish("OPEN_EXPOSURE", 3,
-                                  _reverse_exposure_reason(
-                                      truth, plan, *open_counts))
                 receipt["final_truth"] = {
                     "liability": _canonical_decimal_text(truth.liability),
                     "futures_position": _canonical_decimal_text(
                         truth.futures_position),
                     "base_balance_delta": _canonical_decimal_text(
                         truth.base_balance_delta),
-                    "spot_open_orders": 0, "futures_open_orders": 0,
+                    **detail,
                     "dust": _canonical_decimal_text(plan.dust),
                 }
+                if not flat:
+                    return finish("OPEN_EXPOSURE", 3,
+                                  _reverse_exposure_reason(
+                                      truth, plan, *open_counts))
                 if entry_failure and receipt.get("leverage", {}).get(
                         "verdict") == "REFUSED":
                     return finish("REFUSED", 2, entry_failure)

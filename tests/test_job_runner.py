@@ -408,8 +408,13 @@ class ReverseTransport:
                 {"asset": "USDT", "free": "100"},
             ]}
         if method == "GET" and path == jr.basis_executor.SPOT_OPEN_ORDERS_PATH:
-            final = self.final_open_venue == "spot" and self.history["REPAY"]
-            return "ok", ([{"symbol": "TSTUSDT"}] if final else [])
+            return "ok", []
+        if method == "GET" and path == "/sapi/v1/margin/openOrders":
+            final = bool(self.history["REPAY"])
+            if final and self.final_open_venue == "api_error":
+                return "api_error", {"code": -1000, "msg": "read unavailable"}
+            resting = final and self.final_open_venue == "cross_margin"
+            return "ok", ([{"symbol": "TSTUSDT"}] if resting else [])
         if method == "GET" and path == jr.basis_executor.USDM.exchange_info_path:
             return "ok", self.futures_exchange()
         if method == "GET" and path == jr.basis_executor.USDM_BOOK_PATH:
@@ -5647,7 +5652,7 @@ class JobRunnerTests(unittest.TestCase):
         )
         self.assertEqual(source["final_truth"], {
             "liability": "0", "futures_position": "0",
-            "base_balance_delta": "-0.0005", "spot_open_orders": 0,
+            "base_balance_delta": "-0.0005", "cross_margin_open_orders": 0,
             "futures_open_orders": 0, "dust": "0.001",
         })
         self.assertEqual((source["plan"]["intent_id"],
@@ -5824,21 +5829,68 @@ class JobRunnerTests(unittest.TestCase):
                 self.assertFalse(any(call[0] == "POST"
                                      for call in transport.calls))
 
-    def test_reverse_closed_truth_requires_both_venues_without_open_orders(self):
-        for venue in ("spot", "futures"):
-            with self.subTest(venue=venue), tempfile.TemporaryDirectory() as root:
+    def test_reverse_closed_truth_requires_no_futures_open_orders(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "jobs"))
+            self.write_reverse_controls(root)
+            self.reverse_job("reverse-final-futures", root)
+            transport = ReverseTransport(os.path.join(root, "STOP-JOBS"))
+            transport.final_open_venue = "futures"
+
+            self.assertEqual(self.reverse_tick(transport, root), 3)
+            result = json.loads(Path(
+                root, "jobs", "results.jsonl").read_text().splitlines()[0])
+            self.assertEqual(result["verdict"], "OPEN_EXPOSURE")
+            self.assertIn("FUTURES_OPEN_ORDERS",
+                          self.reverse_source(result, root)["reason"])
+
+    def test_reverse_final_truth_reads_cross_margin_open_orders(self):
+        cases = (
+            ("resting", "cross_margin", 3, "OPEN_EXPOSURE"),
+            ("empty", "", 0, "CLOSED"),
+            ("api-error", "api_error", 4, "UNKNOWN"),
+        )
+        for suffix, final_state, exit_code, verdict in cases:
+            with self.subTest(case=suffix), tempfile.TemporaryDirectory() as root:
                 os.makedirs(os.path.join(root, "jobs"))
                 self.write_reverse_controls(root)
-                self.reverse_job("reverse-final-" + venue, root)
+                self.reverse_job("reverse-margin-orders-" + suffix, root)
                 transport = ReverseTransport(os.path.join(root, "STOP-JOBS"))
-                transport.final_open_venue = venue
+                transport.final_open_venue = final_state
 
-                self.assertEqual(self.reverse_tick(transport, root), 3)
+                self.assertEqual(self.reverse_tick(transport, root), exit_code)
+
                 result = json.loads(Path(
                     root, "jobs", "results.jsonl").read_text().splitlines()[0])
-                self.assertEqual(result["verdict"], "OPEN_EXPOSURE")
-                self.assertIn(venue.upper() + "_OPEN_ORDERS",
-                              self.reverse_source(result, root)["reason"])
+                self.assertEqual(result["verdict"], verdict)
+                source = self.reverse_source(result, root)
+                margin_reads = [call for call in transport.calls
+                                if call[0] == "GET"
+                                and call[2] == "/sapi/v1/margin/openOrders"]
+                self.assertTrue(margin_reads)
+                self.assertTrue(all(
+                    call[3] == {"symbol": "TSTUSDT", "isIsolated": "FALSE"}
+                    and call[4] for call in margin_reads
+                ))
+                self.assertTrue(any(
+                    call[0] == "GET"
+                    and call[2] == jr.basis_executor.SPOT_OPEN_ORDERS_PATH
+                    for call in transport.calls
+                ))
+                if suffix == "resting":
+                    self.assertEqual(
+                        source["final_truth"]["cross_margin_open_orders"], 1
+                    )
+                    self.assertIn("CROSS_MARGIN_OPEN_ORDERS", source["reason"])
+                elif suffix == "empty":
+                    self.assertEqual(
+                        source["final_truth"]["cross_margin_open_orders"], 0
+                    )
+                else:
+                    self.assertEqual(
+                        source["reason"],
+                        "REVERSE_CROSS_MARGIN_OPEN_ORDERS_UNREADABLE",
+                    )
 
     def test_reverse_stop_on_history_read_refuses_borrow_post(self):
         self.reverse_job("reverse-history-stop")
