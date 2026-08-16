@@ -88,9 +88,12 @@ MARGIN_LEGACY_RECONCILED_FIELDS = (
 ) | {"legacy_exclusivity_proof"}
 LEGACY_REPAY_SHAPE = "LEGACY_REPAY_SHAPE"
 LEGACY_REPAY_SHAPE_VERSION = 1
-# Frozen releases that wrote the four-field REPAY expectation.
-LEGACY_REPAY_SHAPE_RELEASES = (
-    "4a7e2634361892dccf41137fbd88fe62ae8e3281",
+# Frozen historical receipt facts measured outside the receipt files.
+LEGACY_REPAY_RECEIPTS = (
+    (
+        "mproofr-2c2a3027d877", "401382497303", "USDT", "2.5000387",
+        "4a7e2634361892dccf41137fbd88fe62ae8e3281",
+    ),
 )
 MARGIN_LEGACY_REPAY_RECONCILED_FIELDS = MARGIN_RECONCILED_FIELDS | {
     "receipt_shape", "receipt_shape_version",
@@ -206,6 +209,14 @@ class JobRefusal(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class LegacyProvenanceMismatch(JobRefusal):
+    """One named fact did not bind the frozen legacy REPAY receipt."""
+
+    def __init__(self, fact: str):
+        super().__init__("LEGACY_PROVENANCE_MISMATCH")
+        self.fact = fact
 
 
 class DuplicateField(JobRefusal):
@@ -4616,6 +4627,51 @@ def _legacy_repay_current_liability(
     }, ""
 
 
+def _legacy_repay_exchange_provenance(
+        history_payload: Any, receipt_facts: Tuple[str, str, str, str, str]) \
+        -> str:
+    """Name the first exact-id exchange fact that misses the allowlist."""
+    try:
+        transaction_id = receipt_facts[1]
+        asset = receipt_facts[2]
+        requested_amount = _margin_decimal_text(receipt_facts[3])
+        if requested_amount is None:
+            return "ALLOWLIST_REQUESTED_AMOUNT"
+        if type(history_payload) is not dict \
+                or type(history_payload.get("rows")) is not list \
+                or len(history_payload["rows"]) != 1 \
+                or type(history_payload["rows"][0]) is not dict:
+            return "EXCHANGE_HISTORY_ROW"
+        row = history_payload["rows"][0]
+        aliases = _margin_identity_aliases(row)
+        target = _margin_transaction_number(transaction_id)
+        row_target = _margin_transaction_number(
+            _margin_transaction_id({"txId": row.get("txId")})
+        )
+        if target is None or aliases != [transaction_id] \
+                or row_target != target:
+            return "EXCHANGE_TRANSACTION_ID"
+        if type(row.get("asset")) is not str or row["asset"] != asset:
+            return "EXCHANGE_ASSET"
+        amount = _margin_decimal_text(row.get("amount"))
+        if amount is None \
+                or Decimal(amount) != Decimal(requested_amount):
+            return "EXCHANGE_AMOUNT"
+        principal = _margin_decimal_text(row.get("principal"))
+        if principal is None:
+            return "EXCHANGE_PRINCIPAL"
+        interest = _margin_decimal_text(row.get("interest"))
+        if interest is None:
+            return "EXCHANGE_INTEREST"
+        with localcontext() as context:
+            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+            if Decimal(principal) + Decimal(interest) != Decimal(amount):
+                return "EXCHANGE_PRINCIPAL_INTEREST_TOTAL"
+        return ""
+    except Exception:
+        return "EXCHANGE_HISTORY_ROW"
+
+
 def _legacy_repay_history_confirmation(
         history_payload: Any, transaction_id: Any, expected: Any,
         liability_before: Any) \
@@ -5984,7 +6040,7 @@ def _release_compare(label: str, actual: Dict[str, Any],
 
 def _margin_reconcile_unconfirmed(
         paths: Dict[str, str], job_id: str, reason: str,
-        now: datetime) -> int:
+        now: datetime, fact: str = "") -> int:
     row = {
         "kind": "RECONCILE_UNCONFIRMED",
         "job_id": job_id,
@@ -5996,7 +6052,8 @@ def _margin_reconcile_unconfirmed(
     except Exception:
         print("JOB-RUNNER | RECONCILE REFUSED | EVIDENCE_PERSISTENCE_FAILED")
         return 3
-    print("JOB-RUNNER | RECONCILE UNCONFIRMED | " + reason)
+    detail = reason if not fact else reason + " | " + fact
+    print("JOB-RUNNER | RECONCILE UNCONFIRMED | " + detail)
     return 3
 
 
@@ -6034,12 +6091,66 @@ def _reconcile_unknown_result(
     )
 
 
+def _legacy_repay_allowlisted_facts(
+        job_id: Any, transaction_id: Any, asset: Any,
+        requested_amount: Any, writer_sha: Any) \
+        -> Tuple[str, str, str, str, str]:
+    matches = [
+        facts for facts in LEGACY_REPAY_RECEIPTS
+        if facts[0] == job_id
+    ]
+    if len(matches) != 1:
+        raise LegacyProvenanceMismatch("JOB_ID")
+    facts = matches[0]
+    for fact, actual, expected in (
+            ("SUBMISSION_TRANSACTION_ID", transaction_id, facts[1]),
+            ("ASSET", asset, facts[2]),
+            ("REQUESTED_AMOUNT", requested_amount, facts[3]),
+            ("WRITER_RELEASE_SHA", writer_sha, facts[4])):
+        if actual != expected:
+            raise LegacyProvenanceMismatch(fact)
+    return facts
+
+
+def _legacy_repay_result_ledger_fact(
+        results_path: str, job_id: str) -> str:
+    try:
+        lines = _read_file_bytes(results_path).splitlines()
+        if not lines or any(not line for line in lines):
+            return "RESULT_LEDGER_READ"
+        rows = [
+            _decode_bounded_plain_object(line, "RESULT", "RESULTS")
+            for line in lines
+        ]
+    except (ArtifactAnomaly, JobRefusal, OSError):
+        return "RESULT_LEDGER_READ"
+    job_rows = [
+        row for row in rows
+        if set(row) == RESULT_FIELDS and row.get("job_id") == job_id
+    ]
+    if not job_rows:
+        return "RESULT_LEDGER_JOB_ID"
+    operation_rows = [
+        row for row in job_rows if row.get("op") == margin_ops.MARGIN_REPAY
+    ]
+    if not operation_rows:
+        return "RESULT_LEDGER_OPERATION"
+    expected_basename = "job-%s.json" % job_id
+    if not any(
+            type(row.get("receipt_path")) is str
+            and os.path.basename(row["receipt_path"]) == expected_basename
+            for row in operation_rows):
+        return "RESULT_LEDGER_RECEIPT_PATH"
+    return ""
+
+
 def _load_margin_reconcile_facts(
         paths: Dict[str, str], receipt_dir: str, job_id: str) \
         -> Tuple[
             str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any],
             Dict[str, str], Dict[str, str], Optional[Dict[str, str]],
-            str, Optional[int], str, bool,
+            str, Optional[int], str,
+            Optional[Tuple[str, str, str, str, str]],
         ]:
     source_path = os.path.join(
         paths["receipts"], "margin-%s.json" % job_id
@@ -6147,19 +6258,18 @@ def _load_margin_reconcile_facts(
             }, params["asset"]) == liability_before,
             "SOURCE_ACCOUNT_LIABILITY_BEFORE_MISMATCH",
         )
-    legacy_repay = False
+    legacy_repay = None
     if params["type"] == "REPAY" and not legacy_receipt:
         if expected == expected_row:
-            recorded_sha = source.get("sha")
-            legacy_repay = (
-                recorded_sha in LEGACY_REPAY_SHAPE_RELEASES
-                and runner.get("sha_valid") is True
-                and runner.get("sha") == recorded_sha
-                and runner.get("measured_sha") == recorded_sha
+            legacy_repay = _legacy_repay_allowlisted_facts(
+                source.get("job_id"), transaction_id, params["asset"],
+                params["amount"], source.get("sha"),
             )
-            _release_require(
-                legacy_repay, "LEGACY_PROVENANCE_MISMATCH"
+            ledger_fact = _legacy_repay_result_ledger_fact(
+                paths["results"], job_id
             )
+            if ledger_fact:
+                raise LegacyProvenanceMismatch(ledger_fact)
         else:
             modern_expected = _margin_repay_expected_ledger_confirmation(
                 params, liability_before
@@ -6264,6 +6374,10 @@ def reconcile_margin(
         return _margin_reconcile_unconfirmed(
             paths, job_id, anomaly.reason, now
         )
+    except LegacyProvenanceMismatch as mismatch:
+        return _margin_reconcile_unconfirmed(
+            paths, job_id, mismatch.reason, now, mismatch.fact
+        )
     except JobRefusal as refusal:
         return _margin_reconcile_unconfirmed(
             paths, job_id, refusal.reason, now
@@ -6297,6 +6411,14 @@ def reconcile_margin(
             )
         history_payload = history_result[1]
         if legacy_repay:
+            provenance_fact = _legacy_repay_exchange_provenance(
+                history_payload, legacy_repay
+            )
+            if provenance_fact:
+                return _margin_reconcile_unconfirmed(
+                    paths, job_id, "LEGACY_PROVENANCE_MISMATCH", now,
+                    provenance_fact,
+                )
             history_confirmation, history_fact_reason = \
                 _legacy_repay_history_confirmation(
                     history_payload, transaction_id, expected,
@@ -6329,8 +6451,8 @@ def reconcile_margin(
             return _margin_reconcile_unconfirmed(
                 paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
             )
-        # The exact-id read binds the target row. Only frozen release
-        # provenance may use the four-field REPAY confirmation law.
+        # The exact-id read binds the target row. Only the frozen allowlist,
+        # job ledger, and exchange facts may use the four-field REPAY law.
         if legacy_receipt:
             history_reason, _history_after, history_identifiers, \
                 legacy_exclusivity_proof = \
