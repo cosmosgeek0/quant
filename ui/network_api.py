@@ -30,24 +30,33 @@ GROUPS = ("rest", "wss", "cf", "news")
 PROBE_EDGES = ("spot_rest", "usdm_rest", "connector_origin", "cf_connector")
 RANGES = {"1h": (3_600_000, 60_000), "6h": (21_600_000, 300_000),
           "24h": (86_400_000, 900_000)}
-_CURRENT_KEYS = frozenset((
-    "schema_version", "generated_at", "generated_ms", "collector",
-    "deployed_ui_release", "summary", "nodes", "edges", "events",
-))
 _EDGE_KEYS = frozenset((
     "id", "source", "target", "label", "direction", "mode", "required",
     "group", "health", "health_reason", "authority", "monitoring", "truth",
     "observed_at", "observed_ms", "fresh_until_ms", "cadence_ms",
     "sample_count", "metrics", "counters", "evidence", "controls",
 ))
-_EVENT_KEYS = (
-    "event_id", "ts", "edge_id", "transition", "severity", "reason",
-    "evidence",
-)
 _EVENT_EVIDENCE_KEYS = frozenset((
     "key", "group", "old", "new", "receipt_id", "reread", "http_status",
     "rtt_ms", "edge_id", "request_id", "delta", "from", "to", "note",
 ))
+_COLLECTOR_KEYS = frozenset((
+    "status", "started_at", "last_cycle_at", "cycle_ms", "tick_s",
+    "recorder_release", "config", "probe_now",
+))
+_SUMMARY_KEYS = frozenset((
+    "operational_required", "observed_required", "required_total",
+    "unknown_count", "worst", "oldest_required_evidence_at",
+    "last_transition",
+))
+_TRUTH_KEYS = frozenset(("configured", "transport", "application"))
+_COUNTER_KEYS = frozenset((
+    "count_429", "count_418", "consecutive_failures",
+    "probes", "failures", "quorum",
+))
+_CONTROL_NAMES = frozenset(("pause_monitor", "monitor_every", "probe_now"))
+_EVENT_RESPONSE_MAX_BYTES = 200_000
+_DROP = object()
 
 _EDGE_ROWS = (
     ("browser_site", "browser", "quant_ui", "Browser site", "->", "Session", False, "session", "Public", ()),
@@ -82,6 +91,8 @@ _METRICS = {
     "news_fetch": ("sources_available", "sources_live", "sources_pending", "sources_error", "as_of_age_s", "last_fetch_age_s"),
     "binance_exec": ("last_used_at", "last_op", "last_outcome"),
 }
+_METRIC_NAMES = frozenset(
+    name for names in _METRICS.values() for name in names)
 
 _CONFIG_COOLDOWNS = {}
 _CONFIG_WRITE_LOCK = threading.Lock()
@@ -192,6 +203,136 @@ def _unknown_current(release, note=None):
     return current
 
 
+def _bounded_scalar(value, text_limit=120):
+    if isinstance(value, str):
+        return value[:text_limit]
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return _DROP
+
+
+def _project_scalar_map(value, allowed, text_limit=120):
+    if not isinstance(value, dict):
+        return {}
+    projected = {}
+    for key, item in value.items():
+        if key not in allowed:
+            continue
+        scalar = _bounded_scalar(item, text_limit)
+        if scalar is not _DROP:
+            projected[key] = scalar
+    return projected
+
+
+def _project_config(value):
+    if not isinstance(value, dict):
+        return {}
+    projected = {}
+    for key, item in value.items():
+        if key not in DEFAULT_CONFIG:
+            continue
+        if key == "paused":
+            projected[key] = _project_scalar_map(item, frozenset(GROUPS))
+            continue
+        scalar = _bounded_scalar(item)
+        if scalar is not _DROP:
+            projected[key] = scalar
+    return projected
+
+
+def _project_collector(value):
+    if not isinstance(value, dict):
+        return {}
+    projected = {}
+    for key, item in value.items():
+        if key not in _COLLECTOR_KEYS:
+            continue
+        if key == "config":
+            projected[key] = _project_config(item)
+        elif key == "probe_now":
+            projected[key] = _project_scalar_map(
+                item, frozenset(PROBE_EDGES))
+        else:
+            scalar = _bounded_scalar(item)
+            if scalar is not _DROP:
+                projected[key] = scalar
+    return projected
+
+
+def _project_summary(value):
+    if not isinstance(value, dict):
+        return {}
+    projected = {}
+    for key, item in value.items():
+        if key not in _SUMMARY_KEYS:
+            continue
+        if key == "worst":
+            projected[key] = _project_scalar_map(
+                item, frozenset(("edge_id", "health")))
+        elif key == "last_transition":
+            projected[key] = (
+                None if item is None else _project_scalar_map(
+                    item, frozenset(("ts", "edge_id", "transition"))))
+        else:
+            scalar = _bounded_scalar(item)
+            if scalar is not _DROP:
+                projected[key] = scalar
+    return projected
+
+
+def _project_edge_evidence(value):
+    if not isinstance(value, dict):
+        return {}
+    projected = {}
+    source = value.get("source")
+    if isinstance(source, str):
+        projected["source"] = source[:120]
+    age = value.get("source_age_s")
+    if age is None:
+        projected["source_age_s"] = None
+    elif (isinstance(age, (int, float)) and not isinstance(age, bool)
+          and (not isinstance(age, float) or math.isfinite(age))):
+        projected["source_age_s"] = age
+    return projected
+
+
+def _project_edge(edge):
+    projected = {}
+    for key, item in edge.items():
+        if key not in _EDGE_KEYS:
+            continue
+        if key == "metrics":
+            projected[key] = _project_scalar_map(item, _METRIC_NAMES)
+        elif key == "counters":
+            projected[key] = _project_scalar_map(item, _COUNTER_KEYS)
+        elif key == "truth":
+            projected[key] = _project_scalar_map(item, _TRUTH_KEYS)
+        elif key == "evidence":
+            projected[key] = _project_edge_evidence(item)
+        elif key == "controls":
+            projected[key] = [
+                value for value in item
+                if isinstance(value, str) and value in _CONTROL_NAMES
+            ] if isinstance(item, list) else []
+        else:
+            scalar = _bounded_scalar(item, 500 if key == "health_reason" else 120)
+            if scalar is not _DROP:
+                projected[key] = scalar
+    return projected
+
+
+def _project_nodes(nodes):
+    projected = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            return None
+        projected.append(_project_scalar_map(
+            node, frozenset(("id", "label", "kind"))))
+    return projected
+
+
 def _sanitize_current(current):
     if not isinstance(current, dict) or not isinstance(current.get("edges"), list):
         return None
@@ -203,16 +344,31 @@ def _sanitize_current(current):
         edge_id = edge.get("id")
         if not isinstance(edge_id, str) or edge_id not in known_ids:
             return None
-        edges.append({key: value for key, value in edge.items()
-                      if key in _EDGE_KEYS})
+        edges.append(_project_edge(edge))
     for key in ("collector", "summary"):
         if key in current and not isinstance(current[key], dict):
             return None
     for key in ("nodes", "events"):
         if key in current and not isinstance(current[key], list):
             return None
-    output = {key: value for key, value in current.items()
-              if key in _CURRENT_KEYS}
+    output = {}
+    for key in ("schema_version", "generated_at", "generated_ms",
+                "deployed_ui_release"):
+        if key in current:
+            scalar = _bounded_scalar(current[key])
+            if scalar is not _DROP:
+                output[key] = scalar
+    if "collector" in current:
+        output["collector"] = _project_collector(current["collector"])
+    if "summary" in current:
+        output["summary"] = _project_summary(current["summary"])
+    if "nodes" in current:
+        nodes = _project_nodes(current["nodes"])
+        if nodes is None:
+            return None
+        output["nodes"] = nodes
+    if "events" in current:
+        output["events"] = current["events"]
     output["edges"] = edges
     return output
 
@@ -224,30 +380,57 @@ def _project_evidence(value):
     for key, item in value.items():
         if key not in _EVENT_EVIDENCE_KEYS:
             continue
-        if isinstance(item, str):
-            evidence[key] = item[:200]
-        elif (item is None or isinstance(item, (bool, int))
-              or (isinstance(item, float) and math.isfinite(item))):
-            evidence[key] = item
+        scalar = _bounded_scalar(item, 200)
+        if scalar is not _DROP:
+            evidence[key] = scalar
     return evidence
 
 
 def _project_event(event):
     if not isinstance(event, dict):
         return None
-    projected = {key: event.get(key) for key in _EVENT_KEYS}
+    event_id = event.get("event_id")
+    event_id = event_id if isinstance(event_id, int) and not isinstance(
+        event_id, bool) else None
+    ts = _bounded_scalar(event.get("ts"), 200)
+    edge_id = event.get("edge_id")
+    transition = event.get("transition")
+    severity = event.get("severity")
     reason = event.get("reason")
-    projected["reason"] = reason[:500] if isinstance(reason, str) else ""
-    projected["evidence"] = _project_evidence(event.get("evidence"))
-    return projected
+    return {
+        "event_id": event_id,
+        "ts": None if ts is _DROP else ts,
+        "edge_id": edge_id[:200] if isinstance(edge_id, str) else None,
+        "transition": transition[:200] if isinstance(transition, str) else "",
+        "severity": severity[:200] if isinstance(severity, str) else "",
+        "reason": reason[:500] if isinstance(reason, str) else "",
+        "evidence": _project_evidence(event.get("evidence")),
+    }
 
 
-def _project_events(events, limit):
+def _event_cursor(event, fallback):
+    event_id = event.get("event_id") if isinstance(event, dict) else None
+    return event_id if isinstance(event_id, int) and not isinstance(
+        event_id, bool) else fallback
+
+
+def _project_events(events, limit, after=0):
     projected = []
+    next_after = after
     for event in events if isinstance(events, list) else ():
         row = _project_event(event)
-        if row is not None:
-            projected.append(row)
+        if row is None:
+            continue
+        candidate = projected + [row]
+        candidate_after = _event_cursor(row, next_after)
+        encoded = json.dumps(
+            {"events": candidate, "next_after": candidate_after},
+            ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > _EVENT_RESPONSE_MAX_BYTES:
+            break
+        projected.append(row)
+        next_after = candidate_after
         if len(projected) >= limit:
             break
     return projected
@@ -351,8 +534,8 @@ def api_network_events(sources, query):
         return 200, {"events": [], "next_after": after}
     payload = _store_read(path, "events_after", after, limit)
     events = payload.get("events") if isinstance(payload, dict) else None
-    events = _project_events(events, limit)
-    next_after = events[-1].get("event_id", after) if events and isinstance(events[-1], dict) else after
+    events = _project_events(events, limit, after)
+    next_after = _event_cursor(events[-1], after) if events else after
     return 200, {"events": events, "next_after": next_after}
 
 
@@ -433,6 +616,16 @@ def _atomic_bytes(path, payload):
         raise
 
 
+def _restore_previous(path, payload, existed):
+    if existed:
+        _atomic_bytes(path, payload)
+        return
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _receipt_id(now_ms):
     global _LAST_RECEIPT_ID
     _LAST_RECEIPT_ID = max(_LAST_RECEIPT_ID + 1, now_ms)
@@ -490,6 +683,7 @@ def write_network_config(sources, body, headers=None):
                       if key == "paused" and isinstance(reread_config, dict)
                       else isinstance(reread_config, dict) and reread_config.get(key) == new)
             if not reread:
+                _restore_previous(config_path, previous_bytes, previous_exists)
                 return None, "saved value could not be confirmed"
             evidence = {"key": key, "group": group, "old": old, "new": new,
                         "receipt_id": receipt_id, "reread": True}
@@ -499,13 +693,7 @@ def write_network_config(sources, body, headers=None):
                 store.insert_event(
                     now_ms, None, "config", "info", reason, evidence)
             except Exception:
-                if previous_exists:
-                    _atomic_bytes(config_path, previous_bytes)
-                else:
-                    try:
-                        config_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                _restore_previous(config_path, previous_bytes, previous_exists)
                 return None, "receipt could not be recorded; change reverted"
         finally:
             store.close()
@@ -542,6 +730,7 @@ def write_network_probe(sources, body, headers=None):
                 pending_ms = None
         if pending_ms is not None and now_ms - pending_ms < 30_000:
             return None, "probe already requested"
+        # The recorder owns per-edge cooldown enforcement; this API check is a courtesy.
         current = _read_dict(sources.get("network_current")) or {}
         collector = current.get("collector") if isinstance(current.get("collector"), dict) else {}
         probe_now = collector.get("probe_now") if isinstance(collector.get("probe_now"), dict) else {}

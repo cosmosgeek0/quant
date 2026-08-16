@@ -202,6 +202,16 @@ class TestNetworkMirror(unittest.TestCase):
 
 class TestNetworkHostScripts(unittest.TestCase):
 
+    def test_r8_mirror_round_2_documents_sentinel_design(self):
+        script = MIRROR_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "# V1 uses head/tail sentinels for truncated writes; full parsing "
+            "every 5 s costs about 2% of one core, and malformed copies are "
+            "Unknown.",
+            script,
+        )
+
     def test_r4_mirror_uses_set_u_and_short_metadata_rows(self):
         rows = MIRROR_SCRIPT.read_text(encoding="utf-8").splitlines()
 
@@ -218,7 +228,7 @@ class TestNetworkHostScripts(unittest.TestCase):
         self.assertIn('SERVER=${1:-ui/serve.py.new}', script)
         self.assertIn('python3 "$SERVER" --port 8081', script)
 
-    def test_r4_stage_checks_every_required_route(self):
+    def test_r8_stage_round_2_validates_json_and_probe_route(self):
         script = STAGE_SCRIPT.read_text(encoding="utf-8")
         checked = set(re.findall(r'^get_path "([^"]+)"$', script, re.MULTILINE))
         required = {
@@ -244,14 +254,34 @@ class TestNetworkHostScripts(unittest.TestCase):
         }
 
         self.assertEqual(checked, required)
-        self.assertIn("post_path=/api/network/config", script)
+        self.assertIn(
+            "python3 -c 'import json,sys; json.load(sys.stdin)'",
+            script,
+        )
+        self.assertIn('post_json "/api/network/config"', script)
+        self.assertIn('post_json "/api/network/probe"', script)
+        self.assertIn('"cooldown" in error or "already requested" in error',
+                      script)
+        self.assertEqual(
+            [(index, len(row)) for index, row in enumerate(
+                script.splitlines(), 1) if len(row) >= 200],
+            [],
+        )
 
-    def test_r4_verify_enforces_size_and_identifier_rules(self):
+    def test_r8_verify_round_2_gates_feed_and_api_bodies(self):
         script = VERIFY_SCRIPT.read_text(encoding="utf-8")
         sha_block = script.split('if [ "$source_sha"', 1)[1].split(
             'echo "== feed meta"', 1)[0]
 
         self.assertNotIn("failed=1", sha_block)
+        self.assertIn('meta_sha=$(', script)
+        self.assertIn('if [ "$meta_sha" = "Unknown" ]', script)
+        self.assertIn('elif [ "$meta_sha" = "$mirror_sha" ]', script)
+        self.assertIn(
+            'feed_lag_s=$((source_mtime_epoch - mirror_mtime_epoch))',
+            script,
+        )
+        self.assertIn('[ "$feed_lag_s" -gt 30 ]', script)
         self.assertIn(
             'benchmark /api/network "$network_url" "$tmp_dir/network.json" 100000',
             script,
@@ -261,7 +291,11 @@ class TestNetworkHostScripts(unittest.TestCase):
             '"$tmp_dir/history.json" 1000000',
             script,
         )
-        self.assertIn("/api/network/events?limit=200", script)
+        self.assertIn(
+            'benchmark /api/network/events "$events_url" '
+            '"$tmp_dir/events.json" 300000',
+            script,
+        )
         self.assertRegex(
             script,
             r'\[ "\$bytes" -gt "\$max_body_bytes" \][\s\S]{0,200}failed=1',
@@ -269,6 +303,7 @@ class TestNetworkHostScripts(unittest.TestCase):
         for word in ("connectorId", "receipt_path", "job_id", '"signature"'):
             self.assertIn(word, script)
         self.assertIn('scan_identifiers network "$tmp_dir/network.json"', script)
+        self.assertIn('scan_identifiers history "$tmp_dir/history.json"', script)
         self.assertIn('scan_identifiers events "$tmp_dir/events.json"', script)
         self.assertIn('echo "== VERIFY FAILED"', script)
         self.assertIn("exit 20", script)

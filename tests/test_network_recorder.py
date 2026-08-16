@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ui import network_health
+from ui import network_api, network_health
 from ui import network_recorder as recorder
 
 
@@ -463,6 +463,39 @@ class NetworkRecorderTests(unittest.TestCase):
         self.assertEqual(list(self.live.glob(
             "network_probe_request.json.claimed-*")), [])
 
+    def test_r7_probe_double_request_is_recorder_cooldown_owned(self):
+        runner = recorder.Recorder(
+            self.live, self.data, quiet=True, deps=self.world.deps())
+        runner.start(self.world.now)
+        sources = {
+            "network_current": self.live / "network_current.json",
+            "network_probe_request": self.live / "network_probe_request.json",
+        }
+        with mock.patch.object(network_api, "_now_ms",
+                               return_value=self.world.now), \
+                mock.patch.object(network_api.secrets, "token_hex",
+                                  side_effect=("first", "second")):
+            first, first_error = network_api.write_network_probe(
+                sources, {"edge_id": "spot_rest"})
+            first_forced = runner.consume_probe(self.world.now)
+            second, second_error = network_api.write_network_probe(
+                sources, {"edge_id": "spot_rest"})
+
+        request_files = list(self.live.glob("network_probe_request.json*"))
+        self.assertIsNone(first_error)
+        self.assertEqual(first["request_id"], "first")
+        self.assertEqual(first_forced, {"spot_rest"})
+        self.assertIsNone(second_error)
+        self.assertEqual(second["request_id"], "second")
+        self.assertLessEqual(len(request_files), 1)
+        self.assertEqual(runner.consume_probe(self.world.now), set())
+        self.assertFalse(request_files[0].exists() if request_files else False)
+        self.assertTrue(any(
+            row["reason"] == "probe refused (cooldown)"
+            for row in self.database()["events"]
+        ))
+        runner.close()
+
     def test_config_reloads_only_after_mtime_change(self):
         config_path = self.write_config(wss_read_s=15)
         runner = recorder.Recorder(
@@ -489,23 +522,35 @@ class NetworkRecorderTests(unittest.TestCase):
         self.assertEqual(len(self.world.calls["feed"]), initial_feed_reads + 1)
         runner.close()
 
-    def test_r3_seed_keeps_only_continuity_and_rederives_every_edge(self):
-        previous = {
-            "id": "spot_rest",
+    def test_r7_seed_allows_only_valid_continuity_fields(self):
+        reviewer_input = {
+            "id": "spot_rest", "sample_count": 7,
+            "counters": {"job_id": 4242},
+        }
+        continuity_input = {
+            "id": "cf_connector",
             "health": "Degraded",
             "observed_ms": self.world.now - 1_000,
-            "counters": {"quorum": 1, "probes": 7, "flag": True,
-                         "text": "not an integer"},
-            "metrics": {"dropped_frames_total": 4, "total_requests": 11,
-                        "request_errors": 2, "lost_packets": 3,
-                        "connect_streams_errors": 1, "http_status": 200},
-            "sample_count": 7,
+            "counters": {
+                "count_429": 1, "count_418": 0,
+                "consecutive_failures": 2, "probes": 7, "failures": 3,
+                "quorum": True, "job_id": 4242,
+            },
+            "metrics": {
+                "dropped_frames_total": True, "total_requests": 11,
+                "request_errors": 2, "lost_packets": 3,
+                "connect_streams_errors": 1, "response_5xx": 6,
+                "http_status": 200,
+            },
+            "sample_count": 4,
             "connectorId": "private-value",
         }
         (self.live / "network_current.json").write_text(json.dumps({
             "edges": [
-                previous,
-                {"id": "aws_secrets", "health": "Operational",
+                reviewer_input,
+                continuity_input,
+                {"id": "aws_secrets", "sample_count": -1,
+                 "observed_ms": 0, "health": "Operational",
                  "connectorId": "private-value"},
                 {"id": "outside_contract", "health": "Operational"},
             ],
@@ -516,19 +561,30 @@ class NetworkRecorderTests(unittest.TestCase):
 
         current = self.run_once()
 
-        seen = [old for edge_id, old in self.world.previous_seen
-                if edge_id == "spot_rest" and isinstance(old, dict)]
-        self.assertEqual(seen[0], {
-            "id": "spot_rest",
-            "health": "Degraded",
-            "observed_ms": self.world.now - 1_000,
-            "counters": {"quorum": 1, "probes": 7},
-            "metrics": {"dropped_frames_total": 4, "total_requests": 11,
-                        "request_errors": 2, "lost_packets": 3,
-                        "connect_streams_errors": 1},
+        seen = {}
+        for edge_id, old in self.world.previous_seen:
+            if isinstance(old, dict) and edge_id not in seen:
+                seen[edge_id] = old
+        self.assertEqual(seen["spot_rest"], {
+            "id": "spot_rest", "sample_count": 7,
         })
+        self.assertEqual(seen["cf_connector"], {
+            "id": "cf_connector",
+            "observed_ms": self.world.now - 1_000,
+            "sample_count": 4,
+            "counters": {
+                "count_429": 1, "count_418": 0,
+                "consecutive_failures": 2, "probes": 7, "failures": 3,
+            },
+            "metrics": {
+                "total_requests": 11, "request_errors": 2,
+                "lost_packets": 3, "connect_streams_errors": 1,
+                "response_5xx": 6,
+            },
+        })
+        self.assertEqual(seen["aws_secrets"], {"id": "aws_secrets"})
         spot = next(edge for edge in current["edges"] if edge["id"] == "spot_rest")
-        self.assertEqual(spot["sample_count"], 1)
+        self.assertEqual(spot["sample_count"], 8)
         secrets_edge = next(
             edge for edge in current["edges"] if edge["id"] == "aws_secrets")
         self.assertEqual(secrets_edge["health"], "Unknown")

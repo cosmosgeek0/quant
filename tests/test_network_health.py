@@ -728,6 +728,19 @@ class SummaryAndReadTimeTests(unittest.TestCase):
                 self.assertEqual(result["collector"]["status"], "unknown")
                 self.assertEqual(result["edges"][0]["health"], "Stale")
 
+    def test_r6_list_collector_becomes_unknown_before_timing(self):
+        current = {
+            "generated_ms": NOW - 15001,
+            "collector": [],
+            "summary": {},
+            "edges": [],
+        }
+
+        result = health.apply_read_time_staleness(current, NOW)
+
+        self.assertEqual(result["collector"], {"status": "unknown"})
+        self.assertEqual(current["collector"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

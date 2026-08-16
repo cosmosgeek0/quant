@@ -193,6 +193,20 @@ class StreamStateTests(unittest.TestCase):
         self.assertIsNone(result["book_age_p50_ms"])
         self.assertIsNone(result["stream_row_age_ms"])
 
+    def test_r6_utc_only_stream_row_has_unknown_book_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "stream.json"
+            path.write_text(
+                json.dumps({"UTC_ONLY": {"utc": "2026-08-16T16:34:00Z"}}),
+                encoding="utf-8",
+            )
+
+            result = read_stream_state(
+                path, epoch_ms("2026-08-16T16:34:01Z")
+            )
+
+        self.assertIsNone(result["symbols_book_le_5s"])
+
 
 class NewsTests(unittest.TestCase):
     def test_sample_uses_aggregate_counts_and_status_errors(self):
@@ -320,6 +334,38 @@ class JobAndManifestTests(unittest.TestCase):
         self.assertTrue(all(isinstance(item, str) for item in result["errors"]))
         self.assertTrue(all(len(item) <= 200 for item in result["errors"]))
         self.assertEqual(result["errors"][0], "x" * 200)
+
+    def test_r6_nested_manifest_values_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "utc": {"value": "2026-08-16T16:34:00Z"},
+                        "ok": [True],
+                        "interval_ms": {"value": 5000},
+                        "cycle_ms": [40],
+                        "files": {"value": 8},
+                        "errors": [{"message": "not public"}],
+                        "error": ["not public"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = read_manifest(path)
+
+        self.assertEqual(
+            result,
+            {
+                "utc": None,
+                "ok": None,
+                "interval_ms": None,
+                "cycle_ms": None,
+                "files": None,
+                "errors": [],
+            },
+        )
 
     def test_missing_job_and_manifest_return_none(self):
         self.assertIsNone(read_last_job("/missing/results.jsonl"))

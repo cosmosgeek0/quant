@@ -532,7 +532,10 @@ def apply_read_time_staleness(current, now_ms):
     previous_last = result.get("summary", {}).get("last_transition")
     result["summary"] = summarize(result["edges"], now_ms)
     result["summary"]["last_transition"] = previous_last
-    collector = result.setdefault("collector", {})
+    collector = result.get("collector")
+    if not isinstance(collector, dict):
+        collector = {"status": "unknown"}
+        result["collector"] = collector
     generated_ms, tick_s = result.get("generated_ms"), collector.get("tick_s")
     valid_timing = _is_int(generated_ms) and _is_int(tick_s) and tick_s > 0
     if not valid_timing:

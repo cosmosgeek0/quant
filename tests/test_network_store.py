@@ -253,6 +253,76 @@ class NetworkStoreTests(unittest.TestCase):
         self.assertEqual(status["buckets"][0]["n"], 1)
         self.assertEqual(numeric["buckets"], [])
 
+    def test_r5_store_167_invalid_json_reads_fail_closed(self) -> None:
+        connection = sqlite3.connect(str(self.path))
+        self.addCleanup(connection.close)
+        sample_rows = [
+            ("object", '{"rtt_ms":1}', "Operational"),
+            ("string", '"text"', "Unknown"),
+            ("array", "[]", "Unknown"),
+            ("null", "null", "Unknown"),
+            ("malformed", "{", "Unknown"),
+        ]
+        connection.executemany(
+            "INSERT INTO samples(ts_ms, edge_id, status, metrics) "
+            "VALUES(?, ?, ?, ?)",
+            [
+                (NOW_MS - 1, "edge_%s" % name, "Operational", metrics)
+                for name, metrics, _expected in sample_rows
+            ],
+        )
+        event_rows = [
+            ("object", '{"rtt_ms":1}', {"rtt_ms": 1}),
+            ("string", '"text"', {}),
+            ("array", "[]", {}),
+            ("null", "null", {}),
+            ("malformed", "{", {}),
+        ]
+        connection.executemany(
+            "INSERT INTO events(ts_ms, edge_id, transition, severity, reason, "
+            "evidence) VALUES(?, ?, ?, ?, ?, ?)",
+            [
+                (NOW_MS + index, "spot_rest", name, "info", "read", evidence)
+                for index, (name, evidence, _expected) in enumerate(event_rows)
+            ],
+        )
+        connection.commit()
+
+        statuses = {
+            name: self.store.history(
+                "edge_%s" % name, "status", "1h", NOW_MS
+            )["buckets"][0]["status"]
+            for name, _metrics, _expected in sample_rows
+        }
+
+        def read_evidence(reader):
+            try:
+                return {
+                    row["transition"]: row["evidence"] for row in reader()
+                }
+            except Exception as error:
+                return error.__class__.__name__
+
+        observed = {
+            "statuses": statuses,
+            "events_after": read_evidence(
+                lambda: self.store.events_after(0, 20)["events"]
+            ),
+            "latest_events": read_evidence(
+                lambda: self.store.latest_events(20)
+            ),
+        }
+        expected_evidence = {
+            name: expected for name, _evidence, expected in event_rows
+        }
+        self.assertEqual(observed, {
+            "statuses": {
+                name: expected for name, _metrics, expected in sample_rows
+            },
+            "events_after": expected_evidence,
+            "latest_events": expected_evidence,
+        })
+
     def test_empty_history_and_unknown_range_are_explicit(self) -> None:
         result = self.store.history(
             "edge_without_samples", "status", "24h", NOW_MS
@@ -385,6 +455,25 @@ class NetworkStoreTests(unittest.TestCase):
         self.assertGreater(result["samples_deleted"], 0)
         self.assertGreater(len(remaining), 0)
         self.assertGreaterEqual(min(row[0] for row in remaining), oldest_ms + 1_000)
+
+    def test_r5_store_253_events_only_cap_reports_unmet_without_raising(self) -> None:
+        for index in range(40):
+            self.store.insert_event(
+                NOW_MS - index,
+                "spot_rest",
+                "sample",
+                "info",
+                "recent event",
+                {"padding": "x" * 5_000},
+            )
+        self.store.size_cap_bytes = 50_000
+
+        result = self.store.prune(NOW_MS)
+
+        self.assertEqual(self._rows("samples"), [])
+        self.assertEqual(len(self._rows("events")), 40)
+        self.assertFalse(result["cap_met"])
+        self.assertGreater(result["bytes"], self.store.size_cap_bytes)
 
     def test_corrupt_database_is_moved_aside_and_reset_is_noted(self) -> None:
         self.store.close()

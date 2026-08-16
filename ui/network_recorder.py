@@ -44,18 +44,20 @@ DEPENDENCIES = {
 }
 PROBE_COOLDOWN_MS = 30_000
 PRUNE_INTERVAL_MS = 3_600_000
-HEALTH_STATES = frozenset((
-    "Operational", "Degraded", "Outage", "Stale", "Unknown", "Off",
+SEED_COUNTER_KEYS = frozenset((
+    "count_429", "count_418", "consecutive_failures",
+    "probes", "failures", "quorum",
 ))
 SEED_METRIC_KEYS = frozenset((
     "dropped_frames_total", "total_requests", "request_errors",
-    "lost_packets", "connect_streams_errors",
+    "lost_packets", "connect_streams_errors", "response_5xx",
 ))
 CF_SEED_METRICS = {
     "total_requests": "cloudflared_tunnel_total_requests",
     "request_errors": "cloudflared_tunnel_request_errors",
     "lost_packets": "quic_client_lost_packets",
     "connect_streams_errors": "cloudflared_proxy_connect_streams_errors",
+    "response_5xx": "cloudflared_tunnel_response_by_code",
 }
 
 
@@ -275,7 +277,8 @@ class Recorder:
             if isinstance(counters, dict):
                 safe_counters = {
                     key: value for key, value in counters.items()
-                    if isinstance(key, str) and _plain_nonnegative_int(value)
+                    if key in SEED_COUNTER_KEYS
+                    and _plain_nonnegative_int(value)
                 }
                 if safe_counters:
                     previous["counters"] = safe_counters
@@ -289,12 +292,14 @@ class Recorder:
                     previous["metrics"] = safe_metrics
                     for key, raw_name in CF_SEED_METRICS.items():
                         if key in safe_metrics:
-                            previous_cf_raw[raw_name] = safe_metrics[key]
-            health = edge.get("health")
-            if isinstance(health, str) and health in HEALTH_STATES:
-                previous["health"] = health
+                            previous_cf_raw[raw_name] = (
+                                {"status_code=500": safe_metrics[key]}
+                                if key == "response_5xx" else safe_metrics[key])
+            sample_count = edge.get("sample_count")
+            if _plain_nonnegative_int(sample_count):
+                previous["sample_count"] = sample_count
             observed_ms = edge.get("observed_ms")
-            if _plain_nonnegative_int(observed_ms):
+            if _plain_nonnegative_int(observed_ms) and observed_ms > 0:
                 previous["observed_ms"] = observed_ms
             self.seed_previous[edge_id] = previous
         if previous_cf_raw:
@@ -340,6 +345,7 @@ class Recorder:
         return True
 
     def derive(self, edge_id, evidence, now_ms, collected=False):
+        seeded = edge_id in self.seed_previous
         previous = self.seed_previous.pop(edge_id, self.edges.get(edge_id))
         current = self.dep("derive_edge")(edge_id, evidence, previous, self.config, now_ms)
         if not collected and evidence is None:
@@ -348,6 +354,9 @@ class Recorder:
             current["last_transition"] = deepcopy(previous["last_transition"])
         for row in self.dep("transitions")(previous, current) or ():
             if isinstance(row, dict):
+                if (seeded and "health" not in previous
+                        and row.get("transition") == "health"):
+                    continue
                 self.event(now_ms, edge_id, row.get("transition") or "health",
                            row.get("severity") or "info", row.get("reason") or "state changed",
                            row.get("evidence") or {})

@@ -32,7 +32,8 @@ _MAX_CAP_PRUNE_ROUNDS = 200
 _METRIC_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _STATUS_RANK_SQL = (
-    "CASE WHEN json_valid(metrics) = 0 THEN 3 ELSE "
+    "CASE WHEN json_valid(metrics) = 0 THEN 3 "
+    "WHEN json_type(metrics) <> 'object' THEN 3 ELSE "
     "CASE status WHEN 'Outage' THEN 6 WHEN 'Stale' THEN 5 "
     "WHEN 'Degraded' THEN 4 WHEN 'Unknown' THEN 3 WHEN 'Off' THEN 2 "
     "WHEN 'Operational' THEN 1 ELSE 3 END END"
@@ -197,11 +198,17 @@ class NetworkStore:
 
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> dict:
+        try:
+            evidence = json.loads(row["evidence"])
+        except (TypeError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
         return {
             "event_id": int(row["event_id"]), "ts": int(row["ts_ms"]),
             "edge_id": row["edge_id"], "transition": row["transition"],
             "severity": row["severity"], "reason": row["reason"],
-            "evidence": json.loads(row["evidence"]),
+            "evidence": evidence,
         }
 
     @staticmethod

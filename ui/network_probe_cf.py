@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import urllib.error
@@ -156,6 +157,8 @@ def parse_prometheus_text(text):
         try:
             value = float(raw_value)
         except ValueError:
+            continue
+        if not math.isfinite(value):
             continue
         if labels is None:
             values[name] = value

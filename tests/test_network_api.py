@@ -97,18 +97,65 @@ class NetworkApiTest(unittest.TestCase):
         self.assertEqual(result["collector"]["status"], "running")
         self.assertIsNone(result["deployed_ui_release"])
 
-    def test_r3_current_validation_filters_shape_and_falls_back(self):
-        current = network_api._unknown_current(None)
-        current["generated_ms"] = NOW_MS
-        current["collector"]["status"] = "running"
-        current["private_top_level"] = "not public"
-        current["edges"][0]["connectorId"] = "not public"
+    def test_r7_current_validation_deeply_projects_contract_fields(self):
+        current = {
+            "collector": {
+                "status": "running", "connectorId": "private",
+                "config": {"rest_probe_s": 15,
+                           "paused": {"rest": False, "private": True},
+                           "receipt_path": "/private/config"},
+                "probe_now": {"spot_rest": network_api._iso(NOW_MS),
+                              "private_edge": "private"},
+            },
+            "summary": {
+                "required_total": 8, "receipt_path": "/private/summary",
+                "worst": {"edge_id": "aws_secrets", "health": "Operational",
+                          "connectorId": "private"},
+                "last_transition": {"ts": NOW_MS, "edge_id": "aws_secrets",
+                                    "transition": "health", "job_id": 77},
+            },
+            "events": [],
+            "edges": [{
+                "id": "aws_secrets", "health": "Operational",
+                "metrics": {"receipt_path": "/private/receipt",
+                            "feed_status": "m" * 121},
+                "counters": {"job_id": 77, "quorum": 1},
+                "truth": {"configured": "Unknown", "transport": "Unknown",
+                          "application": "Unknown", "connectorId": "private"},
+                "evidence": {"source": "s" * 121, "source_age_s": 3,
+                             "receipt_path": "/private/receipt"},
+                "connectorId": "private",
+            }],
+            "private_top_level": "not public",
+        }
         self.write_json("network_current", current)
 
         result = network_api.api_network(self.sources, now=NOW_MS)
 
         self.assertNotIn("private_top_level", result)
+        self.assertNotIn("connectorId", result["collector"])
+        self.assertEqual(result["collector"]["config"], {
+            "rest_probe_s": 15, "paused": {"rest": False},
+        })
+        self.assertEqual(result["collector"]["probe_now"], {
+            "spot_rest": network_api._iso(NOW_MS),
+        })
+        self.assertNotIn("receipt_path", result["summary"])
+        self.assertEqual(set(result["summary"]["worst"]), {
+            "edge_id", "health"})
+        self.assertEqual(set(result["summary"]["last_transition"]), {
+            "ts", "edge_id", "transition"})
         self.assertNotIn("connectorId", result["edges"][0])
+        self.assertEqual(result["edges"][0]["metrics"], {
+            "feed_status": "m" * 120})
+        self.assertEqual(result["edges"][0]["counters"], {"quorum": 1})
+        self.assertEqual(result["edges"][0]["truth"], {
+            "configured": "Unknown", "transport": "Unknown",
+            "application": "Unknown",
+        })
+        self.assertEqual(result["edges"][0]["evidence"], {
+            "source": "s" * 120, "source_age_s": 3,
+        })
         for invalid in (
                 {"collector": {}, "summary": {}, "edges": [None]},
                 {"collector": {}, "summary": {},
@@ -188,13 +235,13 @@ class NetworkApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result, {"events": [], "next_after": 0})
 
-    def test_r3_events_projection_bounds_endpoint_and_current(self):
+    def test_r7_events_cap_text_and_encoded_response(self):
         event = {
             "event_id": 7,
-            "ts": network_api._iso(NOW_MS),
-            "edge_id": "spot_rest",
-            "transition": "health",
-            "severity": "medium",
+            "ts": "z" * 250,
+            "edge_id": "e" * 250,
+            "transition": "t" * 200_000,
+            "severity": "s" * 250,
             "reason": "r" * 600,
             "evidence": {
                 "note": "n" * 250,
@@ -205,22 +252,37 @@ class NetworkApiTest(unittest.TestCase):
             },
             "receipt_path": "/private/path",
         }
+        events = [event]
+        for event_id in range(8, 207):
+            repeated = dict(event)
+            repeated["event_id"] = event_id
+            repeated["transition"] = "t" * 200
+            events.append(repeated)
         self.sources["network_db"].touch()
         with mock.patch.object(network_api, "_store_read", return_value={
-                "events": [event], "next_after": 7}):
+                "events": events, "next_after": 206}):
             status, endpoint = network_api.api_network_events(
-                self.sources, {"limit": "1"})
+                self.sources, {"limit": "200"})
         self.assertEqual(status, 200)
         projected = endpoint["events"][0]
         self.assertEqual(set(projected), {
             "event_id", "ts", "edge_id", "transition", "severity",
             "reason", "evidence"})
+        self.assertEqual(len(projected["ts"]), 200)
+        self.assertEqual(len(projected["edge_id"]), 200)
+        self.assertEqual(len(projected["transition"]), 200)
+        self.assertEqual(len(projected["severity"]), 200)
         self.assertEqual(len(projected["reason"]), 500)
         self.assertEqual(len(projected["evidence"]["note"]), 200)
         self.assertEqual(projected["evidence"]["http_status"], 200)
         self.assertTrue(projected["evidence"]["reread"])
         self.assertNotIn("receipt_path", projected["evidence"])
         self.assertNotIn("job_id", projected["evidence"])
+        self.assertLess(len(endpoint["events"]), 200)
+        encoded = json.dumps(
+            endpoint, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertLessEqual(len(encoded), 200_000)
 
         current = network_api._unknown_current(None)
         current["generated_ms"] = NOW_MS
@@ -269,6 +331,26 @@ class NetworkApiTest(unittest.TestCase):
         self.assertEqual(
             error, "receipt could not be recorded; change reverted")
         self.assertEqual(self.sources["network_config"].read_bytes(), original)
+        store.close.assert_called_once_with()
+
+    def test_r7_config_reread_none_restores_previous_bytes(self):
+        original = b'{\n  "rest_probe_s": 15,\n  "paused": {"rest": false}\n}\n'
+        self.sources["network_config"].write_bytes(original)
+        store = mock.Mock()
+        first_read = json.loads(original.decode("utf-8"))
+
+        with mock.patch.object(network_api, "_now_ms", return_value=NOW_MS), \
+                mock.patch.object(network_api, "_make_store",
+                                  return_value=store), \
+                mock.patch.object(network_api, "_read_dict",
+                                  side_effect=(first_read, None)):
+            saved, error = network_api.write_network_config(
+                self.sources, {"key": "rest_probe_s", "value": 30})
+
+        self.assertIsNone(saved)
+        self.assertEqual(error, "saved value could not be confirmed")
+        self.assertEqual(self.sources["network_config"].read_bytes(), original)
+        store.insert_event.assert_not_called()
         store.close.assert_called_once_with()
 
     def test_config_paused_allowlist_and_origin_checks(self):

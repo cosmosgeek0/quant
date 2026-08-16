@@ -26,6 +26,7 @@ while true; do
   feed_mtime_json=null; feed_bytes_json=null; feed_sha_json=null; feed_copied_json=null
   if [ ! -f "$feed" ]; then feed_error="feed_state missing"
   elif [ ! -s "$feed" ]; then feed_error="feed_state empty"
+  # V1 uses head/tail sentinels for truncated writes; full parsing every 5 s costs about 2% of one core, and malformed copies are Unknown.
   elif [ "$(head -c 1 "$feed" 2>/dev/null)" != "{" ] || ! feed_tail_complete "$feed"; then
     feed_error="feed_state incomplete"
   elif ! cp -p "$feed" "$L/.tmp.feed_state.json"; then

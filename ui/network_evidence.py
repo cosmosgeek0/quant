@@ -188,7 +188,9 @@ def read_stream_state(path: str, now_ms: int) -> dict | None:
         "book_age_p50_ms": _nearest_rank(book_ages, 50),
         "book_age_p95_ms": _nearest_rank(book_ages, 95),
         "book_age_max_ms": max(book_ages) if book_ages else None,
-        "symbols_book_le_5s": sum(value <= 5000 for value in book_ages),
+        "symbols_book_le_5s": (
+            sum(value <= 5000 for value in book_ages) if book_ages else None
+        ),
         "freshness_p50_ms": _nearest_rank(freshness, 50),
         "stream_row_age_ms": _age_ms(now_ms, max(row_times) if row_times else None),
         "source": None,
@@ -250,10 +252,19 @@ def read_manifest(path: str) -> dict | None:
     payload = _read_object(path)
     if payload is None:
         return None
+    utc = payload.get("utc")
+    ok = payload.get("ok")
     result = {
-        key: payload.get(key)
-        for key in ("utc", "ok", "interval_ms", "cycle_ms", "files")
+        "utc": utc if isinstance(utc, str) and len(utc) <= 40 else None,
+        "ok": ok if isinstance(ok, bool) else None,
     }
+    for key in ("interval_ms", "cycle_ms", "files"):
+        value = payload.get(key)
+        result[key] = (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
     plural = payload.get("errors")
     candidates = plural if isinstance(plural, list) else [plural]
     candidates.append(payload.get("error"))

@@ -41,6 +41,10 @@ if ! kill -0 "$stage_pid" 2>/dev/null; then
   failed=1
 fi
 
+json_body_valid() {
+  python3 -c 'import json,sys; json.load(sys.stdin)' < "$STAGE_BODY" 2>>"$STAGE_LOG"
+}
+
 get_path() {
   path=$1
   result=$(curl -sS --max-time 10 -o "$STAGE_BODY" -w '%{http_code} %{size_download}' "http://127.0.0.1:8081${path}" 2>>"$STAGE_LOG")
@@ -55,6 +59,16 @@ get_path() {
   echo "== $path $code $bytes"
   if [ "$curl_rc" -ne 0 ] || [ "$code" != "200" ]; then
     failed=1
+  fi
+  if [ "$curl_rc" -eq 0 ]; then
+    case "$path" in
+      /api/*)
+        if ! json_body_valid; then
+          echo "== $path JSON Unknown"
+          failed=1
+        fi
+        ;;
+    esac
   fi
 }
 
@@ -78,23 +92,50 @@ get_path "/api/network"
 get_path "/api/network/history?edge_id=spot_rest&metric=status&range=1h"
 get_path "/api/network/events?limit=5"
 
-post_path=/api/network/config
-post_body='{"key":"rest_probe_s","value":15}'
-result=$(curl -sS --max-time 10 -o "$STAGE_BODY" -w '%{http_code} %{size_download}' \
-  -H "Origin: http://127.0.0.1:8081" -H "Content-Type: application/json" \
-  -d "$post_body" "http://127.0.0.1:8081${post_path}" 2>>"$STAGE_LOG")
-curl_rc=$?
-if [ "$curl_rc" -ne 0 ]; then
-  code=Unknown
-  bytes=Unknown
-else
-  code=${result%% *}
-  bytes=${result#* }
-fi
-echo "== $post_path $code $bytes"
-if [ "$curl_rc" -ne 0 ] || [ "$code" != "200" ]; then
+probe_message_code='import json,sys; error=json.load(sys.stdin).get("error",""); '
+probe_message_code="${probe_message_code}"'ok=isinstance(error,str) and '
+probe_message_code="${probe_message_code}"'("cooldown" in error or "already requested" in error); sys.exit(0 if ok else 1)'
+
+post_json() {
+  post_path=$1
+  post_body=$2
+  post_mode=$3
+  result=$(curl -sS --max-time 10 -o "$STAGE_BODY" -w '%{http_code} %{size_download}' \
+    -H "Origin: http://127.0.0.1:8081" -H "Content-Type: application/json" \
+    -d "$post_body" "http://127.0.0.1:8081${post_path}" 2>>"$STAGE_LOG")
+  curl_rc=$?
+  if [ "$curl_rc" -ne 0 ]; then
+    code=Unknown
+    bytes=Unknown
+  else
+    code=${result%% *}
+    bytes=${result#* }
+  fi
+  echo "== $post_path $code $bytes"
+  if [ "$curl_rc" -ne 0 ]; then
+    failed=1
+    return
+  fi
+  if ! json_body_valid; then
+    echo "== $post_path JSON Unknown"
+    failed=1
+    return
+  fi
+  if [ "$post_mode" = "success" ] && [ "$code" = "200" ]; then
+    return
+  fi
+  if [ "$post_mode" = "probe" ] && [ "$code" = "200" ]; then
+    return
+  fi
+  if [ "$post_mode" = "probe" ] && [ "$code" = "400" ] \
+    && python3 -c "$probe_message_code" < "$STAGE_BODY" 2>>"$STAGE_LOG"; then
+    return
+  fi
   failed=1
-fi
+}
+
+post_json "/api/network/config" '{"key":"rest_probe_s","value":15}' success
+post_json "/api/network/probe" '{"edge_id":"spot_rest"}' probe
 
 if [ "$failed" -ne 0 ]; then
   echo "== stage verification incomplete"

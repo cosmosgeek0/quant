@@ -48,6 +48,19 @@ class PrometheusParserTests(unittest.TestCase):
         parsed = parse_prometheus_text("# note\n\nvalid 2\nnot a sample\nbad nope\n")
         self.assertEqual({"valid": 2.0}, parsed)
 
+    def test_r5_probe_cf_157_non_finite_samples_are_absent(self):
+        parsed = parse_prometheus_text(
+            'quic_client_latest_rtt{conn_index="0"} NaN\n'
+            "cloudflared_tunnel_ha_connections +Inf\n"
+        )
+
+        result = cf_metrics_from_raw(parsed, None)
+
+        self.assertEqual({}, parsed)
+        self.assertIsNone(result["cf_connector"]["latest_rtt_ms_max"])
+        self.assertIsNone(result["cf_connector"]["ha_connections"])
+        json.dumps(result, allow_nan=False)
+
 
 class DiscoveryAndScrapeTests(unittest.TestCase):
     def test_discovery_uses_configured_then_ports_and_stops_at_first(self):

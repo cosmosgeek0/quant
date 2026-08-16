@@ -32,6 +32,7 @@ read_file_fact() {
   FACT_SHA=Unknown
   FACT_BYTES=Unknown
   FACT_MTIME=Unknown
+  FACT_MTIME_EPOCH=Unknown
   if [ ! -f "$fact_path" ]; then
     failed=1
     return
@@ -55,13 +56,27 @@ read_file_fact() {
     FACT_MTIME=Unknown
     failed=1
   fi
+  FACT_MTIME_EPOCH=$(stat -c %Y "$fact_path" 2>/dev/null)
+  mtime_epoch_rc=$?
+  case "$FACT_MTIME_EPOCH" in
+    ''|*[!0-9]*)
+      FACT_MTIME_EPOCH=Unknown
+      failed=1
+      ;;
+  esac
+  if [ "$mtime_epoch_rc" -ne 0 ]; then
+    FACT_MTIME_EPOCH=Unknown
+    failed=1
+  fi
 }
 
 read_file_fact "$SOURCE_FEED"
 source_sha=$FACT_SHA
+source_mtime_epoch=$FACT_MTIME_EPOCH
 echo "== source feed sha=$FACT_SHA bytes=$FACT_BYTES mtime=$FACT_MTIME"
 read_file_fact "$MIRROR_FEED"
 mirror_sha=$FACT_SHA
+mirror_mtime_epoch=$FACT_MTIME_EPOCH
 echo "== mirror feed sha=$FACT_SHA bytes=$FACT_BYTES mtime=$FACT_MTIME"
 if [ "$source_sha" = "Unknown" ] || [ "$mirror_sha" = "Unknown" ]; then
   echo "== feed sha_match Unknown"
@@ -72,6 +87,7 @@ else
 fi
 
 echo "== feed meta"
+meta_sha=Unknown
 if [ -f "$FEED_META" ]; then
   if cat "$FEED_META"; then
     echo
@@ -79,9 +95,36 @@ if [ -f "$FEED_META" ]; then
     echo "Unknown"
     failed=1
   fi
+  meta_sha=$(python3 -c 'import json,sys; value=json.load(sys.stdin).get("sha256"); print(value if isinstance(value,str) else "")' < "$FEED_META" 2>/dev/null)
+  meta_rc=$?
+  if [ "$meta_rc" -ne 0 ] || [ -z "$meta_sha" ]; then
+    meta_sha=Unknown
+    failed=1
+  fi
 else
   echo "Unknown"
   failed=1
+fi
+
+if [ "$meta_sha" = "Unknown" ] || [ "$mirror_sha" = "Unknown" ]; then
+  echo "== feed meta_sha_match Unknown"
+  failed=1
+elif [ "$meta_sha" = "$mirror_sha" ]; then
+  echo "== feed meta_sha_match yes"
+else
+  echo "== feed meta_sha_match no"
+  failed=1
+fi
+
+if [ "$source_mtime_epoch" = "Unknown" ] || [ "$mirror_mtime_epoch" = "Unknown" ]; then
+  echo "== feed mirror_lag_s Unknown"
+  failed=1
+else
+  feed_lag_s=$((source_mtime_epoch - mirror_mtime_epoch))
+  echo "== feed mirror_lag_s $feed_lag_s"
+  if [ "$feed_lag_s" -gt 30 ]; then
+    failed=1
+  fi
 fi
 
 summary_code='import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); '
@@ -157,7 +200,7 @@ history_url='http://127.0.0.1:8080/api/network/history?edge_id=spot_rest&metric=
 events_url='http://127.0.0.1:8080/api/network/events?limit=200'
 benchmark /api/network "$network_url" "$tmp_dir/network.json" 100000
 benchmark /api/network/history-24h "$history_url" "$tmp_dir/history.json" 1000000
-benchmark /api/network/events "$events_url" "$tmp_dir/events.json" 0
+benchmark /api/network/events "$events_url" "$tmp_dir/events.json" 300000
 
 pid=$(systemctl show quant-ui-network -p MainPID --value 2>/dev/null)
 pid_rc=$?
@@ -203,6 +246,7 @@ scan_identifiers() {
 }
 
 scan_identifiers network "$tmp_dir/network.json"
+scan_identifiers history "$tmp_dir/history.json"
 scan_identifiers events "$tmp_dir/events.json"
 
 if [ "$failed" -ne 0 ]; then
