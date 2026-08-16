@@ -301,220 +301,17 @@ class NakedDurationTests(unittest.TestCase):
 
 
 # ==========================================================================
-# Handoff settlement record — spec.lifecycle fixtures handoff_* (6).
-# ==========================================================================
-
-BOUND = 1755000100000
-
-
-class SeqClock:
-    def __init__(self, values):
-        self.values = list(values)
-
-    def __call__(self):
-        value = self.values.pop(0) if len(self.values) > 1 \
-            else self.values[0]
-        if isinstance(value, Exception):
-            raise value
-        return value
-
-
-class ThrowingStore:
-    def claim(self, proposal_id):
-        raise AssertionError("store touched through a disabled lane")
-
-
-class Store:
-    def __init__(self):
-        self.claims = []
-
-    def claim(self, proposal_id):
-        self.claims.append(proposal_id)
-        return {"proposal_id": proposal_id, "symbol": "TESTUSDT",
-                "direction": "long_spot_short_perp",
-                "accepted_notional_usd": "10",
-                "accepted_revision_ts": 1755000090000,
-                "accepted_at_ms": 1755000090000,
-                "correlation_id": "corr-1"}
-
-
-def feedback(kind, sequence, observed, quantity=None, **overrides):
-    message = {"kind": kind, "sequence": sequence,
-               "observed_at_ms": observed,
-               "accepted_revision_ts": 1755000090000,
-               "handoff_id": "bh_bp_1", "proposal_id": "bp_1",
-               "symbol": "TESTUSDT"}
-    if quantity is not None:
-        message["cumulative_filled_quantity"] = quantity
-    message.update(overrides)
-    return message
-
-
-def bound_lane(clock_values=(BOUND,)):
-    lane = bp.HandoffLane(store=Store(), clock=SeqClock(clock_values),
-                          enabled=True)
-    result = lane.consume_accepted("bp_1")
-    assert result["ok"] is True
-    return lane
-
-
-class HandoffTests(unittest.TestCase):
-    def snapshot(self, lane):
-        return json.dumps(lane.snapshot(), sort_keys=True)
-
-    def test_handoff_disabled_refuses_inert(self):
-        # spec fixture handoff_disabled_refuses_inert: throwing deps prove
-        # nothing is touched; the store never burns an acceptance.
-        lane = bp.HandoffLane(store=ThrowingStore(),
-                              clock=SeqClock([AssertionError("clock")]),
-                              enabled=False)
-        consume = lane.consume_accepted("bp_whatever")
-        apply_result = lane.apply_feedback(
-            feedback("TERMINAL", 1, BOUND + 1, "0.5"))
-        self.assertEqual(consume, {"ok": False, "refusal": "DISABLED"})
-        self.assertEqual(apply_result, {"ok": False, "refusal": "DISABLED"})
-        self.assertEqual(lane.snapshot(), {"enabled": False, "handoff": None})
-
-    def test_handoff_terminal_records_verbatim(self):
-        # Clock throws at terminal: record unchanged, still awaiting.
-        lane = bound_lane([BOUND, RuntimeError("clock failed"), BOUND])
-        lane.apply_feedback(feedback("WORKING", 1, BOUND + 1000))
-        before = self.snapshot(lane)
-        with self.assertRaises(RuntimeError):
-            lane.apply_feedback(feedback("TERMINAL", 2, BOUND + 2000,
-                                         "0.0075"))
-        self.assertEqual(self.snapshot(lane), before)
-        # Clock regresses: raises 'must not regress', record unchanged.
-        lane = bound_lane([BOUND, BOUND - 1, BOUND])
-        lane.apply_feedback(feedback("WORKING", 1, BOUND + 1000))
-        before = self.snapshot(lane)
-        with self.assertRaises(ValueError) as caught:
-            lane.apply_feedback(feedback("TERMINAL", 2, BOUND + 2000,
-                                         "0.0075"))
-        self.assertIn("must not regress", str(caught.exception))
-        self.assertEqual(self.snapshot(lane), before)
-        # Success: verbatim string quantity, terminalTs = boundTs clock.
-        lane = bound_lane([BOUND])
-        lane.apply_feedback(feedback("WORKING", 1, BOUND + 1000))
-        result = lane.apply_feedback(feedback("TERMINAL", 2, BOUND + 2000,
-                                              "0.0075"))
-        self.assertEqual(result["progressed"], True)
-        self.assertEqual(result["state"], "TERMINAL")
-        self.assertEqual(result["terminal_kind"], "TERMINAL_REPORTED")
-        self.assertIsInstance(result["cumulative_filled_quantity"], str)
-        self.assertEqual(result["cumulative_filled_quantity"], "0.0075")
-        self.assertEqual(result["last_sequence"], 2)
-        self.assertEqual(result["terminal_ts"], BOUND)
-
-    def test_handoff_cancel_confirmed_zero_and_partial(self):
-        zero_lane = bound_lane()
-        zero = zero_lane.apply_feedback(
-            feedback("CANCEL_CONFIRMED", 4, BOUND + 100, "0"))
-        partial_lane = bound_lane()          # fresh binding
-        partial = partial_lane.apply_feedback(
-            feedback("CANCEL_CONFIRMED", 9, BOUND + 100, "0.004"))
-        for result, quantity in ((zero, "0"), (partial, "0.004")):
-            self.assertTrue(result["progressed"])
-            self.assertEqual(result["state"], "TERMINAL")
-            self.assertEqual(result["terminal_kind"], "CANCEL_CONFIRMED")
-            self.assertEqual(result["cumulative_filled_quantity"], quantity)
-        record = zero_lane.snapshot()["handoff"]
-        self.assertEqual(sorted(record), sorted(bp.HANDOFF_FIELDS))
-        self.assertEqual(len(record), 18)
-        for forbidden in ("flat", "residual", "unwind", "recovery"):
-            self.assertFalse(any(forbidden in key for key in record),
-                             "no flatness/residual/unwind/recovery fields")
-
-    def test_handoff_quantity_canonicality(self):
-        rejected_forms = ["0.0045000", "00.5", " 0.5", "0.5 ", "+0.5",
-                          "1e-3", "-0.5", "", "abc", 0.5, None]
-        for form in rejected_forms:
-            lane = bound_lane()
-            before = self.snapshot(lane)
-            result = lane.apply_feedback(
-                feedback("TERMINAL", 2, BOUND + 100, form))
-            self.assertEqual(result, {"ok": False,
-                                      "refusal": "QUANTITY_NOT_EXACT"},
-                             "form %r must refuse" % (form,))
-            self.assertEqual(self.snapshot(lane), before)
-        # Missing quantity ("undefined") refuses the same way.
-        lane = bound_lane()
-        result = lane.apply_feedback(feedback("TERMINAL", 2, BOUND + 100))
-        self.assertEqual(result["refusal"], "QUANTITY_NOT_EXACT")
-        # '250' accepted while acceptedNotionalUsd=10: base quantity and USD
-        # notional are different units, never compared.
-        lane = bound_lane()
-        result = lane.apply_feedback(feedback("TERMINAL", 2, BOUND + 100,
-                                              "250"))
-        self.assertTrue(result["progressed"])
-        self.assertEqual(result["cumulative_filled_quantity"], "250")
-
-    def test_handoff_ordering_refusals(self):
-        cases = [
-            (feedback("WORKING", 5, BOUND + 6000), "DUPLICATE_SEQUENCE"),
-            (feedback("WORKING", 4, BOUND + 6000), "STALE_SEQUENCE"),
-            (feedback("WORKING", 6, BOUND + 4999), "STALE_OBSERVATION"),
-            (feedback("WORKING", 6, BOUND - 1), "STALE_OBSERVATION"),
-            (feedback("WORKING", 1.5, BOUND + 6000), "FEEDBACK_MALFORMED"),
-            (feedback("WORKING", -1, BOUND + 6000), "FEEDBACK_MALFORMED"),
-            (feedback("WORKING", 2 ** 53, BOUND + 6000),
-             "FEEDBACK_MALFORMED"),
-            (feedback("WORKING", 6, 1.5), "FEEDBACK_MALFORMED"),
-            (feedback("WORKING", 6, BOUND + 6000,
-                      accepted_revision_ts=float("nan")),
-             "FEEDBACK_MALFORMED"),
-        ]
-        for message, refusal in cases:
-            lane = bound_lane()
-            lane.apply_feedback(feedback("WORKING", 5, BOUND + 5000))
-            before = self.snapshot(lane)
-            result = lane.apply_feedback(message)
-            self.assertEqual(result, {"ok": False, "refusal": refusal},
-                             "case %r" % (message,))
-            self.assertEqual(self.snapshot(lane), before,
-                             "record must be byte-identical after refusal")
-
-    def test_handoff_terminal_immutable(self):
-        lane = bound_lane()
-        result = lane.apply_feedback(feedback("TERMINAL", 2, BOUND + 100,
-                                              "5"))
-        self.assertTrue(result["progressed"])
-        attempts = [feedback("TERMINAL", 3, BOUND + 200, "9"),
-                    feedback("CANCEL_CONFIRMED", 3, BOUND + 200, "1"),
-                    feedback("WORKING", 3, BOUND + 200),
-                    feedback("AMBIGUOUS", 3, BOUND + 200),
-                    feedback("CANCEL_REQUESTED", 3, BOUND + 200)]
-        for attempt in attempts:
-            outcome = lane.apply_feedback(attempt)
-            self.assertEqual(outcome, {"ok": False,
-                                       "refusal": "ALREADY_TERMINAL"})
-        record = lane.snapshot()["handoff"]
-        self.assertEqual(record["cumulative_filled_quantity"], "5")
-
-    def test_wrong_identity_and_revision_refusals(self):
-        # Rule handoff_machine refusal order rows 4-5 (identity before
-        # revision), exercised beside the fixture table.
-        lane = bound_lane()
-        wrong = lane.apply_feedback(
-            feedback("WORKING", 1, BOUND + 1, handoff_id="bh_other"))
-        self.assertEqual(wrong["refusal"], "WRONG_IDENTITY")
-        mismatch = lane.apply_feedback(
-            feedback("WORKING", 1, BOUND + 1, accepted_revision_ts=1))
-        self.assertEqual(mismatch["refusal"], "REVISION_MISMATCH")
-
-
-# ==========================================================================
 # Signal-layer fixtures — WAIVED with reasons (never silently deleted).
 # ==========================================================================
 
 class SignalLayerFixtureWaivers(unittest.TestCase):
     """The five remaining lifecycle-area fixtures exercise the signal
     (candidate) machine — IDLE/WATCHING/FOCUS/PROPOSED/COOLDOWN, proposal
-    sweep, universe pruning. B3's scope is the position machine (plan +
-    supervision + handoff layers); the candidate machine is the scanner
-    builder's file, so basis_position deliberately exposes no signal-layer
-    API. Each waiver asserts the fixture still exists in the spec (not
-    silently deleted) and that this module stays out of that layer."""
+    sweep, universe pruning. B3's scope is the position machine (plan and
+    supervision layers); the candidate machine is in the scanner builder's
+    file, so basis_position deliberately exposes no signal-layer API. Each
+    waiver asserts the fixture still exists in the spec and that this module
+    stays out of that layer."""
 
     def waive(self, name):
         self.assertIn(name, LIFECYCLE_FIXTURES)
@@ -1629,6 +1426,35 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         flat_event["event_digest"] = bp.v2_event_digest(flat_event)
         self.write_raw_position(invalid)
         with self.assertRaisesRegex(bp.PositionError, "chain is broken"):
+            bp.load_position(self.receipt_dir)
+
+    def test_v2_loader_parses_once_and_keeps_one_schema_gate(self):
+        self.ready()
+        raw = self.state_path.read_text(encoding="utf-8")
+        real_loads = json.loads
+        position_parses = []
+
+        def tracked_loads(value, *args, **kwargs):
+            if value == raw:
+                position_parses.append(kwargs.get("object_pairs_hook"))
+            return real_loads(value, *args, **kwargs)
+
+        with mock.patch.object(bp.json, "loads", side_effect=tracked_loads):
+            bp.load_position(self.receipt_dir)
+        self.assertEqual(position_parses, [bp._v2_no_duplicate_fields])
+
+        marker = '  "schema_version": 2,'
+        self.assertEqual(raw.count(marker), 1)
+        self.state_path.write_text(
+            raw.replace(marker, marker + '\n' + marker, 1),
+            encoding="utf-8")
+        with self.assertRaisesRegex(bp.PositionError, "duplicated"):
+            bp.load_position(self.receipt_dir)
+
+        self.state_path.write_text(
+            raw.replace(marker, '  "schema_version": 3,', 1),
+            encoding="utf-8")
+        with self.assertRaisesRegex(bp.PositionError, "marker is invalid"):
             bp.load_position(self.receipt_dir)
 
     def test_v2_append_cas_refusal_changes_nothing(self):
@@ -2925,17 +2751,16 @@ class OpenTests(MachineCase):
             self.assertIn("owner decision required", buffer.getvalue())
             self.assertEqual(transport.posts, [])
 
-    def test_open_entry_revalidation_equal_gap_proceeds_and_records(self):
+    def test_open_entry_revalidation_equal_gap_proceeds_without_unused_fields(
+            self):
         code, transport, out = self.run_cmd(bp.cmd_open, happy_spec())
         self.assertEqual(code, 0, out)
         self.assertEqual(post_stages(transport),
                          ["enter_spot", "enter_short"])
-        check = self.receipt()["entry_revalidation"]
-        self.assertEqual(Decimal(check["proposal_entry_gap_pct"]),
-                         Decimal("0.2"))
-        self.assertEqual(Decimal(check["fresh_entry_gap_pct"]),
-                         Decimal("0.2"))
-        self.assertEqual(check["decision"], "PROCEED")
+        receipt = self.receipt()
+        self.assertNotIn("entry_revalidation", receipt)
+        self.assertNotIn("symbol_leverage_after", receipt["preflight"])
+        self.assertNotIn("leverage_verified_utc", receipt["preflight"])
 
     def test_open_entry_revalidation_better_gap_proceeds(self):
         spec = happy_spec()
@@ -2944,9 +2769,6 @@ class OpenTests(MachineCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(post_stages(transport),
                          ["enter_spot", "enter_short"])
-        self.assertGreater(
-            Decimal(self.receipt()["entry_revalidation"]
-                    ["fresh_entry_gap_pct"]), Decimal("0.2"))
 
     def test_open_entry_revalidation_decay_refuses_without_posts(self):
         spec = happy_spec()
@@ -2955,15 +2777,9 @@ class OpenTests(MachineCase):
         code, transport, out = self.run_cmd(bp.cmd_open, spec)
         self.assertEqual(code, 2, out)
         self.assertIn("ENTRY_REVALIDATION_FAILED", out)
+        self.assertIn("0.1800% is below the minimum 0.19%", out)
         self.assertFalse([call for call in transport.calls
                           if call[0] == "POST"])
-        check = self.receipt()["entry_revalidation"]
-        self.assertEqual(Decimal(check["proposal_entry_gap_pct"]),
-                         Decimal("0.2"))
-        self.assertEqual(Decimal(check["fresh_entry_gap_pct"]),
-                         Decimal("0.18"))
-        self.assertEqual(check["decision"], "REFUSE")
-        self.assertEqual(check["reason"], "ENTRY_REVALIDATION_FAILED")
 
     def test_open_entry_revalidation_unreadable_book_refuses(self):
         spec = happy_spec()
@@ -2971,12 +2787,9 @@ class OpenTests(MachineCase):
         code, transport, out = self.run_cmd(bp.cmd_open, spec)
         self.assertEqual(code, 2, out)
         self.assertIn("ENTRY_REVALIDATION_FAILED", out)
+        self.assertIn("fresh Spot book read failed", out)
         self.assertFalse([call for call in transport.calls
                           if call[0] == "POST"])
-        check = self.receipt()["entry_revalidation"]
-        self.assertEqual(check["decision"], "REFUSE")
-        self.assertEqual(check["fresh_books"]["spot"]["read_status"],
-                         "unclear")
         book_paths = [call[2] for call in transport.calls
                       if call[2].endswith("ticker/bookTicker")]
         self.assertEqual(book_paths, ["/api/v3/ticker/bookTicker",

@@ -24,10 +24,6 @@ Spec mapping (python_target_mapping collapse):
   MAXIMUM_HOLDING_HORIZON), convergence take-profit (recomputed ENTRY gap
   below watchGapPct -> THESIS_TARGET_REACHED, the old gap_closed exit), and
   edge inversion (REMAINING_EDGE_EXHAUSTED / BASIS_DIVERGENCE_INVALIDATION).
-- settlement record: HandoffLane is the spec's BasisHandoffLifecycle —
-  verbatim canonical quantities, strict refusal order, terminal immutable,
-  default OFF (enabling is an owner decision).
-
 Unit conventions (spec math area, tested explicitly): gaps/fees/edges in
 PERCENT (0.78 = 0.78%); book gaps arrive in BPS from basis_read and are
 converted (pct = bps / 100); funding rates are per-period FRACTIONS
@@ -160,7 +156,6 @@ WATCH_GAP_PCT_DEFAULT = Decimal("0.15")    # scanner entry_thresholds KEEP
 SPOT_TAKER_FEE_PCT_DEFAULT = Decimal("0.1")   # math four_leg_fees KEEP, per leg
 USDM_TAKER_FEE_PCT_DEFAULT = Decimal("0.05")  # math four_leg_fees KEEP, per leg
 ENTRY_REVALIDATION_FAILED = "ENTRY_REVALIDATION_FAILED"
-ENTRY_REVALIDATION_PASSED = "ENTRY_REVALIDATION_PASSED"
 
 # Persisted machine states (plan-layer collapse).
 ST_OPENING = "OPENING"
@@ -628,141 +623,6 @@ def apply_naked_duration_expired(exposed_since_ms: Optional[int],
     return ("RECOVERY_REQUIRED",
             "naked exposure outlived the per-plan clock; EXPIRED is "
             "unreachable after exposure")
-
-
-# --------------------------------------------------------------------------
-# Handoff settlement record (spec handoff_machine): single-use, default OFF,
-# verbatim canonical quantities, strict refusal order, terminal immutable.
-# --------------------------------------------------------------------------
-
-HANDOFF_FIELDS = (
-    "handoff_id", "proposal_id", "symbol", "direction",
-    "accepted_notional_usd", "accepted_revision_ts", "accepted_at_ms",
-    "correlation_id", "bound_ts", "state", "last_sequence",
-    "last_observed_at_ms", "working_count", "ambiguous_count",
-    "cancel_requested_count", "terminal_kind", "cumulative_filled_quantity",
-    "terminal_ts",
-)
-CANONICAL_QTY_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?")
-TERMINAL_KINDS = ("TERMINAL", "CANCEL_CONFIRMED")
-OBSERVATION_KINDS = ("WORKING", "AMBIGUOUS", "CANCEL_REQUESTED")
-
-
-def canonical_quantity(value: Any) -> bool:
-    """True only for a string equal to its own canonical non-negative
-    exact-decimal form: no sign, no exponent, no padding, no trailing or
-    leading zeros (a lone 0 stands)."""
-    return isinstance(value, str) and \
-        CANONICAL_QTY_RE.fullmatch(value) is not None
-
-
-class HandoffLane:
-    """One BasisHandoffLifecycle lane. Disabled lanes refuse BEFORE any
-    dependency is touched, so no acceptance ever burns without a handoff."""
-
-    def __init__(self, store: Any = None, clock: Callable[[], int] = None,
-                 enabled: bool = False):
-        self.store = store
-        self.clock = clock
-        self.enabled = enabled
-        self.record: Optional[Dict[str, Any]] = None
-
-    def snapshot(self) -> Dict[str, Any]:
-        return {"enabled": self.enabled,
-                "handoff": dict(self.record) if self.record else None}
-
-    def consume_accepted(self, proposal_id: str) -> Dict[str, Any]:
-        if not self.enabled:
-            return {"ok": False, "refusal": "DISABLED"}
-        if self.record is not None:
-            return {"ok": False, "refusal": "ALREADY_BOUND"}
-        accepted = self.store.claim(proposal_id)
-        bound_ts = self.clock()
-        self.record = {
-            "handoff_id": "bh_" + str(accepted["proposal_id"]),
-            "proposal_id": accepted["proposal_id"],
-            "symbol": accepted["symbol"],
-            "direction": accepted["direction"],
-            "accepted_notional_usd": accepted["accepted_notional_usd"],
-            "accepted_revision_ts": accepted["accepted_revision_ts"],
-            "accepted_at_ms": accepted["accepted_at_ms"],
-            "correlation_id": accepted["correlation_id"],
-            "bound_ts": bound_ts,
-            "state": "AWAITING_FEEDBACK",
-            "last_sequence": 0,
-            "last_observed_at_ms": bound_ts,
-            "working_count": 0,
-            "ambiguous_count": 0,
-            "cancel_requested_count": 0,
-            "terminal_kind": None,
-            "cumulative_filled_quantity": None,
-            "terminal_ts": None,
-        }
-        return {"ok": True, "handoff_id": self.record["handoff_id"]}
-
-    def apply_feedback(self, message: Any) -> Dict[str, Any]:
-        # Refusal order is the spec's, exactly.
-        if not self.enabled:
-            return {"ok": False, "refusal": "DISABLED"}
-        if self.record is None:
-            return {"ok": False, "refusal": "NO_ACTIVE_HANDOFF"}
-        if not isinstance(message, dict) \
-                or message.get("kind") not in TERMINAL_KINDS + OBSERVATION_KINDS:
-            return {"ok": False, "refusal": "FEEDBACK_MALFORMED"}
-        sequence = message.get("sequence")
-        observed = message.get("observed_at_ms")
-        revision = message.get("accepted_revision_ts")
-        if _safe_ms(sequence) is None or sequence < 1 \
-                or _safe_ms(observed) is None or _safe_ms(revision) is None:
-            return {"ok": False, "refusal": "FEEDBACK_MALFORMED"}
-        for field in ("handoff_id", "proposal_id", "symbol"):
-            if not isinstance(message.get(field), str):
-                return {"ok": False, "refusal": "FEEDBACK_MALFORMED"}
-        record = self.record
-        if message["handoff_id"] != record["handoff_id"] \
-                or message["proposal_id"] != record["proposal_id"] \
-                or message["symbol"] != record["symbol"]:
-            return {"ok": False, "refusal": "WRONG_IDENTITY"}
-        if revision != record["accepted_revision_ts"]:
-            return {"ok": False, "refusal": "REVISION_MISMATCH"}
-        if record["state"] == "TERMINAL":
-            return {"ok": False, "refusal": "ALREADY_TERMINAL"}
-        if sequence < record["last_sequence"]:
-            return {"ok": False, "refusal": "STALE_SEQUENCE"}
-        if sequence == record["last_sequence"]:
-            return {"ok": False, "refusal": "DUPLICATE_SEQUENCE"}
-        if observed < record["bound_ts"] \
-                or observed < record["last_observed_at_ms"]:
-            return {"ok": False, "refusal": "STALE_OBSERVATION"}
-        kind = message["kind"]
-        if kind in TERMINAL_KINDS:
-            quantity = message.get("cumulative_filled_quantity")
-            if not canonical_quantity(quantity):
-                return {"ok": False, "refusal": "QUANTITY_NOT_EXACT"}
-            # Terminal clock runs BEFORE any mutation: a throw or a
-            # regression leaves the record wholly awaiting.
-            terminal_ts = self.clock()
-            if terminal_ts < record["bound_ts"]:
-                raise ValueError("terminal clock must not regress")
-            record["state"] = "TERMINAL"
-            record["terminal_kind"] = "TERMINAL_REPORTED" \
-                if kind == "TERMINAL" else "CANCEL_CONFIRMED"
-            record["cumulative_filled_quantity"] = quantity
-            record["last_sequence"] = sequence
-            record["last_observed_at_ms"] = observed
-            record["terminal_ts"] = terminal_ts
-            return {"ok": True, "progressed": True, "state": "TERMINAL",
-                    "terminal_kind": record["terminal_kind"],
-                    "cumulative_filled_quantity": quantity,
-                    "last_sequence": sequence, "terminal_ts": terminal_ts}
-        # Observations advance ordering only; smuggled quantity is ignored.
-        record["last_sequence"] = sequence
-        record["last_observed_at_ms"] = observed
-        counter = {"WORKING": "working_count", "AMBIGUOUS": "ambiguous_count",
-                   "CANCEL_REQUESTED": "cancel_requested_count"}[kind]
-        record[counter] += 1
-        return {"ok": True, "progressed": False, "state": "AWAITING_FEEDBACK",
-                "last_sequence": sequence}
 
 
 # --------------------------------------------------------------------------
@@ -2647,14 +2507,6 @@ def _is_v2_position(position: Any) -> bool:
     return _has_v2_record_shape(position)
 
 
-def _require_v2_schema_marker(position: Dict[str, Any]) -> None:
-    marker = position.get("schema_version")
-    if isinstance(marker, bool) or not isinstance(marker, int) \
-            or marker != V2_SCHEMA_VERSION:
-        raise PositionError(
-            "basis-position.json schema_version is not supported or is missing")
-
-
 class _DuplicateV2Field(ValueError):
     pass
 
@@ -2728,7 +2580,11 @@ def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
             "basis-position.json exists but is unreadable; "
             "human check required before any trade")
     try:
-        loaded = json.loads(raw)
+        loaded = json.loads(raw, object_pairs_hook=_v2_no_duplicate_fields)
+    except _DuplicateV2Field:
+        raise PositionError(
+            "basis-position.json version-2 fields are duplicated or "
+            "unreadable") from None
     except json.JSONDecodeError:
         raise PositionError(
             "basis-position.json exists but is unreadable; "
@@ -2736,14 +2592,6 @@ def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
     if not isinstance(loaded, dict):
         raise PositionError("basis-position.json is not an object")
     if _is_v2_position(loaded):
-        try:
-            loaded = json.loads(
-                raw, object_pairs_hook=_v2_no_duplicate_fields)
-        except (_DuplicateV2Field, json.JSONDecodeError):
-            raise PositionError(
-                "basis-position.json version-2 fields are duplicated or "
-                "unreadable") from None
-        _require_v2_schema_marker(loaded)
         head = _load_v2_committed_head(receipt_dir)
         _validate_v2_position(loaded)
         _match_v2_committed_head(loaded, head)
@@ -2983,21 +2831,6 @@ def initialize_v2_position(
     return append_v2_event(
         receipt_dir, new_v2_config_snapshot_event(config_snapshot),
         expected_length)
-
-
-def v2_event_age_at_creation_ms(event: Dict[str, Any]) -> int:
-    """Return a RungFilled event age using only its sealed source and cut."""
-    if not isinstance(event, dict) \
-            or event.get("event_type") != "RungFilled":
-        raise PositionError("version-2 event is not RungFilled")
-    age = _v2_epoch_ms(
-        event["cut_ms"], "RungFilled.cut_ms") - _v2_epoch_ms(
-            event["dislocation"]["source_time_ms"],
-            "RungFilled.dislocation.source_time_ms")
-    if age < 0:
-        raise PositionError(
-            "version-2 dislocation source time is later than its cut")
-    return age
 
 
 def _prior_receipt_blocker(receipt_dir: str) -> Optional[str]:
@@ -3702,21 +3535,6 @@ def _read_only_entry_preflight(state: RunState, plan: CyclePlan,
     return leverage_before
 
 
-def _book_snapshot(kind: Any, payload: Any) -> Dict[str, Any]:
-    """Receipt-safe public-book fields, including malformed-read evidence."""
-    snapshot = {"read_status": clean(kind, 40),
-                "symbol": None, "bid": None, "ask": None}
-    if not isinstance(payload, dict):
-        return snapshot
-    for receipt_key, payload_key in (("symbol", "symbol"),
-                                     ("bid", "bidPrice"),
-                                     ("ask", "askPrice")):
-        raw = payload.get(payload_key)
-        if isinstance(raw, (str, int, Decimal)) and not isinstance(raw, bool):
-            snapshot[receipt_key] = clean(raw, 80)
-    return snapshot
-
-
 def _validated_book(payload: Any, symbol: str,
                     label: str) -> Tuple[Decimal, Decimal]:
     if not isinstance(payload, dict):
@@ -3746,7 +3564,7 @@ def _validated_book(payload: Any, symbol: str,
 
 def _revalidate_entry(state: RunState,
                       accepted: AcceptedProposal) -> Optional[str]:
-    """Read exactly two public books and persist the entry-time decision.
+    """Read exactly two public books and evaluate the entry-time decision.
 
     Returns a plain refusal detail, or None when the fresh executable gap is
     still within the proposal's configured safety buffer.
@@ -3762,20 +3580,6 @@ def _revalidate_entry(state: RunState,
     tolerance_pct = _proposal_decimal(
         accepted.payload, "safety_buffer_pct", (("safety_buffer_pct",),))
     minimum_gap_pct = proposal_gap_pct - tolerance_pct
-    record = {
-        "proposal_entry_gap_pct": fmt(proposal_gap_pct),
-        "tolerance_pct": fmt(tolerance_pct),
-        "minimum_acceptable_gap_pct": fmt(minimum_gap_pct),
-        "fresh_entry_gap_pct": None,
-        "fresh_books": {
-            "spot": _book_snapshot(spot_kind, spot_payload),
-            "perp": _book_snapshot(usdm_kind, usdm_payload),
-        },
-        "decision": "REFUSE",
-        "reason": ENTRY_REVALIDATION_FAILED,
-        "checked_utc": utc(),
-    }
-
     detail = None
     if spot_kind != "ok":
         detail = "fresh Spot book read failed"
@@ -3789,7 +3593,6 @@ def _revalidate_entry(state: RunState,
                 usdm_payload, symbol, "USD-M")
             fresh_gap_pct = ((usdm_bid - spot_ask) / spot_ask
                              * Decimal(100))
-            record["fresh_entry_gap_pct"] = fmt(fresh_gap_pct)
             if fresh_gap_pct <= 0:
                 detail = "fresh executable entry gap is not positive"
             elif fresh_gap_pct < minimum_gap_pct:
@@ -3799,14 +3602,6 @@ def _revalidate_entry(state: RunState,
                              fmt(proposal_gap_pct), fmt(tolerance_pct)))
         except PositionError as error:
             detail = str(error)
-
-    if detail is None:
-        record["decision"] = "PROCEED"
-        record["reason"] = ENTRY_REVALIDATION_PASSED
-    else:
-        record["detail"] = clean(detail, 300)
-    state.receipt["entry_revalidation"] = record
-    save(state)
     return detail
 
 
@@ -3932,10 +3727,6 @@ def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
         return conclude(state, "PREFLIGHT_REFUSED", "none",
                         "leverage could not be proven exactly 1x; nothing "
                         "submitted")
-    state.receipt["preflight"]["symbol_leverage_after"] = 1
-    state.receipt["preflight"]["leverage_verified_utc"] = utc()
-    save(state)
-
     # Leg 1 — spot BUY, quote-bounded; intent persisted before the POST.
     client = persist_intent(cfg.receipt_dir, position, ENTER_SPOT, plan,
                             state.run_id)
@@ -4790,14 +4581,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         if getattr(args, name) is not None)
     if args.proposal is not None and command != "open":
         parser.error("--proposal is valid only with --open")
-    if command == "open":
-        receipt_dir = os.path.expanduser(
-            os.environ.get("RECEIPT_DIR", "~/quant_receipts"))
-        if os.path.exists(os.path.join(receipt_dir, STOP_FILE)):
-            display_symbol = (symbol or os.environ.get("SYMBOL", "")).upper()
-            print("OPEN | %s | BLOCKED | STOP file present; entry is disabled"
-                  % display_symbol)
-            return EXIT_CODE["BLOCKED"]
     try:
         cfg = config_from_env(os.environ, symbol)
     except PositionError as error:
