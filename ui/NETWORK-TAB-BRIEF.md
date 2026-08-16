@@ -116,7 +116,7 @@ badges that link to Machine / Basis / Reverse / Volume — never as wires.
    MARKET (box ↔ Binance public ↔ account API), NEWS. Nodes are neutral;
    the STATE sits on the link; arrows show direction; each hop shows its own
    number; UNKNOWN when unmeasured.
-3. Large aligned story graph — OWNER'S WORD, kept: one shared time cursor, one
+3. [SUPERSEDED 2026-08-16 late — owner: a master graph is NOT useful; the story surface is a small path strip + GitHub-style status boxes over time per wire; see ui/NETWORK-V1-BUILD-ORDER.md OWNER WORD — LATE] Large aligned story graph — earlier owner word: one shared time cursor, one
    lane per wire, each lane its own unit and colour (milliseconds, message age,
    percentages never share one Y-axis) [codex]; hovering/clicking a moment
    shows the linked event beside it; 1H/6H/24H. (Codex's own mock omits this
