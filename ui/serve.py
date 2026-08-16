@@ -14,6 +14,7 @@ the files written beneath RECEIPT_DIR:
   /api/health      service ticks, job-log tail, stop flags, and tick ages
   /api/decisions   recent momentum decisions with recorded signal evidence
   /api/failures    recent REFUSED/UNKNOWN job results and recorded reasons
+  /api/telemetry   recent timestamped UI telemetry, range-filtered and sampled
 
 Missing sources are honest empty responses. Malformed input is counted, never
 repaired. GET and HEAD are the only accepted methods. The server never writes a
@@ -28,15 +29,16 @@ import os
 import re
 import stat as stat_module
 import sys
+import tempfile
 import threading
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 UI_DIR = Path(__file__).resolve().parent
 ROOT_DIR = UI_DIR.parent
@@ -107,6 +109,8 @@ RECENT_DECISIONS = 50
 RECENT_NEWS = 2000
 RECENT_FAILURES = 50
 FAILURE_SCAN_RECORDS = 250
+TELEMETRY_MAX_POINTS = 7200
+TELEMETRY_RANGE_HOURS = {"1h": 1, "6h": 6, "24h": 24}
 TAIL_BYTES = 1024 * 1024
 SOURCE_PARSE_CACHE_ENTRIES = 512
 GZIP_MIN_BYTES = 512
@@ -188,6 +192,7 @@ def default_sources():
         "momentum_state": LIVE_DIR / "momentum-position.json",
         "momentum_receipts": LIVE_DIR / "momentum-paper-receipts.jsonl",
         "health": LIVE_DIR / "health.jsonl",
+        "poll_config": LIVE_DIR / "poll_config.json",
         "jobs_log": Path(os.path.expanduser(os.environ.get(
             "JOBS_LOG", str(LIVE_DIR / "jobs.log")))),
         "stop": LIVE_DIR / "STOP",
@@ -200,6 +205,8 @@ def default_sources():
         "manifest": LIVE_DIR / "pull_manifest.json",
         "news": LIVE_DIR / "news.jsonl",
         "news_sources": LIVE_DIR / "news_sources.json",
+        "telemetry": LIVE_DIR / "telemetry.jsonl",
+        "grace": LIVE_DIR / "grace.json",
     }
 
 
@@ -975,13 +982,14 @@ def _service_name(record):
     return None
 
 
-def _jobs_log_summary(path, now):
+def _jobs_log_summary(path, now, pull_age=None):
     present, lines, encoding_errors, truncated = _read_tail_lines(
         path, RECENT_JOB_LOG_LINES)
     if not present:
         return {
             "source": str(path), "present": False, "as_of": None,
             "last_tick_utc": None, "last_tick_age_seconds": None,
+            "capture_age_seconds": None,
             "last_tick_basis": None, "level": None, "level_basis": None,
             "tail": [], "line_count": 0, "parse_errors": 0,
             "tail_truncated": False,
@@ -1005,12 +1013,17 @@ def _jobs_log_summary(path, now):
         reported = "ERROR"
     elif any(word in text for word in ("WARNING", "WARN", "BUSY", "STOPPED")):
         reported = "WARNING"
+    capture_age = _capture_age_seconds(age, pull_age)
+    # Attribution: grade the runner on its own lag when the transport
+    # term is known — the pull row carries transport staleness itself.
     level, _, basis = _health_level(
-        {"status": reported}, age,
+        {"status": reported},
+        capture_age if capture_age is not None else age,
         JOB_AMBER_AFTER_SECONDS, JOB_RED_AFTER_SECONDS)
     return {
         "source": str(path), "present": True, "as_of": file_as_of,
         "last_tick_utc": last_seen, "last_tick_age_seconds": age,
+        "capture_age_seconds": capture_age,
         "last_tick_basis": "log_timestamp" if tick_utc else "file_mtime",
         "level": level, "level_basis": basis, "tail": lines,
         "line_count": len(lines), "parse_errors": encoding_errors,
@@ -1032,13 +1045,22 @@ def api_health(sources, now=None):
             continue
         latest[name] = record
 
+    # Transport term for attribution: these files arrive via the mirror
+    # pull, so each service's observed age includes the pull's own age.
+    pull_age = _strip_pull_facts(sources, now).get("age_seconds")
+
     services = []
     for name in sorted(latest):
         record = latest[name]
         record_as_of = _record_as_of(record)
         last_seen = record_as_of or file_as_of
         age = _age_seconds(last_seen, now)
-        level, reported, basis = _health_level(record, age)
+        capture_age = _capture_age_seconds(age, pull_age)
+        # Grade on the loop's OWN lag when attribution is possible — a
+        # stale mirror pull must not paint every host service amber; the
+        # pull row carries its own staleness.
+        level, reported, basis = _health_level(
+            record, capture_age if capture_age is not None else age)
         services.append({
             "service": name,
             "level": level,
@@ -1046,11 +1068,12 @@ def api_health(sources, now=None):
             "reported_status": reported,
             "last_seen_utc": last_seen,
             "last_seen_age_seconds": age,
+            "capture_age_seconds": capture_age,
             "last_seen_basis": "record" if record_as_of else "file_mtime",
             "record": record,
         })
 
-    jobs = _jobs_log_summary(sources["jobs_log"], now)
+    jobs = _jobs_log_summary(sources["jobs_log"], now, pull_age)
     flags = {}
     for label, source_name in (("STOP", "stop"), ("STOP-JOBS", "stop_jobs")):
         flag_path = sources[source_name]
@@ -1100,7 +1123,12 @@ def api_health(sources, now=None):
         "stop_jobs": flags["STOP-JOBS"]["present"],
         "parse_errors": parse_errors + jobs["parse_errors"],
         "tail_truncated": truncated,
-        "sources": {name: str(source) for name, source in sources.items()},
+        # Telemetry is presentation history served by its own endpoint, not
+        # part of health's established operational-source inventory.
+        "sources": {
+            name: str(source) for name, source in sources.items()
+            if name != "telemetry"
+        },
     }
 
 
@@ -1169,6 +1197,190 @@ def api_news(sources):
         "parse_errors": parse_errors,
         "tail_truncated": truncated,
     }
+
+
+TELEMETRY_TAIL_BYTES = 16 * 1024 * 1024
+
+
+# Attribution: a host loop's observed age on this Mac = transport age
+# (mirror pull) + the loop's REAL lag at the moment the mirror snapshotted
+# the host. The raw *_s fields conflate the two, which paints the pull
+# cycle's sawtooth onto every host loop. The derived *_true_s fields carry
+# the loop's own truth; mirror_s alone carries the transport.
+TRUE_LAG_FIELDS = {
+    "market_s": "market_true_s",
+    "supervisor_s": "supervisor_true_s",
+    "basis_watch_s": "basis_watch_true_s",
+    "basis_sup_s": "basis_sup_true_s",
+    "jobs_s": "jobs_true_s",
+}
+TRUE_LAG_MIRROR_CARRY_SECONDS = 240
+
+# Beat representation: every loop's graphable truth is the interval
+# between its real works (write timestamps recovered as sample_ts - age,
+# which stay constant between pulls). Healthy = a flat line at the loop's
+# own rhythm; a late loop's line RISES with its real silence; a stalled
+# transport freezes the view (None) instead of faking lateness.
+BEAT_FIELDS = {
+    "mirror_s": ("mirror_beat_s", False),
+    "news_s": ("news_beat_s", False),
+    "market_s": ("market_beat_s", True),
+    "supervisor_s": ("supervisor_beat_s", True),
+    "basis_watch_s": ("basis_watch_beat_s", True),
+    "basis_sup_s": ("basis_sup_beat_s", True),
+    "jobs_s": ("jobs_beat_s", True),
+}
+BEAT_NEW_WRITE_SECONDS = 2.5
+
+
+def _capture_age_seconds(age, pull_age):
+    """Loop lag at the mirror's snapshot instant: observed minus transport,
+    floored at zero (host-vs-Mac clock skew appears as a constant; the
+    floor keeps the number honest rather than negative)."""
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        return None
+    if isinstance(pull_age, bool) or not isinstance(pull_age, (int, float)):
+        return None
+    return round(max(0.0, float(age) - float(pull_age)), 3)
+
+
+def _derive_true_lags(records):
+    """Add *_true_s to chronological telemetry rows. mirror_s is carried
+    forward briefly (growing by wall clock, as a manifest age does) so
+    sparse loop samples still receive their transport term; past the carry
+    window the derived field is honestly None."""
+    last_mirror = None
+    last_mirror_ts = None
+    beat_state = {}
+    for record in records:
+        ts = _parse_utc(record.get("ts"))
+        mirror = record.get("mirror_s")
+        if (ts is not None and not isinstance(mirror, bool)
+                and isinstance(mirror, (int, float))):
+            last_mirror = float(mirror)
+            last_mirror_ts = ts
+        carried = None
+        if ts is not None and last_mirror_ts is not None:
+            gap = (ts - last_mirror_ts).total_seconds()
+            if 0 <= gap <= TRUE_LAG_MIRROR_CARRY_SECONDS:
+                carried = last_mirror + gap
+        for raw_key, true_key in TRUE_LAG_FIELDS.items():
+            if raw_key not in record:
+                continue
+            value = record.get(raw_key)
+            if (carried is not None and not isinstance(value, bool)
+                    and isinstance(value, (int, float))):
+                record[true_key] = _capture_age_seconds(value, carried)
+            else:
+                record[true_key] = None
+        _derive_beats(record, ts, beat_state)
+
+
+def _derive_beats(record, ts, state):
+    """Add *_beat_s: max(last completed beat, current open interval).
+    Write timestamps derive from sample_ts - age and are pull-phase
+    stable; a new write farther than BEAT_NEW_WRITE_SECONDS advances the
+    beat. Warm-up (no beat yet) and frozen-transport rows stay None."""
+    for raw_key, (out_key, hosted) in BEAT_FIELDS.items():
+        if raw_key not in record:
+            continue
+        value = record.get(raw_key)
+        if (ts is None or isinstance(value, bool)
+                or not isinstance(value, (int, float))):
+            record[out_key] = None
+            continue
+        write_ts = ts - timedelta(seconds=float(value))
+        st = state.setdefault(raw_key, {"write": None, "beat": None})
+        if st["write"] is None:
+            st["write"] = write_ts
+        else:
+            delta = (write_ts - st["write"]).total_seconds()
+            if delta > BEAT_NEW_WRITE_SECONDS:
+                st["beat"] = delta
+                st["write"] = write_ts
+            elif delta < -BEAT_NEW_WRITE_SECONDS:
+                # rotation/out-of-order artifact: re-anchor, keep the beat
+                st["write"] = write_ts
+        if hosted:
+            open_s = record.get(TRUE_LAG_FIELDS[raw_key])
+        else:
+            open_s = float(value)
+        if st["beat"] is None or open_s is None:
+            record[out_key] = None
+        else:
+            record[out_key] = round(max(st["beat"], open_s), 3)
+
+
+def api_telemetry(sources, range_name="1h", now=None):
+    path = sources["telemetry"]
+    if range_name not in TELEMETRY_RANGE_HOURS:
+        range_name = "1h"
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    window_start = now - timedelta(hours=TELEMETRY_RANGE_HOURS[range_name])
+
+    # _read_jsonl_tail bounds the byte read with TAIL_BYTES first. The same
+    # value as its line cap retains every non-empty line that can fit in that
+    # bounded tail without ever slurping an indefinitely growing source.
+    present, raw_records, parse_errors, tail_truncated = _read_jsonl_tail(
+        path, TELEMETRY_TAIL_BYTES, scan_limit=TELEMETRY_TAIL_BYTES)
+    kept = []
+    for record in raw_records:
+        if not isinstance(record, dict):
+            parse_errors += 1
+            continue
+        parsed = _parse_utc(record.get("ts"))
+        if parsed is None:
+            parse_errors += 1
+            continue
+        if window_start <= parsed <= now:
+            kept.append((parsed, record))
+    kept.sort(key=lambda item: item[0])
+
+    # dict copies: the jsonl tail is cached; derived fields must never
+    # leak into the shared cache rows.
+    records = [dict(record) for _, record in kept]
+    _derive_true_lags(records)
+    kept_count = len(records)
+    truncated = tail_truncated
+    stride = None
+    if kept_count > TELEMETRY_MAX_POINTS:
+        # Audit fix: whole-row striding aliased sparse per-metric rows
+        # (a 15s field could vanish entirely for a phase). Merge each
+        # bucket instead: the last non-null value per field survives,
+        # so every metric keeps its presence at display resolution.
+        stride = (kept_count + TELEMETRY_MAX_POINTS - 1) \
+            // TELEMETRY_MAX_POINTS
+        merged = []
+        for start in range(0, kept_count, stride):
+            chunk = records[start:start + stride]
+            row = {"ts": chunk[-1]["ts"]}
+            for record in chunk:
+                for key, value in record.items():
+                    if key == "ts":
+                        continue
+                    if value is not None:
+                        row[key] = value
+                    elif key not in row:
+                        row[key] = None
+            merged.append(row)
+        records = merged
+        truncated = True
+
+    payload = {
+        "ok": True,
+        "read_only": True,
+        "source": str(path),
+        "present": present,
+        "range": range_name,
+        "as_of": records[-1]["ts"] if records else None,
+        "count": kept_count,
+        "parse_errors": parse_errors,
+        "truncated": truncated,
+        "points": records,
+    }
+    if stride is not None:
+        payload["stride"] = stride
+    return payload
 
 
 def _failure_verdict(record):
@@ -1431,6 +1643,7 @@ def api_strip(sources, now=None):
                 "reported_status": service.get("reported_status"),
                 "last_seen_utc": service.get("last_seen_utc"),
                 "age_seconds": service.get("last_seen_age_seconds"),
+                "capture_age_seconds": service.get("capture_age_seconds"),
             }
             break
 
@@ -1449,11 +1662,186 @@ def api_strip(sources, now=None):
             "state": market_state,
             "as_of": market_as_of,
             "age_seconds": market_age,
+            "capture_age_seconds": _capture_age_seconds(
+                market_age, pull.get("age_seconds")),
         },
         "supervisor": supervisor,
         "governor": _strip_governor_facts(sources, now),
         "pull": pull,
     }
+
+
+POLL_WRITE_LOCK = threading.Lock()
+POLL_METRICS = ("server", "mirror", "market", "supervisor", "newsloop",
+                "basiswatch", "basissup", "jobrunner")
+POLL_ALLOWED = (1, 2, 5, 10, 15, 30, 60, 120)
+POLL_DEFAULT = 15
+
+
+def _read_poll_config(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}, False
+    return (payload if isinstance(payload, dict) else {}), True
+
+
+def _resolve_poll_config(payload):
+    default = payload.get("default_s")
+    if isinstance(default, bool) or default not in POLL_ALLOWED:
+        default = POLL_DEFAULT
+    metrics_in = payload.get("metrics")
+    metrics_in = metrics_in if isinstance(metrics_in, dict) else {}
+    metrics = {}
+    for key in POLL_METRICS:
+        value = metrics_in.get(key)
+        if isinstance(value, bool):
+            value = None
+        metrics[key] = value if value in POLL_ALLOWED else default
+    return {"default_s": default, "metrics": metrics}
+
+
+def api_poll_config(sources, now=None):
+    payload, present = _read_poll_config(sources["poll_config"])
+    resolved = _resolve_poll_config(payload)
+    return {
+        "ok": True,
+        "present": present,
+        "default_s": resolved["default_s"],
+        "metrics": resolved["metrics"],
+        "allowed": list(POLL_ALLOWED),
+    }
+
+
+def write_poll_config(sources, body):
+    """Validate and atomically write the recorder's poll config.
+
+    The ONLY mutation this server performs: a UI-local preferences file
+    (ui/live/poll_config.json) that the telemetry recorder reads. It can
+    not reach the host, the machine, or any money path.
+    """
+    if not isinstance(body, dict):
+        return None, "body must be a JSON object"
+    with POLL_WRITE_LOCK:
+        return _write_poll_config_locked(sources, body)
+
+
+def _write_poll_config_locked(sources, body):
+    current, _ = _read_poll_config(sources["poll_config"])
+    resolved = _resolve_poll_config(current)
+    default = body.get("default_s", resolved["default_s"])
+    if isinstance(default, bool) or default not in POLL_ALLOWED:
+        return None, "default_s must be one of %s" % (list(POLL_ALLOWED),)
+    metrics_in = body.get("metrics", {})
+    if not isinstance(metrics_in, dict):
+        return None, "metrics must be an object"
+    merged = dict(resolved["metrics"])
+    for key, value in metrics_in.items():
+        if key not in POLL_METRICS:
+            return None, "unknown metric %r" % (key,)
+        if isinstance(value, bool) or value not in POLL_ALLOWED:
+            return None, "interval for %r must be one of %s" % (
+                key, list(POLL_ALLOWED))
+        merged[key] = value
+    output = {"default_s": default, "metrics": merged}
+    target = Path(sources["poll_config"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".%s-" % target.name, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+            json.dump(output, tmp, ensure_ascii=False, separators=(",", ":"))
+            tmp.flush()
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return output, None
+
+
+# ---- per-loop grace (V5): UI grading preference, its own file --------
+# Kept OUT of poll_config.json so the telemetry recorder (which reads
+# that file) never sees an unknown key. Same read/merge/atomic-write
+# discipline as the poll config.
+
+GRACE_WRITE_LOCK = threading.Lock()
+GRACE_ALLOWED = (15, 30, 60, 120, 300, 600)
+
+
+def _read_grace(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}, False
+    return (payload if isinstance(payload, dict) else {}), True
+
+
+def _resolve_grace(payload):
+    raw = payload.get("grace_s")
+    raw = raw if isinstance(raw, dict) else {}
+    resolved = {}
+    for key in POLL_METRICS:
+        value = raw.get(key)
+        if isinstance(value, bool):
+            value = None
+        resolved[key] = value if value in GRACE_ALLOWED else "auto"
+    return resolved
+
+
+def api_grace(sources, now=None):
+    payload, present = _read_grace(sources["grace"])
+    return {
+        "ok": True,
+        "present": present,
+        "grace_s": _resolve_grace(payload),
+        "allowed": list(GRACE_ALLOWED),
+    }
+
+
+def write_grace(sources, body):
+    """Validate and atomically write the per-loop grace preferences."""
+    if not isinstance(body, dict):
+        return None, "body must be a JSON object"
+    with GRACE_WRITE_LOCK:
+        return _write_grace_locked(sources, body)
+
+
+def _write_grace_locked(sources, body):
+    current, _ = _read_grace(sources["grace"])
+    merged = _resolve_grace(current)
+    grace_in = body.get("grace_s", {})
+    if not isinstance(grace_in, dict):
+        return None, "grace_s must be an object"
+    for key, value in grace_in.items():
+        if key not in POLL_METRICS:
+            return None, "unknown metric %r" % (key,)
+        if value == "auto":
+            merged[key] = "auto"
+            continue
+        if isinstance(value, bool) or value not in GRACE_ALLOWED:
+            return None, "grace for %r must be 'auto' or one of %s" % (
+                key, list(GRACE_ALLOWED))
+        merged[key] = value
+    output = {"grace_s": merged}
+    target = Path(sources["grace"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".%s-" % target.name, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+            json.dump(output, tmp, ensure_ascii=False, separators=(",", ":"))
+            tmp.flush()
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return output, None
 
 
 API_ROUTES = {
@@ -1469,6 +1857,9 @@ API_ROUTES = {
     "/api/fees": api_fees,
     "/api/pnl": api_pnl,
     "/api/news": api_news,
+    "/api/telemetry": api_telemetry,
+    "/api/poll_config": api_poll_config,
+    "/api/grace": api_grace,
 }
 
 
@@ -1628,7 +2019,8 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
 
     def _handle(self, head_only):
         try:
-            path = unquote(urlsplit(self.path).path)
+            parsed_url = urlsplit(self.path)
+            path = unquote(parsed_url.path)
         except ValueError:
             self._send(
                 404, "text/plain; charset=utf-8", b"not found\n",
@@ -1636,8 +2028,14 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
             return
         route = API_ROUTES.get(path)
         if route is not None:
+            if route is api_telemetry:
+                query = parse_qs(parsed_url.query, keep_blank_values=True)
+                range_name = query.get("range", ["1h"])[0]
+                payload = route(type(self).sources, range_name)
+            else:
+                payload = route(type(self).sources)
             self._send_json(
-                200, route(type(self).sources), head_only,
+                200, payload, head_only,
                 cache_control="no-cache")
             return
         if path.startswith("/api/"):
@@ -1683,7 +2081,45 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
         }, head_only=self.command == "HEAD",
                         extra_headers=(("Allow", "GET, HEAD"),))
 
-    do_POST = _refuse
+    def do_POST(self):
+        """Two narrow writes: recorder poll config, V5 grace prefs."""
+        clean = urlsplit(self.path).path
+        writers = {
+            "/api/poll_config": write_poll_config,
+            "/api/grace": write_grace,
+        }
+        writer = writers.get(clean)
+        if writer is None:
+            self._refuse()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 1 or length > 4096:
+            self._send_json(400, {"ok": False,
+                                  "error": "body must be 1-4096 bytes"})
+            return
+        raw_body = self.rfile.read(length)
+        if len(raw_body) != length:
+            self._send_json(400, {"ok": False, "error": "short body"})
+            return
+        try:
+            body = json.loads(raw_body)
+        except (ValueError, UnicodeError):
+            self._send_json(400, {"ok": False,
+                                  "error": "body must be valid JSON"})
+            return
+        try:
+            saved, error = writer(type(self).sources, body)
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        if error:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        self._send_json(200, {"ok": True, "saved": saved})
+
     do_PUT = _refuse
     do_DELETE = _refuse
     do_PATCH = _refuse

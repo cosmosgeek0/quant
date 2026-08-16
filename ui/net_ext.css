@@ -1,0 +1,126 @@
+.qmulti-host { margin-top: 12px; }
+
+.qmulti {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.qmulti-panel {
+  display: block;
+  width: 100%;
+  padding: 11px 14px 9px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.qmulti-panel:last-child { border-right: 0; }
+
+.qmulti-panel:hover { background: var(--hover); }
+
+.qmulti-panel.on { background: var(--pill); }
+
+.qmulti-label {
+  display: block;
+  color: var(--muted);
+  font-size: 9.75px;
+  font-weight: 500;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.qmulti-cur {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.qmulti-cur.warn { color: #d4a406; }
+
+.qmulti-cur.bad { color: #cc2f3c; }
+
+.qmulti-unit {
+  margin-left: 3px;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 10.5px;
+}
+
+.qmulti-spark {
+  display: block;
+  width: 100%;
+  height: 34px;
+  margin-top: 6px;
+}
+
+.qmulti-spark canvas {
+  display: block;
+  width: 100%;
+}
+
+.qmulti-empty {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.qevents {
+  display: block;
+  margin-top: 12px;
+}
+
+.qevents-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-height: 30px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+}
+
+.qevents-time {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.qevents-name {
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.qevents-arrow { color: var(--faint); }
+
+.qevents-state.qe-ok { color: var(--ink); }
+
+.qevents-state.qe-warn {
+  color: #b58a06;
+  font-weight: 500;
+}
+
+.qevents-state.qe-bad {
+  color: #cc2f3c;
+  font-weight: 500;
+}
+
+.qevents-empty {
+  padding: 10px 0;
+  color: var(--faint);
+  font-size: 11px;
+}

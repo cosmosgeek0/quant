@@ -1,22 +1,25 @@
 "use strict";
 
 (function () {
-  var BAR_WIDTH = 3;
-  var BAR_GAP = 2;
-  var BAR_HEIGHT = 14;
-  var BAR_RADIUS = 1;
+  /* bar grammar measured off status.openai.com (2026-08-15): bars
+     fill 68% of an even slot across the full row, with 15px height and
+     full state colors — bars are history DATA, so they carry the real palette */
+  var BAR_FILL = 0.68;
+  var BAR_HEIGHT = 15;
+  var BAR_RADIUS = 0.5;
   var CAPACITY = 90;
   var COLORS = {
-    ok: "#16a34a",
-    warn: "#d4a406",
-    bad: "#cc2f3c"
+    ok: "#24c19a",
+    warn: "#fbbf24",
+    bad: "#f87171"
   };
 
-  function drawBar(ctx, x, y, color) {
-    var right = x + BAR_WIDTH;
+  function drawBar(ctx, x, y, width, color, alpha) {
+    var right = x + width;
     var bottom = y + BAR_HEIGHT;
 
     ctx.fillStyle = color;
+    ctx.globalAlpha = alpha;
     ctx.beginPath();
     ctx.moveTo(x + BAR_RADIUS, y);
     ctx.lineTo(right - BAR_RADIUS, y);
@@ -41,7 +44,9 @@
     var ratio;
     var ctx;
     var neutral;
-    var stripWidth;
+    var slotWidth;
+    var barWidth;
+    var gap;
     var x;
     var y;
     var i;
@@ -81,16 +86,20 @@
     ctx.clearRect(0, 0, width, height);
 
     neutral = window.getComputedStyle(el)
-      .getPropertyValue("--line-2").trim() || "transparent";
-    stripWidth = count ? count * BAR_WIDTH + (count - 1) * BAR_GAP : 0;
-    x = width - stripWidth;
+      .getPropertyValue("--st-line").trim() || "#e5e7eb";
+    slotWidth = count ? width / count : 0;
+    barWidth = slotWidth * BAR_FILL;
+    gap = count > 1 ? (width - count * barWidth) / (count - 1) : 0;
+    x = count === 1 ? (width - barWidth) / 2 : 0;
     y = Math.floor((height - BAR_HEIGHT) / 2);
 
     for (i = start; i < values.length; i++) {
       sample = values[i];
-      drawBar(ctx, x, y, COLORS[sample] || neutral);
-      x += BAR_WIDTH + BAR_GAP;
+      drawBar(ctx, x, y, barWidth, COLORS[sample] || neutral,
+        sample === null ? 0.25 : 1);
+      x += barWidth + gap;
     }
+    ctx.globalAlpha = 1;
   }
 
   window.QNet = window.QNet || {};

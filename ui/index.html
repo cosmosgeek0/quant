@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quant</title>
+<link rel="icon" type="image/png" href="brand-mark.png">
 <link rel="stylesheet" href="vendor/uPlot.min.css">
 <style>
   /* Quant owner shell v5 — adds the bottom profile + account popup
@@ -205,17 +206,44 @@
 
   /* Connections page — one centered measured column, symmetric
      padding, hairlines only inside the list. No boxes. */
-  .conn-page { max-width: none; margin: 0; padding: 72px 40px 56px; }
+  .conn-page { max-width: 1280px; margin: 0; padding: 72px 40px 56px; }
+  .conn-tiles {
+    display: flex; gap: 0; margin-top: 22px;
+    border: 1px solid var(--line-2); border-radius: 14px;
+    overflow: hidden;
+  }
+  .conn-tile { flex: 1; padding: 13px 16px; border-right: 1px solid var(--line); min-width: 0; }
+  .conn-tile:last-child { border-right: 0; }
+  .conn-tile em {
+    display: block; font-style: normal;
+    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+    text-transform: uppercase; color: var(--muted); line-height: 13px;
+  }
+  .conn-tile b {
+    display: block; margin-top: 2px;
+    font-family: var(--mono);
+    font-size: 17px; font-weight: 400; color: var(--ink);
+    line-height: 24px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* nominal tile values stay ink (DESIGN.md §2) — only deviation colors */
+  .conn-tile b.warn { color: #d4a406; }
+  .conn-tile b.bad { color: #cc2f3c; }
+  .conn-tile small {
+    display: block; margin-top: 1px;
+    font-size: 10.5px; color: var(--faint); line-height: 14px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .machine-chip {
     display: inline-flex; align-items: center; gap: 7px;
     height: 28px; padding: 0 11px;
     border: 1px solid var(--line-2); border-radius: 999px;
-    font-size: 11px; font-weight: 640; letter-spacing: 0.04em;
+    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+    text-transform: uppercase;
     font-variant-numeric: tabular-nums;
     color: var(--muted);
   }
-  .machine-chip b { font-family: var(--mono); font-weight: 400; font-size: 12.5px; }
-  .machine-chip b.ok { color: #16a34a; }
+  .machine-chip b { font-family: var(--mono); font-weight: 400; font-size: 12.5px; color: var(--ink); }
   .machine-chip b.warn { color: #d4a406; }
   .machine-chip b.bad { color: #cc2f3c; }
   .conn-assessed { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -231,14 +259,20 @@
   .conn-overall {
     display: inline-flex; align-items: center; gap: 7px;
     margin-left: auto;
-    font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em;
+    font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+    text-transform: uppercase;
     color: var(--muted);
   }
-  .conn-overall .livedot { width: 8px; height: 8px; }
+  /* the page lamp: solid state glyph, no pulse — deviation classes
+     stay loud. Same green as the row dots: one status green everywhere. */
+  .conn-overall .livedot {
+    width: 8px; height: 8px;
+    background: #16a34a;
+    animation: none;
+  }
   .conn-head-row { display: flex; align-items: center; gap: 14px; }
   .conn-title { font-size: 16px; font-weight: 600; color: var(--ink); }
   .conn-sub { margin-top: 4px; font-size: 13px; color: var(--muted); }
-  .conn-note { margin-top: 2px; font-size: 12.5px; color: var(--faint); }
   /* News v4 — decongested top, two-column body: list left, dedicated
      Sources box + Activity box on the right (owner-sanctioned boxes:
      functional containers, 1px line, small radius). */
@@ -321,7 +355,6 @@
   .fpill.on {
     background: var(--pill);
     color: var(--ink);
-    font-weight: 600;
     box-shadow: inset 0 0 0 1px var(--line-2);
   }
   .fpill .cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -645,7 +678,7 @@
      (measured 208x38 r9999) — deliberately a size bigger, per owner. */
   .qsearch {
     position: relative;
-    width: 264px;
+    width: 344px;
   }
   .qsearch-box {
     position: relative;
@@ -795,18 +828,28 @@
   /* results panel — old .snav-search-pop, opaque by their owner-fix
      law (never backdrop-filter), grouped rows in our tokens. */
   .qsearch-pop {
-    position: absolute;
-    top: calc(100% + 7px);
-    left: 0;
-    right: 0;
-    z-index: 90;
+    position: fixed;
+    top: 88px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(880px, 74vw);
+    z-index: 95;
     background: var(--panel);
     border: 1px solid var(--line-2);
-    border-radius: 12px;
-    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.12);
-    padding: 5px;
-    max-height: min(520px, 70vh);
+    border-radius: 14px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.22);
+    padding: 6px;
+    max-height: min(66vh, 720px);
     overflow-y: auto;
+  }
+  .qsearch-dim {
+    position: fixed;
+    inset: 0;
+    z-index: 94;
+    background: rgba(13, 13, 13, 0.32);
+  }
+  html[data-theme="dark"] .qsearch-dim {
+    background: rgba(0, 0, 0, 0.5);
   }
   .ssr-tabs {
     display: flex;
@@ -1007,6 +1050,7 @@
   }
 </style>
 <link rel="stylesheet" href="net.css">
+<link rel="stylesheet" href="net_v5.css">
 </head>
 <body>
 <div class="frame">
@@ -1085,6 +1129,7 @@
           <button class="qsearch-k" id="qsearch-k" tabindex="-1" title="Focus search (⌘K)">⌘K</button>
         </div>
         <span class="search-beam" aria-hidden="true"></span>
+        <div class="qsearch-dim" id="qsearch-dim" hidden></div>
         <div class="qsearch-pop" id="qsearch-pop" hidden></div>
       </div>
     </div>
@@ -1126,9 +1171,10 @@
 
 <div id="tip" role="tooltip" aria-hidden="true"></div>
 <script src="vendor/uPlot.iife.min.js"></script>
-<script src="net_spark.js"></script>
+<script src="net_chart.js"></script>
 <script src="net_bars.js"></script>
-<script src="net_table.js"></script>
+<script src="net_events.js"></script>
+<script src="net_v5.js"></script>
 <script src="shell.js"></script>
 </body>
 </html>

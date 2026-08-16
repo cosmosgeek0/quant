@@ -6,7 +6,6 @@ import http.client
 import io
 import json
 import os
-import socket
 import sys
 import tempfile
 import threading
@@ -88,29 +87,7 @@ def proposal(proposal_id="live01", expires="2099-08-13T00:02:00.000Z"):
 class ServerHarness(unittest.TestCase):
     """Start the real server on 127.0.0.1:0 with isolated source paths."""
 
-    _bind_probe_complete = False
-    _bind_probe_error = None
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        if ServerHarness._bind_probe_complete:
-            return
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.bind(("127.0.0.1", 0))
-        except OSError as error:
-            ServerHarness._bind_probe_error = "%s: %s" % (
-                type(error).__name__, error)
-        finally:
-            probe.close()
-            ServerHarness._bind_probe_complete = True
-
     def start(self, sources):
-        if ServerHarness._bind_probe_error is not None:
-            self.skipTest(
-                "127.0.0.1 socket bind unavailable: %s"
-                % ServerHarness._bind_probe_error)
         server = serve.make_server(sources, port=0)
         thread = threading.Thread(
             target=lambda: server.serve_forever(poll_interval=0.05),
@@ -1197,11 +1174,11 @@ class TestReadOnlyGuarantees(ServerHarness):
         self.assertEqual(payload["methods"], ["GET", "HEAD"])
         self.assertEqual(sorted(payload["sources"]), [
             "basis_position", "basis_receipts_dir", "events", "fees",
-            "governor_dir", "governor_lock", "health", "job_receipts_dir",
+            "governor_dir", "governor_lock", "grace", "health", "job_receipts_dir",
             "job_results", "jobs_log", "manifest", "momentum_decisions",
             "momentum_receipts", "momentum_state", "news", "news_sources",
-            "proposals_dir", "stop", "stop_jobs", "stream_log",
-            "stream_state",
+            "poll_config", "proposals_dir", "stop", "stop_jobs",
+            "stream_log", "stream_state",
         ])
 
     def test_head_matches_status_and_has_empty_body(self):
@@ -1385,6 +1362,278 @@ class TestNewsEndpoint(ServerHarness):
         self.assertEqual(payload["parse_errors"], 1)
         self.assertEqual(payload["items"][0]["impact"], 3)
         self.assertIsNotNone(payload["as_of"])
+
+
+class TestTelemetryEndpoint(ServerHarness):
+
+    def telemetry_sources(self, root):
+        sources = self.empty_sources(root / "missing")
+        sources["telemetry"] = root / "telemetry.jsonl"
+        return sources
+
+    def test_range_filters_and_sorts_points_ascending(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(minutes=15)), "value": 3},
+            {"ts": self.utc_text(now - timedelta(hours=7)), "value": 1},
+            {"ts": self.utc_text(now - timedelta(hours=5)), "value": 2},
+            {"ts": self.utc_text(now + timedelta(minutes=1)), "value": 4},
+        ]
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=6h")
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["read_only"])
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["range"], "6h")
+        self.assertEqual([row["value"] for row in payload["points"]], [2, 3])
+        self.assertEqual(payload["as_of"], rows[0]["ts"])
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["parse_errors"], 0)
+        self.assertFalse(payload["truncated"])
+
+    def test_downsamples_by_stride_and_always_keeps_newest(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        cap = serve.TELEMETRY_MAX_POINTS
+        total = cap + 1
+        rows = [
+            {"ts": self.utc_text(now - timedelta(seconds=total - 1 - index)),
+             "value": index}
+            for index in range(total)
+        ]
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=6h")
+
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["stride"], 2)
+        self.assertEqual(payload["count"], total)
+        self.assertEqual(len(payload["points"]), (total + 1) // 2)
+        # bucket-merged: each point carries the bucket's last non-null
+        self.assertEqual(payload["points"][0]["value"], 1)
+        self.assertEqual(payload["points"][-1]["value"], total - 1)
+
+    def test_downsample_merge_preserves_sparse_fields(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        cap = serve.TELEMETRY_MAX_POINTS
+        total = cap * 2
+        rows = []
+        for index in range(total):
+            row = {"ts": self.utc_text(
+                now - timedelta(seconds=total - 1 - index)),
+                "dense": index}
+            if index % 15 == 0:
+                row["sparse"] = index
+            rows.append(row)
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=6h")
+
+        kept_sparse = sum(1 for p in payload["points"]
+                          if p.get("sparse") is not None)
+        expected = sum(1 for r in rows if "sparse" in r)
+        self.assertEqual(kept_sparse, expected)
+
+    def test_malformed_lines_and_unparseable_timestamps_are_counted(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        valid = {"ts": self.utc_text(now - timedelta(minutes=1)), "value": 7}
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "not json\n[]\n{\"value\":1}\n{\"ts\":\"junk\"}\n" +
+            json.dumps(valid) + "\n", encoding="utf-8")
+
+        payload = self.get_json(self.start(sources), "/api/telemetry")
+
+        self.assertEqual(payload["points"], [valid])
+        self.assertEqual(payload["parse_errors"], 4)
+
+    def test_absent_file_is_honest_empty(self):
+        root = self.tempdir()
+        sources = self.telemetry_sources(root)
+
+        payload = self.get_json(self.start(sources), "/api/telemetry")
+
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["source"], str(sources["telemetry"]))
+        self.assertEqual(payload["points"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertIsNone(payload["as_of"])
+        self.assertEqual(payload["parse_errors"], 0)
+        self.assertFalse(payload["truncated"])
+
+    def test_junk_range_defaults_to_one_hour(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(hours=2)), "value": 1},
+            {"ts": self.utc_text(now - timedelta(minutes=30)), "value": 2},
+        ]
+        sources = self.telemetry_sources(root)
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+
+        payload = self.get_json(
+            self.start(sources), "/api/telemetry?range=junk")
+
+        self.assertEqual(payload["range"], "1h")
+        self.assertEqual([row["value"] for row in payload["points"]], [2])
+
+
+class TestLagAttribution(ServerHarness):
+    """Observed age = transport age + true loop lag; the derived fields
+    must carry ONLY the loop's own truth."""
+
+    def test_capture_age_subtracts_transport_and_floors_at_zero(self):
+        self.assertEqual(serve._capture_age_seconds(150.0, 120.0), 30.0)
+        self.assertEqual(serve._capture_age_seconds(100.0, 120.0), 0.0)
+        self.assertIsNone(serve._capture_age_seconds(None, 120.0))
+        self.assertIsNone(serve._capture_age_seconds(150.0, None))
+        self.assertIsNone(serve._capture_age_seconds(True, 120.0))
+
+    def test_derive_true_lags_carries_mirror_and_honors_window(self):
+        base = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            {"ts": self.utc_text(base), "mirror_s": 60.0,
+             "market_s": 65.0},
+            # 30s later, no mirror sample: carried transport = 60 + 30
+            {"ts": self.utc_text(base + timedelta(seconds=30)),
+             "market_s": 95.0, "supervisor_s": 200.0},
+            # past the carry window: derived fields must be None
+            {"ts": self.utc_text(
+                base + timedelta(seconds=30 + serve
+                                 .TRUE_LAG_MIRROR_CARRY_SECONDS + 1)),
+             "market_s": 40.0},
+        ]
+        serve._derive_true_lags(rows)
+        self.assertEqual(rows[0]["market_true_s"], 5.0)
+        self.assertEqual(rows[1]["market_true_s"], 5.0)
+        self.assertEqual(rows[1]["supervisor_true_s"], 110.0)
+        self.assertIsNone(rows[2]["market_true_s"])
+        self.assertNotIn("supervisor_true_s", rows[2])
+
+    def test_telemetry_endpoint_serves_true_fields_without_cache_leak(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": self.utc_text(now - timedelta(seconds=20)),
+             "mirror_s": 50.0, "jobs_s": 80.0},
+        ]
+        sources = self.empty_sources(root / "missing")
+        sources["telemetry"] = root / "telemetry.jsonl"
+        sources["telemetry"].write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8")
+        server = self.start(sources)
+        first = self.get_json(server, "/api/telemetry?range=1h")
+        second = self.get_json(server, "/api/telemetry?range=1h")
+        for payload in (first, second):
+            self.assertEqual(payload["points"][0]["jobs_true_s"], 30.0)
+        # raw file rows stay untouched — derivation never rewrites disk
+        on_disk = sources["telemetry"].read_text(encoding="utf-8")
+        self.assertNotIn("jobs_true_s", on_disk)
+
+    def test_strip_and_health_carry_capture_age(self):
+        root = self.tempdir()
+        now = datetime.now(timezone.utc)
+        sources = self.empty_sources(root)
+        manifest = {"utc": self.utc_text(now - timedelta(seconds=90)),
+                    "ok": True, "interval_ms": 45000}
+        sources["manifest"].write_text(json.dumps(manifest),
+                                       encoding="utf-8")
+        state = {"as_of": self.utc_text(now - timedelta(seconds=100))}
+        sources["stream_state"].write_text(json.dumps(state),
+                                           encoding="utf-8")
+        server = self.start(sources)
+        strip = self.get_json(server, "/api/strip")
+        market = strip["market_pass"]
+        self.assertIsNotNone(market["capture_age_seconds"])
+        self.assertAlmostEqual(market["capture_age_seconds"],
+                               market["age_seconds"]
+                               - strip["pull"]["age_seconds"], places=1)
+
+
+class TestPollConfigEndpoint(ServerHarness):
+    """The server's one write: the recorder's per-metric poll config."""
+
+    def poll_sources(self, root):
+        return {"poll_config": root / "poll_config.json",
+                "telemetry": root / "telemetry.jsonl"}
+
+    def test_get_defaults_when_absent(self):
+        root = self.tempdir()
+        payload = self.get_json(
+            self.start(self.poll_sources(root)), "/api/poll_config")
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["default_s"], 15)
+        self.assertEqual(payload["metrics"]["server"], 15)
+        self.assertIn(1, payload["allowed"])
+        self.assertIn(2, payload["allowed"])
+        self.assertIn(5, payload["allowed"])
+
+    def test_post_roundtrip(self):
+        root = self.tempdir()
+        base = self.start(self.poll_sources(root))
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"server": 1, "mirror": 60}}))
+        self.assertEqual(status, 200)
+        saved = json.loads(body)["saved"]
+        self.assertEqual(saved["metrics"]["server"], 1)
+        self.assertEqual(saved["metrics"]["mirror"], 60)
+        payload = self.get_json(base, "/api/poll_config")
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["metrics"]["server"], 1)
+        self.assertEqual(payload["metrics"]["mirror"], 60)
+        self.assertEqual(payload["metrics"]["market"], 15)
+
+    def test_post_rejects_bad_values(self):
+        root = self.tempdir()
+        self.start(self.poll_sources(root))
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"server": 7}}))
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(body)["ok"])
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"nope": 5}}))
+        self.assertEqual(status, 400)
+
+    def test_post_rejects_booleans_and_bad_lengths(self):
+        root = self.tempdir()
+        self.start(self.poll_sources(root))
+        status, body = self.request(
+            "POST", "/api/poll_config",
+            body=json.dumps({"metrics": {"server": True}}))
+        self.assertEqual(status, 400)
+        status, _, _ = self.request_full(
+            "POST", "/api/poll_config", body="",
+            headers={"Content-Length": "0"})
+        self.assertEqual(status, 400)
+
+    def test_post_other_paths_still_refused(self):
+        root = self.tempdir()
+        self.start(self.poll_sources(root))
+        status, _ = self.request("POST", "/api/strip", body="{}")
+        self.assertEqual(status, 405)
 
 
 if __name__ == "__main__":

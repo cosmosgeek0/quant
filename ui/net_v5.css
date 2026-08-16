@@ -1,0 +1,190 @@
+/* net_v5.css — Network V5 proposal (branch lane/ui-network-v5).
+   Every rule lives inside DESIGN.md: existing castes, existing palette,
+   color only as deviation or history data. New classes are v5-* only;
+   everything else reuses the st-* grammar from net.css. */
+
+/* ---- subline under the page title (T5) ---- */
+.v5-sub {
+  font-size: 11px; font-weight: 400; color: var(--st-mid, #787882);
+  margin: -6px 0 14px;
+}
+
+/* ---- answer layer composition: two columns, cards top-aligned ---- */
+.v5-duo {
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 14px; align-items: start; margin-bottom: 14px;
+}
+.v5-duo > .st-card { margin-bottom: 0; min-width: 0; }
+@media (max-width: 1100px) { .v5-duo { grid-template-columns: 1fr; } }
+
+/* ---- control path card: MAC → TRANSPORT → HOST, vertical ---- */
+.v5-pv-tier { padding: 2px 0 6px; }
+.v5-pv-tier + .v5-pv-tier {
+  border-top: 1px solid var(--st-line, #e5e7eb); padding-top: 8px;
+}
+.v5-path-tier {
+  font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+  text-transform: uppercase; color: var(--st-faint, #95959d);
+  margin: 2px 0 8px;
+}
+.v5-node {
+  display: flex; align-items: center; gap: 8px;
+  min-height: 26px;
+}
+.v5-node-name {
+  font-size: 13.5px; font-weight: 500; color: var(--st-ink, #161618);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.v5-node .st-spacer { flex: 1; }
+.v5-node-val {
+  font-family: var(--mono, "JBMono", monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px; color: var(--st-ink, #161618);
+}
+.v5-node-val.warn { color: var(--st-warn-text, #b45309); }
+.v5-node-val.bad { color: var(--st-bad-text, #cc2f3c); }
+
+/* one dot vocabulary: 6px, full status color, quiet green when nominal */
+.v5-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #16a34a; flex: 0 0 6px;
+}
+.v5-dot.warn { background: #d4a406; }
+.v5-dot.bad { background: #cc2f3c; }
+.v5-dot.off { background: var(--st-faint, #95959d); }
+
+/* ---- schedule raster: loop × time, worst sample per slice ---- */
+.v5-raster-rows { padding: 2px 0 0; }
+.v5-r-row { display: flex; align-items: center; gap: 10px; height: 15px; }
+.v5-r-name {
+  flex: 0 0 96px; text-align: right;
+  font-size: 11px; font-weight: 400; color: var(--st-mid, #787882);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.v5-r-canvas { flex: 1; height: 11px; min-width: 0; }
+.v5-r-axis {
+  display: flex; justify-content: space-between;
+  margin: 6px 0 0 106px;
+  font-size: 11px; color: var(--st-faint, #95959d);
+}
+.v5-note {
+  font-size: 11px; font-weight: 400; color: var(--st-faint, #95959d);
+  margin-top: 8px;
+}
+
+/* ---- worst-first table ---- */
+.v5-table { width: 100%; border-collapse: collapse; }
+.v5-table th {
+  font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+  text-transform: uppercase; color: var(--st-faint, #95959d);
+  text-align: right; padding: 4px 10px 6px;
+  border-bottom: 1px solid var(--st-line, #e5e7eb);
+  white-space: nowrap;
+}
+.v5-table th:first-child { text-align: left; padding-left: 2px; }
+.v5-table th.c-status { text-align: left; }
+.v5-table td {
+  padding: 0 10px; height: 40px;
+  border-bottom: 1px solid var(--st-line, #e5e7eb);
+  font-family: var(--mono, "JBMono", monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px; color: var(--st-ink, #161618);
+  text-align: right; white-space: nowrap;
+}
+.v5-table tr:last-child td { border-bottom: 0; }
+.v5-table tbody tr { cursor: pointer; }
+.v5-table tbody tr:hover td { background: var(--st-hover, #fafafb); }
+.v5-td-name {
+  font-family: inherit; text-align: left !important; padding-left: 2px !important;
+}
+.v5-td-name .nm {
+  font-size: 13.5px; font-weight: 500; color: var(--st-ink, #161618);
+  font-family: InterVariable, Inter, sans-serif;
+}
+.v5-td-tier {
+  font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+  text-transform: uppercase; color: var(--st-faint, #95959d);
+  font-family: InterVariable, Inter, sans-serif;
+  text-align: left !important;
+}
+.v5-td-status { text-align: left !important; }
+.v5-word {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 11px; font-weight: 450; color: var(--st-ink, #161618);
+  font-family: InterVariable, Inter, sans-serif;
+}
+.v5-word.warn { color: var(--st-warn-text, #b45309); font-weight: 500; }
+.v5-word.bad { color: var(--st-bad-text, #cc2f3c); font-weight: 500; }
+.v5-word.off { color: var(--st-faint, #95959d); }
+.v5-td-ratio { color: var(--st-mid, #787882); }
+.v5-td-ratio.warn { color: var(--st-warn-text, #b45309); }
+.v5-td-ratio.bad { color: var(--st-bad-text, #cc2f3c); }
+.v5-spark { width: 96px; height: 18px; display: inline-block; vertical-align: middle; }
+
+/* ---- envelope panels ---- */
+.v5-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+  margin-top: 14px;
+}
+@media (max-width: 1100px) { .v5-grid { grid-template-columns: 1fr; } }
+.v5-panel {
+  border: 1px solid var(--st-line, #e5e7eb); border-radius: 14px;
+  background: var(--st-card, #fff); padding: 14px 16px 12px;
+  min-width: 0;
+}
+.v5-p-head { display: flex; align-items: center; gap: 9px; }
+.v5-p-name { font-size: 13.5px; font-weight: 500; color: var(--st-ink, #161618); }
+.v5-p-tier {
+  font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+  text-transform: uppercase; color: var(--st-faint, #95959d);
+}
+.v5-p-detail {
+  font-size: 11px; color: var(--st-faint, #95959d);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.v5-p-head .st-spacer { flex: 1; }
+.v5-env { display: block; width: 100%; height: 106px; margin-top: 10px; }
+.v5-p-stats {
+  display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap;
+  font-family: var(--mono, "JBMono", monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px; color: var(--st-mid, #787882);
+}
+.v5-p-stats b {
+  font-weight: 400; color: var(--st-ink, #161618);
+}
+.v5-p-stats b.warn { color: var(--st-warn-text, #b45309); }
+.v5-p-stats b.bad { color: var(--st-bad-text, #cc2f3c); }
+
+/* quiet select — real control, hairline until touched */
+.v5-select {
+  font: 12.5px/1.4 InterVariable, Inter, sans-serif;
+  color: var(--st-mid, #787882);
+  background: transparent;
+  border: 1px solid var(--st-line, #e5e7eb); border-radius: 7px;
+  padding: 2px 4px 2px 6px;
+}
+.v5-select:hover { color: var(--st-ink, #161618); }
+.v5-select:focus { outline: none; border-color: var(--focus, #2557d6); }
+
+/* card head label (T2) shared by raster/table cards */
+.v5-card-lbl {
+  font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
+  text-transform: uppercase; color: var(--st-faint, #95959d);
+}
+.v5-card-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px;
+}
+.v5-card-head .st-spacer { flex: 1; }
+
+/* paused page: history stays, live-ness visibly stops */
+.st-page.paused .v5-env,
+.st-page.paused .v5-r-canvas,
+.st-page.paused .v5-spark { opacity: 0.55; }
+
+/* focus flash when the table jumps you to a panel */
+.v5-panel.flash { border-color: var(--focus, #2557d6); }
+
+/* state-change log stays a card, not a page: newest visible, rest scroll */
+.v5-ev-host { max-height: 396px; overflow-y: auto; }
+.v5-ev-host .qevents-row { flex-wrap: wrap; }
