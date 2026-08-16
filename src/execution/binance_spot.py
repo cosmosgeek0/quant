@@ -7,9 +7,9 @@ import math as _math, re as _re, time as _time
 from typing import Callable as _Callable, Literal as _Literal
 from execution import binance_http as _http
 
-__all__ = ("SpotMarket", "SpotAccountState", "read_market", "read_account_state", "build_market_order", "query_order", "submit_order_once", "read_my_trades", "read_fills", "fees_by_asset", "net_base_quantity")
+__all__ = ("SPOT_MY_TRADES_PATH", "SPOT_ORDER_PATH", "SpotMarket", "SpotAccountState", "read_market", "read_account_state", "build_market_order", "query_order", "submit_order_once", "read_my_trades", "read_fills", "fees_by_asset", "net_base_quantity")
 _INFO, _BOOK, _ACCOUNT = "/api/v3/exchangeInfo", "/api/v3/ticker/bookTicker", "/api/v3/account"
-_OPEN, _ORDER, _TRADES = "/api/v3/openOrders", "/api/v3/order", "/api/v3/myTrades"
+_OPEN, SPOT_ORDER_PATH, SPOT_MY_TRADES_PATH = "/api/v3/openOrders", "/api/v3/order", "/api/v3/myTrades"
 _DAY_MS = 86_400_000
 _SYMBOL, _ASSET = _re.compile(r"[A-Z0-9]{5,20}\Z"), _re.compile(r"[A-Z0-9]{1,20}\Z")
 _CLIENT_ID = _re.compile(r"[A-Za-z0-9._:/-]{1,36}\Z")
@@ -177,7 +177,7 @@ def query_order(transport: _http.Transport, base_url: str, symbol: str, client_i
     if not _named(symbol, _SYMBOL) or not _named(client_id, _CLIENT_ID): raise _http.AdapterRefusal("order identity is invalid")
     params = (("symbol", symbol), ("origClientOrderId", client_id)); missing, last = 0, None
     for attempt in range(_http.ORDER_QUERY_ATTEMPTS):
-        result = transport("GET", base_url, _ORDER, params, True)
+        result = transport("GET", base_url, SPOT_ORDER_PATH, params, True)
         parsed = _parsed(result.payload, symbol, client_id) if isinstance(result, _http.HttpResult) and result.kind == "ok" else None
         if parsed is not None:
             missing, last = 0, parsed
@@ -191,7 +191,7 @@ def query_order(transport: _http.Transport, base_url: str, symbol: str, client_i
     return last or _empty("pending", symbol, client_id)
 
 
-def _full_fills(payload: object, order_id: int) -> tuple[_http.Fill, ...]:
+def _full_fills(payload: object, order_id: int, side: str | None) -> tuple[_http.Fill, ...]:
     rows = payload.get("fills", []) if isinstance(payload, dict) and payload.get("orderId") == order_id else None
     if not isinstance(rows, list): return ()
     found = []
@@ -199,11 +199,13 @@ def _full_fills(payload: object, order_id: int) -> tuple[_http.Fill, ...]:
         for row in rows:
             trade_id = row.get("tradeId") if isinstance(row, dict) else None
             if isinstance(trade_id, bool) or not isinstance(trade_id, int) or trade_id < 0 or any(x.trade_id == trade_id for x in found): raise _http.AdapterRefusal("fill identity is invalid")
+            buyer, maker, when = (row["isBuyer"] if "isBuyer" in row else side == "BUY"), row.get("isMaker"), row.get("time"); fill_side = "BUY" if buyer is True else "SELL" if buyer is False else None
+            if side not in ("BUY", "SELL") or type(buyer) is not bool or fill_side != side or type(maker) is not bool or type(when) is not int or when < 0: raise _http.AdapterRefusal("fill facts are invalid")
             price, quantity = _money(row.get("price"), True), _money(row.get("qty"), True)
             asset = row.get("commissionAsset")
             if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
             fee = _http.Fee(asset, _money(row.get("commission")))
-            with _http.exact_guard(): found.append(_http.Fill(trade_id, order_id, price, quantity, price * quantity, fee))
+            with _http.exact_guard(): found.append(_http.Fill(trade_id, order_id, price, quantity, price * quantity, fee, fill_side, maker, when, None))
     except _http.AdapterRefusal: return ()
     return tuple(found)
 
@@ -214,7 +216,7 @@ def submit_order_once(transport: _http.Transport, base_url: str, plan: _http.Ord
     try: write_intent(plan.intent)
     except _http.IntentNotDurable: raise
     except Exception: raise _http.IntentNotDurable("intent was not durably written") from None
-    posted = transport("POST", base_url, _ORDER, plan.intent.params, True)
+    posted = transport("POST", base_url, SPOT_ORDER_PATH, plan.intent.params, True)
     returned = posted.payload.get("clientOrderId") if posted.kind == "ok" and isinstance(posted.payload, dict) else None
     mismatch = posted.kind == "ok" and returned != plan.intent.identity
     queried = query_order(transport, base_url, plan.symbol, plan.intent.identity, sleep=sleep)
@@ -222,7 +224,7 @@ def submit_order_once(transport: _http.Transport, base_url: str, plan: _http.Ord
         error = _http.HttpResult("unclear", None, None, "returned_client_id_mismatch")
         return _replace(queried, tag="pending", terminal=False, returned_client_id=returned if isinstance(returned, str) else None, response_fills=(), error=error)
     if queried.tag == "terminal":
-        fills = _full_fills(posted.payload, queried.identity.order_id) if posted.kind == "ok" else ()
+        fills = _full_fills(posted.payload, queried.identity.order_id, queried.side) if posted.kind == "ok" else ()
         return _replace(queried, response_fills=fills)
     if posted.kind == "api_error" and queried.tag == "not_found": return _empty("error", plan.symbol, plan.intent.identity, posted)
     return _replace(queried, tag="pending", terminal=False, returned_client_id=returned if isinstance(returned, str) else None, error=posted if posted.kind != "ok" else queried.error)
@@ -232,13 +234,13 @@ def _trade(row: object, symbol: str, order_id: int | None, start_ms: int | None,
     if not isinstance(row, dict) or row.get("symbol") != symbol: raise _http.AdapterRefusal("trade symbol is not exact")
     oid, trade_id = row.get("orderId"), row.get("id")
     if isinstance(oid, bool) or not isinstance(oid, int) or oid <= 0 or isinstance(trade_id, bool) or not isinstance(trade_id, int) or trade_id < 0 or (order_id is not None and oid != order_id): raise _http.AdapterRefusal("trade identity is not exact")
-    when = row.get("time")
-    if start_ms is not None and (isinstance(when, bool) or not isinstance(when, int) or not start_ms <= when <= end_ms): raise _http.AdapterRefusal("trade time is outside window")
+    buyer, maker, when = row.get("isBuyer"), row.get("isMaker"), row.get("time")
+    if type(buyer) is not bool or type(maker) is not bool or type(when) is not int or when < 0 or start_ms is not None and not start_ms <= when <= end_ms: raise _http.AdapterRefusal("trade facts are incomplete")
     price, quantity = _money(row.get("price"), True), _money(row.get("qty"), True)
     asset = row.get("commissionAsset")
     if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
     fee = _http.Fee(asset, _money(row.get("commission")))
-    return _http.Fill(trade_id, oid, price, quantity, _money(row.get("quoteQty"), True), fee)
+    return _http.Fill(trade_id, oid, price, quantity, _money(row.get("quoteQty"), True), fee, "BUY" if buyer else "SELL", maker, when, None)
 
 
 def read_my_trades(transport: _http.Transport, base_url: str, symbol: str, *, order_id: int | None = None, start_ms: int | None = None, end_ms: int | None = None, sleep: _Callable[[float], None] = _time.sleep) -> _http.ReadResult[tuple[_http.Fill, ...]]:
@@ -248,7 +250,7 @@ def read_my_trades(transport: _http.Transport, base_url: str, symbol: str, *, or
     window = order_id is None and all(isinstance(x, int) and not isinstance(x, bool) for x in (start_ms, end_ms))
     if id_mode == window or (window and (start_ms < 0 or end_ms < start_ms or end_ms - start_ms > _DAY_MS)): raise _http.AdapterRefusal("one bounded trade selector is required")
     params = (("symbol", symbol), ("orderId", str(order_id)), ("limit", "1000")) if id_mode else (("symbol", symbol), ("startTime", str(start_ms)), ("endTime", str(end_ms)), ("limit", "1000"))
-    result = _http.read(transport, base_url, _TRADES, params, signed=True, sleep=sleep)
+    result = _http.read(transport, base_url, SPOT_MY_TRADES_PATH, params, signed=True, sleep=sleep)
     if result.kind != "ok": return _failed(result)
     try:
         if not isinstance(result.payload, list) or len(result.payload) > 1000: raise _http.AdapterRefusal("trade ledger is malformed")

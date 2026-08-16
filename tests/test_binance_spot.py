@@ -43,16 +43,17 @@ def order_payload(status="FILLED", executed="1", client=CLIENT, order_id=7):
             "cummulativeQuoteQty": str(Decimal(executed) * Decimal("10"))}
 
 
-def fill(trade_id=1, quantity="1", asset="BTC", fee="0.01"):
+def fill(trade_id=1, quantity="1", asset="BTC", fee="0.01", side="BUY", is_maker=False, when=100):
     price = Decimal("10"); quantity = Decimal(quantity)
     return http.Fill(trade_id, 7, price, quantity, price * quantity,
-                     http.Fee(asset, Decimal(fee)))
+                     http.Fee(asset, Decimal(fee)), side, is_maker, when, None)
 
 
-def trade(trade_id=1, quantity="1", asset="BTC", fee="0.01", when=100):
+def trade(trade_id=1, quantity="1", asset="BTC", fee="0.01", when=100, is_buyer=True, is_maker=False):
     return {"symbol": SYMBOL, "id": trade_id, "orderId": 7, "price": "10",
             "qty": quantity, "quoteQty": str(Decimal(quantity) * Decimal("10")),
-            "commissionAsset": asset, "commission": fee, "time": when}
+            "commissionAsset": asset, "commission": fee, "time": when,
+            "isBuyer": is_buyer, "isMaker": is_maker}
 
 
 def terminal(executed="1", response_fills=()):
@@ -88,7 +89,8 @@ class SpotAdapterTests(unittest.TestCase):
         self.assertEqual(set(spot.__all__), {"SpotMarket", "SpotAccountState",
                          "read_market", "read_account_state", "build_market_order",
                          "query_order", "submit_order_once", "read_my_trades",
-                         "read_fills", "fees_by_asset", "net_base_quantity"})
+                         "read_fills", "fees_by_asset", "net_base_quantity", "SPOT_MY_TRADES_PATH", "SPOT_ORDER_PATH"})
+        self.assertEqual((spot.SPOT_MY_TRADES_PATH, spot.SPOT_ORDER_PATH), ("/api/v3/myTrades", "/api/v3/order"))
 
     def test_builder_floors_step_and_uses_the_executable_side(self):
         built = spot.build_market_order(market(), "SELL", CLIENT, SHA,
@@ -145,7 +147,8 @@ class SpotAdapterTests(unittest.TestCase):
     def test_submit_writes_first_posts_once_and_keeps_full_fills(self):
         posted = {"clientOrderId": CLIENT, "orderId": 7, "fills": [
             {"tradeId": 1, "price": "10", "qty": "0.02",
-             "commissionAsset": "BTC", "commission": "0.0001"}]}
+             "commissionAsset": "BTC", "commission": "0.0001",
+             "isMaker": False, "time": 100}]}
         replies, events = [ok(posted), ok(order_payload(executed="0.02"))], []
 
         def transport(method, base_url, path, params, signed):
@@ -157,6 +160,7 @@ class SpotAdapterTests(unittest.TestCase):
                           sum(event[:2] == ("wire", "POST") for event in events),
                           events[0][0], events[1][:2], result.tag, len(result.response_fills)),
                          (1, 1, "intent", ("wire", "POST"), "terminal", 1))
+        self.assertEqual((result.response_fills[0].side, result.response_fills[0].is_maker, result.response_fills[0].time_ms, result.response_fills[0].realized_pnl), ("BUY", False, 100, None))
         feed = Feed(ok(posted))
         with self.assertRaises(http.IntentNotDurable):
             spot.submit_order_once(feed, BASE, plan(),
@@ -210,6 +214,19 @@ class SpotAdapterTests(unittest.TestCase):
         with self.assertRaises(http.AdapterRefusal):
             spot.read_my_trades(Feed(), BASE, SYMBOL, order_id=7,
                                 start_ms=100, end_ms=200)
+
+    def test_my_trades_preserves_measured_fill_facts(self):
+        feed = Feed(ok([trade(when=321, is_buyer=False, is_maker=True)]))
+        result = spot.read_my_trades(feed, BASE, SYMBOL, order_id=7)
+        self.assertEqual((result.value[0].side, result.value[0].is_maker,
+                          result.value[0].time_ms, result.value[0].realized_pnl),
+                         ("SELL", True, 321, None))
+        self.assertEqual(feed.calls[0][2], spot.SPOT_MY_TRADES_PATH)
+
+    def test_my_trades_without_buyer_fact_is_unclear(self):
+        row = trade(); del row["isBuyer"]
+        result = spot.read_my_trades(Feed(ok([row])), BASE, SYMBOL, order_id=7)
+        self.assertEqual(result.kind, "unclear")
 
     def test_full_fills_precede_trade_reads_and_ids_deduplicate(self):
         full = fill(quantity="1")

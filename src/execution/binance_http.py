@@ -1,10 +1,9 @@
-"""Shared Binance types, exact-money context, and one-attempt HTTP transport."""
+"""Shared Binance types (rows 016-024, 129), exact-money context, and HTTP transport."""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import (Context, Decimal, DecimalException, DivisionByZero, Inexact,
-                     InvalidOperation, Overflow, Rounded, localcontext)
+from decimal import (Context, Decimal, DecimalException, DivisionByZero, Inexact, InvalidOperation, Overflow, Rounded, localcontext)
 from typing import Callable, Generic, Literal, Optional, Tuple, TypeVar
 
 SPOT_BASE_URL = "https://api.binance.com"
@@ -16,8 +15,7 @@ READ_BACKOFF_SECONDS = (1, 2)
 ORDER_QUERY_ATTEMPTS = 45
 ORDER_QUERY_DELAY_SECONDS = 2
 ORDER_NOT_FOUND_STREAK = 8
-TERMINAL_ORDER_STATUSES = frozenset(
-    {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"})
+TERMINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"})
 AMBIGUOUS_API_CODES = frozenset({-1006, -1007})
 
 Params = Tuple[Tuple[str, str], ...]
@@ -117,6 +115,10 @@ class Fill:  # row 022
     quantity: Decimal
     quote_quantity: Decimal
     fee: Fee
+    side: Literal["BUY", "SELL"]
+    is_maker: bool
+    time_ms: int
+    realized_pnl: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -210,8 +212,7 @@ def _canonical_params(params: Params | None) -> Params:
 
 
 class BinanceHttp:
-    def __init__(self, api_key: str, api_secret: str, *, timeout_seconds: int = HTTP_TIMEOUT_SECONDS, recv_window_ms: int = RECV_WINDOW_MS,
-                 now_ms: Callable[[], int] = system_now_ms):
+    def __init__(self, api_key: str, api_secret: str, *, timeout_seconds: int = HTTP_TIMEOUT_SECONDS, recv_window_ms: int = RECV_WINDOW_MS, now_ms: Callable[[], int] = system_now_ms):
         if type(api_key) is not str or not api_key.strip() or type(api_secret) is not str or not api_secret.strip(): raise AdapterRefusal("nonempty credentials are required")
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS: raise AdapterRefusal("timeout_seconds is outside its bound")
         if type(recv_window_ms) is not int or not 1 <= recv_window_ms <= _MAX_RECV_WINDOW_MS: raise AdapterRefusal("recv_window_ms is outside its bound")
@@ -272,8 +273,7 @@ class BinanceHttp:
             return _unclear("transport_error")
 
 
-def read(transport: Transport, base_url: str, path: str,
-         params: Params | None = None, *, signed: bool = False,
+def read(transport: Transport, base_url: str, path: str, params: Params | None = None, *, signed: bool = False,
          sleep: Callable[[float], None] = time.sleep) -> HttpResult:
     for attempt in range(READ_ATTEMPTS):
         result = transport("GET", base_url, path, params, signed)

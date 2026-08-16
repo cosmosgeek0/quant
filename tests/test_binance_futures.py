@@ -36,10 +36,12 @@ class Spy:
 
 def symbol_row(symbol=SYMBOL):
     return {"symbol": symbol, "status": "TRADING", "contractType": "PERPETUAL",
-            "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
-                        {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+            "quoteAsset": "USDT", "marginAsset": "USDT", "orderTypes": ["LIMIT", "MARKET"], "timeInForce": ["GTC", "IOC"],
+            "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.1", "minPrice": "0.1", "maxPrice": "1000000"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001", "maxQty": "1000"},
+                        {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001", "minQty": "0.001", "maxQty": "500"},
                         {"filterType": "MIN_NOTIONAL", "notional": "5"},
-                        {"filterType": "PERCENT_PRICE", "multiplierUp": "1.20"}]}
+                        {"filterType": "PERCENT_PRICE", "multiplierUp": "1.20", "multiplierDown": "0.80"}]}
 
 def market_spy(symbols):
     return Spy({"/fapi/v1/exchangeInfo": ok({"symbols": symbols}),
@@ -48,7 +50,9 @@ def market_spy(symbols):
 
 def market():
     return futures.FuturesMarket(SYMBOL, "TRADING", "PERPETUAL", D("0.001"),
-                                 D("0.001"), D("5"), D("1.20"), D("99"), D("100"), D("99.5"))
+                                 D("0.001"), D("5"), D("1.20"), D("99"), D("100"), D("99.5"),
+                                 D("0.1"), D("0.1"), D("1000000"), D("500"), D("0.80"),
+                                 "USDT", "USDT", ("LIMIT", "MARKET"), ("GTC", "IOC"))
 
 def preflight_routes():
     position = {"symbol": SYMBOL, "positionSide": "BOTH", "positionAmt": "0"}
@@ -70,11 +74,18 @@ class FuturesAdapterTest(unittest.TestCase):
         transport = market_spy([symbol_row("ETHUSDT"), symbol_row()])
         result = futures.read_market(transport, BASE, SYMBOL, sleep=lambda _: None)
         self.assertEqual(result.kind, "ok"); self.assertEqual(result.value.symbol, SYMBOL)
+        self.assertEqual((result.value.tick_size, result.value.min_price, result.value.max_price, result.value.max_quantity, result.value.multiplier_down),
+                         (D("0.1"), D("0.1"), D("1000000"), D("500"), D("0.80")))
+        self.assertEqual((result.value.quote_asset, result.value.margin_asset, result.value.order_types, result.value.time_in_force),
+                         ("USDT", "USDT", ("LIMIT", "MARKET"), ("GTC", "IOC")))
         self.assertIsNone(transport.calls[0][3])
         for rows in ([symbol_row("ETHUSDT")], [symbol_row(), symbol_row()]):
             with self.subTest(count=len(rows)):
                 self.assertEqual(futures.read_market(market_spy(rows), BASE, SYMBOL,
                                                      sleep=lambda _: None).kind, "unclear")
+        for key in ("quoteAsset", "marginAsset", "orderTypes", "timeInForce"):
+            row = symbol_row(); row.pop(key)
+            self.assertEqual(futures.read_market(market_spy([row]), BASE, SYMBOL, sleep=lambda _: None).kind, "unclear")
 
     def test_preflight_proves_all_reads_and_banded_margin(self):
         transport = Spy(preflight_routes())
@@ -86,6 +97,12 @@ class FuturesAdapterTest(unittest.TestCase):
         routes = preflight_routes(); routes["/fapi/v3/balance"] = ok([{"asset": "USDT", "availableBalance": "119.99"}])
         self.assertEqual(futures.read_preflight(Spy(routes), BASE, market(), D("100"),
                                                require_flat=True, sleep=lambda _: None).kind, "unclear")
+        routes = preflight_routes(); routes["/fapi/v3/balance"] = ok([{"asset": "T", "availableBalance": "120"}])
+        self.assertEqual(futures.read_preflight(Spy(routes), BASE, market(), D("100"), require_flat=True, sleep=lambda _: None).kind, "unclear")
+        for proposed in ("100", 100.0):
+            guarded = Spy({})
+            with self.assertRaises(http.AdapterRefusal): futures.read_preflight(guarded, BASE, market(), proposed, require_flat=True, sleep=lambda _: None)
+            self.assertEqual(guarded.calls, [])
         guarded = Spy({})
         with self.assertRaises(http.AdapterRefusal):
             futures.read_preflight(guarded, BASE, market(), D("9" * 60), require_flat=True, sleep=lambda _: None)
@@ -138,6 +155,9 @@ class FuturesAdapterTest(unittest.TestCase):
     def test_open_floors_and_close_is_exact_reduce_only(self):
         opened = futures.build_open_order(market(), "BUY", "fut-open-1", SHA, D("1.2345"), profile="MARKET")
         self.assertEqual((opened.quantity, opened.residual), (D("1.234"), D("0.0005")))
+        buy = futures.build_open_order(market(), "BUY", "fut-limit-b", SHA, D("1.234"), profile="LIMIT_IOC", limit_price=D("99.51"))
+        sell = futures.build_open_order(market(), "SELL", "fut-limit-s", SHA, D("1.234"), profile="LIMIT_IOC", limit_price=D("99.59"))
+        self.assertEqual((dict(buy.intent.params)["price"], dict(sell.intent.params)["price"]), ("99.6", "99.5"))
         closed = futures.build_reduce_only_close(market(), "SELL", "fut-close-1", SHA, D("1.234"))
         wire = dict(closed.intent.params)
         self.assertEqual((wire["type"], wire["positionSide"], wire["reduceOnly"], wire["quantity"]),
@@ -146,6 +166,8 @@ class FuturesAdapterTest(unittest.TestCase):
             futures.build_reduce_only_close(market(), "SELL", "fut-close-2", SHA, D("1.2345"))
         with self.assertRaises(http.AdapterRefusal):
             futures.build_open_order(market(), "BUY", "fut-open-2", SHA, "1.234", profile="MARKET")
+        for unavailable in (replace(market(), order_types=("MARKET",)), replace(market(), time_in_force=("GTC",)), replace(market(), symbol="bad!")):
+            with self.assertRaises(http.AdapterRefusal): futures.build_open_order(unavailable, "BUY", "fut-open-4", SHA, D("1.234"), profile="LIMIT_IOC", limit_price=D("99.5"))
 
     def test_submit_posts_once_queries_exact_id_and_never_resends(self):
         plan = futures.build_open_order(market(), "BUY", "fut-open-3", SHA, D("1.234"), profile="MARKET")
@@ -188,33 +210,41 @@ class FuturesAdapterTest(unittest.TestCase):
 
     def test_fill_fee_and_income_ledgers_preserve_decimal_truth(self):
         trades = [{"symbol": SYMBOL, "id": 1, "orderId": 77, "price": "100", "qty": "1",
-                   "quoteQty": "100", "commission": "0.04", "commissionAsset": "USDT"},
+                   "quoteQty": "100", "commission": "0.04", "commissionAsset": "USDT", "side": "BUY", "maker": False, "time": 1001, "realizedPnl": "1.25"},
                   {"symbol": SYMBOL, "id": 2, "orderId": 77, "price": "100", "qty": "0.234",
-                   "quoteQty": "23.4", "commission": "0.002", "commissionAsset": "BNB"}]
+                   "quoteQty": "23.4", "commission": "0.002", "commissionAsset": "BNB", "buyer": True, "maker": True, "time": 1002, "realizedPnl": "-0.10"}]
+        direct_spy = Spy({futures.FUTURES_USER_TRADES_PATH: ok(trades)}); direct = futures.read_user_trades(direct_spy, BASE, SYMBOL, order_id=77, sleep=lambda _: None)
+        self.assertEqual((direct.kind, direct_spy.calls[0][2]), ("ok", futures.FUTURES_USER_TRADES_PATH))
+        self.assertEqual((direct.value[0].side, direct.value[0].is_maker, direct.value[0].time_ms, direct.value[0].realized_pnl), ("BUY", False, 1001, D("1.25")))
+        self.assertEqual((direct.value[1].side, direct.value[1].is_maker, direct.value[1].time_ms, direct.value[1].realized_pnl), ("BUY", True, 1002, D("-0.10")))
         identity = http.OrderIdentity(SYMBOL, "fut-open-4", 77)
         order = http.OrderResult("terminal", identity, "fut-open-4", "FILLED", True, "BUY", False,
                                  D("1.234"), D("123.4"), (), None)
-        coverage = futures.read_fills(Spy({"/fapi/v1/userTrades": ok(trades)}), BASE, order,
+        coverage = futures.read_fills(Spy({futures.FUTURES_USER_TRADES_PATH: ok(trades)}), BASE, order,
                                       sleep=lambda _: None).value
         self.assertTrue(coverage.complete); self.assertEqual(coverage.covered_quantity, D("1.234"))
         self.assertEqual(coverage.fees, (http.Fee("BNB", D("0.002")), http.Fee("USDT", D("0.04"))))
         wrong = copy.deepcopy(trades); wrong[0]["orderId"] = 78
         self.assertEqual(futures.read_fills(Spy({"/fapi/v1/userTrades": ok(wrong)}), BASE,
                                              order, sleep=lambda _: None).kind, "unclear")
-        valid = http.Fill(3, 77, D("100"), D("1.234"), D("123.4"), http.Fee("USDT", D("0")))
+        valid = http.Fill(3, 77, D("100"), D("1.234"), D("123.4"), http.Fee("USDT", D("0")), "BUY", False, 1003, D("0"))
         invalid = (replace(valid, order_id=78), replace(valid, price=D("0")), replace(valid, quantity=D("0")),
                    replace(valid, quantity="1.234"), replace(valid, fee=http.Fee("USDT", D("-0.1"))),
-                   replace(valid, fee=http.Fee("", D("0"))))
+                   replace(valid, fee=http.Fee("", D("0"))), replace(valid, side="HOLD"), replace(valid, is_maker=0),
+                   replace(valid, time_ms="1003"), replace(valid, realized_pnl="0"))
         for supplied in invalid:
             with self.subTest(fill=supplied):
                 feed = Spy({}); result = futures.read_fills(feed, BASE, order, (supplied,), sleep=lambda _: None)
                 self.assertEqual((result.kind, feed.calls), ("unclear", []))
+        feed = Spy({}); result = futures.read_fills(feed, BASE, order, [valid], sleep=lambda _: None)
+        self.assertEqual((result.kind, feed.calls), ("unclear", []))
+        self.assertEqual((futures.FUTURES_INCOME_PATH, futures.FUTURES_ORDER_PATH), ("/fapi/v1/income", "/fapi/v1/order"))
         income = [{"tranId": index, "symbol": SYMBOL, "incomeType": kind, "income": amount,
                    "asset": "USDT", "time": 1000 + index, "tradeId": ""}
                   for index, kind, amount in ((1, "COMMISSION", "-0.04"),
                                                (2, "REALIZED_PNL", "1.25"),
                                                (3, "FUNDING_FEE", "-0.01"))]
-        rows = futures.read_income(Spy({"/fapi/v1/income": ok(income)}), BASE, SYMBOL,
+        rows = futures.read_income(Spy({futures.FUTURES_INCOME_PATH: ok(income)}), BASE, SYMBOL,
                                    0, 2000, sleep=lambda _: None).value
         self.assertEqual(tuple(row.income_type for row in rows), ("COMMISSION", "REALIZED_PNL", "FUNDING_FEE"))
         self.assertTrue(all(type(row.amount) is Decimal for row in rows))

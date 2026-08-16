@@ -4,13 +4,13 @@ import math as _math, re as _re, time as _time, typing as _t
 from dataclasses import dataclass; from decimal import Decimal
 from execution import binance_http as _h
 
-__all__ = ["FuturesMarket", "FuturesPreflight", "LeverageResult", "Income", "read_market", "read_preflight", "read_leverage", "set_leverage_1x_once", "build_open_order", "build_reduce_only_close", "query_order", "submit_order_once", "read_user_trades", "read_fills", "read_income"]
+__all__ = ["FUTURES_USER_TRADES_PATH", "FUTURES_INCOME_PATH", "FUTURES_ORDER_PATH", "FuturesMarket", "FuturesPreflight", "LeverageResult", "Income", "read_market", "read_preflight", "read_leverage", "set_leverage_1x_once", "build_open_order", "build_reduce_only_close", "query_order", "submit_order_once", "read_user_trades", "read_fills", "read_income"]
 _SYMBOL = _re.compile(r"[A-Z0-9]{5,20}"); _CLIENT = _re.compile(r"[.A-Z:/a-z0-9_-]{1,36}"); _IDENTITY = _re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
-_SHA = _re.compile(r"[0-9a-f]{40}"); _ASSET = _re.compile(r"[A-Z0-9]{1,20}"); _WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+_SHA = _re.compile(r"[0-9a-f]{40}"); _ASSET = _re.compile(r"[A-Z0-9]{1,20}"); _WINDOW_MS = 7 * 24 * 60 * 60 * 1000; FUTURES_USER_TRADES_PATH, FUTURES_INCOME_PATH, FUTURES_ORDER_PATH = "/fapi/v1/userTrades", "/fapi/v1/income", "/fapi/v1/order"
 
 @dataclass(frozen=True)
 class FuturesMarket:
-    symbol: str; status: str; contract_type: str; step_size: Decimal; min_quantity: Decimal; min_notional: Decimal; multiplier_up: Decimal; bid: Decimal; ask: Decimal; mark_price: Decimal
+    symbol: str; status: str; contract_type: str; step_size: Decimal; min_quantity: Decimal; min_notional: Decimal; multiplier_up: Decimal; bid: Decimal; ask: Decimal; mark_price: Decimal; tick_size: Decimal; min_price: Decimal; max_price: Decimal; max_quantity: Decimal; multiplier_down: Decimal; quote_asset: str; margin_asset: str; order_types: _t.Tuple[str, ...]; time_in_force: _t.Tuple[str, ...]
 
 @dataclass(frozen=True)
 class FuturesPreflight:
@@ -42,7 +42,7 @@ def _int(value, zero=False):
 
 def _name(value, pattern, label): return value if type(value) is str and pattern.fullmatch(value) else _no(label + " is invalid")
 def _base(value): return value if type(value) is str and value else _no("base_url is invalid")
-def _input(value, zero=False): return _dec(value, zero) if isinstance(value, Decimal) else _no("money input must be Decimal")
+def _input(value, zero=False, negative=False): return _dec(value, zero, negative) if isinstance(value, Decimal) else _no("money input must be Decimal")
 
 def _bad(label): return _h.ReadResult("unclear", None, _h.HttpResult("unclear", None, None, label))
 
@@ -59,8 +59,10 @@ def _step(first, second):
 
 def _market(market):
     if not isinstance(market, FuturesMarket) or market.status != "TRADING" or market.contract_type != "PERPETUAL": _no("market is not a trading perpetual")
-    for value in (market.step_size, market.min_quantity, market.min_notional, market.multiplier_up, market.bid, market.ask, market.mark_price): _input(value)
-    if market.bid >= market.ask: _no("market book is crossed")
+    _name(market.symbol, _SYMBOL, "symbol"); _name(market.quote_asset, _ASSET, "quote asset"); _name(market.margin_asset, _ASSET, "margin asset")
+    for value in (market.step_size, market.min_quantity, market.min_notional, market.multiplier_up, market.bid, market.ask, market.mark_price, market.tick_size, market.max_quantity, market.multiplier_down): _input(value)
+    _input(market.min_price, True); _input(market.max_price, True); choices = (market.order_types, market.time_in_force)
+    if market.bid >= market.ask or market.max_quantity < market.min_quantity or market.max_price and market.max_price < market.min_price or any(type(items) is not tuple or any(type(item) is not str or not item for item in items) or len(items) != len(set(items)) for items in choices): _no("market facts are invalid")
 
 def read_market(transport: _h.Transport, base_url: str, symbol: str, *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.ReadResult[FuturesMarket]:
     _name(symbol, _SYMBOL, "symbol"); values = []
@@ -78,15 +80,17 @@ def read_market(transport: _h.Transport, base_url: str, symbol: str, *, sleep: _
         if row.get("status") != "TRADING" or row.get("contractType") != "PERPETUAL": _no("contract unavailable")
         filters = row.get("filters")
         if not isinstance(filters, list) or any(not isinstance(item, dict) or type(item.get("filterType")) is not str for item in filters) or len(filters) != len({item["filterType"] for item in filters}): _no("filters malformed")
-        found = {kind: [item for item in filters if item.get("filterType") == kind] for kind in ("LOT_SIZE", "MARKET_LOT_SIZE", "MIN_NOTIONAL", "PERCENT_PRICE")}
+        found = {kind: [item for item in filters if item.get("filterType") == kind] for kind in ("PRICE_FILTER", "LOT_SIZE", "MARKET_LOT_SIZE", "MIN_NOTIONAL", "PERCENT_PRICE")}
         if any(len(items) != 1 for items in found.values()): _no("filter not unique")
-        lot, mlot = found["LOT_SIZE"][0], found["MARKET_LOT_SIZE"][0]; step = _step(_dec(lot.get("stepSize")), _dec(mlot.get("stepSize"))); minimum = max(_dec(lot.get("minQty")), _dec(mlot.get("minQty")))
-        notional = _dec(found["MIN_NOTIONAL"][0].get("notional")); multiplier = _dec(found["PERCENT_PRICE"][0].get("multiplierUp"))
+        price, lot, mlot, percent = found["PRICE_FILTER"][0], found["LOT_SIZE"][0], found["MARKET_LOT_SIZE"][0], found["PERCENT_PRICE"][0]; step = _step(_dec(lot.get("stepSize")), _dec(mlot.get("stepSize"))); minimum = max(_dec(lot.get("minQty")), _dec(mlot.get("minQty"))); maximum = min(_dec(lot.get("maxQty")), _dec(mlot.get("maxQty")))
+        tick, min_price, max_price = _dec(price.get("tickSize")), _dec(price.get("minPrice"), True), _dec(price.get("maxPrice"), True); notional = _dec(found["MIN_NOTIONAL"][0].get("notional")); multiplier, multiplier_down = _dec(percent.get("multiplierUp")), _dec(percent.get("multiplierDown"))
+        quote, margin, choices = row.get("quoteAsset"), row.get("marginAsset"), (row.get("orderTypes"), row.get("timeInForce")); _name(quote, _ASSET, "quote asset"); _name(margin, _ASSET, "margin asset")
+        if any(type(items) is not list or any(type(item) is not str or not item for item in items) or len(items) != len(set(items)) for items in choices): _no("market choices malformed")
         book, mark = values[1], values[2]
         if not isinstance(book, dict) or book.get("symbol") != symbol or not isinstance(mark, dict) or mark.get("symbol") != symbol: _no("market symbol mismatch")
         bid, ask, mark_price = _dec(book.get("bidPrice")), _dec(book.get("askPrice")), _dec(mark.get("markPrice"))
         if bid >= ask: _no("book crossed")
-        result = FuturesMarket(symbol, "TRADING", "PERPETUAL", step, minimum, notional, multiplier, bid, ask, mark_price)
+        result = FuturesMarket(symbol, "TRADING", "PERPETUAL", step, minimum, notional, multiplier, bid, ask, mark_price, tick, min_price, max_price, maximum, multiplier_down, quote, margin, tuple(choices[0]), tuple(choices[1])); _market(result)
     except (_h.AdapterRefusal, KeyError, TypeError): return _bad("futures_market_schema")
     return _h.ReadResult("ok", result, None)
 
@@ -99,7 +103,7 @@ def _position(rows, symbol):
 def read_preflight(transport: _h.Transport, base_url: str, market: FuturesMarket, proposed_notional: Decimal | None, *, require_flat: bool, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.ReadResult[FuturesPreflight]:
     _market(market)
     if type(require_flat) is not bool: _no("require_flat is invalid")
-    with _h.exact_guard(): required = None if proposed_notional is None else _dec(proposed_notional) * market.multiplier_up
+    with _h.exact_guard(): required = None if proposed_notional is None else _input(proposed_notional) * market.multiplier_up
     specs = (("/fapi/v1/accountConfig", None), ("/fapi/v1/positionSide/dual", None), ("/fapi/v3/account", None), ("/fapi/v1/openOrders", (("symbol", market.symbol),)), ("/fapi/v3/positionRisk", (("symbol", market.symbol),)), ("/fapi/v3/balance", None))
     values = []
     for path, params in specs:
@@ -120,7 +124,7 @@ def read_preflight(transport: _h.Transport, base_url: str, market: FuturesMarket
         order_ids = tuple(sorted(_int(row.get("orderId")) for row in orders))
         if len(set(order_ids)) != len(order_ids) or require_flat and (order_ids or risk_qty != 0): _no("flatness absent")
         if not isinstance(balances, list) or any(not isinstance(row, dict) for row in balances): _no("balances malformed")
-        matches = [row for row in balances if type(row.get("asset")) is str and market.symbol.endswith(row["asset"])]
+        matches = [row for row in balances if row.get("asset") == market.margin_asset]
         if len(matches) != 1: _no("balance not unique")
         available = _dec(matches[0].get("availableBalance"), True)
         if required is not None and available < required: _no("margin insufficient")
@@ -145,10 +149,8 @@ def set_leverage_1x_once(transport: _h.Transport, base_url: str, symbol: str, mu
     before = read_leverage(transport, base_url, symbol, sleep=sleep)
     if before.kind != "ok": return LeverageResult(before.kind, None, None, False, before.error)
     if before.value == 1: return LeverageResult("proven", 1, 1, False, None)
-    params = (("symbol", symbol), ("leverage", "1"))
-    _write(write_intent, _h.MutationIntent("BINANCE_USDM", "SET_LEVERAGE", mutation_id, git_sha, params))
-    posted = transport("POST", base_url, "/fapi/v1/leverage", params, True)
-    after = read_leverage(transport, base_url, symbol, sleep=sleep)
+    params = (("symbol", symbol), ("leverage", "1")); _write(write_intent, _h.MutationIntent("BINANCE_USDM", "SET_LEVERAGE", mutation_id, git_sha, params))
+    posted = transport("POST", base_url, "/fapi/v1/leverage", params, True); after = read_leverage(transport, base_url, symbol, sleep=sleep)
     if after.kind == "ok" and after.value == 1: return LeverageResult("proven", before.value, 1, True, None)
     kind = "api_error" if posted.kind == "api_error" else "unclear"; error = posted if posted.kind != "ok" else after.error or _bad("leverage_not_1x").error
     return LeverageResult(kind, before.value, after.value if after.kind == "ok" else None, True, error)
@@ -157,21 +159,20 @@ def _plan(market, side, client_id, git_sha, quantity, reduce_only, profile, limi
     with _h.exact_guard():
         _market(market)
         if side not in ("BUY", "SELL") or profile not in ("MARKET", "LIMIT_IOC"): _no("order shape invalid")
+        if (profile == "MARKET" and "MARKET" not in market.order_types) or (profile == "LIMIT_IOC" and ("LIMIT" not in market.order_types or "IOC" not in market.time_in_force)): _no("order profile unavailable")
         original = _input(quantity); sized = original if reduce_only else original // market.step_size * market.step_size
-        if sized <= 0 or sized < market.min_quantity or reduce_only and sized % market.step_size: _no("quantity filter failed")
-        if profile == "LIMIT_IOC": price = _input(limit_price)
+        if sized <= 0 or sized < market.min_quantity or sized > market.max_quantity or reduce_only and sized % market.step_size: _no("quantity filter failed")
+        if profile == "LIMIT_IOC": raw = _input(limit_price); price = raw // market.tick_size * market.tick_size; price += market.tick_size if side == "BUY" and price != raw else Decimal(0)
         elif limit_price is not None: _no("market order has a price")
         else: price = market.ask if side == "BUY" else market.bid
-        if profile == "LIMIT_IOC" and price > market.mark_price * market.multiplier_up: _no("percent-price filter failed")
+        if profile == "LIMIT_IOC" and (price < market.min_price or market.max_price and price > market.max_price or side == "BUY" and price > market.mark_price * market.multiplier_up or side == "SELL" and price < market.mark_price * market.multiplier_down): _no("price filter failed")
         if sized * price < market.min_notional: _no("notional filter failed")
         pairs = [("symbol", market.symbol), ("side", side), ("positionSide", "BOTH"), ("type", "LIMIT" if profile == "LIMIT_IOC" else "MARKET")] + ([("timeInForce", "IOC")] if profile == "LIMIT_IOC" else []) + [("quantity", format(sized, "f"))] + ([("price", format(price, "f"))] if profile == "LIMIT_IOC" else []) + [("reduceOnly", "true" if reduce_only else "false"), ("newClientOrderId", client_id), ("newOrderRespType", "RESULT")]
         intent = _h.MutationIntent("BINANCE_USDM", "ORDER", client_id, git_sha, tuple(pairs)); return _checked_plan(_h.OrderPlan(intent, market.symbol, side, sized, None, original - sized, reduce_only))
 
-def build_open_order(market: FuturesMarket, side: _t.Literal["BUY", "SELL"], client_id: str, git_sha: str, quantity: Decimal, *, profile: _t.Literal["MARKET", "LIMIT_IOC"], limit_price: Decimal | None = None) -> _h.OrderPlan:
-    return _plan(market, side, client_id, git_sha, quantity, False, profile, limit_price)
+def build_open_order(market: FuturesMarket, side: _t.Literal["BUY", "SELL"], client_id: str, git_sha: str, quantity: Decimal, *, profile: _t.Literal["MARKET", "LIMIT_IOC"], limit_price: Decimal | None = None) -> _h.OrderPlan: return _plan(market, side, client_id, git_sha, quantity, False, profile, limit_price)
 
-def build_reduce_only_close(market: FuturesMarket, side: _t.Literal["BUY", "SELL"], client_id: str, git_sha: str, quantity: Decimal) -> _h.OrderPlan:
-    return _plan(market, side, client_id, git_sha, quantity, True, "MARKET")
+def build_reduce_only_close(market: FuturesMarket, side: _t.Literal["BUY", "SELL"], client_id: str, git_sha: str, quantity: Decimal) -> _h.OrderPlan: return _plan(market, side, client_id, git_sha, quantity, True, "MARKET")
 
 def _checked_plan(plan):
     if not isinstance(plan, _h.OrderPlan) or not isinstance(plan.intent, _h.MutationIntent): _no("order plan invalid")
@@ -196,7 +197,7 @@ def query_order(transport: _h.Transport, base_url: str, symbol: str, client_id: 
     _base(base_url); _name(symbol, _SYMBOL, "symbol"); _name(client_id, _CLIENT, "client id")
     params = (("symbol", symbol), ("origClientOrderId", client_id)); missing = 0; last = None
     for attempt in range(_h.ORDER_QUERY_ATTEMPTS):
-        response = transport("GET", base_url, "/fapi/v1/order", params, True)
+        response = transport("GET", base_url, FUTURES_ORDER_PATH, params, True)
         if not isinstance(response, _h.HttpResult): response = _h.HttpResult("unclear", None, None, "order_query_result")
         if response.kind == "ok":
             missing = 0
@@ -212,17 +213,14 @@ def query_order(transport: _h.Transport, base_url: str, symbol: str, client_id: 
     return last or _result("pending", symbol, client_id)
 
 def submit_order_once(transport: _h.Transport, base_url: str, plan: _h.OrderPlan, write_intent: _h.IntentWriter, *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.OrderResult:
-    _base(base_url); plan = _checked_plan(plan); params = plan.intent.params
-    _write(write_intent, plan.intent); posted = transport("POST", base_url, "/fapi/v1/order", params, True); conflict = None
-    returned = posted.payload.get("clientOrderId") if posted.kind == "ok" and isinstance(posted.payload, dict) else None
+    _base(base_url); plan = _checked_plan(plan); params = plan.intent.params; _write(write_intent, plan.intent); posted = transport("POST", base_url, FUTURES_ORDER_PATH, params, True); conflict = None; returned = posted.payload.get("clientOrderId") if posted.kind == "ok" and isinstance(posted.payload, dict) else None
     if posted.kind == "ok" and (returned != plan.intent.identity or plan.reduce_only and posted.payload.get("reduceOnly") is not True):
         conflict = _h.HttpResult("unclear", None, None, "order_response_conflict")
     queried = query_order(transport, base_url, plan.symbol, plan.intent.identity, sleep=sleep)
     if conflict is None and plan.reduce_only and queried.tag == "terminal" and queried.reduce_only is not True: conflict = _h.HttpResult("unclear", None, None, "order_query_conflict")
     if queried.tag == "terminal" and conflict is None: return queried
     if queried.tag == "not_found" and posted.kind == "api_error": return _result("error", plan.symbol, plan.intent.identity, error=posted)
-    error = conflict or queried.error or (posted if posted.kind != "ok" else None)
-    shown = returned if isinstance(returned, str) else queried.returned_client_id if conflict is None else None
+    error = conflict or queried.error or (posted if posted.kind != "ok" else None); shown = returned if isinstance(returned, str) else queried.returned_client_id if conflict is None else None
     return _result("pending", plan.symbol, plan.intent.identity, queried.identity.order_id, shown, queried.status, queried.side, queried.reduce_only, queried.executed_quantity, queried.quote_quantity, error)
 
 def _valid_fills(fills, expected=None):
@@ -230,15 +228,18 @@ def _valid_fills(fills, expected=None):
     for fill in fills:
         if not isinstance(fill, _h.Fill) or not isinstance(fill.fee, _h.Fee): _no("fill shape invalid")
         trade, order = _int(fill.trade_id, True), _int(fill.order_id)
-        if trade in seen or expected is not None and order != expected: _no("trade identity mismatch")
-        _input(fill.price); _input(fill.quantity); _input(fill.quote_quantity); _name(fill.fee.asset, _ASSET, "commission asset"); _input(fill.fee.amount, True); seen.add(trade)
+        if trade in seen or expected is not None and order != expected or fill.side not in ("BUY", "SELL") or type(fill.is_maker) is not bool or type(fill.time_ms) is not int or fill.time_ms < 0: _no("fill facts invalid")
+        _input(fill.price); _input(fill.quantity); _input(fill.quote_quantity); _name(fill.fee.asset, _ASSET, "commission asset"); _input(fill.fee.amount, True); None if fill.realized_pnl is None else _input(fill.realized_pnl, True, True); seen.add(trade)
     return fills
 
 def _fills(payload, symbol, expected=None):
     result = [] if isinstance(payload, list) and all(isinstance(row, dict) for row in payload) else _no("trades malformed")
     for row in payload:
         if row.get("symbol") != symbol: _no("trade symbol mismatch")
-        result.append(_h.Fill(_int(row.get("id"), True), _int(row.get("orderId")), _dec(row.get("price")), _dec(row.get("qty")), _dec(row.get("quoteQty")), _h.Fee(row.get("commissionAsset"), _dec(row.get("commission"), True))))
+        side, buyer, maker, stamp = row.get("side"), row.get("buyer"), row.get("maker"), row.get("time")
+        if side is None and type(buyer) is bool: side = "BUY" if buyer else "SELL"
+        if side not in ("BUY", "SELL") or buyer is not None and (type(buyer) is not bool or buyer != (side == "BUY")) or type(maker) is not bool or type(stamp) is not int or stamp < 0: _no("trade facts invalid")
+        result.append(_h.Fill(_int(row.get("id"), True), _int(row.get("orderId")), _dec(row.get("price")), _dec(row.get("qty")), _dec(row.get("quoteQty")), _h.Fee(row.get("commissionAsset"), _dec(row.get("commission"), True)), side, maker, stamp, _dec(row.get("realizedPnl"), True, True)))
     return _valid_fills(tuple(result), expected)
 
 def read_user_trades(transport: _h.Transport, base_url: str, symbol: str, *, order_id: int | None = None, start_ms: int | None = None, end_ms: int | None = None, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.ReadResult[_t.Tuple[_h.Fill, ...]]:
@@ -250,7 +251,7 @@ def read_user_trades(transport: _h.Transport, base_url: str, symbol: str, *, ord
     else:
         if type(start_ms) is not int or type(end_ms) is not int or start_ms < 0 or end_ms < start_ms or end_ms - start_ms > _WINDOW_MS: _no("trade window invalid")
         params = (("symbol", symbol), ("startTime", str(start_ms)), ("endTime", str(end_ms)), ("limit", "1000"))
-    value, error = _get(transport, base_url, "/fapi/v1/userTrades", params, True, sleep)
+    value, error = _get(transport, base_url, FUTURES_USER_TRADES_PATH, params, True, sleep)
     if error: return error
     try: result = _fills(value, symbol, order_id)
     except (_h.AdapterRefusal, TypeError): return _bad("futures_trades_schema")
@@ -265,7 +266,7 @@ def _coverage(fills, executed):
 
 def read_fills(transport: _h.Transport, base_url: str, order: _h.OrderResult, response_fills: _t.Tuple[_h.Fill, ...] = (), *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.ReadResult[_h.FillCoverage]:
     executed = _dec(order.executed_quantity, True) if isinstance(order, _h.OrderResult) and order.terminal and order.identity.order_id is not None and isinstance(order.executed_quantity, Decimal) else _no("order identity unproved")
-    try: local = _valid_fills(order.response_fills + response_fills, order.identity.order_id)
+    try: local = _valid_fills(_valid_fills(order.response_fills, order.identity.order_id) + _valid_fills(response_fills, order.identity.order_id), order.identity.order_id)
     except (TypeError, _h.AdapterRefusal): return _bad("futures_response_fills_schema")
     result = _coverage(local, executed)
     if result.covered_quantity > executed: return _bad("futures_fill_coverage")
@@ -278,8 +279,7 @@ def read_fills(transport: _h.Transport, base_url: str, order: _h.OrderResult, re
 def read_income(transport: _h.Transport, base_url: str, symbol: str, start_ms: int, end_ms: int, *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.ReadResult[_t.Tuple[Income, ...]]:
     _name(symbol, _SYMBOL, "symbol")
     if type(start_ms) is not int or type(end_ms) is not int or start_ms < 0 or end_ms < start_ms or end_ms - start_ms > _WINDOW_MS: _no("income window invalid")
-    params = (("symbol", symbol), ("startTime", str(start_ms)), ("endTime", str(end_ms)), ("limit", "1000"))
-    value, error = _get(transport, base_url, "/fapi/v1/income", params, True, sleep)
+    params = (("symbol", symbol), ("startTime", str(start_ms)), ("endTime", str(end_ms)), ("limit", "1000")); value, error = _get(transport, base_url, FUTURES_INCOME_PATH, params, True, sleep)
     if error: return error
     try:
         if not isinstance(value, list) or len(value) > 1000 or any(not isinstance(row, dict) for row in value): _no("income malformed")
@@ -287,7 +287,6 @@ def read_income(transport: _h.Transport, base_url: str, symbol: str, start_ms: i
         for row in value:
             transaction = _int(row.get("tranId")); asset, kind = row.get("asset"), row.get("incomeType")
             if transaction in seen or row.get("symbol") != symbol or type(asset) is not str or _ASSET.fullmatch(asset) is None or type(kind) is not str or not kind or type(row.get("time")) is not int or not start_ms <= row["time"] <= end_ms: _no("income identity invalid")
-            trade = row.get("tradeId"); trade = None if trade in (None, "") else _int(trade, True); seen.add(transaction)
-            result.append(Income(transaction, symbol, kind, _dec(row.get("income"), True, True), asset, _int(row.get("time"), True), trade))
+            trade = row.get("tradeId"); trade = None if trade in (None, "") else _int(trade, True); seen.add(transaction); result.append(Income(transaction, symbol, kind, _dec(row.get("income"), True, True), asset, _int(row.get("time"), True), trade))
     except (_h.AdapterRefusal, TypeError): return _bad("futures_income_schema")
     return _h.ReadResult("ok", tuple(result), None)
