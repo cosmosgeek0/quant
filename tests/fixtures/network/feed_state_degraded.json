@@ -1,0 +1,144 @@
+{
+ "connections": {
+  "perp": {
+   "dropped_frames": 32846,
+   "expected_connections": 4,
+   "handshake_failures": 0,
+   "reconnects": 2,
+   "shards": [
+    {
+     "attempts": 1,
+     "connected": true,
+     "connection": 0,
+     "handshake_failures": 0,
+     "reconnects": 0,
+     "status": "healthy",
+     "stream_count": 198,
+     "successful_handshakes": 1
+    },
+    {
+     "attempts": 1,
+     "connected": true,
+     "connection": 1,
+     "handshake_failures": 0,
+     "reconnects": 0,
+     "status": "healthy",
+     "stream_count": 198,
+     "successful_handshakes": 1
+    },
+    {
+     "attempts": 1,
+     "connected": true,
+     "connection": 2,
+     "handshake_failures": 0,
+     "reconnects": 0,
+     "status": "healthy",
+     "stream_count": 128,
+     "successful_handshakes": 1
+    }
+   ],
+   "status": "degraded",
+   "successful_handshakes": 4,
+   "ticker": {
+    "attempts": 1,
+    "connected": false,
+    "connection": "ticker",
+    "handshake_failures": 0,
+    "last_message_ms": "1786897849483",
+    "reconnects": 0,
+    "shards": [
+     {
+      "attempts": 1,
+      "connected": false,
+      "connection": 0,
+      "handshake_failures": 0,
+      "last_message_ms": "1786897849483",
+      "reconnects": 0,
+      "status": "disconnected",
+      "stream_count": 1,
+      "successful_handshakes": 1
+     }
+    ],
+    "status": "disconnected",
+    "stream_count": 1,
+    "successful_handshakes": 1
+   }
+  },
+  "spot": {
+   "dropped_frames": 199999,
+   "expected_connections": 4,
+   "handshake_failures": 0,
+   "reconnects": 0,
+   "shards": [
+    {
+     "attempts": 1,
+     "connected": true,
+     "connection": 0,
+     "handshake_failures": 0,
+     "reconnects": 0,
+     "status": "healthy",
+     "stream_count": 132,
+     "successful_handshakes": 1
+    }
+   ],
+   "status": "healthy",
+   "successful_handshakes": 4,
+   "ticker": {
+    "attempts": 3,
+    "connected": true,
+    "connection": "ticker",
+    "handshake_failures": 0,
+    "last_message_ms": "1786897849483",
+    "reconnects": 0,
+    "shards": [
+     {
+      "attempts": 1,
+      "connected": true,
+      "connection": 0,
+      "handshake_failures": 0,
+      "last_message_ms": "1786897849483",
+      "reconnects": 0,
+      "status": "healthy",
+      "stream_count": 200,
+      "successful_handshakes": 1
+     },
+     {
+      "attempts": 1,
+      "connected": true,
+      "connection": 1,
+      "handshake_failures": 0,
+      "last_message_ms": "1786897849482",
+      "reconnects": 0,
+      "status": "healthy",
+      "stream_count": 200,
+      "successful_handshakes": 1
+     },
+     {
+      "attempts": 1,
+      "connected": true,
+      "connection": 2,
+      "handshake_failures": 0,
+      "last_message_ms": "1786897849483",
+      "reconnects": 0,
+      "status": "healthy",
+      "stream_count": 89,
+      "successful_handshakes": 1
+     }
+    ],
+    "status": "healthy",
+    "stream_count": 489,
+    "successful_handshakes": 3
+   }
+  }
+ },
+ "symbols": {
+  "BTCUSDT": {
+   "note": "per-symbol book/candle payload trimmed in this fixture; the real file is ~5.4 MB with 656 symbols"
+  }
+ },
+ "version": 1,
+ "window": 240,
+ "window_newest_ms": "1786897799999",
+ "window_oldest_ms": "1786881659999",
+ "written_ms": "1786897864490"
+}

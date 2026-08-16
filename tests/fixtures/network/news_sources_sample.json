@@ -1,0 +1,35 @@
+{
+ "as_of": "2026-08-16T16:33:07Z",
+ "available": 104,
+ "live": 74,
+ "pending": 15,
+ "sources": [
+  {
+   "key": "21shares-insights",
+   "label": "21Shares",
+   "domain": "21shares.com",
+   "channel": "issuer",
+   "status": "pending",
+   "count": 0,
+   "last_ts": null
+  },
+  {
+   "key": "example-live",
+   "label": "Example Live",
+   "domain": "example.org",
+   "channel": "media",
+   "status": "live",
+   "count": 12,
+   "last_ts": "2026-08-16T16:31:00Z"
+  },
+  {
+   "key": "example-error",
+   "label": "Example Error",
+   "domain": "example.net",
+   "channel": "media",
+   "status": "error",
+   "count": 3,
+   "last_ts": "2026-08-16T12:00:00Z"
+  }
+ ]
+}

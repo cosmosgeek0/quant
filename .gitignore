@@ -11,3 +11,6 @@ study/data-1m-history/
 study/data-daily/
 study/data-episode-tape/
 study/data-funding/
+
+# Network V1 local history database (box: /home/ssm-user/quant-ui/data)
+data/
