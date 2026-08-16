@@ -12,7 +12,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import basis_ladder  # noqa: E402
+import depth_walk as depth  # noqa: E402
 import executable_gap  # noqa: E402
+import funding_ruler  # noqa: E402
 import reverse_rung_intent as reverse  # noqa: E402
 
 
@@ -78,14 +80,37 @@ def market(spot_bid="102", perp_ask="100", **changes):
     return reverse.ReverseMarketMetadata(**values)
 
 
+def depth_input(*, thin=False, insufficient=False):
+    spot_bids = [["102", "0.001"]] if insufficient else [["102", "1"]]
+    perp_asks = [["100", "1"]]
+    if thin:
+        spot_bids = [["102", "0.005"], ["100", "1"]]
+        perp_asks = [["100", "0.005"], ["101", "1"]]
+    return reverse.ReverseDepthInput(
+        {"bids": spot_bids, "asks": [["103", "1"]]},
+        {"bids": [["99", "1"]], "asks": perp_asks},
+    )
+
+
+def funding_input(cap="0.001", floor="-0.001", interval_hours=1,
+                  hold_minutes="60"):
+    return reverse.ReverseFundingInput(
+        funding_ruler.FundingInfo(
+            D(cap), D(floor), interval_hours),
+        D(hold_minutes),
+    )
+
+
 def build(gap=None, ladder_input=None, borrow_input=None,
-          market_input=None, caps=None):
+          market_input=None, caps=None, depth_value=None, funding_value=None):
     return reverse.build_reverse_rung_intent(
         directional() if gap is None else gap,
         ladder() if ladder_input is None else ladder_input,
         borrow() if borrow_input is None else borrow_input,
         market() if market_input is None else market_input,
         reverse.ReverseRungCaps() if caps is None else caps,
+        depth_value,
+        funding_value,
     )
 
 
@@ -104,6 +129,9 @@ class ReverseIntentExactnessTests(unittest.TestCase):
         self.assertEqual(result.expected_capture_pct, D("2"))
         self.assertEqual(
             result.funding_and_interest_drag_pct, D("0.0104"))
+        self.assertEqual(result.capture_source, "top_of_book")
+        self.assertEqual(result.drag_source, "kernel_default_hold")
+        self.assertEqual(result.settlements_crossed, 1)
         self.assertLessEqual(result.quote_notional, D("8"))
         self.assertRegex(result.intent_id, r"^rri-[0-9a-f]{24}$")
         self.assertRegex(result.sealed_inputs_digest, r"^[0-9a-f]{64}$")
@@ -139,6 +167,30 @@ class ReverseIntentExactnessTests(unittest.TestCase):
         self.assertNotEqual(
             first.sealed_inputs_digest, changed.sealed_inputs_digest)
 
+    def test_depth_source_is_sealed_when_capture_matches_touch(self):
+        top = build()
+        walked = build(depth_value=depth_input())
+
+        self.assertIsInstance(top, reverse.ReverseRungIntent)
+        self.assertIsInstance(walked, reverse.ReverseRungIntent)
+        self.assertEqual(top.expected_capture_pct,
+                         walked.expected_capture_pct)
+        self.assertEqual(walked.capture_source, "depth_walk")
+        self.assertNotEqual(top.intent_id, walked.intent_id)
+        self.assertNotEqual(top.sealed_inputs_digest,
+                            walked.sealed_inputs_digest)
+
+    def test_funding_ruler_records_worst_case_and_settlements(self):
+        result = build(
+            market_input=market(funding_period_ms=None),
+            funding_value=funding_input())
+
+        self.assertIsInstance(result, reverse.ReverseRungIntent)
+        self.assertEqual(result.drag_source, "funding_ruler_worst_case")
+        self.assertEqual(result.settlements_crossed, 1)
+        self.assertEqual(
+            result.funding_and_interest_drag_pct, D("0.1001"))
+
 
 class OrderedRefusalTests(unittest.TestCase):
     def assertGate(self, result, expected):
@@ -148,6 +200,10 @@ class OrderedRefusalTests(unittest.TestCase):
         self.assertTrue(result.detail)
         self.assertEqual(result.gate_index,
                          reverse.GATE_ORDER.index(expected) + 1)
+        self.assertIn(result.capture_source,
+                      ("top_of_book", "depth_walk"))
+        self.assertIn(result.drag_source,
+                      ("kernel_default_hold", "funding_ruler_worst_case"))
 
     def test_borrow_power_defaults_closed(self):
         self.assertGate(
@@ -197,6 +253,31 @@ class OrderedRefusalTests(unittest.TestCase):
             build(market_input=market(spot_step=None)),
             reverse.STEP_OR_MIN_NOTIONAL_INFEASIBLE,
         )
+
+    def test_insufficient_depth_refuses_after_sizing(self):
+        self.assertGate(
+            build(depth_value=depth_input(insufficient=True)),
+            reverse.DEPTH_INSUFFICIENT_OR_INVALID,
+        )
+
+    def test_thin_depth_lowers_capture_and_can_refuse_net_edge(self):
+        thin = depth_input(thin=True)
+        walked = depth.walk_lockin(
+            "REVERSE", "ENTRY", thin.spot_depth, thin.perp_depth, D("2.5"))
+        result = build(depth_value=thin)
+
+        self.assertIsInstance(walked, depth.LockinDepthWalk)
+        self.assertLess(walked.executable_capture_pct, D("2"))
+        self.assertGate(result, reverse.NET_EDGE_NOT_POSITIVE)
+        self.assertEqual(result.capture_source, "depth_walk")
+
+    def test_funding_worst_case_above_capture_refuses(self):
+        result = build(funding_value=funding_input(
+            cap="0.03", floor="-0.03"))
+
+        self.assertGate(result, reverse.NET_EDGE_NOT_POSITIVE)
+        self.assertEqual(result.drag_source, "funding_ruler_worst_case")
+        self.assertEqual(result.settlements_crossed, 1)
 
     def test_nonpositive_all_cost_edge_refuses(self):
         self.assertGate(
@@ -252,9 +333,11 @@ class OrderedRefusalTests(unittest.TestCase):
                    market_input=market(spot_step=None)), 5),
             (build(market_input=market(
                 spot_step=None, funding_rate=None)), 6),
+            (build(depth_value=reverse.ReverseDepthInput({}, {}),
+                   market_input=market(funding_rate=None)), 7),
             (build(gap=directional("100.1", "100"),
                    ladder_input=ladder(threshold="0.01"),
-                   market_input=market("100.1", "100")), 7),
+                   market_input=market("100.1", "100")), 8),
         )
         for result, gate_index in cases:
             with self.subTest(gate=reverse.GATE_ORDER[gate_index]):
