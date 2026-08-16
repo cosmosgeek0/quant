@@ -1,0 +1,1927 @@
+--- a/src/job_runner.py
++++ b/src/job_runner.py
+@@ -20,7 +20,6 @@
+ import secrets
+ import sys
+ import time
+-import unicodedata
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from datetime import datetime, timedelta, timezone
+@@ -150,10 +149,7 @@
+ TICK_LOCK_HEARTBEAT_INTERVALS = 3
+ MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
+ MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
+-MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
+-MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
+-# Margin history type records request origin, not BORROW or REPAY direction.
+-MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
++MARGIN_ENDPOINT_PATH = margin_ops.MARGIN_ENDPOINT_PATH
+ # Exchange CONFIRMED maps to the direction-bearing internal receipt status.
+ MARGIN_HISTORY_CONFIRMED_STATUS = {
+     "BORROW": "BORROW_CONFIRMED",
+@@ -163,8 +159,6 @@
+ MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT = 3
+ # Fixed 1s, 2s, and 4s delays bound the added confirmation wait at 7s.
+ MARGIN_HISTORY_CONFIRMATION_BACKOFF_SECONDS = (1, 2, 4)
+-MARGIN_LEGACY_HISTORY_PAGE_SIZE = 100
+-MARGIN_LEGACY_HISTORY_PAGE_CAP = 20
+ MARGIN_LEGACY_HISTORY_WINDOW_PAD = timedelta(seconds=60)
+ MARGIN_DECIMAL_TEXT_MAX = 64
+ MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+@@ -174,17 +168,10 @@
+ MARGIN_REPAY_RELATIVE_DUST_RATE = Decimal("0.001")
+ MARGIN_SNAPSHOT_TIME_VERIFIED = "SNAPSHOT_TIME_VERIFIED"
+ MARGIN_SNAPSHOT_TIME_UNVERIFIED = "SNAPSHOT_TIME_UNVERIFIED"
+-MARGIN_IDENTITY_KEY_RE = re.compile(
+-    r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$"
+-)
+ MARGIN_TRANSACTION_ID_RE = re.compile(r"^[1-9][0-9]*$")
+-# Identity evidence is ambiguous once a response walk exceeds this node budget.
+-MARGIN_IDENTITY_MAX_NODES = 4096
+-# Bound the encoded response material examined by one identity walk to 1 MiB.
+-MARGIN_IDENTITY_MAX_RESPONSE_BYTES = 1024 * 1024
+-# Durable Margin release evidence uses the same bounded node walk.  A separate
+-# depth ceiling keeps the standard JSON decoder below its recursion boundary.
+-MARGIN_ARTIFACT_MAX_NODES = MARGIN_IDENTITY_MAX_NODES
++# Durable Margin release evidence has a bounded node walk.  A separate depth
++# ceiling keeps the standard JSON decoder below its recursion boundary.
++MARGIN_ARTIFACT_MAX_NODES = 4096
+ MARGIN_ARTIFACT_MAX_DEPTH = 64
+ ACCOUNT_GOVERNOR_LOCK_FILE = "account-governor.lock"
+ JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
+@@ -1341,9 +1328,9 @@
+         for name in liability_names:
+             liability = row.get(name)
+             if type(liability) is not dict \
+-                    or _margin_account_liability({
+-                        "userAssets": [liability]
+-                    }, row["asset"]) != liability:
++                    or _margin_liability_from_receipt(
++                        liability, row["asset"]
++                    ) is None:
+                 return False
+         after = row["account_liability"]
+         if legacy:
+@@ -3797,136 +3784,8 @@
+ def _persist_margin_source(path: str, payload: Dict[str, Any],
+                            create: bool = False) -> None:
+     _persist_json_receipt(path, payload, create=create)
+-
+-
+-def _margin_identity_scalar_size(value: Any, maximum: int) -> Optional[int]:
+-    if maximum < 0:
+-        return maximum + 1
+-    if type(value) is str:
+-        size = 2
+-        for character in value:
+-            codepoint = ord(character)
+-            if character in {'"', "\\"} \
+-                    or character in {"\b", "\t", "\n", "\f", "\r"}:
+-                size += 2
+-            elif codepoint < 0x20 or codepoint > 0x7f:
+-                size += 6 if codepoint <= 0xffff else 12
+-            else:
+-                size += 1
+-            if size > maximum:
+-                return maximum + 1
+-        return size
+-    if value is None:
+-        return 4
+-    if type(value) is bool:
+-        return 4 if value else 5
+-    if type(value) is int:
+-        if value.bit_length() * 30103 // 100000 + 2 > maximum:
+-            return maximum + 1
+-        try:
+-            return len(str(value))
+-        except ValueError:
+-            return None
+-    if type(value) is not float:
+-        return None
+-    try:
+-        encoded = json.dumps(
+-            value, allow_nan=False, separators=(",", ":"),
+-        ).encode("utf-8")
+-    except (TypeError, ValueError):
+-        return None
+-    return len(encoded)
+-
+-
+-def _margin_identity_aliases(payload: Any) -> Optional[List[str]]:
+-    if not isinstance(payload, dict):
+-        return None
+-    values: List[str] = []
+-    stack = [(payload, True)]
+-    visited = set()
+-    scheduled_nodes = 1
+-    visited_nodes = 0
+-    response_bytes = 0
+-    while stack:
+-        current, top_level = stack.pop()
+-        visited_nodes += 1
+-        if visited_nodes > MARGIN_IDENTITY_MAX_NODES:
+-            return None
+-        if isinstance(current, dict):
+-            identity = id(current)
+-            if identity in visited:
+-                continue
+-            visited.add(identity)
+-            response_bytes += 2 + max(0, len(current) - 1)
+-            children = []
+-            for name, value in current.items():
+-                if type(name) is not str:
+-                    return None
+-                remaining = MARGIN_IDENTITY_MAX_RESPONSE_BYTES \
+-                    - response_bytes
+-                name_size = _margin_identity_scalar_size(name, remaining)
+-                if name_size is None or name_size > remaining:
+-                    return None
+-                response_bytes += name_size + 1
+-                if response_bytes > MARGIN_IDENTITY_MAX_RESPONSE_BYTES:
+-                    return None
+-                normalized = unicodedata.normalize("NFKC", name).casefold()
+-                if MARGIN_IDENTITY_KEY_RE.fullmatch(normalized) is not None:
+-                    if top_level and name not in {"tranId", "txId"}:
+-                        return None
+-                    if type(value) not in (int, str):
+-                        return None
+-                    if type(value) is int and value.bit_length() > 430:
+-                        return None
+-                    try:
+-                        text = str(value)
+-                    except ValueError:
+-                        return None
+-                    if not text or len(text) > 128:
+-                        return None
+-                    if top_level:
+-                        values.append(text)
+-                        if len(set(values)) > 1:
+-                            return None
+-                    else:
+-                        # Providers may repeat the confirmed top-level id in
+-                        # nested evidence; exact canonical equality adds no
+-                        # competing ownership claim.
+-                        if not values or text != values[0]:
+-                            return None
+-                children.append((value, False))
+-            if scheduled_nodes + len(children) > MARGIN_IDENTITY_MAX_NODES:
+-                return None
+-            scheduled_nodes += len(children)
+-            stack.extend(reversed(children))
+-        elif isinstance(current, (list, tuple)):
+-            identity = id(current)
+-            if identity in visited:
+-                continue
+-            visited.add(identity)
+-            response_bytes += 2 + max(0, len(current) - 1)
+-            if scheduled_nodes + len(current) > MARGIN_IDENTITY_MAX_NODES:
+-                return None
+-            scheduled_nodes += len(current)
+-            stack.extend((value, False) for value in reversed(current))
+-        else:
+-            remaining = MARGIN_IDENTITY_MAX_RESPONSE_BYTES - response_bytes
+-            scalar_size = _margin_identity_scalar_size(current, remaining)
+-            if scalar_size is None or scalar_size > remaining:
+-                return None
+-            response_bytes += scalar_size
+-        if response_bytes > MARGIN_IDENTITY_MAX_RESPONSE_BYTES:
+-            return None
+-    return values
+ 
+ 
+-def _margin_transaction_id(payload: Any) -> str:
+-    aliases = _margin_identity_aliases(payload)
+-    if aliases is None or not aliases:
+-        return ""
+-    return aliases[0]
+-
+-
+ def _margin_transaction_number(value: Any) -> Optional[int]:
+     if type(value) is not str or len(value) > 128 \
+             or MARGIN_TRANSACTION_ID_RE.fullmatch(value) is None:
+@@ -3937,52 +3796,43 @@
+         return None
+ 
+ 
+-def _margin_history_transaction_ids(payload: Any, asset: Any) \
+-        -> Optional[List[int]]:
+-    try:
+-        if type(payload) is not dict or type(asset) is not str or not asset:
+-            return None
+-        rows = payload.get("rows")
+-        if type(rows) is not list:
+-            return None
+-        identifiers = []
+-        for row in rows:
+-            if type(row) is not dict or type(row.get("asset")) is not str \
+-                    or row["asset"] != asset:
+-                return None
+-            aliases = _margin_identity_aliases(row)
+-            if aliases is None or not aliases:
+-                return None
+-            identifier = _margin_transaction_number(aliases[0])
+-            if identifier is None:
+-                return None
+-            identifiers.append(identifier)
+-        return identifiers
+-    except Exception:
++def _margin_history_rows(
++        result: Any, direction: str) \
++        -> Optional[Tuple[binance_margin.MarginHistoryRow, ...]]:
++    if not isinstance(result, binance_http.ReadResult) \
++            or result.kind != "ok" or type(result.value) is not tuple:
+         return None
++    rows = result.value
++    if any(
++            not isinstance(row, binance_margin.MarginHistoryRow)
++            or row.direction != direction
++            for row in rows):
++        return None
++    return rows
+ 
+ 
+-def _margin_history_snapshot(
+-        transport: Callable[..., Tuple[str, Any]], base_url: str,
+-        endpoint_path: str, asset: str) \
+-        -> Tuple[str, Dict[str, Any], List[int]]:
+-    payloads = {}
++def _read_margin_history_snapshot(
++        services: ExecutionServices, asset: str,
++        start_ms: Optional[int] = None,
++        end_ms: Optional[int] = None) \
++        -> Tuple[
++            str, Dict[str, Tuple[binance_margin.MarginHistoryRow, ...]],
++            List[int],
++        ]:
++    histories = {}
+     identifiers = []
+     try:
+-        for request_type in ("BORROW", "REPAY"):
+-            result = transport(
+-                "GET", base_url, endpoint_path,
+-                {"asset": asset, "type": request_type}, True,
++        for direction in ("BORROW", "REPAY"):
++            result = services.margin_read_history_by_direction(
++                services.transport, services.spot_base_url, asset, direction,
++                start_ms=start_ms, end_ms=end_ms, sleep=services.sleep,
+             )
+-            if type(result) is not tuple or len(result) != 2 \
+-                    or result[0] != "ok":
++            rows = _margin_history_rows(result, direction)
++            if rows is None:
+                 return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
+-            current = _margin_history_transaction_ids(result[1], asset)
+-            if current is None:
+-                return "MARGIN_CONFIRMATION_MISMATCH", {}, []
+-            payloads[request_type] = result[1]
+-            identifiers.extend(current)
+-        return "", payloads, identifiers
++            histories[direction] = rows
++            identifiers.extend(row.tx_id for row in rows)
++        return "", histories, identifiers
+     except Exception:
+         return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
+ 
+@@ -3999,92 +3849,32 @@
+         else microseconds // 1000
+ 
+ 
+-def _margin_legacy_exclusivity_snapshot(
+-        transport: Callable[..., Tuple[str, Any]], base_url: str,
+-        endpoint_path: str, asset: str, transaction_id: str,
++def _read_margin_legacy_exclusivity(
++        services: ExecutionServices, asset: str, transaction_id: str,
+         mutation_started_utc: Any, now: datetime) \
+-        -> Tuple[str, Dict[str, Any], List[int], Optional[Dict[str, Any]]]:
+-    """Prove one legacy receipt owns the only row in its full window."""
++        -> Tuple[
++            str, Dict[str, Tuple[binance_margin.MarginHistoryRow, ...]],
++            List[int], Optional[Dict[str, Any]],
++        ]:
++    """Read the frozen legacy window without overstating exclusivity."""
+     try:
+-        try:
+-            mutation_started = _timestamp(mutation_started_utc)
+-        except (JobRefusal, TypeError):
+-            return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
++        mutation_started = _timestamp(mutation_started_utc)
+         target = _margin_transaction_number(transaction_id)
+         if target is None or mutation_started > now:
+             return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+         window_start = mutation_started - MARGIN_LEGACY_HISTORY_WINDOW_PAD
+-        # Millisecond request bounds cover the full recorded UTC window.
+-        window_start_ms = str(_margin_history_epoch_milliseconds(
+-            window_start
+-        ))
+-        window_end_ms = str(_margin_history_epoch_milliseconds(
+-            now, round_up=True
+-        ))
+-        payloads = {}
+-        identifiers = []
+-        for request_type in ("BORROW", "REPAY"):
+-            rows = []
+-            total = None
+-            complete = False
+-            for page in range(1, MARGIN_LEGACY_HISTORY_PAGE_CAP + 1):
+-                result = transport(
+-                    "GET", base_url, endpoint_path, {
+-                        "asset": asset,
+-                        "type": request_type,
+-                        "startTime": window_start_ms,
+-                        "endTime": window_end_ms,
+-                        "current": str(page),
+-                        "size": str(MARGIN_LEGACY_HISTORY_PAGE_SIZE),
+-                    }, True,
+-                )
+-                if type(result) is not tuple or len(result) != 2 \
+-                        or result[0] != "ok":
+-                    return "MARGIN_CONFIRMATION_UNREADABLE", {}, [], None
+-                payload = result[1]
+-                if type(payload) is not dict:
+-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                page_rows = payload.get("rows", [])
+-                page_total = payload.get("total")
+-                if type(page_rows) is not list \
+-                        or len(page_rows) > MARGIN_LEGACY_HISTORY_PAGE_SIZE \
+-                        or page_total is not None \
+-                        and (type(page_total) is not int or page_total < 0):
+-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                page_identifiers = _margin_history_transaction_ids(
+-                    {"rows": page_rows}, asset
+-                )
+-                if page_identifiers is None:
+-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                if page_total is not None:
+-                    if total is None:
+-                        total = page_total
+-                    elif total != page_total:
+-                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                rows.extend(page_rows)
+-                identifiers.extend(page_identifiers)
+-                if total is not None and len(rows) > total:
+-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                complete = len(page_rows) < MARGIN_LEGACY_HISTORY_PAGE_SIZE \
+-                    or total is not None and len(rows) == total
+-                if complete:
+-                    if total is not None and len(rows) != total:
+-                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                    if page == MARGIN_LEGACY_HISTORY_PAGE_CAP:
+-                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-                    break
+-            if not complete:
+-                return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-            payloads[request_type] = {"rows": rows}
++        reason, histories, identifiers = _read_margin_history_snapshot(
++            services, asset,
++            _margin_history_epoch_milliseconds(window_start),
++            _margin_history_epoch_milliseconds(now, round_up=True),
++        )
++        if reason:
++            return reason, {}, [], None
+         if identifiers != [target]:
+             return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+-        proof = {
+-            "kind": "LEGACY_EXCLUSIVITY_PROOF",
+-            "window_start_utc": _utc_text(window_start),
+-            "window_end_utc": _utc_text(now),
+-            "row_count": len(identifiers),
+-        }
+-        return "", payloads, identifiers, proof
++        # The frozen typed surface does not return pagination completeness.
++        # One page cannot prove that the retained legacy window has one row.
++        return "LEGACY_WINDOW_NOT_EXCLUSIVE", histories, identifiers, None
+     except Exception:
+         return "MARGIN_CONFIRMATION_UNREADABLE", {}, [], None
+ 
+@@ -4105,9 +3895,6 @@
+             return "CONCURRENT_MARGIN_ACTIVITY"
+         if target <= watermark or identifiers.count(target) != 1:
+             return ""
+-        # Account and history reads are not atomic. An actor exactly mirroring
+-        # our POST timing with an identical amount can remain indistinguishable
+-        # until its separate transaction id becomes visible.
+         return "CONFIRMED"
+     except Exception:
+         return ""
+@@ -4130,28 +3917,27 @@
+     print(json.dumps(row, separators=(",", ":")))
+ 
+ 
+-def _margin_post_history_snapshot(
+-        transport: Callable[..., Tuple[str, Any]], base_url: str,
+-        endpoint_path: str, asset: str, request_type: str,
++def _read_margin_post_history(
++        services: ExecutionServices, asset: str, request_type: str,
+         transaction_id: str, history_watermark: int, job_id: str) \
+-        -> Tuple[str, Dict[str, Any], List[int]]:
+-    """Retry only while a valid submitted identity is not yet visible."""
++        -> Tuple[
++            str, Dict[str, Tuple[binance_margin.MarginHistoryRow, ...]],
++            List[int],
++        ]:
++    """Retry typed snapshots only while the submitted identity is absent."""
+     target = _margin_transaction_number(transaction_id)
+     delays = (0,) + MARGIN_HISTORY_CONFIRMATION_BACKOFF_SECONDS[
+         :MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT
+     ]
+-    latest: Tuple[str, Dict[str, Any], List[int]] = ("", {}, [])
++    latest = ("", {}, [])
+     for attempt, delay_seconds in enumerate(delays, start=1):
+         if delay_seconds:
+             try:
+-                time.sleep(delay_seconds)
++                services.sleep(delay_seconds)
+             except Exception:
+                 return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
+-        history_reason, history_after, history_identifiers = \
+-            _margin_history_snapshot(
+-                transport, base_url, endpoint_path, asset
+-            )
+-        latest = history_reason, history_after, history_identifiers
++        latest = _read_margin_history_snapshot(services, asset)
++        history_reason, _history_after, history_identifiers = latest
+         fence_status = ""
+         if not history_reason:
+             fence_status = _margin_history_fence_status(
+@@ -4191,223 +3977,253 @@
+     return _canonical_decimal_text(parsed)
+ 
+ 
+-def _margin_history_confirmation(payload: Any, transaction_id: str,
+-                                 expected: Dict[str, Any],
+-                                 request_type: str) \
+-        -> Optional[Dict[str, str]]:
++def _margin_liability_receipt(
++        liability: Any) -> Optional[Dict[str, str]]:
++    if not isinstance(liability, binance_margin.Liability):
++        return None
+     try:
+-        if type(payload) is not dict or type(transaction_id) is not str \
+-                or not transaction_id or type(expected) is not dict \
+-                or type(request_type) is not str \
+-                or request_type not in {"BORROW", "REPAY"}:
++        values = (
++            liability.principal, liability.interest, liability.total
++        )
++        if any(
++                not isinstance(value, Decimal) or not value.is_finite()
++                or value < Decimal("0")
++                for value in values):
+             return None
+-        rows = payload.get("rows")
+-        expected_asset = expected.get("asset")
+-        expected_principal = expected.get("principal")
+-        expected_interest = expected.get("interest")
+-        expected_status = expected.get("status")
+-        if type(rows) is not list or any(
+-                type(value) is not str for value in (
+-                    expected_asset, expected_principal,
+-                    expected_interest, expected_status,
+-                )):
++        if liability.principal + liability.interest != liability.total:
+             return None
+-        matches = []
+-        for row in rows:
+-            if type(row) is not dict:
+-                continue
+-            aliases = _margin_identity_aliases(row)
+-            if aliases is None:
+-                return None
+-            if aliases and aliases[0] == transaction_id:
+-                matches.append(row)
+-        if len(matches) != 1:
+-            return None
+-        row = matches[0]
+-        asset = row.get("asset")
+-        origin_type = row.get("type")
+-        principal_value = row.get("principal")
+-        status = row.get("status")
+-        if any(type(value) is not str for value in (
+-                asset, origin_type, principal_value, status)):
+-            return None
+-        if asset != expected_asset \
+-                or origin_type not in MARGIN_HISTORY_ORIGIN_TYPES:
+-            return None
+-        principal = _margin_decimal_text(principal_value)
+-        if principal is None or status != "CONFIRMED":
+-            return None
+-        internal_status = MARGIN_HISTORY_CONFIRMED_STATUS[request_type]
+-        if request_type == "REPAY":
+-            amount_value = row.get("amount")
+-            interest_value = row.get("interest")
+-            row_transaction = _margin_transaction_number(
+-                _margin_transaction_id({"txId": row.get("txId")})
+-            )
+-            expected_transaction = _margin_transaction_number(transaction_id)
+-            if type(amount_value) is not str \
+-                    or type(interest_value) is not str \
+-                    or row_transaction is None \
+-                    or row_transaction != expected_transaction:
+-                return None
+-            amount = _margin_decimal_text(amount_value)
+-            interest = _margin_decimal_text(interest_value)
+-            if amount is None or interest is None:
+-                return None
+-            with localcontext() as context:
+-                context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-                if Decimal(principal) + Decimal(interest) != Decimal(amount):
+-                    return None
+-            confirmation = {
+-                "asset": asset,
+-                "amount": amount,
+-                "principal": principal,
+-                "interest": interest,
+-                "status": internal_status,
+-            }
+-            if confirmation != expected:
+-                return None
+-            return confirmation
+-        confirmation = {
+-            "asset": asset,
+-            "principal": principal,
+-            "interest": "0",
+-            "status": internal_status,
++        return {
++            "asset": liability.asset,
++            "borrowed": _canonical_decimal_text(liability.principal),
++            "interest": _canonical_decimal_text(liability.interest),
++            "total_liability": _canonical_decimal_text(liability.total),
+         }
+-        if confirmation != expected:
+-            return None
+-        return confirmation
+     except Exception:
+         return None
+ 
+ 
+-def _margin_account_liability(payload: Any, asset: str) \
+-        -> Optional[Dict[str, str]]:
++def _margin_liability_from_receipt(
++        value: Any, asset: Optional[str] = None) \
++        -> Optional[binance_margin.Liability]:
+     try:
+-        if type(payload) is not dict or type(asset) is not str or not asset:
++        if type(value) is not dict or set(value) != {
++                "asset", "borrowed", "interest", "total_liability"
++        } or type(value.get("asset")) is not str \
++                or asset is not None and value["asset"] != asset:
+             return None
+-        rows = payload.get("userAssets")
+-        if type(rows) is not list:
++        canonical = [
++            _margin_decimal_text(value.get(field))
++            for field in ("borrowed", "interest", "total_liability")
++        ]
++        if any(item is None for item in canonical):
+             return None
+-        matches = []
+-        for row in rows:
+-            if type(row) is not dict:
+-                return None
+-            row_asset = row.get("asset")
+-            if type(row_asset) is not str:
+-                return None
+-            if row_asset == asset:
+-                matches.append(row)
+-        if len(matches) != 1:
++        liability = binance_margin.Liability(
++            value["asset"], Decimal(canonical[0]),
++            Decimal(canonical[1]), Decimal(canonical[2]),
++        )
++        return liability \
++            if _margin_liability_receipt(liability) == value else None
++    except Exception:
++        return None
++
++
++def _margin_operation_ledger_confirmation(
++        operation: Any) -> Optional[Dict[str, str]]:
++    if not isinstance(operation, binance_margin.MarginOperation):
++        return None
++    row = {
++        "asset": operation.asset,
++        "principal": _canonical_decimal_text(operation.principal),
++        "interest": _canonical_decimal_text(operation.interest),
++        "status": operation.direction + "_CONFIRMED",
++    }
++    if operation.direction == "REPAY":
++        row["amount"] = _canonical_decimal_text(operation.amount)
++    return row
++
++
++def _margin_history_ledger_confirmation(
++        row: Any) -> Optional[Dict[str, str]]:
++    if not isinstance(row, binance_margin.MarginHistoryRow):
++        return None
++    confirmation = {
++        "asset": row.asset,
++        "principal": _canonical_decimal_text(row.principal),
++        "interest": _canonical_decimal_text(row.interest),
++        "status": row.direction + "_CONFIRMED",
++    }
++    if row.direction == "REPAY":
++        confirmation["amount"] = _canonical_decimal_text(row.amount)
++    return confirmation
++
++
++def _margin_target_history(
++        histories: Any, direction: str, tx_id: int) \
++        -> Optional[binance_margin.MarginHistoryRow]:
++    try:
++        if type(histories) is not dict \
++                or set(histories) != {"BORROW", "REPAY"}:
+             return None
+-        borrowed_value = matches[0].get("borrowed")
+-        interest_value = matches[0].get("interest")
+-        if type(borrowed_value) is not str \
+-                or type(interest_value) is not str:
++        rows = histories.get(direction)
++        if type(rows) is not tuple:
+             return None
+-        borrowed = _margin_decimal_text(borrowed_value)
+-        interest = _margin_decimal_text(interest_value)
+-        if borrowed is None or interest is None:
+-            return None
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            total = Decimal(borrowed) + Decimal(interest)
+-        return {
+-            "asset": asset,
+-            "borrowed": borrowed,
+-            "interest": interest,
+-            "total_liability": _canonical_decimal_text(total),
+-        }
++        matches = [
++            row for row in rows
++            if isinstance(row, binance_margin.MarginHistoryRow)
++            and row.tx_id == tx_id
++        ]
++        return matches[0] if len(matches) == 1 else None
+     except Exception:
+         return None
+ 
+ 
+-def _margin_account_snapshot_time(payload: Any) \
+-        -> Tuple[str, Optional[Decimal]]:
+-    """Return one strict account snapshot time without guessing its unit."""
++def _read_margin_liability(
++        services: ExecutionServices, asset: str) \
++        -> Tuple[str, Optional[binance_margin.Liability]]:
+     try:
+-        if type(payload) is not dict:
+-            return "INVALID", None
+-        values = []
+-        for field in ("timestamp", "updateTime"):
+-            if field not in payload:
+-                continue
+-            raw = payload[field]
+-            if type(raw) is int:
+-                raw = str(raw)
+-            if type(raw) is not str:
+-                return "INVALID", None
+-            canonical = _margin_decimal_text(raw)
+-            if canonical is None:
+-                return "INVALID", None
+-            values.append(Decimal(canonical))
+-        if not values:
+-            return "ABSENT", None
+-        if any(value != values[0] for value in values[1:]):
+-            return "INVALID", None
+-        return "PRESENT", values[0]
++        result = services.margin_read_liability(
++            services.transport, services.spot_base_url, asset,
++            sleep=services.sleep,
++        )
++        if not isinstance(result, binance_http.ReadResult) \
++                or result.kind != "ok" \
++                or not isinstance(result.value, binance_margin.Liability):
++            return "MARGIN_CONFIRMATION_UNREADABLE", None
++        return "", result.value
+     except Exception:
+-        return "INVALID", None
++        return "MARGIN_CONFIRMATION_UNREADABLE", None
+ 
+ 
+-def _margin_snapshot_time_note(before_payload: Any,
+-                               after_payload: Any) -> Optional[str]:
+-    before_kind, before_time = _margin_account_snapshot_time(before_payload)
+-    after_kind, after_time = _margin_account_snapshot_time(after_payload)
+-    if "INVALID" in {before_kind, after_kind}:
+-        return None
+-    if "ABSENT" in {before_kind, after_kind}:
+-        return MARGIN_SNAPSHOT_TIME_UNVERIFIED
+-    if before_time is None or after_time is None or after_time <= before_time:
+-        return None
+-    return MARGIN_SNAPSHOT_TIME_VERIFIED
++def _read_margin_history_identity(
++        services: ExecutionServices, asset: str, direction: str,
++        transaction_id: str) \
++        -> Tuple[str, Optional[binance_margin.MarginHistoryRow]]:
++    target = _margin_transaction_number(transaction_id)
++    if target is None:
++        return "MARGIN_TRANSACTION_MISSING", None
++    try:
++        result = services.margin_read_history_by_tx_id(
++            services.transport, services.spot_base_url, asset,
++            direction, target, sleep=services.sleep,
++        )
++        if not isinstance(result, binance_http.ReadResult) \
++                or result.kind != "ok":
++            return "MARGIN_CONFIRMATION_UNREADABLE", None
++        if not isinstance(result.value, binance_margin.MarginHistoryRow) \
++                or result.value.direction != direction \
++                or result.value.tx_id != target:
++            return "MARGIN_CONFIRMATION_MISMATCH", None
++        return "", result.value
++    except Exception:
++        return "MARGIN_CONFIRMATION_UNREADABLE", None
+ 
+ 
+-def _margin_liability_decimals(value: Any) \
+-        -> Optional[Tuple[str, Decimal, Decimal, Decimal]]:
++def _build_typed_margin_operation(
++        services: ExecutionServices, job: Job, ready: Dict[str, Any],
++        liability_before: binance_margin.Liability, sha: str) \
++        -> Tuple[Optional[binance_margin.MarginOperation], str, bool]:
++    """Build one adapter operation and bind it to fresh runner authority."""
+     try:
+-        if type(value) is not dict or type(value.get("asset")) is not str:
+-            return None
+-        canonical = [
+-            _margin_decimal_text(value.get(field))
+-            for field in ("borrowed", "interest", "total_liability")
+-        ]
+-        if any(item is None for item in canonical):
+-            return None
+-        borrowed, interest, total = (
+-            Decimal(item) for item in canonical if item is not None
++        params = ready["params"]
++        if params["type"] == "BORROW":
++            operation = services.margin_build_borrow(
++                params["asset"], job.requested_max_notional,
++                job.intent_id, sha,
++            )
++        else:
++            if job.requested_max_notional > liability_before.total:
++                return None, "PRINCIPAL_EXCEEDS_LIABILITY", True
++            if job.requested_max_notional != liability_before.total:
++                return None, "REPAY_PRINCIPAL_INTEREST_MISMATCH", True
++            operation = services.margin_build_repay(
++                liability_before, job.intent_id, sha
++            )
++        expected_params = tuple(
++            (name, params[name]) for name in ("asset", "amount", "type")
+         )
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            if borrowed + interest != total:
++        if not isinstance(operation, binance_margin.MarginOperation) \
++                or operation.direction != params["type"] \
++                or operation.asset != params["asset"] \
++                or operation.amount != Decimal(params["amount"]) \
++                or operation.intent.venue != "BINANCE_MARGIN" \
++                or operation.intent.operation != params["type"] \
++                or operation.intent.identity != job.intent_id \
++                or operation.intent.git_sha != sha \
++                or operation.intent.params != expected_params:
++            return None, "MARGIN_VALIDATION_UNKNOWN", False
++        return operation, "", False
++    except Exception:
++        return None, "MARGIN_VALIDATION_UNKNOWN", False
++
++
++def _margin_operation_from_receipt(
++        services: ExecutionServices, ready: Dict[str, Any],
++        liability_before: Any, sha: Any) \
++        -> Optional[binance_margin.MarginOperation]:
++    """Rebuild a modern typed plan from read-only durable facts."""
++    try:
++        params = ready["params"]
++        if type(sha) is not str or SHA_RE.fullmatch(sha) is None:
++            return None
++        if params["type"] == "BORROW":
++            operation = services.margin_build_borrow(
++                params["asset"], Decimal(params["amount"]),
++                ready["intent_id"], sha,
++            )
++        else:
++            before = _margin_liability_from_receipt(
++                liability_before, params["asset"]
++            )
++            if before is None or before.total != Decimal(params["amount"]):
+                 return None
+-        return value["asset"], borrowed, interest, total
++            operation = services.margin_build_repay(
++                before, ready["intent_id"], sha
++            )
++        expected_params = tuple(
++            (name, params[name]) for name in ("asset", "amount", "type")
++        )
++        if not isinstance(operation, binance_margin.MarginOperation) \
++                or operation.intent.params != expected_params \
++                or operation.intent.identity != ready["intent_id"] \
++                or _margin_operation_ledger_confirmation(operation) \
++                != ready["expected_ledger_confirmation"]:
++            return None
++        return operation
+     except Exception:
+         return None
+ 
+ 
+-def _margin_repay_expected_ledger_confirmation(
++def _margin_liability_decimals(value: Any) \
++        -> Optional[Tuple[str, Decimal, Decimal, Decimal]]:
++    liability = _margin_liability_from_receipt(value)
++    if liability is None:
++        return None
++    return (
++        liability.asset, liability.principal,
++        liability.interest, liability.total,
++    )
++
++
++def _margin_repay_receipt_expected(
+         params: Any, liability_before: Any) -> Optional[Dict[str, str]]:
+-    """Build one exact REPAY split from the pre-mutation account read."""
++    """Validate one persisted REPAY split without reading exchange schema."""
+     try:
+         if type(params) is not dict \
+                 or params.get("type") != "REPAY" \
+                 or type(params.get("asset")) is not str:
+             return None
+         amount = _margin_decimal_text(params.get("amount"))
+-        values = _margin_liability_decimals(liability_before)
+-        if amount is None or values is None \
+-                or values[0] != params["asset"]:
++        liability = _margin_liability_from_receipt(
++            liability_before, params["asset"]
++        )
++        if amount is None or liability is None \
++                or liability.total != Decimal(amount):
+             return None
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            if values[1] + values[2] != Decimal(amount):
+-                return None
+         return {
+             "asset": params["asset"],
+             "amount": amount,
+-            "principal": liability_before["borrowed"],
+-            "interest": liability_before["interest"],
++            "principal": _canonical_decimal_text(liability.principal),
++            "interest": _canonical_decimal_text(liability.interest),
+             "status": MARGIN_HISTORY_CONFIRMED_STATUS["REPAY"],
+         }
+     except Exception:
+@@ -4425,150 +4241,57 @@
+         context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+         relative = amount * MARGIN_REPAY_RELATIVE_DUST_RATE
+     return min(MARGIN_REPAY_DUST_BOUND, relative)
+-
+-
+-def _margin_repay_principal_above_liability(
+-        liability: Any, principal: Any) -> Optional[bool]:
+-    values = _margin_liability_decimals(liability)
+-    canonical = _margin_decimal_text(principal)
+-    dust_bound = _margin_repay_dust_bound(principal)
+-    if values is None or canonical is None or dust_bound is None:
+-        return None
+-    with localcontext() as context:
+-        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-        maximum = values[3] + dust_bound
+-    return Decimal(canonical) > maximum
+-
+-
+-def _margin_repay_proof_values(before: Any, after: Any, principal: Any) \
+-        -> Optional[Tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]:
+-    try:
+-        before_values = _margin_liability_decimals(before)
+-        after_values = _margin_liability_decimals(after)
+-        canonical_principal = _margin_decimal_text(principal)
+-        if before_values is None or after_values is None \
+-                or canonical_principal is None \
+-                or before_values[0] != after_values[0]:
+-            return None
+-        amount = Decimal(canonical_principal)
+-        zero = Decimal("0")
+-        if amount <= zero:
+-            return None
+-        before_borrowed = before_values[1]
+-        before_interest = before_values[2]
+-        after_borrowed = after_values[1]
+-        after_interest = after_values[2]
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            interest_settled_first = min(amount, before_interest)
+-            principal_settled = amount - interest_settled_first
+-            expected_borrowed = max(
+-                zero, before_borrowed - principal_settled
+-            )
+-            liability_decrease = before_values[3] - after_values[3]
+-        return (
+-            amount, expected_borrowed, after_borrowed, after_interest,
+-            liability_decrease,
+-        )
+-    except Exception:
+-        return None
+ 
+ 
+-def _margin_liability_confirmation_status(
+-        before: Any, after: Any, principal: Any, request_type: Any) -> str:
+-    """Map a direction-bearing liability proof to one internal status."""
+-    try:
+-        if type(request_type) is not str \
+-                or request_type not in {"BORROW", "REPAY"}:
+-            return ""
+-        if request_type == "REPAY":
+-            proof = _margin_repay_proof_values(before, after, principal)
+-            dust_bound = _margin_repay_dust_bound(principal)
+-            if proof is None or dust_bound is None:
+-                return ""
+-            amount, expected_borrowed, after_borrowed, _after_interest, \
+-                liability_decrease = proof
+-            zero = Decimal("0")
+-            with localcontext() as context:
+-                context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-                minimum_decrease = amount - dust_bound
+-            enough_decrease = liability_decrease > zero \
+-                and liability_decrease >= minimum_decrease
+-            if enough_decrease and after_borrowed == expected_borrowed:
+-                return "REPAY_CONFIRMED"
+-            return ""
+-
+-        if type(before) is not dict or type(after) is not dict \
+-                or type(principal) is not str:
+-            return ""
+-        before_asset = before.get("asset")
+-        after_asset = after.get("asset")
+-        before_borrowed = before.get("borrowed")
+-        after_borrowed = after.get("borrowed")
+-        if any(type(value) is not str for value in (
+-                before_asset, after_asset,
+-                before_borrowed, after_borrowed)) \
+-                or before_asset != after_asset:
+-            return ""
+-        canonical_principal = _margin_decimal_text(principal)
+-        canonical_before = _margin_decimal_text(before_borrowed)
+-        canonical_after = _margin_decimal_text(after_borrowed)
+-        if canonical_principal is None or canonical_before is None \
+-                or canonical_after is None:
+-            return ""
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            amount = Decimal(canonical_principal)
+-            change = Decimal(canonical_after) - Decimal(canonical_before)
+-        if amount > Decimal("0") and change == amount:
+-            return "BORROW_CONFIRMED"
+-        return ""
+-    except Exception:
+-        return ""
+-
+-
+-def _margin_repay_close_verdict(before: Any, after: Any,
+-                                principal: Any) -> str:
+-    proof = _margin_repay_proof_values(before, after, principal)
+-    values = _margin_liability_decimals(after)
++def _margin_repay_close_verdict(
++        before: Any, after: Any, principal: Any) -> str:
++    before_values = _margin_liability_decimals(before)
++    after_values = _margin_liability_decimals(after)
++    canonical = _margin_decimal_text(principal)
+     dust_bound = _margin_repay_dust_bound(principal)
++    if before_values is None or after_values is None or canonical is None \
++            or dust_bound is None or before_values[0] != after_values[0]:
++        return ""
++    amount = Decimal(canonical)
+     zero = Decimal("0")
+-    if proof is None or values is None or dust_bound is None \
+-            or values[1] != zero:
++    if amount <= zero or after_values[1] != zero:
+         return ""
+-    if values[2] == zero:
+-        status = _margin_liability_confirmation_status(
+-            before, after, principal, "REPAY"
+-        )
+-        return "CLOSED" if status == "REPAY_CONFIRMED" else ""
+-    amount, _expected_borrowed, _after_borrowed, _after_interest, \
+-        liability_decrease = proof
+     with localcontext() as context:
+         context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
++        principal_settled = amount - min(amount, before_values[2])
++        expected_borrowed = max(zero, before_values[1] - principal_settled)
++        liability_decrease = before_values[3] - after_values[3]
+         minimum_decrease = amount - dust_bound
+     enough_decrease = liability_decrease > zero \
+-        and liability_decrease >= minimum_decrease
+-    if values[2] < dust_bound and enough_decrease:
++        and liability_decrease >= minimum_decrease \
++        and after_values[1] == expected_borrowed
++    if enough_decrease and after_values[2] == zero:
++        return "CLOSED"
++    if enough_decrease and after_values[2] < dust_bound:
+         return "CLOSED-WITH-DUST"
+     return ""
+ 
+ 
+ def _margin_liability_direction_confirmed(
+         before: Any, after: Any, principal: Any, request_type: Any) -> bool:
+-    if type(request_type) is not str:
++    if request_type == "REPAY":
++        return bool(_margin_repay_close_verdict(before, after, principal))
++    before_values = _margin_liability_decimals(before)
++    after_values = _margin_liability_decimals(after)
++    canonical = _margin_decimal_text(principal)
++    if request_type != "BORROW" or before_values is None \
++            or after_values is None or canonical is None \
++            or before_values[0] != after_values[0]:
+         return False
+-    return _margin_liability_confirmation_status(
+-        before, after, principal, request_type
+-    ) == request_type + "_CONFIRMED"
++    return after_values[1] - before_values[1] == Decimal(canonical)
+ 
+ 
+-def _evaluate_margin_confirmation(
+-        history_payload: Any, history_identifiers: Any,
+-        transaction_id: Any, history_watermark: Any,
+-        expected: Any, request_type: Any, liability_before: Any,
+-        account_before_payload: Any, account_after_payload: Any) \
+-        -> MarginConfirmation:
+-    """Apply the one confirmation law used by completion and reconciliation."""
++def _evaluate_typed_margin_confirmation(
++        services: ExecutionServices, histories: Any,
++        history_identifiers: Any, transaction_id: Any,
++        history_watermark: Any, operation: Any,
++        liability_before: Any, liability_after: Any) -> MarginConfirmation:
++    """Apply runner fences and outcomes to one typed adapter confirmation."""
+     try:
+         fence_status = _margin_history_fence_status(
+             history_identifiers, transaction_id, history_watermark
+@@ -4581,69 +4304,85 @@
+             return MarginConfirmation(
+                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+             )
+-        confirmation = _margin_history_confirmation(
+-            history_payload, transaction_id, expected, request_type
+-        )
+-        if confirmation is None:
++        target = _margin_transaction_number(transaction_id)
++        if target is None \
++                or not isinstance(operation, binance_margin.MarginOperation) \
++                or not isinstance(liability_before, binance_margin.Liability) \
++                or not isinstance(liability_after, binance_margin.Liability):
+             return MarginConfirmation(
+                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+             )
+-        liability = _margin_account_liability(
+-            account_after_payload, expected["asset"]
++        history = _margin_target_history(
++            histories, operation.direction, target
+         )
+-        if liability is None:
++        if history is None:
+             return MarginConfirmation(
+                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+             )
+-        snapshot_time_note = _margin_snapshot_time_note(
+-            account_before_payload, account_after_payload
++        adapter_confirmation = services.margin_confirm(
++            operation, target, history, liability_before, liability_after
+         )
+-        if snapshot_time_note is None:
++        if not isinstance(
++                adapter_confirmation, binance_margin.MarginConfirmation) \
++                or adapter_confirmation.operation != operation \
++                or adapter_confirmation.tx_id != target \
++                or adapter_confirmation.before != liability_before \
++                or adapter_confirmation.after != liability_after:
+             return MarginConfirmation(
+-                "UNKNOWN", "MARGIN_SNAPSHOT_TIME_MISMATCH",
+-                account_liability=liability,
++                "UNKNOWN", "MARGIN_CONFIRMATION_UNREADABLE"
+             )
+-        confirmation_amount = expected["principal"] \
+-            if request_type == "BORROW" else expected["amount"]
+-        confirmation_status = _margin_liability_confirmation_status(
+-            liability_before, liability, confirmation_amount,
+-            request_type,
+-        )
+-        exact_confirmation = confirmation_status == expected["status"]
+-        if request_type == "BORROW":
+-            if not exact_confirmation:
++        before_receipt = _margin_liability_receipt(liability_before)
++        after_receipt = _margin_liability_receipt(liability_after)
++        ledger = _margin_operation_ledger_confirmation(operation)
++        if before_receipt is None or after_receipt is None or ledger is None:
++            return MarginConfirmation(
++                "UNKNOWN", "MARGIN_CONFIRMATION_UNREADABLE"
++            )
++        snapshot_time_note = MARGIN_SNAPSHOT_TIME_UNVERIFIED
++        if operation.direction == "BORROW":
++            if adapter_confirmation.kind != "confirmed":
+                 return MarginConfirmation(
+-                    "UNKNOWN", "MARGIN_LIABILITY_MISMATCH",
+-                    account_liability=liability,
++                    "UNKNOWN", adapter_confirmation.reason,
++                    account_liability=after_receipt,
+                     snapshot_time_note=snapshot_time_note,
+                 )
+             return MarginConfirmation(
+-                "OPEN", expected["status"], confirmation, liability,
++                "OPEN", ledger["status"], ledger, after_receipt,
+                 snapshot_time_note,
+             )
+ 
+-        repay_verdict = _margin_repay_close_verdict(
+-            liability_before, liability, confirmation_amount
+-        )
+-        if not repay_verdict \
+-                or repay_verdict == "CLOSED" and not exact_confirmation:
++        if adapter_confirmation.kind == "confirmed":
++            repay_verdict = "CLOSED"
++        elif adapter_confirmation.kind == "unknown" \
++                and adapter_confirmation.reason \
++                == "MARGIN_LIABILITY_MISMATCH":
++            repay_verdict = _margin_repay_close_verdict(
++                before_receipt, after_receipt,
++                _canonical_decimal_text(operation.amount),
++            )
++        else:
+             return MarginConfirmation(
++                "UNKNOWN", adapter_confirmation.reason,
++                account_liability=after_receipt,
++                snapshot_time_note=snapshot_time_note,
++            )
++        if not repay_verdict:
++            return MarginConfirmation(
+                 "UNKNOWN", "MARGIN_LIABILITY_MISMATCH",
+-                confirmation if exact_confirmation else None, liability,
+-                snapshot_time_note,
++                account_liability=after_receipt,
++                snapshot_time_note=snapshot_time_note,
+             )
+         follow_up = None
+-        reason = expected["status"]
++        reason = ledger["status"]
+         if repay_verdict == "CLOSED-WITH-DUST":
+             follow_up = {
+                 "kind": "INTEREST_ONLY_REPAY",
+-                "asset": liability["asset"],
+-                "principal": liability["interest"],
++                "asset": after_receipt["asset"],
++                "principal": after_receipt["interest"],
+             }
+             reason = "REPAY_CONFIRMED_WITH_DUST"
+         return MarginConfirmation(
+-            repay_verdict, reason,
+-            confirmation if exact_confirmation else None, liability,
++            repay_verdict, reason, ledger, after_receipt,
+             snapshot_time_note, follow_up,
+         )
+     except Exception:
+@@ -4653,30 +4392,29 @@
+ 
+ 
+ def _evaluate_legacy_margin_confirmation(
+-        history_payload: Any, history_identifiers: Any,
++        history: Any, history_identifiers: Any,
+         transaction_id: Any, expected: Any, request_type: Any,
+-        account_payload: Any, exclusivity_proof: Any) \
++        liability_value: Any, exclusivity_proof: Any) \
+         -> MarginConfirmation:
+-    """Evaluate the two substitutes for the frozen legacy receipt shape."""
++    """Evaluate the frozen BORROW receipt from typed read-only facts."""
+     try:
+         target = _margin_transaction_number(transaction_id)
+         if target is None or history_identifiers != [target] \
+                 or not _valid_margin_legacy_exclusivity_proof(
+                     exclusivity_proof
+-                ):
++                ) or not isinstance(
++                    history, binance_margin.MarginHistoryRow
++                ) or history.tx_id != target \
++                or history.direction != request_type:
+             return MarginConfirmation(
+                 "UNKNOWN", "LEGACY_WINDOW_NOT_EXCLUSIVE"
+             )
+-        confirmation = _margin_history_confirmation(
+-            history_payload, transaction_id, expected, request_type
+-        )
+-        if confirmation is None:
++        confirmation = _margin_history_ledger_confirmation(history)
++        if confirmation != expected or history.status != "CONFIRMED":
+             return MarginConfirmation(
+                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+             )
+-        liability = _margin_account_liability(
+-            account_payload, expected["asset"]
+-        )
++        liability = _margin_liability_receipt(liability_value)
+         if request_type != "BORROW" \
+                 or not _legacy_current_liability_matches(
+                     liability, expected["principal"]
+@@ -4696,154 +4434,80 @@
+ 
+ 
+ def _legacy_repay_current_liability(
+-        payload: Any, asset: str) \
+-        -> Tuple[Optional[Dict[str, str]], str]:
+-    if type(payload) is not dict or type(payload.get("userAssets")) is not list:
++        liability_value: Any) -> Tuple[Optional[Dict[str, str]], str]:
++    liability = _margin_liability_receipt(liability_value)
++    if liability is None:
+         return None, "LEGACY_REPAY_CURRENT_ACCOUNT_MISSING"
+-    matches = [
+-        row for row in payload["userAssets"]
+-        if type(row) is dict and row.get("asset") == asset
+-    ]
+-    if len(matches) != 1:
+-        return None, "LEGACY_REPAY_CURRENT_ASSET_MISSING"
+-    row = matches[0]
+-    borrowed = _margin_decimal_text(row.get("borrowed"))
+-    if borrowed is None:
+-        return None, "LEGACY_REPAY_CURRENT_BORROWED_MISSING"
+-    interest = _margin_decimal_text(row.get("interest"))
+-    if interest is None:
+-        return None, "LEGACY_REPAY_CURRENT_INTEREST_MISSING"
+-    with localcontext() as context:
+-        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-        total = Decimal(borrowed) + Decimal(interest)
+-    return {
+-        "asset": asset,
+-        "borrowed": borrowed,
+-        "interest": interest,
+-        "total_liability": _canonical_decimal_text(total),
+-    }, ""
++    return liability, ""
+ 
+ 
+ def _legacy_repay_exchange_provenance(
+-        history_payload: Any, receipt_facts: Tuple[str, str, str, str, str]) \
++        history: Any, receipt_facts: Tuple[str, str, str, str, str]) \
+         -> str:
+-    """Name the first exact-id exchange fact that misses the allowlist."""
++    """Name the first typed exact-id fact that misses the allowlist."""
+     try:
+         transaction_id = receipt_facts[1]
+-        asset = receipt_facts[2]
+         requested_amount = _margin_decimal_text(receipt_facts[3])
++        target = _margin_transaction_number(transaction_id)
+         if requested_amount is None:
+             return "ALLOWLIST_REQUESTED_AMOUNT"
+-        if type(history_payload) is not dict \
+-                or type(history_payload.get("rows")) is not list \
+-                or len(history_payload["rows"]) != 1 \
+-                or type(history_payload["rows"][0]) is not dict:
++        if not isinstance(history, binance_margin.MarginHistoryRow):
+             return "EXCHANGE_HISTORY_ROW"
+-        row = history_payload["rows"][0]
+-        aliases = _margin_identity_aliases(row)
+-        target = _margin_transaction_number(transaction_id)
+-        row_target = _margin_transaction_number(
+-            _margin_transaction_id({"txId": row.get("txId")})
+-        )
+-        if target is None or aliases != [transaction_id] \
+-                or row_target != target:
++        if target is None or history.tx_id != target:
+             return "EXCHANGE_TRANSACTION_ID"
+-        if type(row.get("asset")) is not str or row["asset"] != asset:
++        if history.asset != receipt_facts[2]:
+             return "EXCHANGE_ASSET"
+-        amount = _margin_decimal_text(row.get("amount"))
+-        if amount is None \
+-                or Decimal(amount) != Decimal(requested_amount):
++        if history.amount != Decimal(requested_amount):
+             return "EXCHANGE_AMOUNT"
+-        principal = _margin_decimal_text(row.get("principal"))
+-        if principal is None:
+-            return "EXCHANGE_PRINCIPAL"
+-        interest = _margin_decimal_text(row.get("interest"))
+-        if interest is None:
+-            return "EXCHANGE_INTEREST"
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            if Decimal(principal) + Decimal(interest) != Decimal(amount):
+-                return "EXCHANGE_PRINCIPAL_INTEREST_TOTAL"
++        if history.principal + history.interest != history.amount:
++            return "EXCHANGE_PRINCIPAL_INTEREST_TOTAL"
+         return ""
+     except Exception:
+         return "EXCHANGE_HISTORY_ROW"
+ 
+ 
+ def _legacy_repay_history_confirmation(
+-        history_payload: Any, transaction_id: Any, expected: Any,
++        history: Any, transaction_id: Any, expected: Any,
+         liability_before: Any) \
+         -> Tuple[Optional[Dict[str, str]], str]:
+     try:
+-        if type(history_payload) is not dict \
+-                or type(history_payload.get("rows")) is not list:
+-            return None, "LEGACY_REPAY_HISTORY_ROWS_MISSING"
+         target = _margin_transaction_number(transaction_id)
+-        rows = history_payload["rows"]
+-        if target is None or len(rows) != 1 or type(rows[0]) is not dict:
++        if target is None \
++                or not isinstance(history, binance_margin.MarginHistoryRow):
+             return None, "LEGACY_REPAY_TX_ID_MISSING"
+-        row = rows[0]
+-        aliases = _margin_identity_aliases(row)
+-        if aliases is None or len(aliases) != 1:
+-            return None, "LEGACY_REPAY_TX_ID_MISSING"
+-        row_target = _margin_transaction_number(
+-            _margin_transaction_id({"txId": row.get("txId")})
+-        )
+-        if row_target is None:
+-            return None, "LEGACY_REPAY_TX_ID_MISSING"
+-        if aliases[0] != transaction_id or row_target != target:
++        if history.tx_id != target:
+             return None, "LEGACY_REPAY_TX_ID_MISMATCH"
+-        for field in ("asset", "amount", "principal", "interest",
+-                      "status", "type"):
+-            if type(row.get(field)) is not str:
+-                return None, "LEGACY_REPAY_%s_MISSING" % field.upper()
+-        if row["asset"] != expected.get("asset"):
++        if history.asset != expected.get("asset"):
+             return None, "LEGACY_REPAY_ASSET_MISMATCH"
+-        if row["type"] not in MARGIN_HISTORY_ORIGIN_TYPES:
+-            return None, "LEGACY_REPAY_ORIGIN_TYPE_MISMATCH"
+-        if row["status"] != "CONFIRMED" \
++        if history.direction != "REPAY" or history.status != "CONFIRMED" \
+                 or expected.get("status") \
+                 != MARGIN_HISTORY_CONFIRMED_STATUS["REPAY"]:
+             return None, "LEGACY_REPAY_STATUS_MISMATCH"
+-        amount = _margin_decimal_text(row["amount"])
+-        principal = _margin_decimal_text(row["principal"])
+-        interest = _margin_decimal_text(row["interest"])
+         expected_amount = _margin_decimal_text(expected.get("principal"))
+-        if amount is None:
+-            return None, "LEGACY_REPAY_AMOUNT_MISSING"
+-        if principal is None:
+-            return None, "LEGACY_REPAY_PRINCIPAL_MISSING"
+-        if interest is None:
+-            return None, "LEGACY_REPAY_INTEREST_MISSING"
+         if expected_amount is None \
+-                or Decimal(amount) != Decimal(expected_amount):
++                or history.amount != Decimal(expected_amount):
+             return None, "LEGACY_REPAY_AMOUNT_MISMATCH"
+         before_values = _margin_liability_decimals(liability_before)
+         if before_values is None:
+             return None, "LEGACY_REPAY_ACCOUNT_LIABILITY_BEFORE_MISSING"
+-        with localcontext() as context:
+-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+-            if Decimal(principal) + Decimal(interest) != Decimal(amount):
+-                return None, "LEGACY_REPAY_ROW_TOTAL_MISMATCH"
+-        if Decimal(principal) != before_values[1]:
++        if history.principal + history.interest != history.amount:
++            return None, "LEGACY_REPAY_ROW_TOTAL_MISMATCH"
++        if history.principal != before_values[1]:
+             return None, "LEGACY_REPAY_PRINCIPAL_MISMATCH"
+-        if Decimal(interest) != before_values[2]:
++        if history.interest != before_values[2]:
+             return None, "LEGACY_REPAY_INTEREST_MISMATCH"
+-        return {
+-            "asset": row["asset"],
+-            "amount": amount,
+-            "principal": principal,
+-            "interest": interest,
+-            "status": MARGIN_HISTORY_CONFIRMED_STATUS["REPAY"],
+-        }, ""
++        confirmation = _margin_history_ledger_confirmation(history)
++        return confirmation, "" if confirmation is not None \
++            else "MARGIN_CONFIRMATION_UNREADABLE"
+     except Exception:
+         return None, "MARGIN_CONFIRMATION_UNREADABLE"
+ 
+ 
+ def _evaluate_legacy_repay_confirmation(
+-        history_payload: Any, history_identifiers: Any,
++        history: Any, history_identifiers: Any,
+         transaction_id: Any, history_watermark: Any, expected: Any,
+-        liability_before: Any, account_payload: Any) -> MarginConfirmation:
+-    """Prove the frozen version-1 REPAY receipt from exchange truth."""
++        liability_before: Any, liability_value: Any) -> MarginConfirmation:
++    """Prove the frozen version-1 REPAY receipt from typed exchange truth."""
+     try:
+         fence_status = _margin_history_fence_status(
+             history_identifiers, transaction_id, history_watermark
+@@ -4857,12 +4521,12 @@
+                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+             )
+         confirmation, history_reason = _legacy_repay_history_confirmation(
+-            history_payload, transaction_id, expected, liability_before
++            history, transaction_id, expected, liability_before
+         )
+         if confirmation is None:
+             return MarginConfirmation("UNKNOWN", history_reason)
+         liability, missing_reason = _legacy_repay_current_liability(
+-            account_payload, expected["asset"]
++            liability_value
+         )
+         if liability is None:
+             return MarginConfirmation("UNKNOWN", missing_reason)
+@@ -5071,9 +4735,9 @@
+ 
+ def _run_margin_operation(
+         job: Job, paths: Dict[str, str],
+-        request: Optional[Callable[..., Tuple[str, Any]]] = None,
+         governor_token: str = "", sha: str = "",
+-        validated_job_digest: str = "") -> Outcome:
++        validated_job_digest: str = "",
++        execution_services: Optional[ExecutionServices] = None) -> Outcome:
+     fresh_now = _utc_now()
+     principal = _canonical_decimal_text(job.requested_max_notional)
+     projection = {
+@@ -5131,12 +4795,10 @@
+             "MARGIN_READY_PERSISTENCE_FAILED",
+         )
+ 
+-    base_url = basis_executor.SPOT.base_url
+     try:
+-        transport = request or basis_executor.live_request_factory(
+-            os.environ.get("BINANCE_API_KEY", ""),
+-            os.environ.get("BINANCE_API_SECRET", ""),
+-        )
++        services = execution_services or _build_execution_services()
++        if not isinstance(services, ExecutionServices):
++            raise ValueError("execution services are unavailable")
+     except Exception:
+         return _finish_margin_before_post(
+             receipt, source_path, "UNKNOWN", 4,
+@@ -5159,10 +4821,7 @@
+ 
+     params = operation["params"]
+     history_reason, _history_before, history_ids_before = \
+-        _margin_history_snapshot(
+-            transport, base_url, operation["endpoint_path"],
+-            params["asset"],
+-        )
++        _read_margin_history_snapshot(services, params["asset"])
+     if history_reason:
+         return _finish_margin_before_post(
+             receipt, source_path, "UNKNOWN", 4,
+@@ -5170,55 +4829,50 @@
+         )
+     history_watermark = max(history_ids_before, default=0)
+ 
+-    try:
+-        account_before_result = transport(
+-            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
+-        )
+-        account_before_readable = type(account_before_result) is tuple \
+-            and len(account_before_result) == 2 \
+-            and account_before_result[0] == "ok"
+-        liability_before = _margin_account_liability(
+-            account_before_result[1], params["asset"]
+-        ) if account_before_readable else None
+-    except Exception:
++    liability_reason, liability_before = _read_margin_liability(
++        services, params["asset"]
++    )
++    if liability_reason or liability_before is None:
+         return _finish_margin_before_post(
+             receipt, source_path, "UNKNOWN", 4,
+-            "MARGIN_CONFIRMATION_UNREADABLE", authority_now,
++            liability_reason or "MARGIN_CONFIRMATION_UNREADABLE",
++            authority_now,
+         )
+-    if not account_before_readable:
++    liability_before_receipt = _margin_liability_receipt(liability_before)
++    if liability_before_receipt is None:
+         return _finish_margin_before_post(
+             receipt, source_path, "UNKNOWN", 4,
+             "MARGIN_CONFIRMATION_UNREADABLE", authority_now,
+         )
+-    if liability_before is None:
++
++    adapter_operation, build_reason, definite_refusal = \
++        _build_typed_margin_operation(
++            services, job, operation, liability_before, sha
++        )
++    if adapter_operation is None:
+         return _finish_margin_before_post(
++            receipt, source_path,
++            "REFUSED" if definite_refusal else "UNKNOWN",
++            2 if definite_refusal else 4, build_reason, authority_now,
++        )
++    adapter_expected = _margin_operation_ledger_confirmation(
++        adapter_operation
++    )
++    if adapter_expected is None:
++        return _finish_margin_before_post(
+             receipt, source_path, "UNKNOWN", 4,
+-            "MARGIN_CONFIRMATION_MISMATCH", authority_now,
++            "MARGIN_VALIDATION_UNKNOWN", authority_now,
+         )
+-    repay_expected = None
+-    if job.op == margin_ops.MARGIN_REPAY:
+-        principal_above_liability = \
+-            _margin_repay_principal_above_liability(
+-                liability_before, principal
+-            )
+-        if principal_above_liability is None:
++    if params["type"] == "BORROW":
++        if adapter_expected != operation["expected_ledger_confirmation"]:
+             return _finish_margin_before_post(
+                 receipt, source_path, "UNKNOWN", 4,
+-                "MARGIN_CONFIRMATION_MISMATCH", authority_now,
++                "MARGIN_VALIDATION_UNKNOWN", authority_now,
+             )
+-        if principal_above_liability:
+-            return _finish_margin_before_post(
+-                receipt, source_path, "REFUSED", 2,
+-                "PRINCIPAL_EXCEEDS_LIABILITY", authority_now,
+-            )
+-        repay_expected = _margin_repay_expected_ledger_confirmation(
+-            params, liability_before
+-        )
+-        if repay_expected is None:
+-            return _finish_margin_before_post(
+-                receipt, source_path, "REFUSED", 2,
+-                "REPAY_PRINCIPAL_INTEREST_MISMATCH", authority_now,
+-            )
++    else:
++        ready_operation = dict(operation)
++        ready_operation["expected_ledger_confirmation"] = adapter_expected
++        receipt["ready"] = ready_operation
+ 
+     authority_refusal, authority_now, authority_digests, stop_present = \
+         _margin_post_authority(
+@@ -5232,10 +4886,6 @@
+             receipt, source_path, "REFUSED", 2,
+             authority_refusal, authority_now,
+         )
+-    if repay_expected is not None:
+-        ready_operation = dict(operation)
+-        ready_operation["expected_ledger_confirmation"] = repay_expected
+-        receipt["ready"] = ready_operation
+ 
+     intent_id = operation["intent_id"]
+     try:
+@@ -5258,7 +4908,7 @@
+     receipt["mutation_attempts"] = 1
+     receipt["mutation_started_utc"] = _utc_text(authority_now)
+     receipt["history_watermark"] = history_watermark
+-    receipt["account_liability_before"] = liability_before
++    receipt["account_liability_before"] = liability_before_receipt
+     try:
+         _persist_margin_source(source_path, receipt)
+     except Exception:
+@@ -5266,37 +4916,52 @@
+             "UNKNOWN", 4, source_path, "MARGIN_READY_PERSISTENCE_FAILED"
+         )
+ 
+-    # These separate file reads and the socket write cannot be one OS-level
+-    # transaction.  The remaining read-to-write window is irreducible; the
+-    # durable timestamp and digests above record it without claiming otherwise.
++    writer_called = False
++
++    def write_intent(intent: binance_http.MutationIntent) -> None:
++        nonlocal writer_called
++        if writer_called or intent != adapter_operation.intent:
++            raise binance_http.IntentNotDurable(
++                "margin intent does not match the durable receipt"
++            )
++        try:
++            _persist_margin_source(source_path, receipt)
++        except Exception:
++            raise binance_http.IntentNotDurable(
++                "margin intent receipt was not durable"
++            ) from None
++        writer_called = True
++
+     try:
+-        post_result = transport(
+-            "POST", base_url, operation["endpoint_path"],
+-            post_params, True,
++        submission = services.margin_submit_once(
++            services.transport, services.spot_base_url,
++            adapter_operation, write_intent,
+         )
+-    except Exception:
++    except binance_http.IntentNotDurable:
+         return _finish_margin_source(
+             receipt, source_path, "UNKNOWN", 4,
+-            "MARGIN_POST_UNREADABLE", fresh_now,
++            "MARGIN_READY_PERSISTENCE_FAILED", fresh_now,
+         )
+-    if type(post_result) is not tuple or len(post_result) != 2:
++    except Exception:
+         return _finish_margin_source(
+             receipt, source_path, "UNKNOWN", 4,
+             "MARGIN_POST_UNREADABLE", fresh_now,
+         )
+-    try:
+-        post_kind, post_payload = post_result
+-        transaction_id = _margin_transaction_id(post_payload) \
+-            if post_kind == "ok" else ""
+-        receipt["submission"] = {
+-            "kind": post_kind if type(post_kind) is str else "unreadable",
+-            "transaction_id": transaction_id,
+-        }
+-    except Exception:
++    if not writer_called or not isinstance(
++            submission, binance_margin.MarginSubmit):
+         return _finish_margin_source(
+             receipt, source_path, "UNKNOWN", 4,
+-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
++            "MARGIN_POST_UNREADABLE", fresh_now,
+         )
++
++    transaction_id = ""
++    if submission.kind == "accepted" \
++            and type(submission.tx_id) is int and submission.tx_id > 0:
++        transaction_id = str(submission.tx_id)
++    receipt["submission"] = {
++        "kind": "ok" if transaction_id else submission.kind,
++        "transaction_id": transaction_id,
++    }
+     try:
+         _persist_margin_source(source_path, receipt)
+     except Exception:
+@@ -5310,29 +4975,18 @@
+             "MARGIN_TRANSACTION_MISSING", fresh_now,
+         )
+ 
+-    expected = ready_operation["expected_ledger_confirmation"]
+-    # The post-state account read stays inside the two history snapshots so
+-    # visible activity contributing to its delta is checked by the fence.
+-    try:
+-        account_result = transport(
+-            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
+-        )
+-    except Exception:
++    liability_reason, liability_after = _read_margin_liability(
++        services, params["asset"]
++    )
++    if liability_reason or liability_after is None:
+         return _finish_margin_source(
+             receipt, source_path, "UNKNOWN", 4,
+-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
++            liability_reason or "MARGIN_CONFIRMATION_UNREADABLE",
++            fresh_now,
+         )
+-    if type(account_result) is not tuple or len(account_result) != 2 \
+-            or account_result[0] != "ok":
+-        return _finish_margin_source(
+-            receipt, source_path, "UNKNOWN", 4,
+-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+-        )
+-
+     history_reason, history_after, history_ids_after = \
+-        _margin_post_history_snapshot(
+-            transport, base_url, operation["endpoint_path"],
+-            params["asset"], params["type"], transaction_id,
++        _read_margin_post_history(
++            services, params["asset"], params["type"], transaction_id,
+             history_watermark, job.job_id,
+         )
+     if history_reason:
+@@ -5340,10 +4994,10 @@
+             receipt, source_path, "UNKNOWN", 4,
+             history_reason, fresh_now,
+         )
+-    confirmation = _evaluate_margin_confirmation(
+-        history_after.get(params["type"]), history_ids_after,
+-        transaction_id, history_watermark, expected, params["type"],
+-        liability_before, account_before_result[1], account_result[1],
++    confirmation = _evaluate_typed_margin_confirmation(
++        services, history_after, history_ids_after,
++        transaction_id, history_watermark, adapter_operation,
++        liability_before, liability_after,
+     )
+     if confirmation.snapshot_time_note:
+         receipt["snapshot_time_note"] = confirmation.snapshot_time_note
+@@ -5396,8 +5050,8 @@
+             return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
+     if job.op in MARGIN_OPS:
+         return _run_margin_operation(
+-            job, paths, margin_request, governor_token, sha,
+-            validated_job_digest,
++            job, paths, governor_token, sha, validated_job_digest,
++            execution_services,
+         )
+ 
+     values = {
+@@ -6353,9 +6007,9 @@
+             job_id,
+         )
+         _release_require(
+-            _margin_account_liability({
+-                "userAssets": [liability_before]
+-            }, params["asset"]) == liability_before,
++            _margin_liability_from_receipt(
++                liability_before, params["asset"]
++            ) is not None,
+             "SOURCE_ACCOUNT_LIABILITY_BEFORE_MISMATCH",
+         )
+     legacy_repay = None
+@@ -6371,7 +6025,7 @@
+             if ledger_fact:
+                 raise LegacyProvenanceMismatch(ledger_fact)
+         else:
+-            modern_expected = _margin_repay_expected_ledger_confirmation(
++            modern_expected = _margin_repay_receipt_expected(
+                 params, liability_before
+             )
+             _release_require(
+@@ -6451,7 +6105,6 @@
+         job_id: str, confirm_reconcile: bool,
+         receipt_dir: Optional[str] = None,
+         now: Optional[datetime] = None,
+-        request: Optional[Callable[..., Tuple[str, Any]]] = None,
+         execution_services: Optional[ExecutionServices] = None) -> int:
+     if confirm_reconcile is not True:
+         print("JOB-RUNNER | RECONCILE REFUSED | CONFIRM_RECONCILE_REQUIRED")
+@@ -6492,28 +6145,20 @@
+     legacy_exclusivity_proof = None
+ 
+     try:
+-        transport = request or basis_executor.live_request_factory(
+-            os.environ.get("BINANCE_API_KEY", ""),
+-            os.environ.get("BINANCE_API_SECRET", ""),
+-        )
+-        history_result = transport(
+-            "GET", basis_executor.SPOT.base_url,
+-            ready["endpoint_path"], {
+-                "asset": params["asset"],
+-                "type": params["type"],
+-                "txId": transaction_id,
+-            }, True,
+-        )
+-        if type(history_result) is not tuple \
+-                or len(history_result) != 2 \
+-                or history_result[0] != "ok":
++        services = execution_services or _build_execution_services()
++        if not isinstance(services, ExecutionServices):
++            raise ValueError("execution services are unavailable")
++        history_reason, exact_history = _read_margin_history_identity(
++            services, params["asset"], params["type"], transaction_id
++        )
++        if history_reason or exact_history is None:
+             return _margin_reconcile_unconfirmed(
+-                paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
++                paths, job_id,
++                history_reason or "MARGIN_CONFIRMATION_MISMATCH", now
+             )
+-        history_payload = history_result[1]
+         if legacy_repay:
+             provenance_fact = _legacy_repay_exchange_provenance(
+-                history_payload, legacy_repay
++                exact_history, legacy_repay
+             )
+             if provenance_fact:
+                 return _margin_reconcile_unconfirmed(
+@@ -6522,56 +6167,46 @@
+                 )
+             history_confirmation, history_fact_reason = \
+                 _legacy_repay_history_confirmation(
+-                    history_payload, transaction_id, expected,
++                    exact_history, transaction_id, expected,
+                     liability_before,
+                 )
+             if history_confirmation is None:
+                 return _margin_reconcile_unconfirmed(
+                     paths, job_id, history_fact_reason, now
+                 )
+-            history_identifiers = []
+-        else:
+-            history_identifiers = _margin_history_transaction_ids(
+-                history_payload, params["asset"]
+-            )
+-            if history_identifiers is None \
+-                    or _margin_history_confirmation(
+-                        history_payload, transaction_id, expected,
+-                        params["type"],
+-                    ) is None:
+-                return _margin_reconcile_unconfirmed(
+-                    paths, job_id, "MARGIN_CONFIRMATION_MISMATCH", now
+-                )
+-        account_result = transport(
+-            "GET", basis_executor.SPOT.base_url,
+-            MARGIN_ACCOUNT_PATH, {}, True,
++
++        liability_reason, liability_after = _read_margin_liability(
++            services, params["asset"]
+         )
+-        if type(account_result) is not tuple \
+-                or len(account_result) != 2 \
+-                or account_result[0] != "ok":
++        if liability_reason or liability_after is None:
+             return _margin_reconcile_unconfirmed(
+-                paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+-            )
+-        # The exact-id read binds the target row. Only the frozen allowlist,
+-        # job ledger, and exchange facts may use the four-field REPAY law.
++                paths, job_id,
++                liability_reason or "MARGIN_CONFIRMATION_UNREADABLE", now
++            )
+         if legacy_receipt:
+-            history_reason, _history_after, history_identifiers, \
++            history_reason, history_after, history_identifiers, \
+                 legacy_exclusivity_proof = \
+-                _margin_legacy_exclusivity_snapshot(
+-                    transport, basis_executor.SPOT.base_url,
+-                    ready["endpoint_path"], params["asset"], transaction_id,
++                _read_margin_legacy_exclusivity(
++                    services, params["asset"], transaction_id,
+                     source.get("mutation_started_utc"), now,
+                 )
+         else:
+-            history_reason, _history_after, history_identifiers = \
+-                _margin_history_snapshot(
+-                    transport, basis_executor.SPOT.base_url,
+-                    ready["endpoint_path"], params["asset"],
++            history_reason, history_after, history_identifiers = \
++                _read_margin_history_snapshot(
++                    services, params["asset"]
+                 )
+         if history_reason:
+             return _margin_reconcile_unconfirmed(
+                 paths, job_id, history_reason, now
+             )
++        target = _margin_transaction_number(transaction_id)
++        snapshot_history = _margin_target_history(
++            history_after, params["type"], target or 0
++        )
++        if snapshot_history != exact_history:
++            return _margin_reconcile_unconfirmed(
++                paths, job_id, "MARGIN_CONFIRMATION_MISMATCH", now
++            )
+     except Exception:
+         return _margin_reconcile_unconfirmed(
+             paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+@@ -6579,22 +6214,31 @@
+ 
+     if legacy_repay:
+         confirmation = _evaluate_legacy_repay_confirmation(
+-            history_payload, history_identifiers, transaction_id,
++            exact_history, history_identifiers, transaction_id,
+             history_watermark, expected, liability_before,
+-            account_result[1],
++            liability_after,
+         )
+     elif legacy_receipt:
+         confirmation = _evaluate_legacy_margin_confirmation(
+-            history_payload, history_identifiers, transaction_id, expected,
+-            params["type"], account_result[1], legacy_exclusivity_proof,
++            exact_history, history_identifiers, transaction_id, expected,
++            params["type"], liability_after, legacy_exclusivity_proof,
+         )
+     else:
+-        account_before_payload = {"userAssets": [liability_before]}
+-        confirmation = _evaluate_margin_confirmation(
+-            history_payload, history_identifiers, transaction_id,
+-            history_watermark, expected, params["type"], liability_before,
+-            account_before_payload, account_result[1],
++        adapter_operation = _margin_operation_from_receipt(
++            services, ready, liability_before, source.get("sha")
+         )
++        typed_before = _margin_liability_from_receipt(
++            liability_before, params["asset"]
++        )
++        if adapter_operation is None or typed_before is None:
++            return _margin_reconcile_unconfirmed(
++                paths, job_id, "SOURCE_READY_MISMATCH", now
++            )
++        confirmation = _evaluate_typed_margin_confirmation(
++            services, history_after, history_identifiers,
++            transaction_id, history_watermark, adapter_operation,
++            typed_before, liability_after,
++        )
+     if confirmation.verdict == "UNKNOWN" \
+             or confirmation.ledger_confirmation is None \
+             or confirmation.account_liability is None \
+@@ -6950,9 +6594,9 @@
+             after_liability = source["account_liability"]
+             if legacy_source:
+                 _release_require(
+-                    _margin_account_liability({
+-                        "userAssets": [after_liability]
+-                    }, validated.symbol) == after_liability
++                    _margin_liability_from_receipt(
++                        after_liability, validated.symbol
++                    ) is not None
+                     and _legacy_current_liability_matches(
+                         after_liability, principal
+                     ),
+@@ -6969,12 +6613,12 @@
+                     "SOURCE_RECEIPT", "account_liability_before", job_id,
+                 )
+                 _release_require(
+-                    _margin_account_liability({
+-                        "userAssets": [before_liability]
+-                    }, validated.symbol) == before_liability
+-                    and _margin_account_liability({
+-                        "userAssets": [after_liability]
+-                    }, validated.symbol) == after_liability
++                    _margin_liability_from_receipt(
++                        before_liability, validated.symbol
++                    ) is not None
++                    and _margin_liability_from_receipt(
++                        after_liability, validated.symbol
++                    ) is not None
+                     and _margin_liability_direction_confirmed(
+                         before_liability, after_liability, principal, "BORROW"
+                     ),
