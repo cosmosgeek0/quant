@@ -7,7 +7,7 @@ plain operator output. It never retries or repairs a live mutation.
 """
 
 import json, os, secrets, sys, time
-from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN, localcontext
+from decimal import Decimal, DecimalException, InvalidOperation
 
 from execution import binance_http, binance_spot
 
@@ -44,11 +44,6 @@ def balances_of(acct, *assets):
     and deletes this use (map rows 006, 007, 121)."""
     free = {b["asset"]: d(b["free"]) for b in acct.get("balances", [])}
     return {a: free.get(a, Decimal(0)) for a in assets}
-
-def floor_step(quantity, step):
-    if not isinstance(quantity, Decimal) or not isinstance(step, Decimal) or step <= 0: raise ValueError("quantity and step must be positive Decimals")
-    return (quantity // step) * step
-
 
 def utc(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -123,6 +118,26 @@ def _fee_amount(fees, asset):
     return next((fee.amount for fee in fees if fee.asset == asset), Decimal(0))
 
 
+def _fill_rows(fills):
+    return [{"trade_id": f.trade_id, "order_id": f.order_id, "price": fmt(f.price),
+             "quantity": fmt(f.quantity), "quote_quantity": fmt(f.quote_quantity),
+             "commission_asset": f.fee.asset, "commission": fmt(f.fee.amount), "side": f.side,
+             "is_maker": f.is_maker, "time_ms": f.time_ms} for f in fills]
+
+
+def _record_coverage(side, order, coverage):
+    fills = coverage.fills if coverage is not None else order.response_fills
+    with binance_http.exact_context(): full_quantity = sum((fill.quantity for fill in order.response_fills), Decimal(0))
+    fees = coverage.fees if coverage is not None else binance_spot.fees_by_asset(fills)
+    complete = bool(coverage is not None and coverage.complete)
+    receipt[side].update({"fills": _fill_rows(fills), "fills_complete": complete,
+        "covered_quantity": fmt(coverage.covered_quantity if coverage else full_quantity),
+        "coverage_source": "FULL" if full_quantity == order.executed_quantity else "myTrades",
+        "fee_by_asset": _fee_map(fees)})
+    ctx[side + "_fills"], ctx[side + "_coverage_complete"] = fills, complete
+    save(); return fees
+
+
 def write_intent(intent):
     """Durably attach one adapter intent to its owned side before any wire."""
     try:
@@ -160,14 +175,13 @@ def wrap_up(verdict, note, code):
     open_after = state.open_order_ids if state is not None else None
     if final is None or open_after is None:
         first_fail("final_account_state", _read_note(account) if account else "unproved")
-    fees, commissions = None, "UNKNOWN"
-    if ctx.get("buy_coverage_complete") and ctx.get("sell_coverage_complete"):
-        all_fills = tuple(ctx["buy_fills"]) + tuple(ctx["sell_fills"])
-        try:
-            fees = binance_spot.fees_by_asset(all_fills)
-            commissions = _fee_map(fees)
-        except binance_http.AdapterRefusal as error:
-            first_fail("final_fees", error)
+    fills_complete = bool(ctx.get("buy_coverage_complete") and ctx.get("sell_coverage_complete"))
+    all_fills = tuple(ctx.get("buy_fills", ())) + tuple(ctx.get("sell_fills", ()))
+    try:
+        known_fees = binance_spot.fees_by_asset(all_fills); commissions = _fee_map(known_fees)
+    except binance_http.AdapterRefusal as error:
+        known_fees, commissions = None, {}; first_fail("final_fees", error)
+    fees = known_fees if fills_complete else None
     quote_spent, quote_received = ctx.get("quote_spent"), ctx.get("quote_recv")
     net_cost = None
     if (isinstance(quote_spent, Decimal) and isinstance(quote_received, Decimal)
@@ -176,8 +190,7 @@ def wrap_up(verdict, note, code):
             with binance_http.exact_context():
                 net_cost = quote_spent - quote_received + _fee_amount(fees, quote)
         except DecimalException: first_fail("final_quote_cost", "arithmetic is not exact")
-    result = {
-        "commissions": commissions,
+    result = {"commissions": commissions, "fills_complete": fills_complete,
         "quote_spent": fmt(quote_spent) if isinstance(quote_spent, Decimal) else "UNKNOWN",
         "quote_received": fmt(quote_received) if isinstance(quote_received, Decimal) else "UNKNOWN",
         "net_quote_cost_incl_fees": fmt(net_cost) if net_cost is not None else "UNKNOWN",
@@ -186,6 +199,11 @@ def wrap_up(verdict, note, code):
         "final_quote_free": fmt(final[quote]) if final else "UNKNOWN",
         "open_orders_after": len(open_after) if open_after is not None else "UNKNOWN"}
     receipt["result"] = result
+    receipt["legs"] = [{"stage": side.upper(), "market": "spot", "side": side.upper(),
+         "status": leg.get("status") or "UNKNOWN", "executed_qty": leg.get("executed_qty", "UNKNOWN"),
+         "quote": leg.get("quote_spent", leg.get("quote_received", "UNKNOWN")),
+         "order_id": leg.get("order_id", ""), "fee_by_asset": leg.get("fee_by_asset", {})}
+        for side in ("buy", "sell") for leg in (receipt.get(side),) if isinstance(leg, dict)]
     save()
     for side in ("buy", "sell"):
         order = receipt.get(side, {})
@@ -206,7 +224,7 @@ def wrap_up(verdict, note, code):
         elif open_after:
             verdict, code = "OPEN_EXPOSURE", 3
             note = "%s open order(s) remain on %s; no repair order was sent" % (len(open_after), SYMBOL)
-        elif fees is None or not ctx.get("buy_coverage_complete") or not ctx.get("sell_coverage_complete"):
+        elif fees is None:
             verdict, code = "UNKNOWN", 4
             note = "orders are terminal but complete fill and fee proof is unavailable"
         else:
@@ -281,6 +299,7 @@ def main():
     market = market_read.value
     base, quote = market.base_asset, market.quote_asset
     ctx.update({"base": base, "quote": quote, "step": market.step_size})
+    receipt["base_asset"], receipt["quote_asset"] = base, quote
     account_read = binance_spot.read_account_state(transport, BASE_URL, SYMBOL)
     state = account_read.value if account_read.kind == "ok" else None
     start = _balance_pair(state, base, quote)
@@ -332,21 +351,12 @@ def main():
         "sellability_cushion": fmt(sellability_cushion)})
     save()
     try:
-        with localcontext() as arithmetic:
-            arithmetic.prec = 60
-            arithmetic.rounding = ROUND_DOWN
-            bought_estimate = floor_step(quote_spend / price, market.step_size)
-            sell_estimate = floor_step(
-                bought_estimate * (Decimal(1) - sellability_cushion), market.step_size)
-            feasible = (sell_estimate >= market.min_quantity
-                        and sell_estimate * price >= market.min_notional)
-            needed = max(market.min_quantity, market.min_notional / price)
-            sufficient_quote = ((needed + 2 * market.step_size) * price
-                                / (Decimal(1) - sellability_cushion))
-    except (ArithmeticError, DecimalException, ValueError): refuse("sellability arithmetic is unproved")
-    if not feasible:
-        refuse("approved amount is too small to sell back; sufficient minimum is about %s %s" %
-               (fmt(sufficient_quote), quote))
+        with binance_http.exact_context():
+            estimated_buy = binance_spot.build_market_order(
+                market, "SELL", sell_id, QUANT_SHA, quantity=quote_spend / price)
+            binance_spot.build_market_order(market, "SELL", sell_id, QUANT_SHA,
+                quantity=estimated_buy.quantity * (Decimal(1) - sellability_cushion))
+    except (ArithmeticError, binance_http.AdapterRefusal): refuse("approved amount is too small to sell back after fees and fresh filters")
 
     receipt["buy"] = {"submitted_utc": utc()}
     save()
@@ -362,29 +372,25 @@ def main():
         wrap_up("UNKNOWN", "the terminal BUY lacks exact quantities", 4)
     ctx["quote_spent"] = quote_spent
     receipt["buy"].update({
-        "order_id": buy.identity.order_id, "status": buy.status,
+        "order_id": buy.identity.order_id, "status": buy.status, "terminal_utc": utc(),
         "executed_qty": fmt(executed), "quote_spent": fmt(quote_spent)})
     save()
     if executed == 0: finish("REJECTED_BEFORE_BUY", "the terminal BUY executed zero quantity", 2)
     buy_fill_read = binance_spot.read_fills(transport, BASE_URL, buy)
     buy_coverage = buy_fill_read.value if buy_fill_read.kind == "ok" else None
+    try:
+        buy_fees = _record_coverage("buy", buy, buy_coverage)
+    except (binance_http.AdapterRefusal, DecimalException) as error:
+        ctx.pop("residual", None); first_fail("buy_fees", error)
+        wrap_up("UNKNOWN", "the BUY fee proof is unavailable", 4)
     if buy_coverage is None:
         ctx.pop("residual", None)
         first_fail("buy_fills", _read_note(buy_fill_read))
-        wrap_up("OPEN_EXPOSURE", "the BUY executed but complete fill and fee proof is unavailable", 3)
-    ctx["buy_fills"] = buy_coverage.fills
-    try:
-        buy_fees = binance_spot.fees_by_asset(buy_coverage.fills)
-        receipt["buy"]["fee_by_asset"] = _fee_map(buy_fees)
-    except binance_http.AdapterRefusal as error:
-        ctx.pop("residual", None)
-        first_fail("buy_fees", error)
-        wrap_up("OPEN_EXPOSURE", "the BUY fee proof is unavailable", 3)
+        wrap_up("UNKNOWN", "the BUY executed but complete fill and fee proof is unavailable", 4)
     if not buy_coverage.complete:
         ctx.pop("residual", None)
         first_fail("buy_fills", "fill coverage is incomplete")
-        wrap_up("OPEN_EXPOSURE", "the BUY fill ledger is incomplete, so no SELL was sized", 3)
-    ctx["buy_coverage_complete"] = True
+        wrap_up("UNKNOWN", "the BUY fill ledger is incomplete, so no SELL was sized", 4)
     try:
         net_base = binance_spot.net_base_quantity(executed, base, buy_fees)
     except binance_http.AdapterRefusal as error:
@@ -405,9 +411,9 @@ def main():
             fresh_market, "SELL", sell_id, QUANT_SHA, quantity=net_base)
     except binance_http.AdapterRefusal:
         wrap_up("OPEN_EXPOSURE", "the run-owned net base cannot satisfy fresh SELL filters", 3)
-    receipt["sell"] = {
-        "submitted_utc": utc(), "quantity": fmt(sell_plan.quantity),
-        "planned_residual": fmt(sell_plan.residual)}
+    receipt["sell"] = {"submitted_utc": utc(), "quantity": fmt(sell_plan.quantity),
+                       "planned_residual": fmt(sell_plan.residual),
+                       "fresh_step": fmt(fresh_market.step_size)}
     save()
     try:
         sell = binance_spot.submit_order_once(
@@ -425,30 +431,26 @@ def main():
         wrap_up("UNKNOWN", "the terminal SELL lacks exact quantities", 4)
     ctx["quote_recv"] = quote_received
     receipt["sell"].update({
-        "order_id": sell.identity.order_id, "status": sell.status,
+        "order_id": sell.identity.order_id, "status": sell.status, "terminal_utc": utc(),
         "executed_qty": fmt(sold), "quote_received": fmt(quote_received)})
     save()
     if sold == 0:
         wrap_up("OPEN_EXPOSURE", "the terminal SELL executed zero quantity", 3)
     sell_fill_read = binance_spot.read_fills(transport, BASE_URL, sell)
     sell_coverage = sell_fill_read.value if sell_fill_read.kind == "ok" else None
+    try:
+        sell_fees = _record_coverage("sell", sell, sell_coverage)
+    except (binance_http.AdapterRefusal, DecimalException) as error:
+        ctx.pop("residual", None); first_fail("sell_fees", error)
+        wrap_up("UNKNOWN", "the SELL fee proof is unavailable", 4)
     if sell_coverage is None:
         ctx.pop("residual", None)
         first_fail("sell_fills", _read_note(sell_fill_read))
         wrap_up("UNKNOWN", "the SELL executed but its fill and fee proof is unavailable", 4)
-    ctx["sell_fills"] = sell_coverage.fills
-    try:
-        sell_fees = binance_spot.fees_by_asset(sell_coverage.fills)
-        receipt["sell"]["fee_by_asset"] = _fee_map(sell_fees)
-    except binance_http.AdapterRefusal as error:
-        ctx.pop("residual", None)
-        first_fail("sell_fees", error)
-        wrap_up("UNKNOWN", "the SELL fee proof is unavailable", 4)
     if not sell_coverage.complete:
         ctx.pop("residual", None)
         first_fail("sell_fills", "fill coverage is incomplete")
         wrap_up("UNKNOWN", "the SELL fill ledger is incomplete", 4)
-    ctx["sell_coverage_complete"] = True
     try:
         with binance_http.exact_context(): residual = net_base - sold - _fee_amount(sell_fees, base)
     except DecimalException:

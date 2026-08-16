@@ -14,6 +14,7 @@ import types
 import unittest
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -67,6 +68,43 @@ def utc(value):
     return value.isoformat().replace("+00:00", "Z")
 
 
+def execution_services(transport, sleep=lambda _delay: None):
+    return jr.ExecutionServices(
+        transport=transport,
+        spot_base_url=jr.binance_http.SPOT_BASE_URL,
+        futures_base_url=jr.binance_http.FUTURES_BASE_URL,
+        sleep=sleep,
+        margin_build_borrow=jr.binance_margin.build_borrow,
+        margin_build_repay=jr.binance_margin.build_repay,
+        margin_read_history_by_direction=
+        jr.binance_margin.read_history_by_direction,
+        margin_read_history_by_tx_id=
+        jr.binance_margin.read_history_by_tx_id,
+        margin_read_liability=jr.binance_margin.read_liability,
+        margin_submit_once=jr.binance_margin.submit_once,
+        margin_confirm=jr.binance_margin.confirm,
+        futures_read_market=jr.binance_futures.read_market,
+        futures_read_preflight=jr.binance_futures.read_preflight,
+        futures_set_leverage_1x_once=
+        jr.binance_futures.set_leverage_1x_once,
+        futures_build_open_order=jr.binance_futures.build_open_order,
+        futures_build_reduce_only_close=
+        jr.binance_futures.build_reduce_only_close,
+        futures_query_order=jr.binance_futures.query_order,
+        futures_submit_order_once=jr.binance_futures.submit_order_once,
+        futures_read_fills=jr.binance_futures.read_fills,
+        futures_read_income=jr.binance_futures.read_income,
+        spot_read_market=jr.binance_spot.read_market,
+        spot_read_account_state=jr.binance_spot.read_account_state,
+        spot_build_market_order=jr.binance_spot.build_market_order,
+        spot_query_order=jr.binance_spot.query_order,
+        spot_submit_order_once=jr.binance_spot.submit_order_once,
+        spot_read_fills=jr.binance_spot.read_fills,
+        spot_fees_by_asset=jr.binance_spot.fees_by_asset,
+        spot_net_base_quantity=jr.binance_spot.net_base_quantity,
+    )
+
+
 def momentum_symbol_info():
     return {
         "symbol": "TSTUSDT",
@@ -85,14 +123,14 @@ def momentum_symbol_info():
             },
             {
                 "filterType": "LOT_SIZE",
-                "stepSize": "0.001",
-                "minQty": "0.001",
+                "stepSize": "0.01",
+                "minQty": "0.01",
                 "maxQty": "1000",
             },
             {
                 "filterType": "MARKET_LOT_SIZE",
-                "stepSize": "0.001",
-                "minQty": "0.001",
+                "stepSize": "0.01",
+                "minQty": "0.01",
                 "maxQty": "500",
             },
             {"filterType": "MIN_NOTIONAL", "notional": "5"},
@@ -112,16 +150,24 @@ class LeverageTransport:
         self.current = 1
 
     def __call__(self, method, base_url, path, params=None, signed=False):
-        call = (method, path, dict(params or {}), signed)
+        values = dict(params or ())
+        call = (method, path, values, signed)
         self.calls.append(call)
         self.events.append(("leverage", call))
+        if base_url != jr.binance_http.FUTURES_BASE_URL:
+            raise AssertionError("leverage used the wrong venue")
         if method == "GET" and path == "/fapi/v1/symbolConfig":
-            symbol = (params or {}).get("symbol", "")
-            return "ok", [{"symbol": symbol, "leverage": str(self.current)}]
+            symbol = values.get("symbol", "")
+            return jr.binance_http.HttpResult(
+                "ok", [{"symbol": symbol, "leverage": str(self.current)}],
+                None, None,
+            )
         if method == "POST" and path == "/fapi/v1/leverage" \
-                and (params or {}).get("leverage") == "1":
+                and values.get("leverage") == "1":
             self.current = 1
-            return "ok", {"leverage": 1}
+            return jr.binance_http.HttpResult(
+                "ok", {"leverage": 1}, None, None
+            )
         raise AssertionError("unexpected leverage transport call")
 
 
@@ -144,11 +190,11 @@ class MarginTransport:
         params = dict(params or {})
         call = (method, base_url, path, params, signed)
         self.calls.append(call)
-        if base_url != jr.basis_executor.SPOT.base_url or not signed:
+        if base_url != jr.binance_http.SPOT_BASE_URL or not signed:
             raise AssertionError("margin request was not a signed Spot call")
         if method == "POST" and path == jr.MARGIN_ENDPOINT_PATH:
             self.operation = dict(params)
-            return self.post_kind, self.post_payload
+            return self.result(self.post_kind, self.post_payload)
         if method == "GET" and path == jr.MARGIN_ENDPOINT_PATH:
             request_type = params.get("type")
             if request_type not in {"BORROW", "REPAY"}:
@@ -157,22 +203,32 @@ class MarginTransport:
                 payload = self.history_before_payloads.get(
                     request_type, {"rows": []}
                 )
-                return self.history_kind, payload
+                return self.result(
+                    self.history_kind, self.history_payload_for(payload, params)
+                )
             sequence = self.history_after_sequences.get(request_type)
             if sequence:
-                return self.history_kind, sequence.pop(0)
-            if request_type in self.history_after_payloads:
-                return (
+                return self.result(
                     self.history_kind,
-                    self.history_after_payloads[request_type],
+                    self.history_payload_for(sequence.pop(0), params),
+                )
+            if request_type in self.history_after_payloads:
+                return self.result(
+                    self.history_kind, self.history_payload_for(
+                        self.history_after_payloads[request_type], params
+                    ),
                 )
             if self.history_payload is not None:
                 payload = self.history_payload \
                     if request_type == self.operation["type"] \
                     else {"rows": []}
-                return self.history_kind, payload
+                return self.result(
+                    self.history_kind, self.history_payload_for(payload, params)
+                )
             if request_type != self.operation["type"]:
-                return self.history_kind, {"rows": []}
+                return self.result(
+                    self.history_kind, {"rows": [], "total": 0}
+                )
             transaction_id = self.post_payload.get(
                 "tranId", self.post_payload.get("txId", "")
             )
@@ -197,38 +253,103 @@ class MarginTransport:
                     "interest": before["interest"],
                 })
             else:
-                row["principal"] = self.operation["amount"]
-            return self.history_kind, {"rows": [row]}
-        if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
+                row.update({
+                    "amount": self.operation["amount"],
+                    "principal": self.operation["amount"], "interest": "0",
+                })
+            row["timestamp"] = int(NOW.timestamp() * 1000)
+            return self.result(
+                self.history_kind, {"rows": [row], "total": 1}
+            )
+        if method == "GET" and path == "/sapi/v1/margin/account":
             if self.operation is None:
                 if self.account_before_payload is not None:
-                    return self.account_kind, self.account_before_payload
-                return self.account_kind, {"userAssets": [{
+                    return self.result(
+                        self.account_kind, self.account_before_payload
+                    )
+                return self.result(self.account_kind, {"userAssets": [{
                     "asset": "USDT",
                     "borrowed": "0",
                     "interest": "0",
-                }]}
+                }]})
             if self.account_payload is not None:
-                return self.account_kind, self.account_payload
+                return self.result(self.account_kind, self.account_payload)
             borrowed = self.operation["amount"] \
                 if self.operation["type"] == "BORROW" else "0"
-            return self.account_kind, {"userAssets": [{
+            return self.result(self.account_kind, {"userAssets": [{
                 "asset": self.operation["asset"],
                 "borrowed": borrowed,
                 "interest": "0",
-            }]}
+            }]})
         raise AssertionError("unexpected margin request")
 
+    @staticmethod
+    def history_payload_for(payload, params):
+        if not isinstance(payload, dict) or not isinstance(
+                payload.get("rows"), list):
+            return payload
+        converted = dict(payload)
+        rows = []
+        for value in payload["rows"]:
+            if not isinstance(value, dict):
+                rows.append(value)
+                continue
+            row = dict(value)
+            if type(row.get("txId")) is str and row["txId"].isdigit():
+                row["txId"] = int(row["txId"])
+            if type(row.get("txId")) is int \
+                    and type(row.get("asset")) is str \
+                    and type(row.get("status")) is str \
+                    and type(row.get("type")) is str:
+                row.setdefault("timestamp", int(NOW.timestamp() * 1000))
+                direction = params.get("type")
+                if direction == "BORROW":
+                    principal = row.get("principal", row.get("amount"))
+                    interest = row.get("interest", "0")
+                    if type(principal) is str and type(interest) is str:
+                        try:
+                            amount = Decimal(principal) + Decimal(interest)
+                        except ArithmeticError:
+                            pass
+                        else:
+                            row.setdefault("principal", principal)
+                            row.setdefault("interest", interest)
+                            row.setdefault("amount", format(amount, "f"))
+            rows.append(row)
+        if "txId" in params:
+            rows = [row for row in rows if isinstance(row, dict)
+                    and str(row.get("txId")) == str(params["txId"])]
+        converted["rows"] = rows
+        converted["total"] = len(rows)
+        return converted
 
-class MomentumReadTransport:
-    """Serve complete signed momentum snapshots at the HTTP boundary."""
+    @staticmethod
+    def result(kind, payload):
+        if kind == "ok":
+            return jr.binance_http.HttpResult("ok", payload, None, None)
+        code = payload.get("code") if isinstance(payload, dict) else None
+        code = code if type(code) is int else None
+        message = payload.get("msg") if isinstance(payload, dict) else None
+        message = message if type(message) is str else "offline_result"
+        if kind == "api_error":
+            return jr.binance_http.HttpResult(
+                "api_error", None, code, message
+            )
+        return jr.binance_http.HttpResult("unclear", None, code, message)
 
-    def __init__(self, events):
+
+class FuturesTransport:
+    """Serve complete typed Futures rows through one injected transport."""
+
+    def __init__(self, owner, leverage):
+        self.owner = owner
+        self.leverage = leverage
         self.calls = []
-        self.events = events
         self.snapshots = []
         self.active = None
         self.position_failures = []
+        self.quantity = Decimal("0")
+        self.orders = {}
 
     def queue(self, risks, positions, orders=(), leverage=1):
         self.snapshots.append({
@@ -248,24 +369,171 @@ class MomentumReadTransport:
             (kind, dict(payload)) for _unused in range(count)
         )
 
-    def __call__(self, method, path, params=None, signed=False):
+    def current_snapshot(self):
+        row = {
+            "symbol": "TSTUSDT", "positionSide": "BOTH",
+            "positionAmt": format(self.quantity, "f"),
+            "markPrice": "200",
+        }
+        return {
+            "/fapi/v3/positionRisk": [dict(row)],
+            "/fapi/v3/account": {"positions": [dict(row)]},
+            "/fapi/v1/openOrders": [],
+            "/fapi/v1/symbolConfig": [{
+                "symbol": "TSTUSDT", "leverage": str(self.leverage.current),
+            }],
+        }
+
+    def start_snapshot(self):
+        if self.active is None:
+            if self.position_failures:
+                self.active = self.current_snapshot()
+            elif self.snapshots:
+                self.active = self.snapshots.pop(0)
+            else:
+                self.active = self.current_snapshot()
+
+    @staticmethod
+    def result(payload):
+        return jr.binance_http.HttpResult("ok", payload, None, None)
+
+    def order_row(self, wire):
+        close = wire["reduceOnly"] == "true"
+        quantity = Decimal(wire["quantity"])
+        price = Decimal("205") if close else Decimal("200")
+        quote = quantity * price
+        if not close and self.owner.open_quote_override is not None:
+            quote = Decimal(self.owner.open_quote_override)
+        row = {
+            "symbol": "TSTUSDT", "clientOrderId": wire["newClientOrderId"],
+            "orderId": 2202 if close else 1101, "status": "FILLED",
+            "side": wire["side"], "reduceOnly": close,
+            "executedQty": format(quantity, "f"),
+            "cumQuote": format(quote, "f"),
+            "trade_id": 92 if close else 91, "price": price,
+        }
+        return row
+
+    def __call__(self, method, base_url, path, params=None, signed=False):
+        if base_url != jr.binance_http.FUTURES_BASE_URL:
+            raise AssertionError("Futures request used the wrong venue")
         call = (method, path, dict(params or {}), signed)
         self.calls.append(call)
-        self.events.append(("momentum-read", call))
-        if method != "GET" or not signed:
-            raise AssertionError("momentum truth read was not a signed GET")
+        self.owner.momentum_http_calls.append(call)
+        wire = call[2]
+        if method == "GET" and path == "/fapi/v1/exchangeInfo":
+            return self.result({"symbols": [momentum_symbol_info()]})
+        if method == "GET" and path == "/fapi/v1/ticker/bookTicker":
+            return self.result({
+                "symbol": "TSTUSDT", "bidPrice": "199.99",
+                "askPrice": "200",
+            })
+        if method == "GET" and path == "/fapi/v1/premiumIndex":
+            mark = "200"
+            if self.snapshots:
+                rows = self.snapshots[0]["/fapi/v3/positionRisk"]
+                if rows and rows[0].get("markPrice") is not None:
+                    mark = rows[0]["markPrice"]
+            return self.result({"symbol": "TSTUSDT", "markPrice": mark})
+        if method == "GET" and path == "/fapi/v1/accountConfig":
+            return self.result({"canTrade": True})
+        if method == "GET" and path == "/fapi/v1/positionSide/dual":
+            return self.result({"dualSidePosition": False})
+        if method == "GET" and path == "/fapi/v3/balance":
+            return self.result([{"asset": "USDT", "availableBalance": "100"}])
+        if method == "GET" and path == "/fapi/v3/account":
+            self.start_snapshot()
+            return self.result(self.active[path])
+        if method == "GET" and path == "/fapi/v1/openOrders":
+            self.start_snapshot()
+            return self.result(self.active[path])
         if path == "/fapi/v3/positionRisk" and self.position_failures:
-            return self.position_failures.pop(0)
-        if path == "/fapi/v3/positionRisk":
-            if self.active is not None or not self.snapshots:
-                raise AssertionError("unexpected momentum snapshot start")
-            self.active = self.snapshots.pop(0)
-        if self.active is None or path not in self.active:
-            raise AssertionError("unexpected momentum truth read: " + path)
-        payload = self.active[path]
-        if path == "/fapi/v1/symbolConfig":
+            kind, payload = self.position_failures.pop(0)
+            if not self.position_failures:
+                self.active = None
+            return jr.binance_http.HttpResult(
+                kind, None, payload.get("code"), "offline_position_read"
+            )
+        if method == "GET" and path == "/fapi/v3/positionRisk":
+            self.start_snapshot()
+            return self.result(self.active[path])
+        if method == "GET" and path == "/fapi/v1/symbolConfig" \
+                and self.active is not None:
+            payload = self.active[path]
             self.active = None
-        return "ok", payload
+            return self.result(payload)
+        if path == "/fapi/v1/symbolConfig":
+            return self.leverage(method, base_url, path, params, signed)
+        if method == "POST" and path == "/fapi/v1/leverage":
+            return self.leverage(method, base_url, path, params, signed)
+        if method == "POST" and path == "/fapi/v1/order":
+            self.owner.momentum_intents.append(dict(wire))
+            state = json.loads(Path(
+                jr._paths(self.owner.receipt_dir)["momentum_position"]
+            ).read_text(encoding="utf-8"))
+            if state["pending_intent"]["job_op"] in {
+                    "FUTURES_ROUNDTRIP", "MOMENTUM_ROUNDTRIP"} \
+                    and state["pending_intent"]["action"] == "OPEN":
+                self.owner.hand_calls.append({"intent": dict(wire)})
+                self.owner.events.append(("futures", dict(wire)))
+            if self.owner.momentum_query_state != "terminal" \
+                    or self.owner.hand_verdict != "CLOSED":
+                return jr.binance_http.HttpResult(
+                    "unclear", None, None, "offline_pending_order"
+                )
+            order = self.order_row(wire)
+            self.orders[wire["newClientOrderId"]] = order
+            self.owner.momentum_order = dict(order)
+            self.quantity = Decimal("0") \
+                if order["reduceOnly"] else Decimal(order["executedQty"])
+            return self.result({
+                "clientOrderId": wire["newClientOrderId"],
+                "reduceOnly": order["reduceOnly"],
+            })
+        if method == "GET" and path == "/fapi/v1/order":
+            order = self.orders.get(wire.get("origClientOrderId"))
+            if order is None:
+                return jr.binance_http.HttpResult(
+                    "unclear", None, None, "offline_order_pending"
+                )
+            return self.result(dict(order))
+        if method == "GET" and path == "/fapi/v1/userTrades":
+            order_id = int(wire["orderId"])
+            order = next(row for row in self.orders.values()
+                         if row["orderId"] == order_id)
+            return self.result([{
+                "symbol": "TSTUSDT", "id": order["trade_id"],
+                "orderId": order_id, "price": format(order["price"], "f"),
+                "qty": order["executedQty"], "quoteQty": order["cumQuote"],
+                "commission": "0.002" if order["reduceOnly"] else "0.003",
+                "commissionAsset": "USDT", "side": order["side"],
+                "buyer": order["side"] == "BUY", "maker": False,
+                "time": 1, "realizedPnl": "0.25"
+                if order["reduceOnly"] else "0",
+            }])
+        if method == "GET" and path == "/fapi/v1/income":
+            order = next(row for row in self.orders.values()
+                         if row["reduceOnly"])
+            return self.result([{
+                "tranId": 501, "symbol": "TSTUSDT",
+                "incomeType": "REALIZED_PNL", "income": "0.25",
+                "asset": "USDT", "time": int(wire["startTime"]) + 1,
+                "tradeId": order["trade_id"],
+            }])
+        raise AssertionError("unexpected Futures request: %s %s" % (
+            method, path,
+        ))
+
+
+class ExecutionTransport:
+    def __init__(self, margin, futures):
+        self.margin = margin
+        self.futures = futures
+
+    def __call__(self, method, base_url, path, params=None, signed=False):
+        target = self.margin if base_url == jr.binance_http.SPOT_BASE_URL \
+            else self.futures
+        return target(method, base_url, path, params, signed)
 
 
 _SAME_POSITION = object()
@@ -287,15 +555,24 @@ class JobRunnerTests(unittest.TestCase):
         self.hand_exit = 0
         self.leverage = LeverageTransport(self.events)
         self.margin = MarginTransport()
-        self.margin_sleep_delays = []
-        self.momentum_reads = MomentumReadTransport(self.events)
         self.momentum_intents = []
         self.momentum_order = None
-        self.momentum_plan_caps = []
         self.momentum_query_state = "terminal"
         self.momentum_http_calls = []
-        self.momentum_preflight = False
         self.open_quote_override = None
+        self.momentum_reads = FuturesTransport(self, self.leverage)
+        self.margin_sleep_delays = []
+        self.execution_services = execution_services(
+            ExecutionTransport(self.margin, self.momentum_reads),
+            self.margin_sleep_delays.append,
+        )
+        self.real_build_execution_services = jr._build_execution_services
+        service_builder = mock.patch.object(
+            jr, "_build_execution_services",
+            side_effect=lambda: self.execution_services,
+        )
+        service_builder.start()
+        self.addCleanup(service_builder.stop)
         self.governor_budget = (True, "")
         self.governor_budget_calls = []
         self.governor_acquire_calls = []
@@ -354,20 +631,11 @@ class JobRunnerTests(unittest.TestCase):
             "QUANT_SHA": SHA,
             "BINANCE_API_KEY": "offline-key",
             "BINANCE_API_SECRET": "offline-secret",
+            "MAX_SLIPPAGE_BPS": "0",
         }, clear=False)
         env.start()
         self.addCleanup(env.stop)
 
-        factory = mock.patch.object(
-            jr.set_leverage_1x, "live_request_factory",
-            return_value=self.leverage,
-        )
-        factory.start()
-        self.addCleanup(factory.stop)
-
-        futures = mock.patch.object(jr.futures_hand, "main", self.fake_futures)
-        futures.start()
-        self.addCleanup(futures.stop)
         basis = mock.patch.object(jr.basis_executor, "main", self.fake_basis)
         basis.start()
         self.addCleanup(basis.stop)
@@ -416,8 +684,11 @@ class JobRunnerTests(unittest.TestCase):
         value.update(overrides)
         if explicit_tag is None:
             try:
-                value["client_tag"] = jr.margin_ops.deterministic_client_tag(
-                    value["op"], value["asset"], value["principal"],
+                amount = jr._canonical_decimal_text(
+                    Decimal(str(value["principal"]))
+                )
+                value["client_tag"] = jr._margin_client_tag(
+                    value["op"], value["asset"], amount,
                     value["expires_utc"],
                 )
             except ValueError:
@@ -448,25 +719,6 @@ class JobRunnerTests(unittest.TestCase):
             json.dump(value, handle)
         return value
 
-    def fake_futures(self):
-        index = len(self.hand_calls) + 1
-        self.events.append(("futures", list(sys.argv)))
-        self.hand_calls.append({
-            "argv": list(sys.argv),
-            "symbol": os.environ.get("SYMBOL"),
-            "max_notional": os.environ.get("MAX_NOTIONAL"),
-            "sha": os.environ.get("QUANT_SHA"),
-            "module_symbol": jr.futures_hand.SYMBOL,
-            "module_max_notional": jr.futures_hand.MAX_NOTIONAL_RAW,
-        })
-        path = os.path.join(
-            self.receipt_dir, "futures-hand-offline%s.json" % index
-        )
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"verdict": self.hand_verdict}, handle)
-        jr.futures_hand.receipt_path = path
-        raise SystemExit(self.hand_exit)
-
     def fake_basis(self, argv):
         index = len(self.basis_calls) + 1
         self.basis_calls.append({
@@ -484,17 +736,156 @@ class JobRunnerTests(unittest.TestCase):
         return 0
 
     def tick(self, **kwargs):
+        kwargs.setdefault("execution_services", self.execution_services)
         return jr.tick(receipt_dir=self.receipt_dir, now=NOW, **kwargs)
 
-    def margin_tick(self, mutation_now=NOW, request=None):
+    def margin_services(self, request):
+        return execution_services(request, self.margin_sleep_delays.append)
+
+    def reconcile_margin(self, job_id, request=None, services=None):
+        return jr.reconcile_margin(
+            job_id, True, receipt_dir=self.receipt_dir, now=NOW,
+            execution_services=services or self.margin_services(
+                request or self.margin
+            ),
+        )
+
+    @staticmethod
+    def adapter_margin_row(**overrides):
+        row = {
+            "txId": 7301, "timestamp": int(NOW.timestamp() * 1000),
+            "asset": "USDT", "amount": "3", "principal": "3",
+            "interest": "0", "status": "CONFIRMED", "type": "MANUAL",
+        }
+        row.update(overrides)
+        return row
+
+    @staticmethod
+    def read_margin_history(rows, direction="BORROW", tx_id=7301):
+        def transport(*_args, **_kwargs):
+            return jr.binance_http.HttpResult(
+                "ok", {"rows": rows, "total": len(rows)}, None, None
+            )
+        return jr.binance_margin.read_history_by_tx_id(
+            transport, jr.binance_http.SPOT_BASE_URL, "USDT", direction,
+            tx_id, sleep=lambda _delay: None,
+        )
+
+    @staticmethod
+    def read_margin_liability(payload):
+        def transport(*_args, **_kwargs):
+            return jr.binance_http.HttpResult("ok", payload, None, None)
+        return jr.binance_margin.read_liability(
+            transport, jr.binance_http.SPOT_BASE_URL, "USDT",
+            sleep=lambda _delay: None,
+        )
+
+    def test_execution_service_fixture_binds_the_frozen_adapter_surface(self):
+        transport = lambda *_args, **_kwargs: jr.binance_http.HttpResult(
+            "unclear", None, None, "offline"
+        )
+        services = execution_services(transport)
+        self.assertEqual(tuple(services.__dataclass_fields__), (
+            "transport", "spot_base_url", "futures_base_url", "sleep",
+            "margin_build_borrow", "margin_build_repay",
+            "margin_read_history_by_direction",
+            "margin_read_history_by_tx_id", "margin_read_liability",
+            "margin_submit_once", "margin_confirm",
+            "futures_read_market", "futures_read_preflight",
+            "futures_set_leverage_1x_once", "futures_build_open_order",
+            "futures_build_reduce_only_close", "futures_query_order",
+            "futures_submit_order_once", "futures_read_fills",
+            "futures_read_income", "spot_read_market",
+            "spot_read_account_state", "spot_build_market_order",
+            "spot_query_order", "spot_submit_order_once",
+            "spot_read_fills", "spot_fees_by_asset",
+            "spot_net_base_quantity",
+        ))
+        self.assertIs(services.margin_submit_once,
+                      jr.binance_margin.submit_once)
+        self.assertIs(services.futures_submit_order_once,
+                      jr.binance_futures.submit_order_once)
+        self.assertIs(services.spot_submit_order_once,
+                      jr.binance_spot.submit_order_once)
+        one_call_fault = lambda *_args, **_kwargs: None
+        faulted = replace(services, margin_submit_once=one_call_fault)
+        self.assertIs(faulted.margin_submit_once, one_call_fault)
+        self.assertIs(faulted.transport, transport)
+
+    def test_execution_service_builder_syncs_each_needed_venue_once(self):
+        clients = []
+
+        class FakeClient:
+            def __init__(inner_self, key, secret):
+                inner_self.credentials = (key, secret)
+                inner_self.syncs = []
+                inner_self.calls = []
+                clients.append(inner_self)
+
+            def sync_time(inner_self, base_url, path):
+                inner_self.syncs.append((base_url, path))
+                return jr.binance_http.HttpResult(
+                    "ok", {"serverTime": 1}, None, None
+                )
+
+            def __call__(inner_self, method, base_url, path,
+                         params=None, signed=False):
+                inner_self.calls.append(
+                    (method, base_url, path, params, signed)
+                )
+                return jr.binance_http.HttpResult("ok", {}, None, None)
+
+        with mock.patch.object(jr.binance_http, "BinanceHttp", FakeClient):
+            services = self.real_build_execution_services()
+        spot = services.spot_base_url
+        futures = services.futures_base_url
+        services.transport("GET", spot, "/api/v3/exchangeInfo")
+        services.transport("GET", spot, "/api/v3/account", (), True)
+        services.transport("GET", spot, "/api/v3/openOrders", (), True)
+        services.transport("GET", futures, "/fapi/v3/account", (), True)
+        self.assertEqual(clients[0].credentials,
+                         ("offline-key", "offline-secret"))
+        self.assertEqual(clients[0].syncs, [
+            (spot, "/api/v3/time"),
+            (futures, "/fapi/v1/time"),
+        ])
+
+    def test_tick_forwards_one_injected_table_to_each_current_seam(self):
+        transport = lambda *_args, **_kwargs: jr.binance_http.HttpResult(
+            "unclear", None, None, "offline"
+        )
+        services = execution_services(transport)
+        self.job("service-seam")
+        outcome = jr.Outcome("REFUSED", 2, "", "SERVICE_SEAM_TEST")
+        with mock.patch.object(
+                jr, "_recover_pending_momentum", return_value=None
+        ) as recover, mock.patch.object(
+                jr, "_max_adverse_stop", return_value=(None, None, False)
+        ) as adverse, mock.patch.object(
+                jr, "_execute", return_value=outcome
+        ) as execute:
+            self.assertEqual(self.tick(execution_services=services), 2)
+        self.assertIs(recover.call_args.args[-1], services)
+        self.assertIs(adverse.call_args.args[-1], services)
+        self.assertIs(execute.call_args.kwargs["execution_services"],
+                      services)
+        self.assertEqual(jr.reconcile_margin(
+            "service-seam", False, receipt_dir=self.receipt_dir, now=NOW,
+            execution_services=services,
+        ), 3)
+
+    def margin_tick(self, mutation_now=NOW, request=None, services=None):
         transport = request or self.margin
-        transport.operation = None
+        if isinstance(transport, MarginTransport):
+            transport.operation = None
         with mock.patch.object(jr, "_utc_now", return_value=mutation_now), \
                 mock.patch.object(
                     jr.time, "sleep",
                     side_effect=self.margin_sleep_delays.append,
                 ):
-            return self.tick(margin_request=transport)
+            return self.tick(
+                execution_services=services or self.margin_services(transport),
+            )
 
     def results(self):
         path = os.path.join(self.jobs_dir, "results.jsonl")
@@ -772,14 +1163,6 @@ class JobRunnerTests(unittest.TestCase):
             self.jobs_dir, "basis_proof_passed"
         )).touch()
 
-    def fake_momentum_plan(self, effective):
-        self.momentum_plan_caps.append(effective)
-        return {
-            "quantity": effective / Decimal("200"),
-            "limit_price": Decimal("200"),
-            "current_leverage": 1,
-        }
-
     @staticmethod
     def momentum_row(quantity, position_side="BOTH", mark_price=None):
         row = {
@@ -807,116 +1190,13 @@ class JobRunnerTests(unittest.TestCase):
             risks, positions, leverage=leverage
         )
 
-    def fake_momentum_submit(self, intent):
-        self.momentum_intents.append(dict(intent))
-        if self.momentum_query_state != "terminal":
-            return self.momentum_query_state, None, [], "unclear"
-        close = str(intent["reduceOnly"]).lower() == "true"
-        quantity = Decimal(intent["quantity"])
-        price = Decimal("205") if close else Decimal("200")
-        quote = quantity * price
-        if not close and self.open_quote_override is not None:
-            quote = Decimal(self.open_quote_override)
-        order_id = "2202" if close else "1101"
-        commission = Decimal("0.002") if close else Decimal("0.003")
-        realized = Decimal("0.25") if close else Decimal("0")
-        order = {
-            "status": "FILLED",
-            "clientOrderId": intent["newClientOrderId"],
-            "orderId": order_id,
-            "executedQty": str(quantity),
-            "cumQuote": str(quote),
-            "avgPrice": str(price),
-            "reduceOnly": close,
-        }
-        fills = [{
-            "id": "92" if close else "91",
-            "orderId": order_id,
-            "qty": str(quantity),
-            "price": str(price),
-            "commission": str(commission),
-            "commissionAsset": "USDT",
-            "realizedPnl": str(realized),
-        }]
-        return "terminal", order, fills, "ok"
-
-    def momentum_http(self, method, path, params=None, signed=False):
-        call = (method, path, dict(params or {}), signed)
-        self.momentum_http_calls.append(call)
-        if method == "POST" and path == "/fapi/v1/order" and signed:
-            query_state, order, fills, kind = self.fake_momentum_submit(params)
-            self.assertEqual(query_state, "terminal")
-            self.momentum_order = dict(order)
-            response = dict(order)
-            response["fills"] = list(fills)
-            return kind, response
-        if method == "GET" and path == "/fapi/v1/order" and signed:
-            self.assertIsNotNone(self.momentum_order)
-            self.assertEqual(
-                (params or {}).get("origClientOrderId"),
-                self.momentum_order["clientOrderId"],
-            )
-            return "ok", dict(self.momentum_order)
-        if method == "GET" and path == "/fapi/v1/time" and not signed:
-            self.momentum_preflight = True
-            return "ok", {"serverTime": 1786708800000}
-        if self.momentum_preflight:
-            preflight = {
-                "/fapi/v1/exchangeInfo": {
-                    "symbols": [momentum_symbol_info()],
-                },
-                "/fapi/v1/ticker/bookTicker": {
-                    "bidPrice": "199.99",
-                    "askPrice": "200",
-                },
-                "/fapi/v1/premiumIndex": {"markPrice": "200"},
-                "/fapi/v1/accountConfig": {"canTrade": True},
-                "/fapi/v3/account": {
-                    "availableBalance": "100",
-                    "positions": [],
-                },
-                "/fapi/v1/positionSide/dual": {
-                    "dualSidePosition": False,
-                },
-                "/fapi/v1/openOrders": [],
-                "/fapi/v3/positionRisk": [],
-                "/fapi/v1/symbolConfig": [{
-                    "symbol": "TSTUSDT",
-                    "leverage": "1",
-                    "marginType": "CROSSED",
-                }],
-            }
-            if method != "GET" or path not in preflight:
-                raise AssertionError(
-                    "unexpected momentum preflight request: %s %s" % (
-                        method, path,
-                    )
-                )
-            if path == "/fapi/v1/symbolConfig":
-                self.momentum_preflight = False
-            return "ok", preflight[path]
-        return self.momentum_reads(method, path, params, signed)
-
     @contextmanager
     def momentum_runtime(self):
-        with mock.patch.object(
-                jr, "_momentum_open_plan",
-                side_effect=self.fake_momentum_plan), \
-                mock.patch.object(
-                    jr.futures_hand, "http", self.momentum_reads), \
-                mock.patch.object(
-                    jr, "_momentum_submit",
-                    side_effect=self.fake_momentum_submit):
-            yield
+        yield
 
     @contextmanager
     def momentum_http_runtime(self):
-        with mock.patch.object(
-                jr.futures_hand, "http", side_effect=self.momentum_http), \
-                mock.patch.object(
-                    jr.futures_hand.time, "sleep", return_value=None
-                ):
-            yield
+        yield
 
     def momentum_state(self):
         with open(os.path.join(
@@ -932,7 +1212,6 @@ class JobRunnerTests(unittest.TestCase):
         )
         cap = Decimal("32") if os.path.isfile(marker) else Decimal("8")
         effective = min(Decimal(str(max_notional)), cap)
-        self.queue_momentum_measurement(effective / Decimal("200"))
         self.job(
             job_id, op="MOMENTUM_OPEN", max_notional=max_notional
         )
@@ -950,7 +1229,6 @@ class JobRunnerTests(unittest.TestCase):
         cap = Decimal("32") if os.path.isfile(marker) else Decimal("8")
         effective = min(Decimal(str(max_notional)), cap)
         quantity = effective / Decimal("200")
-        self.queue_momentum_measurement(quantity)
         self.job(job_id, op="MOMENTUM_OPEN", max_notional=max_notional)
         with mock.patch.dict(
                 os.environ, {"MAX_SLIPPAGE_BPS": "0"}), \
@@ -984,12 +1262,12 @@ class JobRunnerTests(unittest.TestCase):
         self.job("clamped", max_notional=800)
         self.assertEqual(self.tick(), 0)
         self.assertEqual(len(self.hand_calls), 1)
-        self.assertEqual(self.hand_calls[0]["argv"], [
-            "futures_hand.py", "--short", "--execute"
-        ])
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["sha"], SHA)
+        self.assertEqual(
+            [intent["reduceOnly"] for intent in self.momentum_intents],
+            ["false", "true"],
+        )
+        self.assertEqual(self.momentum_intents[0]["quantity"], "0.04")
+        self.assertEqual(self.momentum_state()["effective_notional"], "8")
         self.assertEqual(len(self.leverage.calls), 2)
 
     def test_missing_expiry_is_recorded_and_never_executed(self):
@@ -1486,14 +1764,16 @@ class JobRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     jr.margin_ops, "build_margin_operation",
                     wraps=jr.margin_ops.build_margin_operation) as builder:
-            code = self.tick(margin_request=self.margin)
+            code = self.tick()
 
         self.assertEqual(code, 2)
         self.assertEqual(
             [call.args[2] for call in builder.call_args_list],
-            [NOW, NOW, boundary],
+            [NOW, boundary],
         )
-        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
         self.assertEqual(self.reason(self.results()[0]), "EXPIRED")
         self.assertEqual(
             self.margin_source(self.results()[0])["authority_checked_utc"],
@@ -1515,11 +1795,13 @@ class JobRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(code, 2)
-        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
         result = self.results()[0]
         self.assertEqual(self.reason(result), "ACCEPT_ONE_INVALID")
         source = self.margin_source(result)
-        self.assertEqual(source["mutation_attempts"], 0)
+        self.assertEqual(source["mutation_attempts"], 1)
         self.assertEqual(
             source["authority_checked_utc"],
             utc(NOW + timedelta(seconds=2)),
@@ -1543,7 +1825,9 @@ class JobRunnerTests(unittest.TestCase):
             code = self.margin_tick()
 
         self.assertEqual(code, 2)
-        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
         result = self.results()[0]
         self.assertEqual(self.reason(result), "OPERATOR_MISMATCH")
         self.assertEqual(
@@ -1555,26 +1839,25 @@ class JobRunnerTests(unittest.TestCase):
 
     def test_margin_borrow_rechecks_stop_jobs_at_post_boundary(self):
         self.margin_job("margin-stop-freshness")
-        persist = jr._persist_margin_source
+        claim = jr._claim_margin_intent
 
-        def seal_after_create(path, payload, create=False):
-            persist(path, payload, create=create)
-            if create:
-                Path(os.path.join(
-                    self.receipt_dir, "STOP-JOBS"
-                )).touch()
+        def seal_after_claim(*args, **kwargs):
+            result = claim(*args, **kwargs)
+            Path(os.path.join(self.receipt_dir, "STOP-JOBS")).touch()
+            return result
 
         with mock.patch.object(
-                jr, "_persist_margin_source",
-                side_effect=seal_after_create):
+                jr, "_claim_margin_intent", side_effect=seal_after_claim):
             code = self.margin_tick()
 
         self.assertEqual(code, 2)
-        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
         result = self.results()[0]
         self.assertEqual(self.reason(result), "STOP_JOBS_SEALED")
         self.assertEqual(
-            self.margin_source(result)["mutation_attempts"], 0
+            self.margin_source(result)["mutation_attempts"], 1
         )
         self.assertTrue(os.path.isfile(os.path.join(
             self.receipt_dir, "ACCEPT-ONE"
@@ -1608,13 +1891,15 @@ class JobRunnerTests(unittest.TestCase):
             code = self.margin_tick()
 
         self.assertEqual(code, 2)
-        self.assertEqual(self.margin.calls, [])
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
         result = self.results()[0]
         self.assertEqual(
             self.reason(result), "MARGIN_VALIDATION_UNKNOWN"
         )
         source = self.margin_source(result)
-        self.assertEqual(source["mutation_attempts"], 0)
+        self.assertEqual(source["mutation_attempts"], 1)
         self.assertEqual(source["authority_checked_utc"], utc(NOW))
         self.assertTrue(source["authority_stop_jobs_present"])
 
@@ -2015,16 +2300,11 @@ class JobRunnerTests(unittest.TestCase):
         )
 
     def test_mrv11_target_history_row_alone_confirms(self):
-        old_borrow = {"txId": "7200", "asset": "USDT"}
-        old_repay = {"txId": "7201", "asset": "USDT"}
-        target = {
-            "txId": "7301",
-            "asset": "USDT",
-            "principal": "3",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
+        old_borrow = self.adapter_margin_row(txId=7200, amount="1",
+                                              principal="1")
+        old_repay = self.adapter_margin_row(txId=7201, amount="1",
+                                             principal="1")
+        target = self.adapter_margin_row()
         self.margin.history_before_payloads = {
             "BORROW": {"rows": [old_borrow]},
             "REPAY": {"rows": [old_repay]},
@@ -2047,24 +2327,14 @@ class JobRunnerTests(unittest.TestCase):
         )
 
     def test_mrv11_later_unrelated_repay_row_is_unknown(self):
-        old_borrow = {"txId": "7200", "asset": "USDT"}
-        old_repay = {"txId": "7201", "asset": "USDT"}
-        target = {
-            "txId": "7301",
-            "asset": "USDT",
-            "principal": "2.5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
-        unrelated_repay = {
-            "txId": "7302",
-            "asset": "USDT",
-            "principal": "5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
+        old_borrow = self.adapter_margin_row(txId=7200, amount="1",
+                                              principal="1")
+        old_repay = self.adapter_margin_row(txId=7201, amount="1",
+                                             principal="1")
+        target = self.adapter_margin_row(amount="2.5", principal="2.5")
+        unrelated_repay = self.adapter_margin_row(
+            txId=7302, amount="5", principal="5"
+        )
         self.margin.history_before_payloads = {
             "BORROW": {"rows": [old_borrow]},
             "REPAY": {"rows": [old_repay]},
@@ -2106,26 +2376,20 @@ class JobRunnerTests(unittest.TestCase):
         }
         real_row = {
             "txId": 401344857108,
+            "timestamp": int(NOW.timestamp() * 1000),
             "asset": "USDT",
+            "amount": "2.5",
             "principal": "2.5",
+            "interest": "0",
             "status": "CONFIRMED",
-            "clientTag": "",
             "type": "MANUAL",
         }
-
-        self.assertEqual(
-            jr._margin_history_confirmation(
-                {"rows": [real_row]}, "401344857108", expected, "BORROW"
-            ),
-            expected,
-        )
-        self.assertEqual(
-            jr._margin_history_confirmation(
-                {"rows": [dict(real_row, type="AUTO")]},
-                "401344857108", expected, "BORROW",
-            ),
-            expected,
-        )
+        for origin in ("MANUAL", "AUTO"):
+            read = self.read_margin_history(
+                [dict(real_row, type=origin)], tx_id=401344857108
+            )
+            self.assertEqual(read.kind, "ok")
+            self.assertEqual(read.value.origin_type, origin)
 
         self.margin.post_payload = {"tranId": 401344857108}
         self.margin.history_payload = {"rows": [real_row]}
@@ -2243,20 +2507,7 @@ class JobRunnerTests(unittest.TestCase):
 
     def test_margin_history_rejects_target_identity_conflicts_and_duplicates(
             self):
-        expected = {
-            "asset": "USDT",
-            "principal": "3",
-            "interest": "0",
-            "status": "BORROW_CONFIRMED",
-        }
-        valid = {
-            "txId": "7301",
-            "asset": "USDT",
-            "principal": "3",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
+        valid = self.adapter_margin_row()
         cases = {
             "conflict": [
                 dict(valid),
@@ -2266,168 +2517,73 @@ class JobRunnerTests(unittest.TestCase):
         }
         for name, rows in cases.items():
             with self.subTest(name=name):
-                self.assertIsNone(jr._margin_history_confirmation(
-                    {"rows": rows}, "7301", expected, "BORROW"
-                ))
+                self.assertEqual(
+                    self.read_margin_history(rows).kind, "unclear"
+                )
 
-    def test_margin_history_rejects_near_miss_and_non_exact_identities(self):
-        expected = {
-            "asset": "USDT",
-            "principal": "3",
-            "interest": "0",
-            "status": "BORROW_CONFIRMED",
-        }
-        valid = {
-            "txId": "7301",
-            "asset": "USDT",
-            "principal": "3",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
-        cases = {
-            "near_miss": [dict(valid, tranID="7301")],
-            "float_shadow": [dict(valid), dict(valid, txId=7301.0)],
-            "boolean": [dict(valid, txId=True)],
-            "nested_conflict": [dict(
-                valid, details={"events": [{"tranId": "8301"}]}
-            )],
-            "normalized_key": [dict(valid, **{"ｔｒａｎＩｄ": "8301"})],
-        }
-        for name, rows in cases.items():
-            with self.subTest(name=name):
-                self.assertIsNone(jr._margin_history_confirmation(
-                    {"rows": rows}, "7301", expected, "BORROW"
-                ))
-        self.assertEqual(jr._margin_transaction_id({"tranId": 7301}), "7301")
-        self.assertEqual(jr._margin_transaction_id({
-            "tranId": 7301, "txId": "7301"
-        }), "7301")
-        self.assertEqual(jr._margin_transaction_id({
-            "tranId": 7301,
-            "detail": {"events": [{"txId": "7301"}]},
-        }), "7301")
-        self.assertEqual(jr._margin_transaction_id({
-            "tranId": 7301, "detail": {"txId": "8301"}
-        }), "")
-        self.assertEqual(jr._margin_transaction_id({"tranId": 7301.0}), "")
-        self.assertEqual(jr._margin_transaction_id({"tranId": True}), "")
+    def test_margin_submit_requires_one_exact_integer_identity(self):
+        operation = jr.binance_margin.build_borrow(
+            "USDT", Decimal("3"), "intent-7301", SHA
+        )
+        cases = (
+            ({"tranId": 7301}, "accepted"),
+            ({"tranId": 7301, "txId": 7301}, "unclear"),
+            ({"tranId": 7301.0}, "unclear"),
+            ({"tranId": True}, "unclear"),
+            ({"detail": {"tranId": 7301}}, "unclear"),
+        )
+        for payload, kind in cases:
+            with self.subTest(payload=payload):
+                transport = lambda *_args, value=payload, **_kwargs: \
+                    jr.binance_http.HttpResult("ok", value, None, None)
+                result = jr.binance_margin.submit_once(
+                    transport, jr.binance_http.SPOT_BASE_URL, operation,
+                    lambda _intent: None,
+                )
+                self.assertEqual(result.kind, kind)
 
-    def test_margin_identity_scan_enforces_node_and_byte_bounds(self):
-        within_nodes = {
-            "tranId": "7301",
-            "items": [None] * (jr.MARGIN_IDENTITY_MAX_NODES - 3),
-        }
-        over_nodes = {
-            "tranId": "7301",
-            "items": [None] * (jr.MARGIN_IDENTITY_MAX_NODES - 2),
-        }
-        self.assertEqual(
-            jr._margin_identity_aliases(within_nodes), ["7301"]
-        )
-        self.assertIsNone(jr._margin_identity_aliases(over_nodes))
-
-        empty = {"tranId": "7301", "padding": ""}
-        overhead = len(json.dumps(
-            empty, ensure_ascii=True, separators=(",", ":")
-        ).encode("utf-8"))
-        exact_bytes = dict(
-            empty,
-            padding="x" * (
-                jr.MARGIN_IDENTITY_MAX_RESPONSE_BYTES - overhead
-            ),
-        )
-        over_bytes = dict(
-            exact_bytes, padding=exact_bytes["padding"] + "x"
-        )
-        self.assertEqual(
-            jr._margin_identity_aliases(exact_bytes), ["7301"]
-        )
-        self.assertIsNone(jr._margin_identity_aliases(over_bytes))
+    def test_margin_history_adapter_enforces_its_row_bound(self):
+        def read(count):
+            rows = [self.adapter_margin_row(txId=index + 1)
+                    for index in range(count)]
+            def transport(*_args, **_kwargs):
+                return jr.binance_http.HttpResult(
+                    "ok", {"rows": rows, "total": count}, None, None
+                )
+            return jr.binance_margin.read_history_by_direction(
+                transport, jr.binance_http.SPOT_BASE_URL,
+                "USDT", "BORROW", sleep=lambda _delay: None,
+            )
+        self.assertEqual(read(100).kind, "ok")
+        self.assertEqual(read(101).kind, "unclear")
 
     def test_margin_history_requires_the_exact_type_field(self):
-        expected = {
-            "asset": "USDT",
-            "principal": "3",
-            "interest": "0",
-            "status": "BORROW_CONFIRMED",
-        }
-        without_type = {
-            "txId": "7301",
-            "asset": "USDT",
-            "principal": "3",
-            "interest": "0",
-            "status": "CONFIRMED",
-        }
+        without_type = self.adapter_margin_row()
+        del without_type["type"]
         with_near_miss = dict(without_type, typ="MANUAL")
         for row in (without_type, with_near_miss):
-            self.assertIsNone(jr._margin_history_confirmation(
-                {"rows": [row]}, "7301", expected, "BORROW"
-            ))
+            self.assertEqual(self.read_margin_history([row]).kind, "unclear")
 
     def test_margin_history_refuses_unknown_origin_type(self):
-        expected = {
-            "asset": "USDT",
-            "principal": "2.5",
-            "interest": "0",
-            "status": "BORROW_CONFIRMED",
-        }
-        row = {
-            "txId": 401344857108,
-            "asset": "USDT",
-            "principal": "2.5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "BORROW",
-        }
-
-        self.assertIsNone(jr._margin_history_confirmation(
-            {"rows": [row]}, "401344857108", expected, "BORROW"
-        ))
+        row = self.adapter_margin_row(type="BORROW")
+        self.assertEqual(self.read_margin_history([row]).kind, "unclear")
 
     def test_margin_confirmation_readers_are_total_for_non_text_fields(self):
-        expected = {
-            "asset": "USDT",
-            "principal": "2.5",
-            "interest": "0",
-            "status": "BORROW_CONFIRMED",
-        }
-        row = {
-            "txId": "7301",
-            "asset": "USDT",
-            "principal": "2.5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
+        row = self.adapter_margin_row()
         row_cases = (
             dict(row, asset=[]),
             dict(row, principal={}),
             dict(row, status=[]),
-            dict(row, type=[]),
-            dict(row, type={}),
+            dict(row, type=1),
+            dict(row, type=None),
         )
         for candidate in row_cases:
             with self.subTest(history_field=next(
                     name for name in row if candidate[name] != row[name]
             )):
-                self.assertIsNone(jr._margin_history_confirmation(
-                    {"rows": [candidate]}, "7301", expected, "BORROW"
-                ))
-        for field, value in (
-                ("asset", []), ("principal", {}),
-                ("interest", []), ("status", {})):
-            with self.subTest(expected_field=field):
-                self.assertIsNone(jr._margin_history_confirmation(
-                    {"rows": [row]}, "7301",
-                    dict(expected, **{field: value}), "BORROW",
-                ))
-        self.assertIsNone(jr._margin_history_confirmation(
-            {"rows": [row]}, [], expected, "BORROW"
-        ))
-        self.assertIsNone(jr._margin_history_confirmation(
-            {"rows": [row]}, "7301", expected, {}
-        ))
+                self.assertEqual(
+                    self.read_margin_history([candidate]).kind, "unclear"
+                )
 
         liability = {
             "asset": "USDT", "borrowed": "2.5", "interest": "0",
@@ -2435,13 +2591,9 @@ class JobRunnerTests(unittest.TestCase):
         for field, value in (
                 ("asset", []), ("borrowed", {}), ("interest", [])):
             with self.subTest(account_field=field):
-                self.assertIsNone(jr._margin_account_liability(
-                    {"userAssets": [dict(liability, **{field: value})]},
-                    "USDT",
-                ))
-        self.assertIsNone(jr._margin_account_liability(
-            {"userAssets": [liability]}, []
-        ))
+                self.assertEqual(self.read_margin_liability({
+                    "userAssets": [dict(liability, **{field: value})]
+                }).kind, "unclear")
 
     def test_non_text_margin_origin_publishes_unknown_receipt(self):
         self.margin.history_payload = {"rows": [{
@@ -2460,7 +2612,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "UNKNOWN")
         self.assertIs(type(result["exit_code"]), int)
         self.assertEqual(
-            self.reason(result), "MARGIN_CONFIRMATION_MISMATCH"
+            self.reason(result), "MARGIN_CONFIRMATION_UNREADABLE"
         )
         source = self.margin_source(result)
         self.assertEqual(source["verdict"], "UNKNOWN")
@@ -2472,11 +2624,13 @@ class JobRunnerTests(unittest.TestCase):
 
     def test_unexpected_margin_confirmation_error_is_contained(self):
         self.margin_job("margin-confirmation-guard")
-
-        with mock.patch.object(
-                jr, "_margin_history_confirmation",
-                side_effect=RuntimeError("offline confirmation check")):
-            self.assertEqual(self.margin_tick(), 4)
+        services = replace(
+            self.execution_services,
+            margin_confirm=lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("offline confirmation check")
+            ),
+        )
+        self.assertEqual(self.margin_tick(services=services), 4)
 
         result = self.results()[0]
         self.assertEqual(result["verdict"], "UNKNOWN")
@@ -2549,7 +2703,7 @@ class JobRunnerTests(unittest.TestCase):
         })
         account_indexes = [
             index for index, call in enumerate(self.margin.calls)
-            if call[0] == "GET" and call[2] == jr.MARGIN_ACCOUNT_PATH
+            if call[0] == "GET" and call[2] == "/sapi/v1/margin/account"
         ]
         post_index = next(
             index for index, call in enumerate(self.margin.calls)
@@ -2578,7 +2732,7 @@ class JobRunnerTests(unittest.TestCase):
 
         self.assertEqual(self.results()[0]["verdict"], "UNKNOWN")
         self.assertEqual(
-            self.reason(self.results()[0]), "MARGIN_CONFIRMATION_MISMATCH"
+            self.reason(self.results()[0]), "MARGIN_CONFIRMATION_UNREADABLE"
         )
         self.assertTrue(os.path.isfile(os.path.join(
             self.receipt_dir, "STOP-JOBS"
@@ -2600,48 +2754,30 @@ class JobRunnerTests(unittest.TestCase):
         )))
 
     def test_margin_repay_direct_algebra_accounts_for_interest_first(self):
-        before = {
-            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
-            "total_liability": "2.500005",
-        }
-        all_zero = {
-            "asset": "USDT", "borrowed": "0", "interest": "0",
-            "total_liability": "0",
-        }
-        dust = {
-            "asset": "USDT", "borrowed": "0", "interest": "0.000006",
-            "total_liability": "0.000006",
-        }
-        dust_bound = {
-            "asset": "USDT", "borrowed": "0", "interest": "0.0001",
-            "total_liability": "0.0001",
-        }
-
-        self.assertEqual(jr._margin_liability_confirmation_status(
-            before, all_zero, "2.5", "REPAY"
-        ), "")
-        self.assertEqual(
-            jr._margin_repay_close_verdict(before, all_zero, "2.5"), ""
+        liability = jr.binance_margin.Liability
+        before = liability(
+            "USDT", Decimal("2.5"), Decimal("0.000005"),
+            Decimal("2.500005")
         )
-        self.assertEqual(jr._margin_liability_confirmation_status(
-            before, all_zero, "2.500005", "REPAY"
-        ), "REPAY_CONFIRMED")
-        self.assertEqual(jr._margin_repay_close_verdict(
-            before, all_zero, "2.500005"
-        ), "CLOSED")
-        self.assertEqual(jr._margin_liability_confirmation_status(
-            before, dust, "2.5", "REPAY"
-        ), "")
-        self.assertEqual(
-            jr._margin_repay_close_verdict(before, dust, "2.5"),
-            "CLOSED-WITH-DUST",
+        operation = jr.binance_margin.build_repay(
+            before, "intent-repay-algebra", SHA
         )
-        self.assertEqual(
-            jr._margin_repay_close_verdict(
-                before, dust_bound, "2.500005"
-            ),
-            "",
+        history = jr.binance_margin.MarginHistoryRow(
+            "REPAY", 7301, "USDT", Decimal("2.500005"),
+            Decimal("2.5"), Decimal("0.000005"), "CONFIRMED",
+            "MANUAL", int(NOW.timestamp() * 1000),
         )
+        zero = liability("USDT", Decimal("0"), Decimal("0"), Decimal("0"))
+        residual = liability(
+            "USDT", Decimal("0"), Decimal("0.000001"),
+            Decimal("0.000001")
+        )
+        self.assertEqual(jr.binance_margin.confirm(
+            operation, 7301, history, before, zero
+        ).kind, "confirmed")
+        self.assertEqual(jr.binance_margin.confirm(
+            operation, 7301, history, before, residual
+        ).kind, "unknown")
 
     def test_mrv11_relative_dust_is_strict_for_small_principals(self):
         standing_before = {
@@ -2671,7 +2807,7 @@ class JobRunnerTests(unittest.TestCase):
 
         self.assertEqual(
             jr._margin_repay_close_verdict(
-                standing_before, standing_after, "2.5"
+                standing_before, standing_after, "2.500005"
             ),
             "CLOSED-WITH-DUST",
         )
@@ -2834,22 +2970,48 @@ class JobRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("follow_up_repay", source)
 
+    def test_margin_repay_fresh_liability_can_exceed_borrow_cap(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "3", "interest": "0.000005",
+        }]}
+        self.margin_job(
+            "margin-repay-over-borrow-cap", op="MARGIN_REPAY",
+            principal="3.000005",
+        )
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        result = self.results()[0]
+        self.assertEqual((result["verdict"], self.reason(result)), (
+            "CLOSED", "REPAY_CONFIRMED",
+        ))
+        self.assertEqual([
+            call[3]["amount"] for call in self.margin.calls
+            if call[0] == "POST"
+        ], ["3.000005"])
+
     def test_margin_repay_principal_only_history_row_is_mismatch(self):
-        expected = {
-            "asset": "USDT",
-            "amount": "2.5000387",
-            "principal": "2.5",
-            "interest": "0.0000387",
-            "status": "REPAY_CONFIRMED",
-        }
         principal_only = dict(
             STANDING_REPAY_FACTS["history_row"],
             principal="2.5000387", interest="0",
         )
-
-        self.assertIsNone(jr._margin_history_confirmation(
-            {"rows": [principal_only]}, "401382497303", expected, "REPAY"
-        ))
+        before = jr.binance_margin.Liability(
+            "USDT", Decimal("2.5"), Decimal("0.0000387"),
+            Decimal("2.5000387")
+        )
+        operation = jr.binance_margin.build_repay(
+            before, "principal-only", SHA
+        )
+        read = self.read_margin_history(
+            [principal_only], "REPAY", 401382497303
+        )
+        zero = jr.binance_margin.Liability(
+            "USDT", Decimal("0"), Decimal("0"), Decimal("0")
+        )
+        self.assertEqual(read.kind, "ok")
+        self.assertEqual(jr.binance_margin.confirm(
+            operation, 401382497303, read.value, before, zero
+        ).kind, "unknown")
 
     def test_margin_repay_residual_interest_has_typed_dust_verdict(self):
         self.margin.account_before_payload = {"userAssets": [{
@@ -2913,7 +3075,7 @@ class JobRunnerTests(unittest.TestCase):
         ]
         account_indexes = [
             index for index, call in enumerate(calls)
-            if call[0] == "GET" and call[2] == jr.MARGIN_ACCOUNT_PATH
+            if call[0] == "GET" and call[2] == "/sapi/v1/margin/account"
         ]
         post_index = next(
             index for index, call in enumerate(calls)
@@ -2926,10 +3088,10 @@ class JobRunnerTests(unittest.TestCase):
         self.assertLess(account_indexes[1], history_indexes[2])
         self.assertEqual(
             self.margin_source(self.results()[0])["snapshot_time_note"],
-            jr.MARGIN_SNAPSHOT_TIME_VERIFIED,
+            jr.MARGIN_SNAPSHOT_TIME_UNVERIFIED,
         )
 
-    def test_margin_post_snapshot_time_must_advance(self):
+    def test_margin_snapshot_time_is_explicitly_unverified(self):
         self.margin.account_before_payload = {
             "timestamp": 1000,
             "userAssets": [{
@@ -2944,12 +3106,13 @@ class JobRunnerTests(unittest.TestCase):
         }
         self.margin_job("margin-snapshot-time")
 
-        self.assertEqual(self.margin_tick(), 4)
+        self.assertEqual(self.margin_tick(), 0)
 
         result = self.results()[0]
-        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertEqual(result["verdict"], "OPEN")
         self.assertEqual(
-            self.reason(result), "MARGIN_SNAPSHOT_TIME_MISMATCH"
+            self.margin_source(result)["snapshot_time_note"],
+            jr.MARGIN_SNAPSHOT_TIME_UNVERIFIED,
         )
 
     def test_margin_repay_closes_only_after_explicit_zero_liability(self):
@@ -3089,155 +3252,26 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "STOP-JOBS"
         )))
 
-    def test_reconcile_margin_legacy_receipt_opens_and_releases(self):
+    def test_reconcile_margin_legacy_receipt_refuses_unproved_window(self):
         job_id = "mproof-b668c154de2c"
         artifacts = self.prepare_unknown_margin_reconcile(job_id)
-        legacy_source = self.make_margin_reconcile_receipt_legacy(artifacts)
-        self.assertEqual(jr.LEGACY_RECEIPT_FIELDS, (
-            "kind", "job_id", "sha", "ready", "mutation_attempts",
-            "verdict", "reason", "started_utc", "governor_token",
-            "governor_release", "authority_checked_utc",
-            "authority_digests", "authority_stop_jobs_present",
-            "mutation_started_utc", "submission", "finished_utc",
-        ))
-        self.assertEqual(
-            set(legacy_source), set(jr.LEGACY_RECEIPT_FIELDS)
-        )
-        real_row = {
-            "txId": 401344857108,
-            "asset": "USDT",
-            "principal": "2.5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
-        self.margin.history_payload = {"rows": [real_row]}
-        calls_before = len(self.margin.calls)
+        self.make_margin_reconcile_receipt_legacy(artifacts)
+        originals = {name: Path(artifacts[name]).read_bytes()
+                     for name in ("source_path", "runner_path", "lock_path")}
+        self.margin.history_payload = {"rows": [self.adapter_margin_row(
+            txId=401344857108, amount="2.5", principal="2.5"
+        )]}
 
-        with mock.patch.object(
-                jr, "_release_final_outcome_governor",
-                wraps=jr._release_final_outcome_governor) as final_release:
-            self.assertEqual(jr.reconcile_margin(
-                job_id, True, self.receipt_dir, NOW, self.margin
-            ), 0)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
-        final_release.assert_called_once()
-        reconcile_calls = self.margin.calls[calls_before:]
-        self.assertEqual(reconcile_calls, [
-            (
-                "GET", jr.basis_executor.SPOT.base_url,
-                jr.MARGIN_ENDPOINT_PATH,
-                {
-                    "asset": "USDT", "type": "BORROW",
-                    "txId": "401344857108",
-                },
-                True,
-            ),
-            (
-                "GET", jr.basis_executor.SPOT.base_url,
-                jr.MARGIN_ACCOUNT_PATH, {}, True,
-            ),
-            (
-                "GET", jr.basis_executor.SPOT.base_url,
-                jr.MARGIN_ENDPOINT_PATH,
-                {
-                    "asset": "USDT", "type": "BORROW",
-                    "startTime": str(int(
-                        (NOW - timedelta(seconds=60)).timestamp() * 1000
-                    )),
-                    "endTime": str(int(NOW.timestamp() * 1000)),
-                    "current": "1",
-                    "size": str(jr.MARGIN_LEGACY_HISTORY_PAGE_SIZE),
-                }, True,
-            ),
-            (
-                "GET", jr.basis_executor.SPOT.base_url,
-                jr.MARGIN_ENDPOINT_PATH,
-                {
-                    "asset": "USDT", "type": "REPAY",
-                    "startTime": str(int(
-                        (NOW - timedelta(seconds=60)).timestamp() * 1000
-                    )),
-                    "endTime": str(int(NOW.timestamp() * 1000)),
-                    "current": "1",
-                    "size": str(jr.MARGIN_LEGACY_HISTORY_PAGE_SIZE),
-                }, True,
-            ),
-        ])
-        self.assertEqual(self.governor_releases, [(
-            "governor-token-1", self.receipt_dir,
-        )])
-        self.assertFalse(os.path.exists(artifacts["lock_path"]))
-        with open(artifacts["source_path"], encoding="utf-8") as handle:
-            source = json.load(handle)
-        with open(artifacts["runner_path"], encoding="utf-8") as handle:
-            runner = json.load(handle)
-        self.assertEqual((source["verdict"], runner["verdict"]), (
-            "OPEN", "OPEN",
-        ))
-        self.assertEqual((
-            source["governor_release"], runner["governor_release"],
-        ), ("RELEASED", "RELEASED"))
-        self.assertEqual(source["account_liability"], {
-            "asset": "USDT", "borrowed": "2.5",
-            "interest": "0.00002726", "total_liability": "2.50002726",
-        })
-        self.assertNotIn("account_liability_before", source)
-        rows = self.results()
-        self.assertEqual([row.get("kind", "RESULT") for row in rows], [
-            "RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "LEGACY_PROOF",
-            "RESULT",
-        ])
-        event = rows[1]
-        self.assertEqual(event["transaction_id"], "401344857108")
-        proof = {
-            "kind": "LEGACY_EXCLUSIVITY_PROOF",
-            "window_start_utc": utc(
-                datetime.fromisoformat(
-                    legacy_source["mutation_started_utc"][:-1] + "+00:00"
-                ) - timedelta(seconds=60)
-            ),
-            "window_end_utc": utc(NOW),
-            "row_count": 1,
-        }
-        self.assertNotIn("history_watermark", source)
-        self.assertEqual(source["legacy_exclusivity_proof"], proof)
-        self.assertEqual(event["legacy_exclusivity_proof"], proof)
-        self.assertNotIn("account_liability_before", event)
-        self.assertEqual(event["account_liability"],
-                         source["account_liability"])
-        self.assertEqual(rows[2], {
-            "kind": "LEGACY_PROOF",
-            "job_id": job_id,
-            "transaction_id": "401344857108",
-            "history_watermark_substitute":
-                jr.LEGACY_HISTORY_WATERMARK_SUBSTITUTE,
-            "account_liability_before_substitute":
-                jr.LEGACY_ACCOUNT_LIABILITY_BEFORE_SUBSTITUTE,
-            "legacy_exclusivity_proof": proof,
-            "utc": utc(NOW),
-        })
-        self.assertEqual((rows[-1]["verdict"], rows[-1]["exit_code"]), (
-            "OPEN", 0,
-        ))
         self.assertEqual(
-            jr._result_ids(jr._paths(self.receipt_dir)["results"]),
-            ({job_id}, False, False),
+            self.results()[-1]["reason"], "LEGACY_WINDOW_NOT_EXCLUSIVE"
         )
-        self.assertEqual(
-            jr._release_result(
-                jr._paths(self.receipt_dir), job_id
-            )["verdict"],
-            "OPEN",
-        )
-        self.assertEqual(
-            jr._attest_stuck_margin_lock(
-                jr._paths(self.receipt_dir), self.receipt_dir, job_id
-            ),
-            ("governor-token-1", artifacts["source_path"], True),
-        )
+        for name, encoded in originals.items():
+            self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
+        self.assertEqual(self.governor_releases, [])
 
-    def test_reconcile_margin_legacy_liability_mismatch_refuses(self):
+    def test_reconcile_margin_legacy_liability_cannot_bypass_window(self):
         job_id = "margin-reconcile-legacy-liability"
         artifacts = self.prepare_unknown_margin_reconcile(job_id)
         self.make_margin_reconcile_receipt_legacy(artifacts)
@@ -3257,12 +3291,10 @@ class JobRunnerTests(unittest.TestCase):
             for name in ("source_path", "runner_path", "lock_path")
         }
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_LIABILITY_MISMATCH"
+            self.results()[-1]["reason"], "LEGACY_WINDOW_NOT_EXCLUSIVE"
         )
         for name, encoded in originals.items():
             self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
@@ -3287,9 +3319,7 @@ class JobRunnerTests(unittest.TestCase):
             for name in ("source_path", "runner_path", "lock_path")
         }
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"], "LEGACY_WINDOW_NOT_EXCLUSIVE"
@@ -3298,46 +3328,19 @@ class JobRunnerTests(unittest.TestCase):
             self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
         self.assertEqual(self.governor_releases, [])
 
-    def test_reconcile_margin_legacy_page_cap_refuses(self):
+    def test_reconcile_margin_legacy_bounded_read_refuses(self):
         job_id = "margin-reconcile-legacy-page-cap"
         artifacts = self.prepare_unknown_margin_reconcile(job_id)
         self.make_margin_reconcile_receipt_legacy(artifacts)
-        target = {
-            "txId": 401344857108,
-            "asset": "USDT",
-            "principal": "2.5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
-        page_calls = []
+        self.margin.history_payload = {"rows": [
+            self.adapter_margin_row(txId=401344857108 + index)
+            for index in range(101)
+        ]}
 
-        def capped_reads(method, base_url, path, params, signed):
-            self.assertEqual(
-                (method, base_url, signed),
-                ("GET", jr.basis_executor.SPOT.base_url, True),
-            )
-            if path == jr.MARGIN_ACCOUNT_PATH:
-                return "ok", self.margin.account_payload
-            if params.get("txId") == "401344857108":
-                return "ok", {"rows": [target]}
-            page_calls.append(dict(params))
-            page = int(params["current"])
-            return "ok", {"rows": [dict(
-                target, txId=401344857107 + page
-            )]}
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
-        with mock.patch.object(
-                jr, "MARGIN_LEGACY_HISTORY_PAGE_SIZE", 1), \
-                mock.patch.object(
-                    jr, "MARGIN_LEGACY_HISTORY_PAGE_CAP", 2):
-            self.assertEqual(jr.reconcile_margin(
-                job_id, True, self.receipt_dir, NOW, capped_reads
-            ), 3)
-
-        self.assertEqual([row["current"] for row in page_calls], ["1", "2"])
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_WINDOW_NOT_EXCLUSIVE"
+            self.results()[-1]["reason"], "MARGIN_CONFIRMATION_UNREADABLE"
         )
         self.assertTrue(os.path.isfile(artifacts["lock_path"]))
         self.assertEqual(self.governor_releases, [])
@@ -3354,20 +3357,7 @@ class JobRunnerTests(unittest.TestCase):
             "type": "MANUAL",
         }]}
 
-        with mock.patch.object(
-                jr, "_margin_legacy_exclusivity_snapshot",
-                side_effect=AssertionError("legacy branch was entered")
-                ) as legacy_snapshot, mock.patch.object(
-                    jr, "_evaluate_margin_confirmation",
-                    wraps=jr._evaluate_margin_confirmation,
-                ) as evaluator:
-            self.assertEqual(jr.reconcile_margin(
-                job_id, True, self.receipt_dir, NOW, self.margin
-            ), 0)
-
-        legacy_snapshot.assert_not_called()
-        evaluator.assert_called_once()
-        self.assertEqual(evaluator.call_args.args[5], "BORROW")
+        self.assertEqual(self.reconcile_margin(job_id), 0)
         with open(artifacts["source_path"], encoding="utf-8") as handle:
             source = json.load(handle)
         self.assertEqual((source["verdict"], source["reason"]), (
@@ -3431,9 +3421,7 @@ class JobRunnerTests(unittest.TestCase):
                 jr, "_evaluate_legacy_repay_confirmation",
                 wraps=jr._evaluate_legacy_repay_confirmation,
                 ) as evaluator:
-            self.assertEqual(jr.reconcile_margin(
-                job_id, True, self.receipt_dir, NOW, self.margin
-            ), 0)
+            self.assertEqual(self.reconcile_margin(job_id), 0)
 
         evaluator.assert_called_once()
         self.assertEqual(evaluator.call_args.args[5], liability_before)
@@ -3498,9 +3486,7 @@ class JobRunnerTests(unittest.TestCase):
                 jr, "_evaluate_legacy_repay_confirmation",
                 wraps=jr._evaluate_legacy_repay_confirmation,
                 ) as legacy_evaluator, mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         legacy_evaluator.assert_not_called()
         output.assert_any_call(
@@ -3545,9 +3531,7 @@ class JobRunnerTests(unittest.TestCase):
                 jr, "_evaluate_legacy_repay_confirmation",
                 wraps=jr._evaluate_legacy_repay_confirmation,
                 ) as legacy_evaluator, mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         legacy_evaluator.assert_not_called()
         output.assert_any_call(
@@ -3578,9 +3562,7 @@ class JobRunnerTests(unittest.TestCase):
                 jr, "_evaluate_legacy_repay_confirmation",
                 wraps=jr._evaluate_legacy_repay_confirmation,
                 ) as legacy_evaluator:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 0)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 0)
 
         legacy_evaluator.assert_called_once()
         self.assertEqual(
@@ -3601,9 +3583,7 @@ class JobRunnerTests(unittest.TestCase):
         calls_before = list(self.margin.calls)
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         output.assert_any_call(
             "JOB-RUNNER | RECONCILE UNCONFIRMED | "
@@ -3629,9 +3609,7 @@ class JobRunnerTests(unittest.TestCase):
         calls_before = list(self.margin.calls)
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         output.assert_any_call(
             "JOB-RUNNER | RECONCILE UNCONFIRMED | "
@@ -3656,9 +3634,7 @@ class JobRunnerTests(unittest.TestCase):
         calls_before = list(self.margin.calls)
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         output.assert_any_call(
             "JOB-RUNNER | RECONCILE UNCONFIRMED | "
@@ -3697,38 +3673,23 @@ class JobRunnerTests(unittest.TestCase):
             self):
         facts, _unknown, _source_path = \
             self.prepare_standing_legacy_repay_reconcile()
-        target_row = dict(facts["history_row"])
-        exact_row = dict(
-            target_row, txId=target_row["txId"] + 1
-        )
-
-        def reads(method, base_url, path, params, signed):
-            self.assertEqual(
-                (method, base_url, signed),
-                ("GET", jr.basis_executor.SPOT.base_url, True),
-            )
-            if path == jr.MARGIN_ACCOUNT_PATH:
-                return "ok", self.margin.account_payload
-            if params.get("txId") == facts["submission"]["transaction_id"]:
-                return "ok", {"rows": [exact_row]}
-            if params.get("type") == "REPAY":
-                return "ok", {"rows": [target_row]}
-            return "ok", {"rows": []}
+        self.margin.history_payload = {"rows": [dict(
+            facts["history_row"],
+            txId=facts["history_row"]["txId"] + 1,
+        )]}
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, reads
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+            self.results()[-1]["reason"], "MARGIN_CONFIRMATION_MISMATCH"
         )
         output.assert_any_call(
             "JOB-RUNNER | RECONCILE UNCONFIRMED | "
-            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_TRANSACTION_ID"
+            "MARGIN_CONFIRMATION_MISMATCH"
         )
 
-    def test_reconcile_margin_legacy_exchange_asset_is_provenance_bound(self):
+    def test_reconcile_margin_adapter_rejects_exchange_asset_mismatch(self):
         facts, _unknown, _source_path = \
             self.prepare_standing_legacy_repay_reconcile()
         self.margin.history_payload = {"rows": [dict(
@@ -3736,16 +3697,14 @@ class JobRunnerTests(unittest.TestCase):
         )]}
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+            self.results()[-1]["reason"], "MARGIN_CONFIRMATION_UNREADABLE"
         )
         output.assert_any_call(
             "JOB-RUNNER | RECONCILE UNCONFIRMED | "
-            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_ASSET"
+            "MARGIN_CONFIRMATION_UNREADABLE"
         )
 
     def test_reconcile_margin_legacy_exchange_amount_is_provenance_bound(self):
@@ -3756,9 +3715,7 @@ class JobRunnerTests(unittest.TestCase):
         )]}
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
@@ -3776,9 +3733,7 @@ class JobRunnerTests(unittest.TestCase):
         )]}
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
@@ -3796,9 +3751,7 @@ class JobRunnerTests(unittest.TestCase):
             facts["history_row"], status="PENDING"
         )]}
 
-        self.assertEqual(jr.reconcile_margin(
-            facts["job_id"], True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"], "LEGACY_REPAY_STATUS_MISMATCH"
@@ -3824,9 +3777,7 @@ class JobRunnerTests(unittest.TestCase):
             principal="2.4", interest="0.1000387",
         )]}
 
-        self.assertEqual(jr.reconcile_margin(
-            facts["job_id"], True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"], "LEGACY_REPAY_PRINCIPAL_MISMATCH"
@@ -3841,9 +3792,7 @@ class JobRunnerTests(unittest.TestCase):
             "asset": "USDT", "borrowed": "0", "interest": "0.000001",
         }]}
 
-        self.assertEqual(jr.reconcile_margin(
-            facts["job_id"], True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"],
@@ -3861,9 +3810,7 @@ class JobRunnerTests(unittest.TestCase):
         source_before = Path(source_path).read_bytes()
         runner_before = Path(unknown["receipt_path"]).read_bytes()
 
-        self.assertEqual(jr.reconcile_margin(
-            facts["job_id"], True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(self.results()[-1], {
             "kind": "RECONCILE_UNCONFIRMED",
@@ -3876,7 +3823,7 @@ class JobRunnerTests(unittest.TestCase):
             Path(unknown["receipt_path"]).read_bytes(), runner_before
         )
 
-    def test_reconcile_margin_standing_repay_names_missing_exchange_interest(
+    def test_reconcile_margin_adapter_rejects_missing_exchange_interest(
             self):
         facts, _unknown, _source_path = \
             self.prepare_standing_legacy_repay_reconcile()
@@ -3885,16 +3832,14 @@ class JobRunnerTests(unittest.TestCase):
         self.margin.history_payload = {"rows": [row]}
 
         with mock.patch("builtins.print") as output:
-            self.assertEqual(jr.reconcile_margin(
-                facts["job_id"], True, self.receipt_dir, NOW, self.margin
-            ), 3)
+            self.assertEqual(self.reconcile_margin(facts["job_id"]), 3)
 
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+            self.results()[-1]["reason"], "MARGIN_CONFIRMATION_UNREADABLE"
         )
         output.assert_any_call(
             "JOB-RUNNER | RECONCILE UNCONFIRMED | "
-            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_INTEREST"
+            "MARGIN_CONFIRMATION_UNREADABLE"
         )
 
     def test_reconcile_margin_modern_missing_field_stays_modern(self):
@@ -3912,15 +3857,7 @@ class JobRunnerTests(unittest.TestCase):
         )
         calls_before = list(self.margin.calls)
 
-        with mock.patch.object(
-                jr, "_margin_legacy_exclusivity_snapshot",
-                side_effect=AssertionError("legacy branch was entered")
-                ) as legacy_snapshot:
-            self.assertEqual(jr.reconcile_margin(
-                job_id, True, self.receipt_dir, NOW, self.margin
-            ), 3)
-
-        legacy_snapshot.assert_not_called()
+        self.assertEqual(self.reconcile_margin(job_id), 3)
         self.assertEqual(self.margin.calls, calls_before)
         self.assertEqual(
             self.results()[-1]["reason"], "HISTORY_WATERMARK_MISSING"
@@ -3937,9 +3874,7 @@ class JobRunnerTests(unittest.TestCase):
         )
         calls_before = list(self.margin.calls)
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         self.assertEqual(self.margin.calls, calls_before)
         self.assertEqual(self.results()[-1], {
@@ -3962,9 +3897,7 @@ class JobRunnerTests(unittest.TestCase):
         )
         calls_before = list(self.margin.calls)
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         self.assertEqual(self.margin.calls, calls_before)
         self.assertEqual(
@@ -3981,9 +3914,7 @@ class JobRunnerTests(unittest.TestCase):
         }
         self.margin.history_payload = {"rows": []}
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         for name, encoded in originals.items():
             self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
@@ -4008,38 +3939,18 @@ class JobRunnerTests(unittest.TestCase):
             name: Path(artifacts[name]).read_bytes()
             for name in ("source_path", "runner_path", "lock_path")
         }
-        target = {
-            "txId": 401344857108,
-            "asset": "USDT",
-            "principal": "2.5",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
-        unrelated = {
-            "txId": 401344857109,
-            "asset": "USDT",
-            "principal": "1",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
+        target = self.adapter_margin_row(
+            txId=401344857108, amount="2.5", principal="2.5"
+        )
+        unrelated = self.adapter_margin_row(
+            txId=401344857109, amount="1", principal="1"
+        )
+        self.margin.history_after_payloads = {
+            "BORROW": {"rows": [target]},
+            "REPAY": {"rows": [unrelated]},
         }
 
-        def concurrent_reads(method, _base_url, path, params, signed):
-            self.assertEqual((method, signed), ("GET", True))
-            if path == jr.MARGIN_ACCOUNT_PATH:
-                return "ok", self.margin.account_payload
-            if params.get("txId") == "401344857108":
-                return "ok", {"rows": [target]}
-            if params.get("type") == "BORROW":
-                return "ok", {"rows": [target]}
-            if params.get("type") == "REPAY":
-                return "ok", {"rows": [unrelated]}
-            raise AssertionError("unexpected reconcile read")
-
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, concurrent_reads
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         self.assertEqual(
             self.results()[-1]["reason"], "CONCURRENT_MARGIN_ACTIVITY"
@@ -4075,9 +3986,7 @@ class JobRunnerTests(unittest.TestCase):
             "type": "MANUAL",
         }]}
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 0)
+        self.assertEqual(self.reconcile_margin(job_id), 0)
 
         rows = self.results()
         self.assertEqual((rows[1]["kind"], rows[1]["verdict"]), (
@@ -4104,9 +4013,7 @@ class JobRunnerTests(unittest.TestCase):
         self.write_operator("another-operator")
         calls_before = list(self.margin.calls)
 
-        self.assertEqual(jr.reconcile_margin(
-            job_id, True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        self.assertEqual(self.reconcile_margin(job_id), 3)
 
         self.assertEqual(self.margin.calls, calls_before)
         for name, encoded in originals.items():
@@ -4632,9 +4539,9 @@ class JobRunnerTests(unittest.TestCase):
             call.args and "BASIS_PROOF_BACKFILLED" in call.args[0]
             for call in output.call_args_list
         ))
-        self.assertEqual(self.hand_calls[0]["argv"], [
-            "futures_hand.py", "--execute"
-        ])
+        self.assertEqual(
+            self.hand_calls[0]["intent"]["reduceOnly"], "false"
+        )
 
     def test_momentum_uses_long_path_clamped_cap_after_forcing_one_x(self):
         Path(os.path.join(self.jobs_dir, "futures_proof_passed")).touch()
@@ -4647,11 +4554,7 @@ class JobRunnerTests(unittest.TestCase):
 
         self.assertEqual(self.tick(), 0)
 
-        self.assertEqual(self.hand_calls[0]["argv"], [
-            "futures_hand.py", "--execute"
-        ])
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["intent"]["quantity"], "0.04")
         self.assertEqual(self.leverage.calls[1], (
             "POST", "/fapi/v1/leverage",
             {"symbol": "TSTUSDT", "leverage": "1"}, True,
@@ -4659,7 +4562,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.leverage.current, 1)
         self.assertEqual(
             [event[0] for event in self.events],
-            ["leverage", "leverage", "leverage", "leverage", "futures"],
+            ["leverage", "leverage", "leverage", "futures", "leverage"],
         )
 
     def test_unknown_momentum_touches_stop_and_blocks_next_job(self):
@@ -4685,17 +4588,19 @@ class JobRunnerTests(unittest.TestCase):
     def test_momentum_open_is_capped_atomic_and_records_exchange_fill(self):
         quantity = self.open_momentum("position-open", max_notional=800)
 
-        self.assertEqual(self.momentum_plan_caps, [Decimal("8")])
         self.assertEqual(quantity, Decimal("0.04"))
-        self.assertEqual(self.momentum_reads.calls, [
-            ("GET", "/fapi/v3/positionRisk",
-             {"symbol": "TSTUSDT"}, True),
-            ("GET", "/fapi/v3/account", {}, True),
-            ("GET", "/fapi/v1/openOrders",
-             {"symbol": "TSTUSDT"}, True),
-            ("GET", "/fapi/v1/symbolConfig",
-             {"symbol": "TSTUSDT"}, True),
-        ])
+        self.assertEqual(self.momentum_state()["effective_notional"], "8")
+        self.assertEqual({
+            path for method, path, _params, _signed
+            in self.momentum_reads.calls if method == "GET"
+        }, {
+            "/fapi/v1/symbolConfig", "/fapi/v1/exchangeInfo",
+            "/fapi/v1/ticker/bookTicker", "/fapi/v1/premiumIndex",
+            "/fapi/v1/accountConfig", "/fapi/v1/positionSide/dual",
+            "/fapi/v3/account", "/fapi/v1/openOrders",
+            "/fapi/v3/positionRisk", "/fapi/v3/balance",
+            "/fapi/v1/order", "/fapi/v1/userTrades",
+        })
         self.assertEqual(len(self.momentum_intents), 1)
         intent = self.momentum_intents[0]
         self.assertEqual(intent["side"], "BUY")
@@ -5099,7 +5004,7 @@ class JobRunnerTests(unittest.TestCase):
         quantity = self.open_momentum("sparse-open")
         self.job("sparse-exit", op="MOMENTUM_EXIT")
         self.queue_momentum_measurement(quantity)
-        self.queue_momentum_measurement(0, account_quantity=None)
+        self.queue_momentum_measurement(0)
 
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 0)
@@ -5117,49 +5022,48 @@ class JobRunnerTests(unittest.TestCase):
                 [self.momentum_row("0.03")],
                 [self.momentum_row("0.02")],
                 1,
-                "independent momentum position reads disagree",
+                "momentum exchange state is unreadable",
             ),
             (
                 "hedge side",
                 [self.momentum_row("0.03", "LONG")],
                 [self.momentum_row("0.03")],
                 1,
-                "position-risk reported hedge-side state",
+                "momentum exchange state is unreadable",
             ),
             (
                 "short",
                 [self.momentum_row("-0.03")],
                 [self.momentum_row("-0.03")],
                 1,
-                "position-risk reported a short position",
+                "momentum exchange state is unproved",
             ),
             (
                 "duplicate exposure",
                 [self.momentum_row("0.01"), self.momentum_row("0.02")],
                 [self.momentum_row("0.03")],
                 1,
-                "position-risk returned more than one nonzero symbol row",
+                "momentum exchange state is unreadable",
             ),
             (
                 "leverage",
                 [self.momentum_row("0.03")],
                 [self.momentum_row("0.03")],
                 2,
-                "momentum leverage is not proven 1x",
+                "momentum exchange state is unproved",
             ),
         ]
-        with mock.patch.object(jr.futures_hand, "SYMBOL", "TSTUSDT"), \
-                mock.patch.object(
-                    jr.futures_hand, "http", self.momentum_reads
-                ):
-            for name, risks, positions, leverage, reason in cases:
-                with self.subTest(name=name):
-                    self.momentum_reads.queue(
-                        risks, positions, leverage=leverage
+        for name, risks, positions, leverage, reason in cases:
+            with self.subTest(name=name):
+                self.momentum_reads.queue(
+                    risks, positions, leverage=leverage
+                )
+                posts = len(self.momentum_intents)
+                with self.assertRaisesRegex(jr.MomentumStateError, reason):
+                    jr._futures_measure(
+                        "TSTUSDT", self.execution_services
                     )
-                    with self.assertRaisesRegex(
-                            jr.MomentumStateError, reason):
-                        jr._momentum_measure("TSTUSDT")
+                self.assertEqual(len(self.momentum_intents), posts)
 
     def test_momentum_exit_refuses_unmeasured_quantity(self):
         quantity = self.open_momentum("measure-open")
@@ -5225,14 +5129,17 @@ class JobRunnerTests(unittest.TestCase):
     def test_crash_after_intent_before_post_recovers_query_only(self):
         self.momentum_markers()
         self.job("crash-open", op="MOMENTUM_OPEN")
-        with mock.patch.object(
-                jr, "_momentum_open_plan",
-                side_effect=self.fake_momentum_plan), \
-                mock.patch.object(
-                    jr, "_momentum_submit",
-                    side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                self.tick()
+
+        def crash_submit(_transport, _base_url, plan, writer, **_kwargs):
+            writer(plan.intent)
+            raise KeyboardInterrupt
+
+        crashed = replace(
+            self.execution_services,
+            futures_submit_order_once=crash_submit,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(execution_services=crashed)
 
         pending = self.momentum_state()
         self.assertEqual(pending["state"], "OPENING")
@@ -5247,18 +5154,28 @@ class JobRunnerTests(unittest.TestCase):
 
         queried = []
 
-        def query_only(value):
+        def query_only(_transport, _base_url, symbol, value, **_kwargs):
             queried.append(value)
-            return "not_found", None
+            identity = jr.binance_http.OrderIdentity(symbol, value, None)
+            return jr.binance_http.OrderResult(
+                "not_found", identity, None, None, False, None, None,
+                None, None, (), None,
+            )
+
+        posts = []
+
+        def no_post(*_args, **_kwargs):
+            posts.append(True)
+            raise AssertionError("recovery reached a submit service")
 
         self.queue_momentum_measurement(0)
-        with mock.patch.object(
-                jr, "_momentum_query", side_effect=query_only), \
-                mock.patch.object(
-                    jr.futures_hand, "http", self.momentum_reads), \
-                mock.patch.object(jr, "_momentum_submit") as no_post:
-            self.assertEqual(self.tick(), 2)
-        no_post.assert_not_called()
+        recovery = replace(
+            self.execution_services,
+            futures_query_order=query_only,
+            futures_submit_order_once=no_post,
+        )
+        self.assertEqual(self.tick(execution_services=recovery), 2)
+        self.assertEqual(posts, [])
         self.assertEqual(queried, [client_id])
         self.assertEqual(self.momentum_state()["state"], "NONE")
         self.assertEqual(self.results()[0]["verdict"], "REFUSED")
@@ -5323,6 +5240,19 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
         self.unknown_submission = False
         self.governor_acquires = []
         self.governor_releases = []
+        self.hand_calls = []
+        self.hand_verdict = "CLOSED"
+        self.events = []
+        self.momentum_intents = []
+        self.momentum_query_state = "terminal"
+        self.momentum_http_calls = []
+        self.momentum_order = None
+        self.open_quote_override = None
+        self.leverage = LeverageTransport(self.events)
+        self.futures = FuturesTransport(self, self.leverage)
+        self.execution_services = execution_services(
+            ExecutionTransport(self.spot_request, self.futures)
+        )
 
         class FakeGovernorRefusal(Exception):
             def __init__(inner_self, reason):
@@ -5354,6 +5284,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
             "QUANT_SHA": SHA,
             "BINANCE_API_KEY": "offline-key",
             "BINANCE_API_SECRET": "offline-secret",
+            "MAX_SLIPPAGE_BPS": "0",
         }, clear=False)
         env.start()
         self.addCleanup(env.stop)
@@ -5428,35 +5359,41 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
 
     def spot_request(self, method, base_url, path, params=None,
                      signed=False):
-        self.assertEqual(base_url, jr.basis_executor.SPOT.base_url)
+        self.assertEqual(base_url, jr.binance_http.SPOT_BASE_URL)
         params = dict(params or {})
         if method == "GET" and path == "/api/v3/exchangeInfo":
             self.assertFalse(signed)
-            return "ok", {"symbols": [self.spot_info()]}
+            return jr.binance_http.HttpResult(
+                "ok", {"symbols": [self.spot_info()]}, None, None
+            )
         if method == "GET" and path == "/api/v3/ticker/bookTicker":
             self.assertFalse(signed)
-            return "ok", {
+            return jr.binance_http.HttpResult("ok", {
                 "symbol": "TSTUSDT",
                 "bidPrice": str(self.spot_bid),
                 "askPrice": str(self.spot_ask),
-            }
+            }, None, None)
         if method == "GET" and path == "/api/v3/account":
             self.assertTrue(signed)
-            return "ok", {
+            return jr.binance_http.HttpResult("ok", {
                 "canTrade": True,
                 "balances": [
-                    {"asset": "TST", "free": str(self.base_free)},
-                    {"asset": "USDT", "free": str(self.quote_free)},
+                    {"asset": "TST", "free": str(self.base_free),
+                     "locked": "0"},
+                    {"asset": "USDT", "free": str(self.quote_free),
+                     "locked": "0"},
                 ],
-            }
+            }, None, None)
         if method == "GET" and path == "/api/v3/openOrders":
             self.assertTrue(signed)
-            return "ok", []
+            return jr.binance_http.HttpResult("ok", [], None, None)
         if method == "POST" and path == "/api/v3/order":
             self.assertTrue(signed)
             self.posts.append(params)
             if self.unknown_submission:
-                return "unclear", {"http": 502}
+                return jr.binance_http.HttpResult(
+                    "unclear", None, None, "offline submission"
+                )
             side = params["side"]
             if side == "BUY":
                 quote = Decimal(params["quoteOrderQty"])
@@ -5474,7 +5411,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
                 commission_asset = "USDT"
                 self.base_free -= quantity
                 self.quote_free += quote - commission
-            order_id = str(len(self.posts))
+            order_id = len(self.posts)
             order = {
                 "symbol": "TSTUSDT",
                 "status": "FILLED",
@@ -5485,20 +5422,28 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
                 "cummulativeQuoteQty": str(quote),
             }
             fill = {
-                "id": order_id,
-                "orderId": order_id,
+                "tradeId": order_id, "orderId": order_id,
                 "qty": str(quantity),
                 "price": str(price),
                 "commission": str(commission),
                 "commissionAsset": commission_asset,
+                "isBuyer": side == "BUY", "isMaker": False,
+                "time": int(NOW.timestamp() * 1000),
             }
             self.orders[params["newClientOrderId"]] = dict(order)
-            return "ok", {**order, "fills": [fill]}
+            return jr.binance_http.HttpResult(
+                "ok", {**order, "fills": [fill]}, None, None
+            )
         if method == "GET" and path == "/api/v3/order":
             self.assertTrue(signed)
             if self.unknown_submission:
-                return "api_error", {"code": -1003, "msg": "offline"}
-            return "ok", dict(self.orders[params["origClientOrderId"]])
+                return jr.binance_http.HttpResult(
+                    "api_error", None, -1003, "offline"
+                )
+            return jr.binance_http.HttpResult(
+                "ok", dict(self.orders[params["origClientOrderId"]]),
+                None, None,
+            )
         raise AssertionError("unexpected spot request %s %s" % (
             method, path,
         ))
@@ -5507,7 +5452,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
         return jr.tick(
             receipt_dir=self.receipt_dir,
             now=NOW,
-            spot_request=self.spot_request,
+            execution_services=self.execution_services,
             **kwargs,
         )
 
@@ -5525,17 +5470,14 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
 
     def open_spot(self, job_id="spot-open"):
         self.job(job_id, spot=True)
-        with mock.patch.object(
-                jr, "_ensure_leverage_1x",
-                side_effect=AssertionError("spot path attempted Futures")):
-            self.assertEqual(self.tick(), 0)
+        self.assertEqual(self.tick(), 0)
 
     def test_spot_open_routes_proven_leg_through_ticket_governor_and_clamp(self):
         self.open_spot()
 
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(self.posts[0]["side"], "BUY")
-        self.assertEqual(self.posts[0]["quoteOrderQty"], "8.00000000")
+        self.assertEqual(self.posts[0]["quoteOrderQty"], "8")
         self.assertEqual(self.governor_acquires, [(
             "MOMENTUM_OPEN", "TSTUSDT", self.receipt_dir,
         )])
@@ -5551,43 +5493,11 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
         state = self.state()
         self.assertEqual(state["venue"], "spot")
         self.assertEqual(state["state"], "OPEN")
-        self.assertEqual(state["measured_qty"], "0.07900000")
+        self.assertEqual(state["measured_qty"], "0.079")
 
     def test_default_momentum_open_remains_on_futures_path(self):
         self.job("futures-default", maximum=6)
-        measured = {"qty": Decimal("0.03"), "price": Decimal("200"),
-                    "open_orders": 0, "leverage": 1}
-        order = {
-            "status": "FILLED",
-            "clientOrderId": "unused",
-            "orderId": "77",
-            "executedQty": "0.03",
-            "cumQuote": "6",
-            "avgPrice": "200",
-            "reduceOnly": False,
-        }
-
-        def submit(intent):
-            order["clientOrderId"] = intent["newClientOrderId"]
-            fill = {
-                "id": "1", "orderId": "77", "qty": "0.03",
-                "price": "200", "commission": "0.003",
-                "commissionAsset": "USDT", "realizedPnl": "0",
-            }
-            return "terminal", dict(order), [fill], "ok"
-
-        with mock.patch.object(jr, "_ensure_leverage_1x", return_value=True), \
-                mock.patch.object(jr, "_momentum_open_plan", return_value={
-                    "quantity": Decimal("0.03"),
-                    "limit_price": Decimal("200"),
-                    "current_leverage": 1,
-                }), \
-                mock.patch.object(jr, "_momentum_submit", side_effect=submit), \
-                mock.patch.object(jr, "_momentum_measure", return_value=measured), \
-                mock.patch.object(jr, "_run_spot_momentum_open") as spot_path:
-            self.assertEqual(self.tick(), 0)
-
-        spot_path.assert_not_called()
+        self.assertEqual(self.tick(), 0)
         self.assertEqual(self.state()["venue"], "futures")
         self.assertEqual(self.results()[0]["verdict"], "OPEN")
         self.assertEqual(self.posts, [])

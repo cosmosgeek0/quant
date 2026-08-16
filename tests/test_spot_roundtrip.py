@@ -17,6 +17,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
+import events, mechanics_reconcile as mechanics
 SPEC = importlib.util.spec_from_file_location(
     "spot_roundtrip_under_test", SRC / "spot_roundtrip.py")
 spot = importlib.util.module_from_spec(SPEC)
@@ -52,11 +53,11 @@ def account(base="5", quote="100", *, open_ids=(), can_trade=True,
     return adapter.SpotAccountState(can_trade, tuple(open_ids), tuple(balances))
 
 
-def order(plan, order_id, executed, quote):
+def order(plan, order_id, executed, quote, fills=()):
     return http.OrderResult(
         "terminal", http.OrderIdentity(SYMBOL, plan.intent.identity, order_id),
         plan.intent.identity, "FILLED", True, plan.side, False,
-        Decimal(executed), Decimal(quote), (), None)
+        Decimal(executed), Decimal(quote), fills, None)
 
 
 class OfflineTransport:
@@ -110,7 +111,7 @@ class SpotRoundtripCase(unittest.TestCase):
 
     def _run(self, *, buy_tag="terminal", sell_tag="terminal",
              start_state=None, final_state=None, test_results=None,
-             refuse_sell_build=False):
+             refuse_sell_build=False, buy_coverage="complete"):
         wire = OfflineTransport(test_results)
         initial = start_state or account()
         final = final_state if final_state is not None else ok(account("5", "99.89"))
@@ -135,7 +136,7 @@ class SpotRoundtripCase(unittest.TestCase):
             if tag == "terminal":
                 return order(plan, 11 if plan.side == "BUY" else 12,
                              "0.1" if plan.side == "BUY" else "0.099",
-                             "10" if plan.side == "BUY" else "9.9")
+                             "10" if plan.side == "BUY" else "9.9", (buy_fill,) if plan.side == "BUY" else ())
             error = http.HttpResult("api_error", None, -1013, "filter refusal")
             identity = http.OrderIdentity(SYMBOL, plan.intent.identity, None)
             return http.OrderResult(
@@ -143,18 +144,19 @@ class SpotRoundtripCase(unittest.TestCase):
                 None, None, (), error if tag == "error" else None)
 
         def fills(_transport, _base_url, result):
+            if result.side == "BUY" and buy_coverage == "absent": return unclear()
             selected = (buy_fill,) if result.side == "BUY" else (sell_fill,)
             executed = result.executed_quantity
+            complete = result.side != "BUY" or buy_coverage == "complete"
             coverage = http.FillCoverage(
-                selected, executed, executed, True,
+                selected, executed, executed, complete,
                 adapter.fees_by_asset(selected))
             return ok(coverage)
 
         original_builder = adapter.build_market_order
 
         def build(*args, **kwargs):
-            if refuse_sell_build and args[1] == "SELL":
-                raise http.AdapterRefusal("fresh sell filter refusal")
+            if refuse_sell_build and args[1] == "SELL" and args[0].bid == Decimal("98"): raise http.AdapterRefusal("fresh sell filter refusal")
             return original_builder(*args, **kwargs)
 
         patches = (
@@ -218,6 +220,32 @@ class SpotRoundtripCase(unittest.TestCase):
         self.assertEqual(sum(call[2] == "/api/v3/order/test" for call in wire.calls), 1)
         self.assertFalse(os.path.exists(spot.LOCK_PATH))
         self.assertEqual(stored["result"]["final_base_free"], "5")
+        self.assertEqual([(stored[s]["covered_quantity"], stored[s]["fills_complete"])
+                          for s in ("buy", "sell")], [("0.1", True), ("0.099", True)])
+        self.assertEqual([stored[s]["coverage_source"] for s in ("buy", "sell")],
+                         ["FULL", "myTrades"])
+        self.assertTrue(all(stored[s]["fills"] for s in ("buy", "sell")))
+        self.assertEqual(stored["sell"]["fresh_step"], "0.001")
+
+    def test_incomplete_buy_coverage_keeps_known_fees_and_returns_unknown(self):
+        code, stored, plans, _events, _wire = self._run(buy_coverage="incomplete")
+        self.assertEqual((code, stored["verdict"], len(plans), stored["result"]["fills_complete"]),
+                         (4, "UNKNOWN", 1, False))
+        self.assertEqual(stored["result"]["commissions"], {"BTC": "0.001"})
+
+    def test_absent_buy_coverage_returns_unknown(self):
+        code, stored, _plans, _events, _wire = self._run(buy_coverage="absent")
+        self.assertEqual((code, stored["verdict"], stored["result"]["commissions"],
+                          stored["result"]["fills_complete"]), (4, "UNKNOWN", {"BTC": "0.001"}, False))
+
+    def test_written_receipt_schema_is_accepted_by_both_readers(self):
+        _code, stored, _plans, _events, _wire = self._run()
+        emitted = events.events_from_receipt(stored)
+        probe = os.path.join(spot.RECEIPT_DIR, "basis-executor-roundtrip-probe.json")
+        os.link(spot.receipt_path, probe)
+        claim = mechanics.read_receipt(probe)
+        self.assertEqual((bool(emitted), claim.kind, len(claim.legs), claim.issues),
+                         (True, "basis", 2, ()))
 
     def test_pending_buy_maps_unknown_and_retains_lock(self):
         code, stored, plans, _events, _wire = self._run(buy_tag="pending")

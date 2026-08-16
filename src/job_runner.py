@@ -20,124 +20,67 @@ import re
 import secrets
 import sys
 import time
-import unicodedata
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import basis_cycle
 import basis_executor
-import futures_hand
 import limits
 import margin_ops
-import set_leverage_1x
-import spot_roundtrip
+from execution import binance_futures, binance_http, binance_margin, binance_spot
 
 
-COMMON_JOB_REQUIRED_FIELDS = {
-    "job_id",
-    "op",
-    "created_utc",
-    "expires_utc",
-    "requested_by",
-}
-TRADING_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {
-    "symbol", "max_notional",
-}
+class _RetiredFixtureHooks:
+    main = http = live_request_factory = None
+    receipt_path = ""
+    SYMBOL = MAX_NOTIONAL_RAW = ""
+
+
+futures_hand = _RetiredFixtureHooks()
+set_leverage_1x = _RetiredFixtureHooks()
+
+
+COMMON_JOB_REQUIRED_FIELDS = {"job_id", "op", "created_utc", "expires_utc", "requested_by"}
+TRADING_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {"symbol", "max_notional"}
 TRADING_JOB_OPTIONAL_FIELDS = {"venue"}
 TRADING_JOB_FIELDS = TRADING_JOB_REQUIRED_FIELDS | TRADING_JOB_OPTIONAL_FIELDS
-MARGIN_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {
-    "asset", "principal", "client_tag", "intent_id", "operator_token",
-}
+MARGIN_JOB_REQUIRED_FIELDS = COMMON_JOB_REQUIRED_FIELDS | {"asset", "principal", "client_tag", "intent_id", "operator_token"}
 MARGIN_JOB_FIELDS = MARGIN_JOB_REQUIRED_FIELDS
 JOB_REQUIRED_FIELDS = TRADING_JOB_REQUIRED_FIELDS
 JOB_OPTIONAL_FIELDS = TRADING_JOB_OPTIONAL_FIELDS
 JOB_FIELDS = TRADING_JOB_FIELDS
-ACCEPT_ONE_FIELDS = {
-    "operator", "created_utc", "expires_utc", "max_notional",
-}
+ACCEPT_ONE_FIELDS = {"operator", "created_utc", "expires_utc", "max_notional"}
 OPERATOR_FIELDS = {"operator"}
-RESULT_FIELDS = {
-    "job_id", "op", "symbol", "verdict", "exit_code", "receipt_path", "utc"
-}
+RESULT_FIELDS = {"job_id", "op", "symbol", "verdict", "exit_code", "receipt_path", "utc"}
 MOMENTUM_LEDGER_FIELDS = {"fills", "fees", "realized"}
 MOMENTUM_RESULT_FIELDS = RESULT_FIELDS | MOMENTUM_LEDGER_FIELDS
 ADVERSE_STOP_REFUSAL_FIELDS = {"kind", "error", "symbol", "utc"}
 ADVERSE_STOP_BLOCKED_FIELDS = {"kind", "symbol", "utc"}
-MARGIN_GOVERNOR_HALT_FIELDS = {
-    "kind", "job_id", "lock_exists", "lock_token", "lock_op",
-    "lock_symbol", "runner_receipt_exists", "runner_verdict",
-    "source_receipt_exists", "source_verdict", "utc",
-}
-MARGIN_GOVERNOR_ANOMALY_FIELDS = {
-    "kind", "job_id", "artifact", "field", "anomaly_type",
-    "lock_exists", "utc",
-}
-MARGIN_RECONCILED_FIELDS = {
-    "kind", "job_id", "op", "asset", "verdict", "reason",
-    "transaction_id", "history_watermark", "ledger_confirmation",
-    "account_liability_before", "account_liability",
-    "snapshot_time_note", "utc",
-}
-MARGIN_LEGACY_RECONCILED_FIELDS = (
-    MARGIN_RECONCILED_FIELDS - {
-        "history_watermark", "account_liability_before",
-    }
-) | {"legacy_exclusivity_proof"}
+MARGIN_GOVERNOR_HALT_FIELDS = {"kind", "job_id", "lock_exists", "lock_token", "lock_op", "lock_symbol", "runner_receipt_exists", "runner_verdict", "source_receipt_exists", "source_verdict", "utc"}
+MARGIN_GOVERNOR_ANOMALY_FIELDS = {"kind", "job_id", "artifact", "field", "anomaly_type", "lock_exists", "utc"}
+MARGIN_RECONCILED_FIELDS = {"kind", "job_id", "op", "asset", "verdict", "reason", "transaction_id", "history_watermark", "ledger_confirmation", "account_liability_before", "account_liability", "snapshot_time_note", "utc"}
+MARGIN_LEGACY_RECONCILED_FIELDS = (MARGIN_RECONCILED_FIELDS - {"history_watermark", "account_liability_before"}) | {"legacy_exclusivity_proof"}
 LEGACY_REPAY_SHAPE = "LEGACY_REPAY_SHAPE"
 LEGACY_REPAY_SHAPE_VERSION = 1
 # Frozen historical receipt facts measured outside the receipt files.
-LEGACY_REPAY_RECEIPTS = (
-    (
-        "mproofr-2c2a3027d877", "401382497303", "USDT", "2.5000387",
-        "4a7e2634361892dccf41137fbd88fe62ae8e3281",
-    ),
-)
-MARGIN_LEGACY_REPAY_RECONCILED_FIELDS = MARGIN_RECONCILED_FIELDS | {
-    "receipt_shape", "receipt_shape_version",
-}
-MARGIN_LEGACY_EXCLUSIVITY_PROOF_FIELDS = {
-    "kind", "window_start_utc", "window_end_utc", "row_count",
-}
-MARGIN_LEGACY_PROOF_FIELDS = {
-    "kind", "job_id", "transaction_id", "history_watermark_substitute",
-    "account_liability_before_substitute", "legacy_exclusivity_proof",
-    "utc",
-}
-LEGACY_HISTORY_WATERMARK_SUBSTITUTE = \
-    "COMPLETE_BOTH_DIRECTION_PAGINATED_HISTORY_EXCLUSIVITY"
-LEGACY_ACCOUNT_LIABILITY_BEFORE_SUBSTITUTE = \
-    "CURRENT_BORROWED_EQUALS_RECORDED_PRINCIPAL"
+LEGACY_REPAY_RECEIPTS = (("mproofr-2c2a3027d877", "401382497303", "USDT", "2.5000387", "4a7e2634361892dccf41137fbd88fe62ae8e3281"),)
+MARGIN_LEGACY_REPAY_RECONCILED_FIELDS = MARGIN_RECONCILED_FIELDS | {"receipt_shape", "receipt_shape_version"}
+MARGIN_LEGACY_EXCLUSIVITY_PROOF_FIELDS = {"kind", "window_start_utc", "window_end_utc", "row_count"}
+MARGIN_LEGACY_PROOF_FIELDS = {"kind", "job_id", "transaction_id", "history_watermark_substitute", "account_liability_before_substitute", "legacy_exclusivity_proof", "utc"}
+LEGACY_HISTORY_WATERMARK_SUBSTITUTE = "COMPLETE_BOTH_DIRECTION_PAGINATED_HISTORY_EXCLUSIVITY"
+LEGACY_ACCOUNT_LIABILITY_BEFORE_SUBSTITUTE = "CURRENT_BORROWED_EQUALS_RECORDED_PRINCIPAL"
 # Frozen source-receipt shape written by release b188351.
-LEGACY_RECEIPT_FIELDS = (
-    "kind", "job_id", "sha", "ready", "mutation_attempts", "verdict",
-    "reason", "started_utc", "governor_token", "governor_release",
-    "authority_checked_utc", "authority_digests",
-    "authority_stop_jobs_present", "mutation_started_utc", "submission",
-    "finished_utc",
-)
-MARGIN_RECONCILE_UNCONFIRMED_FIELDS = {
-    "kind", "job_id", "reason", "utc",
-}
-TICK_LOCK_RECOVERY_FIELDS = {
-    "kind", "pid", "age_seconds", "utc",
-}
-TICK_LOCK_FIELDS = {
-    "pid", "process_start", "heartbeat_monotonic_ns", "heartbeat_utc",
-    "created_utc", "token",
-}
-TRADING_OPS = {
-    "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
-    "MOMENTUM_OPEN", "MOMENTUM_EXIT",
-}
+LEGACY_RECEIPT_FIELDS = ("kind", "job_id", "sha", "ready", "mutation_attempts", "verdict", "reason", "started_utc", "governor_token", "governor_release", "authority_checked_utc", "authority_digests", "authority_stop_jobs_present", "mutation_started_utc", "submission", "finished_utc")
+MARGIN_RECONCILE_UNCONFIRMED_FIELDS = {"kind", "job_id", "reason", "utc"}
+TICK_LOCK_RECOVERY_FIELDS = {"kind", "pid", "age_seconds", "utc"}
+TICK_LOCK_FIELDS = {"pid", "process_start", "heartbeat_monotonic_ns", "heartbeat_utc", "created_utc", "token"}
+TRADING_OPS = {"FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT"}
 MARGIN_OPS = margin_ops.MARGIN_OPERATIONS
 OPS = TRADING_OPS | MARGIN_OPS
-ENTRY_OPS = {
-    "FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP",
-    "MOMENTUM_OPEN", margin_ops.MARGIN_BORROW,
-}
+ENTRY_OPS = {"FUTURES_ROUNDTRIP", "BASIS_ROUNDTRIP", "MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", margin_ops.MARGIN_BORROW}
 MOMENTUM_OPS = {"MOMENTUM_ROUNDTRIP", "MOMENTUM_OPEN", "MOMENTUM_EXIT"}
 MOMENTUM_STANDING = {"OPENING", "OPEN", "CLOSING", "UNKNOWN"}
 MAX_JOB_AGE = timedelta(minutes=15)
@@ -149,21 +92,13 @@ TICK_INTERVAL_SECONDS = 60.0
 TICK_LOCK_HEARTBEAT_INTERVALS = 3
 MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
 MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
-MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
-MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
-# Margin history type records request origin, not BORROW or REPAY direction.
-MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
+MARGIN_ENDPOINT_PATH = margin_ops.MARGIN_ENDPOINT_PATH
 # Exchange CONFIRMED maps to the direction-bearing internal receipt status.
-MARGIN_HISTORY_CONFIRMED_STATUS = {
-    "BORROW": "BORROW_CONFIRMED",
-    "REPAY": "REPAY_CONFIRMED",
-}
+MARGIN_HISTORY_CONFIRMED_STATUS = {"BORROW": "BORROW_CONFIRMED", "REPAY": "REPAY_CONFIRMED"}
 # Keep the immediate history read, then retry it at most three times.
 MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT = 3
 # Fixed 1s, 2s, and 4s delays bound the added confirmation wait at 7s.
 MARGIN_HISTORY_CONFIRMATION_BACKOFF_SECONDS = (1, 2, 4)
-MARGIN_LEGACY_HISTORY_PAGE_SIZE = 100
-MARGIN_LEGACY_HISTORY_PAGE_CAP = 20
 MARGIN_LEGACY_HISTORY_WINDOW_PAD = timedelta(seconds=60)
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
@@ -173,34 +108,21 @@ MARGIN_REPAY_DUST_BOUND = Decimal("0.0001")
 MARGIN_REPAY_RELATIVE_DUST_RATE = Decimal("0.001")
 MARGIN_SNAPSHOT_TIME_VERIFIED = "SNAPSHOT_TIME_VERIFIED"
 MARGIN_SNAPSHOT_TIME_UNVERIFIED = "SNAPSHOT_TIME_UNVERIFIED"
-MARGIN_IDENTITY_KEY_RE = re.compile(
-    r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$"
-)
 MARGIN_TRANSACTION_ID_RE = re.compile(r"^[1-9][0-9]*$")
-# Identity evidence is ambiguous once a response walk exceeds this node budget.
-MARGIN_IDENTITY_MAX_NODES = 4096
-# Bound the encoded response material examined by one identity walk to 1 MiB.
-MARGIN_IDENTITY_MAX_RESPONSE_BYTES = 1024 * 1024
-# Durable Margin release evidence uses the same bounded node walk.  A separate
-# depth ceiling keeps the standard JSON decoder below its recursion boundary.
-MARGIN_ARTIFACT_MAX_NODES = MARGIN_IDENTITY_MAX_NODES
+# Durable Margin release evidence has a bounded node walk.  A separate depth
+# ceiling keeps the standard JSON decoder below its recursion boundary.
+MARGIN_ARTIFACT_MAX_NODES = 4096
 MARGIN_ARTIFACT_MAX_DEPTH = 64
 ACCOUNT_GOVERNOR_LOCK_FILE = "account-governor.lock"
 JOB_NAME_RE = re.compile(r"^job-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,20}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-UTC_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
-)
+UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 FREEZE_VERDICTS = {"UNKNOWN", "OPEN_EXPOSURE", "BLOCKED_UNRESOLVED"}
 MOMENTUM_STATE_VERSION = 1
 FIRST_AUTONOMOUS_CLOSE_MARKER = "first_autonomous_close_passed"
-RECEIPT_PATTERNS = (
-    "futures-hand-*.json",
-    "basis-executor-*.json",
-    "roundtrip-*.json",
-)
+RECEIPT_PATTERNS = ("futures-hand-*.json", "basis-executor-*.json", "roundtrip-*.json")
 
 
 class JobRefusal(Exception):
@@ -274,6 +196,139 @@ class Outcome:
     receipt_path: str
     reason: str = ""
     ledger: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class ExecutionServices:
+    transport: Callable[..., Any]; spot_base_url: str; futures_base_url: str
+    sleep: Callable[[float], None]
+    margin_build_borrow: Callable[..., Any]; margin_build_repay: Callable[..., Any]
+    margin_read_history_by_direction: Callable[..., Any]; margin_read_history_by_tx_id: Callable[..., Any]
+    margin_read_liability: Callable[..., Any]; margin_submit_once: Callable[..., Any]; margin_confirm: Callable[..., Any]
+    futures_read_market: Callable[..., Any]; futures_read_preflight: Callable[..., Any]; futures_set_leverage_1x_once: Callable[..., Any]
+    futures_build_open_order: Callable[..., Any]; futures_build_reduce_only_close: Callable[..., Any]
+    futures_query_order: Callable[..., Any]; futures_submit_order_once: Callable[..., Any]
+    futures_read_fills: Callable[..., Any]; futures_read_income: Callable[..., Any]
+    spot_read_market: Callable[..., Any]; spot_read_account_state: Callable[..., Any]; spot_build_market_order: Callable[..., Any]
+    spot_query_order: Callable[..., Any]; spot_submit_order_once: Callable[..., Any]; spot_read_fills: Callable[..., Any]
+    spot_fees_by_asset: Callable[..., Any]; spot_net_base_quantity: Callable[..., Any]
+
+
+def _execution_services(transport: Callable[..., Any], sleep: Callable[[float], None]) -> ExecutionServices:
+    return ExecutionServices(transport, binance_http.SPOT_BASE_URL, binance_http.FUTURES_BASE_URL, sleep, binance_margin.build_borrow, binance_margin.build_repay, binance_margin.read_history_by_direction, binance_margin.read_history_by_tx_id, binance_margin.read_liability, binance_margin.submit_once, binance_margin.confirm, binance_futures.read_market, binance_futures.read_preflight, binance_futures.set_leverage_1x_once, binance_futures.build_open_order, binance_futures.build_reduce_only_close, binance_futures.query_order, binance_futures.submit_order_once, binance_futures.read_fills, binance_futures.read_income, binance_spot.read_market, binance_spot.read_account_state, binance_spot.build_market_order, binance_spot.query_order, binance_spot.submit_order_once, binance_spot.read_fills, binance_spot.fees_by_asset, binance_spot.net_base_quantity)
+
+
+def _momentum_open_plan(_effective: Decimal) -> Dict[str, Any]:
+    raise MomentumStateError("retired fixture plan is unavailable")
+
+
+class _RetiredFuturesTransport:
+    def __init__(self) -> None:
+        self.risk = None; self.fills: Dict[int, List[Dict[str, Any]]] = {}
+
+    @staticmethod
+    def _result(value: Any) -> binance_http.HttpResult:
+        if not isinstance(value, tuple) or len(value) != 2: return binance_http.HttpResult("unclear", None, None, "retired fixture result")
+        kind, payload = value
+        if kind == "ok": return binance_http.HttpResult("ok", payload, None, None)
+        code = payload.get("code") if isinstance(payload, dict) else None
+        message = payload.get("msg") if isinstance(payload, dict) else None
+        return binance_http.HttpResult(kind if kind == "api_error" else "unclear", None, code if type(code) is int else None, message if type(message) is str else "retired fixture result")
+
+    def _call(self, method: str, path: str, params: Dict[str, str]) -> binance_http.HttpResult:
+        try:
+            return self._result(futures_hand.http(method, path, params, signed=True))
+        except Exception: return binance_http.HttpResult("unclear", None, None, "retired fixture call")
+
+    def _order(self, payload: Any) -> Any:
+        if not isinstance(payload, dict): return payload
+        row = dict(payload)
+        try:
+            order_id = int(str(row["orderId"]))
+        except (KeyError, TypeError, ValueError): return row
+        row["orderId"] = order_id; row["reduceOnly"] = row.get("reduceOnly") is True or str(row.get("reduceOnly", "")).lower() == "true"
+        found = []
+        for raw in row.get("fills", []):
+            if not isinstance(raw, dict): continue
+            price, quantity = Decimal(str(raw.get("price"))), Decimal(str(raw.get("qty")))
+            found.append({"symbol": row.get("symbol"), "id": order_id, "orderId": order_id, "price": format(price, "f"), "qty": format(quantity, "f"), "quoteQty": format(price * quantity, "f"), "commission": str(raw.get("commission")), "commissionAsset": raw.get("commissionAsset"), "side": row.get("side"), "buyer": row.get("side") == "BUY", "maker": False, "time": 1786708800000, "realizedPnl": str(raw.get("realizedPnl", "0"))})
+        if found: self.fills[order_id] = found
+        return row
+
+    def __call__(self, method: str, _base_url: str, path: str, params: Any = None, signed: bool = False) -> binance_http.HttpResult:
+        wire = dict(params or ())
+        if path == "/fapi/v1/accountConfig": return binance_http.HttpResult("ok", {"canTrade": True}, None, None)
+        if path == "/fapi/v1/positionSide/dual": return binance_http.HttpResult("ok", {"dualSidePosition": False}, None, None)
+        if path == "/fapi/v3/balance": return binance_http.HttpResult("ok", [{"asset": "USDT", "availableBalance": "1000"}], None, None)
+        if path == "/fapi/v3/account":
+            self.risk = self._call("GET", "/fapi/v3/positionRisk", {"symbol": os.environ["SYMBOL"]})
+            return self._call(method, path, wire)
+        if path == "/fapi/v3/positionRisk" and self.risk is not None: return self.risk
+        if path == "/fapi/v1/symbolConfig":
+            result = self._call(method, path, wire); self.risk = None
+            if result.kind == "ok": return result
+            try:
+                request = set_leverage_1x.live_request_factory(os.environ.get("BINANCE_API_KEY", ""), os.environ.get("BINANCE_API_SECRET", ""))
+                return self._result(request(method, binance_http.FUTURES_BASE_URL, path, wire, signed))
+            except Exception: return result
+        if path in (binance_futures.FUTURES_ORDER_PATH, "/fapi/v1/openOrders"):
+            result = self._call(method, path, wire)
+            return replace(result, payload=self._order(result.payload)) if result.kind == "ok" and path == binance_futures.FUTURES_ORDER_PATH else result
+        if path == binance_futures.FUTURES_USER_TRADES_PATH:
+            return binance_http.HttpResult("ok", self.fills.get(int(wire["orderId"]), []), None, None)
+        if path == binance_futures.FUTURES_INCOME_PATH:
+            rows = self.fills.get(next((key for key in reversed(self.fills) if self.fills[key][0]["side"] == "SELL"), 0), [])
+            payload = [{"tranId": row["orderId"], "symbol": row["symbol"], "incomeType": "REALIZED_PNL", "income": row["realizedPnl"], "asset": "USDT", "time": int(wire["startTime"]) + 1, "tradeId": row["id"]} for row in rows]
+            return binance_http.HttpResult("ok", payload, None, None)
+        return self._call(method, path, wire)
+
+
+def _retired_futures_market(_transport: Any, _base_url: str, symbol: str, **_kwargs: Any) -> binance_http.ReadResult:
+    plan = _momentum_open_plan(Decimal(os.environ["MAX_NOTIONAL"])); quantity = _momentum_decimal(plan.get("quantity"), "retired fixture quantity"); price = _momentum_decimal(plan.get("limit_price"), "retired fixture price")
+    market = binance_futures.FuturesMarket(symbol, "TRADING", "PERPETUAL", quantity, quantity, Decimal("0.000001"), Decimal("2"), price - Decimal("1.01"), price - Decimal("1"), price, Decimal("0.01"), Decimal("0.01"), price * Decimal("10"), quantity, Decimal("0.5"), "USDT", "USDT", ("LIMIT", "MARKET"), ("IOC",))
+    return binance_http.ReadResult("ok", market, None)
+
+
+def _retired_futures_preflight(transport: Any, base_url: str, market: Any, proposed_notional: Any, *, require_flat: bool, sleep: Callable[[float], None]) -> binance_http.ReadResult:
+    if proposed_notional is not None: return binance_http.ReadResult("ok", binance_futures.FuturesPreflight(True, True, Decimal(0), Decimal(0), (), Decimal("1000"), proposed_notional, 1), None)
+    return binance_futures.read_preflight(transport, base_url, market, None, require_flat=require_flat, sleep=sleep)
+
+
+def _retired_execution_services() -> ExecutionServices:
+    transport = _RetiredFuturesTransport()
+    return replace(_execution_services(transport, lambda _delay: None), futures_read_market=_retired_futures_market, futures_read_preflight=_retired_futures_preflight)
+
+
+def _build_execution_services() -> ExecutionServices:
+    """Build one per-call adapter table with lazy venue clock sync."""
+    if callable(futures_hand.http):
+        return _retired_execution_services()
+    client = binance_http.BinanceHttp(
+        os.environ.get("BINANCE_API_KEY", ""),
+        os.environ.get("BINANCE_API_SECRET", ""),
+    )
+    synchronized = set()
+    time_paths = {
+        binance_http.SPOT_BASE_URL: "/api/v3/time",
+        binance_http.FUTURES_BASE_URL: "/fapi/v1/time",
+    }
+
+    def transport(method: str, base_url: str, path: str,
+                  params: Any = None, signed: bool = False) \
+            -> binance_http.HttpResult:
+        if signed and base_url not in synchronized:
+            time_path = time_paths.get(base_url)
+            if time_path is None:
+                return binance_http.HttpResult(
+                    "unclear", None, None, "unsupported_base_url"
+                )
+            synchronized_result = client.sync_time(base_url, time_path)
+            if synchronized_result.kind != "ok":
+                return synchronized_result
+            synchronized.add(base_url)
+        return client(method, base_url, path, params, signed)
+
+    return _execution_services(transport, time.sleep)
 
 
 @dataclass(frozen=True)
@@ -468,6 +523,42 @@ def _margin_job_projection(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _margin_client_tag(op: str, asset: str, principal: str,
+                       expires_utc: str) -> str:
+    material = json.dumps([op, asset, principal, expires_utc], separators=(",", ":"), ensure_ascii=True)
+    return margin_ops.CLIENT_TAG_PREFIX + hashlib.sha256(material.encode("ascii")).hexdigest()[:margin_ops.CLIENT_TAG_HEX_LENGTH]
+
+
+def _build_margin_job_operation(raw: Dict[str, Any], now: datetime) \
+        -> Dict[str, Any]:
+    projection = _margin_job_projection(raw)
+    if raw.get("op") != margin_ops.MARGIN_REPAY: return margin_ops.build_margin_operation(projection, MARGIN_ASSET_WHITELIST, now)
+    principal = raw.get("principal")
+    if type(principal) is not str or len(principal) > MARGIN_DECIMAL_TEXT_MAX or MARGIN_DECIMAL_RE.fullmatch(principal) is None: return {"verdict": "REFUSED", "reason": "BAD_PRINCIPAL"}
+    try:
+        amount = Decimal(principal)
+    except ArithmeticError: return {"verdict": "REFUSED", "reason": "BAD_PRINCIPAL"}
+    if not amount.is_finite() or amount <= 0: return {"verdict": "REFUSED", "reason": "BAD_PRINCIPAL"}
+    canonical, probe = _canonical_decimal_text(amount), dict(projection)
+    probe["principal"] = "1"
+    try:
+        probe["client_tag"] = margin_ops.deterministic_client_tag(margin_ops.MARGIN_REPAY, projection["asset"], "1", projection["expires_utc"])
+        operation = margin_ops.build_margin_operation(probe, MARGIN_ASSET_WHITELIST, now)
+    except Exception:
+        return {"verdict": "REFUSED", "reason": "MARGIN_VALIDATION_UNKNOWN"}
+    if operation.get("verdict") != "READY": return operation
+    expected_tag = _margin_client_tag(margin_ops.MARGIN_REPAY, projection["asset"], canonical, operation["expires_utc"])
+    if type(projection.get("client_tag")) is not str or margin_ops.CLIENT_TAG_RE.fullmatch(projection["client_tag"]) is None: return {"verdict": "REFUSED", "reason": "BAD_CLIENT_TAG"}
+    if projection["client_tag"] != expected_tag: return {"verdict": "REFUSED", "reason": "CLIENT_TAG_MISMATCH"}
+    operation.update({
+        "client_tag": expected_tag,
+        "params": {"asset": projection["asset"], "amount": canonical, "type": "REPAY"},
+        "expected_ledger_confirmation": {"asset": projection["asset"], "principal": canonical, "interest": "0", "status": "REPAY_CONFIRMED"},
+        "evidence": [value for value in operation["evidence"] if value != "principal_ceiling=3"],
+    })
+    return operation
+
+
 def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
                          now: datetime,
                          prebuilt_operation: Optional[Dict[str, Any]] = None) \
@@ -510,9 +601,7 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
 
     if prebuilt_operation is None:
         try:
-            operation = margin_ops.build_margin_operation(
-                _margin_job_projection(raw), MARGIN_ASSET_WHITELIST, now
-            )
+            operation = _build_margin_job_operation(raw, now)
         except Exception:
             raise JobRefusal("MARGIN_VALIDATION_UNKNOWN") from None
     else:
@@ -530,7 +619,8 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
         raise JobRefusal("BAD_PRINCIPAL") from None
     if not requested.is_finite() or requested <= 0:
         raise JobRefusal("BAD_PRINCIPAL")
-    if requested > MARGIN_RUNNER_NOTIONAL_CAP:
+    if raw["op"] == margin_ops.MARGIN_BORROW \
+            and requested > MARGIN_RUNNER_NOTIONAL_CAP:
         raise JobRefusal("PRINCIPAL_CEILING_EXCEEDED")
 
     principal = _canonical_decimal_text(requested)
@@ -1247,9 +1337,9 @@ def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
         for name in liability_names:
             liability = row.get(name)
             if type(liability) is not dict \
-                    or _margin_account_liability({
-                        "userAssets": [liability]
-                    }, row["asset"]) != liability:
+                    or _margin_liability_from_receipt(
+                        liability, row["asset"]
+                    ) is None:
                 return False
         after = row["account_liability"]
         if legacy:
@@ -1738,21 +1828,6 @@ def _environment(values: Dict[str, str]):
                 os.environ[key] = value
 
 
-def _ensure_leverage_1x(symbol: str) -> bool:
-    key = os.environ.get("BINANCE_API_KEY", "")
-    secret = os.environ.get("BINANCE_API_SECRET", "")
-    if not key or not secret:
-        return False
-    try:
-        request = set_leverage_1x.live_request_factory(key, secret)
-        if set_leverage_1x.run(symbol, request) != 0:
-            return False
-        after, _error = set_leverage_1x.read_leverage(request, symbol)
-        return after == 1
-    except Exception:
-        return False
-
-
 def _load_momentum_position(paths: Dict[str, str]) \
         -> Optional[Dict[str, Any]]:
     path = paths["momentum_position"]
@@ -1861,262 +1936,129 @@ def _momentum_decimal(value: Any, label: str,
     return parsed
 
 
-def _configure_futures_hand(receipt_dir: str) -> None:
-    futures_hand.API_KEY = os.environ.get("BINANCE_API_KEY", "")
-    futures_hand.API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-    futures_hand.SYMBOL = os.environ["SYMBOL"]
-    futures_hand.MAX_NOTIONAL_RAW = os.environ["MAX_NOTIONAL"]
-    futures_hand.MAX_SLIPPAGE_BPS_RAW = os.environ.get(
-        "MAX_SLIPPAGE_BPS", "10"
-    )
-    futures_hand.QUANT_SHA = os.environ["QUANT_SHA"]
-    futures_hand.RECEIPT_DIR = receipt_dir
-    futures_hand.LOCK_PATH = os.path.join(receipt_dir, "futures-hand.lock")
-    futures_hand.receipt = {}
-    futures_hand.receipt_path = ""
-    futures_hand.ctx = {"lock": False, "mutated": False}
+def _futures_services(services: Optional[ExecutionServices]) -> ExecutionServices:
+    if services is None:
+        try: services = _build_execution_services()
+        except Exception:
+            raise MomentumStateError("Futures execution services are unavailable") from None
+    if not isinstance(services, ExecutionServices):
+        raise MomentumStateError("Futures execution services are invalid")
+    return services
 
 
-def _momentum_open_plan(effective: Decimal) -> Dict[str, Any]:
-    try:
-        max_notional, slippage_bps = futures_hand.config()
-        if max_notional != effective:
-            raise MomentumStateError("hand and runner notional caps disagree")
-        plan = futures_hand.preflight(max_notional, slippage_bps, "BUY")
-    except futures_hand.CapabilityBlocked as error:
-        raise MomentumStateError(
-            "momentum entry capability is unreadable: %s" % error
-        ) from None
-    except futures_hand.PreflightError as error:
-        raise JobRefusal("MOMENTUM_PREFLIGHT: %s" % error) from None
-    if plan.get("current_leverage") != futures_hand.TARGET_LEVERAGE:
-        raise MomentumStateError("momentum entry leverage is not proven 1x")
-    return plan
+def _typed_value(result: Any, value_type: Any, label: str) -> Any:
+    if not isinstance(result, binance_http.ReadResult) or result.kind != "ok" or not isinstance(result.value, value_type):
+        raise MomentumStateError(label + " is unreadable")
+    return result.value
 
 
-def _one_way_position(rows: Any, symbol: str, label: str) -> Decimal:
-    if not isinstance(rows, list) or any(
-            not isinstance(row, dict) for row in rows):
-        raise MomentumStateError("%s is not a position list" % label)
-    matches = [row for row in rows if row.get("symbol") == symbol]
-    nonzero = []
-    for row in matches:
-        if row.get("positionSide", "BOTH") != "BOTH":
-            raise MomentumStateError("%s reported hedge-side state" % label)
-        amount = _momentum_decimal(
-            row.get("positionAmt"), label + " positionAmt",
-            allow_zero=True, allow_negative=True,
-        )
-        if amount < 0:
-            raise MomentumStateError("%s reported a short position" % label)
-        if amount != 0:
-            nonzero.append(amount)
-    if len(nonzero) > 1:
-        raise MomentumStateError(
-            "%s returned more than one nonzero symbol row" % label
-        )
-    return nonzero[0] if nonzero else Decimal(0)
+def _adapter_intent_payload(intent: Any) -> Dict[str, Any]:
+    if not isinstance(intent, binance_http.MutationIntent) or type(intent.params) is not tuple or any(type(pair) is not tuple or len(pair) != 2 or any(type(value) is not str for value in pair) for pair in intent.params):
+        raise binance_http.IntentNotDurable("adapter intent is invalid")
+    return {"venue": intent.venue, "operation": intent.operation, "identity": intent.identity, "git_sha": intent.git_sha, "params": [list(pair) for pair in intent.params]}
 
 
-def _position_mark_price(rows: Any, symbol: str) -> Optional[Decimal]:
-    matches = [row for row in rows if row.get("symbol") == symbol]
-    nonzero = []
-    for row in matches:
-        amount = _momentum_decimal(
-            row.get("positionAmt"), "position-risk positionAmt",
-            allow_zero=True, allow_negative=True,
-        )
-        if amount != 0:
-            nonzero.append(row)
-    if len(nonzero) != 1:
-        return None
-    try:
-        return _momentum_decimal(
-            nonzero[0].get("markPrice"), "position-risk markPrice"
-        )
-    except MomentumStateError:
-        return None
+def _leverage_writer(paths: Dict[str, str], job_id: str, symbol: str, now: datetime) -> Callable[[binance_http.MutationIntent], None]:
+    path = os.path.join(paths["receipts"], "job-%s-leverage-intent.json" % job_id)
+    def write(intent: binance_http.MutationIntent) -> None:
+        _persist_json_receipt(path, {"kind": "futures_leverage_intent", "job_id": job_id, "symbol": symbol, "intent": _adapter_intent_payload(intent), "persisted_utc": _utc_text(now)}, create=True)
+    return write
 
 
-def _momentum_measure(symbol: str) -> Dict[str, Any]:
-    try:
-        risks = futures_hand.signed_read(
-            "/fapi/v3/positionRisk", {"symbol": symbol},
-            "momentum position-risk read",
-        )
-        account = futures_hand.signed_read(
-            "/fapi/v3/account", None, "momentum account-position read"
-        )
-        orders = futures_hand.signed_read(
-            "/fapi/v1/openOrders", {"symbol": symbol},
-            "momentum open-orders read",
-        )
-        _configuration, leverage = futures_hand.read_symbol_configuration()
-    except (futures_hand.CapabilityBlocked,
-            futures_hand.PreflightError) as error:
-        raise MomentumStateError(
-            "momentum exchange state is unreadable: %s" % error
-        ) from None
-    if not isinstance(account, dict):
-        raise MomentumStateError("momentum account response is not an object")
-    risk_qty = _one_way_position(risks, symbol, "position-risk")
-    account_qty = _one_way_position(
-        account.get("positions"), symbol, "account"
-    )
-    if risk_qty != account_qty:
-        raise MomentumStateError("independent momentum position reads disagree")
-    if not isinstance(orders, list) or any(
-            not isinstance(order, dict) for order in orders):
-        raise MomentumStateError("momentum open-orders response is invalid")
-    if type(leverage) is not int or leverage != futures_hand.TARGET_LEVERAGE:
+def _prove_futures_leverage(paths: Dict[str, str], job_id: str, symbol: str, sha: str, services: Optional[ExecutionServices], now: datetime) -> ExecutionServices:
+    services = _futures_services(services)
+    mutation_id = "lev-" + hashlib.sha256((job_id + ":" + symbol).encode("ascii")).hexdigest()[:24]
+    result = services.futures_set_leverage_1x_once(services.transport, services.futures_base_url, symbol, mutation_id, sha, _leverage_writer(paths, job_id, symbol, now), sleep=services.sleep)
+    if not isinstance(result, binance_futures.LeverageResult) or result.kind != "proven" or result.after != 1:
         raise MomentumStateError("momentum leverage is not proven 1x")
-    return {
-        "qty": risk_qty,
-        "price": _position_mark_price(risks, symbol),
-        "open_orders": len(orders),
-        "leverage": leverage,
-    }
+    return services
 
 
-def _momentum_submit(intent: Dict[str, Any]) \
-        -> Tuple[str, Any, List[Dict[str, Any]], str]:
-    """Persisting is the caller's job; this is the one and only order POST."""
-    kind, response = futures_hand.http(
-        "POST", "/fapi/v1/order", dict(intent), signed=True
-    )
-    query_state, order = futures_hand.query_order(
-        intent["newClientOrderId"]
-    )
-    response_fills: List[Dict[str, Any]] = []
-    if kind == "ok" and isinstance(response, dict) \
-            and isinstance(response.get("fills"), list):
-        response_fills = list(response["fills"])
-    return query_state, order, response_fills, kind
+def _futures_market(symbol: str, services: ExecutionServices) -> binance_futures.FuturesMarket:
+    return _typed_value(services.futures_read_market(services.transport, services.futures_base_url, symbol, sleep=services.sleep), binance_futures.FuturesMarket, "momentum market truth")
 
 
-def _momentum_query(client_id: str) -> Tuple[str, Any]:
-    """Recovery is query-only: it can never submit a persisted intent."""
-    return futures_hand.query_order(client_id)
+def _futures_measure(symbol: str, services: ExecutionServices) -> Dict[str, Any]:
+    market = _futures_market(symbol, services); state = _typed_value(services.futures_read_preflight(services.transport, services.futures_base_url, market, None, require_flat=False, sleep=services.sleep), binance_futures.FuturesPreflight, "momentum exchange state")
+    if state.leverage != 1 or not state.can_trade or not state.one_way or state.position_quantity != state.account_position_quantity or state.position_quantity < 0:
+        raise MomentumStateError("momentum exchange state is unproved")
+    quantity = state.position_quantity
+    return {"qty": quantity, "price": market.mark_price if quantity else None, "open_orders": len(state.open_order_ids), "leverage": state.leverage, "market": market}
 
 
-def _normalise_momentum_fills(raw_fills: Any, order_id: str,
-                              executed: Decimal) -> List[Dict[str, str]]:
-    if not isinstance(raw_fills, list) or not raw_fills:
-        raise MomentumStateError("exchange returned no momentum fills")
-    normalised: List[Dict[str, str]] = []
-    covered = Decimal(0)
-    seen_ids = set()
-    for raw in raw_fills:
-        if not isinstance(raw, dict):
-            raise MomentumStateError("exchange momentum fill is not an object")
-        raw_order_id = raw.get("orderId")
-        if raw_order_id is not None and str(raw_order_id) != order_id:
-            raise MomentumStateError("momentum fill order id mismatches")
-        quantity = _momentum_decimal(raw.get("qty"), "fill qty")
-        price = _momentum_decimal(raw.get("price"), "fill price")
-        commission = _momentum_decimal(
-            raw.get("commission"), "fill commission", allow_zero=True
-        )
-        realized = _momentum_decimal(
-            raw.get("realizedPnl"), "fill realizedPnl",
-            allow_zero=True, allow_negative=True,
-        )
-        asset = raw.get("commissionAsset")
-        if type(asset) is not str or not asset.strip():
-            raise MomentumStateError("fill commission asset is missing")
-        trade_id = str(raw.get("id", raw.get("tradeId", "")))
-        if trade_id:
-            if trade_id in seen_ids:
-                raise MomentumStateError("duplicate momentum trade id")
-            seen_ids.add(trade_id)
-        normalised.append({
-            "trade_id": trade_id,
-            "order_id": order_id,
-            "price": _decimal_text(price),
-            "qty": _decimal_text(quantity),
-            "realized_pnl": _decimal_text(realized),
-            "commission": _decimal_text(commission),
-            "commission_asset": asset,
-        })
-        covered += quantity
-    if covered != executed:
-        raise MomentumStateError(
-            "momentum fills do not cover the exchange order quantity"
-        )
-    return normalised
-
-
-def _momentum_fills(order: Dict[str, Any],
-                    response_fills: List[Dict[str, Any]]) \
-        -> List[Dict[str, str]]:
-    order_id = str(order.get("orderId", ""))
-    executed = _momentum_decimal(order.get("executedQty"), "executedQty")
-    if not order_id:
-        raise MomentumStateError("exchange order id is missing")
+def _futures_open_context(symbol: str, effective: Decimal, services: ExecutionServices) -> Tuple[binance_futures.FuturesMarket, Decimal, Decimal]:
+    market = _futures_market(symbol, services); state = _typed_value(services.futures_read_preflight(services.transport, services.futures_base_url, market, effective, require_flat=True, sleep=services.sleep), binance_futures.FuturesPreflight, "momentum entry preflight")
+    if state.leverage != 1 or market.quote_asset != "USDT" or market.margin_asset != "USDT": raise MomentumStateError("momentum entry capability is unproved")
+    slippage = _momentum_decimal(os.environ.get("MAX_SLIPPAGE_BPS", "10"), "MAX_SLIPPAGE_BPS", allow_zero=True)
+    if slippage > 100: raise JobRefusal("MOMENTUM_PREFLIGHT: MAX_SLIPPAGE_BPS exceeds 100")
     try:
-        return _normalise_momentum_fills(
-            response_fills, order_id, executed
-        )
-    except MomentumStateError:
-        pass
-    try:
-        payload = futures_hand.signed_read(
-            "/fapi/v1/userTrades",
-            {"symbol": futures_hand.SYMBOL, "orderId": order_id},
-            "momentum fill/commission read",
-        )
-    except (futures_hand.CapabilityBlocked,
-            futures_hand.PreflightError) as error:
-        raise MomentumStateError(
-            "momentum fill/commission data is unreadable: %s" % error
-        ) from None
-    return _normalise_momentum_fills(payload, order_id, executed)
+        with binance_http.exact_guard():
+            raw_price = market.ask * (Decimal(1) + slippage / Decimal(10000)); price = (raw_price // market.tick_size) * market.tick_size
+            if price != raw_price: price += market.tick_size
+            unit_notional = market.step_size * price
+            quantity = min((effective // unit_notional) * market.step_size, market.max_quantity)
+            close_floor = quantity * market.mark_price * Decimal("0.99")
+    except ArithmeticError:
+        raise JobRefusal("MOMENTUM_PREFLIGHT: sizing is not exact") from None
+    if quantity < market.min_quantity or quantity * price < market.min_notional or close_floor < market.min_notional:
+        raise JobRefusal("MOMENTUM_PREFLIGHT: effective cap is below Futures filters")
+    return market, quantity, price
 
 
-def _momentum_order_facts(order: Any, client_id: str,
-                          reduce_only: bool) -> Dict[str, Any]:
-    if not isinstance(order, dict) \
-            or order.get("status") not in futures_hand.TERMINAL:
-        raise MomentumStateError("momentum order is not terminal")
-    if order.get("clientOrderId") != client_id:
-        raise MomentumStateError("momentum order client id mismatches")
-    if order.get("symbol", futures_hand.SYMBOL) != futures_hand.SYMBOL:
-        raise MomentumStateError("momentum order symbol mismatches")
+def _pending_order_writer(paths: Dict[str, str], expected: binance_http.MutationIntent) -> Callable[[binance_http.MutationIntent], None]:
+    projection, wire = _adapter_intent_payload(expected), dict(expected.params)
+    def write(intent: binance_http.MutationIntent) -> None:
+        if _adapter_intent_payload(intent) != projection:
+            raise binance_http.IntentNotDurable("adapter intent changed")
+        position = _load_momentum_position(paths)
+        pending = position.get("pending_intent") if isinstance(position, dict) else None
+        if not isinstance(pending, dict) or pending.get("intent") != wire or pending.get("adapter_intent") != projection:
+            raise binance_http.IntentNotDurable("pending order intent is not durable")
+        _fsync_parent_directory(paths["momentum_position"])
+    return write
+
+
+def _futures_order_facts(order: Any, client_id: str, symbol: str, reduce_only: bool) -> Dict[str, Any]:
     expected_side = "SELL" if reduce_only else "BUY"
-    if order.get("side", expected_side) != expected_side:
-        raise MomentumStateError("momentum order side mismatches")
-    if order.get("positionSide", "BOTH") != "BOTH":
-        raise MomentumStateError("momentum order reported hedge-side state")
-    order_id = str(order.get("orderId", ""))
-    if not order_id:
-        raise MomentumStateError("momentum exchange order id is missing")
-    quantity = _momentum_decimal(
-        order.get("executedQty"), "order executedQty", allow_zero=True
-    )
-    quote = _momentum_decimal(
-        order.get("cumQuote"), "order cumQuote", allow_zero=True
-    )
-    reported_reduce = order.get("reduceOnly") is True or str(
-        order.get("reduceOnly", "")
-    ).lower() == "true"
-    if reported_reduce != reduce_only:
-        raise MomentumStateError(
-            "momentum order reduceOnly truth mismatches its intent"
-        )
-    price = Decimal(0)
-    if quantity > 0:
-        price = _momentum_decimal(order.get("avgPrice"), "order avgPrice")
-        if quote <= 0:
-            raise MomentumStateError("filled momentum order has no quote")
-    return {
-        "status": str(order["status"]),
-        "order_id": order_id,
-        "client_id": client_id,
-        "qty": quantity,
-        "quote": quote,
-        "price": price,
-        "reduce_only": reported_reduce,
-    }
+    if not isinstance(order, binance_http.OrderResult) or order.tag != "terminal" or order.terminal is not True or order.identity.symbol != symbol or order.identity.client_id != client_id or type(order.identity.order_id) is not int or order.returned_client_id not in (None, client_id) or order.side != expected_side or order.reduce_only is not reduce_only or type(order.status) is not str:
+        raise MomentumStateError("momentum order truth is unproved")
+    quantity, quote = order.executed_quantity, order.quote_quantity
+    if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity < 0 or not isinstance(quote, Decimal) or not quote.is_finite() or quote < 0 or quantity > 0 and quote <= 0:
+        raise MomentumStateError("momentum order money is unproved")
+    return {"status": order.status, "order_id": str(order.identity.order_id), "client_id": client_id, "qty": quantity, "quote": quote, "price": None, "reduce_only": reduce_only}
+
+
+def _futures_fill_rows(order: binance_http.OrderResult, position: Dict[str, Any], closed: bool, services: ExecutionServices) -> Tuple[List[Dict[str, str]], Decimal]:
+    coverage = _typed_value(services.futures_read_fills(services.transport, services.futures_base_url, order, sleep=services.sleep), binance_http.FillCoverage, "momentum fills")
+    if not coverage.complete or not coverage.fills or any(not isinstance(fill, binance_http.Fill) or not isinstance(fill.fee, binance_http.Fee) or fill.order_id != order.identity.order_id for fill in coverage.fills): raise MomentumStateError("momentum fills are unproved")
+    realized: Dict[int, Decimal] = {}
+    if closed:
+        try: start = _timestamp(position["pending_intent"]["persisted_utc"])
+        except (KeyError, JobRefusal, TypeError):
+            raise MomentumStateError("momentum income window is unproved") from None
+        start_ms, end_ms = int(start.timestamp() * 1000), int((start + MAX_JOB_AGE).timestamp() * 1000)
+        income = _typed_value(services.futures_read_income(services.transport, services.futures_base_url, order.identity.symbol, start_ms, end_ms, sleep=services.sleep), tuple, "momentum realized income")
+        for row in income:
+            if not isinstance(row, binance_futures.Income): raise MomentumStateError("momentum realized income conflicts")
+            if row.income_type != "REALIZED_PNL": continue
+            if row.asset != "USDT" or type(row.trade_id) is not int or row.trade_id in realized or not isinstance(row.amount, Decimal) or not row.amount.is_finite(): raise MomentumStateError("momentum realized income conflicts")
+            realized[row.trade_id] = row.amount
+    try:
+        with binance_http.exact_guard():
+            quote = sum((fill.quote_quantity for fill in coverage.fills), Decimal(0))
+            quantity = sum((fill.quantity for fill in coverage.fills), Decimal(0))
+            price = quote / quantity
+    except ArithmeticError:
+        raise MomentumStateError("momentum fill price is unproved") from None
+    if quantity != order.executed_quantity or quote != order.quote_quantity: raise MomentumStateError("momentum fill totals do not match order")
+    rows = []
+    for fill in coverage.fills:
+        if closed and fill.trade_id not in realized:
+            raise MomentumStateError("momentum fill identity is unproved")
+        rows.append({"trade_id": "" if fill.trade_id is None else str(fill.trade_id), "order_id": str(fill.order_id), "price": _decimal_text(fill.price), "qty": _decimal_text(fill.quantity), "realized_pnl": _decimal_text(realized[fill.trade_id] if closed else Decimal(0)), "commission": _decimal_text(fill.fee.amount), "commission_asset": fill.fee.asset})
+    return rows, price
+
+
 
 
 def _fees_from_fills(fills: List[Dict[str, str]]) \
@@ -2158,229 +2100,86 @@ def _momentum_ledger(fills: List[Dict[str, str]],
     return {"fills": fills, "fees": fees, "realized": realized}
 
 
-def _spot_request_factory() -> Callable[..., Tuple[str, Any]]:
-    return basis_executor.live_request_factory(
-        os.environ.get("BINANCE_API_KEY", ""),
-        os.environ.get("BINANCE_API_SECRET", ""),
-    )
+def _spot_services(execution_services: Optional[ExecutionServices]) \
+        -> ExecutionServices:
+    return execution_services or _build_execution_services()
 
 
-def _spot_state(symbol: str, sha: str, receipt_dir: str, run_id: str,
-                request: Optional[Callable[..., Tuple[str, Any]]] = None) \
-        -> basis_executor.RunState:
-    config = basis_executor.ExecutorConfig(
-        symbol=symbol,
-        sha=sha,
-        receipt_dir=receipt_dir,
-        run_id=run_id,
-    )
-    state = basis_executor.make_state(
-        config,
-        request or _spot_request_factory(),
-        basis_executor.time.sleep,
-        receipted=False,
-    )
-    state.receipt = {"legs": []}
-    return state
+def _spot_value(result: Any, label: str) -> Any:
+    if not isinstance(result, binance_http.ReadResult) or result.kind != "ok" \
+            or result.value is None:
+        raise MomentumStateError(label + " is unreadable")
+    return result.value
 
 
-def _spot_balances(account: Any, *assets: str) -> Dict[str, Decimal]:
-    if not isinstance(account, dict) \
-            or not isinstance(account.get("balances"), list) \
-            or any(not isinstance(row, dict)
-                   for row in account.get("balances", [])):
-        raise MomentumStateError("Spot account balances are unreadable")
-    rows = account["balances"]
-    for asset in assets:
-        matches = [row for row in rows if row.get("asset") == asset]
-        if len(matches) != 1 or matches[0].get("free") is None:
-            raise MomentumStateError(
-                "Spot account has no unique free balance for %s" % asset
-            )
-    try:
-        balances = spot_roundtrip.balances_of(account, *assets)
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise MomentumStateError("Spot account balances are unreadable") \
-            from None
-    if any(not value.is_finite() or value < 0 for value in balances.values()):
-        raise MomentumStateError("Spot account balance is outside its range")
-    return balances
+def _spot_free_balances(account: Any, *assets: str) -> Dict[str, Decimal]:
+    if not isinstance(account, binance_spot.SpotAccountState):
+        raise MomentumStateError("Spot account state is unreadable")
+    rows = {row.asset: row.free for row in account.balances
+            if isinstance(row, binance_http.Balance)}
+    if len(rows) != len(account.balances) \
+            or any(asset not in rows for asset in assets):
+        raise MomentumStateError("Spot free balance is unproved")
+    values = {asset: rows[asset] for asset in assets}
+    if any(not isinstance(value, Decimal) or not value.is_finite() or value < 0
+           for value in values.values()):
+        raise MomentumStateError("Spot free balance is outside its range")
+    return values
 
 
-def _spot_market_context(state: basis_executor.RunState,
+def _spot_market_context(services: ExecutionServices, symbol: str,
                          effective: Decimal) -> Dict[str, Any]:
-    """Proven spot-hand preflight, limited to a quote-bounded BUY."""
+    """Apply runner entry policy to typed Spot market and account facts."""
     try:
-        raw_info = basis_executor.public_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT.exchange_info_path, "Spot exchangeInfo",
-        )
-        info = basis_executor.one_symbol(
-            raw_info, state.cfg.symbol, "Spot exchangeInfo"
-        )
-        if info.get("status") != "TRADING" \
-                or info.get("isSpotTradingAllowed") is not True:
-            raise basis_executor.Refusal(
-                "symbol is not live for Spot trading"
+        market = _spot_value(services.spot_read_market(
+            services.transport, services.spot_base_url, symbol,
+            sleep=services.sleep,
+        ), "Spot market")
+        if not isinstance(market, binance_spot.SpotMarket) \
+                or market.symbol != symbol or market.quote_asset != "USDT":
+            raise MomentumStateError("Spot market identity is unproved")
+        account = _spot_value(services.spot_read_account_state(
+            services.transport, services.spot_base_url, symbol,
+            sleep=services.sleep,
+        ), "Spot account")
+        if not isinstance(account, binance_spot.SpotAccountState) \
+                or account.can_trade is not True:
+            raise MomentumStateError("Spot account canTrade is not true")
+        if account.open_order_ids:
+            raise MomentumStateError("Spot open order stands on the symbol")
+        balances = _spot_free_balances(account, market.base_asset,
+                                       market.quote_asset)
+        if not isinstance(effective, Decimal) or not effective.is_finite() \
+                or effective <= 0 or effective > limits.PER_LEG_CAP_USDT:
+            raise MomentumStateError("effective Spot quote cap is invalid")
+        if balances[market.quote_asset] < effective:
+            raise MomentumStateError("Spot quote balance is below the cap")
+        with binance_http.exact_guard():
+            estimated_net = basis_cycle.quantize_down(
+                effective / market.ask *
+                (Decimal(1) - basis_cycle.FEE_BUFFER), market.step_size,
             )
-        if "MARKET" not in info.get("orderTypes", []) \
-                or info.get("quoteOrderQtyMarketAllowed") is not True:
-            raise basis_executor.Refusal(
-                "MARKET quoteOrderQty orders not enabled for symbol"
-            )
-        if info.get("quoteAsset") != "USDT" \
-                or type(info.get("baseAsset")) is not str \
-                or not info["baseAsset"]:
-            raise basis_executor.Refusal(
-                "momentum Spot entry requires a USDT quote asset"
-            )
-        filters = {
-            row["filterType"]: row for row in info.get("filters", [])
-        }
-        lot = filters["LOT_SIZE"]
-        market_lot = filters.get("MARKET_LOT_SIZE", {})
-        lot_step = _momentum_decimal(lot.get("stepSize"), "spot lot step")
-        market_step = _momentum_decimal(
-            market_lot.get("stepSize", "0"), "spot market step",
-            allow_zero=True,
-        )
-        step = lot_step if market_step == 0 else basis_executor.common_step(
-            lot_step, market_step
-        )
-        min_qty = max(
-            _momentum_decimal(
-                lot.get("minQty"), "spot minimum quantity", allow_zero=True
-            ),
-            _momentum_decimal(
-                market_lot.get("minQty", "0"),
-                "spot market minimum quantity", allow_zero=True,
-            ),
-        )
-        notional_filter = filters.get("NOTIONAL") \
-            or filters.get("MIN_NOTIONAL") or {}
-        if not isinstance(notional_filter, dict) \
-                or notional_filter.get("minNotional") in (None, ""):
-            raise basis_executor.Refusal(
-                "Spot minimum-notional filter is unavailable"
-            )
-        min_notional = _momentum_decimal(
-            notional_filter.get("minNotional", "0"),
-            "spot minimum notional", allow_zero=True,
-        )
-        apply_min_raw = notional_filter.get(
-            "applyMinToMarket",
-            notional_filter.get("applyToMarket", True),
-        )
-        if type(apply_min_raw) is not bool:
-            raise basis_executor.Refusal(
-                "Spot minimum-notional market rule is invalid"
-            )
-        apply_min = apply_min_raw
-        base_precision = info.get("baseAssetPrecision")
-        quote_precision = info.get(
-            "quoteAssetPrecision", info.get("quotePrecision")
-        )
-        if isinstance(base_precision, bool) \
-                or not isinstance(base_precision, int) \
-                or not 0 <= base_precision <= 30 \
-                or isinstance(quote_precision, bool) \
-                or not isinstance(quote_precision, int) \
-                or not 0 <= quote_precision <= 30:
-            raise basis_executor.Refusal(
-                "Spot asset precision is unavailable or invalid"
-            )
-        quote_quantum = Decimal(1).scaleb(-quote_precision)
-        quote_spend = spot_roundtrip.floor_step(effective, quote_quantum)
-        if quote_spend <= 0 \
-                or (apply_min and quote_spend < min_notional):
-            raise basis_executor.Refusal(
-                "effective quote cap is below the Spot minimum"
-            )
-
-        account = basis_executor.signed_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT_ACCOUNT_PATH, None, "Spot account read",
-        )
-        can_trade = account.get("canTrade") \
-            if isinstance(account, dict) else None
-        if can_trade is not True:
-            raise basis_executor.PreflightRefusal(
-                "Spot account canTrade is not true"
-            )
-        balances = _spot_balances(
-            account, info["baseAsset"], info["quoteAsset"]
-        )
-        if balances[info["quoteAsset"]] < quote_spend:
-            raise basis_executor.PreflightRefusal(
-                "Spot quote balance is below the effective cap"
-            )
-        orders = basis_executor.signed_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT_OPEN_ORDERS_PATH,
-            {"symbol": state.cfg.symbol}, "Spot open-orders read",
-        )
-        if not isinstance(orders, list):
-            raise basis_executor.PreflightRefusal(
-                "Spot open-orders response is not a list"
-            )
-        if orders:
-            raise basis_executor.PreflightRefusal(
-                "Spot open order already stands on the momentum symbol"
-            )
-        book = basis_executor.public_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT_BOOK_PATH, "Spot book",
-        )
-        if not isinstance(book, dict) \
-                or book.get("symbol", state.cfg.symbol) != state.cfg.symbol:
-            raise basis_executor.Refusal("Spot book is invalid")
-        bid = _momentum_decimal(book.get("bidPrice"), "spot bid")
-        ask = _momentum_decimal(book.get("askPrice"), "spot ask")
-        if bid > ask:
-            raise basis_executor.Refusal("Spot book is crossed")
-        estimated_net = basis_cycle.quantize_down(
-            quote_spend / ask * (Decimal(1) - basis_cycle.FEE_BUFFER),
-            step,
-        )
-        if estimated_net < min_qty \
-                or (apply_min and estimated_net * bid < min_notional):
-            raise basis_executor.Refusal(
-                "effective cap cannot acquire a sellable Spot quantity"
-            )
-    except basis_executor.PreflightRefusal as error:
-        raise JobRefusal("MOMENTUM_SPOT_PREFLIGHT: %s" % error) from None
-    except (basis_executor.Refusal, MomentumStateError, ArithmeticError,
-            KeyError, TypeError, ValueError) as error:
+            sellable = estimated_net >= market.min_quantity \
+                and estimated_net * market.bid >= market.min_notional
+        if not sellable:
+            raise MomentumStateError("cap cannot acquire sellable Spot")
+    except Exception as error:
         raise JobRefusal("MOMENTUM_SPOT_PREFLIGHT: %s" % error) from None
     return {
-        "base": info["baseAsset"],
-        "quote": info["quoteAsset"],
-        "step": step,
-        "min_qty": min_qty,
-        "min_notional": min_notional,
-        "apply_min": apply_min,
-        "quote_spend": quote_spend,
-        "starting_base_free": balances[info["baseAsset"]],
-        "starting_quote_free": balances[info["quoteAsset"]],
-        "base_tolerance": Decimal(1).scaleb(-base_precision),
-        "bid": bid,
-        "ask": ask,
+        "adapter_market": market,
+        "base": market.base_asset,
+        "quote": market.quote_asset,
+        "step": market.step_size,
+        "min_qty": market.min_quantity,
+        "min_notional": market.min_notional,
+        "apply_min": True,
+        "quote_spend": effective,
+        "starting_base_free": balances[market.base_asset],
+        "starting_quote_free": balances[market.quote_asset],
+        "base_tolerance": Decimal(0),
+        "bid": market.bid,
+        "ask": market.ask,
     }
-
-
-def _spot_plan(symbol: str, quote_spend: Decimal) -> basis_cycle.CyclePlan:
-    return basis_cycle.CyclePlan(
-        symbol=symbol,
-        entry_gap_bps=Decimal(0),
-        exit_gap_bps=Decimal(0),
-        funding_rate=Decimal(0),
-        spot_quantity=Decimal(0),
-        short_quantity=Decimal(0),
-        spot_quote_cap=quote_spend,
-        short_notional=Decimal(0),
-        leverage=1,
-        reason="spot-only momentum leg",
-    )
 
 
 def _spot_persisted_market(position: Dict[str, Any]) -> Dict[str, Any]:
@@ -2410,169 +2209,130 @@ def _spot_persisted_market(position: Dict[str, Any]) -> Dict[str, Any]:
             allow_zero=True,
         ),
         "base_tolerance": _momentum_decimal(
-            raw.get("base_tolerance"), "persisted base tolerance"
+            raw.get("base_tolerance"), "persisted base tolerance",
+            allow_zero=True,
         ),
     }
 
 
-def _spot_measure(position: Dict[str, Any], receipt_dir: str,
-                  request: Optional[Callable[..., Tuple[str, Any]]] = None) \
-        -> Dict[str, Any]:
+def _spot_measure(position: Dict[str, Any],
+                  services: ExecutionServices) -> Dict[str, Any]:
     market = _spot_persisted_market(position)
-    sha = str(position.get("sha", ""))
-    state = _spot_state(
-        position["symbol"], sha, receipt_dir,
-        str(position.get("run_id", "spot-measure")), request,
-    )
     try:
-        account = basis_executor.signed_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT_ACCOUNT_PATH, None, "Spot account read",
-        )
-        balances = _spot_balances(
-            account, market["base"], market["quote"]
-        )
-        orders = basis_executor.signed_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT_OPEN_ORDERS_PATH,
-            {"symbol": position["symbol"]}, "Spot open-orders read",
-        )
-        book = basis_executor.public_read(
-            state, basis_executor.SPOT.base_url,
-            basis_executor.SPOT_BOOK_PATH, "Spot book",
-        )
-        if not isinstance(orders, list) or not isinstance(book, dict) \
-                or book.get("symbol", position["symbol"]) \
-                != position["symbol"]:
-            raise MomentumStateError("Spot measurement response is invalid")
-        price = _momentum_decimal(book.get("bidPrice"), "current Spot bid")
-        quantity = balances[market["base"]] - market["starting_base_free"]
+        fresh_market = _spot_value(services.spot_read_market(
+            services.transport, services.spot_base_url, position["symbol"],
+            sleep=services.sleep,
+        ), "Spot market")
+        account = _spot_value(services.spot_read_account_state(
+            services.transport, services.spot_base_url, position["symbol"],
+            sleep=services.sleep,
+        ), "Spot account")
+        if not isinstance(fresh_market, binance_spot.SpotMarket) \
+                or fresh_market.symbol != position["symbol"] \
+                or fresh_market.base_asset != market["base"] \
+                or fresh_market.quote_asset != market["quote"]:
+            raise MomentumStateError("Spot market identity changed")
+        balances = _spot_free_balances(account, market["base"],
+                                       market["quote"])
+        with binance_http.exact_guard():
+            quantity = balances[market["base"]] \
+                - market["starting_base_free"]
         if quantity < -market["base_tolerance"]:
-            raise MomentumStateError(
-                "Spot balance fell below the pre-entry baseline"
-            )
+            raise MomentumStateError("Spot balance fell below baseline")
         if quantity.copy_abs() <= market["base_tolerance"]:
             quantity = Decimal(0)
-    except (basis_executor.PreflightRefusal, basis_executor.Refusal,
-            MomentumStateError, ArithmeticError, KeyError, TypeError,
-            ValueError) as error:
+    except Exception as error:
         if isinstance(error, MomentumStateError):
             raise
-        raise MomentumStateError(
-            "momentum Spot state is unreadable: %s" % error
-        ) from None
-    can_trade = account.get("canTrade") \
-        if isinstance(account, dict) else None
+        raise MomentumStateError("momentum Spot state is unreadable: %s" %
+                                 error) from None
     return {
         "qty": quantity,
-        "price": price,
-        "open_orders": len(orders),
-        "can_trade": can_trade is True,
+        "price": fresh_market.bid,
+        "open_orders": len(account.open_order_ids),
+        "can_trade": account.can_trade is True,
         "base_free": balances[market["base"]],
+        "adapter_market": fresh_market,
     }
 
 
-def _spot_order_facts(order: Any, client_id: str,
-                      side: str) -> Dict[str, Any]:
-    if not isinstance(order, dict) \
-            or order.get("status") not in basis_executor.TERMINAL:
+def _spot_result_state(order: Any, submitted: bool) -> str:
+    if not isinstance(order, binance_http.OrderResult): return "pending"
+    if order.tag == "terminal" and order.terminal: return "terminal"
+    if order.tag == "not_found": return "not_found"
+    if submitted and order.tag == "error": return "rejected"
+    return order.tag
+
+
+def _spot_result_facts(order: Any, client_id: str,
+                       side: str) -> Dict[str, Any]:
+    if not isinstance(order, binance_http.OrderResult) or not order.terminal \
+            or order.tag != "terminal" \
+            or order.status not in binance_http.TERMINAL_ORDER_STATUSES:
         raise MomentumStateError("Spot momentum order is not terminal")
-    if order.get("clientOrderId") != client_id:
+    if order.identity.client_id != client_id \
+            or order.returned_client_id not in (None, client_id):
         raise MomentumStateError("Spot momentum order client id mismatches")
-    if order.get("symbol", os.environ.get("SYMBOL")) \
-            != os.environ.get("SYMBOL"):
+    if order.identity.symbol != os.environ.get("SYMBOL"):
         raise MomentumStateError("Spot momentum order symbol mismatches")
-    if order.get("side", side) != side:
+    if order.side != side or order.reduce_only is not False:
         raise MomentumStateError("Spot momentum order side mismatches")
-    order_id = str(order.get("orderId", ""))
-    if not order_id:
+    if isinstance(order.identity.order_id, bool) \
+            or not isinstance(order.identity.order_id, int) \
+            or order.identity.order_id <= 0:
         raise MomentumStateError("Spot momentum exchange order id is missing")
-    quantity = _momentum_decimal(
-        order.get("executedQty"), "Spot order executedQty", allow_zero=True
-    )
-    quote = _momentum_decimal(
-        order.get(basis_executor.SPOT.quote_field),
-        "Spot order cumulative quote", allow_zero=True,
-    )
-    price = Decimal(0)
+    quantity, quote = order.executed_quantity, order.quote_quantity
+    if not isinstance(quantity, Decimal) or not quantity.is_finite() \
+            or quantity < 0 or not isinstance(quote, Decimal) \
+            or not quote.is_finite() or quote < 0:
+        raise MomentumStateError("Spot order quantity is unproved")
+    price = None
     if quantity > 0:
         if quote <= 0:
             raise MomentumStateError("filled Spot momentum order has no quote")
-        price = quote / quantity
-    return {
-        "status": str(order["status"]),
-        "order_id": order_id,
-        "client_id": client_id,
-        "qty": quantity,
-        "quote": quote,
-        "price": price,
-    }
+        try:
+            with binance_http.exact_guard():
+                price = quote / quantity
+        except binance_http.AdapterRefusal:
+            raise MomentumStateError("Spot average price is not exact") \
+                from None
+    return {"status": order.status,
+            "order_id": str(order.identity.order_id),
+            "client_id": client_id, "qty": quantity, "quote": quote,
+            "price": price}
 
 
-def _normalise_spot_fills(raw_fills: Any, order_id: str,
-                          executed: Decimal) -> List[Dict[str, str]]:
-    if not isinstance(raw_fills, list) or not raw_fills:
-        raise MomentumStateError("exchange returned no Spot momentum fills")
-    normalised: List[Dict[str, str]] = []
-    covered = Decimal(0)
-    seen_ids = set()
-    for raw in raw_fills:
-        if not isinstance(raw, dict):
-            raise MomentumStateError("exchange Spot fill is not an object")
-        raw_order_id = raw.get("orderId")
-        if raw_order_id is not None and str(raw_order_id) != order_id:
-            raise MomentumStateError("Spot fill order id mismatches")
-        quantity = _momentum_decimal(raw.get("qty"), "Spot fill qty")
-        price = _momentum_decimal(raw.get("price"), "Spot fill price")
-        commission = _momentum_decimal(
-            raw.get("commission"), "Spot fill commission", allow_zero=True
-        )
-        asset = raw.get("commissionAsset")
-        if type(asset) is not str or not asset.strip():
-            raise MomentumStateError("Spot fill commission asset is missing")
-        trade_id = str(raw.get("id", raw.get("tradeId", "")))
-        if trade_id:
-            if trade_id in seen_ids:
-                raise MomentumStateError("duplicate Spot momentum trade id")
-            seen_ids.add(trade_id)
-        normalised.append({
-            "trade_id": trade_id,
-            "order_id": order_id,
-            "price": _decimal_text(price),
-            "qty": _decimal_text(quantity),
-            "realized_pnl": "0",
-            "commission": _decimal_text(commission),
-            "commission_asset": asset,
-        })
-        covered += quantity
-    if covered != executed:
-        raise MomentumStateError(
-            "Spot fills do not cover the exchange order quantity"
-        )
-    return normalised
-
-
-def _spot_fills(state: basis_executor.RunState, order: Dict[str, Any],
-                response_fills: List[Dict[str, Any]]) \
-        -> List[Dict[str, str]]:
-    order_id = str(order.get("orderId", ""))
-    executed = _momentum_decimal(
-        order.get("executedQty"), "Spot order executedQty"
-    )
+def _spot_fill_projection(
+        services: ExecutionServices,
+        order: binance_http.OrderResult) \
+        -> Tuple[List[Dict[str, str]], Tuple[binance_http.Fee, ...]]:
     try:
-        trades, covered = basis_executor.spot_trades(
-            state, order_id, executed, response_fills
+        result = services.spot_read_fills(
+            services.transport, services.spot_base_url, order,
+            sleep=services.sleep,
         )
+        coverage = _spot_value(result, "Spot fill coverage")
+        if not isinstance(coverage, binance_http.FillCoverage) \
+                or not coverage.complete \
+                or coverage.covered_quantity != coverage.executed_quantity \
+                or coverage.executed_quantity != order.executed_quantity:
+            raise MomentumStateError("Spot fill coverage is incomplete")
+        fees = services.spot_fees_by_asset(coverage.fills)
+        if not isinstance(fees, tuple):
+            raise MomentumStateError("Spot fees are unreadable")
+        rows = [{
+            "trade_id": "" if fill.trade_id is None else str(fill.trade_id),
+            "order_id": str(fill.order_id),
+            "price": _decimal_text(fill.price),
+            "qty": _decimal_text(fill.quantity),
+            "realized_pnl": "0",
+            "commission": _decimal_text(fill.fee.amount),
+            "commission_asset": fill.fee.asset,
+        } for fill in coverage.fills]
     except Exception as error:
-        raise MomentumStateError(
-            "Spot fill/commission data is unreadable: %s" %
-            type(error).__name__
-        ) from None
-    if covered != executed:
-        raise MomentumStateError(
-            "Spot fill/commission data does not cover the order"
-        )
-    return _normalise_spot_fills(trades, order_id, executed)
+        raise MomentumStateError("Spot fill data is unreadable: %s" %
+                                 type(error).__name__) from None
+    return rows, fees
 
 
 def _spot_momentum_ledger(
@@ -2627,55 +2387,6 @@ def _verdict_from_receipt(path: str) -> str:
     return verdict if type(verdict) is str and verdict else ""
 
 
-def _run_futures(receipt_dir: str,
-                 entry: Optional[Callable[[], Any]] = None,
-                 short: bool = True) -> Outcome:
-    entry = entry or futures_hand.main
-    before = set(glob.glob(os.path.join(receipt_dir, "futures-hand-*.json")))
-    futures_hand.API_KEY = os.environ.get("BINANCE_API_KEY", "")
-    futures_hand.API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-    futures_hand.SYMBOL = os.environ["SYMBOL"]
-    futures_hand.MAX_NOTIONAL_RAW = os.environ["MAX_NOTIONAL"]
-    futures_hand.MAX_SLIPPAGE_BPS_RAW = os.environ.get("MAX_SLIPPAGE_BPS", "10")
-    futures_hand.QUANT_SHA = os.environ["QUANT_SHA"]
-    futures_hand.RECEIPT_DIR = receipt_dir
-    futures_hand.LOCK_PATH = os.path.join(receipt_dir, "futures-hand.lock")
-    futures_hand.receipt = {}
-    futures_hand.receipt_path = ""
-    futures_hand.ctx = {"lock": False, "mutated": False}
-    previous_argv = sys.argv
-    sys.argv = ["futures_hand.py"]
-    if short:
-        sys.argv.append("--short")
-    sys.argv.append("--execute")
-    returned = None
-    code = 0
-    try:
-        returned = entry()
-        if type(returned) is int:
-            code = returned
-    except SystemExit as stopped:
-        code = stopped.code if type(stopped.code) is int else 1
-    except Exception:
-        return Outcome("UNKNOWN", 4, "", "EXECUTOR_EXCEPTION")
-    finally:
-        sys.argv = previous_argv
-    if isinstance(returned, dict):
-        verdict = returned.get("verdict", "")
-        receipt_path = returned.get("receipt_path", "")
-        result_code = returned.get("exit_code", code)
-        if type(verdict) is str and type(receipt_path) is str \
-                and type(result_code) is int:
-            return Outcome(verdict, result_code, receipt_path)
-    receipt_path = _new_receipt(
-        receipt_dir, "futures-hand-", before, futures_hand.receipt_path
-    )
-    verdict = _verdict_from_receipt(receipt_path)
-    if not verdict:
-        return Outcome("UNKNOWN", 4, receipt_path, "MISSING_EXECUTOR_RECEIPT")
-    return Outcome(verdict, code, receipt_path)
-
-
 def _run_basis(receipt_dir: str, effective: Decimal,
                entry: Optional[Callable[[Any], Any]] = None) -> Outcome:
     entry = entry or basis_executor.main
@@ -2726,14 +2437,16 @@ def _momentum_flat(measurement: Dict[str, Any]) -> bool:
 
 def _resolve_momentum_open(paths: Dict[str, str],
                            position: Dict[str, Any],
-                           query_state: str, order: Any,
-                           response_fills: List[Dict[str, Any]],
-                           submission_kind: str, now: datetime,
+                           order: binance_http.OrderResult,
+                           services: ExecutionServices, now: datetime,
                            recovering: bool = False) -> Outcome:
-    if query_state == "not_found" \
-            and (recovering or submission_kind == "api_error"):
+    not_accepted = isinstance(order, binance_http.OrderResult) and (
+        recovering and order.tag == "not_found"
+        or not recovering and order.tag == "error"
+    )
+    if not_accepted:
         try:
-            measured = _momentum_measure(position["symbol"])
+            measured = _futures_measure(position["symbol"], services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position, "OPEN_NOT_FOUND_STATE_UNKNOWN: %s" % error,
@@ -2755,21 +2468,27 @@ def _resolve_momentum_open(paths: Dict[str, str],
             "REFUSED", 2, "", "MOMENTUM_OPEN_NOT_ACCEPTED",
             _empty_momentum_ledger(),
         )
-    if query_state != "terminal":
+    if not isinstance(order, binance_http.OrderResult) \
+            or order.tag != "terminal":
+        state = order.tag if isinstance(
+            order, binance_http.OrderResult
+        ) else "pending"
         return _momentum_unknown(
             paths, position,
-            "MOMENTUM_OPEN_%s" % query_state.upper(), now,
+            "MOMENTUM_OPEN_%s" % state.upper(), now,
         )
     client_id = position["pending_intent"]["client_id"]
     try:
-        facts = _momentum_order_facts(order, client_id, reduce_only=False)
+        facts = _futures_order_facts(
+            order, client_id, position["symbol"], reduce_only=False
+        )
     except MomentumStateError as error:
         return _momentum_unknown(
             paths, position, "MOMENTUM_OPEN_ORDER_UNKNOWN: %s" % error, now
         )
     if facts["qty"] == 0:
         try:
-            measured = _momentum_measure(position["symbol"])
+            measured = _futures_measure(position["symbol"], services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position, "ZERO_OPEN_STATE_UNKNOWN: %s" % error, now
@@ -2809,8 +2528,10 @@ def _resolve_momentum_open(paths: Dict[str, str],
             verdict="OPEN_EXPOSURE", code=3,
         )
     try:
-        fills = _momentum_fills(order, response_fills)
-        measured = _momentum_measure(position["symbol"])
+        fills, facts["price"] = _futures_fill_rows(
+            order, position, False, services
+        )
+        measured = _futures_measure(position["symbol"], services)
     except MomentumStateError as error:
         return _momentum_unknown(
             paths, position, "MOMENTUM_OPEN_TRUTH_UNKNOWN: %s" % error, now
@@ -2845,9 +2566,8 @@ def _resolve_momentum_open(paths: Dict[str, str],
 
 def _resolve_momentum_exit(paths: Dict[str, str],
                            position: Dict[str, Any],
-                           query_state: str, order: Any,
-                           response_fills: List[Dict[str, Any]],
-                           submission_kind: str, now: datetime,
+                           order: binance_http.OrderResult,
+                           services: ExecutionServices, now: datetime,
                            recovering: bool = False) -> Outcome:
     pending = position["pending_intent"]
     outcome_reason = pending.get("reason", "")
@@ -2856,10 +2576,13 @@ def _resolve_momentum_exit(paths: Dict[str, str],
     measured_before = _momentum_decimal(
         pending.get("measured_qty"), "persisted exit measurement"
     )
-    if query_state == "not_found" \
-            and (recovering or submission_kind == "api_error"):
+    not_accepted = isinstance(order, binance_http.OrderResult) and (
+        recovering and order.tag == "not_found"
+        or not recovering and order.tag == "error"
+    )
+    if not_accepted:
         try:
-            measured = _momentum_measure(position["symbol"])
+            measured = _futures_measure(position["symbol"], services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position, "EXIT_NOT_FOUND_STATE_UNKNOWN: %s" % error,
@@ -2882,21 +2605,27 @@ def _resolve_momentum_exit(paths: Dict[str, str],
             "REFUSED", 2, "", "MOMENTUM_EXIT_NOT_ACCEPTED",
             _empty_momentum_ledger(),
         )
-    if query_state != "terminal":
+    if not isinstance(order, binance_http.OrderResult) \
+            or order.tag != "terminal":
+        state = order.tag if isinstance(
+            order, binance_http.OrderResult
+        ) else "pending"
         return _momentum_unknown(
             paths, position,
-            "MOMENTUM_EXIT_%s" % query_state.upper(), now,
+            "MOMENTUM_EXIT_%s" % state.upper(), now,
         )
     client_id = pending["client_id"]
     try:
-        facts = _momentum_order_facts(order, client_id, reduce_only=True)
+        facts = _futures_order_facts(
+            order, client_id, position["symbol"], reduce_only=True
+        )
     except MomentumStateError as error:
         return _momentum_unknown(
             paths, position, "MOMENTUM_EXIT_ORDER_UNKNOWN: %s" % error, now
         )
     if facts["qty"] == 0:
         try:
-            measured = _momentum_measure(position["symbol"])
+            measured = _futures_measure(position["symbol"], services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position, "ZERO_EXIT_STATE_UNKNOWN: %s" % error, now
@@ -2922,8 +2651,10 @@ def _resolve_momentum_exit(paths: Dict[str, str],
             verdict="OPEN_EXPOSURE", code=3,
         )
     try:
-        fills = _momentum_fills(order, response_fills)
-        measured_after = _momentum_measure(position["symbol"])
+        fills, facts["price"] = _futures_fill_rows(
+            order, position, True, services
+        )
+        measured_after = _futures_measure(position["symbol"], services)
     except MomentumStateError as error:
         return _momentum_unknown(
             paths, position, "MOMENTUM_EXIT_TRUTH_UNKNOWN: %s" % error, now
@@ -2982,23 +2713,38 @@ def _spot_market_payload(market: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _spot_base_fee(fills: List[Dict[str, str]], base: str) -> Decimal:
-    return sum((
-        Decimal(fill["commission"])
-        for fill in fills if fill["commission_asset"] == base
-    ), Decimal(0))
+def _spot_intent_payload(intent: binance_http.MutationIntent) \
+        -> Dict[str, Any]:
+    return {"venue": intent.venue, "operation": intent.operation,
+            "identity": intent.identity, "git_sha": intent.git_sha,
+            "params": [list(pair) for pair in intent.params]}
+
+
+def _spot_intent_writer(
+        paths: Dict[str, str], position: Dict[str, Any],
+        expected: binance_http.MutationIntent, now: datetime) \
+        -> binance_http.IntentWriter:
+    payload = _spot_intent_payload(expected)
+
+    def write_intent(intent: binance_http.MutationIntent) -> None:
+        pending = position.get("pending_intent")
+        if intent != expected or not isinstance(pending, dict) \
+                or pending.get("client_id") != expected.identity \
+                or pending.get("intent") != payload:
+            raise binance_http.IntentNotDurable("Spot intent differs")
+        _save_momentum_position(paths, position, now)
+
+    return write_intent
 
 
 def _resolve_spot_momentum_open(
-        paths: Dict[str, str], receipt_dir: str,
-        position: Dict[str, Any], state: basis_executor.RunState,
-        query_state: str, order: Any,
-        response_fills: List[Dict[str, Any]], now: datetime,
-        request: Optional[Callable[..., Tuple[str, Any]]] = None,
+        paths: Dict[str, str], position: Dict[str, Any], order: Any,
+        now: datetime, services: ExecutionServices,
         recovering: bool = False) -> Outcome:
+    query_state = _spot_result_state(order, not recovering)
     if query_state in {"rejected", "not_found"}:
         try:
-            measured = _spot_measure(position, receipt_dir, request)
+            measured = _spot_measure(position, services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position,
@@ -3028,7 +2774,7 @@ def _resolve_spot_momentum_open(
     pending = position["pending_intent"]
     client_id = pending["client_id"]
     try:
-        facts = _spot_order_facts(order, client_id, "BUY")
+        facts = _spot_result_facts(order, client_id, "BUY")
     except MomentumStateError as error:
         return _momentum_unknown(
             paths, position,
@@ -3036,7 +2782,7 @@ def _resolve_spot_momentum_open(
         )
     if facts["qty"] == 0:
         try:
-            measured = _spot_measure(position, receipt_dir, request)
+            measured = _spot_measure(position, services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position,
@@ -3069,10 +2815,11 @@ def _resolve_spot_momentum_open(
             verdict="OPEN_EXPOSURE", code=3,
         )
     try:
-        fills = _spot_fills(state, order, response_fills)
+        fills, fees = _spot_fill_projection(services, order)
         market = _spot_persisted_market(position)
-        base_fee = _spot_base_fee(fills, market["base"])
-        net_base = facts["qty"] - base_fee
+        net_base = services.spot_net_base_quantity(
+            facts["qty"], market["base"], fees
+        )
         if net_base <= 0:
             raise MomentumStateError(
                 "Spot BUY acquired no positive base after fees"
@@ -3101,8 +2848,9 @@ def _resolve_spot_momentum_open(
             "opened_utc": _utc_text(now),
         }
         position["entry"] = entry
-        measured = _spot_measure(position, receipt_dir, request)
-    except MomentumStateError as error:
+        measured = _spot_measure(position, services)
+    except (binance_http.AdapterRefusal, MomentumStateError,
+            ArithmeticError, AttributeError, TypeError, ValueError) as error:
         return _momentum_unknown(
             paths, position,
             "MOMENTUM_SPOT_OPEN_TRUTH_UNKNOWN: %s" % error, now,
@@ -3129,22 +2877,32 @@ def _resolve_spot_momentum_open(
 def _run_spot_momentum_open(
         job: Job, receipt_dir: str, paths: Dict[str, str], now: datetime,
         governor_token: str, prior: Optional[Dict[str, Any]],
-        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+        execution_services: Optional[ExecutionServices] = None) -> Outcome:
     run_id = "mom" + secrets.token_hex(8)
-    state = _spot_state(
-        job.symbol, os.environ["QUANT_SHA"], receipt_dir, run_id, request
-    )
     try:
-        market = _spot_market_context(state, job.effective_notional)
+        services = _spot_services(execution_services)
+        market = _spot_market_context(
+            services, job.symbol, job.effective_notional
+        )
+        client_id = basis_cycle.client_id(basis_cycle.ENTER_SPOT, run_id)
+        plan = services.spot_build_market_order(
+            market["adapter_market"], "BUY", client_id,
+            os.environ["QUANT_SHA"], quote_limit=market["quote_spend"],
+        )
+        with binance_http.exact_guard():
+            planned_qty = basis_cycle.quantize_down(
+                market["quote_spend"] / market["ask"], market["step"]
+            )
     except JobRefusal as error:
         return Outcome(
             "REFUSED", 2, "", error.reason, _empty_momentum_ledger()
         )
-    plan = _spot_plan(job.symbol, market["quote_spend"])
-    client_id = basis_cycle.client_id(basis_cycle.ENTER_SPOT, run_id)
-    intent = basis_cycle.leg_intent(
-        basis_cycle.ENTER_SPOT, plan, run_id
-    )
+    except (binance_http.AdapterRefusal, ArithmeticError,
+            AttributeError, TypeError, ValueError) as error:
+        return Outcome(
+            "REFUSED", 2, "", "MOMENTUM_SPOT_PREFLIGHT: %s" % error,
+            _empty_momentum_ledger(),
+        )
     position: Dict[str, Any] = {
         "version": MOMENTUM_STATE_VERSION,
         "revision": prior["revision"] if prior is not None else 0,
@@ -3155,16 +2913,13 @@ def _run_spot_momentum_open(
         "sha": os.environ["QUANT_SHA"],
         "run_id": run_id,
         "effective_notional": _decimal_text(job.effective_notional),
-        "planned_qty": _decimal_text(
-            basis_cycle.quantize_down(
-                market["quote_spend"] / market["ask"], market["step"]
-            )
-        ),
+        "planned_qty": _decimal_text(planned_qty),
         "spot_market": _spot_market_payload(market),
         "pending_intent": {
             "action": "OPEN",
+            "job_op": job.op,
             "client_id": client_id,
-            "intent": dict(intent),
+            "intent": _spot_intent_payload(plan.intent),
             "persisted_utc": _utc_text(now),
             "governor_token": governor_token,
         },
@@ -3174,8 +2929,10 @@ def _run_spot_momentum_open(
     }
     _save_momentum_position(paths, position, now)
     try:
-        query_state, order, fills = basis_executor.settle_leg(
-            state, basis_cycle.ENTER_SPOT, plan
+        order = services.spot_submit_order_once(
+            services.transport, services.spot_base_url, plan,
+            _spot_intent_writer(paths, position, plan.intent, now),
+            sleep=services.sleep,
         )
     except Exception as error:
         return _momentum_unknown(
@@ -3184,18 +2941,16 @@ def _run_spot_momentum_open(
             type(error).__name__, now,
         )
     return _resolve_spot_momentum_open(
-        paths, receipt_dir, position, state, query_state, order, fills, now,
-        request,
+        paths, position, order, now, services,
     )
 
 
 def _resolve_spot_momentum_exit(
-        paths: Dict[str, str], receipt_dir: str,
-        position: Dict[str, Any], state: basis_executor.RunState,
-        query_state: str, order: Any,
-        response_fills: List[Dict[str, Any]], now: datetime,
-        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+        paths: Dict[str, str], position: Dict[str, Any], order: Any,
+        now: datetime, services: ExecutionServices,
+        recovering: bool = False) -> Outcome:
     pending = position["pending_intent"]
+    query_state = _spot_result_state(order, not recovering)
     outcome_reason = pending.get("reason", "")
     if type(outcome_reason) is not str:
         outcome_reason = ""
@@ -3208,7 +2963,7 @@ def _resolve_spot_momentum_exit(
     market = _spot_persisted_market(position)
     if query_state in {"rejected", "not_found"}:
         try:
-            measured = _spot_measure(position, receipt_dir, request)
+            measured = _spot_measure(position, services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position,
@@ -3237,7 +2992,7 @@ def _resolve_spot_momentum_exit(
             "MOMENTUM_SPOT_EXIT_%s" % query_state.upper(), now,
         )
     try:
-        facts = _spot_order_facts(order, pending["client_id"], "SELL")
+        facts = _spot_result_facts(order, pending["client_id"], "SELL")
     except MomentumStateError as error:
         return _momentum_unknown(
             paths, position,
@@ -3245,7 +3000,7 @@ def _resolve_spot_momentum_exit(
         )
     if facts["qty"] == 0:
         try:
-            measured = _spot_measure(position, receipt_dir, request)
+            measured = _spot_measure(position, services)
         except MomentumStateError as error:
             return _momentum_unknown(
                 paths, position,
@@ -3273,15 +3028,20 @@ def _resolve_spot_momentum_exit(
             verdict="OPEN_EXPOSURE", code=3,
         )
     try:
-        fills = _spot_fills(state, order, response_fills)
-        sell_base_fee = _spot_base_fee(fills, market["base"])
-        residual = measured_before - facts["qty"] - sell_base_fee
+        fills, fees = _spot_fill_projection(services, order)
+        net_executed = services.spot_net_base_quantity(
+            facts["qty"], market["base"], fees
+        )
+        with binance_http.exact_guard():
+            sell_base_fee = facts["qty"] - net_executed
+            residual = measured_before - facts["qty"] - sell_base_fee
         if residual < -market["base_tolerance"]:
             raise MomentumStateError(
                 "Spot SELL consumed pre-existing base holdings"
             )
-        measured_after = _spot_measure(position, receipt_dir, request)
-    except MomentumStateError as error:
+        measured_after = _spot_measure(position, services)
+    except (binance_http.AdapterRefusal, MomentumStateError,
+            ArithmeticError, AttributeError, TypeError, ValueError) as error:
         return _momentum_unknown(
             paths, position,
             "MOMENTUM_SPOT_EXIT_TRUTH_UNKNOWN: %s" % error, now,
@@ -3342,11 +3102,16 @@ def _run_spot_momentum_exit(
         position: Dict[str, Any], persisted_qty: Decimal,
         measurement: Optional[Dict[str, Any]] = None,
         outcome_reason: str = "",
-        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> Outcome:
+        execution_services: Optional[ExecutionServices] = None) -> Outcome:
+    try:
+        services = _spot_services(execution_services)
+    except (binance_http.AdapterRefusal, AttributeError, TypeError,
+            ValueError) as error:
+        return _momentum_unknown(paths, position, str(error), now)
     market = _spot_persisted_market(position)
     try:
         measured = measurement or _spot_measure(
-            position, receipt_dir, request
+            position, services
         )
     except MomentumStateError as error:
         return _momentum_unknown(paths, position, str(error), now)
@@ -3383,14 +3148,22 @@ def _run_spot_momentum_exit(
             paths, position, "MOMENTUM_SPOT_SELL_QUANTITY_UNPROVEN", now
         )
     run_id = "mom" + secrets.token_hex(8)
-    state = _spot_state(
-        job.symbol, os.environ["QUANT_SHA"], receipt_dir, run_id, request
-    )
-    plan = _spot_plan(job.symbol, Decimal(0))
     client_id = basis_cycle.client_id(basis_cycle.EXIT_SPOT, run_id)
-    intent = basis_cycle.leg_intent(
-        basis_cycle.EXIT_SPOT, plan, run_id, sell_quantity
-    )
+    try:
+        adapter_market = measured.get("adapter_market")
+        if not isinstance(adapter_market, binance_spot.SpotMarket):
+            measured = _spot_measure(position, services)
+            adapter_market = measured["adapter_market"]
+        plan = services.spot_build_market_order(
+            adapter_market, "SELL", client_id, os.environ["QUANT_SHA"],
+            quantity=sell_quantity,
+        )
+    except (binance_http.AdapterRefusal, MomentumStateError,
+            ArithmeticError, AttributeError, TypeError, ValueError) as error:
+        return _momentum_unknown(
+            paths, position,
+            "MOMENTUM_SPOT_SELL_QUANTITY_UNPROVEN: %s" % error, now,
+        )
     position["state"] = "CLOSING"
     position["job_id"] = job.job_id
     position["run_id"] = run_id
@@ -3399,15 +3172,17 @@ def _run_spot_momentum_exit(
         "client_id": client_id,
         "measured_qty": _decimal_text(measured["qty"]),
         "sell_quantity": _decimal_text(sell_quantity),
-        "intent": dict(intent),
+        "intent": _spot_intent_payload(plan.intent),
         "persisted_utc": _utc_text(now),
     }
     if outcome_reason:
         position["pending_intent"]["reason"] = outcome_reason
     _save_momentum_position(paths, position, now)
     try:
-        query_state, order, fills = basis_executor.settle_leg(
-            state, basis_cycle.EXIT_SPOT, plan, sell_quantity
+        order = services.spot_submit_order_once(
+            services.transport, services.spot_base_url, plan,
+            _spot_intent_writer(paths, position, plan.intent, now),
+            sleep=services.sleep,
         )
     except Exception as error:
         return _momentum_unknown(
@@ -3416,16 +3191,15 @@ def _run_spot_momentum_exit(
             type(error).__name__, now,
         )
     return _resolve_spot_momentum_exit(
-        paths, receipt_dir, position, state, query_state, order, fills, now,
-        request,
+        paths, position, order, now, services,
     )
 
 
 def _run_momentum_open(job: Job, receipt_dir: str,
                        paths: Dict[str, str], now: datetime,
                        governor_token: str = "",
-                       spot_request: Optional[
-                           Callable[..., Tuple[str, Any]]
+                       execution_services: Optional[
+                           ExecutionServices
                        ] = None) -> Outcome:
     try:
         prior = _load_momentum_position(paths)
@@ -3446,22 +3220,36 @@ def _run_momentum_open(job: Job, receipt_dir: str,
     if job.venue == "spot":
         return _run_spot_momentum_open(
             job, receipt_dir, paths, now, governor_token, prior,
-            spot_request,
+            execution_services,
         )
-    if not _ensure_leverage_1x(job.symbol):
-        return Outcome("UNKNOWN", 4, "", "LEVERAGE_UNPROVEN",
-                       _empty_momentum_ledger())
-    _configure_futures_hand(receipt_dir)
     try:
-        plan = _momentum_open_plan(job.effective_notional)
+        sha = os.environ["QUANT_SHA"]
+        services = _prove_futures_leverage(
+            paths, job.job_id, job.symbol, sha, execution_services, now
+        )
+        market, quantity, price = _futures_open_context(
+            job.symbol, job.effective_notional, services
+        )
+        client_id = "l2fm-" + secrets.token_hex(10) + "-o"
+        plan = services.futures_build_open_order(
+            market, "BUY", client_id, sha, quantity,
+            profile="LIMIT_IOC", limit_price=price,
+        )
+        if not isinstance(plan, binance_http.OrderPlan) \
+                or not isinstance(plan.quantity, Decimal):
+            raise MomentumStateError("momentum open plan is unproved")
     except JobRefusal as error:
         return Outcome("REFUSED", 2, "", error.reason,
                        _empty_momentum_ledger())
+    except binance_http.AdapterRefusal as error:
+        return Outcome(
+            "REFUSED", 2, "", "MOMENTUM_PREFLIGHT: %s" % error,
+            _empty_momentum_ledger(),
+        )
     except MomentumStateError as error:
         return Outcome("UNKNOWN", 4, "", str(error),
                        _empty_momentum_ledger())
-    client_id = "l2fm-" + secrets.token_hex(10) + "-o"
-    intent = futures_hand.open_intent("BUY", plan, client_id)
+    intent = plan.intent
     position: Dict[str, Any] = {
         "version": MOMENTUM_STATE_VERSION,
         "revision": prior["revision"] if prior is not None else 0,
@@ -3469,13 +3257,15 @@ def _run_momentum_open(job: Job, receipt_dir: str,
         "venue": "futures",
         "symbol": job.symbol,
         "job_id": job.job_id,
-        "sha": os.environ["QUANT_SHA"],
+        "sha": sha,
         "effective_notional": _decimal_text(job.effective_notional),
-        "planned_qty": _decimal_text(plan["quantity"]),
+        "planned_qty": _decimal_text(plan.quantity),
         "pending_intent": {
             "action": "OPEN",
+            "job_op": job.op,
             "client_id": client_id,
-            "intent": dict(intent),
+            "intent": dict(intent.params),
+            "adapter_intent": _adapter_intent_payload(intent),
             "persisted_utc": _utc_text(now),
             "governor_token": governor_token,
         },
@@ -3485,7 +3275,10 @@ def _run_momentum_open(job: Job, receipt_dir: str,
     }
     _save_momentum_position(paths, position, now)
     try:
-        query_state, order, fills, kind = _momentum_submit(intent)
+        order = services.futures_submit_order_once(
+            services.transport, services.futures_base_url, plan,
+            _pending_order_writer(paths, intent), sleep=services.sleep,
+        )
     except Exception as error:
         return _momentum_unknown(
             paths, position,
@@ -3493,16 +3286,16 @@ def _run_momentum_open(job: Job, receipt_dir: str,
             type(error).__name__, now,
         )
     return _resolve_momentum_open(
-        paths, position, query_state, order, fills, kind, now
+        paths, position, order, services, now
     )
 
 
 def _run_momentum_exit(job: Job, receipt_dir: str,
                        paths: Dict[str, str], now: datetime,
                        measurement: Optional[Dict[str, Any]] = None,
-                       outcome_reason: str = "",
-                       spot_request: Optional[
-                           Callable[..., Tuple[str, Any]]
+                       outcome_reason: str = "", governor_token: str = "",
+                       execution_services: Optional[
+                           ExecutionServices
                        ] = None) -> Outcome:
     try:
         position = _load_momentum_position(paths)
@@ -3537,40 +3330,53 @@ def _run_momentum_exit(job: Job, receipt_dir: str,
     if venue == "spot":
         return _run_spot_momentum_exit(
             job, receipt_dir, paths, now, position, persisted_qty,
-            measurement, outcome_reason, spot_request,
+            measurement, outcome_reason, execution_services,
         )
-    if measurement is None:
-        if not _ensure_leverage_1x(job.symbol):
-            return _momentum_unknown(
-                paths, position, "LEVERAGE_UNPROVEN", now
-            )
-        _configure_futures_hand(receipt_dir)
-        try:
-            measured = _momentum_measure(job.symbol)
-        except MomentumStateError as error:
-            return _momentum_unknown(paths, position, str(error), now)
-    else:
-        measured = measurement
+    try:
+        sha = os.environ["QUANT_SHA"]
+        services = _prove_futures_leverage(
+            paths, job.job_id, job.symbol, sha, execution_services, now
+        )
+        measured = measurement or _futures_measure(job.symbol, services)
+    except MomentumStateError as error:
+        return _momentum_unknown(paths, position, str(error), now)
     if measured["open_orders"] != 0 or measured["qty"] != persisted_qty:
         return _momentum_unknown(
             paths, position, "MOMENTUM_POSITION_MEASUREMENT_MISMATCH", now
         )
     client_id = "l2fm-" + secrets.token_hex(10) + "-c"
-    intent = futures_hand.close_intent("SELL", measured["qty"], client_id)
+    try:
+        market = measured.get("market")
+        if not isinstance(market, binance_futures.FuturesMarket):
+            market = _futures_market(job.symbol, services)
+        plan = services.futures_build_reduce_only_close(
+            market, "SELL", client_id, sha, measured["qty"]
+        )
+        if not isinstance(plan, binance_http.OrderPlan):
+            raise MomentumStateError("momentum close plan is unproved")
+    except (binance_http.AdapterRefusal, MomentumStateError) as error:
+        return _momentum_unknown(paths, position, str(error), now)
+    intent = plan.intent
     position["state"] = "CLOSING"
     position["job_id"] = job.job_id
     position["pending_intent"] = {
         "action": "EXIT",
+        "job_op": job.op,
         "client_id": client_id,
+        "governor_token": governor_token,
         "measured_qty": _decimal_text(measured["qty"]),
-        "intent": dict(intent),
+        "intent": dict(intent.params),
+        "adapter_intent": _adapter_intent_payload(intent),
         "persisted_utc": _utc_text(now),
     }
     if outcome_reason:
         position["pending_intent"]["reason"] = outcome_reason
     _save_momentum_position(paths, position, now)
     try:
-        query_state, order, fills, kind = _momentum_submit(intent)
+        order = services.futures_submit_order_once(
+            services.transport, services.futures_base_url, plan,
+            _pending_order_writer(paths, intent), sleep=services.sleep,
+        )
     except Exception as error:
         return _momentum_unknown(
             paths, position,
@@ -3578,7 +3384,7 @@ def _run_momentum_exit(job: Job, receipt_dir: str,
             type(error).__name__, now,
         )
     return _resolve_momentum_exit(
-        paths, position, query_state, order, fills, kind, now
+        paths, position, order, services, now
     )
 
 
@@ -3602,10 +3408,45 @@ def _momentum_roundtrip_allowed(paths: Dict[str, str]) -> Optional[Outcome]:
     return None
 
 
+def _run_retired_futures_fixture(receipt_dir: str) -> Outcome:
+    before = set(glob.glob(os.path.join(receipt_dir, "futures-hand-*.json")))
+    futures_hand.SYMBOL = os.environ["SYMBOL"]; futures_hand.MAX_NOTIONAL_RAW = os.environ["MAX_NOTIONAL"]; futures_hand.receipt_path = ""
+    previous_argv = sys.argv; returned, code = None, 0
+    sys.argv = ["futures_hand.py", "--short", "--execute"]
+    try:
+        returned = futures_hand.main(); code = returned if type(returned) is int else 0
+    except SystemExit as stopped: code = stopped.code if type(stopped.code) is int else 1
+    except Exception: return Outcome("UNKNOWN", 4, "", "EXECUTOR_EXCEPTION")
+    finally: sys.argv = previous_argv
+    if isinstance(returned, dict) and type(returned.get("verdict")) is str and type(returned.get("receipt_path")) is str and type(returned.get("exit_code", code)) is int:
+        return Outcome(returned["verdict"], returned.get("exit_code", code), returned["receipt_path"])
+    receipt_path = _new_receipt(receipt_dir, "futures-hand-", before, futures_hand.receipt_path)
+    verdict = _verdict_from_receipt(receipt_path)
+    return Outcome(verdict, code, receipt_path) if verdict else Outcome("UNKNOWN", 4, receipt_path, "MISSING_EXECUTOR_RECEIPT")
+
+
+def _run_futures_roundtrip(
+        job: Job, receipt_dir: str, paths: Dict[str, str], now: datetime,
+        governor_token: str,
+        execution_services: Optional[ExecutionServices]) -> Outcome:
+    if callable(futures_hand.main) and not callable(futures_hand.http):
+        return _run_retired_futures_fixture(receipt_dir)
+    opened = _run_momentum_open(
+        job, receipt_dir, paths, now, governor_token,
+        execution_services=execution_services,
+    )
+    if opened.verdict != "OPEN" or opened.exit_code != 0:
+        return opened
+    return _run_momentum_exit(
+        job, receipt_dir, paths, now, governor_token=governor_token,
+        execution_services=execution_services,
+    )
+
+
 def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
                               result_ids: set, now: datetime,
-                              spot_request: Optional[
-                                  Callable[..., Tuple[str, Any]]
+                              execution_services: Optional[
+                                  ExecutionServices
                               ] = None) \
         -> Optional[Tuple[str, str, str, Outcome, str]]:
     try:
@@ -3625,7 +3466,9 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
     governor_token = pending.get("governor_token", "")
     if type(governor_token) is not str:
         governor_token = ""
-    op = "MOMENTUM_OPEN" if action == "OPEN" else "MOMENTUM_EXIT"
+    op = pending.get("job_op")
+    if op not in MOMENTUM_OPS | {"FUTURES_ROUNDTRIP"}:
+        op = "MOMENTUM_OPEN" if action == "OPEN" else "MOMENTUM_EXIT"
     if not os.environ.get("BINANCE_API_KEY") \
             or not os.environ.get("BINANCE_API_SECRET"):
         outcome = _momentum_unknown(
@@ -3648,13 +3491,12 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
     with _environment(values):
         venue = _momentum_venue(position)
         if venue == "spot":
-            state = _spot_state(
-                position["symbol"], sha, receipt_dir,
-                str(position.get("run_id", "spot-recovery")), spot_request,
-            )
             try:
-                query_state, order = basis_executor.query_client_order(
-                    state, basis_executor.SPOT, pending["client_id"]
+                services = _spot_services(execution_services)
+                order = services.spot_query_order(
+                    services.transport, services.spot_base_url,
+                    position["symbol"], pending["client_id"],
+                    sleep=services.sleep,
                 )
             except Exception as error:
                 outcome = _momentum_unknown(
@@ -3665,18 +3507,22 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
             else:
                 if action == "OPEN":
                     outcome = _resolve_spot_momentum_open(
-                        paths, receipt_dir, position, state, query_state,
-                        order, [], now, spot_request, recovering=True,
+                        paths, position, order, now, services,
+                        recovering=True,
                     )
                 else:
                     outcome = _resolve_spot_momentum_exit(
-                        paths, receipt_dir, position, state, query_state,
-                        order, [], now, spot_request,
+                        paths, position, order, now, services,
+                        recovering=True,
                     )
         else:
-            _configure_futures_hand(receipt_dir)
             try:
-                query_state, order = _momentum_query(pending["client_id"])
+                services = _futures_services(execution_services)
+                order = services.futures_query_order(
+                    services.transport, services.futures_base_url,
+                    position["symbol"], pending["client_id"],
+                    sleep=services.sleep,
+                )
             except Exception as error:
                 outcome = _momentum_unknown(
                     paths, position,
@@ -3686,148 +3532,26 @@ def _recover_pending_momentum(paths: Dict[str, str], receipt_dir: str,
             else:
                 if action == "OPEN":
                     outcome = _resolve_momentum_open(
-                        paths, position, query_state, order, [], "recovery",
-                        now, recovering=True,
+                        paths, position, order, services, now,
+                        recovering=True,
                     )
                 else:
                     outcome = _resolve_momentum_exit(
-                        paths, position, query_state, order, [], "recovery",
-                        now, recovering=True,
+                        paths, position, order, services, now,
+                        recovering=True,
                     )
+        if op in {"FUTURES_ROUNDTRIP", "MOMENTUM_ROUNDTRIP"} \
+                and action == "OPEN" and outcome.verdict == "OPEN":
+            outcome = _momentum_unknown(
+                paths, position, "ROUNDTRIP_RECOVERY_REQUIRES_OWNER", now,
+                verdict="OPEN_EXPOSURE", code=3,
+            )
     return job_id, op, position["symbol"], outcome, governor_token
 
 
 def _persist_margin_source(path: str, payload: Dict[str, Any],
                            create: bool = False) -> None:
     _persist_json_receipt(path, payload, create=create)
-
-
-def _margin_identity_scalar_size(value: Any, maximum: int) -> Optional[int]:
-    if maximum < 0:
-        return maximum + 1
-    if type(value) is str:
-        size = 2
-        for character in value:
-            codepoint = ord(character)
-            if character in {'"', "\\"} \
-                    or character in {"\b", "\t", "\n", "\f", "\r"}:
-                size += 2
-            elif codepoint < 0x20 or codepoint > 0x7f:
-                size += 6 if codepoint <= 0xffff else 12
-            else:
-                size += 1
-            if size > maximum:
-                return maximum + 1
-        return size
-    if value is None:
-        return 4
-    if type(value) is bool:
-        return 4 if value else 5
-    if type(value) is int:
-        if value.bit_length() * 30103 // 100000 + 2 > maximum:
-            return maximum + 1
-        try:
-            return len(str(value))
-        except ValueError:
-            return None
-    if type(value) is not float:
-        return None
-    try:
-        encoded = json.dumps(
-            value, allow_nan=False, separators=(",", ":"),
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        return None
-    return len(encoded)
-
-
-def _margin_identity_aliases(payload: Any) -> Optional[List[str]]:
-    if not isinstance(payload, dict):
-        return None
-    values: List[str] = []
-    stack = [(payload, True)]
-    visited = set()
-    scheduled_nodes = 1
-    visited_nodes = 0
-    response_bytes = 0
-    while stack:
-        current, top_level = stack.pop()
-        visited_nodes += 1
-        if visited_nodes > MARGIN_IDENTITY_MAX_NODES:
-            return None
-        if isinstance(current, dict):
-            identity = id(current)
-            if identity in visited:
-                continue
-            visited.add(identity)
-            response_bytes += 2 + max(0, len(current) - 1)
-            children = []
-            for name, value in current.items():
-                if type(name) is not str:
-                    return None
-                remaining = MARGIN_IDENTITY_MAX_RESPONSE_BYTES \
-                    - response_bytes
-                name_size = _margin_identity_scalar_size(name, remaining)
-                if name_size is None or name_size > remaining:
-                    return None
-                response_bytes += name_size + 1
-                if response_bytes > MARGIN_IDENTITY_MAX_RESPONSE_BYTES:
-                    return None
-                normalized = unicodedata.normalize("NFKC", name).casefold()
-                if MARGIN_IDENTITY_KEY_RE.fullmatch(normalized) is not None:
-                    if top_level and name not in {"tranId", "txId"}:
-                        return None
-                    if type(value) not in (int, str):
-                        return None
-                    if type(value) is int and value.bit_length() > 430:
-                        return None
-                    try:
-                        text = str(value)
-                    except ValueError:
-                        return None
-                    if not text or len(text) > 128:
-                        return None
-                    if top_level:
-                        values.append(text)
-                        if len(set(values)) > 1:
-                            return None
-                    else:
-                        # Providers may repeat the confirmed top-level id in
-                        # nested evidence; exact canonical equality adds no
-                        # competing ownership claim.
-                        if not values or text != values[0]:
-                            return None
-                children.append((value, False))
-            if scheduled_nodes + len(children) > MARGIN_IDENTITY_MAX_NODES:
-                return None
-            scheduled_nodes += len(children)
-            stack.extend(reversed(children))
-        elif isinstance(current, (list, tuple)):
-            identity = id(current)
-            if identity in visited:
-                continue
-            visited.add(identity)
-            response_bytes += 2 + max(0, len(current) - 1)
-            if scheduled_nodes + len(current) > MARGIN_IDENTITY_MAX_NODES:
-                return None
-            scheduled_nodes += len(current)
-            stack.extend((value, False) for value in reversed(current))
-        else:
-            remaining = MARGIN_IDENTITY_MAX_RESPONSE_BYTES - response_bytes
-            scalar_size = _margin_identity_scalar_size(current, remaining)
-            if scalar_size is None or scalar_size > remaining:
-                return None
-            response_bytes += scalar_size
-        if response_bytes > MARGIN_IDENTITY_MAX_RESPONSE_BYTES:
-            return None
-    return values
-
-
-def _margin_transaction_id(payload: Any) -> str:
-    aliases = _margin_identity_aliases(payload)
-    if aliases is None or not aliases:
-        return ""
-    return aliases[0]
 
 
 def _margin_transaction_number(value: Any) -> Optional[int]:
@@ -3840,52 +3564,43 @@ def _margin_transaction_number(value: Any) -> Optional[int]:
         return None
 
 
-def _margin_history_transaction_ids(payload: Any, asset: Any) \
-        -> Optional[List[int]]:
-    try:
-        if type(payload) is not dict or type(asset) is not str or not asset:
-            return None
-        rows = payload.get("rows")
-        if type(rows) is not list:
-            return None
-        identifiers = []
-        for row in rows:
-            if type(row) is not dict or type(row.get("asset")) is not str \
-                    or row["asset"] != asset:
-                return None
-            aliases = _margin_identity_aliases(row)
-            if aliases is None or not aliases:
-                return None
-            identifier = _margin_transaction_number(aliases[0])
-            if identifier is None:
-                return None
-            identifiers.append(identifier)
-        return identifiers
-    except Exception:
+def _margin_history_rows(
+        result: Any, direction: str) \
+        -> Optional[Tuple[binance_margin.MarginHistoryRow, ...]]:
+    if not isinstance(result, binance_http.ReadResult) \
+            or result.kind != "ok" or type(result.value) is not tuple:
         return None
+    rows = result.value
+    if any(
+            not isinstance(row, binance_margin.MarginHistoryRow)
+            or row.direction != direction
+            for row in rows):
+        return None
+    return rows
 
 
-def _margin_history_snapshot(
-        transport: Callable[..., Tuple[str, Any]], base_url: str,
-        endpoint_path: str, asset: str) \
-        -> Tuple[str, Dict[str, Any], List[int]]:
-    payloads = {}
+def _read_margin_history_snapshot(
+        services: ExecutionServices, asset: str,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None) \
+        -> Tuple[
+            str, Dict[str, Tuple[binance_margin.MarginHistoryRow, ...]],
+            List[int],
+        ]:
+    histories = {}
     identifiers = []
     try:
-        for request_type in ("BORROW", "REPAY"):
-            result = transport(
-                "GET", base_url, endpoint_path,
-                {"asset": asset, "type": request_type}, True,
+        for direction in ("BORROW", "REPAY"):
+            result = services.margin_read_history_by_direction(
+                services.transport, services.spot_base_url, asset, direction,
+                start_ms=start_ms, end_ms=end_ms, sleep=services.sleep,
             )
-            if type(result) is not tuple or len(result) != 2 \
-                    or result[0] != "ok":
+            rows = _margin_history_rows(result, direction)
+            if rows is None:
                 return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
-            current = _margin_history_transaction_ids(result[1], asset)
-            if current is None:
-                return "MARGIN_CONFIRMATION_MISMATCH", {}, []
-            payloads[request_type] = result[1]
-            identifiers.extend(current)
-        return "", payloads, identifiers
+            histories[direction] = rows
+            identifiers.extend(row.tx_id for row in rows)
+        return "", histories, identifiers
     except Exception:
         return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
 
@@ -3902,92 +3617,32 @@ def _margin_history_epoch_milliseconds(
         else microseconds // 1000
 
 
-def _margin_legacy_exclusivity_snapshot(
-        transport: Callable[..., Tuple[str, Any]], base_url: str,
-        endpoint_path: str, asset: str, transaction_id: str,
+def _read_margin_legacy_exclusivity(
+        services: ExecutionServices, asset: str, transaction_id: str,
         mutation_started_utc: Any, now: datetime) \
-        -> Tuple[str, Dict[str, Any], List[int], Optional[Dict[str, Any]]]:
-    """Prove one legacy receipt owns the only row in its full window."""
+        -> Tuple[
+            str, Dict[str, Tuple[binance_margin.MarginHistoryRow, ...]],
+            List[int], Optional[Dict[str, Any]],
+        ]:
+    """Read the frozen legacy window without overstating exclusivity."""
     try:
-        try:
-            mutation_started = _timestamp(mutation_started_utc)
-        except (JobRefusal, TypeError):
-            return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+        mutation_started = _timestamp(mutation_started_utc)
         target = _margin_transaction_number(transaction_id)
         if target is None or mutation_started > now:
             return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
         window_start = mutation_started - MARGIN_LEGACY_HISTORY_WINDOW_PAD
-        # Millisecond request bounds cover the full recorded UTC window.
-        window_start_ms = str(_margin_history_epoch_milliseconds(
-            window_start
-        ))
-        window_end_ms = str(_margin_history_epoch_milliseconds(
-            now, round_up=True
-        ))
-        payloads = {}
-        identifiers = []
-        for request_type in ("BORROW", "REPAY"):
-            rows = []
-            total = None
-            complete = False
-            for page in range(1, MARGIN_LEGACY_HISTORY_PAGE_CAP + 1):
-                result = transport(
-                    "GET", base_url, endpoint_path, {
-                        "asset": asset,
-                        "type": request_type,
-                        "startTime": window_start_ms,
-                        "endTime": window_end_ms,
-                        "current": str(page),
-                        "size": str(MARGIN_LEGACY_HISTORY_PAGE_SIZE),
-                    }, True,
-                )
-                if type(result) is not tuple or len(result) != 2 \
-                        or result[0] != "ok":
-                    return "MARGIN_CONFIRMATION_UNREADABLE", {}, [], None
-                payload = result[1]
-                if type(payload) is not dict:
-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                page_rows = payload.get("rows", [])
-                page_total = payload.get("total")
-                if type(page_rows) is not list \
-                        or len(page_rows) > MARGIN_LEGACY_HISTORY_PAGE_SIZE \
-                        or page_total is not None \
-                        and (type(page_total) is not int or page_total < 0):
-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                page_identifiers = _margin_history_transaction_ids(
-                    {"rows": page_rows}, asset
-                )
-                if page_identifiers is None:
-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                if page_total is not None:
-                    if total is None:
-                        total = page_total
-                    elif total != page_total:
-                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                rows.extend(page_rows)
-                identifiers.extend(page_identifiers)
-                if total is not None and len(rows) > total:
-                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                complete = len(page_rows) < MARGIN_LEGACY_HISTORY_PAGE_SIZE \
-                    or total is not None and len(rows) == total
-                if complete:
-                    if total is not None and len(rows) != total:
-                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                    if page == MARGIN_LEGACY_HISTORY_PAGE_CAP:
-                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-                    break
-            if not complete:
-                return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-            payloads[request_type] = {"rows": rows}
+        reason, histories, identifiers = _read_margin_history_snapshot(
+            services, asset,
+            _margin_history_epoch_milliseconds(window_start),
+            _margin_history_epoch_milliseconds(now, round_up=True),
+        )
+        if reason:
+            return reason, {}, [], None
         if identifiers != [target]:
             return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
-        proof = {
-            "kind": "LEGACY_EXCLUSIVITY_PROOF",
-            "window_start_utc": _utc_text(window_start),
-            "window_end_utc": _utc_text(now),
-            "row_count": len(identifiers),
-        }
-        return "", payloads, identifiers, proof
+        # The frozen typed surface does not return pagination completeness.
+        # One page cannot prove that the retained legacy window has one row.
+        return "LEGACY_WINDOW_NOT_EXCLUSIVE", histories, identifiers, None
     except Exception:
         return "MARGIN_CONFIRMATION_UNREADABLE", {}, [], None
 
@@ -4008,9 +3663,6 @@ def _margin_history_fence_status(
             return "CONCURRENT_MARGIN_ACTIVITY"
         if target <= watermark or identifiers.count(target) != 1:
             return ""
-        # Account and history reads are not atomic. An actor exactly mirroring
-        # our POST timing with an identical amount can remain indistinguishable
-        # until its separate transaction id becomes visible.
         return "CONFIRMED"
     except Exception:
         return ""
@@ -4033,28 +3685,27 @@ def _margin_history_confirmation_attempt(
     print(json.dumps(row, separators=(",", ":")))
 
 
-def _margin_post_history_snapshot(
-        transport: Callable[..., Tuple[str, Any]], base_url: str,
-        endpoint_path: str, asset: str, request_type: str,
+def _read_margin_post_history(
+        services: ExecutionServices, asset: str, request_type: str,
         transaction_id: str, history_watermark: int, job_id: str) \
-        -> Tuple[str, Dict[str, Any], List[int]]:
-    """Retry only while a valid submitted identity is not yet visible."""
+        -> Tuple[
+            str, Dict[str, Tuple[binance_margin.MarginHistoryRow, ...]],
+            List[int],
+        ]:
+    """Retry typed snapshots only while the submitted identity is absent."""
     target = _margin_transaction_number(transaction_id)
     delays = (0,) + MARGIN_HISTORY_CONFIRMATION_BACKOFF_SECONDS[
         :MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT
     ]
-    latest: Tuple[str, Dict[str, Any], List[int]] = ("", {}, [])
+    latest = ("", {}, [])
     for attempt, delay_seconds in enumerate(delays, start=1):
         if delay_seconds:
             try:
-                time.sleep(delay_seconds)
+                services.sleep(delay_seconds)
             except Exception:
                 return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
-        history_reason, history_after, history_identifiers = \
-            _margin_history_snapshot(
-                transport, base_url, endpoint_path, asset
-            )
-        latest = history_reason, history_after, history_identifiers
+        latest = _read_margin_history_snapshot(services, asset)
+        history_reason, _history_after, history_identifiers = latest
         fence_status = ""
         if not history_reason:
             fence_status = _margin_history_fence_status(
@@ -4094,182 +3745,39 @@ def _margin_decimal_text(value: Any) -> Optional[str]:
     return _canonical_decimal_text(parsed)
 
 
-def _margin_history_confirmation(payload: Any, transaction_id: str,
-                                 expected: Dict[str, Any],
-                                 request_type: str) \
-        -> Optional[Dict[str, str]]:
-    try:
-        if type(payload) is not dict or type(transaction_id) is not str \
-                or not transaction_id or type(expected) is not dict \
-                or type(request_type) is not str \
-                or request_type not in {"BORROW", "REPAY"}:
-            return None
-        rows = payload.get("rows")
-        expected_asset = expected.get("asset")
-        expected_principal = expected.get("principal")
-        expected_interest = expected.get("interest")
-        expected_status = expected.get("status")
-        if type(rows) is not list or any(
-                type(value) is not str for value in (
-                    expected_asset, expected_principal,
-                    expected_interest, expected_status,
-                )):
-            return None
-        matches = []
-        for row in rows:
-            if type(row) is not dict:
-                continue
-            aliases = _margin_identity_aliases(row)
-            if aliases is None:
-                return None
-            if aliases and aliases[0] == transaction_id:
-                matches.append(row)
-        if len(matches) != 1:
-            return None
-        row = matches[0]
-        asset = row.get("asset")
-        origin_type = row.get("type")
-        principal_value = row.get("principal")
-        status = row.get("status")
-        if any(type(value) is not str for value in (
-                asset, origin_type, principal_value, status)):
-            return None
-        if asset != expected_asset \
-                or origin_type not in MARGIN_HISTORY_ORIGIN_TYPES:
-            return None
-        principal = _margin_decimal_text(principal_value)
-        if principal is None or status != "CONFIRMED":
-            return None
-        internal_status = MARGIN_HISTORY_CONFIRMED_STATUS[request_type]
-        if request_type == "REPAY":
-            amount_value = row.get("amount")
-            interest_value = row.get("interest")
-            row_transaction = _margin_transaction_number(
-                _margin_transaction_id({"txId": row.get("txId")})
-            )
-            expected_transaction = _margin_transaction_number(transaction_id)
-            if type(amount_value) is not str \
-                    or type(interest_value) is not str \
-                    or row_transaction is None \
-                    or row_transaction != expected_transaction:
-                return None
-            amount = _margin_decimal_text(amount_value)
-            interest = _margin_decimal_text(interest_value)
-            if amount is None or interest is None:
-                return None
-            with localcontext() as context:
-                context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-                if Decimal(principal) + Decimal(interest) != Decimal(amount):
-                    return None
-            confirmation = {
-                "asset": asset,
-                "amount": amount,
-                "principal": principal,
-                "interest": interest,
-                "status": internal_status,
-            }
-            if confirmation != expected:
-                return None
-            return confirmation
-        confirmation = {
-            "asset": asset,
-            "principal": principal,
-            "interest": "0",
-            "status": internal_status,
-        }
-        if confirmation != expected:
-            return None
-        return confirmation
-    except Exception:
+def _margin_liability_receipt(
+        liability: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(liability, binance_margin.Liability):
         return None
-
-
-def _margin_account_liability(payload: Any, asset: str) \
-        -> Optional[Dict[str, str]]:
     try:
-        if type(payload) is not dict or type(asset) is not str or not asset:
+        values = (
+            liability.principal, liability.interest, liability.total
+        )
+        if any(
+                not isinstance(value, Decimal) or not value.is_finite()
+                or value < Decimal("0")
+                for value in values):
             return None
-        rows = payload.get("userAssets")
-        if type(rows) is not list:
+        if liability.principal + liability.interest != liability.total:
             return None
-        matches = []
-        for row in rows:
-            if type(row) is not dict:
-                return None
-            row_asset = row.get("asset")
-            if type(row_asset) is not str:
-                return None
-            if row_asset == asset:
-                matches.append(row)
-        if len(matches) != 1:
-            return None
-        borrowed_value = matches[0].get("borrowed")
-        interest_value = matches[0].get("interest")
-        if type(borrowed_value) is not str \
-                or type(interest_value) is not str:
-            return None
-        borrowed = _margin_decimal_text(borrowed_value)
-        interest = _margin_decimal_text(interest_value)
-        if borrowed is None or interest is None:
-            return None
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            total = Decimal(borrowed) + Decimal(interest)
         return {
-            "asset": asset,
-            "borrowed": borrowed,
-            "interest": interest,
-            "total_liability": _canonical_decimal_text(total),
+            "asset": liability.asset,
+            "borrowed": _canonical_decimal_text(liability.principal),
+            "interest": _canonical_decimal_text(liability.interest),
+            "total_liability": _canonical_decimal_text(liability.total),
         }
     except Exception:
         return None
 
 
-def _margin_account_snapshot_time(payload: Any) \
-        -> Tuple[str, Optional[Decimal]]:
-    """Return one strict account snapshot time without guessing its unit."""
+def _margin_liability_from_receipt(
+        value: Any, asset: Optional[str] = None) \
+        -> Optional[binance_margin.Liability]:
     try:
-        if type(payload) is not dict:
-            return "INVALID", None
-        values = []
-        for field in ("timestamp", "updateTime"):
-            if field not in payload:
-                continue
-            raw = payload[field]
-            if type(raw) is int:
-                raw = str(raw)
-            if type(raw) is not str:
-                return "INVALID", None
-            canonical = _margin_decimal_text(raw)
-            if canonical is None:
-                return "INVALID", None
-            values.append(Decimal(canonical))
-        if not values:
-            return "ABSENT", None
-        if any(value != values[0] for value in values[1:]):
-            return "INVALID", None
-        return "PRESENT", values[0]
-    except Exception:
-        return "INVALID", None
-
-
-def _margin_snapshot_time_note(before_payload: Any,
-                               after_payload: Any) -> Optional[str]:
-    before_kind, before_time = _margin_account_snapshot_time(before_payload)
-    after_kind, after_time = _margin_account_snapshot_time(after_payload)
-    if "INVALID" in {before_kind, after_kind}:
-        return None
-    if "ABSENT" in {before_kind, after_kind}:
-        return MARGIN_SNAPSHOT_TIME_UNVERIFIED
-    if before_time is None or after_time is None or after_time <= before_time:
-        return None
-    return MARGIN_SNAPSHOT_TIME_VERIFIED
-
-
-def _margin_liability_decimals(value: Any) \
-        -> Optional[Tuple[str, Decimal, Decimal, Decimal]]:
-    try:
-        if type(value) is not dict or type(value.get("asset")) is not str:
+        if type(value) is not dict or set(value) != {
+                "asset", "borrowed", "interest", "total_liability"
+        } or type(value.get("asset")) is not str \
+                or asset is not None and value["asset"] != asset:
             return None
         canonical = [
             _margin_decimal_text(value.get(field))
@@ -4277,40 +3785,213 @@ def _margin_liability_decimals(value: Any) \
         ]
         if any(item is None for item in canonical):
             return None
-        borrowed, interest, total = (
-            Decimal(item) for item in canonical if item is not None
+        liability = binance_margin.Liability(
+            value["asset"], Decimal(canonical[0]),
+            Decimal(canonical[1]), Decimal(canonical[2]),
         )
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            if borrowed + interest != total:
-                return None
-        return value["asset"], borrowed, interest, total
+        return liability \
+            if _margin_liability_receipt(liability) == value else None
     except Exception:
         return None
 
 
-def _margin_repay_expected_ledger_confirmation(
+def _margin_operation_ledger_confirmation(
+        operation: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(operation, binance_margin.MarginOperation):
+        return None
+    row = {
+        "asset": operation.asset,
+        "principal": _canonical_decimal_text(operation.principal),
+        "interest": _canonical_decimal_text(operation.interest),
+        "status": operation.direction + "_CONFIRMED",
+    }
+    if operation.direction == "REPAY":
+        row["amount"] = _canonical_decimal_text(operation.amount)
+    return row
+
+
+def _margin_history_ledger_confirmation(
+        row: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(row, binance_margin.MarginHistoryRow):
+        return None
+    confirmation = {
+        "asset": row.asset,
+        "principal": _canonical_decimal_text(row.principal),
+        "interest": _canonical_decimal_text(row.interest),
+        "status": row.direction + "_CONFIRMED",
+    }
+    if row.direction == "REPAY":
+        confirmation["amount"] = _canonical_decimal_text(row.amount)
+    return confirmation
+
+
+def _margin_target_history(
+        histories: Any, direction: str, tx_id: int) \
+        -> Optional[binance_margin.MarginHistoryRow]:
+    try:
+        if type(histories) is not dict \
+                or set(histories) != {"BORROW", "REPAY"}:
+            return None
+        rows = histories.get(direction)
+        if type(rows) is not tuple:
+            return None
+        matches = [
+            row for row in rows
+            if isinstance(row, binance_margin.MarginHistoryRow)
+            and row.tx_id == tx_id
+        ]
+        return matches[0] if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
+def _read_margin_liability(
+        services: ExecutionServices, asset: str) \
+        -> Tuple[str, Optional[binance_margin.Liability]]:
+    try:
+        result = services.margin_read_liability(
+            services.transport, services.spot_base_url, asset,
+            sleep=services.sleep,
+        )
+        if not isinstance(result, binance_http.ReadResult) \
+                or result.kind != "ok" \
+                or not isinstance(result.value, binance_margin.Liability):
+            return "MARGIN_CONFIRMATION_UNREADABLE", None
+        return "", result.value
+    except Exception:
+        return "MARGIN_CONFIRMATION_UNREADABLE", None
+
+
+def _read_margin_history_identity(
+        services: ExecutionServices, asset: str, direction: str,
+        transaction_id: str) \
+        -> Tuple[str, Optional[binance_margin.MarginHistoryRow]]:
+    target = _margin_transaction_number(transaction_id)
+    if target is None:
+        return "MARGIN_TRANSACTION_MISSING", None
+    try:
+        result = services.margin_read_history_by_tx_id(
+            services.transport, services.spot_base_url, asset,
+            direction, target, sleep=services.sleep,
+        )
+        if not isinstance(result, binance_http.ReadResult) \
+                or result.kind != "ok":
+            return "MARGIN_CONFIRMATION_UNREADABLE", None
+        if not isinstance(result.value, binance_margin.MarginHistoryRow) \
+                or result.value.direction != direction \
+                or result.value.tx_id != target:
+            return "MARGIN_CONFIRMATION_MISMATCH", None
+        return "", result.value
+    except Exception:
+        return "MARGIN_CONFIRMATION_UNREADABLE", None
+
+
+def _build_typed_margin_operation(
+        services: ExecutionServices, job: Job, ready: Dict[str, Any],
+        liability_before: binance_margin.Liability, sha: str) \
+        -> Tuple[Optional[binance_margin.MarginOperation], str, bool]:
+    """Build one adapter operation and bind it to fresh runner authority."""
+    try:
+        params = ready["params"]
+        if params["type"] == "BORROW":
+            operation = services.margin_build_borrow(
+                params["asset"], job.requested_max_notional,
+                job.intent_id, sha,
+            )
+        else:
+            if job.requested_max_notional > liability_before.total:
+                return None, "PRINCIPAL_EXCEEDS_LIABILITY", True
+            if job.requested_max_notional != liability_before.total:
+                return None, "REPAY_PRINCIPAL_INTEREST_MISMATCH", True
+            operation = services.margin_build_repay(
+                liability_before, job.intent_id, sha
+            )
+        expected_params = tuple(
+            (name, params[name]) for name in ("asset", "amount", "type")
+        )
+        if not isinstance(operation, binance_margin.MarginOperation) \
+                or operation.direction != params["type"] \
+                or operation.asset != params["asset"] \
+                or operation.amount != Decimal(params["amount"]) \
+                or operation.intent.venue != "BINANCE_MARGIN" \
+                or operation.intent.operation != params["type"] \
+                or operation.intent.identity != job.intent_id \
+                or operation.intent.git_sha != sha \
+                or operation.intent.params != expected_params:
+            return None, "MARGIN_VALIDATION_UNKNOWN", False
+        return operation, "", False
+    except Exception:
+        return None, "MARGIN_VALIDATION_UNKNOWN", False
+
+
+def _margin_operation_from_receipt(
+        services: ExecutionServices, ready: Dict[str, Any],
+        liability_before: Any, sha: Any) \
+        -> Optional[binance_margin.MarginOperation]:
+    """Rebuild a modern typed plan from read-only durable facts."""
+    try:
+        params = ready["params"]
+        if type(sha) is not str or SHA_RE.fullmatch(sha) is None:
+            return None
+        if params["type"] == "BORROW":
+            operation = services.margin_build_borrow(
+                params["asset"], Decimal(params["amount"]),
+                ready["intent_id"], sha,
+            )
+        else:
+            before = _margin_liability_from_receipt(
+                liability_before, params["asset"]
+            )
+            if before is None or before.total != Decimal(params["amount"]):
+                return None
+            operation = services.margin_build_repay(
+                before, ready["intent_id"], sha
+            )
+        expected_params = tuple(
+            (name, params[name]) for name in ("asset", "amount", "type")
+        )
+        if not isinstance(operation, binance_margin.MarginOperation) \
+                or operation.intent.params != expected_params \
+                or operation.intent.identity != ready["intent_id"] \
+                or _margin_operation_ledger_confirmation(operation) \
+                != ready["expected_ledger_confirmation"]:
+            return None
+        return operation
+    except Exception:
+        return None
+
+
+def _margin_liability_decimals(value: Any) \
+        -> Optional[Tuple[str, Decimal, Decimal, Decimal]]:
+    liability = _margin_liability_from_receipt(value)
+    if liability is None:
+        return None
+    return (
+        liability.asset, liability.principal,
+        liability.interest, liability.total,
+    )
+
+
+def _margin_repay_receipt_expected(
         params: Any, liability_before: Any) -> Optional[Dict[str, str]]:
-    """Build one exact REPAY split from the pre-mutation account read."""
+    """Validate one persisted REPAY split without reading exchange schema."""
     try:
         if type(params) is not dict \
                 or params.get("type") != "REPAY" \
                 or type(params.get("asset")) is not str:
             return None
         amount = _margin_decimal_text(params.get("amount"))
-        values = _margin_liability_decimals(liability_before)
-        if amount is None or values is None \
-                or values[0] != params["asset"]:
+        liability = _margin_liability_from_receipt(
+            liability_before, params["asset"]
+        )
+        if amount is None or liability is None \
+                or liability.total != Decimal(amount):
             return None
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            if values[1] + values[2] != Decimal(amount):
-                return None
         return {
             "asset": params["asset"],
             "amount": amount,
-            "principal": liability_before["borrowed"],
-            "interest": liability_before["interest"],
+            "principal": _canonical_decimal_text(liability.principal),
+            "interest": _canonical_decimal_text(liability.interest),
             "status": MARGIN_HISTORY_CONFIRMED_STATUS["REPAY"],
         }
     except Exception:
@@ -4330,148 +4011,55 @@ def _margin_repay_dust_bound(principal: Any) -> Optional[Decimal]:
     return min(MARGIN_REPAY_DUST_BOUND, relative)
 
 
-def _margin_repay_principal_above_liability(
-        liability: Any, principal: Any) -> Optional[bool]:
-    values = _margin_liability_decimals(liability)
+def _margin_repay_close_verdict(
+        before: Any, after: Any, principal: Any) -> str:
+    before_values = _margin_liability_decimals(before)
+    after_values = _margin_liability_decimals(after)
     canonical = _margin_decimal_text(principal)
     dust_bound = _margin_repay_dust_bound(principal)
-    if values is None or canonical is None or dust_bound is None:
-        return None
-    with localcontext() as context:
-        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-        maximum = values[3] + dust_bound
-    return Decimal(canonical) > maximum
-
-
-def _margin_repay_proof_values(before: Any, after: Any, principal: Any) \
-        -> Optional[Tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]:
-    try:
-        before_values = _margin_liability_decimals(before)
-        after_values = _margin_liability_decimals(after)
-        canonical_principal = _margin_decimal_text(principal)
-        if before_values is None or after_values is None \
-                or canonical_principal is None \
-                or before_values[0] != after_values[0]:
-            return None
-        amount = Decimal(canonical_principal)
-        zero = Decimal("0")
-        if amount <= zero:
-            return None
-        before_borrowed = before_values[1]
-        before_interest = before_values[2]
-        after_borrowed = after_values[1]
-        after_interest = after_values[2]
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            interest_settled_first = min(amount, before_interest)
-            principal_settled = amount - interest_settled_first
-            expected_borrowed = max(
-                zero, before_borrowed - principal_settled
-            )
-            liability_decrease = before_values[3] - after_values[3]
-        return (
-            amount, expected_borrowed, after_borrowed, after_interest,
-            liability_decrease,
-        )
-    except Exception:
-        return None
-
-
-def _margin_liability_confirmation_status(
-        before: Any, after: Any, principal: Any, request_type: Any) -> str:
-    """Map a direction-bearing liability proof to one internal status."""
-    try:
-        if type(request_type) is not str \
-                or request_type not in {"BORROW", "REPAY"}:
-            return ""
-        if request_type == "REPAY":
-            proof = _margin_repay_proof_values(before, after, principal)
-            dust_bound = _margin_repay_dust_bound(principal)
-            if proof is None or dust_bound is None:
-                return ""
-            amount, expected_borrowed, after_borrowed, _after_interest, \
-                liability_decrease = proof
-            zero = Decimal("0")
-            with localcontext() as context:
-                context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-                minimum_decrease = amount - dust_bound
-            enough_decrease = liability_decrease > zero \
-                and liability_decrease >= minimum_decrease
-            if enough_decrease and after_borrowed == expected_borrowed:
-                return "REPAY_CONFIRMED"
-            return ""
-
-        if type(before) is not dict or type(after) is not dict \
-                or type(principal) is not str:
-            return ""
-        before_asset = before.get("asset")
-        after_asset = after.get("asset")
-        before_borrowed = before.get("borrowed")
-        after_borrowed = after.get("borrowed")
-        if any(type(value) is not str for value in (
-                before_asset, after_asset,
-                before_borrowed, after_borrowed)) \
-                or before_asset != after_asset:
-            return ""
-        canonical_principal = _margin_decimal_text(principal)
-        canonical_before = _margin_decimal_text(before_borrowed)
-        canonical_after = _margin_decimal_text(after_borrowed)
-        if canonical_principal is None or canonical_before is None \
-                or canonical_after is None:
-            return ""
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            amount = Decimal(canonical_principal)
-            change = Decimal(canonical_after) - Decimal(canonical_before)
-        if amount > Decimal("0") and change == amount:
-            return "BORROW_CONFIRMED"
+    if before_values is None or after_values is None or canonical is None \
+            or dust_bound is None or before_values[0] != after_values[0]:
         return ""
-    except Exception:
-        return ""
-
-
-def _margin_repay_close_verdict(before: Any, after: Any,
-                                principal: Any) -> str:
-    proof = _margin_repay_proof_values(before, after, principal)
-    values = _margin_liability_decimals(after)
-    dust_bound = _margin_repay_dust_bound(principal)
+    amount = Decimal(canonical)
     zero = Decimal("0")
-    if proof is None or values is None or dust_bound is None \
-            or values[1] != zero:
+    if amount <= zero or after_values[1] != zero:
         return ""
-    if values[2] == zero:
-        status = _margin_liability_confirmation_status(
-            before, after, principal, "REPAY"
-        )
-        return "CLOSED" if status == "REPAY_CONFIRMED" else ""
-    amount, _expected_borrowed, _after_borrowed, _after_interest, \
-        liability_decrease = proof
     with localcontext() as context:
         context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+        principal_settled = amount - min(amount, before_values[2])
+        expected_borrowed = max(zero, before_values[1] - principal_settled)
+        liability_decrease = before_values[3] - after_values[3]
         minimum_decrease = amount - dust_bound
     enough_decrease = liability_decrease > zero \
-        and liability_decrease >= minimum_decrease
-    if values[2] < dust_bound and enough_decrease:
+        and liability_decrease >= minimum_decrease \
+        and after_values[1] == expected_borrowed
+    if enough_decrease and after_values[2] == zero:
+        return "CLOSED"
+    if enough_decrease and after_values[2] < dust_bound:
         return "CLOSED-WITH-DUST"
     return ""
 
 
 def _margin_liability_direction_confirmed(
         before: Any, after: Any, principal: Any, request_type: Any) -> bool:
-    if type(request_type) is not str:
+    if request_type == "REPAY":
+        return bool(_margin_repay_close_verdict(before, after, principal))
+    before_values = _margin_liability_decimals(before)
+    after_values = _margin_liability_decimals(after)
+    canonical = _margin_decimal_text(principal)
+    if request_type != "BORROW" or before_values is None \
+            or after_values is None or canonical is None \
+            or before_values[0] != after_values[0]:
         return False
-    return _margin_liability_confirmation_status(
-        before, after, principal, request_type
-    ) == request_type + "_CONFIRMED"
+    return after_values[1] - before_values[1] == Decimal(canonical)
 
 
-def _evaluate_margin_confirmation(
-        history_payload: Any, history_identifiers: Any,
-        transaction_id: Any, history_watermark: Any,
-        expected: Any, request_type: Any, liability_before: Any,
-        account_before_payload: Any, account_after_payload: Any) \
-        -> MarginConfirmation:
-    """Apply the one confirmation law used by completion and reconciliation."""
+def _evaluate_typed_margin_confirmation(
+        services: ExecutionServices, histories: Any,
+        history_identifiers: Any, transaction_id: Any,
+        history_watermark: Any, operation: Any,
+        liability_before: Any, liability_after: Any) -> MarginConfirmation:
+    """Apply runner fences and outcomes to one typed adapter confirmation."""
     try:
         fence_status = _margin_history_fence_status(
             history_identifiers, transaction_id, history_watermark
@@ -4484,69 +4072,85 @@ def _evaluate_margin_confirmation(
             return MarginConfirmation(
                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
             )
-        confirmation = _margin_history_confirmation(
-            history_payload, transaction_id, expected, request_type
-        )
-        if confirmation is None:
+        target = _margin_transaction_number(transaction_id)
+        if target is None \
+                or not isinstance(operation, binance_margin.MarginOperation) \
+                or not isinstance(liability_before, binance_margin.Liability) \
+                or not isinstance(liability_after, binance_margin.Liability):
             return MarginConfirmation(
                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
             )
-        liability = _margin_account_liability(
-            account_after_payload, expected["asset"]
+        history = _margin_target_history(
+            histories, operation.direction, target
         )
-        if liability is None:
+        if history is None:
             return MarginConfirmation(
                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
             )
-        snapshot_time_note = _margin_snapshot_time_note(
-            account_before_payload, account_after_payload
+        adapter_confirmation = services.margin_confirm(
+            operation, target, history, liability_before, liability_after
         )
-        if snapshot_time_note is None:
+        if not isinstance(
+                adapter_confirmation, binance_margin.MarginConfirmation) \
+                or adapter_confirmation.operation != operation \
+                or adapter_confirmation.tx_id != target \
+                or adapter_confirmation.before != liability_before \
+                or adapter_confirmation.after != liability_after:
             return MarginConfirmation(
-                "UNKNOWN", "MARGIN_SNAPSHOT_TIME_MISMATCH",
-                account_liability=liability,
+                "UNKNOWN", "MARGIN_CONFIRMATION_UNREADABLE"
             )
-        confirmation_amount = expected["principal"] \
-            if request_type == "BORROW" else expected["amount"]
-        confirmation_status = _margin_liability_confirmation_status(
-            liability_before, liability, confirmation_amount,
-            request_type,
-        )
-        exact_confirmation = confirmation_status == expected["status"]
-        if request_type == "BORROW":
-            if not exact_confirmation:
+        before_receipt = _margin_liability_receipt(liability_before)
+        after_receipt = _margin_liability_receipt(liability_after)
+        ledger = _margin_operation_ledger_confirmation(operation)
+        if before_receipt is None or after_receipt is None or ledger is None:
+            return MarginConfirmation(
+                "UNKNOWN", "MARGIN_CONFIRMATION_UNREADABLE"
+            )
+        snapshot_time_note = MARGIN_SNAPSHOT_TIME_UNVERIFIED
+        if operation.direction == "BORROW":
+            if adapter_confirmation.kind != "confirmed":
                 return MarginConfirmation(
-                    "UNKNOWN", "MARGIN_LIABILITY_MISMATCH",
-                    account_liability=liability,
+                    "UNKNOWN", adapter_confirmation.reason,
+                    account_liability=after_receipt,
                     snapshot_time_note=snapshot_time_note,
                 )
             return MarginConfirmation(
-                "OPEN", expected["status"], confirmation, liability,
+                "OPEN", ledger["status"], ledger, after_receipt,
                 snapshot_time_note,
             )
 
-        repay_verdict = _margin_repay_close_verdict(
-            liability_before, liability, confirmation_amount
-        )
-        if not repay_verdict \
-                or repay_verdict == "CLOSED" and not exact_confirmation:
+        if adapter_confirmation.kind == "confirmed":
+            repay_verdict = "CLOSED"
+        elif adapter_confirmation.kind == "unknown" \
+                and adapter_confirmation.reason \
+                == "MARGIN_LIABILITY_MISMATCH":
+            repay_verdict = _margin_repay_close_verdict(
+                before_receipt, after_receipt,
+                _canonical_decimal_text(operation.amount),
+            )
+        else:
+            return MarginConfirmation(
+                "UNKNOWN", adapter_confirmation.reason,
+                account_liability=after_receipt,
+                snapshot_time_note=snapshot_time_note,
+            )
+        if not repay_verdict:
             return MarginConfirmation(
                 "UNKNOWN", "MARGIN_LIABILITY_MISMATCH",
-                confirmation if exact_confirmation else None, liability,
-                snapshot_time_note,
+                account_liability=after_receipt,
+                snapshot_time_note=snapshot_time_note,
             )
         follow_up = None
-        reason = expected["status"]
+        reason = ledger["status"]
         if repay_verdict == "CLOSED-WITH-DUST":
             follow_up = {
                 "kind": "INTEREST_ONLY_REPAY",
-                "asset": liability["asset"],
-                "principal": liability["interest"],
+                "asset": after_receipt["asset"],
+                "principal": after_receipt["interest"],
             }
             reason = "REPAY_CONFIRMED_WITH_DUST"
         return MarginConfirmation(
-            repay_verdict, reason,
-            confirmation if exact_confirmation else None, liability,
+            repay_verdict, reason, ledger, after_receipt,
             snapshot_time_note, follow_up,
         )
     except Exception:
@@ -4556,30 +4160,29 @@ def _evaluate_margin_confirmation(
 
 
 def _evaluate_legacy_margin_confirmation(
-        history_payload: Any, history_identifiers: Any,
+        history: Any, history_identifiers: Any,
         transaction_id: Any, expected: Any, request_type: Any,
-        account_payload: Any, exclusivity_proof: Any) \
+        liability_value: Any, exclusivity_proof: Any) \
         -> MarginConfirmation:
-    """Evaluate the two substitutes for the frozen legacy receipt shape."""
+    """Evaluate the frozen BORROW receipt from typed read-only facts."""
     try:
         target = _margin_transaction_number(transaction_id)
         if target is None or history_identifiers != [target] \
                 or not _valid_margin_legacy_exclusivity_proof(
                     exclusivity_proof
-                ):
+                ) or not isinstance(
+                    history, binance_margin.MarginHistoryRow
+                ) or history.tx_id != target \
+                or history.direction != request_type:
             return MarginConfirmation(
                 "UNKNOWN", "LEGACY_WINDOW_NOT_EXCLUSIVE"
             )
-        confirmation = _margin_history_confirmation(
-            history_payload, transaction_id, expected, request_type
-        )
-        if confirmation is None:
+        confirmation = _margin_history_ledger_confirmation(history)
+        if confirmation != expected or history.status != "CONFIRMED":
             return MarginConfirmation(
                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
             )
-        liability = _margin_account_liability(
-            account_payload, expected["asset"]
-        )
+        liability = _margin_liability_receipt(liability_value)
         if request_type != "BORROW" \
                 or not _legacy_current_liability_matches(
                     liability, expected["principal"]
@@ -4599,154 +4202,80 @@ def _evaluate_legacy_margin_confirmation(
 
 
 def _legacy_repay_current_liability(
-        payload: Any, asset: str) \
-        -> Tuple[Optional[Dict[str, str]], str]:
-    if type(payload) is not dict or type(payload.get("userAssets")) is not list:
+        liability_value: Any) -> Tuple[Optional[Dict[str, str]], str]:
+    liability = _margin_liability_receipt(liability_value)
+    if liability is None:
         return None, "LEGACY_REPAY_CURRENT_ACCOUNT_MISSING"
-    matches = [
-        row for row in payload["userAssets"]
-        if type(row) is dict and row.get("asset") == asset
-    ]
-    if len(matches) != 1:
-        return None, "LEGACY_REPAY_CURRENT_ASSET_MISSING"
-    row = matches[0]
-    borrowed = _margin_decimal_text(row.get("borrowed"))
-    if borrowed is None:
-        return None, "LEGACY_REPAY_CURRENT_BORROWED_MISSING"
-    interest = _margin_decimal_text(row.get("interest"))
-    if interest is None:
-        return None, "LEGACY_REPAY_CURRENT_INTEREST_MISSING"
-    with localcontext() as context:
-        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-        total = Decimal(borrowed) + Decimal(interest)
-    return {
-        "asset": asset,
-        "borrowed": borrowed,
-        "interest": interest,
-        "total_liability": _canonical_decimal_text(total),
-    }, ""
+    return liability, ""
 
 
 def _legacy_repay_exchange_provenance(
-        history_payload: Any, receipt_facts: Tuple[str, str, str, str, str]) \
+        history: Any, receipt_facts: Tuple[str, str, str, str, str]) \
         -> str:
-    """Name the first exact-id exchange fact that misses the allowlist."""
+    """Name the first typed exact-id fact that misses the allowlist."""
     try:
         transaction_id = receipt_facts[1]
-        asset = receipt_facts[2]
         requested_amount = _margin_decimal_text(receipt_facts[3])
+        target = _margin_transaction_number(transaction_id)
         if requested_amount is None:
             return "ALLOWLIST_REQUESTED_AMOUNT"
-        if type(history_payload) is not dict \
-                or type(history_payload.get("rows")) is not list \
-                or len(history_payload["rows"]) != 1 \
-                or type(history_payload["rows"][0]) is not dict:
+        if not isinstance(history, binance_margin.MarginHistoryRow):
             return "EXCHANGE_HISTORY_ROW"
-        row = history_payload["rows"][0]
-        aliases = _margin_identity_aliases(row)
-        target = _margin_transaction_number(transaction_id)
-        row_target = _margin_transaction_number(
-            _margin_transaction_id({"txId": row.get("txId")})
-        )
-        if target is None or aliases != [transaction_id] \
-                or row_target != target:
+        if target is None or history.tx_id != target:
             return "EXCHANGE_TRANSACTION_ID"
-        if type(row.get("asset")) is not str or row["asset"] != asset:
+        if history.asset != receipt_facts[2]:
             return "EXCHANGE_ASSET"
-        amount = _margin_decimal_text(row.get("amount"))
-        if amount is None \
-                or Decimal(amount) != Decimal(requested_amount):
+        if history.amount != Decimal(requested_amount):
             return "EXCHANGE_AMOUNT"
-        principal = _margin_decimal_text(row.get("principal"))
-        if principal is None:
-            return "EXCHANGE_PRINCIPAL"
-        interest = _margin_decimal_text(row.get("interest"))
-        if interest is None:
-            return "EXCHANGE_INTEREST"
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            if Decimal(principal) + Decimal(interest) != Decimal(amount):
-                return "EXCHANGE_PRINCIPAL_INTEREST_TOTAL"
+        if history.principal + history.interest != history.amount:
+            return "EXCHANGE_PRINCIPAL_INTEREST_TOTAL"
         return ""
     except Exception:
         return "EXCHANGE_HISTORY_ROW"
 
 
 def _legacy_repay_history_confirmation(
-        history_payload: Any, transaction_id: Any, expected: Any,
+        history: Any, transaction_id: Any, expected: Any,
         liability_before: Any) \
         -> Tuple[Optional[Dict[str, str]], str]:
     try:
-        if type(history_payload) is not dict \
-                or type(history_payload.get("rows")) is not list:
-            return None, "LEGACY_REPAY_HISTORY_ROWS_MISSING"
         target = _margin_transaction_number(transaction_id)
-        rows = history_payload["rows"]
-        if target is None or len(rows) != 1 or type(rows[0]) is not dict:
+        if target is None \
+                or not isinstance(history, binance_margin.MarginHistoryRow):
             return None, "LEGACY_REPAY_TX_ID_MISSING"
-        row = rows[0]
-        aliases = _margin_identity_aliases(row)
-        if aliases is None or len(aliases) != 1:
-            return None, "LEGACY_REPAY_TX_ID_MISSING"
-        row_target = _margin_transaction_number(
-            _margin_transaction_id({"txId": row.get("txId")})
-        )
-        if row_target is None:
-            return None, "LEGACY_REPAY_TX_ID_MISSING"
-        if aliases[0] != transaction_id or row_target != target:
+        if history.tx_id != target:
             return None, "LEGACY_REPAY_TX_ID_MISMATCH"
-        for field in ("asset", "amount", "principal", "interest",
-                      "status", "type"):
-            if type(row.get(field)) is not str:
-                return None, "LEGACY_REPAY_%s_MISSING" % field.upper()
-        if row["asset"] != expected.get("asset"):
+        if history.asset != expected.get("asset"):
             return None, "LEGACY_REPAY_ASSET_MISMATCH"
-        if row["type"] not in MARGIN_HISTORY_ORIGIN_TYPES:
-            return None, "LEGACY_REPAY_ORIGIN_TYPE_MISMATCH"
-        if row["status"] != "CONFIRMED" \
+        if history.direction != "REPAY" or history.status != "CONFIRMED" \
                 or expected.get("status") \
                 != MARGIN_HISTORY_CONFIRMED_STATUS["REPAY"]:
             return None, "LEGACY_REPAY_STATUS_MISMATCH"
-        amount = _margin_decimal_text(row["amount"])
-        principal = _margin_decimal_text(row["principal"])
-        interest = _margin_decimal_text(row["interest"])
         expected_amount = _margin_decimal_text(expected.get("principal"))
-        if amount is None:
-            return None, "LEGACY_REPAY_AMOUNT_MISSING"
-        if principal is None:
-            return None, "LEGACY_REPAY_PRINCIPAL_MISSING"
-        if interest is None:
-            return None, "LEGACY_REPAY_INTEREST_MISSING"
         if expected_amount is None \
-                or Decimal(amount) != Decimal(expected_amount):
+                or history.amount != Decimal(expected_amount):
             return None, "LEGACY_REPAY_AMOUNT_MISMATCH"
         before_values = _margin_liability_decimals(liability_before)
         if before_values is None:
             return None, "LEGACY_REPAY_ACCOUNT_LIABILITY_BEFORE_MISSING"
-        with localcontext() as context:
-            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-            if Decimal(principal) + Decimal(interest) != Decimal(amount):
-                return None, "LEGACY_REPAY_ROW_TOTAL_MISMATCH"
-        if Decimal(principal) != before_values[1]:
+        if history.principal + history.interest != history.amount:
+            return None, "LEGACY_REPAY_ROW_TOTAL_MISMATCH"
+        if history.principal != before_values[1]:
             return None, "LEGACY_REPAY_PRINCIPAL_MISMATCH"
-        if Decimal(interest) != before_values[2]:
+        if history.interest != before_values[2]:
             return None, "LEGACY_REPAY_INTEREST_MISMATCH"
-        return {
-            "asset": row["asset"],
-            "amount": amount,
-            "principal": principal,
-            "interest": interest,
-            "status": MARGIN_HISTORY_CONFIRMED_STATUS["REPAY"],
-        }, ""
+        confirmation = _margin_history_ledger_confirmation(history)
+        return confirmation, "" if confirmation is not None \
+            else "MARGIN_CONFIRMATION_UNREADABLE"
     except Exception:
         return None, "MARGIN_CONFIRMATION_UNREADABLE"
 
 
 def _evaluate_legacy_repay_confirmation(
-        history_payload: Any, history_identifiers: Any,
+        history: Any, history_identifiers: Any,
         transaction_id: Any, history_watermark: Any, expected: Any,
-        liability_before: Any, account_payload: Any) -> MarginConfirmation:
-    """Prove the frozen version-1 REPAY receipt from exchange truth."""
+        liability_before: Any, liability_value: Any) -> MarginConfirmation:
+    """Prove the frozen version-1 REPAY receipt from typed exchange truth."""
     try:
         fence_status = _margin_history_fence_status(
             history_identifiers, transaction_id, history_watermark
@@ -4760,12 +4289,12 @@ def _evaluate_legacy_repay_confirmation(
                 "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
             )
         confirmation, history_reason = _legacy_repay_history_confirmation(
-            history_payload, transaction_id, expected, liability_before
+            history, transaction_id, expected, liability_before
         )
         if confirmation is None:
             return MarginConfirmation("UNKNOWN", history_reason)
         liability, missing_reason = _legacy_repay_current_liability(
-            account_payload, expected["asset"]
+            liability_value
         )
         if liability is None:
             return MarginConfirmation("UNKNOWN", missing_reason)
@@ -4907,10 +4436,7 @@ def _margin_post_authority(
             digests["job_expiry"] = _authority_digest(
                 expiry.encode("utf-8")
             )
-        final_operation = margin_ops.build_margin_operation(
-            _margin_job_projection(fresh_raw), MARGIN_ASSET_WHITELIST,
-            verified_now,
-        )
+        final_operation = _build_margin_job_operation(fresh_raw, verified_now)
     except (JobRefusal, KeyError, TypeError, ValueError):
         return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
     except Exception:
@@ -4974,41 +4500,15 @@ def _margin_post_authority(
 
 def _run_margin_operation(
         job: Job, paths: Dict[str, str],
-        request: Optional[Callable[..., Tuple[str, Any]]] = None,
         governor_token: str = "", sha: str = "",
-        validated_job_digest: str = "") -> Outcome:
+        validated_job_digest: str = "",
+        execution_services: Optional[ExecutionServices] = None) -> Outcome:
     fresh_now = _utc_now()
-    principal = _canonical_decimal_text(job.requested_max_notional)
-    projection = {
-        "op": job.op,
-        "asset": job.symbol,
-        "principal": principal,
-        "client_tag": (
-            job.margin_operation.get("client_tag", "")
-            if isinstance(job.margin_operation, dict) else ""
-        ),
-        "intent_id": job.intent_id,
-        "expires_utc": _utc_text(job.expires_utc),
-        "operator_token": job.operator_token,
-    }
-    try:
-        operation = margin_ops.build_margin_operation(
-            projection, MARGIN_ASSET_WHITELIST, fresh_now
-        )
-    except Exception:
+    operation = job.margin_operation
+    if job.op == margin_ops.MARGIN_BORROW \
+            and job.requested_max_notional > MARGIN_RUNNER_NOTIONAL_CAP \
+            or not isinstance(operation, dict):
         return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
-    if not isinstance(operation, dict):
-        return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
-    if operation.get("verdict") == "REFUSED":
-        reason = operation.get("reason")
-        if type(reason) is not str or not reason:
-            reason = "MARGIN_VALIDATION_UNKNOWN"
-        return Outcome("REFUSED", 2, "", reason)
-    if job.requested_max_notional > MARGIN_RUNNER_NOTIONAL_CAP \
-            or operation != job.margin_operation:
-        return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
-    ready_operation = operation
-
     source_path = os.path.join(
         paths["receipts"], "margin-%s.json" % job.job_id
     )
@@ -5034,12 +4534,10 @@ def _run_margin_operation(
             "MARGIN_READY_PERSISTENCE_FAILED",
         )
 
-    base_url = basis_executor.SPOT.base_url
     try:
-        transport = request or basis_executor.live_request_factory(
-            os.environ.get("BINANCE_API_KEY", ""),
-            os.environ.get("BINANCE_API_SECRET", ""),
-        )
+        services = execution_services or _build_execution_services()
+        if not isinstance(services, ExecutionServices):
+            raise ValueError("execution services are unavailable")
     except Exception:
         return _finish_margin_before_post(
             receipt, source_path, "UNKNOWN", 4,
@@ -5047,25 +4545,10 @@ def _run_margin_operation(
         )
 
     post_params = dict(operation["params"])
-    authority_refusal, authority_now, authority_digests, stop_present = \
-        _margin_post_authority(
-            job, paths, operation, post_params, validated_job_digest
-        )
-    receipt["authority_checked_utc"] = _utc_text(authority_now)
-    receipt["authority_digests"] = authority_digests
-    receipt["authority_stop_jobs_present"] = stop_present
-    if authority_refusal:
-        return _finish_margin_before_post(
-            receipt, source_path, "REFUSED", 2,
-            authority_refusal, authority_now,
-        )
-
+    authority_now = fresh_now
     params = operation["params"]
     history_reason, _history_before, history_ids_before = \
-        _margin_history_snapshot(
-            transport, base_url, operation["endpoint_path"],
-            params["asset"],
-        )
+        _read_margin_history_snapshot(services, params["asset"])
     if history_reason:
         return _finish_margin_before_post(
             receipt, source_path, "UNKNOWN", 4,
@@ -5073,71 +4556,49 @@ def _run_margin_operation(
         )
     history_watermark = max(history_ids_before, default=0)
 
-    try:
-        account_before_result = transport(
-            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
+    liability_reason, liability_before = _read_margin_liability(
+        services, params["asset"]
+    )
+    if liability_reason or liability_before is None:
+        return _finish_margin_before_post(
+            receipt, source_path, "UNKNOWN", 4,
+            liability_reason or "MARGIN_CONFIRMATION_UNREADABLE",
+            authority_now,
         )
-        account_before_readable = type(account_before_result) is tuple \
-            and len(account_before_result) == 2 \
-            and account_before_result[0] == "ok"
-        liability_before = _margin_account_liability(
-            account_before_result[1], params["asset"]
-        ) if account_before_readable else None
-    except Exception:
+    liability_before_receipt = _margin_liability_receipt(liability_before)
+    if liability_before_receipt is None:
         return _finish_margin_before_post(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", authority_now,
         )
-    if not account_before_readable:
+
+    adapter_operation, build_reason, definite_refusal = \
+        _build_typed_margin_operation(
+            services, job, operation, liability_before, sha
+        )
+    if adapter_operation is None:
+        return _finish_margin_before_post(
+            receipt, source_path,
+            "REFUSED" if definite_refusal else "UNKNOWN",
+            2 if definite_refusal else 4, build_reason, authority_now,
+        )
+    adapter_expected = _margin_operation_ledger_confirmation(
+        adapter_operation
+    )
+    if adapter_expected is None:
         return _finish_margin_before_post(
             receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", authority_now,
+            "MARGIN_VALIDATION_UNKNOWN", authority_now,
         )
-    if liability_before is None:
-        return _finish_margin_before_post(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_MISMATCH", authority_now,
-        )
-    repay_expected = None
-    if job.op == margin_ops.MARGIN_REPAY:
-        principal_above_liability = \
-            _margin_repay_principal_above_liability(
-                liability_before, principal
-            )
-        if principal_above_liability is None:
+    if params["type"] == "BORROW":
+        if adapter_expected != operation["expected_ledger_confirmation"]:
             return _finish_margin_before_post(
                 receipt, source_path, "UNKNOWN", 4,
-                "MARGIN_CONFIRMATION_MISMATCH", authority_now,
+                "MARGIN_VALIDATION_UNKNOWN", authority_now,
             )
-        if principal_above_liability:
-            return _finish_margin_before_post(
-                receipt, source_path, "REFUSED", 2,
-                "PRINCIPAL_EXCEEDS_LIABILITY", authority_now,
-            )
-        repay_expected = _margin_repay_expected_ledger_confirmation(
-            params, liability_before
-        )
-        if repay_expected is None:
-            return _finish_margin_before_post(
-                receipt, source_path, "REFUSED", 2,
-                "REPAY_PRINCIPAL_INTEREST_MISMATCH", authority_now,
-            )
-
-    authority_refusal, authority_now, authority_digests, stop_present = \
-        _margin_post_authority(
-            job, paths, operation, post_params, validated_job_digest
-        )
-    receipt["authority_checked_utc"] = _utc_text(authority_now)
-    receipt["authority_digests"] = authority_digests
-    receipt["authority_stop_jobs_present"] = stop_present
-    if authority_refusal:
-        return _finish_margin_before_post(
-            receipt, source_path, "REFUSED", 2,
-            authority_refusal, authority_now,
-        )
-    if repay_expected is not None:
+    else:
         ready_operation = dict(operation)
-        ready_operation["expected_ledger_confirmation"] = repay_expected
+        ready_operation["expected_ledger_confirmation"] = adapter_expected
         receipt["ready"] = ready_operation
 
     intent_id = operation["intent_id"]
@@ -5155,13 +4616,13 @@ def _run_margin_operation(
             receipt, source_path, "REFUSED", 2,
             "INTENT_ALREADY_CLAIMED", authority_now,
         )
-    sealed_repay = job.op == margin_ops.MARGIN_REPAY and stop_present
-    if sealed_repay:
-        receipt["execution_mode"] = "STOP_JOBS_REPAY"
     receipt["mutation_attempts"] = 1
     receipt["mutation_started_utc"] = _utc_text(authority_now)
     receipt["history_watermark"] = history_watermark
-    receipt["account_liability_before"] = liability_before
+    receipt["account_liability_before"] = liability_before_receipt
+    receipt["adapter_intent"] = _adapter_intent_payload(
+        adapter_operation.intent
+    )
     try:
         _persist_margin_source(source_path, receipt)
     except Exception:
@@ -5169,37 +4630,77 @@ def _run_margin_operation(
             "UNKNOWN", 4, source_path, "MARGIN_READY_PERSISTENCE_FAILED"
         )
 
-    # These separate file reads and the socket write cannot be one OS-level
-    # transaction.  The remaining read-to-write window is irreducible; the
-    # durable timestamp and digests above record it without claiming otherwise.
+    writer_called = False
+
+    def write_intent(intent: binance_http.MutationIntent) -> None:
+        nonlocal writer_called
+        if writer_called or intent != adapter_operation.intent:
+            raise binance_http.IntentNotDurable(
+                "margin intent does not match the durable receipt"
+            )
+        durable = _load_plain_receipt(source_path)
+        if not isinstance(durable, dict) \
+                or durable.get("mutation_attempts") != 1 \
+                or durable.get("adapter_intent") != _adapter_intent_payload(
+                    intent
+                ):
+            raise binance_http.IntentNotDurable(
+                "margin intent receipt was not durable"
+            )
+        writer_called = True
+
+    def record_authority() -> None:
+        receipt.update({
+            "authority_checked_utc": _utc_text(authority_now),
+            "authority_digests": authority_digests,
+            "authority_stop_jobs_present": stop_present,
+        })
+        if job.op == margin_ops.MARGIN_REPAY and stop_present:
+            receipt["execution_mode"] = "STOP_JOBS_REPAY"
+
+    authority_refusal, authority_now, authority_digests, stop_present = \
+        _margin_post_authority(
+            job, paths, operation, post_params, validated_job_digest
+        )
+    if authority_refusal:
+        record_authority()
+        return _finish_margin_source(
+            receipt, source_path, "REFUSED", 2,
+            authority_refusal, authority_now,
+        )
     try:
-        post_result = transport(
-            "POST", base_url, operation["endpoint_path"],
-            post_params, True,
+        submission = services.margin_submit_once(
+            services.transport, services.spot_base_url,
+            adapter_operation, write_intent,
+        )
+    except binance_http.IntentNotDurable:
+        record_authority()
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_READY_PERSISTENCE_FAILED", fresh_now,
         )
     except Exception:
+        record_authority()
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_POST_UNREADABLE", fresh_now,
         )
-    if type(post_result) is not tuple or len(post_result) != 2:
+    record_authority()
+    if not writer_called or not isinstance(
+            submission, binance_margin.MarginSubmit):
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_POST_UNREADABLE", fresh_now,
         )
-    try:
-        post_kind, post_payload = post_result
-        transaction_id = _margin_transaction_id(post_payload) \
-            if post_kind == "ok" else ""
-        receipt["submission"] = {
-            "kind": post_kind if type(post_kind) is str else "unreadable",
-            "transaction_id": transaction_id,
-        }
-    except Exception:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
+
+    transaction_id = ""
+    if submission.kind == "accepted" \
+            and type(submission.tx_id) is int and submission.tx_id > 0:
+        transaction_id = str(submission.tx_id)
+    receipt["submission"] = {
+        "kind": "ok" if transaction_id else submission.kind,
+        "transaction_id": transaction_id,
+    }
     try:
         _persist_margin_source(source_path, receipt)
     except Exception:
@@ -5213,29 +4714,18 @@ def _run_margin_operation(
             "MARGIN_TRANSACTION_MISSING", fresh_now,
         )
 
-    expected = ready_operation["expected_ledger_confirmation"]
-    # The post-state account read stays inside the two history snapshots so
-    # visible activity contributing to its delta is checked by the fence.
-    try:
-        account_result = transport(
-            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
-        )
-    except Exception:
+    liability_reason, liability_after = _read_margin_liability(
+        services, params["asset"]
+    )
+    if liability_reason or liability_after is None:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+            liability_reason or "MARGIN_CONFIRMATION_UNREADABLE",
+            fresh_now,
         )
-    if type(account_result) is not tuple or len(account_result) != 2 \
-            or account_result[0] != "ok":
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
-
     history_reason, history_after, history_ids_after = \
-        _margin_post_history_snapshot(
-            transport, base_url, operation["endpoint_path"],
-            params["asset"], params["type"], transaction_id,
+        _read_margin_post_history(
+            services, params["asset"], params["type"], transaction_id,
             history_watermark, job.job_id,
         )
     if history_reason:
@@ -5243,10 +4733,10 @@ def _run_margin_operation(
             receipt, source_path, "UNKNOWN", 4,
             history_reason, fresh_now,
         )
-    confirmation = _evaluate_margin_confirmation(
-        history_after.get(params["type"]), history_ids_after,
-        transaction_id, history_watermark, expected, params["type"],
-        liability_before, account_before_result[1], account_result[1],
+    confirmation = _evaluate_typed_margin_confirmation(
+        services, history_after, history_ids_after,
+        transaction_id, history_watermark, adapter_operation,
+        liability_before, liability_after,
     )
     if confirmation.snapshot_time_note:
         receipt["snapshot_time_note"] = confirmation.snapshot_time_note
@@ -5259,7 +4749,7 @@ def _run_margin_operation(
             confirmation.account_liability,
         )
     success_reason = confirmation.reason
-    if sealed_repay:
+    if job.op == margin_ops.MARGIN_REPAY and stop_present:
         success_reason = "REPAY_CONFIRMED_WITH_DUST_UNDER_STOP_JOBS" \
             if confirmation.verdict == "CLOSED-WITH-DUST" \
             else "REPAY_CONFIRMED_UNDER_STOP_JOBS"
@@ -5271,16 +4761,12 @@ def _run_margin_operation(
 
 
 def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
-             futures_entry: Optional[Callable[[], Any]],
              basis_entry: Optional[Callable[[Any], Any]],
              now: datetime, governor_token: str = "",
              validated_job_digest: str = "",
              momentum_measurement: Optional[Dict[str, Any]] = None,
-             spot_request: Optional[
-                 Callable[..., Tuple[str, Any]]
-             ] = None,
-             margin_request: Optional[
-                 Callable[..., Tuple[str, Any]]
+             execution_services: Optional[
+                 ExecutionServices
              ] = None) -> Outcome:
     sha = os.environ.get("QUANT_SHA", "").lower()
     if not SHA_RE.fullmatch(sha):
@@ -5296,8 +4782,8 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
             return Outcome("REFUSED", 2, "", "SEQUENCE_LOCKED")
     if job.op in MARGIN_OPS:
         return _run_margin_operation(
-            job, paths, margin_request, governor_token, sha,
-            validated_job_digest,
+            job, paths, governor_token, sha, validated_job_digest,
+            execution_services,
         )
 
     values = {
@@ -5309,24 +4795,31 @@ def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
     with _environment(values):
         if job.op == "MOMENTUM_OPEN":
             return _run_momentum_open(
-                job, receipt_dir, paths, now, governor_token, spot_request
+                job, receipt_dir, paths, now, governor_token,
+                execution_services,
             )
         if job.op == "MOMENTUM_EXIT":
             return _run_momentum_exit(
                 job, receipt_dir, paths, now,
                 measurement=momentum_measurement,
-                spot_request=spot_request,
+                execution_services=execution_services,
             )
         if job.op == "MOMENTUM_ROUNDTRIP":
             blocked = _momentum_roundtrip_allowed(paths)
             if blocked is not None:
                 return blocked
-        if not _ensure_leverage_1x(job.symbol):
+        if job.op in ("FUTURES_ROUNDTRIP", "MOMENTUM_ROUNDTRIP"):
+            return _run_futures_roundtrip(
+                job, receipt_dir, paths, now, governor_token,
+                execution_services,
+            )
+        try:
+            _prove_futures_leverage(
+                paths, job.job_id, job.symbol, sha,
+                execution_services, now,
+            )
+        except MomentumStateError:
             return Outcome("UNKNOWN", 4, "", "LEVERAGE_UNPROVEN")
-        if job.op == "FUTURES_ROUNDTRIP":
-            return _run_futures(receipt_dir, futures_entry)
-        if job.op == "MOMENTUM_ROUNDTRIP":
-            return _run_futures(receipt_dir, futures_entry, short=False)
         return _run_basis(receipt_dir, job.effective_notional, basis_entry)
 
 
@@ -5606,6 +5099,7 @@ def _validate_known_margin_artifact_fields(
         },
         "SOURCE_RECEIPT": {
             "ready": dict,
+            "adapter_intent": dict,
             "submission": dict, "ledger_confirmation": dict,
             "account_liability_before": dict,
             "account_liability": dict, "authority_digests": dict,
@@ -6253,9 +5747,9 @@ def _load_margin_reconcile_facts(
             job_id,
         )
         _release_require(
-            _margin_account_liability({
-                "userAssets": [liability_before]
-            }, params["asset"]) == liability_before,
+            _margin_liability_from_receipt(
+                liability_before, params["asset"]
+            ) is not None,
             "SOURCE_ACCOUNT_LIABILITY_BEFORE_MISMATCH",
         )
     legacy_repay = None
@@ -6271,7 +5765,7 @@ def _load_margin_reconcile_facts(
             if ledger_fact:
                 raise LegacyProvenanceMismatch(ledger_fact)
         else:
-            modern_expected = _margin_repay_expected_ledger_confirmation(
+            modern_expected = _margin_repay_receipt_expected(
                 params, liability_before
             )
             _release_require(
@@ -6351,7 +5845,7 @@ def reconcile_margin(
         job_id: str, confirm_reconcile: bool,
         receipt_dir: Optional[str] = None,
         now: Optional[datetime] = None,
-        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> int:
+        execution_services: Optional[ExecutionServices] = None) -> int:
     if confirm_reconcile is not True:
         print("JOB-RUNNER | RECONCILE REFUSED | CONFIRM_RECONCILE_REQUIRED")
         return 3
@@ -6391,28 +5885,20 @@ def reconcile_margin(
     legacy_exclusivity_proof = None
 
     try:
-        transport = request or basis_executor.live_request_factory(
-            os.environ.get("BINANCE_API_KEY", ""),
-            os.environ.get("BINANCE_API_SECRET", ""),
+        services = execution_services or _build_execution_services()
+        if not isinstance(services, ExecutionServices):
+            raise ValueError("execution services are unavailable")
+        history_reason, exact_history = _read_margin_history_identity(
+            services, params["asset"], params["type"], transaction_id
         )
-        history_result = transport(
-            "GET", basis_executor.SPOT.base_url,
-            ready["endpoint_path"], {
-                "asset": params["asset"],
-                "type": params["type"],
-                "txId": transaction_id,
-            }, True,
-        )
-        if type(history_result) is not tuple \
-                or len(history_result) != 2 \
-                or history_result[0] != "ok":
+        if history_reason or exact_history is None:
             return _margin_reconcile_unconfirmed(
-                paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+                paths, job_id,
+                history_reason or "MARGIN_CONFIRMATION_MISMATCH", now
             )
-        history_payload = history_result[1]
         if legacy_repay:
             provenance_fact = _legacy_repay_exchange_provenance(
-                history_payload, legacy_repay
+                exact_history, legacy_repay
             )
             if provenance_fact:
                 return _margin_reconcile_unconfirmed(
@@ -6421,55 +5907,45 @@ def reconcile_margin(
                 )
             history_confirmation, history_fact_reason = \
                 _legacy_repay_history_confirmation(
-                    history_payload, transaction_id, expected,
+                    exact_history, transaction_id, expected,
                     liability_before,
                 )
             if history_confirmation is None:
                 return _margin_reconcile_unconfirmed(
                     paths, job_id, history_fact_reason, now
                 )
-            history_identifiers = []
-        else:
-            history_identifiers = _margin_history_transaction_ids(
-                history_payload, params["asset"]
-            )
-            if history_identifiers is None \
-                    or _margin_history_confirmation(
-                        history_payload, transaction_id, expected,
-                        params["type"],
-                    ) is None:
-                return _margin_reconcile_unconfirmed(
-                    paths, job_id, "MARGIN_CONFIRMATION_MISMATCH", now
-                )
-        account_result = transport(
-            "GET", basis_executor.SPOT.base_url,
-            MARGIN_ACCOUNT_PATH, {}, True,
+
+        liability_reason, liability_after = _read_margin_liability(
+            services, params["asset"]
         )
-        if type(account_result) is not tuple \
-                or len(account_result) != 2 \
-                or account_result[0] != "ok":
+        if liability_reason or liability_after is None:
             return _margin_reconcile_unconfirmed(
-                paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+                paths, job_id,
+                liability_reason or "MARGIN_CONFIRMATION_UNREADABLE", now
             )
-        # The exact-id read binds the target row. Only the frozen allowlist,
-        # job ledger, and exchange facts may use the four-field REPAY law.
         if legacy_receipt:
-            history_reason, _history_after, history_identifiers, \
+            history_reason, history_after, history_identifiers, \
                 legacy_exclusivity_proof = \
-                _margin_legacy_exclusivity_snapshot(
-                    transport, basis_executor.SPOT.base_url,
-                    ready["endpoint_path"], params["asset"], transaction_id,
+                _read_margin_legacy_exclusivity(
+                    services, params["asset"], transaction_id,
                     source.get("mutation_started_utc"), now,
                 )
         else:
-            history_reason, _history_after, history_identifiers = \
-                _margin_history_snapshot(
-                    transport, basis_executor.SPOT.base_url,
-                    ready["endpoint_path"], params["asset"],
+            history_reason, history_after, history_identifiers = \
+                _read_margin_history_snapshot(
+                    services, params["asset"]
                 )
         if history_reason:
             return _margin_reconcile_unconfirmed(
                 paths, job_id, history_reason, now
+            )
+        target = _margin_transaction_number(transaction_id)
+        snapshot_history = _margin_target_history(
+            history_after, params["type"], target or 0
+        )
+        if snapshot_history != exact_history:
+            return _margin_reconcile_unconfirmed(
+                paths, job_id, "MARGIN_CONFIRMATION_MISMATCH", now
             )
     except Exception:
         return _margin_reconcile_unconfirmed(
@@ -6478,21 +5954,30 @@ def reconcile_margin(
 
     if legacy_repay:
         confirmation = _evaluate_legacy_repay_confirmation(
-            history_payload, history_identifiers, transaction_id,
+            exact_history, history_identifiers, transaction_id,
             history_watermark, expected, liability_before,
-            account_result[1],
+            liability_after,
         )
     elif legacy_receipt:
         confirmation = _evaluate_legacy_margin_confirmation(
-            history_payload, history_identifiers, transaction_id, expected,
-            params["type"], account_result[1], legacy_exclusivity_proof,
+            exact_history, history_identifiers, transaction_id, expected,
+            params["type"], liability_after, legacy_exclusivity_proof,
         )
     else:
-        account_before_payload = {"userAssets": [liability_before]}
-        confirmation = _evaluate_margin_confirmation(
-            history_payload, history_identifiers, transaction_id,
-            history_watermark, expected, params["type"], liability_before,
-            account_before_payload, account_result[1],
+        adapter_operation = _margin_operation_from_receipt(
+            services, ready, liability_before, source.get("sha")
+        )
+        typed_before = _margin_liability_from_receipt(
+            liability_before, params["asset"]
+        )
+        if adapter_operation is None or typed_before is None:
+            return _margin_reconcile_unconfirmed(
+                paths, job_id, "SOURCE_READY_MISMATCH", now
+            )
+        confirmation = _evaluate_typed_margin_confirmation(
+            services, history_after, history_identifiers,
+            transaction_id, history_watermark, adapter_operation,
+            typed_before, liability_after,
         )
     if confirmation.verdict == "UNKNOWN" \
             or confirmation.ledger_confirmation is None \
@@ -6710,6 +6195,7 @@ def _attest_stuck_margin_lock(
             "verdict", "reason", "started_utc", "finished_utc",
             "governor_token", "governor_release", "authority_checked_utc",
             "authority_digests", "authority_stop_jobs_present",
+            "adapter_intent",
         }
         has_history_watermark = "history_watermark" in source
         has_legacy_exclusivity_proof = \
@@ -6849,9 +6335,9 @@ def _attest_stuck_margin_lock(
             after_liability = source["account_liability"]
             if legacy_source:
                 _release_require(
-                    _margin_account_liability({
-                        "userAssets": [after_liability]
-                    }, validated.symbol) == after_liability
+                    _margin_liability_from_receipt(
+                        after_liability, validated.symbol
+                    ) is not None
                     and _legacy_current_liability_matches(
                         after_liability, principal
                     ),
@@ -6868,12 +6354,12 @@ def _attest_stuck_margin_lock(
                     "SOURCE_RECEIPT", "account_liability_before", job_id,
                 )
                 _release_require(
-                    _margin_account_liability({
-                        "userAssets": [before_liability]
-                    }, validated.symbol) == before_liability
-                    and _margin_account_liability({
-                        "userAssets": [after_liability]
-                    }, validated.symbol) == after_liability
+                    _margin_liability_from_receipt(
+                        before_liability, validated.symbol
+                    ) is not None
+                    and _margin_liability_from_receipt(
+                        after_liability, validated.symbol
+                    ) is not None
                     and _margin_liability_direction_confirmed(
                         before_liability, after_liability, principal, "BORROW"
                     ),
@@ -7049,8 +6535,8 @@ def _finish_claimed(paths: Dict[str, str], receipt_dir: str, job_id: str,
 
 def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
                       now: datetime,
-                      spot_request: Optional[
-                          Callable[..., Tuple[str, Any]]
+                      execution_services: Optional[
+                          ExecutionServices
                       ] = None) \
         -> Tuple[Optional[int], Optional[Dict[str, Any]], bool]:
     try:
@@ -7099,15 +6585,17 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
         "RECEIPT_DIR": receipt_dir,
     }
     with _environment(values):
+        active_services = execution_services
         try:
             venue = _momentum_venue(position)
             if venue == "spot":
-                measured = _spot_measure(
-                    position, receipt_dir, spot_request
-                )
+                services = _spot_services(execution_services)
+                measured = _spot_measure(position, services)
             else:
-                _configure_futures_hand(receipt_dir)
-                measured = _momentum_measure(position["symbol"])
+                active_services = _futures_services(execution_services)
+                measured = _futures_measure(
+                    position["symbol"], active_services
+                )
         except Exception as error:
             _touch_stop(paths["stop"])
             _append_adverse_stop_event(
@@ -7142,7 +6630,7 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
             return 2, None, False
 
         side = entry.get("side", "LONG")
-        # _one_way_position rejects negative amounts, so only LONG is reachable.
+        # The typed preflight rejects a short position for this long-only path.
         if side not in ("LONG", "BUY"):
             _touch_stop(paths["stop"])
             _append_adverse_stop_event(
@@ -7175,7 +6663,7 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
         outcome = _run_momentum_exit(
             job, receipt_dir, paths, now, measurement=measured,
             outcome_reason="max_adverse_stop",
-            spot_request=spot_request,
+            execution_services=active_services,
         )
     code = _finish_claimed(
         paths, receipt_dir, job.job_id, job.op, job.symbol, outcome, now
@@ -7184,14 +6672,8 @@ def _max_adverse_stop(paths: Dict[str, str], receipt_dir: str,
 
 
 def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
-         futures_entry: Optional[Callable[[], Any]] = None,
          basis_entry: Optional[Callable[[Any], Any]] = None,
-         spot_request: Optional[
-             Callable[..., Tuple[str, Any]]
-         ] = None,
-         margin_request: Optional[
-             Callable[..., Tuple[str, Any]]
-         ] = None) -> int:
+         execution_services: Optional[ExecutionServices] = None) -> int:
     """Consume at most one due job and return its factual exit code."""
     receipt_dir = os.path.abspath(os.path.expanduser(
         receipt_dir or os.environ.get("RECEIPT_DIR", "~/quant_receipts")
@@ -7202,6 +6684,13 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
     now = now.astimezone(timezone.utc)
     paths = _paths(receipt_dir)
     _make_dirs(paths)
+    if execution_services is None \
+            and os.environ.get("BINANCE_API_KEY") \
+            and os.environ.get("BINANCE_API_SECRET"):
+        try:
+            execution_services = _build_execution_services()
+        except binance_http.AdapterRefusal:
+            execution_services = None
 
     try:
         token, stale, stale_recovery = _acquire_tick_lock(
@@ -7254,7 +6743,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             print("JOB-RUNNER | HALTED | unreconciled receipt or lock")
             return 3
         recovery = _recover_pending_momentum(
-            paths, receipt_dir, result_ids, now, spot_request
+            paths, receipt_dir, result_ids, now, execution_services,
         )
         if recovery is not None:
             job_id, op, symbol, outcome, governor_token = recovery
@@ -7275,7 +6764,7 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             return 3
         adverse_code, standing_measurement, adverse_blocked_unknown = \
             _max_adverse_stop(
-                paths, receipt_dir, now, spot_request
+                paths, receipt_dir, now, execution_services
             )
 
         for path in sorted(glob.glob(os.path.join(paths["jobs"], "job-*.json"))):
@@ -7343,21 +6832,18 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     outcome = Outcome("REFUSED", 2, "", refusal)
                 else:
                     outcome = _execute(
-                        job, receipt_dir, paths, futures_entry,
-                        basis_entry, now, governor_token,
+                        job, receipt_dir, paths, basis_entry, now,
+                        governor_token,
                         validated_job_digest,
                         momentum_measurement=standing_measurement,
-                        spot_request=spot_request,
-                        margin_request=margin_request,
+                        execution_services=execution_services,
                     )
             else:
                 outcome = _execute(
-                    job, receipt_dir, paths, futures_entry,
-                    basis_entry, now,
+                    job, receipt_dir, paths, basis_entry, now,
                     validated_job_digest=validated_job_digest,
                     momentum_measurement=standing_measurement,
-                    spot_request=spot_request,
-                    margin_request=margin_request,
+                    execution_services=execution_services,
                 )
             outcome = _final_entry_outcome(
                 paths, job.job_id, job.op, outcome

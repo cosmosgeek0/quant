@@ -1,58 +1,16 @@
-"""basis_executor.py — one-shot command-line executor for the smallest basis cycle.
-
-Connects the proven pieces and adds only the missing plumbing:
-- basis_read supplies the live executable-gap read (build_basis_read_row and
-  the public Spot/USD-M endpoints);
-- basis_cycle supplies the lifecycle: plan_cycle refuses or proceeds, leg_intent
-  and client_id shape every order with unique bc- ids, run_cycle is the verdict
-  oracle over the confirmed leg outcomes and the acquired-base seam;
-- futures_hand lends the short discipline (query the exact client id after the
-  one submission; TERMINAL states; common_step; one mutating call, no retry);
-- spot_roundtrip lends the spot discipline (quoteOrderQty-bounded BUY, fills
-  and commissions from exchange truth via fees_by_asset, receipt + lock shape);
-- events emits EVENT CONTRACT v1 JSONL locally.
-
-Flow when it one day runs live (this wave is OFFLINE ONLY — every test injects
-transport; nothing here was run against the network in-lane):
-one basis read -> refuse or proceed per plan_cycle -> signed READ-ONLY account
-preflight (futures accountConfig canTrade, spot account canTrade, position
-mode proven ONE_WAY, no position and no open orders on the plan symbol on
-either venue, futures available balance covering the planned short margin at
-1x) -> Spot BUY bounded by quoteOrderQty -> confirm ACTUAL net base =
-exchange-reported fills minus base-asset fees, floored to the shared step ->
-Futures SELL short exactly that quantity -> confirm the actual short fill ->
-reduce-only BUY close of the EXACT short fill -> Spot SELL of the actual
-remaining base.
-
-Discipline (each rule is a paid scar):
-- one submission per leg; order truth is established ONLY by querying that
-  leg's client order id; a blind resend double-buys, so nothing is ever resent;
-- partial fills are handled from exchange-reported executed quantities;
-- UNKNOWN stays UNKNOWN: freeze, report exposure with the exact client id to
-  reconcile, exit nonzero; no repair trades ever;
-- a JSON receipt is saved before and after every mutation; contract-v1 events
-  are appended to a local events.jsonl at the end of the run.
-
-Exit codes: 0 CLOSED | 2 REJECTED_BEFORE_ENTRY or config refusal |
-3 OPEN_EXPOSURE / BLOCKED / BLOCKED_UNRESOLVED | 4 UNKNOWN |
-5 PREFLIGHT_REFUSED (a signed read-only account proof failed; nothing sent).
-"""
+"""One-shot normal-basis cycle using the shared Binance execution hand."""
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
 import glob
-import hashlib
-import hmac
 import json
+import math
 import os
 import re
 import secrets
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -67,51 +25,53 @@ from basis_cycle import (
     UNWIND_SPOT,
     CyclePlan,
     client_id,
-    leg_intent,
     plan_cycle,
     quantize_down,
     run_cycle,
 )
 from basis_read import (
-    SPOT_BASE_URL,
     SPOT_BOOK_PATH,
-    USDM_BASE_URL,
     USDM_BOOK_PATH,
     USDM_PREMIUM_PATH,
     BasisReadError,
     build_basis_read_row,
     now_utc,
 )
-from futures_hand import (
-    TERMINAL,
-    PreflightError as FuturesPreflightError,
-    api_reason,
-    clean,
-    common_step,
-    d,
-    fmt,
-    parse_trade_capability,
-)
+from execution import binance_futures as futures
+from execution import binance_http as http
+from execution import binance_spot as spot
 
 
-def fees_by_asset(*trade_lists):
-    """TEMPORARY (Lead, W1 landed): the proof module spot_roundtrip no longer
-    exports this; W4 replaces the whole leg path with execution.binance_spot
-    (fees_by_asset -> tuple[Fee]) and deletes this shim (map rows 006, 007)."""
-    agg = {}
-    for trades in trade_lists:
-        for t in trades:
-            a = t.get("commissionAsset", "?")
-            agg[a] = fmt(d(agg.get(a, "0")) + d(t["commission"]))
-    return agg
+def d(value: Any) -> Decimal:
+    if not isinstance(value, (str, Decimal)):
+        raise ArithmeticError("money is not exact")
+    try:
+        with http.exact_guard():
+            result = +Decimal(value)
+    except (ValueError, http.AdapterRefusal) as error:
+        raise ArithmeticError("money is malformed") from error
+    if not result.is_finite():
+        raise ArithmeticError("money is not finite")
+    return result
+
+
+def fmt(value: Decimal) -> str: return format(value, "f")
+
+
+def clean(value: Any, limit: int = 160) -> str: return " ".join(str(value).split())[:limit]
+
+
+def common_step(first: Decimal, second: Decimal) -> Decimal:
+    with http.exact_guard():
+        if first <= 0 or second <= 0:
+            raise http.AdapterRefusal("quantity step must be positive")
+        unit = Decimal(1).scaleb(min(first.as_tuple().exponent,
+                                    second.as_tuple().exponent))
+        left, right = int(first // unit), int(second // unit)
+        return Decimal(abs(left * right) // math.gcd(left, right)) * unit
 
 ALL_STAGES = (ENTER_SPOT, ENTER_SHORT, EXIT_SHORT, EXIT_SPOT, UNWIND_SPOT)
-RECV_WINDOW = "5000"
-HTTP_TIMEOUT = 15
-QUERY_TRIES = 45          # x QUERY_SLEEP = the live per-order confirmation budget
-QUERY_SLEEP = 2.0
-MISSING_LIMIT = 8         # consecutive -2013 answers = the order never existed
-TRADE_TRIES = 5
+HTTP_TIMEOUT = http.HTTP_TIMEOUT_SECONDS
 SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 EXIT_CODE = {
@@ -130,90 +90,93 @@ USDM_OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
 USDM_ACCOUNT_PATH = "/fapi/v3/account"
 SPOT_ACCOUNT_PATH = "/api/v3/account"
 SPOT_OPEN_ORDERS_PATH = "/api/v3/openOrders"
-QTY_QUANTUM_MARGIN = Decimal("0.00000001")
 
 
 @dataclass(frozen=True)
 class Venue:
-    name: str
-    base_url: str
-    exchange_info_path: str
-    order_path: str
-    trades_path: str
-    quote_field: str
-    resp_type: str
+    name: str; base_url: str; quote_field: str
 
 
-SPOT = Venue("spot", SPOT_BASE_URL, "/api/v3/exchangeInfo", "/api/v3/order",
-             "/api/v3/myTrades", "cummulativeQuoteQty", "FULL")
-USDM = Venue("usdm", USDM_BASE_URL, "/fapi/v1/exchangeInfo", "/fapi/v1/order",
-             "", "cumQuote", "RESULT")
+SPOT = Venue("spot", http.SPOT_BASE_URL, "cummulativeQuoteQty")
+USDM = Venue("usdm", http.FUTURES_BASE_URL, "cumQuote")
 VENUES = {"spot": SPOT, "usdm": USDM}
 
 
 class ExecutorExit(Exception):
-    """Carries the process exit code out of the one finish() call."""
-
     def __init__(self, code: int):
-        super().__init__(code)
-        self.code = code
+        super().__init__(code); self.code = code
 
 
-class Blocked(Exception):
-    """A local precondition (config, lock) refuses the run before any receipt."""
+class Blocked(Exception): pass
 
 
-class Refusal(Exception):
-    """A pre-order refusal inside a receipted run; nothing was submitted."""
+class Refusal(Exception): pass
 
 
-class PreflightRefusal(Exception):
-    """A signed read-only account proof failed before any order was sent."""
+class PreflightRefusal(Exception): pass
+
+
+def _typed_transport(request: Callable[..., Any]) -> http.Transport:
+    def transport(method: str, base_url: str, path: str,
+                  params: Optional[http.Params] = None,
+                  signed: bool = False) -> http.HttpResult:
+        legacy_params = dict(params) if params is not None else None
+        try:
+            result = request(method, base_url, path, legacy_params, signed)
+        except Exception:
+            return http.HttpResult("unclear", None, None, "transport_error")
+        if isinstance(result, http.HttpResult): return result
+        if not isinstance(result, tuple) or len(result) != 2:
+            return http.HttpResult("unclear", None, None, "transport_result_invalid")
+        kind, payload = result
+        if kind == "ok": return http.HttpResult("ok", payload, None, None)
+        code = payload.get("code") if isinstance(payload, dict) else None
+        msg = payload.get("msg") if isinstance(payload, dict) else None
+        code = code if type(code) is int else None; msg = clean(msg, 160) if isinstance(msg, str) else None
+        if kind == "api_error" and code is not None:
+            return http.HttpResult("api_error", None, code, msg)
+        return http.HttpResult("unclear", None, code, msg or str(kind))
+    return transport
 
 
 @dataclass(frozen=True)
 class ExecutorConfig:
-    symbol: str
-    sha: str
-    receipt_dir: str
-    min_entry_bps: Decimal = Decimal("1")
-    events_path: str = ""     # default: <receipt_dir>/events.jsonl
-    run_id: str = ""          # default: generated per run
+    symbol: str; sha: str; receipt_dir: str
+    min_entry_bps: Decimal = Decimal("1"); events_path: str = ""; run_id: str = ""
 
 
 @dataclass
 class RunState:
-    cfg: ExecutorConfig
-    request: Callable[..., Tuple[str, Any]]
-    sleep: Callable[[float], None]
-    run_id: str
-    receipt_path: str
-    lock_path: str
-    events_path: str
-    client_ids: Tuple[str, ...] = ()
-    receipt: Dict[str, Any] = field(default_factory=dict)
-    events: List[Dict[str, Any]] = field(default_factory=list)
-    outcomes: Dict[str, str] = field(default_factory=dict)
-    locked: bool = False
+    cfg: ExecutorConfig; request: Callable[..., Tuple[str, Any]]
+    sleep: Callable[[float], None]; run_id: str; receipt_path: str
+    lock_path: str; events_path: str; client_ids: Tuple[str, ...] = ()
+    receipt: Dict[str, Any] = field(default_factory=dict); events: List[Dict[str, Any]] = field(default_factory=list)
+    outcomes: Dict[str, str] = field(default_factory=dict); locked: bool = False
     partial_short: Optional[Decimal] = None
+    transport: http.Transport = field(init=False, repr=False)
+    spot_market: Optional[spot.SpotMarket] = field(default=None, repr=False)
+    futures_market: Optional[futures.FuturesMarket] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None: self.transport = _typed_transport(self.request)
 
 
-def utc() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def utc() -> str: return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def new_run_id() -> str:
-    return format(int(time.time()), "x") + secrets.token_hex(3)
+def new_run_id() -> str: return format(int(time.time()), "x") + secrets.token_hex(3)
 
 
 def save(state: RunState) -> None:
-    if not state.receipt_path:
-        return
+    if not state.receipt_path: return
     tmp = state.receipt_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(state.receipt, handle, indent=2, default=str)
-    os.chmod(tmp, 0o600)
+        json.dump(state.receipt, handle, indent=2, default=str); handle.flush()
+        os.fchmod(handle.fileno(), 0o600); os.fsync(handle.fileno())
     os.replace(tmp, state.receipt_path)
+    descriptor = os.open(os.path.dirname(state.receipt_path) or ".", os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally: os.close(descriptor)
 
 
 def first_fail(state: RunState, where: str, detail: Any) -> None:
@@ -225,14 +188,10 @@ def first_fail(state: RunState, where: str, detail: Any) -> None:
 
 
 def contract_note(text: Any, identifiers: Tuple[str, ...]) -> str:
-    """Normalize free text into an EVENT CONTRACT v1 note (a _safe_note fixed
-    point): known ids to last-4, then the contract's own token reductions."""
     note = " ".join(str(text).split())
-    for identifier in sorted({i for i in identifiers if len(i) > 4},
-                             key=len, reverse=True):
+    for identifier in sorted({i for i in identifiers if len(i) > 4}, key=len, reverse=True):
         note = note.replace(identifier, identifier[-4:])
-    note = events.LONG_ID_RE.sub(lambda match: match.group(0)[-4:], note)
-    note = events.OPAQUE_TOKEN_RE.sub(lambda match: match.group(0)[-4:], note)
+    note = events.LONG_ID_RE.sub(lambda match: match.group(0)[-4:], note); note = events.OPAQUE_TOKEN_RE.sub(lambda match: match.group(0)[-4:], note)
     return note[:480]
 
 
@@ -242,14 +201,11 @@ def base_event(state: RunState, kind: str) -> Dict[str, Any]:
 
 
 def write_events(state: RunState) -> None:
-    if not state.events:
-        return
+    if not state.events: return
     try:
         events.write_jsonl(state.events, state.events_path, append=True)
     except (events.ReceiptError, OSError) as exc:
-        first_fail(state, "events_contract", exc)
-        state.receipt["events_error"] = clean(exc, 200)
-        save(state)
+        first_fail(state, "events_contract", exc); state.receipt["events_error"] = clean(exc, 200); save(state)
 
 
 def finish(state: RunState, verdict: str, exposure: str, note: str) -> None:
@@ -260,173 +216,103 @@ def finish(state: RunState, verdict: str, exposure: str, note: str) -> None:
         "verdict_note": clean(note, 300),
         "finished_utc": utc(),
     })
-    save(state)
-    verdict_event = base_event(state, "run_verdict")
-    verdict_event["verdict"] = verdict
+    save(state); verdict_event = base_event(state, "run_verdict"); verdict_event["verdict"] = verdict
     residual = state.receipt.get("result", {}).get("residual_base_from_this_run")
-    if residual not in (None, "UNKNOWN"):
-        verdict_event["residual"] = residual
+    if residual not in (None, "UNKNOWN"): verdict_event["residual"] = residual
     text = exposure if exposure and exposure != "none" else note
-    if text:
-        verdict_event["note"] = contract_note(text, state.client_ids)
-    state.events.append(verdict_event)
-    write_events(state)
+    if text: verdict_event["note"] = contract_note(text, state.client_ids)
+    state.events.append(verdict_event); write_events(state)
     if state.locked and verdict in ("CLOSED", "REJECTED_BEFORE_ENTRY",
                                     "PREFLIGHT_REFUSED"):
-        os.unlink(state.lock_path)
-        state.locked = False
-    print("lane: BASIS-EXECUTOR")
-    print("run_id:", state.run_id)
-    print("sha8:", state.cfg.sha[:8])
-    print("symbol:", state.cfg.symbol)
+        os.unlink(state.lock_path); state.locked = False
+    print("lane: BASIS-EXECUTOR"); print("run_id:", state.run_id)
+    print("sha8:", state.cfg.sha[:8]); print("symbol:", state.cfg.symbol)
     for leg in state.receipt.get("legs", []):
         print("leg: %s %s executed=%s client_last4=%s" % (
             leg.get("stage"), leg.get("status", "-"),
             leg.get("executed_qty", "-"), leg.get("client_id", "")[-4:]))
-    if "first_failure" in state.receipt:
-        print("first_failure:", json.dumps(state.receipt["first_failure"]))
-    print("VERDICT:", verdict)
-    print("EXPOSURE:", clean(exposure, 300))
-    print("NOTE:", clean(note, 300))
-    print("RECEIPT:", state.receipt_path)
-    print("EVENTS:", state.events_path)
+    if "first_failure" in state.receipt: print("first_failure:", json.dumps(state.receipt["first_failure"]))
+    print("VERDICT:", verdict); print("EXPOSURE:", clean(exposure, 300))
+    print("NOTE:", clean(note, 300)); print("RECEIPT:", state.receipt_path); print("EVENTS:", state.events_path)
     raise ExecutorExit(EXIT_CODE[verdict])
 
 
+# _W7BasisPositionCompat names delegate to typed execution services.
 def get_retry(state: RunState, base_url: str, path: str,
               params: Optional[Dict[str, str]] = None, signed: bool = False,
               tries: int = 3) -> Tuple[str, Any]:
-    """Reads may retry; mutations NEVER go through here."""
-    kind, payload = "unclear", {}
-    for attempt in range(tries):
-        kind, payload = state.request("GET", base_url, path, params, signed)
-        if kind != "unclear":
-            return kind, payload
-        if attempt + 1 < tries:
-            state.sleep(1 + attempt)
-    return kind, payload
+    if tries != http.READ_ATTEMPTS: raise Refusal("read attempts must use the shared bound")
+    canonical = tuple((str(key), str(value)) for key, value in params.items()) \
+        if params is not None else None
+    result = http.read(state.transport, base_url, path, canonical,
+                       signed=signed, sleep=state.sleep)
+    if result.kind == "ok": return "ok", result.payload
+    payload = {"code": result.code, "msg": result.msg} if result.kind == "api_error" else {}
+    return result.kind, payload
 
 
-def public_read(state: RunState, base_url: str, path: str, label: str) -> Any:
-    kind, payload = get_retry(state, base_url, path,
-                              {"symbol": state.cfg.symbol}, signed=False)
-    if kind != "ok":
-        raise Refusal(f"{label} read failed")
-    return payload
+def _read_payload(state: RunState, base_url: str, path: str,
+                  params: Optional[http.Params], label: str,
+                  *, signed: bool = False) -> Any:
+    result = http.read(state.transport, base_url, path, params, signed=signed,
+                       sleep=state.sleep)
+    if result.kind != "ok": raise Refusal(label + " read failed")
+    return result.payload
 
 
-def one_symbol(payload: Any, symbol: str, label: str) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise Refusal(f"{label} returned a non-object response")
-    matches = [row for row in payload.get("symbols", [])
-               if isinstance(row, dict) and row.get("symbol") == symbol]
-    if len(matches) != 1:
-        raise Refusal(f"{label} did not return exactly one symbol")
-    return matches[0]
+def _spot_market(state: RunState) -> spot.SpotMarket:
+    if state.spot_market is None:
+        result = spot.read_market(state.transport, SPOT.base_url, state.cfg.symbol, sleep=state.sleep)
+        if result.kind != "ok" or result.value is None:
+            raise Refusal("basis read refused: Spot market failed shared validation")
+        state.spot_market = result.value
+    return state.spot_market
+
+
+def _futures_market(state: RunState) -> futures.FuturesMarket:
+    if state.futures_market is None:
+        result = futures.read_market(state.transport, USDM.base_url, state.cfg.symbol, sleep=state.sleep)
+        if result.kind != "ok" or result.value is None: raise Refusal("USD-M market read failed shared validation")
+        state.futures_market = result.value
+    return state.futures_market
 
 
 def market_context(state: RunState) -> Dict[str, Any]:
-    """Read both venues' filters; derive the shared step and minimums."""
-    symbol = state.cfg.symbol
-    spot_info = one_symbol(
-        public_read(state, SPOT.base_url, SPOT.exchange_info_path,
-                    "Spot exchangeInfo"), symbol, "Spot exchangeInfo")
-    usdm_info = one_symbol(
-        public_read(state, USDM.base_url, USDM.exchange_info_path,
-                    "USD-M exchangeInfo"), symbol, "USD-M exchangeInfo")
-
-    if spot_info.get("status") != "TRADING" or \
-            not spot_info.get("isSpotTradingAllowed", False):
-        raise Refusal("symbol is not live for Spot trading")
-    if "MARKET" not in spot_info.get("orderTypes", []) or \
-            not spot_info.get("quoteOrderQtyMarketAllowed", False):
-        raise Refusal("MARKET quoteOrderQty orders not enabled for symbol")
-    if spot_info.get("quoteAsset") != "USDT":
-        raise Refusal("cycle accepts only USDT-quoted Spot symbols")
-    if usdm_info.get("status") != "TRADING":
-        raise Refusal("USD-M symbol is not TRADING")
-    if usdm_info.get("contractType") != "PERPETUAL":
-        raise Refusal("USD-M symbol is not a PERPETUAL contract")
-    if usdm_info.get("quoteAsset") != "USDT" or \
-            usdm_info.get("marginAsset") != "USDT":
+    spot_market, futures_market = _spot_market(state), _futures_market(state)
+    if spot_market.quote_asset != "USDT": raise Refusal("cycle accepts only USDT-quoted Spot symbols")
+    if futures_market.quote_asset != "USDT" or \
+            futures_market.margin_asset != "USDT":
         raise Refusal("cycle accepts only USDT-quoted, USDT-margined contracts")
-    if "MARKET" not in usdm_info.get("orderTypes", []):
-        raise Refusal("USD-M symbol does not support MARKET orders")
-
     try:
-        spot_filters = {row["filterType"]: row
-                        for row in spot_info.get("filters", [])}
-        usdm_filters = {row["filterType"]: row
-                        for row in usdm_info.get("filters", [])}
-        steps = [d(spot_filters["LOT_SIZE"]["stepSize"]),
-                 d(usdm_filters["LOT_SIZE"]["stepSize"])]
-        min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"]),
-                    d(usdm_filters["LOT_SIZE"]["minQty"])]
-        for filters in (spot_filters, usdm_filters):
-            market_lot = filters.get("MARKET_LOT_SIZE", {})
-            market_step = d(market_lot.get("stepSize", "0"))
-            if market_step > 0:
-                steps.append(market_step)
-            min_qtys.append(d(market_lot.get("minQty", "0")))
-        spot_notional = spot_filters.get("NOTIONAL") or \
-            spot_filters.get("MIN_NOTIONAL") or {}
-        usdm_notional = usdm_filters.get("MIN_NOTIONAL", {})
-        min_notional = max(d(spot_notional.get("minNotional", "0")),
-                           d(usdm_notional.get("notional", "0")))
-        shared_step = steps[0]
-        for step in steps[1:]:
-            shared_step = common_step(shared_step, step)
-        # The SPOT venue's own sellability step: a spot-sale residual at or
-        # above this is a sellable remainder, whatever the shared (LCM) step.
-        spot_step = d(spot_filters["LOT_SIZE"]["stepSize"])
-        spot_market_step = d(spot_filters.get("MARKET_LOT_SIZE",
-                                              {}).get("stepSize", "0"))
-        if spot_market_step > 0:
-            spot_step = common_step(spot_step, spot_market_step)
-    except (KeyError, TypeError, ValueError, ArithmeticError):
-        raise Refusal("symbol filters are unusable on one venue") from None
-    if shared_step <= 0 or spot_step <= 0:
-        raise Refusal("shared quantity step is not positive")
-    # Worst-case futures price band for a market order: the exchange reserves
-    # margin at roughly notional x the up-multiplier. Missing band data falls
-    # back to a conservative 1.5; the notional itself comes from the shared
-    # cycle cap through plan_cycle.
-    band = usdm_filters.get("PERCENT_PRICE", {})
-    band_by_side = usdm_filters.get("PERCENT_PRICE_BY_SIDE", {})
-    ups = []
-    for source, key in ((band, "multiplierUp"),
-                        (band_by_side, "askMultiplierUp"),
-                        (band_by_side, "bidMultiplierUp")):
-        try:
-            value = d(source.get(key, "0"))
-        except ArithmeticError:
-            continue
-        if value > 1:
-            ups.append(value)
-    band_up = max(ups) if ups else Decimal("1.5")
-    spot_min_notional = d((spot_notional or {}).get("minNotional", "0"))
-    spot_min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"]),
-                     d(spot_filters.get("MARKET_LOT_SIZE",
-                                        {}).get("minQty", "0"))]
-    return {
-        "base": spot_info.get("baseAsset", ""),
-        "shared_step": shared_step,
-        "spot_step": spot_step,
-        "min_notional": min_notional,
-        "min_qty": max(min_qtys),
-        "band_up": band_up,
-        "spot_min_notional": spot_min_notional,
-        "spot_min_qty": max(spot_min_qtys),
-    }
+        with http.exact_guard():
+            shared_step = common_step(spot_market.step_size, futures_market.step_size)
+            min_notional = max(spot_market.min_notional, futures_market.min_notional)
+            min_quantity = max(spot_market.min_quantity, futures_market.min_quantity)
+    except http.AdapterRefusal as error:
+        raise Refusal(str(error)) from None
+    return {"base": spot_market.base_asset, "shared_step": shared_step,
+            "spot_step": spot_market.step_size, "min_notional": min_notional,
+            "min_qty": min_quantity, "band_up": futures_market.multiplier_up,
+            "spot_min_notional": spot_market.min_notional,
+            "spot_min_qty": spot_market.min_quantity,
+            "spot_market": spot_market, "futures_market": futures_market}
 
 
-def gap_row(state: RunState):
-    """One basis read through the injected transport; contract of basis_read."""
-    symbol = state.cfg.symbol
-    spot_book = public_read(state, SPOT.base_url, SPOT_BOOK_PATH, "Spot book")
-    usdm_book = public_read(state, USDM.base_url, USDM_BOOK_PATH, "USD-M book")
-    premium = public_read(state, USDM.base_url, USDM_PREMIUM_PATH,
-                          "USD-M premium")
+def gap_row(state: RunState, market: Optional[Dict[str, Any]] = None):
+    symbol = state.cfg.symbol; market = market or market_context(state)
+    spot_market = market["spot_market"]; futures_market = market["futures_market"]
+    raw_book = _read_payload(
+        state, USDM.base_url, USDM_BOOK_PATH, (("symbol", symbol),),
+        "USD-M book")
+    premium = _read_payload(
+        state, USDM.base_url, USDM_PREMIUM_PATH, (("symbol", symbol),),
+        "USD-M premium")
+    if not isinstance(raw_book, dict) or raw_book.get("symbol") != symbol: raise Refusal("USD-M book identity is unproved")
+    spot_book = {"symbol": symbol, "bidPrice": fmt(spot_market.bid),
+                 "askPrice": fmt(spot_market.ask)}
+    usdm_book = {"symbol": symbol, "bidPrice": fmt(futures_market.bid),
+                 "askPrice": fmt(futures_market.ask),
+                 "time": raw_book.get("time")}
     try:
         row = build_basis_read_row(symbol, spot_book, usdm_book, premium,
                                    completed_utc=now_utc())
@@ -435,313 +321,244 @@ def gap_row(state: RunState):
     state.receipt["gap"] = {
         name: fmt(value) if isinstance(value, Decimal) else value
         for name, value in dataclasses.asdict(row).items()}
-    save(state)
-    gap_event = base_event(state, "gap_read")
+    save(state); gap_event = base_event(state, "gap_read")
     gap_event["note"] = contract_note(
         "entry %s bps exit %s bps funding %s" % (
             fmt(row.entry_gap_bps_vs_spot_ask),
             fmt(row.exit_gap_bps_vs_spot_bid), fmt(row.funding_rate)),
         state.client_ids)
-    state.events.append(gap_event)
-    return row
+    state.events.append(gap_event); return row
+
+
+def _order_payload(result: http.OrderResult, venue: Venue) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "symbol": result.identity.symbol, "clientOrderId": result.returned_client_id or result.identity.client_id,
+        "status": result.status, "side": result.side,
+        "executedQty": fmt(result.executed_quantity) if result.executed_quantity is not None else None,
+        venue.quote_field: fmt(result.quote_quantity) if result.quote_quantity is not None else None}
+    if result.identity.order_id is not None: payload["orderId"] = result.identity.order_id
+    if venue.name == "usdm": payload["reduceOnly"] = result.reduce_only
+    return payload
+
+
+def _error_note(result: Optional[http.HttpResult]) -> str:
+    if result is None: return "shared order truth remained pending"
+    code = str(result.code) if result.code is not None else result.kind
+    return clean("%s %s" % (code, result.msg or ""), 200)
 
 
 def query_client_order(state: RunState, venue: Venue,
                        order_client_id: str) -> Tuple[str, Any]:
-    """Poll one exact client id until terminal, definitely absent, or unknown.
+    service = spot.query_order if venue.name == "spot" else futures.query_order
+    result = service(state.transport, venue.base_url, state.cfg.symbol,
+                     order_client_id, sleep=state.sleep)
+    if result.tag == "error": first_fail(state, "query_order", _error_note(result.error))
+    payload = _order_payload(result, venue) if result.identity else None
+    return result.tag, payload
 
-    Mirrors futures_hand.query_order over the injected transport: a definite
-    non -2013 query error stops the polling because order truth is NOT
-    established; nothing is ever resent from here.
-    """
-    last, missing = None, 0
-    for _ in range(QUERY_TRIES):
-        kind, order = state.request(
-            "GET", venue.base_url, venue.order_path,
-            {"symbol": state.cfg.symbol, "origClientOrderId": order_client_id},
-            True)
-        if kind == "ok" and isinstance(order, dict):
-            last, missing = order, 0
-            if order.get("status") in TERMINAL:
-                return "terminal", order
-        elif kind == "api_error":
-            if isinstance(order, dict) and order.get("code") == -2013:
-                missing += 1
-                if missing >= MISSING_LIMIT:
-                    return "not_found", None
-            else:
-                first_fail(state, "query_order", api_reason(order))
-                return "error", order
-        state.sleep(QUERY_SLEEP)
-    return "pending", last
+
+def _leg_plan(state: RunState, stage: str, plan: CyclePlan,
+              quantity: Optional[Decimal]) -> Tuple[Venue, http.OrderPlan]:
+    identity = client_id(stage, state.run_id)
+    if stage == ENTER_SPOT:
+        return SPOT, spot.build_market_order(_spot_market(state), "BUY", identity, state.cfg.sha, quote_limit=plan.spot_quote_cap)
+    if stage in (EXIT_SPOT, UNWIND_SPOT):
+        return SPOT, spot.build_market_order(_spot_market(state), "SELL", identity, state.cfg.sha, quantity=quantity)
+    if stage == ENTER_SHORT:
+        return USDM, futures.build_open_order(_futures_market(state), "SELL", identity, state.cfg.sha, quantity, profile="MARKET")
+    if stage == EXIT_SHORT:
+        return USDM, futures.build_reduce_only_close(_futures_market(state), "BUY", identity, state.cfg.sha, quantity)
+    raise http.AdapterRefusal("basis stage is invalid")
+
+
+def _record_coverage(state: RunState, leg: Dict[str, Any],
+                     coverage: Optional[http.FillCoverage]) -> None:
+    if coverage is None:
+        leg["fill_coverage"] = "UNKNOWN"; save(state); return
+    fee_map = {fee.asset: fmt(fee.amount) for fee in coverage.fees}
+    leg.update({"fill_covered_qty": fmt(coverage.covered_quantity),
+                "fill_executed_qty": fmt(coverage.executed_quantity),
+                "fill_coverage_complete": coverage.complete,
+                "fee_by_asset": fee_map})
+    save(state)
+    if fee_map and state.events and state.events[-1]["kind"] == "order_terminal": state.events[-1]["fees"] = fee_map
 
 
 def settle_leg(state: RunState, stage: str, plan: CyclePlan,
                quantity: Optional[Decimal] = None):
-    """Submit ONE order for a stage, then establish its truth by client id.
-
-    Returns ("terminal", order, response_fills) | ("rejected", payload, []) |
-    ("unknown", last_seen, []). The caller decides; nothing is resent here.
-    """
-    intent = leg_intent(stage, plan, state.run_id, quantity)
-    venue = VENUES[intent.pop("market")]
-    wire = dict(intent)
-    wire["newOrderRespType"] = venue.resp_type
-    order_client_id = wire["newClientOrderId"]
+    try:
+        venue, order_plan = _leg_plan(state, stage, plan, quantity)
+    except (http.AdapterRefusal, Refusal) as error:
+        first_fail(state, stage.lower(), clean(error, 200)); return "rejected", {"msg": clean(error, 200)}, None
+    order_client_id = order_plan.intent.identity
     leg: Dict[str, Any] = {
-        "stage": stage, "market": venue.name, "side": wire["side"],
+        "stage": stage, "market": venue.name, "side": order_plan.side,
         "client_id": order_client_id, "submitted_utc": utc(),
     }
-    if "quantity" in wire:
-        leg["quantity"] = wire["quantity"]
-    if "quoteOrderQty" in wire:
-        leg["quote_order_qty"] = wire["quoteOrderQty"]
-    state.receipt["legs"].append(leg)
-    save(state)
-    submitted = base_event(state, "order_submitted")
-    submitted["side"] = wire["side"]
-    submitted["client_id_last4"] = order_client_id[-4:]
-    state.events.append(submitted)
+    if order_plan.quantity is not None: leg["quantity"] = fmt(order_plan.quantity)
+    if order_plan.quote_limit is not None: leg["quote_order_qty"] = fmt(order_plan.quote_limit)
+    state.receipt["legs"].append(leg); save(state)
+    def write_intent(intent: http.MutationIntent) -> None:
+        if intent != order_plan.intent: raise http.IntentNotDurable("intent identity changed")
+        leg["intent"] = {
+            "stage": stage, "venue": intent.venue, "identity": intent.identity,
+            "operation": intent.operation, "git_sha": intent.git_sha,
+            "params": [list(pair) for pair in intent.params],
+            "quantity": fmt(order_plan.quantity) if order_plan.quantity is not None else None,
+            "quote_limit": fmt(order_plan.quote_limit) if order_plan.quote_limit is not None else None}
+        save(state); submitted = base_event(state, "order_submitted")
+        submitted["side"] = order_plan.side; submitted["client_id_last4"] = order_client_id[-4:]
+        state.events.append(submitted)
 
-    kind, response = state.request("POST", venue.base_url, venue.order_path,
-                                   dict(wire), True)
-    query_state, order = query_client_order(state, venue, order_client_id)
+    submit = spot.submit_order_once if venue.name == "spot" \
+        else futures.submit_order_once
+    try:
+        result = submit(state.transport, venue.base_url, order_plan,
+                        write_intent, sleep=state.sleep)
+    except (http.IntentNotDurable, http.AdapterRefusal) as error:
+        first_fail(state, stage.lower(), clean(error, 200)); leg.update({
+            "status": "NOT_SUBMITTED", "reason": "intent was not durable or valid"})
+        save(state); return "rejected", {"msg": clean(error, 200)}, None
 
-    if query_state == "terminal":
-        if order.get("clientOrderId") != order_client_id:
-            first_fail(state, "query_order", "returned client id did not match")
-            leg.update({"status": "UNKNOWN", "detail": "order identity mismatch"})
-            save(state)
-            return "unknown", order, []
-        executed = d(order.get("executedQty", "0"))
-        quote = d(order.get(venue.quote_field, "0"))
-        order_id = str(order.get("orderId", ""))
-        leg.update({"status": str(order.get("status")), "order_id": order_id,
+    order = _order_payload(result, venue)
+    if result.tag == "terminal":
+        executed = result.executed_quantity; quote = result.quote_quantity; order_id = str(result.identity.order_id)
+        leg.update({"status": result.status, "order_id": order_id,
                     "executed_qty": fmt(executed), "quote": fmt(quote),
                     "terminal_utc": utc()})
-        save(state)
-        terminal = base_event(state, "order_terminal")
-        terminal["side"] = wire["side"]
-        terminal["client_id_last4"] = order_client_id[-4:]
-        if order_id:
-            terminal["order_id_last4"] = order_id[-4:]
-        terminal["executed"] = fmt(executed)
-        terminal["quote"] = fmt(quote)
-        terminal["note"] = contract_note(
-            "%s %s" % (stage, order.get("status")), state.client_ids)
+        save(state); terminal = base_event(state, "order_terminal")
+        terminal.update({"side": order_plan.side,
+                         "client_id_last4": order_client_id[-4:],
+                         "order_id_last4": order_id[-4:],
+                         "executed": fmt(executed), "quote": fmt(quote),
+                         "note": contract_note(
+                             "%s %s" % (stage, result.status),
+                             state.client_ids)})
         state.events.append(terminal)
-        fills = response.get("fills") if (
-            kind == "ok" and isinstance(response, dict)) else None
-        return "terminal", order, list(fills or [])
+        fills = (spot.read_fills if venue.name == "spot" else futures.read_fills)(state.transport, venue.base_url, result, sleep=state.sleep)
+        coverage = fills.value if fills.kind == "ok" else None
+        _record_coverage(state, leg, coverage); return "terminal", order, coverage
 
-    if query_state == "not_found" and kind == "api_error":
-        reason = api_reason(response)
-        leg.update({"status": "REJECTED", "reason": clean(reason, 200),
-                    "terminal_utc": utc()})
-        save(state)
-        terminal = base_event(state, "order_terminal")
-        terminal["side"] = wire["side"]
-        terminal["client_id_last4"] = order_client_id[-4:]
-        terminal["executed"] = "0"
-        terminal["note"] = contract_note("%s REJECTED %s" % (stage, reason),
-                                         state.client_ids)
-        state.events.append(terminal)
-        return "rejected", response, []
+    if result.tag == "error":
+        reason = _error_note(result.error)
+        leg.update({"status": "REJECTED", "reason": reason, "terminal_utc": utc()})
+        save(state); terminal = base_event(state, "order_terminal")
+        terminal.update({"side": order_plan.side,
+                         "client_id_last4": order_client_id[-4:],
+                         "executed": "0",
+                         "note": contract_note(
+                             "%s REJECTED %s" % (stage, reason),
+                             state.client_ids)})
+        state.events.append(terminal); return "rejected", order, None
 
-    first_fail(state, stage.lower(),
-               "submission %s; query %s" % (kind, query_state))
-    leg.update({"status": "UNKNOWN", "submission_kind": kind,
-                "query_state": query_state})
-    save(state)
-    return "unknown", order, []
+    where = "query_order" if result.error is not None and result.error.kind == "api_error" else stage.lower()
+    first_fail(state, where, _error_note(result.error)); leg.update({"status": "UNKNOWN", "query_state": result.tag})
+    save(state); return "unknown", order, None
 
 
 def spot_trades(state: RunState, order_id: str, executed: Decimal,
-                response_fills: List[Dict[str, Any]]):
-    """Real fills for one spot order: FULL-response fills first, then myTrades
-    until they cover the executed quantity (spot_roundtrip.order_trades)."""
-    trades = list(response_fills or [])
-    covered = sum((d(t.get("qty", "0")) for t in trades), Decimal(0))
-    for _ in range(TRADE_TRIES):
-        if covered >= executed:
-            break
-        state.sleep(1)
-        kind, payload = get_retry(
-            state, SPOT.base_url, SPOT.trades_path,
-            {"symbol": state.cfg.symbol, "orderId": order_id}, signed=True)
-        if kind == "ok" and isinstance(payload, list) and payload:
-            trades = payload
-            covered = sum((d(t.get("qty", "0")) for t in trades), Decimal(0))
-    if covered < executed:
-        first_fail(state, "order_trades",
-                   "trades cover %s of %s" % (fmt(covered), fmt(executed)))
-    return trades, covered
+                response_fills: Optional[http.FillCoverage]):
+    if not isinstance(response_fills, http.FillCoverage):
+        first_fail(state, "order_trades", "fill coverage is unproved"); return (), None
+    if not response_fills.complete:
+        first_fail(state, "order_trades", "fills cover %s of %s" % (
+            fmt(response_fills.covered_quantity), fmt(executed)))
+    return response_fills.fills, response_fills.covered_quantity
 
 
-def base_fee_of(trades: List[Dict[str, Any]], base_asset: str) -> Decimal:
-    return sum((d(t.get("commission", "0")) for t in trades
-                if t.get("commissionAsset") == base_asset), Decimal(0))
+def base_fee_of(trades: Tuple[http.Fill, ...], base_asset: str) -> Decimal:
+    fees = spot.fees_by_asset(tuple(trades))
+    return next((fee.amount for fee in fees if fee.asset == base_asset), Decimal(0))
 
 
 def attach_fees(state: RunState, leg_index: int, trades) -> None:
-    fee_map = fees_by_asset(trades)
-    state.receipt["legs"][leg_index]["fee_by_asset"] = fee_map
-    save(state)
-    if fee_map and state.events and state.events[-1]["kind"] == "order_terminal":
-        state.events[-1]["fees"] = fee_map
+    fees = spot.fees_by_asset(tuple(trades))
+    fee_map = {fee.asset: fmt(fee.amount) for fee in fees}
+    state.receipt["legs"][leg_index]["fee_by_asset"] = fee_map; save(state)
+    if fee_map and state.events and state.events[-1]["kind"] == "order_terminal": state.events[-1]["fees"] = fee_map
 
 
-def futures_position(rows: Any, symbol: str) -> Optional[Decimal]:
-    """Net one-way position, or None when the read cannot prove flatness.
-
-    A hedge-side row (positionSide LONG/SHORT) makes attribution unsafe —
-    offsetting dual-side positions would sum to zero — so it is treated as
-    unreadable, exactly like futures_hand's one-way discipline."""
-    if not isinstance(rows, list):
-        return None
-    total = Decimal(0)
-    for row in rows:
-        if isinstance(row, dict) and row.get("symbol") == symbol:
-            if row.get("positionSide", "BOTH") != "BOTH":
-                return None
-            try:
-                total += d(row.get("positionAmt", "0"))
-            except ArithmeticError:
-                return None
-    return total
+def futures_position(value: Any, symbol: str) -> Optional[Decimal]:
+    if not isinstance(value, tuple) or len(value) != 2: return None
+    market, facts = value; return facts.position_quantity if isinstance(market, futures.FuturesMarket) and isinstance(facts, futures.FuturesPreflight) and market.symbol == symbol else None
 
 
 def signed_read(state: RunState, base_url: str, path: str,
                 params: Optional[Dict[str, str]], label: str) -> Any:
-    """One signed read-only GET; anything but 'ok' refuses the preflight."""
-    kind, payload = get_retry(state, base_url, path, params, signed=True)
-    if kind != "ok":
-        reason = api_reason(payload) if kind == "api_error" else kind
-        raise PreflightRefusal("%s unavailable: %s" % (label, reason))
+    try:
+        kind, payload = get_retry(state, base_url, path, params, signed=True)
+    except Refusal as error: raise PreflightRefusal(str(error)) from None
+    if kind != "ok": raise PreflightRefusal("%s unavailable: %s" % (label, kind))
     return payload
 
 
 def symbol_leverage(rows: Any, symbol: str) -> int:
-    """The plan symbol's ACTUAL configured leverage from one symbolConfig row."""
-    if not isinstance(rows, list) or \
-            any(not isinstance(row, dict) for row in rows):
-        raise PreflightRefusal("symbol-configuration response is malformed")
-    matches = [row for row in rows if row.get("symbol") == symbol]
-    if len(matches) != 1:
-        raise PreflightRefusal("symbol configuration did not return exactly "
-                               "one row for the plan symbol")
-    try:
-        return int(str(matches[0].get("leverage")))
-    except (TypeError, ValueError):
+    def one_read(_method, _base, _path, _params=None, _signed=False):
+        return http.HttpResult("ok", rows, None, None)
+    result = futures.read_leverage(one_read, USDM.base_url, symbol, sleep=lambda _seconds: None)
+    if result.kind != "ok" or result.value is None:
         raise PreflightRefusal(
-            "symbol leverage is missing or unreadable") from None
+            "symbol configuration did not return exactly one readable row; "
+            "symbol leverage is missing or unreadable")
+    return result.value
+
+
+def parse_trade_capability(payload: Any) -> None:
+    if not isinstance(payload, futures.FuturesPreflight) or not payload.can_trade: raise PreflightRefusal("Futures account canTrade is not true")
 
 
 def signed_preflight(state: RunState, plan: CyclePlan,
                      market: Optional[Dict[str, Any]] = None) -> None:
-    """Signed READ-ONLY account proofs before ANY order is submitted.
+    market = market or market_context(state)
+    spot_state = spot.read_account_state(state.transport, SPOT.base_url, state.cfg.symbol, sleep=state.sleep)
+    if spot_state.kind != "ok" or spot_state.value is None: raise PreflightRefusal("Spot account read unavailable")
+    if not spot_state.value.can_trade: raise PreflightRefusal("Spot account canTrade is not true")
+    if spot_state.value.open_order_ids: raise PreflightRefusal("Spot open order already stands on the plan symbol")
+    quote_balance = next((item for item in spot_state.value.balances if item.asset == market["spot_market"].quote_asset), None)
+    if quote_balance is None: raise PreflightRefusal("Spot quote balance is unavailable")
+    if quote_balance.free < plan.spot_quote_cap: raise PreflightRefusal("available Spot balance %s is below the quote cap %s USDT" % (fmt(quote_balance.free), fmt(plan.spot_quote_cap)))
 
-    Must prove, in the futures_hand discipline: futures canTrade=true from
-    /fapi/v1/accountConfig alone (the /fapi/v3/account snapshot once returned
-    a false negative and is never consulted for capability), spot account
-    canTrade, position mode explicitly ONE_WAY (cycle intents send no
-    positionSide), the plan symbol's ACTUAL configured leverage exactly 1x
-    (owner order 2026-08-13: measured, never assumed; this module never
-    changes leverage), no open orders on the plan symbol on either venue, no
-    existing futures position on the plan symbol, and futures available
-    balance covering the planned short margin at 1x. Any unproven fact raises
-    PreflightRefusal; nothing is ever submitted from here.
-    """
-    symbol = state.cfg.symbol
-    capability = signed_read(state, USDM.base_url, USDM_ACCOUNT_CONFIG_PATH,
-                             None, "Futures account-configuration read")
-    try:
-        parse_trade_capability(capability)
-    except FuturesPreflightError as exc:
-        raise PreflightRefusal(str(exc)) from None
-
-    spot_account = signed_read(state, SPOT.base_url, SPOT_ACCOUNT_PATH, None,
-                               "Spot account read")
-    can_trade = spot_account.get("canTrade") \
-        if isinstance(spot_account, dict) else None
-    if not (can_trade is True or str(can_trade).strip().lower() == "true"):
-        raise PreflightRefusal("Spot account canTrade is not true")
-
-    mode = signed_read(state, USDM.base_url, USDM_POSITION_MODE_PATH, None,
-                       "Futures position-mode read")
-    dual = mode.get("dualSidePosition") if isinstance(mode, dict) else None
-    if not (dual is False or str(dual).strip().lower() == "false"):
-        raise PreflightRefusal("Futures position mode is not proven ONE_WAY; "
-                               "cycle intents send no positionSide")
-
-    config_rows = signed_read(state, USDM.base_url, USDM_SYMBOL_CONFIG_PATH,
-                              {"symbol": symbol},
-                              "Futures symbol-configuration read")
-    leverage = symbol_leverage(config_rows, symbol)
-    if leverage != plan.leverage:
+    leverage = futures.read_leverage(state.transport, USDM.base_url, state.cfg.symbol, sleep=state.sleep)
+    if leverage.kind != "ok" or leverage.value is None:
         raise PreflightRefusal(
-            "actual symbol leverage is %sx, not exactly %sx; refusing before "
-            "any order (this module never changes leverage)" % (
-                leverage, plan.leverage))
+            "Futures symbol-configuration read unavailable or did not return "
+            "exactly one row; symbol leverage is missing or unreadable")
+    if leverage.value != plan.leverage:
+        raise PreflightRefusal("actual symbol leverage is %sx, not exactly %sx; refusing before any order (this module never changes leverage)" % (leverage.value, plan.leverage))
 
-    for venue, orders_path in ((SPOT, SPOT_OPEN_ORDERS_PATH),
-                               (USDM, USDM_OPEN_ORDERS_PATH)):
-        orders = signed_read(state, venue.base_url, orders_path,
-                             {"symbol": symbol},
-                             "%s open-orders read" % venue.name)
-        if not isinstance(orders, list):
+    checked = futures.read_preflight(state.transport, USDM.base_url, market["futures_market"], plan.short_notional, require_flat=True, sleep=state.sleep)
+    facts = checked.value if checked.kind == "ok" else None
+    if facts is None:
+        diagnostic = futures.read_preflight(state.transport, USDM.base_url, market["futures_market"], None, require_flat=False, sleep=state.sleep)
+        facts = diagnostic.value if diagnostic.kind == "ok" else None
+        if facts is None:
+            raise PreflightRefusal("Futures preflight unavailable: shared reads leave canTrade, ONE_WAY, open-order absence, and flatness unproved; cannot prove flatness")
+        if facts.open_order_ids:
+            raise PreflightRefusal("%s Futures open order(s) already stand on the plan symbol" % len(facts.open_order_ids))
+        if facts.position_quantity != 0:
+            raise PreflightRefusal("existing Futures position %s on the plan symbol; attribution unsafe" % fmt(facts.position_quantity))
+        with http.exact_guard():
+            required = plan.short_notional * market["band_up"]
+        if facts.available_balance < required:
             raise PreflightRefusal(
-                "%s open-orders response is not a list" % venue.name)
-        if orders:
-            raise PreflightRefusal(
-                "%s open order(s) already standing on %s for the plan "
-                "symbol; attribution unsafe" % (len(orders), venue.name))
+                "available Futures balance %s is below the banded short margin "
+                "%s USDT (notional %s x band %s at %sx)" % (
+                    fmt(facts.available_balance), fmt(required),
+                    fmt(plan.short_notional), fmt(market["band_up"]),
+                    plan.leverage))
+        raise PreflightRefusal("Futures preflight could not prove flatness")
 
-    rows = signed_read(state, USDM.base_url, USDM_POSITION_PATH,
-                       {"symbol": symbol}, "Futures position read")
-    amount = futures_position(rows, symbol)
-    if amount is None:
-        raise PreflightRefusal("Futures position read cannot prove flatness "
-                               "on the plan symbol")
-    if amount != 0:
-        raise PreflightRefusal("existing Futures position %s on the plan "
-                               "symbol; attribution unsafe" % fmt(amount))
-
-    account = signed_read(state, USDM.base_url, USDM_ACCOUNT_PATH, None,
-                          "Futures balance read")
-    try:
-        available = d(account.get("availableBalance", "0")) \
-            if isinstance(account, dict) else Decimal(0)
-    except ArithmeticError:
-        raise PreflightRefusal(
-            "Futures available balance is unreadable") from None
-    band_up = market["band_up"] if market else Decimal(1)
-    required = (plan.short_notional * band_up).quantize(QTY_QUANTUM_MARGIN)
-    if available < required:
-        raise PreflightRefusal(
-            "available Futures balance %s is below the banded short margin "
-            "%s USDT (notional %s x band %s at %sx) — the exchange reserves "
-            "worst-case market-order margin" % (
-                fmt(available), fmt(required), fmt(plan.short_notional),
-                fmt(band_up), plan.leverage))
-    state.receipt["preflight"] = {
-        "futures_can_trade": True,
-        "spot_can_trade": True,
-        "position_mode": "ONE_WAY",
-        "symbol_leverage": leverage,
-        "open_orders": 0,
-        "position_amount": "0",
-        "available_balance": fmt(available),
-        "required_short_margin_1x": fmt(required),
-        "margin_band_up": fmt(band_up),
-        "verified_utc": utc(),
-    }
+    required = facts.required_margin
+    state.receipt["preflight"] = {"futures_can_trade": facts.can_trade,
+        "spot_can_trade": spot_state.value.can_trade, "position_mode": "ONE_WAY",
+        "symbol_leverage": facts.leverage, "open_orders": len(facts.open_order_ids) + len(spot_state.value.open_order_ids),
+        "position_amount": fmt(facts.position_quantity), "available_balance": fmt(facts.available_balance),
+        "required_short_margin_1x": fmt(required), "margin_band_up": fmt(market["band_up"]), "verified_utc": utc()}
     save(state)
 
 
 def conclude(state: RunState, plan: CyclePlan,
              hedge: Optional[Decimal]) -> None:
-    """Feed the confirmed outcomes to the proven lifecycle for the verdict."""
     result = run_cycle(plan, state.run_id, state.outcomes, acquired_base=hedge)
     exposure = result.exposure
     if state.partial_short is not None and exposure != "none":
@@ -752,24 +569,16 @@ def conclude(state: RunState, plan: CyclePlan,
 def sold_leg_result(state: RunState, stage: str, order, fills,
                     net_base: Decimal, hedge: Decimal,
                     market: Dict[str, Any]) -> Decimal:
-    """Confirm a spot sale from exchange truth; freeze on uncoverable fees.
-
-    Dust is judged at the SPOT venue's own step, never the shared (LCM) step:
-    a shortfall (executed < submitted) whose residual is at or above the spot
-    step is a sellable remainder and freezes as OPEN_EXPOSURE with the exact
-    quantities. Only a residual below the spot step is dust, and it is still
-    recorded in the receipt. Returns the residual base from this run once it
-    is exactly computable.
-    """
     base_asset = market["base"]
     shared_step = market["shared_step"]
     spot_step = market["spot_step"]
-    sold = d(order.get("executedQty", "0"))
-    quote_received = d(order.get(SPOT.quote_field, "0"))
+    sold = d(order.get("executedQty"))
+    quote_received = d(order.get(SPOT.quote_field))
     trades, covered = spot_trades(
         state, state.receipt["legs"][-1].get("order_id", ""), sold, fills)
-    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
-    if covered < sold:
+    if covered is not None:
+        attach_fees(state, len(state.receipt["legs"]) - 1, trades)
+    if covered is None or covered != sold:
         state.receipt["result"] = {"residual_base_from_this_run": "UNKNOWN"}
         save(state)
         finish(state, "UNKNOWN",
@@ -777,7 +586,8 @@ def sold_leg_result(state: RunState, stage: str, order, fills,
                "unknowable" % stage,
                "reconcile the %s client id before trusting balances" % stage)
     sell_base_fee = base_fee_of(trades, base_asset)
-    residual = net_base - sold - sell_base_fee
+    with http.exact_guard():
+        residual = net_base - sold - sell_base_fee
     state.receipt["result"] = {
         "stage": stage,
         "sold_qty": fmt(sold),
@@ -810,11 +620,9 @@ def sold_leg_result(state: RunState, stage: str, order, fills,
 
 def execute_legs(state: RunState, plan: CyclePlan,
                  market: Dict[str, Any]) -> None:
-    """Drive the four-leg cycle; every path ends in finish()/conclude()."""
     base_asset = market["base"]
     shared_step = market["shared_step"]
 
-    # Leg 1 — Spot BUY bounded by quoteOrderQty.
     res, order, fills = settle_leg(state, ENTER_SPOT, plan)
     if res == "rejected":
         state.outcomes[ENTER_SPOT] = "REJECTED"
@@ -822,8 +630,8 @@ def execute_legs(state: RunState, plan: CyclePlan,
     if res == "unknown":
         state.outcomes[ENTER_SPOT] = "UNKNOWN"
         conclude(state, plan, None)
-    executed = d(order.get("executedQty", "0"))
-    quote_spent = d(order.get(SPOT.quote_field, "0"))
+    executed = d(order.get("executedQty"))
+    quote_spent = d(order.get(SPOT.quote_field))
     if executed <= 0:
         state.receipt["legs"][-1]["note"] = "terminal zero fill; nothing acquired"
         save(state)
@@ -831,11 +639,11 @@ def execute_legs(state: RunState, plan: CyclePlan,
         conclude(state, plan, None)
     state.outcomes[ENTER_SPOT] = "FILLED"
 
-    # Acquired exchange truth: fills minus base-asset fees, floored to step.
     trades, covered = spot_trades(
         state, state.receipt["legs"][-1].get("order_id", ""), executed, fills)
-    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
-    if covered < executed:
+    if covered is not None:
+        attach_fees(state, len(state.receipt["legs"]) - 1, trades)
+    if covered is None or covered != executed:
         state.receipt["acquired"] = {"executed_qty": fmt(executed),
                                      "held_worst_case": fmt(executed)}
         save(state)
@@ -844,8 +652,9 @@ def execute_legs(state: RunState, plan: CyclePlan,
                                                           base_asset),
                "trade and fee data never covered the spot fill; sizing a later "
                "leg on an assumed fee is forbidden; no repair trade")
+    fees = spot.fees_by_asset(tuple(trades))
     buy_base_fee = base_fee_of(trades, base_asset)
-    net_base = executed - buy_base_fee
+    net_base = spot.net_base_quantity(executed, base_asset, fees)
     hedge = quantize_down(net_base, shared_step)
     state.receipt["acquired"] = {
         "executed_qty": fmt(executed), "quote_spent": fmt(quote_spent),
@@ -860,7 +669,6 @@ def execute_legs(state: RunState, plan: CyclePlan,
                "net base after fees floors to zero at the shared step; "
                "executor reports and stops; no repair trade")
 
-    # Leg 2 — Futures SELL short exactly the acquired quantity.
     short_filled: Optional[Decimal] = None
     if hedge < market["min_qty"]:
         state.outcomes[ENTER_SHORT] = "REJECTED"
@@ -874,14 +682,15 @@ def execute_legs(state: RunState, plan: CyclePlan,
         first_fail(state, "enter_short",
                    "net quantity below venue minimum; short not submitted")
     else:
-        res, order, _ = settle_leg(state, ENTER_SHORT, plan, hedge)
+        res, order, short_coverage = settle_leg(
+            state, ENTER_SHORT, plan, hedge)
         if res == "unknown":
             state.outcomes[ENTER_SHORT] = "UNKNOWN"
             conclude(state, plan, hedge)
         if res == "rejected":
             state.outcomes[ENTER_SHORT] = "REJECTED"
         else:
-            short_filled = d(order.get("executedQty", "0"))
+            short_filled = d(order.get("executedQty"))
             if short_filled <= 0:
                 state.receipt["legs"][-1]["note"] = "terminal zero fill"
                 save(state)
@@ -889,11 +698,13 @@ def execute_legs(state: RunState, plan: CyclePlan,
                 short_filled = None
             else:
                 state.outcomes[ENTER_SHORT] = "FILLED"
-                # Exchange-reported entry notional vs the compiled ceiling,
-                # measured post-fill. A breach is recorded loudly (receipt +
-                # first-failure); the flow's own reduce-only close remains
-                # the containment — never silent, never a repair trade.
-                short_quote = d(order.get(USDM.quote_field, "0"))
+                if short_coverage is None or not short_coverage.complete:
+                    finish(state, "UNKNOWN",
+                           "short entry is terminal but complete Futures fill "
+                           "and fee truth is unavailable",
+                           "no dependent close was sent; reconcile the exact "
+                           "entry client id")
+                short_quote = d(order.get(USDM.quote_field))
                 if short_quote > MAX_CYCLE_QUOTE:
                     state.receipt["legs"][-1]["ceiling_breach"] = {
                         "cum_quote": fmt(short_quote),
@@ -910,7 +721,6 @@ def execute_legs(state: RunState, plan: CyclePlan,
                         fmt(short_filled), fmt(hedge)))
 
     if state.outcomes[ENTER_SHORT] == "REJECTED":
-        # Unwind: Spot SELL of the actual remaining base through the ordered path.
         res, order, fills = settle_leg(state, UNWIND_SPOT, plan, hedge)
         if res == "unknown":
             state.outcomes[UNWIND_SPOT] = "UNKNOWN"
@@ -918,7 +728,7 @@ def execute_legs(state: RunState, plan: CyclePlan,
         if res == "rejected":
             state.outcomes[UNWIND_SPOT] = "REJECTED"
             conclude(state, plan, hedge)
-        sold = d(order.get("executedQty", "0"))
+        sold = d(order.get("executedQty"))
         if sold <= 0:
             state.receipt["legs"][-1]["note"] = "terminal zero fill"
             save(state)
@@ -929,20 +739,25 @@ def execute_legs(state: RunState, plan: CyclePlan,
         state.outcomes[UNWIND_SPOT] = "FILLED"
         conclude(state, plan, hedge)
 
-    # Leg 3 — reduce-only BUY close of the EXACT short fill.
-    res, order, _ = settle_leg(state, EXIT_SHORT, plan, short_filled)
+    res, order, close_coverage = settle_leg(
+        state, EXIT_SHORT, plan, short_filled)
     if res == "unknown":
         state.outcomes[EXIT_SHORT] = "UNKNOWN"
         conclude(state, plan, hedge)
     if res == "rejected":
         state.outcomes[EXIT_SHORT] = "REJECTED"
         conclude(state, plan, hedge)
-    closed = d(order.get("executedQty", "0"))
+    closed = d(order.get("executedQty"))
     if closed <= 0:
         state.receipt["legs"][-1]["note"] = "terminal zero fill"
         save(state)
         state.outcomes[EXIT_SHORT] = "REJECTED"
         conclude(state, plan, hedge)
+    if close_coverage is None or not close_coverage.complete:
+        finish(state, "UNKNOWN",
+               "short close is terminal but complete Futures fill and fee "
+               "truth is unavailable",
+               "spot sale was not sent; reconcile the exact close client id")
     if closed < short_filled:
         first_fail(state, "exit_short", "closed %s of short %s" % (
             fmt(closed), fmt(short_filled)))
@@ -954,7 +769,6 @@ def execute_legs(state: RunState, plan: CyclePlan,
                "no repair trade")
     state.outcomes[EXIT_SHORT] = "FILLED"
 
-    # Leg 4 — Spot SELL of the actual remaining base.
     res, order, fills = settle_leg(state, EXIT_SPOT, plan, hedge)
     if res == "unknown":
         state.outcomes[EXIT_SPOT] = "UNKNOWN"
@@ -962,7 +776,7 @@ def execute_legs(state: RunState, plan: CyclePlan,
     if res == "rejected":
         state.outcomes[EXIT_SPOT] = "REJECTED"
         conclude(state, plan, hedge)
-    sold = d(order.get("executedQty", "0"))
+    sold = d(order.get("executedQty"))
     if sold <= 0:
         state.receipt["legs"][-1]["note"] = "terminal zero fill"
         save(state)
@@ -971,10 +785,11 @@ def execute_legs(state: RunState, plan: CyclePlan,
     sold_leg_result(state, EXIT_SPOT, order, fills, net_base, hedge, market)
     state.outcomes[EXIT_SPOT] = "FILLED"
 
-    # CLOSED only on observed exchange state: the short must really be flat.
-    kind, rows = get_retry(state, USDM.base_url, USDM_POSITION_PATH,
-                           {"symbol": state.cfg.symbol}, signed=True)
-    amount = futures_position(rows, state.cfg.symbol) if kind == "ok" else None
+    final = futures.read_preflight(
+        state.transport, USDM.base_url, _futures_market(state), None,
+        require_flat=False, sleep=state.sleep)
+    amount = final.value.position_quantity \
+        if final.kind == "ok" and final.value is not None else None
     state.receipt["final_futures_position"] = (
         fmt(amount) if amount is not None else "UNKNOWN")
     save(state)
@@ -992,7 +807,6 @@ def execute_legs(state: RunState, plan: CyclePlan,
 
 
 def acquire(state: RunState) -> None:
-    """Single-runner lock + prior-receipt gate, then the receipt skeleton."""
     receipt_dir = os.path.dirname(state.receipt_path)
     os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
     try:
@@ -1020,9 +834,6 @@ def acquire(state: RunState) -> None:
                                   % fmt(MAX_CYCLE_QUOTE), state.client_ids)
     state.events.append(start)
     own_name = os.path.basename(state.receipt_path)
-    # Any verdict-less *.json in the receipt directory blocks, whatever lane
-    # wrote it (spot_roundtrip's own discipline): an unresolved run in any
-    # lane means unreconciled ids may exist against the same account.
     for name in sorted(os.listdir(receipt_dir)):
         if not name.endswith(".json") or name == own_name:
             continue
@@ -1042,9 +853,8 @@ def acquire(state: RunState) -> None:
 
 
 def read_and_plan(state: RunState):
-    """Reads + plan; raises Refusal when the gap, size, or filters refuse."""
     market = market_context(state)
-    row = gap_row(state)
+    row = gap_row(state, market)
     plan = plan_cycle(row, state.cfg.min_entry_bps, market["shared_step"],
                       market["min_notional"])
     if plan is None:
@@ -1075,8 +885,6 @@ def make_state(cfg: ExecutorConfig, request, sleep,
 
 def run_once(cfg: ExecutorConfig, request,
              sleep: Callable[[float], None] = time.sleep) -> int:
-    """The one-shot cycle: lock, read, plan, signed read-only preflight,
-    four legs, receipt, events, exit."""
     state = make_state(cfg, request, sleep)
     try:
         acquire(state)
@@ -1116,7 +924,6 @@ def run_once(cfg: ExecutorConfig, request,
 
 def plan_only(cfg: ExecutorConfig, request,
               sleep: Callable[[float], None] = time.sleep) -> int:
-    """Unsigned public reads and the plan decision only; no receipt, no orders."""
     state = make_state(cfg, request, sleep, receipted=False)
     try:
         _row, plan, market = read_and_plan(state)
@@ -1132,7 +939,6 @@ def plan_only(cfg: ExecutorConfig, request,
 
 
 def pending_exposure(receipt_dir: str):
-    """Newest own OPEN_EXPOSURE receipt not yet reconciled: (path, receipt)."""
     pattern = os.path.join(receipt_dir, "basis-executor-*.json")
     for path in sorted(glob.glob(pattern), reverse=True):
         try:
@@ -1143,9 +949,6 @@ def pending_exposure(receipt_dir: str):
         if isinstance(receipt, dict) and receipt.get("kind") != "reconcile" \
                 and receipt.get("verdict") == "OPEN_EXPOSURE":
             note = str(receipt.get("reconciled_note", ""))
-            # Legacy "dust_accepted" marks used cross-venue minimums and may
-            # have written off spot-sellable coins; reopen those once. The
-            # corrected mark, "spot_dust_accepted", is terminal.
             if not receipt.get("reconciled_by") \
                     or note.startswith("dust_accepted"):
                 return path, receipt
@@ -1153,7 +956,6 @@ def pending_exposure(receipt_dir: str):
 
 
 def source_symbol_from_events(events_path: str, run_id: str) -> str:
-    """The symbol a recorded run traded, from its own event lines."""
     try:
         with open(events_path, encoding="utf-8") as handle:
             for line in handle:
@@ -1182,15 +984,6 @@ def mark_source(path: str, receipt: Dict[str, Any], run_id: str,
 
 def reconcile_once(cfg: ExecutorConfig, request,
                    sleep: Callable[[float], None] = time.sleep) -> int:
-    """Flatten ONE recorded OPEN_EXPOSURE through the ordered path.
-
-    Sells exactly the source receipt's recorded net acquired base, floored to
-    the SPOT step, with one order proven by client id — never a repair trade,
-    never a retry, never futures. A residual below the sellable minimum is
-    recorded as accepted dust. The lane lock is released only when the
-    exposure is sold or proven dust; anything unproven keeps the lock and
-    exits nonzero for a human. Exit 0 done/none, 3 human check, 4 UNKNOWN.
-    """
     state = make_state(cfg, request, sleep)
     state.receipt["kind"] = "reconcile"
     state.receipt["legs"] = []
@@ -1227,14 +1020,7 @@ def reconcile_once(cfg: ExecutorConfig, request,
     except Refusal as refusal:
         print("RECONCILE | market context refused: %s" % clean(refusal, 200))
         return 3
-    kind, book = state.request("GET", SPOT.base_url,
-                               "/api/v3/ticker/bookTicker",
-                               {"symbol": symbol}, False)
-    bid = d(book.get("bidPrice", "0")) \
-        if kind == "ok" and isinstance(book, dict) else Decimal(0)
-    if bid <= 0:
-        print("RECONCILE | no usable spot bid | try again later")
-        return 3
+    bid = market["spot_market"].bid
     sell_qty = quantize_down(net_base, market["spot_step"])
     if sell_qty <= 0 or sell_qty < market["spot_min_qty"] \
             or sell_qty * bid < market["spot_min_notional"]:
@@ -1258,7 +1044,7 @@ def reconcile_once(cfg: ExecutorConfig, request,
         reason="reconcile: ordered sale of recorded exposure")
     outcome, order, _fills = settle_leg(state, EXIT_SPOT, plan_stub, sell_qty)
     if outcome == "terminal":
-        executed = d(order.get("executedQty", "0"))
+        executed = d(order.get("executedQty"))
         residual = net_base - executed
         if executed > 0 and residual < market["spot_step"]:
             mark_source(source_path, source, state.run_id, "sold",
@@ -1302,17 +1088,6 @@ def reconcile_once(cfg: ExecutorConfig, request,
 
 def validate_only(cfg: ExecutorConfig, request,
                   sleep: Callable[[float], None] = time.sleep) -> int:
-    """The COMPLETE signed read-only preflight with zero POSTs.
-
-    Public reads attempt the plan, then every signed preflight proof runs
-    REGARDLESS of the plan outcome (owner order 2026-08-13): a refused plan
-    only swaps in a conservative full-ceiling margin requirement, so account
-    readiness is always measured. The transport is wrapped so any non-GET
-    attempt dies before leaving the process; the trade lock is never taken
-    and no receipt file is written. Exit 0 = plan and every proof held;
-    exit 5 = preflight refused; exit 2 = account proofs held but the plan
-    itself refused.
-    """
     def get_only(method, base_url, path, params=None, signed=False):
         if method != "GET":
             raise AssertionError("validate-only attempted a non-GET call")
@@ -1331,11 +1106,12 @@ def validate_only(cfg: ExecutorConfig, request,
               "margin requirement %s USDT" % (cfg.symbol,
                                               fmt(MAX_CYCLE_QUOTE)))
     if plan is None:
+        full_ceiling = MAX_CYCLE_QUOTE.quantize(Decimal("0.00000001"))
         plan = CyclePlan(
             symbol=cfg.symbol, entry_gap_bps=Decimal(0),
             exit_gap_bps=Decimal(0), funding_rate=Decimal(0),
             spot_quantity=Decimal(0), short_quantity=Decimal(0),
-            spot_quote_cap=MAX_CYCLE_QUOTE, short_notional=MAX_CYCLE_QUOTE,
+            spot_quote_cap=full_ceiling, short_notional=full_ceiling,
             leverage=1,
             reason="validate-only fallback after plan refusal")
     try:
@@ -1355,69 +1131,46 @@ def validate_only(cfg: ExecutorConfig, request,
 
 def live_request_factory(api_key: str, api_secret: str,
                          timeout: float = HTTP_TIMEOUT):
-    """One transport for both venues, in the futures_hand style: 'ok' = 2xx
-    JSON; 'api_error' = a real Binance {code,msg}; 'unclear' proves NOTHING.
-    Mutations are submitted exactly once by the caller and never retried."""
-    offsets: Dict[str, int] = {}
+    if isinstance(timeout, bool) or int(timeout) != timeout:
+        raise http.AdapterRefusal("timeout must be a whole number of seconds")
+    signed_enabled = bool(api_key and api_secret)
+    transport = http.BinanceHttp(api_key or "UNSIGNED_ONLY",
+                                 api_secret or "UNSIGNED_ONLY",
+                                 timeout_seconds=int(timeout))
+    synchronized = set()
 
-    def sync(base_url: str) -> None:
-        path = "/api/v3/time" if base_url == SPOT_BASE_URL else "/fapi/v1/time"
-        kind, payload = request("GET", base_url, path, None, False)
-        if kind == "ok" and isinstance(payload, dict) and \
-                isinstance(payload.get("serverTime"), int):
-            offsets[base_url] = payload["serverTime"] - int(time.time() * 1000)
-        else:
-            offsets[base_url] = 0
+    def legacy_result(result: http.HttpResult) -> Tuple[str, Any]:
+        if result.kind == "ok":
+            return "ok", result.payload
+        if result.kind == "api_error":
+            return "api_error", {"code": result.code, "msg": result.msg}
+        return "unclear", {}
 
     def request(method: str, base_url: str, path: str,
                 params: Optional[Dict[str, str]] = None,
                 signed: bool = False) -> Tuple[str, Any]:
-        params = dict(params or {})
-        if signed:
-            if base_url not in offsets:
-                sync(base_url)
-            params["timestamp"] = str(int(time.time() * 1000)
-                                      + offsets.get(base_url, 0))
-            params["recvWindow"] = RECV_WINDOW
-            query = urllib.parse.urlencode(params)
-            signature = hmac.new(api_secret.encode(), query.encode(),
-                                 hashlib.sha256).hexdigest()
-            query += "&signature=" + signature
-        else:
-            query = urllib.parse.urlencode(params)
-        http_request = urllib.request.Request(
-            base_url + path + ("?" + query if query else ""), method=method)
-        if api_key:
-            http_request.add_header("X-MBX-APIKEY", api_key)
-        try:
-            with urllib.request.urlopen(http_request,
-                                        timeout=timeout) as response:
-                return "ok", json.loads(response.read().decode())
-        except urllib.error.HTTPError as error:
-            body = error.read().decode(errors="replace")
-            if error.code >= 500 or error.code in (408, 409):
-                return "unclear", {"http": error.code}
-            try:
-                parsed = json.loads(body)
-                if isinstance(parsed, dict) and "code" in parsed:
-                    return "api_error", {"code": parsed.get("code"),
-                                         "msg": clean(parsed.get("msg", ""))}
-            except ValueError:
-                pass
-            return "unclear", {"http": error.code}
-        except Exception as error:  # never stringify an exception with the URL
-            return "unclear", {"error": type(error).__name__}
-
+        if signed and not signed_enabled:
+            return "unclear", {}
+        canonical = tuple((str(key), str(value))
+                          for key, value in (params or {}).items())
+        if signed and base_url not in synchronized:
+            time_path = {SPOT.base_url: "/api/v3/time",
+                         USDM.base_url: "/fapi/v1/time"}.get(base_url)
+            if time_path is None:
+                return "unclear", {}
+            synced = transport.sync_time(base_url, time_path)
+            if synced.kind != "ok":
+                return legacy_result(synced)
+            synchronized.add(base_url)
+        return legacy_result(transport(method, base_url, path, canonical,
+                                       signed))
     return request
 
 
 def config_from_env(env) -> ExecutorConfig:
-    symbol = env.get("SYMBOL", "").upper()
-    sha = env.get("QUANT_SHA", "").lower()
-    if not SYMBOL_RE.fullmatch(symbol):
-        raise Blocked("SYMBOL must be 5-20 uppercase letters/digits")
-    if not SHA_RE.fullmatch(sha):
-        raise Blocked("QUANT_SHA must be a full 40-character git SHA")
+    symbol = env.get("SYMBOL", "").upper(); sha = env.get("QUANT_SHA", "").lower()
+    if not SYMBOL_RE.fullmatch(symbol): raise Blocked("SYMBOL must be 5-20 uppercase letters/digits")
+    if not SHA_RE.fullmatch(sha): raise Blocked("QUANT_SHA must be a full 40-character git SHA")
     raw_bps = env.get("MIN_ENTRY_BPS", "1")
     try:
         min_entry_bps = Decimal(raw_bps)

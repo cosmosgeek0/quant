@@ -8,7 +8,6 @@ import socket
 import sys
 import tempfile
 import unittest
-import urllib.error
 from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
@@ -59,6 +58,14 @@ def wire(value):
     return format(value.quantize(WIRE_QUANTUM), "f")
 
 
+def _stage(params):
+    return params["origClientOrderId"].split("-", 2)[2]
+
+
+def _side(stage):
+    return "BUY" if stage in ("enter_spot", "exit_short") else "SELL"
+
+
 _real_getaddrinfo = socket.getaddrinfo
 
 
@@ -74,21 +81,75 @@ def tearDownModule():
 
 def term_spot(status, executed, quote, order_id):
     def responder(params):
-        return ("ok", {"clientOrderId": params["origClientOrderId"],
-                       "status": status, "executedQty": executed,
+        stage = _stage(params)
+        return ("ok", {"symbol": SYMBOL,
+                       "clientOrderId": params["origClientOrderId"],
+                       "status": status, "side": _side(stage),
+                       "executedQty": executed,
                        "cummulativeQuoteQty": quote, "orderId": order_id})
     return responder
 
 
 def term_usdm(status, executed, quote, order_id):
     def responder(params):
-        return ("ok", {"clientOrderId": params["origClientOrderId"],
-                       "status": status, "executedQty": executed,
-                       "cumQuote": quote, "orderId": order_id})
+        stage = _stage(params)
+        return ("ok", {"symbol": SYMBOL,
+                       "clientOrderId": params["origClientOrderId"],
+                       "status": status, "side": _side(stage),
+                       "reduceOnly": stage == "exit_short",
+                       "executedQty": executed, "cumQuote": quote,
+                       "orderId": order_id})
     return responder
 
 
-NEW_ORDER = ("ok", {"status": "NEW"})
+def pending_order(params):
+    stage = _stage(params)
+    quote_key = "cumQuote" if stage in ("enter_short", "exit_short") \
+        else "cummulativeQuoteQty"
+    return ("ok", {"symbol": SYMBOL,
+                   "clientOrderId": params["origClientOrderId"],
+                   "status": "NEW", "side": _side(stage),
+                   "reduceOnly": stage == "exit_short",
+                   "executedQty": "0", quote_key: "0", "orderId": 999001})
+
+
+def spot_trade(order_id, side, quantity, commission, asset, trade_id=1,
+               price="1"):
+    return {"symbol": SYMBOL, "id": trade_id, "tradeId": trade_id,
+            "orderId": order_id, "price": price, "qty": quantity,
+            "quoteQty": quantity, "commission": commission,
+            "commissionAsset": asset, "isBuyer": side == "BUY",
+            "isMaker": False, "time": 1755000000000}
+
+
+def spot_submit(order_id, side, quantity=None, commission="0", asset="USDT",
+                price="1"):
+    fills = [] if quantity is None else [
+        spot_trade(order_id, side, quantity, commission, asset, price=price)]
+    def responder(params):
+        return ("ok", {"symbol": SYMBOL,
+                       "clientOrderId": params["newClientOrderId"],
+                       "orderId": order_id, "side": side, "fills": fills})
+    return responder
+
+
+def futures_submit(reduce_only):
+    def responder(params):
+        return ("ok", {"symbol": SYMBOL,
+                       "clientOrderId": params["newClientOrderId"],
+                       "reduceOnly": reduce_only})
+    return responder
+
+
+def futures_trade(order_id, side, quantity, quote, trade_id=1, price="1"):
+    return {"symbol": SYMBOL, "id": trade_id, "orderId": order_id,
+            "price": price, "qty": quantity, "quoteQty": quote,
+            "commission": "0", "commissionAsset": "USDT", "side": side,
+            "buyer": side == "BUY", "maker": False,
+            "time": 1755000000000, "realizedPnl": "0"}
+
+
+NEW_ORDER = pending_order
 MISSING = ("api_error", {"code": -2013, "msg": "Order does not exist."})
 
 
@@ -111,53 +172,72 @@ def happy_spec():
             "symbol": SYMBOL, "status": "TRADING",
             "contractType": "PERPETUAL",
             "quoteAsset": "USDT", "marginAsset": "USDT",
-            "orderTypes": ["LIMIT", "MARKET"],
+            "orderTypes": ["LIMIT", "MARKET"], "timeInForce": ["GTC", "IOC"],
             "filters": [
                 {"filterType": "LOT_SIZE", "stepSize": "0.001",
-                 "minQty": "0.001"},
+                 "minQty": "0.001", "maxQty": "1000"},
                 {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001",
-                 "minQty": "0.001"},
+                 "minQty": "0.001", "maxQty": "1000"},
                 {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.1",
+                 "minPrice": "0.1", "maxPrice": "1000000"},
+                {"filterType": "PERCENT_PRICE", "multiplierUp": "1.5",
+                 "multiplierDown": "0.5"},
             ]}]},
         "spot_book": {"symbol": SYMBOL, "bidPrice": "99.9",
                       "askPrice": "100.0"},
         "usdm_book": {"symbol": SYMBOL, "bidPrice": "100.2",
                       "askPrice": "100.3", "time": 1755000000000},
-        "premium": {"symbol": SYMBOL, "lastFundingRate": "0.0001",
+        "premium": {"symbol": SYMBOL, "markPrice": "100.25",
+                    "lastFundingRate": "0.0001",
                     "nextFundingTime": 1755003600000},
         "my_trades": {},
+        "futures_trades": {
+            "444555": [futures_trade(444555, "SELL",
+                                      format(HAPPY_HEDGE_QTY, "f"),
+                                      wire(HAPPY_SHORT_QUOTE), price="100.2")],
+            "444556": [futures_trade(444556, "BUY",
+                                      format(HAPPY_HEDGE_QTY, "f"),
+                                      wire(HAPPY_SHORT_QUOTE), price="100.2")],
+        },
+        "spot_account": {"canTrade": True, "balances": [
+            {"asset": "USDT", "free": "1000", "locked": "0"},
+            {"asset": "BTC", "free": "0", "locked": "0"}]},
+        "usdm_account_config": {"canTrade": True},
+        "position_mode": {"dualSidePosition": False},
+        "symbol_config": [{"symbol": SYMBOL, "leverage": "1"}],
+        "spot_open_orders": [], "usdm_open_orders": [],
+        "preflight_position": [{"symbol": SYMBOL, "positionSide": "BOTH",
+                                "positionAmt": "0.000"}],
+        "position": [{"symbol": SYMBOL, "positionSide": "BOTH",
+                      "positionAmt": "0.000"}],
+        "usdm_balance": [{"asset": "USDT", "availableBalance": "1000"}],
         "legs": {
             "enter_spot": {
-                "submit": ("ok", {"fills": [
-                    {"qty": wire(HAPPY_PLAN_QTY),
-                     "commission": wire(HAPPY_BASE_FEE),
-                     "commissionAsset": "BTC"}]}),
+                "submit": spot_submit(111222, "BUY", wire(HAPPY_PLAN_QTY),
+                                      wire(HAPPY_BASE_FEE), "BTC", "100.0"),
                 "query": [term_spot("FILLED", wire(HAPPY_PLAN_QTY),
                                     wire(HAPPY_BUY_QUOTE), 111222)],
             },
             "enter_short": {
-                "submit": ("ok", {}),
+                "submit": futures_submit(False),
                 "query": [term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
                                     wire(HAPPY_SHORT_QUOTE), 444555)],
             },
             "exit_short": {
-                "submit": ("ok", {}),
+                "submit": futures_submit(True),
                 "query": [term_usdm("FILLED", format(HAPPY_HEDGE_QTY, "f"),
                                     wire(HAPPY_SHORT_QUOTE), 444556)],
             },
             "exit_spot": {
-                "submit": ("ok", {"fills": [
-                    {"qty": wire(HAPPY_HEDGE_QTY),
-                     "commission": wire(HAPPY_SELL_FEE),
-                     "commissionAsset": "USDT"}]}),
+                "submit": spot_submit(111223, "SELL", wire(HAPPY_HEDGE_QTY),
+                                      wire(HAPPY_SELL_FEE), "USDT", "99.9"),
                 "query": [term_spot("FILLED", wire(HAPPY_HEDGE_QTY),
                                     wire(HAPPY_SELL_QUOTE), 111223)],
             },
             "unwind_spot": {
-                "submit": ("ok", {"fills": [
-                    {"qty": wire(HAPPY_HEDGE_QTY),
-                     "commission": wire(HAPPY_SELL_FEE),
-                     "commissionAsset": "USDT"}]}),
+                "submit": spot_submit(111224, "SELL", wire(HAPPY_HEDGE_QTY),
+                                      wire(HAPPY_SELL_FEE), "USDT", "99.9"),
                 "query": [term_spot("FILLED", wire(HAPPY_HEDGE_QTY),
                                     wire(HAPPY_SELL_QUOTE), 111224)],
             },
@@ -165,7 +245,8 @@ def happy_spec():
     }
 
 
-FLAT_POSITION = [{"symbol": SYMBOL, "positionAmt": "0.000"}]
+FLAT_POSITION = [{"symbol": SYMBOL, "positionSide": "BOTH",
+                  "positionAmt": "0.000"}]
 
 
 class ScriptedTransport:
@@ -174,8 +255,8 @@ class ScriptedTransport:
     Signed preflight reads are served from optional spec keys with tradable
     defaults: usdm_account_config, spot_account, position_mode,
     symbol_config (actual leverage; default exactly 1x), spot_open_orders,
-    usdm_open_orders, usdm_account, preflight_position (the
-    FIRST positionRisk read); "position" stays the final flatness read. Any
+    usdm_open_orders, usdm_balance, preflight_position (all reads before the
+    first POST); "position" stays the final flatness read. Any
     of them may be a (kind, payload) tuple to script a non-ok transport kind.
     """
 
@@ -197,7 +278,17 @@ class ScriptedTransport:
             self.posts.append((base_url, params))
             stage = params["newClientOrderId"].split("-", 2)[2]
             entry = self.spec["legs"][stage].get("submit", ("ok", {}))
-            return entry(params) if callable(entry) else entry
+            result = entry(params) if callable(entry) else entry
+            if result[0] == "ok" and isinstance(result[1], dict):
+                payload = dict(result[1])
+                payload.setdefault("symbol", SYMBOL)
+                payload.setdefault("clientOrderId", params["newClientOrderId"])
+                payload.setdefault("side", params["side"])
+                if base_url == USDM_URL:
+                    payload.setdefault("reduceOnly",
+                                       params.get("reduceOnly") == "true")
+                return "ok", payload
+            return result
         if path.endswith("exchangeInfo"):
             key = "spot_info" if base_url == SPOT_URL else "usdm_info"
             return ("ok", self.spec[key])
@@ -210,12 +301,22 @@ class ScriptedTransport:
             trades = self.spec.get("my_trades", {}).get(
                 str(params.get("orderId")), [])
             return ("ok", trades)
+        if path.endswith("userTrades"):
+            trades = self.spec.get("futures_trades", {}).get(
+                str(params.get("orderId")), [])
+            return ("ok", trades)
         if path == "/fapi/v1/accountConfig":
             return self.scripted("usdm_account_config", {"canTrade": True})
         if path == "/api/v3/account":
-            return self.scripted("spot_account", {"canTrade": True})
+            return self.scripted("spot_account", self.spec["spot_account"])
         if path == "/fapi/v3/account":
-            return self.scripted("usdm_account", {"availableBalance": "1000"})
+            key = "position" if self.posts else "preflight_position"
+            position = self.spec.get(key, FLAT_POSITION)
+            if isinstance(position, tuple):
+                return position
+            return ("ok", {"positions": position})
+        if path == "/fapi/v3/balance":
+            return self.scripted("usdm_balance", self.spec["usdm_balance"])
         if path == "/fapi/v1/positionSide/dual":
             return self.scripted("position_mode", {"dualSidePosition": False})
         if path == "/fapi/v1/symbolConfig":
@@ -227,9 +328,8 @@ class ScriptedTransport:
             return self.scripted(key, [])
         if path.endswith("positionRisk"):
             self.position_reads += 1
-            if self.position_reads == 1:
-                return self.scripted("preflight_position", FLAT_POSITION)
-            return self.scripted("position", FLAT_POSITION)
+            key = "position" if self.posts else "preflight_position"
+            return self.scripted(key, FLAT_POSITION)
         if path.endswith("/order"):
             cid = params["origClientOrderId"]
             stage = cid.split("-", 2)[2]
@@ -237,7 +337,15 @@ class ScriptedTransport:
             index = self.query_counts.get(cid, 0)
             self.query_counts[cid] = index + 1
             entry = sequence[index] if index < len(sequence) else sequence[-1]
-            return entry(params) if callable(entry) else entry
+            result = entry(params) if callable(entry) else entry
+            if result[0] == "ok" and isinstance(result[1], dict):
+                payload = dict(result[1])
+                payload.setdefault("symbol", SYMBOL)
+                payload.setdefault("side", _side(stage))
+                if base_url == USDM_URL:
+                    payload.setdefault("reduceOnly", stage == "exit_short")
+                return "ok", payload
+            return result
         raise AssertionError("unexpected GET %s" % path)
 
 
@@ -436,10 +544,11 @@ class HappyPathTests(ExecutorCase):
 class PartialFillTests(ExecutorCase):
     def test_partial_spot_fill_sizes_from_exchange_truth(self):
         spec = happy_spec()
+        spec["spot_info"]["symbols"][0]["filters"][2]["minNotional"] = "4.8"
+        spec["usdm_info"]["symbols"][0]["filters"][2]["notional"] = "4.8"
         spec["legs"]["enter_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.05000000", "commission": "0.00005000",
-                 "commissionAsset": "BTC"}]}),
+            "submit": spot_submit(111222, "BUY", "0.05000000",
+                                  "0.00005000", "BTC", "100.0"),
             "query": [term_spot("EXPIRED", "0.05000000", "5.00000000",
                                 111222)],
         }
@@ -447,10 +556,15 @@ class PartialFillTests(ExecutorCase):
             term_usdm("FILLED", "0.049", "4.90980000", 444555)]
         spec["legs"]["exit_short"]["query"] = [
             term_usdm("FILLED", "0.049", "4.91000000", 444556)]
+        spec["futures_trades"]["444555"] = [
+            futures_trade(444555, "SELL", "0.049", "4.90980000",
+                          price="100.2")]
+        spec["futures_trades"]["444556"] = [
+            futures_trade(444556, "BUY", "0.049", "4.91000000",
+                          price="100.2")]
         spec["legs"]["exit_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.04900000", "commission": "0.00489000",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(111223, "SELL", "0.04900000",
+                                  "0.00489000", "USDT", "99.9"),
             "query": [term_spot("FILLED", "0.04900000", "4.89510000",
                                 111223)],
         }
@@ -471,6 +585,12 @@ class PartialFillTests(ExecutorCase):
             term_usdm("EXPIRED", "0.060", "6.01200000", 444555)]
         spec["legs"]["exit_short"]["query"] = [
             term_usdm("FILLED", "0.060", "6.01300000", 444556)]
+        spec["futures_trades"]["444555"] = [
+            futures_trade(444555, "SELL", "0.060", "6.01200000",
+                          price="100.2")]
+        spec["futures_trades"]["444556"] = [
+            futures_trade(444556, "BUY", "0.060", "6.01300000",
+                          price="100.2")]
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 0)
         by_stage = {params["newClientOrderId"].split("-", 2)[2]: params
@@ -489,6 +609,9 @@ class PartialFillTests(ExecutorCase):
         spec = happy_spec()
         spec["legs"]["exit_short"]["query"] = [
             term_usdm("EXPIRED", "0.030", "3.00600000", 444556)]
+        spec["futures_trades"]["444556"] = [
+            futures_trade(444556, "BUY", "0.030", "3.00600000",
+                          price="100.2")]
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 3)
         self.assertEqual(post_stages(transport),
@@ -502,9 +625,8 @@ class PartialFillTests(ExecutorCase):
     def test_partial_exit_sell_reports_residual_exposure(self):
         spec = happy_spec()
         spec["legs"]["exit_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.05000000", "commission": "0.00500000",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(111223, "SELL", "0.05000000",
+                                  "0.00500000", "USDT", "99.9"),
             "query": [term_spot("EXPIRED", "0.05000000", "4.99500000",
                                 111223)],
         }
@@ -530,12 +652,18 @@ def coarse_step_spec():
         {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"},
         {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.01",
          "minQty": "0.01"},
-        {"filterType": "NOTIONAL", "minNotional": "5.00000000"},
+        {"filterType": "NOTIONAL", "minNotional": "4.90000000"},
     ]
     spec["usdm_info"]["symbols"][0]["filters"] = [
-        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
-        {"filterType": "MARKET_LOT_SIZE", "stepSize": "1", "minQty": "1"},
-        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1",
+         "maxQty": "1000"},
+        {"filterType": "MARKET_LOT_SIZE", "stepSize": "1", "minQty": "1",
+         "maxQty": "1000"},
+        {"filterType": "MIN_NOTIONAL", "notional": "4.9"},
+        {"filterType": "PRICE_FILTER", "tickSize": "0.01",
+         "minPrice": "0.01", "maxPrice": "1000000"},
+        {"filterType": "PERCENT_PRICE", "multiplierUp": "1.5",
+         "multiplierDown": "0.5"},
     ]
     spec["spot_book"] = {"symbol": SYMBOL, "bidPrice": "4.99",
                          "askPrice": "5.00"}
@@ -543,31 +671,34 @@ def coarse_step_spec():
                          "askPrice": "5.02", "time": 1755000000000}
     spec["legs"] = {
         "enter_spot": {
-            "submit": ("ok", {"fills": [
-                {"qty": "1.10", "commission": "0.0055",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(211222, "BUY", "1.10", "0.0055",
+                                  "USDT", "5.00"),
             "query": [term_spot("FILLED", "1.10", "5.00", 211222)],
         },
         "enter_short": {
-            "submit": ("ok", {}),
+            "submit": futures_submit(False),
             "query": [term_usdm("FILLED", "1", "5.01", 544555)],
         },
         "exit_short": {
-            "submit": ("ok", {}),
+            "submit": futures_submit(True),
             "query": [term_usdm("FILLED", "1", "5.02", 544556)],
         },
         "exit_spot": {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.20", "commission": "0.001",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(211223, "SELL", "0.20", "0.001",
+                                  "USDT", "4.99"),
             "query": [term_spot("EXPIRED", "0.20", "1.00", 211223)],
         },
         "unwind_spot": {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.20", "commission": "0.001",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(211224, "SELL", "0.20", "0.001",
+                                  "USDT", "4.99"),
             "query": [term_spot("EXPIRED", "0.20", "1.00", 211224)],
         },
+    }
+    spec["futures_trades"] = {
+        "544555": [futures_trade(544555, "SELL", "1", "5.01",
+                                  price="5.01")],
+        "544556": [futures_trade(544556, "BUY", "1", "5.02",
+                                  price="5.02")],
     }
     return spec
 
@@ -619,15 +750,13 @@ class SpotStepResidualTests(ExecutorCase):
     def test_full_fill_residual_below_spot_step_is_recorded_dust(self):
         spec = coarse_step_spec()
         spec["legs"]["enter_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "1.005", "commission": "0.005",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(211222, "BUY", "1.005", "0.005",
+                                  "USDT", "5.00"),
             "query": [term_spot("FILLED", "1.005", "5.00", 211222)],
         }
         spec["legs"]["exit_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "1.00", "commission": "0.005",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(211223, "SELL", "1.00", "0.005",
+                                  "USDT", "4.99"),
             "query": [term_spot("FILLED", "1.00", "5.00", 211223)],
         }
         code, _, _ = self.run_once(spec)
@@ -691,9 +820,8 @@ class ShortRejectionTests(ExecutorCase):
     def test_partial_unwind_reports_open_exposure(self):
         spec = self.rejecting_short()
         spec["legs"]["unwind_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.05000000", "commission": "0.00500000",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(111224, "SELL", "0.05000000",
+                                  "0.00500000", "USDT", "99.9"),
             "query": [term_spot("EXPIRED", "0.05000000", "4.99500000",
                                 111224)],
         }
@@ -719,9 +847,8 @@ class UnknownLegTests(ExecutorCase):
                                 wire(HAPPY_BUY_QUOTE), 111222)],
         }
         spec["my_trades"]["111222"] = [
-            {"qty": wire(HAPPY_PLAN_QTY),
-             "commission": wire(HAPPY_BASE_FEE),
-             "commissionAsset": "BTC"}]
+            spot_trade(111222, "BUY", wire(HAPPY_PLAN_QTY),
+                       wire(HAPPY_BASE_FEE), "BTC", price="100.0")]
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 0)
         self.assertEqual(self.receipt()["verdict"], "CLOSED")
@@ -801,9 +928,8 @@ class UnknownLegTests(ExecutorCase):
                                 wire(HAPPY_SELL_QUOTE), 111223)],
         }
         spec["my_trades"]["111223"] = [
-            {"qty": wire(HAPPY_HEDGE_QTY),
-             "commission": wire(HAPPY_SELL_FEE),
-             "commissionAsset": "USDT"}]
+            spot_trade(111223, "SELL", wire(HAPPY_HEDGE_QTY),
+                       wire(HAPPY_SELL_FEE), "USDT", price="99.9")]
         code, _, _ = self.run_once(spec)
         self.assertEqual(code, 0)
         self.assertEqual(self.receipt()["verdict"], "CLOSED")
@@ -841,7 +967,7 @@ class UnknownLegTests(ExecutorCase):
     def test_query_error_is_unknown_never_a_resend(self):
         spec = happy_spec()
         spec["legs"]["enter_short"] = {
-            "submit": ("ok", {}),
+            "submit": futures_submit(False),
             "query": [("api_error", {"code": -1003,
                                      "msg": "Too many requests."})],
         }
@@ -856,7 +982,7 @@ class SpotBuyEdgeTests(ExecutorCase):
     def test_zero_fill_spot_buy_rejects_cleanly(self):
         spec = happy_spec()
         spec["legs"]["enter_spot"] = {
-            "submit": ("ok", {}),
+            "submit": spot_submit(111222, "BUY"),
             "query": [term_spot("EXPIRED", "0.00000000", "0.00000000",
                                 111222)],
         }
@@ -881,7 +1007,7 @@ class SpotBuyEdgeTests(ExecutorCase):
     def test_uncovered_buy_trades_freeze_holding(self):
         spec = happy_spec()
         spec["legs"]["enter_spot"] = {
-            "submit": ("ok", {}),
+            "submit": spot_submit(111222, "BUY"),
             "query": [term_spot("FILLED", wire(HAPPY_PLAN_QTY),
                                 wire(HAPPY_BUY_QUOTE), 111222)],
         }
@@ -896,9 +1022,8 @@ class SpotBuyEdgeTests(ExecutorCase):
     def test_dust_net_base_freezes_before_short(self):
         spec = happy_spec()
         spec["legs"]["enter_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.00100000", "commission": "0.00000100",
-                 "commissionAsset": "BTC"}]}),
+            "submit": spot_submit(111222, "BUY", "0.00100000",
+                                  "0.00000100", "BTC", "100.0"),
             "query": [term_spot("EXPIRED", "0.00100000", "0.10000000",
                                 111222)],
         }
@@ -914,16 +1039,14 @@ class SpotBuyEdgeTests(ExecutorCase):
         spec["usdm_info"]["symbols"][0]["filters"][0]["minQty"] = "0.09"
         spec["usdm_info"]["symbols"][0]["filters"][1]["minQty"] = "0.09"
         spec["legs"]["enter_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.08000000", "commission": "0.00008000",
-                 "commissionAsset": "BTC"}]}),
+            "submit": spot_submit(111222, "BUY", "0.08000000",
+                                  "0.00008000", "BTC", "100.0"),
             "query": [term_spot("EXPIRED", "0.08000000", "8.00000000",
                                 111222)],
         }
         spec["legs"]["unwind_spot"] = {
-            "submit": ("ok", {"fills": [
-                {"qty": "0.07900000", "commission": "0.00790000",
-                 "commissionAsset": "USDT"}]}),
+            "submit": spot_submit(111224, "SELL", "0.07900000",
+                                  "0.00790000", "USDT", "99.9"),
             "query": [term_spot("FILLED", "0.07900000", "7.89210000",
                                 111224)],
         }
@@ -945,6 +1068,7 @@ PREFLIGHT_PATHS = (
     "/fapi/v1/openOrders",
     "/fapi/v3/positionRisk",
     "/fapi/v3/account",
+    "/fapi/v3/balance",
 )
 
 
@@ -1002,19 +1126,26 @@ class SignedPreflightTests(ExecutorCase):
 
     def test_spot_can_trade_false_refuses(self):
         spec = happy_spec()
-        spec["spot_account"] = {"canTrade": False}
+        spec["spot_account"]["canTrade"] = False
         self.assert_preflight_refused(spec, "Spot account canTrade")
+
+    def test_spot_quote_shortfall_refuses(self):
+        spec = happy_spec()
+        spec["spot_account"]["balances"][0]["free"] = "5"
+        self.assert_preflight_refused(spec, "available Spot balance")
 
     def test_margin_short_refuses(self):
         spec = happy_spec()
-        spec["usdm_account"] = {"availableBalance": "5"}
+        spec["usdm_balance"] = [
+            {"asset": "USDT", "availableBalance": "5"}]
         receipt = self.assert_preflight_refused(spec, "short margin")
         self.assertIn(wire(HAPPY_SHORT_NOTIONAL), receipt["verdict_note"])
 
     def test_existing_position_refuses(self):
         spec = happy_spec()
         spec["preflight_position"] = [
-            {"symbol": SYMBOL, "positionAmt": "0.010"}]
+            {"symbol": SYMBOL, "positionSide": "BOTH",
+             "positionAmt": "0.010"}]
         self.assert_preflight_refused(spec, "existing Futures position 0.010")
 
     def test_hedge_side_position_rows_refuse(self):
@@ -1086,7 +1217,8 @@ class ShortCeilingTests(ExecutorCase):
 class FinalStateTests(ExecutorCase):
     def test_nonzero_final_position_downgrades_to_exposure(self):
         spec = happy_spec()
-        spec["position"] = [{"symbol": SYMBOL, "positionAmt": "-0.002"}]
+        spec["position"] = [{"symbol": SYMBOL, "positionSide": "BOTH",
+                             "positionAmt": "-0.002"}]
         code, _, _ = self.run_once(spec)
         self.assertEqual(code, 3)
         receipt = self.receipt()
@@ -1256,86 +1388,18 @@ class PlanOnlyAndMainTests(ExecutorCase):
         self.assertIn("events.jsonl", names)
 
 
-class FakeHTTPResponse:
-    def __init__(self, payload):
-        self.payload = payload
-
-    def read(self):
-        return json.dumps(self.payload).encode()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-class LiveTransportOfflineTests(unittest.TestCase):
-    """The live plumbing exercised entirely through a patched urlopen."""
-
-    def test_signed_request_signs_and_sends_key_header(self):
-        captured = []
-
-        def fake_urlopen(request, timeout=None):
-            captured.append(request)
-            return FakeHTTPResponse({"serverTime": 1755000000000})
-
-        live = basis_executor.live_request_factory("key-abc", "secret-xyz")
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            kind, payload = live("GET", SPOT_URL, "/api/v3/order",
-                                 {"symbol": SYMBOL}, True)
-        self.assertEqual(kind, "ok")
-        self.assertEqual(len(captured), 2)  # lazy time sync, then the call
-        self.assertIn("/api/v3/time", captured[0].full_url)
-        signed_url = captured[1].full_url
-        self.assertIn("timestamp=", signed_url)
-        self.assertIn("signature=", signed_url)
-        self.assertEqual(captured[1].get_header("X-mbx-apikey"), "key-abc")
-
-    def test_http_5xx_is_unclear(self):
-        def fake_urlopen(request, timeout=None):
-            raise urllib.error.HTTPError(request.full_url, 502, "bad", None,
-                                         io.BytesIO(b"gateway"))
-
-        live = basis_executor.live_request_factory("k", "s")
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            kind, payload = live("GET", SPOT_URL, "/api/v3/time")
-        self.assertEqual(kind, "unclear")
-        self.assertEqual(payload, {"http": 502})
-
-    def test_definite_api_error_is_parsed(self):
-        body = b'{"code":-1121,"msg":"Invalid symbol."}'
-
-        def fake_urlopen(request, timeout=None):
-            raise urllib.error.HTTPError(request.full_url, 400, "bad", None,
-                                         io.BytesIO(body))
-
-        live = basis_executor.live_request_factory("k", "s")
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            kind, payload = live("GET", SPOT_URL, "/api/v3/exchangeInfo")
-        self.assertEqual(kind, "api_error")
-        self.assertEqual(payload["code"], -1121)
-
-    def test_network_exception_is_unclear_and_nameless(self):
-        def fake_urlopen(request, timeout=None):
-            raise urllib.error.URLError("connection refused")
-
-        live = basis_executor.live_request_factory("k", "s")
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            kind, payload = live("GET", SPOT_URL, "/api/v3/time")
-        self.assertEqual(kind, "unclear")
-        self.assertEqual(payload, {"error": "URLError"})
-
-
 class MarginBandTests(ExecutorCase):
     """The margin proof must cover notional x the futures price band —
     the exchange reserves worst-case market-order margin."""
 
     def with_band(self, spec, multiplier_up, available):
-        spec["usdm_info"]["symbols"][0]["filters"].append(
-            {"filterType": "PERCENT_PRICE", "multiplierUp": multiplier_up,
-             "multiplierDown": "0.85", "multiplierDecimal": "4"})
-        spec["usdm_account"] = {"availableBalance": available}
+        filters = spec["usdm_info"]["symbols"][0]["filters"]
+        band = next(row for row in filters
+                    if row["filterType"] == "PERCENT_PRICE")
+        band.update({"multiplierUp": multiplier_up,
+                     "multiplierDown": "0.85"})
+        spec["usdm_balance"] = [
+            {"asset": "USDT", "availableBalance": available}]
         return spec
 
     def test_banded_margin_refuses_at_the_unbanded_cap(self):
@@ -1365,8 +1429,9 @@ class MarginBandTests(ExecutorCase):
 
     def test_missing_band_uses_conservative_default(self):
         spec = happy_spec()
-        spec["usdm_account"] = {
-            "availableBalance": format(MAX_CYCLE_QUOTE, "f")}
+        spec["usdm_balance"] = [{
+            "asset": "USDT",
+            "availableBalance": format(MAX_CYCLE_QUOTE, "f")}]
         code, transport, _ = self.run_once(spec)
         self.assertEqual(code, 5)
         self.assertEqual(transport.posts, [])
@@ -1460,8 +1525,11 @@ class ValidateOnlyTests(ExecutorCase):
         cfg = ExecutorConfig(symbol=SYMBOL, sha=SHA, receipt_dir=self.dir,
                              run_id=RID, min_entry_bps=Decimal("1000000"))
         spec = happy_spec()
-        spec["usdm_account"] = {
-            "availableBalance": format(MAX_CYCLE_QUOTE, "f")}
+        next(row for row in spec["usdm_info"]["symbols"][0]["filters"]
+             if row["filterType"] == "PERCENT_PRICE")["multiplierUp"] = "1"
+        spec["usdm_balance"] = [{
+            "asset": "USDT",
+            "availableBalance": format(MAX_CYCLE_QUOTE, "f")}]
         code, transport, out = self.validate(spec, cfg=cfg)
         self.assertEqual(code, 2)
         self.assertIn("PLAN_REFUSED", out)
