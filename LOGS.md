@@ -7,6 +7,11 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+ACCOUNT-SWITCH SNAPSHOT 2026-08-16 ~04:15Z | owner switching accounts | full resume state in the Lead vault (memory dir, survives switch) + all task cards preserved at worktrees/lead2-v2fix/lane-logs/cards/
+money safety | GO MARGIN PROOF word given, borrow NOT yet run: no margin job queued, no ACCEPT-ONE, STOP-JOBS present, machine SEALED+FLAT | deploy mid-transfer is resumable file movement only
+in flight, all resumable | margin deploy (rerun cards/margin-deploy.sh) | V2 final chain (tape_prices -> policy_sim -> validate) | five codex lanes: B2 position-v2 schema (fresh-eyes review required), FS1 fine-slice script, AB15 exit profiles, AB16 fresh-listing class, MDV1 evidence digest
+merged this hour | reader class-kill complete f57f72d | pullers + nine giants cc0744e (episode tape coverage 3425/3429 full, zero uncovered)
+
 MARGIN RUNNER MERGED 2026-08-15 night | a4d3b42 on main after EIGHT adversarial rounds | NOT deployed; live proof waits on the owner's one line
 loop | MRV1-8 x MJ2-8: 26 confirmed findings repaired; core money physics PASS since round three; final verdict MERGE-SAFE with limits stated (attestation scope, power-loss untested, two live-proof items)
 tripwire | pre-committed and FIRED: automatic governor recovery removed at round six's verdict — halt-only with typed fact rows + one manually attested release command; the diff removed more than it added
