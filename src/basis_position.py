@@ -174,10 +174,13 @@ STANDING_STATES = (ST_OPENING, ST_OPEN, ST_ONE_LEG, ST_CLOSING, ST_UNKNOWN)
 
 # Version 2 is persistence-only in BUILD-02.  The legacy ``version`` key is
 # deliberately not its gate: version-1 files historically accept any value
-# there.  A new schema_version marker makes strict validation opt-in without
-# changing that frozen compatibility behavior.
+# there.  Any v2-only shape selects strict validation, including when its
+# schema marker is missing or changed, while genuinely legacy files retain
+# their frozen permissive behavior.
 V2_SCHEMA_VERSION = 2
 V2_DIRECTION = "long_spot_short_perp"
+# A flat read may precede its persisted initialization cut by at most 30s.
+V2_FLAT_PROOF_MAX_AGE_MS = 30000
 V2_STATES = frozenset((ST_NONE, ST_OPENING, "ADDING", ST_OPEN,
                        "REDUCING", ST_CLOSING, ST_CLOSED, ST_UNKNOWN))
 V2_STATE_VERDICT = {
@@ -194,6 +197,25 @@ V2_RUNG_STATUSES = frozenset(("ENTRY_PENDING", "OPEN", "REDUCE_ONLY",
                               "CLOSED", "UNKNOWN"))
 V2_CAP_STATUSES = frozenset(("PENDING", "WITHIN_CAP", "EXCEEDED",
                              "UNKNOWN"))
+V2_TERMINAL_ORDER_STATUSES = frozenset((
+    "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED",
+    "EXPIRED_IN_MATCH",
+))
+V2_LEGAL_TRANSITIONS = {
+    ST_NONE: frozenset((ST_OPENING,)),
+    ST_OPENING: frozenset((ST_OPEN, ST_CLOSING, ST_UNKNOWN)),
+    ST_OPEN: frozenset(("ADDING", "REDUCING", ST_CLOSING, ST_UNKNOWN)),
+    "ADDING": frozenset((ST_OPEN, ST_CLOSING, ST_UNKNOWN)),
+    "REDUCING": frozenset((ST_OPEN, ST_CLOSING, ST_CLOSED, ST_UNKNOWN)),
+    ST_CLOSING: frozenset((ST_CLOSED, ST_UNKNOWN)),
+    ST_CLOSED: frozenset(),
+    ST_UNKNOWN: frozenset(("REDUCING", ST_CLOSING)),
+}
+V2_ADD_TRANSITION_EDGES = frozenset((
+    (ST_NONE, ST_OPENING),
+    (ST_OPEN, "ADDING"),
+))
+V2_ADD_STATES = frozenset((ST_OPENING, "ADDING"))
 
 # Cross-lane verdict word carried by the state file so the executor's
 # prior-receipt gate always sees a verdict key with an honest value.
@@ -751,16 +773,16 @@ class HandoffLane:
 
 _V2_POSITION_FIELDS = frozenset({
     "version", "schema_version", "symbol", "config_epoch_digest",
-    "direction", "state", "rungs", "transitions", "flat_proof",
-    "increases_frozen", "reduce_only_path", "revision", "verdict",
-    "updated_utc",
+    "config_snapshot", "direction", "state", "rungs", "transitions",
+    "flat_proof", "initialization_cut_ms", "increases_frozen",
+    "reduce_only_path", "revision", "verdict", "updated_utc",
 })
 _V2_FLAT_PROOF_FIELDS = frozenset({
     "version", "record_type", "symbol", "config_epoch_digest",
     "source_revision", "observed_at_ms", "futures_position_qty",
     "spot_sellable_base_qty", "standard_open_order_count",
     "algorithmic_open_order_count", "own_orders_terminal",
-    "evidence_digest",
+    "evidence_digest", "read_provenance",
 })
 _V2_RUNG_FIELDS = frozenset({
     "version", "record_type", "symbol", "config_epoch_digest", "rung_id",
@@ -775,7 +797,7 @@ _V2_SIZE_FIELDS = frozenset({
 _V2_ORDER_FIELDS = frozenset({
     "version", "record_type", "symbol", "config_epoch_digest", "stage",
     "market", "client_id", "terminal", "status",
-    "terminal_executed_qty", "terminal_quote",
+    "terminal_executed_qty", "terminal_quote", "fee_by_asset",
 })
 _V2_EVENT_FIELDS = frozenset({
     "version", "record_type", "symbol", "config_epoch_digest", "digest",
@@ -792,11 +814,62 @@ _V2_TRANSITION_FIELDS = frozenset({
     "created_cut_ms",
 })
 _V2_EVIDENCE_FIELDS = frozenset({"kind", "digest", "receipt_ids"})
+_V2_CONFIG_FIELDS = frozenset({
+    "symbol", "direction", "schedule", "caps", "venue",
+})
+_V2_FLAT_PROVENANCE_FIELDS = frozenset({
+    "positions", "open_orders", "own_orders",
+})
+_V2_POSITION_READ_FIELDS = frozenset({"spot", "usdm"})
+_V2_OPEN_ORDER_READ_FIELDS = frozenset({
+    "spot", "usdm_standard", "usdm_algorithmic",
+})
+_V2_FLAT_OWN_ORDER_FIELDS = frozenset({
+    "client_id", "market", "status",
+})
+_V2_RECORD_TYPES = frozenset({
+    "FLAT_PROOF", "OWN_ORDER", "TRIGGER_EVENT", "RUNG", "TRANSITION",
+})
+_V2_TOP_LEVEL_SENTINELS = frozenset({
+    "schema_version", "config_epoch_digest", "config_snapshot",
+    "direction", "rungs", "transitions", "flat_proof",
+    "initialization_cut_ms", "increases_frozen", "reduce_only_path",
+    "event", "source_time_ms", "age_at_creation_ms", "entry_gap_pct",
+    "exit_gap_pct", "funding_rate", "funding_period_ms",
+})
+
+
+def _has_v2_record_shape(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if set(value) & _V2_TOP_LEVEL_SENTINELS:
+        return True
+    if value.get("record_type") in _V2_RECORD_TYPES:
+        return True
+    for nested in value.values():
+        if isinstance(nested, dict) \
+                and ("config_epoch_digest" in nested
+                     or nested.get("record_type") in _V2_RECORD_TYPES):
+            return True
+        if isinstance(nested, list) and any(
+                isinstance(item, dict)
+                and ("config_epoch_digest" in item
+                     or item.get("record_type") in _V2_RECORD_TYPES)
+                for item in nested):
+            return True
+    return False
 
 
 def _is_v2_position(position: Any) -> bool:
-    return isinstance(position, dict) \
-        and position.get("schema_version") == V2_SCHEMA_VERSION
+    return _has_v2_record_shape(position)
+
+
+def _require_v2_schema_marker(position: Dict[str, Any]) -> None:
+    marker = position.get("schema_version")
+    if isinstance(marker, bool) or not isinstance(marker, int) \
+            or marker != V2_SCHEMA_VERSION:
+        raise PositionError("basis-position.json schema_version is not "
+                            "supported or is missing")
 
 
 def _v2_exact_fields(value: Any, expected: frozenset, path: str) -> None:
@@ -836,6 +909,95 @@ def _v2_digest(value: Any, path: str) -> str:
     if not isinstance(value, str) or V2_DIGEST_RE.fullmatch(value) is None:
         raise PositionError("version-2 %s is not a valid digest" % path)
     return value
+
+
+def _v2_json_value(value: Any, path: str) -> None:
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int):
+        _v2_int(value, path)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _v2_json_value(item, "%s[%d]" % (path, index))
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise PositionError("version-2 %s has an invalid JSON key"
+                                    % path)
+            _v2_json_value(item, path + "." + key)
+        return
+    raise PositionError("version-2 %s is not canonical JSON data" % path)
+
+
+def _canonical_json_sha256(value: Any, path: str) -> str:
+    _v2_json_value(value, path)
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        raise PositionError("version-2 %s is not canonical JSON data"
+                            % path) from None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_v2_config_snapshot(snapshot: Any, symbol: str) -> str:
+    path = "config_snapshot"
+    _v2_exact_fields(snapshot, _V2_CONFIG_FIELDS, path)
+    _v2_json_value(snapshot, path)
+    if snapshot["symbol"] != symbol:
+        raise PositionError("version-2 config snapshot symbol does not "
+                            "match")
+    if snapshot["direction"] != V2_DIRECTION:
+        raise PositionError("version-2 config snapshot direction is not "
+                            "enabled")
+    if not isinstance(snapshot["schedule"], list) \
+            or not snapshot["schedule"] \
+            or any(not isinstance(row, dict)
+                   for row in snapshot["schedule"]):
+        raise PositionError("version-2 config snapshot schedule is invalid")
+    if not isinstance(snapshot["caps"], dict) or not snapshot["caps"]:
+        raise PositionError("version-2 config snapshot caps are invalid")
+    venue = snapshot["venue"]
+    if not isinstance(venue, dict):
+        raise PositionError("version-2 config snapshot venue is invalid")
+    base_asset = venue.get("base_asset")
+    if not isinstance(base_asset, str) \
+            or re.fullmatch(r"[A-Z0-9]{2,20}", base_asset) is None \
+            or not symbol.startswith(base_asset):
+        raise PositionError("version-2 config snapshot base asset is "
+                            "invalid")
+    return base_asset
+
+
+def v2_config_epoch_digest(config_snapshot: Dict[str, Any]) -> str:
+    """Return the canonical-JSON SHA-256 for one frozen v2 config."""
+    if not isinstance(config_snapshot, dict):
+        raise PositionError("version-2 config snapshot must be an object")
+    symbol = config_snapshot.get("symbol")
+    if not isinstance(symbol, str):
+        raise PositionError("version-2 config snapshot symbol is invalid")
+    _validate_v2_config_snapshot(config_snapshot, symbol)
+    return _canonical_json_sha256(config_snapshot, "config_snapshot")
+
+
+def v2_event_digest(event: Dict[str, Any]) -> str:
+    """Return the canonical-JSON SHA-256 for sealed event fields."""
+    if not isinstance(event, dict):
+        raise PositionError("version-2 event must be an object")
+    expected = _V2_EVENT_FIELDS - {"digest"}
+    payload = {field: event[field] for field in expected if field in event}
+    missing = sorted(expected - set(payload))
+    unknown = sorted(set(event) - _V2_EVENT_FIELDS)
+    if missing:
+        raise PositionError("version-2 event digest input is missing "
+                            "field(s): %s" % ", ".join(missing))
+    if unknown:
+        raise PositionError("version-2 event digest input has unknown "
+                            "field(s): %s" % ", ".join(unknown))
+    return _canonical_json_sha256(payload, "event economics")
 
 
 def _v2_decimal_text(value: Any, path: str,
@@ -883,13 +1045,56 @@ def _v2_binding(record: Dict[str, Any], path: str, symbol: str,
                             "match" % path)
 
 
-def _validate_v2_flat_proof(proof: Any, symbol: str,
-                            config_epoch_digest: str) -> None:
+def _validate_v2_flat_read_provenance(value: Any, path: str) -> None:
+    _v2_exact_fields(value, _V2_FLAT_PROVENANCE_FIELDS, path)
+    positions = value["positions"]
+    _v2_exact_fields(positions, _V2_POSITION_READ_FIELDS,
+                     path + ".positions")
+    if any(positions[field] is not True for field in positions):
+        raise PositionError("version-2 flat proof position reads are not "
+                            "proven")
+    open_orders = value["open_orders"]
+    _v2_exact_fields(open_orders, _V2_OPEN_ORDER_READ_FIELDS,
+                     path + ".open_orders")
+    if any(open_orders[field] is not True for field in open_orders):
+        raise PositionError("version-2 flat proof open-order reads are not "
+                            "proven")
+    own_orders = value["own_orders"]
+    if not isinstance(own_orders, list):
+        raise PositionError("version-2 flat proof own_orders must be a list")
+    client_ids = set()
+    for index, order in enumerate(own_orders):
+        order_path = "%s.own_orders[%d]" % (path, index)
+        _v2_exact_fields(order, _V2_FLAT_OWN_ORDER_FIELDS, order_path)
+        client_id = _v2_id(order["client_id"], order_path + ".client_id")
+        if client_id in client_ids:
+            raise PositionError("version-2 flat proof own-order identity is "
+                                "duplicated")
+        if order["market"] not in ("spot", "usdm"):
+            raise PositionError("version-2 flat proof own-order market is "
+                                "invalid")
+        if order["status"] not in V2_TERMINAL_ORDER_STATUSES:
+            raise PositionError("version-2 flat proof own order lacks a "
+                                "terminal status")
+        client_ids.add(client_id)
+
+
+def _validate_v2_flat_proof(
+        proof: Any, symbol: str, config_epoch_digest: str,
+        initialization_cut_ms: Optional[int] = None) -> None:
     path = "flat_proof"
     _v2_exact_fields(proof, _V2_FLAT_PROOF_FIELDS, path)
     _v2_binding(proof, path, symbol, config_epoch_digest, "FLAT_PROOF")
     _v2_int(proof["source_revision"], path + ".source_revision")
-    _v2_int(proof["observed_at_ms"], path + ".observed_at_ms")
+    observed_at_ms = _v2_int(
+        proof["observed_at_ms"], path + ".observed_at_ms", minimum=1)
+    if initialization_cut_ms is not None:
+        cut = _v2_int(initialization_cut_ms, "initialization_cut_ms",
+                      minimum=1)
+        if observed_at_ms > cut \
+                or cut - observed_at_ms > V2_FLAT_PROOF_MAX_AGE_MS:
+            raise PositionError("version-2 flat proof freshness is outside "
+                                "the initialization bound")
     futures_qty = _v2_decimal_text(
         proof["futures_position_qty"], path + ".futures_position_qty")
     spot_qty = _v2_decimal_text(
@@ -906,6 +1111,28 @@ def _validate_v2_flat_proof(proof: Any, symbol: str,
             or proof["own_orders_terminal"] is not True:
         raise PositionError("version-2 flat proof does not prove flat state")
     _v2_digest(proof["evidence_digest"], path + ".evidence_digest")
+    _validate_v2_flat_read_provenance(
+        proof["read_provenance"], path + ".read_provenance")
+
+
+def _validate_v2_fee_map(value: Any, path: str) -> Dict[str, Decimal]:
+    if not isinstance(value, dict):
+        raise PositionError("version-2 %s must be an object" % path)
+    parsed: Dict[str, Decimal] = {}
+    for asset, amount in value.items():
+        if not isinstance(asset, str) \
+                or re.fullmatch(r"[A-Z0-9]{2,20}", asset) is None:
+            raise PositionError("version-2 %s asset is invalid" % path)
+        parsed_amount = _v2_decimal_text(amount, path + "." + asset)
+        if parsed_amount < 0:
+            raise PositionError("version-2 %s amount is negative" % path)
+        parsed[asset] = parsed_amount
+    return parsed
+
+
+def _v2_order_is_terminal(order: Dict[str, Any]) -> bool:
+    return order.get("terminal") is True \
+        and order.get("status") in V2_TERMINAL_ORDER_STATUSES
 
 
 def _validate_v2_order(order: Any, path: str, symbol: str,
@@ -928,11 +1155,13 @@ def _validate_v2_order(order: Any, path: str, symbol: str,
         path + ".terminal_executed_qty", allow_none=True)
     quote = _v2_decimal_text(order["terminal_quote"],
                              path + ".terminal_quote", allow_none=True)
+    fees = _validate_v2_fee_map(order["fee_by_asset"],
+                                path + ".fee_by_asset")
     if order["terminal"]:
         if quantity is None or quote is None or quantity < 0 or quote < 0:
             raise PositionError("version-2 %s terminal facts are incomplete"
                                 % path)
-    elif quantity is not None or quote is not None:
+    elif quantity is not None or quote is not None or fees:
         raise PositionError("version-2 %s nonterminal facts must stay "
                             "unknown" % path)
 
@@ -942,7 +1171,7 @@ def _validate_v2_event(event: Any, path: str, symbol: str,
                        created_cut_ms: int) -> None:
     _v2_exact_fields(event, _V2_EVENT_FIELDS, path)
     _v2_binding(event, path, symbol, config_epoch_digest, "TRIGGER_EVENT")
-    _v2_digest(event["digest"], path + ".digest")
+    stored_digest = _v2_digest(event["digest"], path + ".digest")
     source_time_ms = _v2_int(event["source_time_ms"],
                              path + ".source_time_ms")
     age = _v2_int(event["age_at_creation_ms"],
@@ -959,11 +1188,46 @@ def _validate_v2_event(event: Any, path: str, symbol: str,
         raise PositionError("version-2 %s entry gap must be positive" % path)
     _v2_int(event["funding_period_ms"], path + ".funding_period_ms",
             minimum=1)
+    if stored_digest != v2_event_digest(event):
+        raise PositionError("version-2 %s event digest does not match its "
+                            "sealed economics" % path)
+
+
+def _v2_terminal_entry_facts(
+        entry_orders: Dict[str, Dict[str, Any]], base_asset: str,
+        path: str) -> Optional[Tuple[List[Decimal], Decimal, Decimal]]:
+    spot = entry_orders[ENTER_SPOT]
+    short = entry_orders[ENTER_SHORT]
+    if not _v2_order_is_terminal(spot) \
+            or not _v2_order_is_terminal(short):
+        return None
+    spot_qty = _v2_decimal_text(
+        spot["terminal_executed_qty"],
+        path + ".spot.terminal_executed_qty", allow_none=True)
+    short_qty = _v2_decimal_text(
+        short["terminal_executed_qty"],
+        path + ".short.terminal_executed_qty", allow_none=True)
+    spot_quote = _v2_decimal_text(
+        spot["terminal_quote"], path + ".spot.terminal_quote",
+        allow_none=True)
+    short_quote = _v2_decimal_text(
+        short["terminal_quote"], path + ".short.terminal_quote",
+        allow_none=True)
+    if spot_qty is None or short_qty is None \
+            or spot_quote is None or short_quote is None:
+        return None
+    fees = _validate_v2_fee_map(
+        spot["fee_by_asset"], path + ".spot.fee_by_asset")
+    net_spot = spot_qty - fees.get(base_asset, Decimal(0))
+    if net_spot < 0:
+        raise PositionError("version-2 base-asset fee exceeds the Spot fill")
+    return [spot_quote, short_quote], net_spot, short_qty
 
 
 def _validate_v2_cap(cap: Any, path: str,
                      effective_cap: Decimal,
-                     entry_orders: Dict[str, Dict[str, Any]]) -> None:
+                     entry_orders: Dict[str, Dict[str, Any]],
+                     base_asset: Optional[str]) -> None:
     _v2_exact_fields(cap, _V2_CAP_FIELDS, path)
     status = cap["status"]
     if not isinstance(status, str) or status not in V2_CAP_STATUSES:
@@ -986,16 +1250,17 @@ def _validate_v2_cap(cap: Any, path: str,
             raise PositionError("version-2 %s unknown facts are invalid"
                                 % path)
         return
-    terminal_quotes = []
-    for stage in (ENTER_SPOT, ENTER_SHORT):
-        order = entry_orders[stage]
-        quote = _v2_decimal_text(order["terminal_quote"],
-                                 path + ".terminal_fill_quote",
-                                 allow_none=True)
-        if not order["terminal"] or quote is None:
-            raise PositionError("version-2 %s terminal fill is unproven"
-                                % path)
-        terminal_quotes.append(quote)
+    if base_asset is None:
+        raise PositionError("version-2 %s base asset is not available"
+                            % path)
+    terminal_facts = _v2_terminal_entry_facts(
+        entry_orders, base_asset, path + ".terminal_exposure")
+    if terminal_facts is None:
+        raise PositionError("version-2 %s terminal fill is unproven" % path)
+    terminal_quotes, net_spot_qty, short_qty = terminal_facts
+    if net_spot_qty != short_qty:
+        raise PositionError("version-2 %s terminal quantities do not agree"
+                            % path)
     enforced_fill = max(terminal_quotes)
     if terminal_fill != enforced_fill:
         raise PositionError("version-2 %s terminal fill does not match own "
@@ -1011,7 +1276,8 @@ def _validate_v2_cap(cap: Any, path: str,
 
 
 def _validate_v2_rung(rung: Any, path: str, symbol: str,
-                      config_epoch_digest: str) -> None:
+                      config_epoch_digest: str,
+                      base_asset: Optional[str] = None) -> None:
     _v2_exact_fields(rung, _V2_RUNG_FIELDS, path)
     _v2_binding(rung, path, symbol, config_epoch_digest, "RUNG")
     _v2_id(rung["rung_id"], path + ".rung_id")
@@ -1088,7 +1354,17 @@ def _validate_v2_rung(rung: Any, path: str, symbol: str,
         raise PositionError("version-2 %s entry gap does not match its "
                             "sealed event" % path)
     _validate_v2_cap(rung["cap_reconcile"], path + ".cap_reconcile",
-                     effective_cap, by_stage)
+                     effective_cap, by_stage, base_asset)
+    cap_status = rung["cap_reconcile"]["status"]
+    valid_rung_statuses = {
+        "PENDING": frozenset(("ENTRY_PENDING",)),
+        "UNKNOWN": frozenset(("UNKNOWN",)),
+        "WITHIN_CAP": frozenset(("OPEN", "CLOSED")),
+        "EXCEEDED": frozenset(("REDUCE_ONLY", "CLOSED")),
+    }[cap_status]
+    if rung["status"] not in valid_rung_statuses:
+        raise PositionError("version-2 %s status is not supported by its "
+                            "cap reconciliation" % path)
 
 
 def _validate_v2_transition(transition: Any, path: str, symbol: str,
@@ -1102,6 +1378,9 @@ def _validate_v2_transition(transition: Any, path: str, symbol: str,
             or transition["to"] not in V2_STATES \
             or transition["from"] == transition["to"]:
         raise PositionError("version-2 %s state change is invalid" % path)
+    if transition["to"] not in V2_LEGAL_TRANSITIONS[transition["from"]]:
+        raise PositionError("version-2 %s is not a legal state transition"
+                            % path)
     _v2_int(transition["expected_revision"],
             path + ".expected_revision")
     _v2_int(transition["created_cut_ms"], path + ".created_cut_ms")
@@ -1109,9 +1388,10 @@ def _validate_v2_transition(transition: Any, path: str, symbol: str,
     _v2_exact_fields(evidence, _V2_EVIDENCE_FIELDS, path + ".evidence")
     _v2_text(evidence["kind"], path + ".evidence.kind")
     _v2_digest(evidence["digest"], path + ".evidence.digest")
-    if not isinstance(evidence["receipt_ids"], list):
+    if not isinstance(evidence["receipt_ids"], list) \
+            or not evidence["receipt_ids"]:
         raise PositionError("version-2 %s.evidence.receipt_ids must be a "
-                            "list" % path)
+                            "nonempty list" % path)
     seen = set()
     for index, receipt_id in enumerate(evidence["receipt_ids"]):
         value = _v2_text(receipt_id,
@@ -1136,6 +1416,13 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
         raise PositionError("version-2 position symbol is invalid")
     config_epoch_digest = _v2_digest(
         position["config_epoch_digest"], "position.config_epoch_digest")
+    base_asset = _validate_v2_config_snapshot(
+        position["config_snapshot"], symbol)
+    computed_config_digest = v2_config_epoch_digest(
+        position["config_snapshot"])
+    if config_epoch_digest != computed_config_digest:
+        raise PositionError("version-2 config snapshot digest does not "
+                            "match config_epoch_digest")
     if position["direction"] != V2_DIRECTION:
         raise PositionError("version-2 reverse direction is not enabled")
     if not isinstance(position["state"], str) \
@@ -1148,8 +1435,11 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
     if not isinstance(position["increases_frozen"], bool) \
             or not isinstance(position["reduce_only_path"], bool):
         raise PositionError("version-2 position path flags must be boolean")
+    initialization_cut_ms = _v2_int(
+        position["initialization_cut_ms"],
+        "position.initialization_cut_ms", minimum=1)
     _validate_v2_flat_proof(position["flat_proof"], symbol,
-                            config_epoch_digest)
+                            config_epoch_digest, initialization_cut_ms)
     if position["flat_proof"]["source_revision"] >= revision:
         raise PositionError("version-2 flat proof revision is not earlier "
                             "than the persisted revision")
@@ -1157,12 +1447,16 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
     rungs = position["rungs"]
     if not isinstance(rungs, list):
         raise PositionError("version-2 position.rungs must be a list")
+    transitions = position["transitions"]
+    if not isinstance(transitions, list):
+        raise PositionError("version-2 position.transitions must be a list")
     rung_ids = set()
     ordinals = set()
     client_ids = set()
     for index, rung in enumerate(rungs):
         path = "position.rungs[%d]" % index
-        _validate_v2_rung(rung, path, symbol, config_epoch_digest)
+        _validate_v2_rung(rung, path, symbol, config_epoch_digest,
+                          base_asset)
         if rung["rung_id"] in rung_ids or rung["ordinal"] in ordinals:
             raise PositionError("version-2 rung id or ordinal is duplicated")
         if rung["ordinal"] != index + 1:
@@ -1175,18 +1469,21 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
                                     "by more than one rung")
             client_ids.add(order["client_id"])
 
-    transitions = position["transitions"]
-    if not isinstance(transitions, list):
-        raise PositionError("version-2 position.transitions must be a list")
     transition_ids = set()
+    evidence_digests = set()
     prior_expected_revision = -1
     chain_state = ST_NONE
+    add_authorizations = 0
     for index, transition in enumerate(transitions):
         path = "position.transitions[%d]" % index
         _validate_v2_transition(transition, path, symbol,
                                 config_epoch_digest)
         if transition["transition_id"] in transition_ids:
             raise PositionError("version-2 transition id is duplicated")
+        evidence_digest = transition["evidence"]["digest"]
+        if evidence_digest in evidence_digests:
+            raise PositionError("version-2 transition evidence digest is "
+                                "reused")
         expected = transition["expected_revision"]
         if expected <= prior_expected_revision or expected >= revision:
             raise PositionError("version-2 transition revision ordering is "
@@ -1194,11 +1491,18 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
         if transition["from"] != chain_state:
             raise PositionError("version-2 transition state chain is invalid")
         transition_ids.add(transition["transition_id"])
+        evidence_digests.add(evidence_digest)
+        if (transition["from"], transition["to"]) \
+                in V2_ADD_TRANSITION_EDGES:
+            add_authorizations += 1
         prior_expected_revision = expected
         chain_state = transition["to"]
     if chain_state != position["state"]:
         raise PositionError("version-2 transition state does not match the "
                             "position")
+    if len(rungs) > add_authorizations:
+        raise PositionError("version-2 rung receipt requires an ADD "
+                            "transition")
 
     expected_freeze = any(
         rung["cap_reconcile"]["freeze_increases"] for rung in rungs)
@@ -1221,7 +1525,34 @@ def _validate_v2_enable_source(current: Optional[Dict[str, Any]],
     if current.get("symbol") != candidate["symbol"]:
         raise PositionError("version-2 enablement symbol does not match the "
                             "flat state")
+    legacy_legs = current.get("legs", [])
+    if not isinstance(legacy_legs, list):
+        raise PositionError("version-2 enablement legacy legs are invalid")
+    for leg in legacy_legs:
+        if not isinstance(leg, dict) \
+                or leg.get("outcome") != "terminal" \
+                or leg.get("status") not in V2_TERMINAL_ORDER_STATUSES:
+            raise PositionError("version-2 enablement legacy leg is not "
+                                "terminal")
+    if current.get("pending_intent") is not None:
+        raise PositionError("version-2 enablement legacy intent is still "
+                            "pending")
     proof = candidate["flat_proof"]
+    legacy_order_facts = {
+        leg["client_id"]: (leg.get("market"), leg.get("status"))
+        for leg in legacy_legs
+        if isinstance(leg.get("client_id"), str)
+    }
+    if len(legacy_order_facts) != len(legacy_legs):
+        raise PositionError("version-2 enablement legacy own-order "
+                            "identity is incomplete")
+    proven_order_facts = {
+        row["client_id"]: (row["market"], row["status"])
+        for row in proof["read_provenance"]["own_orders"]
+    }
+    if proven_order_facts != legacy_order_facts:
+        raise PositionError("version-2 flat proof own-order enumeration "
+                            "does not match legacy legs")
     if proof["source_revision"] != expected_revision:
         raise PositionError("version-2 flat proof revision does not match "
                             "expected_revision")
@@ -1239,7 +1570,8 @@ def _validate_v2_update(current: Dict[str, Any],
     if expected_revision is _NO_REVISION_CHECK:
         raise PositionError("version-2 writes require expected_revision")
     for field in ("version", "schema_version", "symbol",
-                  "config_epoch_digest", "direction", "flat_proof"):
+                  "config_epoch_digest", "config_snapshot", "direction",
+                  "flat_proof", "initialization_cut_ms"):
         if candidate[field] != current[field]:
             raise PositionError("version-2 %s is immutable" % field)
 
@@ -1247,6 +1579,26 @@ def _validate_v2_update(current: Dict[str, Any],
     candidate_rungs = candidate["rungs"]
     if len(candidate_rungs) < len(current_rungs):
         raise PositionError("version-2 rung receipts are append-only")
+    if len(candidate_rungs) > len(current_rungs) + 1:
+        raise PositionError("version-2 one ADD transition may append one "
+                            "rung receipt")
+    if len(candidate_rungs) == len(current_rungs) + 1:
+        if current["state"] not in V2_ADD_STATES \
+                or candidate["state"] != current["state"]:
+            raise PositionError("version-2 rung receipt requires an ADD "
+                                "transition from an allowed state")
+        add_count = sum(
+            1 for transition in current["transitions"]
+            if (transition["from"], transition["to"])
+            in V2_ADD_TRANSITION_EDGES)
+        if add_count != len(candidate_rungs):
+            raise PositionError("version-2 ADD transition was already "
+                                "consumed by a rung receipt")
+        appended_rung = candidate_rungs[-1]
+        if appended_rung["status"] != "ENTRY_PENDING" \
+                or appended_rung["cap_reconcile"]["status"] != "PENDING":
+            raise PositionError("version-2 new rung must begin pending "
+                                "reconciliation")
     immutable_rung_fields = (
         "version", "record_type", "symbol", "config_epoch_digest",
         "rung_id", "ordinal", "entry_gap_pct", "effective_cap_quote",
@@ -1321,10 +1673,8 @@ def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
                             "human check required before any trade")
     if not isinstance(loaded, dict):
         raise PositionError("basis-position.json is not an object")
-    if "schema_version" in loaded and not _is_v2_position(loaded):
-        raise PositionError("basis-position.json schema_version is not "
-                            "supported")
     if _is_v2_position(loaded):
+        _require_v2_schema_marker(loaded)
         _validate_v2_position(loaded)
     return loaded
 
@@ -1374,9 +1724,8 @@ def save_position(receipt_dir: str, position: Dict[str, Any],
                                 "was reading; stale check not saved")
         current_is_v2 = _is_v2_position(current)
         candidate_is_v2 = _is_v2_position(position)
-        if "schema_version" in position and not candidate_is_v2:
-            raise PositionError("basis-position.json schema_version is not "
-                                "supported")
+        if candidate_is_v2:
+            _require_v2_schema_marker(position)
         if current_is_v2 and not candidate_is_v2:
             raise PositionError("version-2 state cannot be replaced by a "
                                 "legacy record")
@@ -1429,8 +1778,10 @@ def new_v2_flat_proof(
         observed_at_ms: int, futures_position_qty: Any,
         spot_sellable_base_qty: Any, standard_open_order_count: int,
         algorithmic_open_order_count: int, own_orders_terminal: bool,
-        evidence_digest: str) -> Dict[str, Any]:
-    """Build the explicit account-flat receipt required for v2 enablement."""
+        evidence_digest: str,
+        read_provenance: Optional[Dict[str, Any]] = None) \
+        -> Dict[str, Any]:
+    """Build the account-flat receipt with explicit completed read sources."""
     proof = {
         "version": V2_SCHEMA_VERSION,
         "record_type": "FLAT_PROOF",
@@ -1447,6 +1798,8 @@ def new_v2_flat_proof(
         "algorithmic_open_order_count": algorithmic_open_order_count,
         "own_orders_terminal": own_orders_terminal,
         "evidence_digest": evidence_digest,
+        "read_provenance": _copy_v2_record(
+            read_provenance, "flat_proof.read_provenance"),
     }
     _validate_v2_flat_proof(proof, symbol, config_epoch_digest)
     return proof
@@ -1456,7 +1809,8 @@ def new_v2_own_order_record(
         symbol: str, config_epoch_digest: str, stage: str, market: str,
         client_id: str, terminal: bool, status: str,
         terminal_executed_qty: Any = None,
-        terminal_quote: Any = None) -> Dict[str, Any]:
+        terminal_quote: Any = None,
+        fee_by_asset: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build one own-order identity with explicit terminal fact slots."""
     order = {
         "version": V2_SCHEMA_VERSION,
@@ -1473,6 +1827,9 @@ def new_v2_own_order_record(
             allow_none=True),
         "terminal_quote": _v2_decimal_record_value(
             terminal_quote, "own_order.terminal_quote", allow_none=True),
+        "fee_by_asset": _copy_v2_record(
+            {} if fee_by_asset is None else fee_by_asset,
+            "own_order.fee_by_asset"),
     }
     _validate_v2_order(order, "own_order", symbol, config_epoch_digest)
     return order
@@ -1509,7 +1866,8 @@ def new_v2_rung_record(
         symbol: str, config_epoch_digest: str, rung_id: str, ordinal: int,
         status: str, entry_gap_pct: Any, effective_cap_quote: Any,
         sizes: Dict[str, Any], own_orders: List[Dict[str, Any]],
-        event_digest: str, event_source_time_ms: int, created_cut_ms: int,
+        event_digest: Optional[str], event_source_time_ms: int,
+        created_cut_ms: int,
         event_exit_gap_pct: Any, funding_rate: Any,
         funding_period_ms: int) -> Dict[str, Any]:
     """Seal one rung's authority, economics, identities, cap, and time cut."""
@@ -1521,6 +1879,28 @@ def new_v2_rung_record(
                             "cut")
     entry_gap = _v2_decimal_record_value(entry_gap_pct,
                                          "rung.entry_gap_pct")
+    event = {
+        "version": V2_SCHEMA_VERSION,
+        "record_type": "TRIGGER_EVENT",
+        "symbol": symbol,
+        "config_epoch_digest": config_epoch_digest,
+        "source_time_ms": source_time,
+        "age_at_creation_ms": creation_cut - source_time,
+        "entry_gap_pct": entry_gap,
+        "exit_gap_pct": _v2_decimal_record_value(
+            event_exit_gap_pct, "rung.event.exit_gap_pct"),
+        "funding_rate": _v2_decimal_record_value(
+            funding_rate, "rung.event.funding_rate"),
+        "funding_period_ms": funding_period_ms,
+    }
+    computed_event_digest = v2_event_digest(event)
+    if event_digest is not None:
+        supplied_event_digest = _v2_digest(
+            event_digest, "rung.event.digest")
+        if supplied_event_digest != computed_event_digest:
+            raise PositionError("version-2 supplied event digest does not "
+                                "match its sealed economics")
+    event["digest"] = computed_event_digest
     rung = {
         "version": V2_SCHEMA_VERSION,
         "record_type": "RUNG",
@@ -1534,21 +1914,7 @@ def new_v2_rung_record(
             effective_cap_quote, "rung.effective_cap_quote"),
         "sizes": _copy_v2_record(sizes, "rung.sizes"),
         "own_orders": _copy_v2_record(own_orders, "rung.own_orders"),
-        "event": {
-            "version": V2_SCHEMA_VERSION,
-            "record_type": "TRIGGER_EVENT",
-            "symbol": symbol,
-            "config_epoch_digest": config_epoch_digest,
-            "digest": event_digest,
-            "source_time_ms": source_time,
-            "age_at_creation_ms": creation_cut - source_time,
-            "entry_gap_pct": entry_gap,
-            "exit_gap_pct": _v2_decimal_record_value(
-                event_exit_gap_pct, "rung.event.exit_gap_pct"),
-            "funding_rate": _v2_decimal_record_value(
-                funding_rate, "rung.event.funding_rate"),
-            "funding_period_ms": funding_period_ms,
-        },
+        "event": event,
         "created_cut_ms": creation_cut,
         "cap_reconcile": {
             "status": "PENDING",
@@ -1593,7 +1959,10 @@ def new_v2_transition_record(
 def enable_v2_position(receipt_dir: str, symbol: str,
                        config_epoch_digest: str,
                        flat_proof: Dict[str, Any],
-                       expected_revision: int) -> Dict[str, Any]:
+                       expected_revision: int,
+                       config_snapshot: Optional[Dict[str, Any]] = None,
+                       initialization_cut_ms: Optional[int] = None) \
+        -> Dict[str, Any]:
     """Replace a proven-flat legacy state with an empty strict v2 schema."""
     _v2_int(expected_revision, "expected_revision")
     current = load_position(receipt_dir)
@@ -1604,18 +1973,33 @@ def enable_v2_position(receipt_dir: str, symbol: str,
         raise PositionError("version-2 expected revision %s is stale; "
                             "current revision is %s"
                             % (expected_revision, current_revision))
+    snapshot = _copy_v2_record(config_snapshot, "config_snapshot")
+    _validate_v2_config_snapshot(snapshot, symbol)
+    supplied_config_digest = _v2_digest(
+        config_epoch_digest, "config_epoch_digest")
+    computed_config_digest = v2_config_epoch_digest(snapshot)
+    if supplied_config_digest != computed_config_digest:
+        raise PositionError("version-2 config snapshot digest does not "
+                            "match supplied config_epoch_digest")
+    if initialization_cut_ms is None:
+        initialization_cut_ms = int(time.time() * 1000)
+    initialization_cut = _v2_int(
+        initialization_cut_ms, "initialization_cut_ms", minimum=1)
     proof = _copy_v2_record(flat_proof, "flat_proof")
-    _validate_v2_flat_proof(proof, symbol, config_epoch_digest)
+    _validate_v2_flat_proof(
+        proof, symbol, supplied_config_digest, initialization_cut)
     position = {
         "version": V2_SCHEMA_VERSION,
         "schema_version": V2_SCHEMA_VERSION,
         "symbol": symbol,
-        "config_epoch_digest": config_epoch_digest,
+        "config_epoch_digest": supplied_config_digest,
+        "config_snapshot": snapshot,
         "direction": V2_DIRECTION,
         "state": ST_NONE,
         "rungs": [],
         "transitions": [],
         "flat_proof": proof,
+        "initialization_cut_ms": initialization_cut,
         "increases_frozen": False,
         "reduce_only_path": False,
         "revision": expected_revision,
@@ -1654,11 +2038,26 @@ def write_v2_rung(receipt_dir: str, rung: Dict[str, Any],
                   expected_revision: int) -> Dict[str, Any]:
     """Append one strict rung receipt under an expected-revision write."""
     position = _load_v2_for_write(receipt_dir, expected_revision)
+    if position["state"] not in V2_ADD_STATES:
+        raise PositionError("version-2 rung receipt requires an ADD "
+                            "transition from an allowed state")
+    add_count = sum(
+        1 for transition in position["transitions"]
+        if (transition["from"], transition["to"])
+        in V2_ADD_TRANSITION_EDGES)
+    if add_count != len(position["rungs"]) + 1:
+        raise PositionError("version-2 ADD transition is absent or already "
+                            "consumed")
     if position["increases_frozen"]:
         raise PositionError("version-2 increases are frozen")
     record = _copy_v2_record(rung, "rung")
     _validate_v2_rung(record, "rung", position["symbol"],
-                      position["config_epoch_digest"])
+                      position["config_epoch_digest"],
+                      position["config_snapshot"]["venue"]["base_asset"])
+    if record["status"] != "ENTRY_PENDING" \
+            or record["cap_reconcile"]["status"] != "PENDING":
+        raise PositionError("version-2 new rung must begin pending "
+                            "reconciliation")
     position["rungs"].append(record)
     _refresh_v2_path_flags(position)
     save_position(receipt_dir, position,
@@ -1679,6 +2078,10 @@ def write_v2_transition(receipt_dir: str,
                             "not match the write")
     if record["from"] != position["state"]:
         raise PositionError("version-2 transition from-state is stale")
+    if any(prior["evidence"]["digest"] == record["evidence"]["digest"]
+           for prior in position["transitions"]):
+        raise PositionError("version-2 transition evidence digest is "
+                            "reused")
     position["transitions"].append(record)
     position["state"] = record["to"]
     save_position(receipt_dir, position,
@@ -1698,18 +2101,12 @@ def reconcile_v2_rung_cap(receipt_dir: str, rung_id: str,
     if rung["cap_reconcile"]["status"] != "PENDING":
         raise PositionError("version-2 rung cap is already reconciled")
     by_stage = {order["stage"]: order for order in rung["own_orders"]}
-    quotes = []
-    for stage in (ENTER_SPOT, ENTER_SHORT):
-        order = by_stage[stage]
-        quote = _v2_decimal_text(
-            order["terminal_quote"],
-            "rung.own_orders.%s.terminal_quote" % stage,
-            allow_none=True)
-        if not order["terminal"] or quote is None:
-            quotes = []
-            break
-        quotes.append(quote)
-    if not quotes:
+    base_asset = position["config_snapshot"]["venue"]["base_asset"]
+    terminal_facts = _v2_terminal_entry_facts(
+        by_stage, base_asset, "rung.terminal_exposure")
+    quantities_agree = terminal_facts is not None \
+        and terminal_facts[1] == terminal_facts[2]
+    if not quantities_agree:
         rung["cap_reconcile"] = {
             "status": "UNKNOWN",
             "terminal_fill_quote": None,
@@ -1718,6 +2115,7 @@ def reconcile_v2_rung_cap(receipt_dir: str, rung_id: str,
         }
         rung["status"] = "UNKNOWN"
     else:
+        quotes = terminal_facts[0]
         terminal_fill = max(quotes)
         effective_cap = _v2_decimal_text(
             rung["effective_cap_quote"], "rung.effective_cap_quote")
@@ -1728,8 +2126,7 @@ def reconcile_v2_rung_cap(receipt_dir: str, rung_id: str,
             "freeze_increases": excess,
             "reduce_only_path": excess,
         }
-        if excess:
-            rung["status"] = "REDUCE_ONLY"
+        rung["status"] = "REDUCE_ONLY" if excess else "OPEN"
     _refresh_v2_path_flags(position)
     save_position(receipt_dir, position,
                   expected_revision=expected_revision)
