@@ -1,0 +1,14 @@
+DASHBOARD DEPLOY TO THE BOX — 2026-08-16 (UI seat, owner order; sanitized host transcript rows)
+
+what | the latest dashboard (repo ui/ at commit ce43cd1 + 47655ef) serving at https://arbitrage.cosmosgeek.org from the execution host, replacing the Mac-side viewer as the source of truth
+host | i-0e87fe0e7ba2063a9 ap-south-1 · user ssm-user · Python 3.12.3 · sudo available · reached via aws-connect/ssmrun.sh + xfer.sh
+before | quant-ui.service running python3 ui/serve.py --port 8080 since 2026-08-14 06:10 UTC (old backend); ui/serve.py, shell.js, index.html on host md5-identical to local (932fdb8b…, c715cfd9…, 5a4384f3…); no telemetry recorder or news fetcher on host; quant-ui-mirror.service (local_mirror.sh, 5 s) active; cloudflared.service active (token tunnel); only web listener 127.0.0.1:8080
+change 1 | ui/telemetry_recorder.py: sampling base URL from env QUANT_UI_URL (default unchanged 8899); local commit 47655ef; transferred with xfer.sh — first attempt landed EMPTY (remote sha e3b0c442… = empty file), second attempt XFER_VERIFIED sha256 59fe28628a01c116…
+change 2 | new unit /etc/systemd/system/quant-ui-telemetry.service (User=ssm-user, WorkingDirectory=/home/ssm-user/quant-ui, Environment=QUANT_UI_URL=http://127.0.0.1:8080, ExecStart=/usr/bin/python3 ui/telemetry_recorder.py --loop 15 -q, Restart=on-failure, NoNewPrivileges, ProtectSystem=full) — xfer sha aa8cc70a… verified
+change 3 | new unit /etc/systemd/system/quant-ui-news.service (same user/dir, ExecStart=/usr/bin/python3 ui/news_fetcher.py --loop 120 -q, Restart=on-failure, NoNewPrivileges, ProtectSystem=full) — xfer sha de577a6b… verified
+apply | install_ui_services.sh (xfer sha 58da938a… verified) run via ssmrun: install both units 0644, daemon-reload, enable --now both, systemctl restart quant-ui
+after | quant-ui active since 2026-08-16 12:45:18 UTC · quant-ui-telemetry active since 12:45:18 · quant-ui-news active since 12:45:18 · quant-ui-mirror active since 2026-08-15 08:36:27 · cloudflared active since 2026-07-26 19:39:52
+verify | GET http://127.0.0.1:8080/ → 200, 46973 bytes (= local ui/index.html size) · GET /api/strip → ok:true, read_only:true, machine ENTRY-SEALED, stop_jobs_present:true, market_pass live age 69.9 s, supervisor IDLE green
+untouched | cloudflared, tunnel token, Cloudflare Access, quant-ui-mirror.service, every machine directory (quant_receipts, quant-run); no secret read or printed
+not verified | the public page in the owner's Chrome (Claude-in-Chrome extension not connected to this account); the owner refreshes arbitrage.cosmosgeek.org himself
+open | Mac→box ui_sync did not carry change 1 by itself (host md5 a31cde92… ≠ local c0b9cd45… after >30 s) — sync unverified; one pre-existing failing test in tests/test_ui_telemetry.py; box history (telemetry, news) starts from 12:45 UTC

@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+DASHBOARD LIVE ON THE BOX 2026-08-16 | arbitrage.cosmosgeek.org now serves the latest UI (ce43cd1 + 47655ef) from the execution host | evidence/dashboard-deploy-2026-08-16.txt · ui/DASHBOARD.md
+host | quant-ui.service restarted 12:45:18Z (backend was 2 days old); NEW quant-ui-telemetry.service (recorder, 15 s, QUANT_UI_URL=127.0.0.1:8080) and quant-ui-news.service (fetcher, 120 s) created + enabled; tunnel, Access, receipt mirror, machine directories untouched
+verify | GET / → 200 46973B (= local index.html) · /api/strip ok, ENTRY-SEALED, market pass live · all five services active | MEASURED on the box
+change | ui/telemetry_recorder.py samples QUANT_UI_URL (default 8899 unchanged) — 47655ef; xfer first attempt landed EMPTY (empty-file sha), second XFER_VERIFIED
+first failure | Mac→box ui_sync did not carry the change by itself — sync UNVERIFIED; file pushed by hand | one pre-existing test failure tests/test_ui_telemetry.py
+not verified | the public page in the owner's Chrome (extension not connected to this account) — owner refreshes the site | box history (telemetry, news) starts 12:45Z
+record | ui/DASHBOARD.md written (owner order): wiring map for every worker; pointers in CLAUDE.md file map + AGENTS.md scope
+
 RESEARCH VERDICT 2026-08-15 | bench day complete, zero live spend | full rows in evidence/research-verdict-2026-08-15.txt
 surge | best possible cell measured: 1h + ladder + maker fees = net -0.029% (3bps under) | tail toxic (24h med -1.07%) — dumps confirmed | fee levers remain: BNB float (owner word) + spot/maker rung (built, audit-ready)
 absorption | tool live, honest refusal on short tape — needs its 21-day baseline | 30-day x 300 tape pulling overnight (klines + aggTrades)
