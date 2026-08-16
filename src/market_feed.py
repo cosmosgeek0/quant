@@ -45,6 +45,7 @@ from market_stream import (
     NUMERIC_FIELDS,
     PublicJsonReader,
     STATE_FIELDS,
+    STATE_PREFIX_FIELDS,
     SYMBOL_PATTERN,
     VENUE_VALUES,
     atomic_write_json,
@@ -94,6 +95,7 @@ METADATA_FIELDS = (
     "perp_min_notional",
 )
 FEED_FIELDS = STATE_FIELDS + METADATA_FIELDS
+REQUIRED_STATE_FIELDS = STATE_PREFIX_FIELDS
 UNSUPPORTED_STREAM_FIELDS = (
     "mark",
     "vol_1m_quote",
@@ -589,7 +591,7 @@ def load_feed_state(path: Path) -> Dict[str, Dict[str, Any]]:
             raise DataReadError("feed state symbols is not a mapping")
     state: Dict[str, Dict[str, Any]] = {}
     allowed = set(FEED_FIELDS)
-    required = set(STATE_FIELDS)
+    required = set(REQUIRED_STATE_FIELDS)
     for raw_symbol, raw_record in payload.items():
         symbol = valid_symbol(raw_symbol)
         if symbol is None or not isinstance(raw_record, dict):

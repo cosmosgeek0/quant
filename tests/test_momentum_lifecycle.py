@@ -268,6 +268,49 @@ class MomentumLifecycleTests(unittest.TestCase):
         with self.assertRaises(ml.StreamDataError):
             ml.StreamRecord.from_payload("AAAUSDT", payload)
 
+    def test_additive_tail_keeps_observation_identity_and_decision(self):
+        baseline = stream_payload(0, "100", "2", "100", "1000")
+        ignition = stream_payload(1, "105", "70", "7000", "1050")
+        ignition_with_tail = dict(ignition, book_age_ms="100")
+        plain_record = ml.StreamRecord.from_payload("AAAUSDT", ignition)
+        tail_record = ml.StreamRecord.from_payload("AAAUSDT", ignition_with_tail)
+
+        self.assertEqual(
+            ml.STATE_IDENTITY_FIELDS,
+            ("utc", "venues") + ml.NUMERIC_FIELDS,
+        )
+        self.assertEqual(plain_record.observation_id, tail_record.observation_id)
+
+        decisions = []
+        for payload in (ignition, ignition_with_tail):
+            state = ml.LifecycleState()
+            ml.process_record(
+                state,
+                ml.StreamRecord.from_payload("AAAUSDT", baseline),
+                self.config,
+                self.receipts,
+                fixed_now,
+            )
+            decisions.append(
+                ml.process_record(
+                    state,
+                    ml.StreamRecord.from_payload("AAAUSDT", payload),
+                    self.config,
+                    self.receipts,
+                    fixed_now,
+                )
+            )
+        self.assertEqual(decisions[0], decisions[1])
+
+        duplicate = ml.process_record(
+            state,
+            plain_record,
+            self.config,
+            self.receipts,
+            fixed_now,
+        )
+        self.assertEqual(duplicate["action"], ml.ACTION_DUPLICATE)
+
     def test_ignition_default_flows_from_limits(self):
         expected = getattr(
             limits, "MOMENTUM_IGNITION_SURGE_RATIO", Decimal("3")

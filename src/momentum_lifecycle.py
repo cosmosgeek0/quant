@@ -74,7 +74,9 @@ RECEIPT_KINDS = {
     ACTION_EXIT: "momentum_exit_decision",
 }
 
-NUMERIC_FIELDS = (
+STATE_IDENTITY_FIELDS = (
+    "utc",
+    "venues",
     "spot_bid",
     "spot_ask",
     "perp_bid",
@@ -90,7 +92,10 @@ NUMERIC_FIELDS = (
     "basis_gap_pct",
     "freshness_ms",
 )
-REQUIRED_STREAM_FIELDS = frozenset(("utc", "venues") + NUMERIC_FIELDS)
+# Identity is frozen to the fields parsed into StreamRecord.  Sizing metadata
+# and additive stream tails do not enter lifecycle decisions.
+NUMERIC_FIELDS = STATE_IDENTITY_FIELDS[2:]
+REQUIRED_STREAM_FIELDS = frozenset(STATE_IDENTITY_FIELDS)
 
 
 class MomentumLifecycleError(Exception):
@@ -307,7 +312,8 @@ class StreamRecord:
             bid, ask = numbers[bid_name], numbers[ask_name]
             if bid is not None and ask is not None and bid > ask:
                 raise StreamDataError(f"stream {symbol} has {bid_name} above {ask_name}")
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        identity = {name: payload[name] for name in STATE_IDENTITY_FIELDS}
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         observation_id = hashlib.sha256((symbol + "\0" + canonical).encode("utf-8")).hexdigest()
         return cls(
             symbol=symbol,

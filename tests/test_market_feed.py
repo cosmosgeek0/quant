@@ -598,6 +598,21 @@ class RestartTests(unittest.TestCase):
             mf.atomic_write_json(path, loaded)
             self.assertEqual(mf.load_feed_state(path), loaded)
 
+    def test_pre_tail_state_restarts_with_unknown_book_age(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            path = root / "stream_state.json"
+            record = mf.empty_record(FIXED_UTC, "spot")
+            record = {field: record[field] for field in mf.REQUIRED_STATE_FIELDS}
+            record["spot_bid"] = "1"
+            record["spot_ask"] = "2"
+            path.write_text(json.dumps({"AAAUSDT": record}), encoding="utf-8")
+
+            restarted = mf.MarketFeed(path, root / "STOP")
+
+            self.assertEqual(set(restarted.state["AAAUSDT"]), set(mf.FEED_FIELDS))
+            self.assertIsNone(restarted.state["AAAUSDT"]["book_age_ms"])
+
     def test_existing_stop_file_prevents_reads_connections_and_writes(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
