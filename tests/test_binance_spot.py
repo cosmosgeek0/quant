@@ -86,6 +86,7 @@ class SpotAdapterTests(unittest.TestCase):
         state = spot.read_account_state(feed, BASE, SYMBOL).value
         self.assertEqual((state.can_trade, state.open_order_ids), (False, (8,)))
         self.assertEqual(state.balances[0].free, Decimal("1.25"))
+        self.assertEqual([call[4] for call in feed.calls], [True, True])
         self.assertEqual(set(spot.__all__), {"SpotMarket", "SpotAccountState",
                          "read_market", "read_account_state", "build_market_order",
                          "query_order", "submit_order_once", "read_my_trades",
@@ -128,13 +129,23 @@ class SpotAdapterTests(unittest.TestCase):
                          (7, Decimal("0.4")))
         self.assertEqual(feed.calls[0][3],
                          (("symbol", SYMBOL), ("origClientOrderId", CLIENT)))
+        self.assertTrue(feed.calls[0][4])
 
     def test_query_absence_needs_eight_consecutive_replies(self):
         feed = Feed(*([api()] * 7 + [ok(order_payload("NEW", "0"))] + [api()] * 8))
         waits = []; result = spot.query_order(feed, BASE, SYMBOL, CLIENT, sleep=waits.append)
         self.assertEqual((result.tag, len(feed.calls), len(waits)),
-                         ("not_found", 16, 15))
+                         ("pending", 16, 15))
         self.assertIsNone(result.error)
+
+    def test_observed_order_survives_later_absence_conflict(self):
+        feed = Feed(api(-1013), ok(order_payload("NEW", "0")), *[api() for _ in range(8)])
+        result = spot.submit_order_once(
+            feed, BASE, plan(), lambda _intent: None, sleep=lambda _delay: None)
+        self.assertEqual((result.tag, result.status, result.identity.order_id),
+                         ("pending", "NEW", 7))
+        self.assertEqual(([call[0] for call in feed.calls].count("POST"), len(feed.calls)),
+                         (1, 10))
 
     def test_query_error_and_budget_exhaustion_keep_their_tags(self):
         rejected = spot.query_order(Feed(api(-1003)), BASE, SYMBOL, CLIENT)
@@ -152,7 +163,7 @@ class SpotAdapterTests(unittest.TestCase):
         replies, events = [ok(posted), ok(order_payload(executed="0.02"))], []
 
         def transport(method, base_url, path, params, signed):
-            events.append(("wire", method, path)); return replies.pop(0)
+            events.append(("wire", method, path, signed)); return replies.pop(0)
 
         result = spot.submit_order_once(
             transport, BASE, plan(), lambda intent: events.append(("intent", intent)))
@@ -161,6 +172,8 @@ class SpotAdapterTests(unittest.TestCase):
                           events[0][0], events[1][:2], result.tag, len(result.response_fills)),
                          (1, 1, "intent", ("wire", "POST"), "terminal", 1))
         self.assertEqual((result.response_fills[0].side, result.response_fills[0].is_maker, result.response_fills[0].time_ms, result.response_fills[0].realized_pnl), ("BUY", False, 100, None))
+        self.assertEqual([event[3] for event in events if event[0] == "wire"],
+                         [True, True])
         feed = Feed(ok(posted))
         with self.assertRaises(http.IntentNotDurable):
             spot.submit_order_once(feed, BASE, plan(),
@@ -171,12 +184,41 @@ class SpotAdapterTests(unittest.TestCase):
         built = plan()
         params = tuple((key, "NaN") if key == "quantity" else (key, value)
                        for key, value in built.intent.params)
-        crafted = replace(built, quantity=1.0,
-                          intent=replace(built.intent, params=params))
-        feed, writes = Feed(), []
+        crafted = (replace(built, quantity=1.0),
+                   replace(built, quantity="0.02"),
+                   replace(built, intent=replace(built.intent, params=params)))
+        for candidate in crafted:
+            feed, writes = Feed(), []
+            with self.subTest(quantity=candidate.quantity), self.assertRaises(http.AdapterRefusal):
+                spot.submit_order_once(feed, BASE, candidate, writes.append)
+            self.assertEqual((writes, feed.calls), ([], []))
         with self.assertRaises(http.AdapterRefusal):
-            spot.submit_order_once(feed, BASE, crafted, writes.append)
-        self.assertEqual((writes, feed.calls), ([], []))
+            spot._money(1.0)
+
+    def test_post_transport_exception_is_one_attempt(self):
+        calls, writes = [], []
+
+        def transport(method, base_url, path, params, signed):
+            calls.append((method, path, signed))
+            raise OSError("offline transport unavailable")
+
+        with self.assertRaises(OSError):
+            spot.submit_order_once(transport, BASE, plan(), writes.append)
+        self.assertEqual((len(writes), calls),
+                         (1, [("POST", spot.SPOT_ORDER_PATH, True)]))
+
+    def test_conflicting_terminal_facts_stay_pending(self):
+        quantity_conflict = order_payload(executed="0")
+        quantity_conflict["cummulativeQuoteQty"] = "10"
+        feed = Feed(*[ok(quantity_conflict) for _ in range(http.ORDER_QUERY_ATTEMPTS)])
+        result = spot.query_order(feed, BASE, SYMBOL, CLIENT, sleep=lambda _delay: None)
+        self.assertEqual((result.tag, result.terminal), ("pending", False))
+        side_conflict = order_payload()
+        side_conflict["side"] = "SELL"
+        feed = Feed(ok({"clientOrderId": CLIENT}), ok(side_conflict))
+        result = spot.submit_order_once(feed, BASE, plan(), lambda _intent: None)
+        self.assertEqual((result.tag, result.terminal, result.side, result.returned_client_id),
+                         ("pending", False, "SELL", CLIENT))
 
     def test_returned_id_mismatch_stays_pending_without_resend(self):
         feed = Feed(ok({"clientOrderId": "other-id"}), ok(order_payload()))
@@ -208,6 +250,7 @@ class SpotAdapterTests(unittest.TestCase):
         self.assertEqual((result.kind, result.value[0].quantity),
                          ("ok", Decimal("1")))
         self.assertEqual(dict(feed.calls[0][3])["limit"], "1000")
+        self.assertTrue(feed.calls[0][4])
         window = spot.read_my_trades(
             Feed(ok([trade(when=150)])), BASE, SYMBOL, start_ms=100, end_ms=200)
         self.assertEqual(window.kind, "ok")
@@ -251,6 +294,18 @@ class SpotAdapterTests(unittest.TestCase):
                          ("ok", False, Decimal("0.2")))
         self.assertEqual((len(feed.calls), waits), (5, [1] * 5))
 
+    def test_fill_coverage_refuses_invalid_spot_fill_facts(self):
+        invalid = (replace(fill(), side="HOLD"),
+                   replace(fill(), is_maker=0),
+                   replace(fill(), time_ms=-1),
+                   replace(fill(), realized_pnl=Decimal("0")))
+        for supplied in invalid:
+            feed = Feed()
+            with self.subTest(fill=supplied):
+                result = spot.read_fills(feed, BASE, terminal(), (supplied,))
+                self.assertEqual((result.kind, result.value), ("unclear", None))
+                self.assertEqual(feed.calls, [])
+
     def test_fee_totals_are_sorted_decimals_and_missing_fees_refuse(self):
         fills = (fill(1, "0.4", "BTC", "0.001"),
                  fill(2, "0.6", "USDT", "0.02"),
@@ -290,6 +345,8 @@ class SpotAdapterTests(unittest.TestCase):
         feed = Feed(ok(info), ok({"symbol": SYMBOL, "bidPrice": "100", "askPrice": "101"}))
         result = spot.read_market(feed, BASE, SYMBOL, sleep=lambda _delay: None)
         self.assertEqual((result.kind, len(feed.calls)), ("unclear", 1))
+        with self.assertRaises(http.AdapterRefusal):
+            spot._step(Decimal("0." + "1" * 31), Decimal("0." + "1" * 30 + "3"))
 
 
 if __name__ == "__main__":

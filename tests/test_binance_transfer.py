@@ -22,9 +22,9 @@ def result(kind, payload=None, code=None):
     return http.HttpResult(kind, payload, code, None)
 
 
-def row(tran_id, amount="2", asset="USDT"):
+def row(tran_id, amount="2", asset="USDT", timestamp=0):
     return {"type": "MAIN_UMFUTURE", "asset": asset, "amount": amount,
-            "tranId": tran_id, "status": "CONFIRMED", "timestamp": 1700000000000}
+            "tranId": tran_id, "status": "CONFIRMED", "timestamp": timestamp}
 
 
 class Feed:
@@ -84,8 +84,20 @@ class TransferAdapterTests(unittest.TestCase):
 
     def test_history_refuses_non_positive_amounts(self):
         for amount in ("0", "-1"):
-            unclear = transfer.read_transfer_history(Feed(result("ok", {"total": 1, "rows": [row(1, amount)]})), BASE, "MAIN_UMFUTURE", 10, 20)
+            unclear = transfer.read_transfer_history(Feed(result("ok", {"total": 1, "rows": [row(1, amount, timestamp=15)]})), BASE, "MAIN_UMFUTURE", 10, 20)
             self.assertEqual((unclear.kind, unclear.value), ("unclear", None))
+
+    def test_history_requires_rows_inside_inclusive_window(self):
+        for timestamp in (9, 21):
+            unclear = transfer.read_transfer_history(
+                Feed(result("ok", {"total": 1, "rows": [row(1, timestamp=timestamp)]})),
+                BASE, "MAIN_UMFUTURE", 10, 20)
+            self.assertEqual((unclear.kind, unclear.value), ("unclear", None))
+        bounded = transfer.read_transfer_history(
+            Feed(result("ok", {"total": 2, "rows": [
+                row(1, timestamp=10), row(2, timestamp=20)]})),
+            BASE, "MAIN_UMFUTURE", 10, 20)
+        self.assertEqual(tuple(item.time_ms for item in bounded.value), (10, 20))
 
     def test_history_stops_at_twenty_pages(self):
         calls = []
@@ -163,6 +175,41 @@ class TransferAdapterTests(unittest.TestCase):
         query = transfer.query_transfer(conflict, BASE, intent, frozenset(), 42, 0, 1)
         self.assertEqual((query.kind, len(conflict.calls)), ("pending", 1))
         for baseline, selected in (([], None), (frozenset(), [])): self.assertRaises(http.AdapterRefusal, transfer.query_transfer, conflict, BASE, intent, baseline, selected, 0, 1)
+
+    def test_query_refuses_known_id_already_in_baseline(self):
+        intent = transfer.build_transfer(
+            "spot_to_usdm", "USDT", Decimal("2"), "l3wrequest9", SHA)
+        feed = Feed(result("ok", {"total": 1, "rows": [row(42)]}))
+        with self.assertRaises(http.AdapterRefusal):
+            transfer.query_transfer(
+                feed, BASE, intent, frozenset({42}), 42, 0, 1)
+        self.assertEqual(feed.calls, [])
+
+    def test_query_requires_amount_for_known_and_new_ids(self):
+        intent = transfer.build_transfer(
+            "spot_to_usdm", "USDT", Decimal("2"), "l3wrequest10", SHA)
+        known = Feed(result("ok", {"total": 1, "rows": [row(42, amount="3")]}))
+        query = transfer.query_transfer(
+            known, BASE, intent, frozenset(), 42, 0, 1)
+        self.assertEqual((query.kind, len(known.calls)), ("pending", 1))
+
+        new = Feed(result("ok", {"total": 1, "rows": [row(43, amount="3")]}))
+        waits = []
+        query = transfer.query_transfer(
+            new, BASE, intent, frozenset(), None, 0, 1, sleep=waits.append)
+        self.assertEqual((query.kind, len(new.calls), waits),
+                         ("not_found", 8, [2] * 7))
+
+    def test_query_returns_history_api_error_without_wait(self):
+        intent = transfer.build_transfer(
+            "spot_to_usdm", "USDT", Decimal("2"), "l3wrequest11", SHA)
+        failure = result("api_error", code=400)
+        feed = Feed(failure, result("ok", {"total": 0}))
+        waits = []
+        query = transfer.query_transfer(
+            feed, BASE, intent, frozenset(), None, 0, 1, sleep=waits.append)
+        self.assertEqual((query.kind, query.error, len(feed.calls), waits),
+                         ("error", failure, 1, []))
 
     def test_query_has_eight_rounds_and_two_second_waits(self):
         intent = transfer.build_transfer(

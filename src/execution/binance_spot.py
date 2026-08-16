@@ -167,6 +167,7 @@ def _parsed(payload: object, symbol: str, client_id: str) -> _http.OrderResult |
         order_id, status, side = payload.get("orderId"), payload.get("status"), payload.get("side")
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0 or not isinstance(status, str) or side not in ("BUY", "SELL"): raise _http.AdapterRefusal("order facts are malformed")
         executed, quote = _money(payload.get("executedQty")), _money(payload.get("cummulativeQuoteQty"))
+        if (executed == 0) != (quote == 0) or (status == "FILLED" and executed == 0): raise _http.AdapterRefusal("order quantities do not agree")
     except _http.AdapterRefusal: return None
     terminal = status in _http.TERMINAL_ORDER_STATUSES
     return _http.OrderResult("terminal" if terminal else "pending", _http.OrderIdentity(symbol, client_id, order_id), client_id, status, terminal, side, False, executed, quote, (), None)
@@ -185,7 +186,7 @@ def query_order(transport: _http.Transport, base_url: str, symbol: str, client_i
         elif isinstance(result, _http.HttpResult) and result.kind == "api_error":
             if type(result.code) is not int or result.code != -2013: return _empty("error", symbol, client_id, result)
             missing += 1
-            if missing == _http.ORDER_NOT_FOUND_STREAK: return _empty("not_found", symbol, client_id)
+            if missing == _http.ORDER_NOT_FOUND_STREAK: return last or _empty("not_found", symbol, client_id)
         else: missing = 0
         if attempt + 1 < _http.ORDER_QUERY_ATTEMPTS: sleep(_http.ORDER_QUERY_DELAY_SECONDS)
     return last or _empty("pending", symbol, client_id)
@@ -202,9 +203,8 @@ def _full_fills(payload: object, order_id: int, side: str | None) -> tuple[_http
             buyer, maker, when = (row["isBuyer"] if "isBuyer" in row else side == "BUY"), row.get("isMaker"), row.get("time"); fill_side = "BUY" if buyer is True else "SELL" if buyer is False else None
             if side not in ("BUY", "SELL") or type(buyer) is not bool or fill_side != side or type(maker) is not bool or type(when) is not int or when < 0: raise _http.AdapterRefusal("fill facts are invalid")
             price, quantity = _money(row.get("price"), True), _money(row.get("qty"), True)
-            asset = row.get("commissionAsset")
-            if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
-            fee = _http.Fee(asset, _money(row.get("commission")))
+            if not _named(row.get("commissionAsset"), _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
+            fee = _http.Fee(row["commissionAsset"], _money(row.get("commission")))
             with _http.exact_guard(): found.append(_http.Fill(trade_id, order_id, price, quantity, price * quantity, fee, fill_side, maker, when, None))
     except _http.AdapterRefusal: return ()
     return tuple(found)
@@ -220,9 +220,9 @@ def submit_order_once(transport: _http.Transport, base_url: str, plan: _http.Ord
     returned = posted.payload.get("clientOrderId") if posted.kind == "ok" and isinstance(posted.payload, dict) else None
     mismatch = posted.kind == "ok" and returned != plan.intent.identity
     queried = query_order(transport, base_url, plan.symbol, plan.intent.identity, sleep=sleep)
-    if mismatch:
-        error = _http.HttpResult("unclear", None, None, "returned_client_id_mismatch")
-        return _replace(queried, tag="pending", terminal=False, returned_client_id=returned if isinstance(returned, str) else None, response_fills=(), error=error)
+    if mismatch or (queried.tag == "terminal" and queried.side != plan.side):
+        error = _http.HttpResult("unclear", None, None, "returned_client_id_mismatch" if mismatch else "returned_order_side_mismatch")
+        return _replace(queried, tag="pending", terminal=False, returned_client_id=(returned if isinstance(returned, str) else None) if mismatch else queried.returned_client_id, response_fills=(), error=error)
     if queried.tag == "terminal":
         fills = _full_fills(posted.payload, queried.identity.order_id, queried.side) if posted.kind == "ok" else ()
         return _replace(queried, response_fills=fills)
@@ -237,9 +237,8 @@ def _trade(row: object, symbol: str, order_id: int | None, start_ms: int | None,
     buyer, maker, when = row.get("isBuyer"), row.get("isMaker"), row.get("time")
     if type(buyer) is not bool or type(maker) is not bool or type(when) is not int or when < 0 or start_ms is not None and not start_ms <= when <= end_ms: raise _http.AdapterRefusal("trade facts are incomplete")
     price, quantity = _money(row.get("price"), True), _money(row.get("qty"), True)
-    asset = row.get("commissionAsset")
-    if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
-    fee = _http.Fee(asset, _money(row.get("commission")))
+    if not _named(row.get("commissionAsset"), _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
+    fee = _http.Fee(row["commissionAsset"], _money(row.get("commission")))
     return _http.Fill(trade_id, oid, price, quantity, _money(row.get("quoteQty"), True), fee, "BUY" if buyer else "SELL", maker, when, None)
 
 
@@ -262,7 +261,8 @@ def read_my_trades(transport: _http.Transport, base_url: str, symbol: str, *, or
 
 def _merge(found: dict, fills: tuple[_http.Fill, ...], order_id: int) -> None:
     for fill in fills:
-        if not isinstance(fill, _http.Fill) or fill.order_id != order_id or isinstance(fill.trade_id, bool) or not isinstance(fill.trade_id, int) or fill.trade_id < 0 or not isinstance(fill.fee, _http.Fee) or not _named(fill.fee.asset, _ASSET): raise _http.AdapterRefusal("fill identity is invalid")
+        if (not isinstance(fill, _http.Fill) or fill.order_id != order_id or isinstance(fill.trade_id, bool) or not isinstance(fill.trade_id, int) or fill.trade_id < 0 or not isinstance(fill.fee, _http.Fee) or not _named(fill.fee.asset, _ASSET) or
+                fill.side not in ("BUY", "SELL") or type(fill.is_maker) is not bool or type(fill.time_ms) is not int or fill.time_ms < 0 or fill.realized_pnl is not None): raise _http.AdapterRefusal("fill identity or facts are invalid")
         _input(fill.price); _input(fill.quantity); _input(fill.quote_quantity, False); _input(fill.fee.amount, False)
         if fill.trade_id in found and found[fill.trade_id] != fill: raise _http.AdapterRefusal("fill identity conflicts")
         found[fill.trade_id] = fill

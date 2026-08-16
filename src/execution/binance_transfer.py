@@ -36,7 +36,7 @@ def read_transfer_history(transport: _http.Transport, base_url: str, transfer_ty
         params = (("type", transfer_type), ("startTime", str(start_ms)), ("endTime", str(end_ms)), ("current", str(page)), ("size", "100"))
         if (reply := _http.read(transport, base_url, _PATH, params, signed=True, sleep=sleep)).kind != "ok": return _http.ReadResult(reply.kind, None, reply)
         try:
-            _require(isinstance(reply.payload, dict), "history page is invalid"); total, rows = reply.payload.get("total"), reply.payload.get("rows"); rows = [] if rows is None and total == 0 else rows; _require(isinstance(rows, list) and len(rows) <= 100 and type(total) is int and total >= 0 and (expected_total is None or total == expected_total), "history page is invalid"); parsed = [_row(row, transfer_type) for row in rows]
+            _require(isinstance(reply.payload, dict), "history page is invalid"); total, rows = reply.payload.get("total"), reply.payload.get("rows"); rows = [] if rows is None and total == 0 else rows; _require(isinstance(rows, list) and len(rows) <= 100 and type(total) is int and total >= 0 and (expected_total is None or total == expected_total), "history page is invalid"); parsed = [_row(row, transfer_type) for row in rows]; _require(all(start_ms <= row.time_ms <= end_ms for row in parsed), "history row is outside requested window")
         except _http.AdapterRefusal: return _schema("transfer_history_schema")
         expected_total = total; found.extend(parsed)
         if len({row.tran_id for row in found}) != len(found) or len(found) > total: return _schema("transfer_history_schema")
@@ -51,7 +51,7 @@ def submit_transfer_once(transport: _http.Transport, base_url: str, intent: _htt
     if type(tran_id := reply.payload.get("tranId") if isinstance(reply.payload, dict) else None) is not int or tran_id <= 0: error = _http.HttpResult("unclear", None, None, "transfer_submit_schema"); return TransferSubmission("unclear", None, error)
     return TransferSubmission("accepted", tran_id, None)
 def query_transfer(transport: _http.Transport, base_url: str, intent: _http.MutationIntent, baseline_ids: frozenset[int], tran_id: int | None, start_ms: int, end_ms: int, *, sleep: _Callable[[float], None] = _time.sleep) -> TransferQuery:
-    kind, asset, amount = _parts(intent); _require(type(baseline_ids) is frozenset and all(type(value) is int and value > 0 for value in baseline_ids) and (tran_id is None or type(tran_id) is int and tran_id > 0), "transfer identity selector is invalid"); last = None
+    kind, asset, amount = _parts(intent); _require(type(baseline_ids) is frozenset and all(type(value) is int and value > 0 for value in baseline_ids) and (tran_id is None or type(tran_id) is int and tran_id > 0 and tran_id not in baseline_ids), "transfer identity selector is invalid"); last = None
     for attempt in range(8):
         if (last := read_transfer_history(transport, base_url, kind, start_ms, end_ms, sleep=sleep)).kind == "api_error": return TransferQuery("error", None, last.error)
         if last.kind == "ok":
