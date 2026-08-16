@@ -5,6 +5,7 @@ import io
 import json
 import os
 import socket
+import stat
 import sys
 import tempfile
 import unittest
@@ -278,6 +279,102 @@ class ExecutorCase(unittest.TestCase):
 
     def lock_exists(self):
         return os.path.exists(os.path.join(self.dir, "basis-executor.lock"))
+
+
+class ReceiptDurabilityTests(ExecutorCase):
+    def state(self, receipt=None, request=None):
+        state = basis_executor.make_state(
+            self.cfg, request or (lambda *_args, **_kwargs: ("ok", {})),
+            sleep=lambda _seconds: None)
+        state.receipt = receipt or {"legs": []}
+        return state
+
+    def sync_kinds(self, action):
+        observed = []
+        parent = os.stat(self.dir)
+        parent_identity = (parent.st_dev, parent.st_ino)
+
+        def observe(descriptor):
+            details = os.fstat(descriptor)
+            identity = (details.st_dev, details.st_ino)
+            if stat.S_ISREG(details.st_mode):
+                observed.append("file")
+            elif stat.S_ISDIR(details.st_mode) \
+                    and identity == parent_identity:
+                observed.append("parent")
+            else:
+                observed.append("other")
+
+        with mock.patch.object(basis_executor.os, "fsync",
+                               side_effect=observe) as fsync:
+            action()
+        self.assertEqual(fsync.call_count, len(observed))
+        return observed
+
+    def plan(self):
+        return basis_cycle.CyclePlan(
+            symbol=SYMBOL, entry_gap_bps=Decimal("20"),
+            exit_gap_bps=Decimal("10"), funding_rate=Decimal("0.0001"),
+            spot_quantity=HAPPY_PLAN_QTY,
+            short_quantity=HAPPY_PLAN_QTY,
+            spot_quote_cap=HAPPY_SPOT_QUOTE_CAP,
+            short_notional=HAPPY_SHORT_NOTIONAL, leverage=1,
+            reason="offline durability test")
+
+    def test_direct_save_syncs_file_and_parent(self):
+        state = self.state()
+        self.assertEqual(
+            self.sync_kinds(lambda: basis_executor.save(state)),
+            ["file", "parent"])
+
+    def test_settle_leg_syncs_file_and_parent_for_each_save(self):
+        def request(method, _base_url, _path, _params, _signed):
+            self.assertEqual(method, "POST")
+            return "ok", {"fills": []}
+
+        def query_order(_state, _venue, order_client_id):
+            return "terminal", {
+                "clientOrderId": order_client_id, "status": "FILLED",
+                "executedQty": "0.1", "cummulativeQuoteQty": "10",
+                "orderId": 123,
+            }
+
+        state = self.state(request=request)
+        self.assertEqual(self.sync_kinds(lambda: basis_executor.settle_leg(
+            state, basis_cycle.ENTER_SPOT, self.plan(),
+            query_order=query_order)),
+            ["file", "parent", "file", "parent"])
+
+    def test_attach_fees_syncs_file_and_parent(self):
+        state = self.state({"legs": [{}]})
+        trades = [{"commission": "0.001", "commissionAsset": "BTC"}]
+        self.assertEqual(self.sync_kinds(
+            lambda: basis_executor.attach_fees(state, 0, trades)),
+            ["file", "parent"])
+
+    def test_mark_source_syncs_file_and_parent(self):
+        path = os.path.join(self.dir, "source.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "source"}, handle)
+        self.assertEqual(self.sync_kinds(lambda: basis_executor.mark_source(
+            path, {"run_id": "source"}, RID, "sold", "0.1")),
+            ["file", "parent"])
+
+    def test_fsync_failure_propagates_as_oserror(self):
+        for failure_call in (1, 2):
+            with self.subTest(failure_call=failure_call):
+                calls = {"count": 0}
+
+                def refuse_one_sync(_descriptor):
+                    calls["count"] += 1
+                    if calls["count"] == failure_call:
+                        raise OSError("simulated receipt sync refusal")
+
+                with mock.patch.object(
+                        basis_executor.os, "fsync",
+                        side_effect=refuse_one_sync):
+                    with self.assertRaises(OSError):
+                        basis_executor.save(self.state())
 
 
 class PlanRefusalTests(ExecutorCase):

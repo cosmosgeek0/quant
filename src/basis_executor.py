@@ -195,14 +195,28 @@ def new_run_id() -> str:
     return format(int(time.time()), "x") + secrets.token_hex(3)
 
 
+def _save_receipt(path: str, receipt: Dict[str, Any], *, private: bool) -> None:
+    """Atomically replace one receipt and seal its file and directory."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=2, default=str)
+        handle.flush()
+        if private:
+            os.chmod(tmp, 0o600)
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    parent = os.path.dirname(path) or "."
+    descriptor = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def save(state: RunState) -> None:
     if not state.receipt_path:
         return
-    tmp = state.receipt_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(state.receipt, handle, indent=2, default=str)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, state.receipt_path)
+    _save_receipt(state.receipt_path, state.receipt, private=True)
 
 
 def first_fail(state: RunState, where: str, detail: Any) -> None:
@@ -1243,10 +1257,7 @@ def mark_source(path: str, receipt: Dict[str, Any], run_id: str,
     receipt = dict(receipt)
     receipt["reconciled_by"] = run_id
     receipt["reconciled_note"] = "%s %s at %s" % (how, amount, utc())
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(receipt, handle, indent=2, default=str)
-    os.replace(tmp, path)
+    _save_receipt(path, receipt, private=False)
 
 
 def reconcile_once(cfg: ExecutorConfig, request,
