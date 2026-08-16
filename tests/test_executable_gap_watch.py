@@ -46,6 +46,14 @@ def stream_record(venues="both", *, at_ms=NOW_MS, **updates):
     return row
 
 
+def accepted_row(symbol, at_ms):
+    return {
+        "utc": utc_text(at_ms), "symbol": symbol, "result": "OK",
+        "entry_gap_pct": "10", "exit_gap_pct": "12",
+        "spot_age_ms": 0, "perp_age_ms": 0, "skew_checked": False,
+    }
+
+
 class ExecutableGapWatchTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -278,6 +286,73 @@ class ExecutableGapWatchTests(unittest.TestCase):
         self.assertEqual(rows["PASTUSDT"]["utc_ahead_ms"], 0)
         self.assertEqual(repeated.rows, ())
         self.assertEqual(len(self.read_rows()), 3)
+
+    def test_future_tolerance_constant_and_literal_edges_match(self):
+        self.assertEqual(watch.RECORD_UTC_FUTURE_TOLERANCE_MS, 2_000)
+        accepted_edges = (
+            watch.RECORD_UTC_FUTURE_TOLERANCE_MS,
+            2_000,
+        )
+        refused_edges = (
+            watch.RECORD_UTC_FUTURE_TOLERANCE_MS + 1,
+            2_001,
+        )
+        for ahead_ms in accepted_edges:
+            with self.subTest(edge="accepted", ahead_ms=ahead_ms):
+                rows, readings, _ = watch.build_rows({
+                    "EDGEUSDT": stream_record(
+                        at_ms=NOW_MS + ahead_ms, book_age_ms="0"),
+                }, NOW_MS)
+                self.assertEqual(rows[0]["result"], "OK")
+                self.assertEqual(len(readings), 1)
+        for ahead_ms in refused_edges:
+            with self.subTest(edge="refused", ahead_ms=ahead_ms):
+                rows, readings, _ = watch.build_rows({
+                    "EDGEUSDT": stream_record(
+                        at_ms=NOW_MS + ahead_ms, book_age_ms="0"),
+                }, NOW_MS)
+                self.assertEqual(rows[0]["result"], "RECORD_UTC_IN_FUTURE")
+                self.assertEqual(readings, ())
+
+    def test_replay_at_literal_2000_restores_and_dedupes_live_cut(self):
+        row = accepted_row("EDGEUSDT", NOW_MS + 2_000)
+        self.output.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+        replayed = watch.replay_history(self.output, NOW_MS)
+
+        self.assertEqual(
+            [cut.utc_text for cut in replayed.series_for("EDGEUSDT")],
+            [utc_text(NOW_MS + 2_000)],
+        )
+        self.write_state({
+            "EDGEUSDT": stream_record(
+                at_ms=NOW_MS + 2_000, book_age_ms="0"),
+        })
+        completed = watch.run_once(self.paths, now_ms=NOW_MS)
+        self.assertEqual(completed.rows, ())
+        self.assertEqual(self.read_rows(), [row])
+
+    def test_replay_at_literal_2001_skips_and_live_cut_refuses(self):
+        replay_row = accepted_row("OVERUSDT", NOW_MS + 2_001)
+        self.output.write_text(
+            json.dumps(replay_row) + "\n", encoding="utf-8")
+
+        replayed = watch.replay_history(self.output, NOW_MS)
+
+        self.assertEqual(replayed.series_for("OVERUSDT"), ())
+        self.write_state({
+            "OVERUSDT": stream_record(
+                at_ms=NOW_MS + 2_001, book_age_ms="0"),
+        })
+        completed = watch.run_once(self.paths, now_ms=NOW_MS)
+        self.assertEqual(completed.history.series_for("OVERUSDT"), ())
+        self.assertEqual(len(completed.rows), 1)
+        self.assertEqual(
+            completed.rows[0]["result"], "RECORD_UTC_IN_FUTURE")
+        self.assertEqual(
+            [row["result"] for row in self.read_rows()],
+            ["OK", "RECORD_UTC_IN_FUTURE"],
+        )
 
     def test_same_record_cut_is_appended_and_recorded_once(self):
         self.write_state({"ONCEUSDT": stream_record()})

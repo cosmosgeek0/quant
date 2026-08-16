@@ -3,10 +3,14 @@
 The input seam follows ``market_stream``: raw book-ticker rows are reduced from
 ``bidPrice``/``askPrice`` (market_stream.py:753-761), then published as the
 Decimal-text fields ``spot_bid``, ``spot_ask``, ``perp_bid``, and ``perp_ask``
-(market_stream.py:1214-1238).  ``VenueQuote`` binds each price pair to its
-venue, observation time, and source-provenance object.  A caller with only one
-shared source/time uses ``read_executable_gap_shared_observation``; its result
-records that paired-venue skew was not checked.
+(market_stream.py:1214-1238).  A source is an upstream producer or feed; an
+observation is one atomic record emitted by that source.  Source labels do not
+prove that two quotes came from different observations.  ``VenueQuote`` binds
+each price pair to its venue, observation time, and a typed observation-record
+identity.  Quotes extracted from one stream record share that identity even if
+the caller supplies unequal venue times.  A caller with only one shared record
+uses ``read_executable_gap_shared_observation``; its result records that
+paired-venue skew was not checked.
 
 This module implements BASIS-LOCKIN-SPEC rows 023-024, 050, 089, 092, and 094.
 Entry is Futures bid minus Spot ask over Spot ask.  Exit is Futures ask minus
@@ -41,9 +45,9 @@ from market_stream import DEFAULT_BASIS_MAX_SKEW_MS
 
 __all__ = [
     "DEFAULT_MAX_QUOTE_AGE_MS", "DEFAULT_MAX_QUOTE_SKEW_MS", "NAMED_WINDOWS",
-    "TimedQuote", "VenueQuote", "ExecutableGapReading", "GapRefusal",
-    "ExecutableGapResult", "GapObservation", "WindowStats", "HistoryQueryError",
-    "quotes_from_stream_record", "read_executable_gap",
+    "TimedQuote", "ObservationRecordId", "VenueQuote", "ExecutableGapReading",
+    "GapRefusal", "ExecutableGapResult", "GapObservation", "WindowStats",
+    "HistoryQueryError", "quotes_from_stream_record", "read_executable_gap",
     "read_executable_gap_shared_observation", "parse_window", "GapHistoryRing",
 ]
 
@@ -72,12 +76,18 @@ class TimedQuote:
     observed_ms: Any
 
 
+@dataclass(frozen=True, eq=False)
+class ObservationRecordId:
+    """Opaque typed identity for one atomic upstream observation record."""
+
+
 @dataclass(frozen=True, init=False)
 class VenueQuote(TimedQuote):
-    """One venue touch with its observation time and provenance object."""
+    """One venue touch with descriptive source and observation identity."""
 
     venue: Literal["spot", "perp"]
     source: Any
+    record_id: Optional[ObservationRecordId]
 
     def __init__(
         self,
@@ -85,13 +95,16 @@ class VenueQuote(TimedQuote):
         bid: Any,
         ask: Any,
         observed_ms: Any,
-        source: Any,
+        source: Any = None,
+        *,
+        record_id: Optional[ObservationRecordId] = None,
     ) -> None:
         object.__setattr__(self, "venue", venue)
         object.__setattr__(self, "bid", bid)
         object.__setattr__(self, "ask", ask)
         object.__setattr__(self, "observed_ms", observed_ms)
         object.__setattr__(self, "source", source)
+        object.__setattr__(self, "record_id", record_id)
 
 
 @dataclass(frozen=True)
@@ -157,19 +170,15 @@ def quotes_from_stream_record(
     spot_observed_ms: Any,
     perp_observed_ms: Any,
 ) -> Tuple[VenueQuote, VenueQuote]:
-    """Adapt a stream row while conservatively tagging caller-made times."""
+    """Adapt one stream observation into quotes with one shared record ID."""
     if not isinstance(record, Mapping):
         raise TypeError("stream record must be a mapping")
-    spot_source = object()
-    same_caller_time = type(spot_observed_ms) is int \
-        and type(perp_observed_ms) is int \
-        and spot_observed_ms == perp_observed_ms
-    perp_source = spot_source if same_caller_time else object()
+    record_id = ObservationRecordId()
     return (
         VenueQuote("spot", record.get("spot_bid"), record.get("spot_ask"),
-                   spot_observed_ms, spot_source),
+                   spot_observed_ms, "market_stream", record_id=record_id),
         VenueQuote("perp", record.get("perp_bid"), record.get("perp_ask"),
-                   perp_observed_ms, perp_source),
+                   perp_observed_ms, "market_stream", record_id=record_id),
     )
 
 
@@ -192,8 +201,7 @@ def _valid_ms(raw: Any) -> bool:
 
 def _valid_quote_for_venue(quote: Any, venue: str) -> bool:
     if isinstance(quote, VenueQuote):
-        return quote.venue == venue and quote.source is not None \
-            and _valid_ms(quote.observed_ms)
+        return quote.venue == venue and _valid_ms(quote.observed_ms)
     return isinstance(quote, TimedQuote) and _valid_ms(quote.observed_ms)
 
 
@@ -202,12 +210,10 @@ def _pair_skew_checked(spot: Any, perp: Any) -> bool:
             or not isinstance(perp, VenueQuote):
         return False
     if not _valid_ms(spot.observed_ms) or not _valid_ms(perp.observed_ms) \
-            or spot.source is None or perp.source is None:
+            or not isinstance(spot.record_id, ObservationRecordId) \
+            or not isinstance(perp.record_id, ObservationRecordId):
         return False
-    same_source = spot.source is perp.source \
-        or type(spot.source) is str and type(perp.source) is str \
-        and spot.source == perp.source
-    return not same_source
+    return spot.record_id is not perp.record_id
 
 
 def _refused(

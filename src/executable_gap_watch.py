@@ -33,7 +33,7 @@ from runtime_paths import PATHS, RuntimePaths
 
 OUTPUT_FILENAME = "executable_gaps.jsonl"; REPLAY_MAX_BYTES = 64 * 1024 * 1024
 REPLAY_WINDOW_MS = 24 * 60 * 60 * 1_000
-# Permit only a small producer/consumer UTC clock difference.
+# Inclusive boundary: +2000 ms is permitted and +2001 ms is future.
 RECORD_UTC_FUTURE_TOLERANCE_MS = 2_000
 VENUES = frozenset(("spot", "perp", "both"))
 STALE_REASONS = frozenset(("SPOT_QUOTE_STALE", "PERP_QUOTE_STALE"))
@@ -114,6 +114,10 @@ def _nonnegative_ms(raw: Any) -> Optional[int]:
     return None
 
 
+def _record_utc_is_permitted(record_ms: int, now_ms: int) -> bool:
+    return record_ms <= now_ms + RECORD_UTC_FUTURE_TOLERANCE_MS
+
+
 def _record_timing(record: Mapping[str, Any], now_ms: int) -> RecordTiming:
     written_ms = _utc_ms(record.get("utc"))
     uses_book_age = "book_age_ms" in record \
@@ -122,8 +126,8 @@ def _record_timing(record: Mapping[str, Any], now_ms: int) -> RecordTiming:
     age_ms = _nonnegative_ms(record.get(age_source))
     utc_ahead_ms = max(0, written_ms - now_ms) \
         if written_ms is not None else None
-    if utc_ahead_ms is not None \
-            and utc_ahead_ms > RECORD_UTC_FUTURE_TOLERANCE_MS:
+    if written_ms is not None \
+            and not _record_utc_is_permitted(written_ms, now_ms):
         return RecordTiming(
             written_ms, None, age_source, utc_ahead_ms,
             "RECORD_UTC_IN_FUTURE")
@@ -252,8 +256,8 @@ def _reading_from_replay_row(row: Any, cutoff_ms: int, now_ms: int):
     if not isinstance(row, dict) or row.get("result") != "OK":
         return None
     row_ms = _utc_ms(row.get("utc"))
-    if row_ms is None or not cutoff_ms <= row_ms \
-            <= now_ms + RECORD_UTC_FUTURE_TOLERANCE_MS:
+    if row_ms is None or row_ms < cutoff_ms \
+            or not _record_utc_is_permitted(row_ms, now_ms):
         return None
     gap_text = (row.get("entry_gap_pct"), row.get("exit_gap_pct"))
     if any(type(value) is not str for value in gap_text):
