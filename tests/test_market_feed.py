@@ -57,6 +57,21 @@ def perp_info(symbol, **overrides):
     return row
 
 
+def metadata_reader(spot=(), perp=()):
+    def reader(base, unused_path, unused_params):
+        symbols, factory = ((spot, spot_info) if base == mf.SPOT_BASE_URL
+                            else (perp, perp_info))
+        return {"symbols": [factory(symbol) for symbol in symbols]}
+    return reader
+
+
+def book_frame(symbol, bid, source_ms=None, stream=None):
+    row = {"s": symbol, "b": str(bid), "a": str(bid + 1)}
+    if source_ms is not None:
+        row["T"] = source_ms
+    return json.dumps({"stream": stream or f"{symbol.lower()}@bookTicker", "data": row})
+
+
 class FakeTransport:
     def __init__(self, chunks=()):
         self.chunks = list(chunks)
@@ -678,6 +693,7 @@ class ReconnectTests(unittest.TestCase):
             feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
                 window=3, reader=reader, utc_fn=lambda: FIXED_UTC,
                 ms_fn=lambda: FIXED_MS + mf.EVENT_QUEUE_MAX + 2)
+            feed.events.subscriptions = {(1, "perp", -1, "AAAUSDT")}
             with mock.patch.object(mf, "run_reconnect_loop", side_effect=flood):
                 worker = threading.Thread(target=feed._worker,
                     args=("perp", -1, mf.FAPI_WS_URL, 1, threading.Event()),
@@ -685,11 +701,12 @@ class ReconnectTests(unittest.TestCase):
                 worker.start()
                 worker.join(1)
             self.assertFalse(worker.is_alive())
-            self.assertEqual((feed.events.qsize(), feed.events.maxsize),
-                (mf.EVENT_QUEUE_MAX + 5,
+            self.assertEqual((feed.events.qsize(), len(feed.events.pending_books),
+                              feed.events.maxsize),
+                (5, 1,
                  mf.EVENT_QUEUE_MAX + mf.EVENT_QUEUE_STATUS_RESERVE))
             status_queue = mf.EventQueue()
-            status = ("attempt", "spot", -1, 1, None)
+            status = ("attempt", "spot", -1, 1, None, FIXED_MS)
             for unused in range(status_queue.maxsize + 1):
                 status_queue.offer(status)
             self.assertEqual((status_queue.qsize(), status_queue.dropped),
@@ -701,12 +718,468 @@ class ReconnectTests(unittest.TestCase):
         self.assertEqual((perp["dropped_frames"], perp["ticker"]["attempts"],
                           perp["ticker"]["successful_handshakes"],
                           perp["ticker"]["last_message_ms"],
-                          perp["ticker"]["status"]), (1, 2, 2, None, "stale"))
-        self.assertEqual(stats.websocket_messages, mf.EVENT_QUEUE_MAX)
+                          perp["ticker"]["status"]),
+                         (0, 2, 2, None, "stale"))
+        self.assertEqual(stats.websocket_messages, 1)
         self.assertEqual((payload["symbols"]["AAAUSDT"]["perp_bid"],
                           payload["symbols"]["AAAUSDT"]["perp_ask"]),
                          (str(mf.EVENT_QUEUE_MAX + 1),
                           str(mf.EVENT_QUEUE_MAX + 2)))
+
+    def test_full_status_queue_keeps_new_cycle_message(self):
+        clock = {
+            "monotonic": 0.0,
+            "ms": FIXED_MS,
+            "started": False,
+            "injected": False,
+        }
+        feed_ref = {}
+
+        def monotonic():
+            feed = feed_ref.get("feed")
+            if (
+                feed is not None
+                and clock["started"]
+                and not clock["injected"]
+                and feed.events.qsize() == 0
+            ):
+                clock["ms"] = FIXED_MS + 200
+                feed.events.offer(
+                    ("connected", "perp", -1, 1, None, clock["ms"])
+                )
+                feed.events.offer((
+                    "text", "perp", -1, 1,
+                    book_frame("AAAUSDT", 20, clock["ms"], "!bookTicker"),
+                    clock["ms"],
+                ))
+                clock["injected"] = True
+            value = clock["monotonic"]
+            clock["monotonic"] += 0.1
+            return value
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(
+                root / "feed.json",
+                root / "STOP",
+                serve=True,
+                window=3,
+                metadata_minutes=100,
+                flush_seconds=100,
+                reader=metadata_reader(perp=("AAAUSDT",)),
+                utc_fn=lambda: FIXED_UTC,
+                ms_fn=lambda: clock["ms"],
+                monotonic_fn=monotonic,
+            )
+            feed_ref["feed"] = feed
+            queue_state = []
+
+            def start_without_socket(unused_urls, generation, unused_stop):
+                feed.events.maxsize = 4
+                feed.events.subscriptions = {
+                    (generation, "perp", -1, "AAAUSDT")
+                }
+                for event in (
+                    ("attempt", "perp", -1, generation, None, FIXED_MS),
+                    ("connected", "perp", -1, generation, None, FIXED_MS),
+                    ("disconnected", "perp", -1, generation, None, FIXED_MS),
+                    ("connected", "spot", 0, generation, None, FIXED_MS),
+                ):
+                    feed.events.offer(event)
+                feed.events.offer((
+                    "text", "perp", -1, generation,
+                    book_frame("AAAUSDT", 10, FIXED_MS, "!bookTicker"),
+                    FIXED_MS,
+                ))
+                feed.events.offer(
+                    ("attempt", "perp", -1, generation, None, FIXED_MS + 1)
+                )
+                queue_state.extend((
+                    feed.events.qsize(),
+                    feed.events.maxsize,
+                    dict(feed.events.dropped),
+                ))
+                clock["started"] = True
+                return []
+
+            connected_message_times = []
+            record_event = feed._record_connection_event
+
+            def observe(kind, venue, shard, message_ms=None):
+                record_event(kind, venue, shard, message_ms)
+                if kind == "connected" and venue == "perp" and shard == -1:
+                    connected_message_times.append(
+                        feed.connections["perp"]["ticker"]["shards"][0][
+                            "last_message_ms"
+                        ]
+                    )
+
+            feed._record_connection_event = observe
+            feed._start_workers = start_without_socket
+            stats = feed.run(0.7)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        ticker = payload["connections"]["perp"]["ticker"]
+        self.assertEqual(queue_state, [4, 4, {(1, "perp"): 1}])
+        self.assertEqual(connected_message_times, [None, None])
+        self.assertEqual((stats.reconnects, stats.websocket_messages,
+                          payload["connections"]["perp"]["dropped_frames"],
+                          payload["symbols"]["AAAUSDT"]["perp_bid"],
+                          ticker["last_message_ms"], ticker["status"]),
+                         (1, 2, 1, "20", str(FIXED_MS + 200), "healthy"))
+
+    def test_book_coalescing_keeps_each_symbol_fresh_and_open_kline_out(self):
+        def reader(base, unused_path, unused_params):
+            symbols = ([spot_info("AAAUSDT"), spot_info("BBBUSDT")]
+                       if base == mf.SPOT_BASE_URL else [])
+            return {"symbols": symbols}
+
+        def book_frame(symbol, value):
+            return json.dumps({"stream": f"{symbol.lower()}@bookTicker", "data": {
+                "s": symbol, "b": str(value), "a": str(value + 1)}})
+
+        open_kline = json.dumps({"stream": "aaausdt@kline_1m", "data": {"k": {
+            "s": "AAAUSDT", "i": "1m", "x": False, "T": FIXED_MS, "q": "1"}}})
+        status_kinds = ["attempt", "connected", "disconnected", "attempt", "connected"]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=reader, utc_fn=lambda: FIXED_UTC,
+                ms_fn=lambda: FIXED_MS + 10)
+            with mock.patch.object(mf, "EVENT_QUEUE_MAX", 2):
+                feed.events = mf.EventQueue()
+                feed.events.subscriptions = {
+                    (1, "spot", -1, "AAAUSDT"),
+                    (1, "spot", -2, "BBBUSDT"),
+                }
+                for cycle in range(6):
+                    feed.events.offer(("text", "spot", -1, 1,
+                                       book_frame("AAAUSDT", 100 + cycle), FIXED_MS + 10))
+                    feed.events.offer(("text", "spot", -2, 1,
+                                       book_frame("BBBUSDT", 200 + cycle), FIXED_MS + 10))
+                    if cycle < len(status_kinds):
+                        feed.events.offer((status_kinds[cycle], "spot", -1, 1,
+                                           None, FIXED_MS + 10))
+                queued_before = feed.events.qsize()
+                feed.events.offer(("text", "spot", 0, 1, open_kline, FIXED_MS + 10))
+            self.assertEqual(feed.events.maxsize, 2 + mf.EVENT_QUEUE_STATUS_RESERVE)
+            self.assertEqual(feed.events.qsize(), queued_before)
+            self.assertNotIn(open_kline, [event[4] for event in feed.events.queue])
+            self.assertEqual(set(feed.events.pending_books),
+                {(1, "spot", "AAAUSDT"), (1, "spot", "BBBUSDT")})
+            self.assertEqual(feed.events.dropped, {})
+            observed = []
+            record_event = feed._record_connection_event
+
+            def observe(kind, venue, shard, message_ms=None):
+                observed.append(kind)
+                record_event(kind, venue, shard, message_ms)
+
+            feed._record_connection_event = observe
+            feed._start_workers = lambda *unused: []
+            stats = feed.run(0.01)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        self.assertEqual(observed, status_kinds + ["message", "message"])
+        self.assertEqual(stats.websocket_messages, 2)
+        self.assertEqual(payload["connections"]["spot"]["dropped_frames"], 0)
+        aaa, bbb = payload["symbols"]["AAAUSDT"], payload["symbols"]["BBBUSDT"]
+        self.assertEqual((aaa["spot_bid"], aaa["freshness_ms"]), ("105", "0"))
+        self.assertEqual((bbb["spot_bid"], bbb["freshness_ms"]), ("205", "0"))
+
+    def test_pre_disconnect_book_does_not_credit_reconnected_cycle(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=metadata_reader(perp=("AAAUSDT",)),
+                utc_fn=lambda: FIXED_UTC, ms_fn=lambda: FIXED_MS + 10)
+            feed.events.subscriptions = {(1, "perp", -1, "AAAUSDT")}
+            events = [
+                ("attempt", "perp", -1, 1, None, FIXED_MS),
+                ("connected", "perp", -1, 1, None, FIXED_MS + 1),
+                ("text", "perp", -1, 1,
+                 book_frame("AAAUSDT", 10, FIXED_MS + 2, "!bookTicker"), FIXED_MS + 2),
+                ("disconnected", "perp", -1, 1, None, FIXED_MS + 3),
+                ("attempt", "perp", -1, 1, None, FIXED_MS + 4),
+                ("connected", "perp", -1, 1, None, FIXED_MS + 5),
+            ]
+            for event in events:
+                feed.events.offer(event)
+            feed._start_workers = lambda *unused: []
+            stats = feed.run(0.01)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        ticker = payload["connections"]["perp"]["ticker"]
+        self.assertEqual((ticker["attempts"], ticker["successful_handshakes"],
+                          ticker["last_message_ms"], ticker["status"]),
+                         (2, 2, None, "stale"))
+        self.assertEqual((stats.websocket_messages,
+                          payload["symbols"]["AAAUSDT"]["perp_bid"]), (1, "10"))
+
+    def test_coalescing_validates_stream_and_perp_source_order(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=metadata_reader(
+                    spot=("AAAUSDT", "BBBUSDT"), perp=("BBBUSDT",)),
+                utc_fn=lambda: FIXED_UTC, ms_fn=lambda: FIXED_MS + 300)
+            feed.events.subscriptions = {
+                (1, "spot", -1, "AAAUSDT"),
+                (1, "spot", -1, "BBBUSDT"),
+                (1, "perp", -1, "BBBUSDT"),
+            }
+            feed.events.offer(("text", "spot", -1, 1,
+                book_frame("BBBUSDT", 20), FIXED_MS))
+            feed.events.offer(("text", "spot", -1, 1,
+                book_frame("BBBUSDT", 90, stream="aaausdt@bookTicker"), FIXED_MS + 1))
+            feed.events.offer(("text", "perp", -1, 1,
+                book_frame("BBBUSDT", 200, FIXED_MS + 200, "!bookTicker"), FIXED_MS + 2))
+            feed.events.offer(("text", "perp", -1, 1,
+                book_frame("BBBUSDT", 100, FIXED_MS + 100, "!bookTicker"), FIXED_MS + 3))
+            spot_pending = feed.events.pending_books[(1, "spot", "BBBUSDT")][1]
+            perp_pending = feed.events.pending_books[(1, "perp", "BBBUSDT")][1]
+            self.assertEqual((json.loads(spot_pending[4])["data"]["b"],
+                              json.loads(perp_pending[4])["data"]["b"],
+                              feed.events.qsize()), ("20", "200", 1))
+            feed._start_workers = lambda *unused: []
+            stats = feed.run(0.01)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        bbb = payload["symbols"]["BBBUSDT"]
+        self.assertEqual((stats.invalid_messages, bbb["spot_bid"], bbb["perp_bid"]),
+                         (1, "20", "200"))
+
+    def test_non_ascii_perp_source_uses_receipt_and_worker_continues(self):
+        continued = []
+
+        def receive_two(unused_url, on_text, **callbacks):
+            callbacks["on_attempt"]()
+            callbacks["on_connect"]()
+            on_text(book_frame("AAAUSDT", 10, "²", "!bookTicker"))
+            continued.append("first")
+            on_text(book_frame("BBBUSDT", 20, FIXED_MS + 1, "!bookTicker"))
+            continued.append("second")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(
+                root / "feed.json",
+                root / "STOP",
+                serve=True,
+                window=3,
+                ms_fn=lambda: FIXED_MS,
+            )
+            feed.events.subscriptions = {
+                (1, "perp", -1, "AAAUSDT"),
+                (1, "perp", -1, "BBBUSDT"),
+            }
+            with mock.patch.object(
+                mf, "run_reconnect_loop", side_effect=receive_two
+            ):
+                feed._worker(
+                    "perp", -1, mf.FAPI_WS_URL, 1, threading.Event()
+                )
+        self.assertEqual(continued, ["first", "second"])
+        self.assertEqual(
+            (feed.events.pending_books[(1, "perp", "AAAUSDT")][0],
+             feed.events.pending_books[(1, "perp", "BBBUSDT")][0]),
+            (FIXED_MS, FIXED_MS + 1),
+        )
+
+    def test_perp_source_floor_and_reconnect_credit_survive_coalescing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=metadata_reader(perp=("AAAUSDT",)),
+                utc_fn=lambda: FIXED_UTC, ms_fn=lambda: FIXED_MS + 400)
+            feed._refresh_metadata()
+            stream, rows = mf.parse_combined_message(
+                book_frame("AAAUSDT", 300, FIXED_MS + 300, "!bookTicker"))
+            mf.merge_ticker_rows(feed.state, "perp", stream, rows, FIXED_UTC,
+                                 FIXED_MS + 300, feed.seen_ms)
+            feed.events.subscriptions = {(1, "perp", -1, "AAAUSDT")}
+            for event in [
+                ("attempt", "perp", -1, 1, None, FIXED_MS),
+                ("connected", "perp", -1, 1, None, FIXED_MS + 1),
+                ("text", "perp", -1, 1,
+                 book_frame("AAAUSDT", 200, FIXED_MS + 200, "!bookTicker"), FIXED_MS + 2),
+                ("disconnected", "perp", -1, 1, None, FIXED_MS + 3),
+                ("attempt", "perp", -1, 1, None, FIXED_MS + 4),
+                ("connected", "perp", -1, 1, None, FIXED_MS + 5),
+                ("text", "perp", -1, 1,
+                 book_frame("AAAUSDT", 100, FIXED_MS + 100, "!bookTicker"), FIXED_MS + 6),
+            ]:
+                feed.events.offer(event)
+            retained = feed.events.pending_books[(1, "perp", "AAAUSDT")][1]
+            credited = feed.events.pending_messages[(1, "perp", -1)]
+            self.assertEqual((json.loads(retained[4])["data"]["b"],
+                              json.loads(credited[4])["data"]["b"]), ("200", "100"))
+            feed._start_workers = lambda *unused: []
+            stats = feed.run(0.01)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        ticker = payload["connections"]["perp"]["ticker"]
+        self.assertEqual((payload["symbols"]["AAAUSDT"]["perp_bid"],
+                          feed.seen_ms["AAAUSDT"]["perp"],
+                          ticker["last_message_ms"], ticker["status"],
+                          stats.websocket_messages),
+                         ("300", FIXED_MS + 300, str(FIXED_MS + 400), "healthy", 1))
+
+    def test_metadata_restart_accounts_pending_book_and_admits_joiner(self):
+        spot_reads = {"count": 0}
+
+        def reader(base, unused_path, unused_params):
+            if base != mf.SPOT_BASE_URL:
+                return {"symbols": []}
+            spot_reads["count"] += 1
+            symbols = ("AAAUSDT",) if spot_reads["count"] == 1 else ("AAAUSDT", "BBBUSDT")
+            return {"symbols": [spot_info(symbol) for symbol in symbols]}
+
+        ticks = iter((0.0, 0.0, 0.0, 2.0, 2.5, 4.0, 5.0))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, metadata_minutes=1 / 60, flush_seconds=100,
+                reader=reader, utc_fn=lambda: FIXED_UTC,
+                ms_fn=lambda: FIXED_MS, monotonic_fn=lambda: next(ticks))
+            start_workers = feed._start_workers
+            generations = []
+
+            def start_without_sockets(urls, generation, worker_stop):
+                generations.append(generation)
+                with mock.patch.object(threading.Thread, "start"):
+                    start_workers(urls, generation, worker_stop)
+                if generation == 1:
+                    feed.events.offer(("text", "spot", -1, 1,
+                                       book_frame("AAAUSDT", 10), FIXED_MS))
+                else:
+                    feed.events.offer(("attempt", "spot", -1, generation,
+                                       None, FIXED_MS))
+                return []
+
+            feed._start_workers = start_without_sockets
+            stats = feed.run(3.0)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        self.assertEqual((generations, stats.metadata_refreshes,
+                          payload["connections"]["spot"]["dropped_frames"]),
+                         ([1, 2], 2, 1))
+        self.assertIn("BBBUSDT", payload["symbols"])
+        self.assertIn((2, "spot", -1, "BBBUSDT"), feed.events.subscriptions)
+        self.assertEqual(feed.events.pending_books, {})
+
+    def test_stale_generation_drop_reaches_venue_total(self):
+        spot_reads = {"count": 0}
+
+        def reader(base, unused_path, unused_params):
+            if base != mf.SPOT_BASE_URL:
+                return {"symbols": []}
+            spot_reads["count"] += 1
+            symbols = (
+                ("AAAUSDT",)
+                if spot_reads["count"] == 1
+                else ("AAAUSDT", "BBBUSDT")
+            )
+            return {"symbols": [spot_info(symbol) for symbol in symbols]}
+
+        ticks = iter((0.0, 0.0, 0.0, 2.0, 2.5, 4.0, 5.0))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(
+                root / "feed.json",
+                root / "STOP",
+                serve=True,
+                window=3,
+                metadata_minutes=1 / 60,
+                flush_seconds=100,
+                reader=reader,
+                utc_fn=lambda: FIXED_UTC,
+                ms_fn=lambda: FIXED_MS,
+                monotonic_fn=lambda: next(ticks),
+            )
+            start_workers = feed._start_workers
+
+            def start_without_sockets(urls, generation, worker_stop):
+                with mock.patch.object(threading.Thread, "start"):
+                    start_workers(urls, generation, worker_stop)
+                if generation == 2:
+                    feed.events.offer((
+                        "text", "spot", -1, 2,
+                        book_frame("AAAUSDT", 20), FIXED_MS + 2,
+                    ))
+                    feed.events.offer((
+                        "text", "spot", -1, 1,
+                        book_frame("AAAUSDT", 5), FIXED_MS + 1,
+                    ))
+                return []
+
+            feed._start_workers = start_without_sockets
+            stats = feed.run(3.0)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        self.assertEqual((stats.websocket_messages,
+                          payload["symbols"]["AAAUSDT"]["spot_bid"],
+                          payload["connections"]["spot"]["dropped_frames"]),
+                         (1, "20", 1))
+
+    def test_unsubscribed_shard_book_cannot_replace_subscribed_book(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, utc_fn=lambda: FIXED_UTC, ms_fn=lambda: FIXED_MS)
+            feed.state = {"AAAUSDT": mf.empty_record(FIXED_UTC, "spot")}
+            feed.state.update({f"S{index:03d}USDT": mf.empty_record(FIXED_UTC, "spot")
+                               for index in range(mf.MAX_STREAMS_PER_CONNECTION)})
+            with mock.patch.object(threading.Thread, "start"):
+                feed._start_workers(mf.websocket_urls(feed.state), 1, threading.Event())
+            self.assertIn((1, "spot", -1, "AAAUSDT"), feed.events.subscriptions)
+            self.assertNotIn((1, "spot", -2, "AAAUSDT"), feed.events.subscriptions)
+            feed.events.offer(("text", "spot", -1, 1,
+                               book_frame("AAAUSDT", 10), FIXED_MS))
+            feed.events.offer(("text", "spot", -2, 1,
+                               book_frame("AAAUSDT", 5), FIXED_MS + 1))
+            pending = feed.events.pending_books[(1, "spot", "AAAUSDT")][1]
+        self.assertEqual((json.loads(pending[4])["data"]["b"],
+                          set(feed.events.pending_messages), feed.events.dropped),
+                         ("10", {(1, "spot", -1)}, {(1, "spot"): 1}))
+
+    def test_spot_queue_residence_preserves_receipt_ms(self):
+        clock = {"ms": FIXED_MS}
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=metadata_reader(spot=("AAAUSDT",)),
+                utc_fn=lambda: FIXED_UTC, ms_fn=lambda: clock["ms"])
+            feed.events.subscriptions = {(1, "spot", -1, "AAAUSDT")}
+
+            def emit_one(unused_url, on_text, **callbacks):
+                callbacks["on_attempt"]()
+                callbacks["on_connect"]()
+                on_text(book_frame("AAAUSDT", 30))
+
+            with mock.patch.object(mf, "run_reconnect_loop", side_effect=emit_one):
+                feed._worker("spot", -1, mf.SPOT_WS_URL, 1, threading.Event())
+            clock["ms"] += 250
+            feed._start_workers = lambda *unused: []
+            feed.run(0.01)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        ticker = payload["connections"]["spot"]["ticker"]
+        self.assertEqual(feed.seen_ms["AAAUSDT"]["spot"], FIXED_MS)
+        self.assertEqual((payload["symbols"]["AAAUSDT"]["freshness_ms"],
+                          ticker["last_message_ms"]), ("250", str(FIXED_MS + 250)))
+
+    def test_unsubscribed_books_are_bounded_and_accounted(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=metadata_reader(spot=("AAAUSDT",)),
+                utc_fn=lambda: FIXED_UTC, ms_fn=lambda: FIXED_MS)
+            feed._refresh_metadata()
+            with mock.patch.object(threading.Thread, "start"):
+                feed._start_workers(mf.websocket_urls(feed.state), 1, threading.Event())
+            for index in range(3):
+                symbol = f"X{index:03d}USDT"
+                feed.events.offer(("text", "spot", -1, 1,
+                                   book_frame(symbol, index + 1), FIXED_MS + index))
+            self.assertEqual((feed.events.pending_books, feed.events.qsize(),
+                              feed.events.dropped), ({}, 0, {(1, "spot"): 3}))
+            feed._start_workers = lambda *unused: []
+            feed.run(0.01)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["connections"]["spot"]["dropped_frames"], 3)
 
     def test_exponential_reconnect_with_injected_clients(self):
         stopped = {"value": False}
