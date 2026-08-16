@@ -40,8 +40,11 @@ METRIC_FIELDS = {
 STRIP_METRICS = ("server", "mirror", "market", "supervisor")
 HEALTH_METRICS = ("basiswatch", "basissup", "jobrunner")
 NEWS_SOURCES_PATH = BASE / "live" / "news_sources.json"
-STRIP_URL = "http://127.0.0.1:8899/api/strip"
-HEALTH_URL = "http://127.0.0.1:8899/api/health"
+# The dashboard this recorder samples: 8899 on the Mac; on the host the
+# service sets QUANT_UI_URL to the port serve.py actually listens on.
+_UI_BASE = os.environ.get("QUANT_UI_URL", "http://127.0.0.1:8899").rstrip("/")
+STRIP_URL = _UI_BASE + "/api/strip"
+HEALTH_URL = _UI_BASE + "/api/health"
 FETCH_TIMEOUT = 4
 TRIM_AT_LINES = 220000
 KEEP_LINES = 200000
