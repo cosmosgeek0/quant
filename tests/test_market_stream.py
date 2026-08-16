@@ -105,6 +105,7 @@ def feed_row(venues, bid, ask, closed=()):
         "perp_bid": None,
         "perp_ask": None,
         "freshness_ms": "4",
+        "book_age_ms": "4",
         "closed_1m": [[str(close_ms), str(volume)] for close_ms, volume in closed],
     }
     prefix = "perp" if venues == "perp" else "spot"
@@ -228,6 +229,46 @@ class OfflineCase(unittest.TestCase):
 
 
 class SchemaCompletenessTests(OfflineCase):
+    def test_book_age_is_the_only_additive_tail_field(self):
+        prior_fields = (
+            "utc",
+            "venues",
+            "spot_bid",
+            "spot_ask",
+            "spot_step",
+            "spot_min_notional",
+            "perp_bid",
+            "perp_ask",
+            "perp_step",
+            "perp_min_notional",
+            "mark",
+            "vol_1m_quote",
+            "vol_med_1m",
+            "surge_ratio",
+            "oi",
+            "oi_change_pct",
+            "funding_rate",
+            "next_funding_ms",
+            "basis_gap_pct",
+            "freshness_ms",
+        )
+
+        self.assertEqual(ms.STATE_FIELDS[:-1], prior_fields)
+        self.assertEqual(ms.STATE_FIELDS[-1], "book_age_ms")
+
+    def test_state_without_book_age_loads_with_unknown_tail(self):
+        old_record = {field: None for field in ms.STATE_FIELDS[:-1]}
+        old_record["utc"] = FIXED_UTC
+        old_record["venues"] = "both"
+        self.state_path.write_text(
+            json.dumps({"AAAUSDT": old_record}), encoding="utf-8"
+        )
+
+        loaded = ms.load_state(self.state_path)["AAAUSDT"]
+
+        self.assertEqual(tuple(loaded), ms.STATE_FIELDS)
+        self.assertIsNone(loaded["book_age_ms"])
+
     def test_every_venue_class_has_exact_frozen_schema(self):
         reader = FixtureReader(
             spot=[
@@ -287,14 +328,17 @@ class SchemaCompletenessTests(OfflineCase):
         self.assertIsNone(spot_only["oi"])
         self.assertIsNone(spot_only["funding_rate"])
         self.assertIsNone(spot_only["basis_gap_pct"])
+        self.assertIsNone(spot_only["book_age_ms"])
 
         perp_only = state["CCCUSDT"]
         self.assertIsNone(perp_only["spot_bid"])
         self.assertEqual(perp_only["oi"], "200")
         self.assertIsNone(perp_only["basis_gap_pct"])
+        self.assertIsNone(perp_only["book_age_ms"])
 
         shared = state["BBBUSDT"]
         self.assertEqual(shared["basis_gap_pct"], "9.0909090909090909090909090909090909090909090909091")
+        self.assertEqual(shared["book_age_ms"], "0")
         self.assertEqual(stats.total, 3)
         self.assertEqual((stats.spot_only, stats.perp_only, stats.both), (1, 1, 1))
         self.assertEqual(stats.request_count, 10)
@@ -313,6 +357,40 @@ class SchemaCompletenessTests(OfflineCase):
         record = self.read_state()["AAAUSDT"]
         self.assertIsNone(record["spot_bid"])
         self.assertIsNone(record["spot_ask"])
+
+    def test_old_oi_age_does_not_expand_book_age(self):
+        three_hours_ms = 3 * 60 * 60 * 1_000
+        clock = iter(
+            (
+                FIXED_MS,
+                FIXED_MS,
+                FIXED_MS,
+                FIXED_MS,
+                FIXED_MS,
+                FIXED_MS + 5_000,
+            )
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100"), book("BBBUSDT", "199", "200")],
+            perp=[book("AAAUSDT", "101", "102"), book("BBBUSDT", "201", "202")],
+            premiums=[premium("AAAUSDT", "101"), premium("BBBUSDT", "201")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        stream = self.stream(
+            reader, focus_cap=1, ms_fn=lambda: next(clock)
+        )
+        stream.state["BBBUSDT"] = {"venues": "both", "oi": "20"}
+        stream.sidecar["symbols"]["BBBUSDT"] = {
+            "closed_1m": [],
+            "last_oi_ms": str(FIXED_MS - three_hours_ms),
+        }
+
+        stream.run_once()
+        record = self.read_state()["BBBUSDT"]
+
+        self.assertEqual(record["freshness_ms"], str(three_hours_ms + 5_000))
+        self.assertEqual(record["book_age_ms"], "5000")
 
     def test_both_venue_records_are_stamped_with_executable_metadata(self):
         reader = FixtureReader(
@@ -678,6 +756,7 @@ class LiveFeedMergeTests(OfflineCase):
         record = self.read_state()["AAAUSDT"]
         self.assertEqual((record["spot_ask"], record["perp_bid"]), ("90", "90"))
         self.assertEqual(record["basis_gap_pct"], "0")
+        self.assertEqual(record["book_age_ms"], "4")
 
     def test_feed_leg_age_uncertainty_over_skew_bound_keeps_basis_unknown(self):
         both = feed_row("spot", "89", "90")
@@ -735,6 +814,9 @@ class FeedDispositionTests(OfflineCase):
 
         self.assertIsNotNone(result.snapshot)
         self.assertEqual(result.reason, "accepted")
+        self.assertEqual(
+            result.snapshot.symbols["AAAUSDT"]["book_age_ms"], "4"
+        )
 
     def test_feed_written_beyond_future_skew_is_rejected(self):
         self.write_feed(

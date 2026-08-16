@@ -115,6 +115,7 @@ STATE_FIELDS = (
     "next_funding_ms",
     "basis_gap_pct",
     "freshness_ms",
+    "book_age_ms",
 )
 SIZING_FIELDS = frozenset({
     "spot_step",
@@ -347,6 +348,7 @@ def _validate_numeric_text(raw: Any, source: str) -> None:
 
 
 def load_state(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load state, treating the additive book-age tail as unknown when absent."""
     path = Path(path)
     if not path.exists():
         return {}
@@ -359,6 +361,9 @@ def load_state(path: Path) -> Dict[str, Dict[str, Any]]:
         symbol = _valid_symbol(raw_symbol)
         if symbol is None or not isinstance(raw_record, dict):
             raise DataReadError("stream state has an invalid symbol record")
+        if "book_age_ms" not in raw_record:
+            raw_record = dict(raw_record)
+            raw_record["book_age_ms"] = None
         record_fields = set(raw_record)
         if record_fields == expected - SIZING_FIELDS:
             raw_record = dict(raw_record)
@@ -454,6 +459,7 @@ def load_fresh_feed_state(
                 "perp_bid",
                 "perp_ask",
                 "freshness_ms",
+                "book_age_ms",
             )
         }
         if clean_record["venues"] not in VENUE_VALUES:
@@ -470,16 +476,21 @@ def load_fresh_feed_state(
                     _validate_numeric_text(raw, f"feed {symbol}.{field}")
                 except DataReadError:
                     return FeedLoadResult(None, f"{field}_invalid")
-        raw_freshness = clean_record["freshness_ms"]
-        if raw_freshness is not None:
-            if not isinstance(raw_freshness, str):
-                return FeedLoadResult(None, "freshness_not_string")
+        for age_field, reason_prefix in (
+            ("freshness_ms", "freshness"),
+            ("book_age_ms", "book_age"),
+        ):
+            raw_age = clean_record[age_field]
+            if raw_age is None:
+                continue
+            if not isinstance(raw_age, str):
+                return FeedLoadResult(None, f"{reason_prefix}_not_string")
             try:
-                freshness = int(raw_freshness)
+                age = int(raw_age)
             except ValueError:
-                return FeedLoadResult(None, "freshness_invalid")
-            if freshness < 0:
-                return FeedLoadResult(None, "freshness_negative")
+                return FeedLoadResult(None, f"{reason_prefix}_invalid")
+            if age < 0:
+                return FeedLoadResult(None, f"{reason_prefix}_negative")
         clean_record["closed_1m"] = clean_closed
         symbols[symbol] = clean_record
     return FeedLoadResult(
@@ -1236,6 +1247,7 @@ class MarketStream:
             "next_funding_ms": next_funding_ms,
             "basis_gap_pct": None,
             "freshness_ms": "0",
+            "book_age_ms": None,
         }
 
     def _focus_symbol(
@@ -1329,6 +1341,7 @@ class MarketStream:
 
         records: Dict[str, Dict[str, Any]] = {}
         feed_ticker_ages: Dict[str, int] = {}
+        book_quote_ages: Dict[str, int] = {}
         for symbol in universe:
             venue = venue_for(symbol, spot, perp)
             records[symbol] = self._base_record(
@@ -1382,6 +1395,20 @@ class MarketStream:
                 self.feed_max_age_ms,
                 self.basis_max_skew_ms,
             )
+            observation_ages: List[int] = []
+            for venue_name in ("spot", "perp"):
+                observation = observations.get(venue_name)
+                if observation is None:
+                    break
+                source, earliest_ms, _ = observation
+                if source == "feed":
+                    observation_ages.append(feed_ticker_ages[symbol])
+                else:
+                    observation_ages.append(
+                        _clamped_age_ms(pass_start_ms, earliest_ms)
+                    )
+            if len(observation_ages) == 2:
+                book_quote_ages[symbol] = max(observation_ages)
         scores = {
             symbol: move_score(records[symbol], self.state.get(symbol))
             for symbol in universe
@@ -1403,12 +1430,13 @@ class MarketStream:
 
         completed_ms = self.ms_fn()
         completed_utc = self.utc_fn()
+        pass_duration_ms = max(0, completed_ms - pass_start_ms)
         for symbol, record in records.items():
             meta = self.sidecar["symbols"].get(symbol, {})
-            ages = [max(0, completed_ms - pass_start_ms)]
+            ages = [pass_duration_ms]
             if symbol in feed_ticker_ages:
                 ages.append(
-                    feed_ticker_ages[symbol] + max(0, completed_ms - pass_start_ms)
+                    feed_ticker_ages[symbol] + pass_duration_ms
                 )
             if record["vol_1m_quote"] is not None and meta.get("last_volume_close_ms"):
                 ages.append(max(0, completed_ms - int(meta["last_volume_close_ms"])))
@@ -1416,6 +1444,11 @@ class MarketStream:
                 ages.append(max(0, completed_ms - int(meta["last_oi_ms"])))
             record["utc"] = completed_utc
             record["freshness_ms"] = str(max(ages))
+            record["book_age_ms"] = (
+                str(book_quote_ages[symbol] + pass_duration_ms)
+                if symbol in book_quote_ages
+                else None
+            )
             # Construction order and key set are frozen for downstream consumers.
             records[symbol] = {field: record[field] for field in STATE_FIELDS}
 
