@@ -3,10 +3,10 @@
 The input seam follows ``market_stream``: raw book-ticker rows are reduced from
 ``bidPrice``/``askPrice`` (market_stream.py:753-761), then published as the
 Decimal-text fields ``spot_bid``, ``spot_ask``, ``perp_bid``, and ``perp_ask``
-(market_stream.py:1214-1238).  ``quotes_from_stream_record`` binds those prices
-to the venue observation times retained by the caller.  A caller with only one
-shared time uses ``read_executable_gap_shared_observation``; its result records
-that paired-venue skew was not checked.
+(market_stream.py:1214-1238).  ``VenueQuote`` binds each price pair to its
+venue, observation time, and source-provenance object.  A caller with only one
+shared source/time uses ``read_executable_gap_shared_observation``; its result
+records that paired-venue skew was not checked.
 
 This module implements BASIS-LOCKIN-SPEC rows 023-024, 050, 089, 092, and 094.
 Entry is Futures bid minus Spot ask over Spot ask.  Exit is Futures ask minus
@@ -41,8 +41,8 @@ from market_stream import DEFAULT_BASIS_MAX_SKEW_MS
 
 __all__ = [
     "DEFAULT_MAX_QUOTE_AGE_MS", "DEFAULT_MAX_QUOTE_SKEW_MS", "NAMED_WINDOWS",
-    "TimedQuote", "ExecutableGapReading", "GapRefusal", "ExecutableGapResult",
-    "GapObservation", "WindowStats", "HistoryQueryError",
+    "TimedQuote", "VenueQuote", "ExecutableGapReading", "GapRefusal",
+    "ExecutableGapResult", "GapObservation", "WindowStats", "HistoryQueryError",
     "quotes_from_stream_record", "read_executable_gap",
     "read_executable_gap_shared_observation", "parse_window", "GapHistoryRing",
 ]
@@ -65,11 +65,33 @@ RefusalReason = Literal[
 
 @dataclass(frozen=True)
 class TimedQuote:
-    """One venue's best bid/ask and the local source observation epoch-ms."""
+    """Legacy best bid/ask shape without explicit venue provenance."""
 
     bid: Any
     ask: Any
     observed_ms: Any
+
+
+@dataclass(frozen=True, init=False)
+class VenueQuote(TimedQuote):
+    """One venue touch with its observation time and provenance object."""
+
+    venue: Literal["spot", "perp"]
+    source: Any
+
+    def __init__(
+        self,
+        venue: Literal["spot", "perp"],
+        bid: Any,
+        ask: Any,
+        observed_ms: Any,
+        source: Any,
+    ) -> None:
+        object.__setattr__(self, "venue", venue)
+        object.__setattr__(self, "bid", bid)
+        object.__setattr__(self, "ask", ask)
+        object.__setattr__(self, "observed_ms", observed_ms)
+        object.__setattr__(self, "source", source)
 
 
 @dataclass(frozen=True)
@@ -108,6 +130,7 @@ class GapObservation:
     utc_text: str
     entry_gap_pct: Decimal
     exit_gap_pct: Decimal
+    skew_checked: bool = True
 
 
 @dataclass(frozen=True)
@@ -133,15 +156,20 @@ def quotes_from_stream_record(
     *,
     spot_observed_ms: Any,
     perp_observed_ms: Any,
-) -> Tuple[TimedQuote, TimedQuote]:
-    """Adapt one unchanged ``market_stream`` symbol record into timed quotes."""
+) -> Tuple[VenueQuote, VenueQuote]:
+    """Adapt a stream row while conservatively tagging caller-made times."""
     if not isinstance(record, Mapping):
         raise TypeError("stream record must be a mapping")
+    spot_source = object()
+    same_caller_time = type(spot_observed_ms) is int \
+        and type(perp_observed_ms) is int \
+        and spot_observed_ms == perp_observed_ms
+    perp_source = spot_source if same_caller_time else object()
     return (
-        TimedQuote(record.get("spot_bid"), record.get("spot_ask"),
-                   spot_observed_ms),
-        TimedQuote(record.get("perp_bid"), record.get("perp_ask"),
-                   perp_observed_ms),
+        VenueQuote("spot", record.get("spot_bid"), record.get("spot_ask"),
+                   spot_observed_ms, spot_source),
+        VenueQuote("perp", record.get("perp_bid"), record.get("perp_ask"),
+                   perp_observed_ms, perp_source),
     )
 
 
@@ -160,6 +188,30 @@ def _price(raw: Any) -> Optional[Decimal]:
 
 def _valid_ms(raw: Any) -> bool:
     return not isinstance(raw, bool) and isinstance(raw, int) and raw >= 0
+
+
+def _valid_quote_for_venue(quote: Any, venue: str) -> bool:
+    if isinstance(quote, VenueQuote):
+        return quote.venue == venue and quote.source is not None \
+            and _valid_ms(quote.observed_ms)
+    return isinstance(quote, TimedQuote) and _valid_ms(quote.observed_ms)
+
+
+def _pair_skew_checked(spot: Any, perp: Any) -> bool:
+    if not _valid_ms(getattr(spot, "observed_ms", None)) \
+            or not _valid_ms(getattr(perp, "observed_ms", None)):
+        return False
+    if isinstance(spot, VenueQuote) and isinstance(perp, VenueQuote):
+        same_source = spot.source is perp.source \
+            or type(spot.source) is str and type(perp.source) is str \
+            and spot.source == perp.source
+        return not (
+            same_source
+            and spot.observed_ms == perp.observed_ms
+        )
+    if isinstance(spot, TimedQuote) and isinstance(perp, TimedQuote):
+        return spot.observed_ms != perp.observed_ms
+    return False
 
 
 def _refused(
@@ -207,9 +259,9 @@ def _read_executable_gap(
         return refused("AGE_BOUND_INVALID")
     if not _valid_ms(max_skew_ms):
         return refused("SKEW_BOUND_INVALID")
-    if not isinstance(spot, TimedQuote) or not _valid_ms(spot.observed_ms):
+    if not _valid_quote_for_venue(spot, "spot"):
         return refused("SPOT_QUOTE_INVALID")
-    if not isinstance(perp, TimedQuote) or not _valid_ms(perp.observed_ms):
+    if not _valid_quote_for_venue(perp, "perp"):
         return refused("PERP_QUOTE_INVALID")
 
     spot_age = now_ms - spot.observed_ms
@@ -256,12 +308,12 @@ def read_executable_gap(
     max_age_ms: Any = DEFAULT_MAX_QUOTE_AGE_MS,
     max_skew_ms: Any = DEFAULT_MAX_QUOTE_SKEW_MS,
 ) -> ExecutableGapResult:
-    """Read quotes with genuine per-venue times and enforce their skew."""
+    """Read a venue pair and enforce skew only when provenance proves it."""
     return _read_executable_gap(
         symbol, spot, perp, now_ms,
         max_age_ms=max_age_ms,
         max_skew_ms=max_skew_ms,
-        skew_checked=True,
+        skew_checked=_pair_skew_checked(spot, perp),
     )
 
 
@@ -324,6 +376,8 @@ class GapHistoryRing:
     def record(self, reading: ExecutableGapReading) -> GapObservation:
         if not isinstance(reading, ExecutableGapReading):
             raise TypeError("history accepts ExecutableGapReading only")
+        if type(reading.skew_checked) is not bool:
+            raise ValueError("history skew truth must be boolean")
         if any(not isinstance(value, Decimal) or not value.is_finite()
                for value in (reading.entry_gap_pct, reading.exit_gap_pct)):
             raise ValueError("history gaps must be finite Decimal values")
@@ -334,6 +388,7 @@ class GapHistoryRing:
             _utc_text(utc),
             reading.entry_gap_pct,
             reading.exit_gap_pct,
+            reading.skew_checked,
         )
         rows = self._rows.setdefault(
             reading.symbol, deque(maxlen=self.capacity))
