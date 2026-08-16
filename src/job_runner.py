@@ -109,6 +109,11 @@ MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
 MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+# A zero-borrow residual strictly below this USDT bound is recorded for an
+# interest-only follow-up; it is never described as a fully closed liability.
+MARGIN_REPAY_DUST_BOUND = Decimal("0.0001")
+MARGIN_SNAPSHOT_TIME_VERIFIED = "SNAPSHOT_TIME_VERIFIED"
+MARGIN_SNAPSHOT_TIME_UNVERIFIED = "SNAPSHOT_TIME_UNVERIFIED"
 MARGIN_IDENTITY_KEY_RE = re.compile(
     r"^(?:(?:tran(?:saction)?)|tx)[_-]?id$"
 )
@@ -3612,14 +3617,130 @@ def _margin_account_liability(payload: Any, asset: str) \
         return None
 
 
-def _margin_liability_direction_confirmed(
-        before: Any, after: Any, principal: Any, request_type: Any) -> bool:
+def _margin_account_snapshot_time(payload: Any) \
+        -> Tuple[str, Optional[Decimal]]:
+    """Return one strict account snapshot time without guessing its unit."""
     try:
-        if type(before) is not dict or type(after) is not dict \
-                or type(principal) is not str \
-                or type(request_type) is not str \
+        if type(payload) is not dict:
+            return "INVALID", None
+        values = []
+        for field in ("timestamp", "updateTime"):
+            if field not in payload:
+                continue
+            raw = payload[field]
+            if type(raw) is int:
+                raw = str(raw)
+            if type(raw) is not str:
+                return "INVALID", None
+            canonical = _margin_decimal_text(raw)
+            if canonical is None:
+                return "INVALID", None
+            values.append(Decimal(canonical))
+        if not values:
+            return "ABSENT", None
+        if any(value != values[0] for value in values[1:]):
+            return "INVALID", None
+        return "PRESENT", values[0]
+    except Exception:
+        return "INVALID", None
+
+
+def _margin_snapshot_time_note(before_payload: Any,
+                               after_payload: Any) -> Optional[str]:
+    before_kind, before_time = _margin_account_snapshot_time(before_payload)
+    after_kind, after_time = _margin_account_snapshot_time(after_payload)
+    if "INVALID" in {before_kind, after_kind}:
+        return None
+    if "ABSENT" in {before_kind, after_kind}:
+        return MARGIN_SNAPSHOT_TIME_UNVERIFIED
+    if before_time is None or after_time is None or after_time <= before_time:
+        return None
+    return MARGIN_SNAPSHOT_TIME_VERIFIED
+
+
+def _margin_liability_decimals(value: Any) \
+        -> Optional[Tuple[str, Decimal, Decimal, Decimal]]:
+    try:
+        if type(value) is not dict or type(value.get("asset")) is not str:
+            return None
+        canonical = [
+            _margin_decimal_text(value.get(field))
+            for field in ("borrowed", "interest", "total_liability")
+        ]
+        if any(item is None for item in canonical):
+            return None
+        borrowed, interest, total = (
+            Decimal(item) for item in canonical if item is not None
+        )
+        with localcontext() as context:
+            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+            if borrowed + interest != total:
+                return None
+        return value["asset"], borrowed, interest, total
+    except Exception:
+        return None
+
+
+def _margin_repay_proof_values(before: Any, after: Any, principal: Any) \
+        -> Optional[Tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]:
+    try:
+        before_values = _margin_liability_decimals(before)
+        after_values = _margin_liability_decimals(after)
+        canonical_principal = _margin_decimal_text(principal)
+        if before_values is None or after_values is None \
+                or canonical_principal is None \
+                or before_values[0] != after_values[0]:
+            return None
+        amount = Decimal(canonical_principal)
+        zero = Decimal("0")
+        if amount <= zero:
+            return None
+        before_borrowed = before_values[1]
+        before_interest = before_values[2]
+        after_borrowed = after_values[1]
+        after_interest = after_values[2]
+        with localcontext() as context:
+            context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+            interest_settled_first = min(amount, before_interest)
+            principal_settled = amount - interest_settled_first
+            expected_borrowed = max(
+                zero, before_borrowed - principal_settled
+            )
+            liability_decrease = before_values[3] - after_values[3]
+        return (
+            amount, expected_borrowed, after_borrowed, after_interest,
+            liability_decrease,
+        )
+    except Exception:
+        return None
+
+
+def _margin_liability_confirmation_status(
+        before: Any, after: Any, principal: Any, request_type: Any) -> str:
+    """Map a direction-bearing liability proof to one internal status."""
+    try:
+        if type(request_type) is not str \
                 or request_type not in {"BORROW", "REPAY"}:
-            return False
+            return ""
+        if request_type == "REPAY":
+            proof = _margin_repay_proof_values(before, after, principal)
+            if proof is None:
+                return ""
+            amount, expected_borrowed, after_borrowed, _after_interest, \
+                liability_decrease = proof
+            zero = Decimal("0")
+            with localcontext() as context:
+                context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+                minimum_decrease = amount - MARGIN_REPAY_DUST_BOUND
+            enough_decrease = liability_decrease > zero \
+                and liability_decrease >= minimum_decrease
+            if enough_decrease and after_borrowed == expected_borrowed:
+                return "REPAY_CONFIRMED"
+            return ""
+
+        if type(before) is not dict or type(after) is not dict \
+                or type(principal) is not str:
+            return ""
         before_asset = before.get("asset")
         after_asset = after.get("asset")
         before_borrowed = before.get("borrowed")
@@ -3628,23 +3749,59 @@ def _margin_liability_direction_confirmed(
                 before_asset, after_asset,
                 before_borrowed, after_borrowed)) \
                 or before_asset != after_asset:
-            return False
+            return ""
         canonical_principal = _margin_decimal_text(principal)
         canonical_before = _margin_decimal_text(before_borrowed)
         canonical_after = _margin_decimal_text(after_borrowed)
         if canonical_principal is None or canonical_before is None \
                 or canonical_after is None:
-            return False
+            return ""
         with localcontext() as context:
             context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
             amount = Decimal(canonical_principal)
             change = Decimal(canonical_after) - Decimal(canonical_before)
-        if amount <= 0:
-            return False
-        expected_change = amount if request_type == "BORROW" else -amount
-        return change == expected_change
+        if amount > Decimal("0") and change == amount:
+            return "BORROW_CONFIRMED"
+        return ""
     except Exception:
+        return ""
+
+
+def _margin_repay_close_verdict(before: Any, after: Any,
+                                principal: Any) -> str:
+    proof = _margin_repay_proof_values(before, after, principal)
+    values = _margin_liability_decimals(after)
+    zero = Decimal("0")
+    if proof is None or values is None or values[1] != zero:
+        return ""
+    if values[2] == zero:
+        status = _margin_liability_confirmation_status(
+            before, after, principal, "REPAY"
+        )
+        return "CLOSED" if status == "REPAY_CONFIRMED" else ""
+    amount, expected_borrowed, after_borrowed, _after_interest, \
+        liability_decrease = proof
+    with localcontext() as context:
+        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
+        minimum_decrease = amount - MARGIN_REPAY_DUST_BOUND
+    enough_decrease = liability_decrease > zero \
+        and liability_decrease >= minimum_decrease
+    borrowed_matches = after_borrowed == expected_borrowed
+    bounded_borrowed_dust = after_borrowed == zero \
+        and zero < expected_borrowed < MARGIN_REPAY_DUST_BOUND
+    if values[2] < MARGIN_REPAY_DUST_BOUND and enough_decrease \
+            and (borrowed_matches or bounded_borrowed_dust):
+        return "CLOSED-WITH-DUST"
+    return ""
+
+
+def _margin_liability_direction_confirmed(
+        before: Any, after: Any, principal: Any, request_type: Any) -> bool:
+    if type(request_type) is not str:
         return False
+    return _margin_liability_confirmation_status(
+        before, after, principal, request_type
+    ) == request_type + "_CONFIRMED"
 
 
 def _finish_margin_source(receipt: Dict[str, Any], path: str,
@@ -4035,66 +4192,118 @@ def _run_margin_operation(
         "txId": transaction_id,
     }
     try:
+        expected = operation["expected_ledger_confirmation"]
         history_result = transport(
             "GET", base_url, operation["endpoint_path"],
             history_params, True,
         )
-        account_result = transport(
-            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
-        )
-        confirmation_results_readable = type(history_result) is tuple \
-            and len(history_result) == 2 \
-            and type(account_result) is tuple \
-            and len(account_result) == 2 \
-            and history_result[0] == "ok" and account_result[0] == "ok"
     except Exception:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
         )
-    if not confirmation_results_readable:
+    if type(history_result) is not tuple or len(history_result) != 2 \
+            or history_result[0] != "ok":
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
         )
 
     try:
-        expected = operation["expected_ledger_confirmation"]
         confirmation = _margin_history_confirmation(
             history_result[1], transaction_id, expected, params["type"]
         )
-        liability = _margin_account_liability(
-            account_result[1], expected["asset"]
-        )
-        direction_confirmed = _margin_liability_direction_confirmed(
-            liability_before, liability, expected["principal"],
-            params["type"],
-        )
-        repay_cleared = job.op != margin_ops.MARGIN_REPAY \
-            or liability is not None and liability.get("borrowed") == "0"
     except Exception:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
         )
-    if confirmation is None or liability is None:
+    if confirmation is None:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
         )
-    if not direction_confirmed or not repay_cleared:
+
+    # The identity-bearing history row binds before this post-state read.
+    try:
+        account_result = transport(
+            "GET", base_url, MARGIN_ACCOUNT_PATH, {}, True,
+        )
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+    if type(account_result) is not tuple or len(account_result) != 2 \
+            or account_result[0] != "ok":
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+
+    try:
+        liability = _margin_account_liability(
+            account_result[1], expected["asset"]
+        )
+        snapshot_time_note = _margin_snapshot_time_note(
+            account_before_result[1], account_result[1]
+        )
+        confirmation_status = _margin_liability_confirmation_status(
+            liability_before, liability, expected["principal"],
+            params["type"],
+        )
+        repay_verdict = _margin_repay_close_verdict(
+            liability_before, liability, expected["principal"]
+        ) if job.op == margin_ops.MARGIN_REPAY else ""
+    except Exception:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
+        )
+    if liability is None:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
+        )
+    if snapshot_time_note is None:
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_SNAPSHOT_TIME_MISMATCH", fresh_now,
+            liability=liability,
+        )
+    receipt["snapshot_time_note"] = snapshot_time_note
+    exact_confirmation = confirmation_status == expected["status"]
+    if job.op != margin_ops.MARGIN_REPAY and not exact_confirmation:
         return _finish_margin_source(
             receipt, source_path, "UNKNOWN", 4,
             "MARGIN_LIABILITY_MISMATCH", fresh_now,
-            confirmation, liability,
+            liability=liability,
         )
-    verdict = "OPEN" if job.op == margin_ops.MARGIN_BORROW else "CLOSED"
-    success_reason = expected["status"]
+    if job.op == margin_ops.MARGIN_REPAY \
+            and (not repay_verdict \
+                 or repay_verdict == "CLOSED" and not exact_confirmation):
+        return _finish_margin_source(
+            receipt, source_path, "UNKNOWN", 4,
+            "MARGIN_LIABILITY_MISMATCH", fresh_now,
+            confirmation if exact_confirmation else None, liability,
+        )
+    verdict = "OPEN" if job.op == margin_ops.MARGIN_BORROW \
+        else repay_verdict
+    if verdict == "CLOSED-WITH-DUST":
+        receipt["follow_up_repay"] = {
+            "kind": "INTEREST_ONLY_REPAY",
+            "asset": liability["asset"],
+            "principal": liability["interest"],
+        }
+    success_reason = "REPAY_CONFIRMED_WITH_DUST" \
+        if verdict == "CLOSED-WITH-DUST" else expected["status"]
     if sealed_repay:
-        success_reason = "REPAY_CONFIRMED_UNDER_STOP_JOBS"
+        success_reason = "REPAY_CONFIRMED_WITH_DUST_UNDER_STOP_JOBS" \
+            if verdict == "CLOSED-WITH-DUST" \
+            else "REPAY_CONFIRMED_UNDER_STOP_JOBS"
     return _finish_margin_source(
         receipt, source_path, verdict, 0, success_reason, fresh_now,
-        confirmation, liability,
+        confirmation if exact_confirmation else None, liability,
     )
 
 
@@ -4395,7 +4604,7 @@ def _validate_known_margin_artifact_fields(
             "kind", "job_id", "sha", "verdict", "reason", "started_utc",
             "finished_utc", "governor_token", "governor_release",
             "governor_released_utc", "authority_checked_utc",
-            "mutation_started_utc",
+            "mutation_started_utc", "snapshot_time_note",
         ),
         "JOB_FILE": tuple(sorted(MARGIN_JOB_REQUIRED_FIELDS)),
         "LOCK": ("token", "op", "symbol", "utc"),
@@ -4926,6 +5135,7 @@ def _attest_stuck_margin_lock(
             source_fields |= {
                 "mutation_started_utc", "submission", "ledger_confirmation",
                 "account_liability_before", "account_liability",
+                "snapshot_time_note",
             }
         _release_require(set(source) == source_fields,
                          "SOURCE_RECEIPT_SHAPE_MISMATCH")
@@ -4980,6 +5190,10 @@ def _attest_stuck_margin_lock(
         if result["verdict"] == "OPEN":
             principal = _canonical_decimal_text(validated.requested_max_notional)
             submission = source["submission"]
+            _release_require(source["snapshot_time_note"] in {
+                MARGIN_SNAPSHOT_TIME_VERIFIED,
+                MARGIN_SNAPSHOT_TIME_UNVERIFIED,
+            }, "SOURCE_SNAPSHOT_TIME_NOTE_MISMATCH")
             _release_require(runner["reason"]
                              == ready["expected_ledger_confirmation"]["status"],
                              "RUNNER_REASON_MISMATCH")

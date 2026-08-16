@@ -2226,6 +2226,182 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "STOP-JOBS"
         )))
 
+    def test_margin_repay_direct_algebra_accounts_for_interest_first(self):
+        before = {
+            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
+            "total_liability": "2.500005",
+        }
+        all_zero = {
+            "asset": "USDT", "borrowed": "0", "interest": "0",
+            "total_liability": "0",
+        }
+        dust = {
+            "asset": "USDT", "borrowed": "0", "interest": "0.000006",
+            "total_liability": "0.000006",
+        }
+        dust_bound = {
+            "asset": "USDT", "borrowed": "0", "interest": "0.0001",
+            "total_liability": "0.0001",
+        }
+
+        self.assertEqual(jr._margin_liability_confirmation_status(
+            before, all_zero, "2.5", "REPAY"
+        ), "")
+        self.assertEqual(
+            jr._margin_repay_close_verdict(before, all_zero, "2.5"), ""
+        )
+        self.assertEqual(jr._margin_liability_confirmation_status(
+            before, all_zero, "2.500005", "REPAY"
+        ), "REPAY_CONFIRMED")
+        self.assertEqual(jr._margin_repay_close_verdict(
+            before, all_zero, "2.500005"
+        ), "CLOSED")
+        self.assertEqual(jr._margin_liability_confirmation_status(
+            before, dust, "2.5", "REPAY"
+        ), "")
+        self.assertEqual(
+            jr._margin_repay_close_verdict(before, dust, "2.5"),
+            "CLOSED-WITH-DUST",
+        )
+        self.assertEqual(
+            jr._margin_repay_close_verdict(
+                before, dust_bound, "2.500005"
+            ),
+            "",
+        )
+
+    def test_margin_repay_measured_total_closes_cleanly(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0", "interest": "0",
+        }]}
+        self.margin_job(
+            "margin-repay-measured-total", op="MARGIN_REPAY",
+            principal="2.500005",
+        )
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("CLOSED", "REPAY_CONFIRMED"),
+        )
+        source = self.margin_source(result)
+        self.assertEqual(
+            source["snapshot_time_note"],
+            jr.MARGIN_SNAPSHOT_TIME_UNVERIFIED,
+        )
+        self.assertNotIn("follow_up_repay", source)
+
+    def test_margin_repay_residual_interest_has_typed_dust_verdict(self):
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0", "interest": "0.000006",
+        }]}
+        self.margin_job(
+            "margin-repay-dust", op="MARGIN_REPAY", principal="2.5"
+        )
+
+        self.assertEqual(self.margin_tick(), 0)
+
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("CLOSED-WITH-DUST", "REPAY_CONFIRMED_WITH_DUST"),
+        )
+        source = self.margin_source(result)
+        self.assertNotIn("ledger_confirmation", source)
+        self.assertEqual(source["account_liability"], {
+            "asset": "USDT", "borrowed": "0", "interest": "0.000006",
+            "total_liability": "0.000006",
+        })
+        self.assertEqual(source["follow_up_repay"], {
+            "kind": "INTEREST_ONLY_REPAY",
+            "asset": "USDT",
+            "principal": "0.000006",
+        })
+        self.assertFalse(os.path.exists(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_margin_post_snapshot_follows_identity_binding(self):
+        self.margin.account_before_payload = {
+            "updateTime": "1000",
+            "userAssets": [{
+                "asset": "USDT", "borrowed": "0", "interest": "0",
+            }],
+        }
+        self.margin.account_payload = {
+            "timestamp": 1001,
+            "userAssets": [{
+                "asset": "USDT", "borrowed": "3", "interest": "0",
+            }],
+        }
+        self.margin_job("margin-snapshot-order")
+        identity_bound = {"value": False}
+        confirm = jr._margin_history_confirmation
+
+        def bind_identity(*args, **kwargs):
+            value = confirm(*args, **kwargs)
+            identity_bound["value"] = value is not None
+            return value
+
+        def ordered_request(method, base_url, path, params=None,
+                            signed=False):
+            if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH \
+                    and self.margin.operation is not None \
+                    and not identity_bound["value"]:
+                raise RuntimeError("post snapshot preceded identity binding")
+            return self.margin(method, base_url, path, params, signed)
+
+        with mock.patch.object(
+                jr, "_margin_history_confirmation",
+                side_effect=bind_identity):
+            self.assertEqual(self.margin_tick(request=ordered_request), 0)
+
+        calls = self.margin.calls
+        history_index = next(
+            index for index, call in enumerate(calls)
+            if call[0] == "GET" and call[2] == jr.MARGIN_ENDPOINT_PATH
+        )
+        account_indexes = [
+            index for index, call in enumerate(calls)
+            if call[0] == "GET" and call[2] == jr.MARGIN_ACCOUNT_PATH
+        ]
+        self.assertLess(history_index, account_indexes[1])
+        self.assertEqual(
+            self.margin_source(self.results()[0])["snapshot_time_note"],
+            jr.MARGIN_SNAPSHOT_TIME_VERIFIED,
+        )
+
+    def test_margin_post_snapshot_time_must_advance(self):
+        self.margin.account_before_payload = {
+            "timestamp": 1000,
+            "userAssets": [{
+                "asset": "USDT", "borrowed": "0", "interest": "0",
+            }],
+        }
+        self.margin.account_payload = {
+            "updateTime": "1000",
+            "userAssets": [{
+                "asset": "USDT", "borrowed": "3", "interest": "0",
+            }],
+        }
+        self.margin_job("margin-snapshot-time")
+
+        self.assertEqual(self.margin_tick(), 4)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertEqual(
+            self.reason(result), "MARGIN_SNAPSHOT_TIME_MISMATCH"
+        )
+
     def test_margin_repay_closes_only_after_explicit_zero_liability(self):
         self.margin.account_before_payload = {"userAssets": [{
             "asset": "USDT", "borrowed": "3", "interest": "0",
