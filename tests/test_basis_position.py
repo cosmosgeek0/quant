@@ -1188,6 +1188,333 @@ class VersionOneContractTests(unittest.TestCase):
         self.assertEqual(persisted["state"], bp.ST_CLOSED)
 
 
+class VersionTwoPersistenceTests(unittest.TestCase):
+    CONFIG_EPOCH_DIGEST = "a" * 64
+    FLAT_EVIDENCE_DIGEST = "b" * 64
+    EVENT_DIGEST = "c" * 64
+    TRANSITION_EVIDENCE_DIGEST = "d" * 64
+    CREATED_CUT_MS = 1755000010000
+    EVENT_SOURCE_MS = 1755000004000
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.receipt_dir = self.temp.name
+        self.state_path = Path(self.receipt_dir) / bp.STATE_FILE
+        self.state_path.write_bytes(V1_CONTRACT_PATH.read_bytes())
+
+    def raw_position(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def write_raw_position(self, position):
+        self.state_path.write_text(json.dumps(position, indent=2),
+                                   encoding="utf-8")
+
+    def flat_proof(self, source_revision=None):
+        if source_revision is None:
+            source_revision = self.raw_position()["revision"]
+        return bp.new_v2_flat_proof(
+            SYMBOL, self.CONFIG_EPOCH_DIGEST, source_revision,
+            self.CREATED_CUT_MS, Decimal("0"), Decimal("0"), 0, 0, True,
+            self.FLAT_EVIDENCE_DIGEST)
+
+    def enable_v2(self):
+        revision = self.raw_position()["revision"]
+        return bp.enable_v2_position(
+            self.receipt_dir, SYMBOL, self.CONFIG_EPOCH_DIGEST,
+            self.flat_proof(revision), revision)
+
+    def own_orders(self, terminal=False, spot_quote="9.80",
+                   short_quote="9.79", suffix="01"):
+        quantity = "0.098" if terminal else None
+        return [
+            bp.new_v2_own_order_record(
+                SYMBOL, self.CONFIG_EPOCH_DIGEST, bp.ENTER_SPOT, "spot",
+                "bc-v2-%s-enter-spot" % suffix, terminal,
+                "FILLED" if terminal else "INTENT_SAVED",
+                quantity, spot_quote if terminal else None),
+            bp.new_v2_own_order_record(
+                SYMBOL, self.CONFIG_EPOCH_DIGEST, bp.ENTER_SHORT, "usdm",
+                "bc-v2-%s-enter-short" % suffix, terminal,
+                "FILLED" if terminal else "INTENT_SAVED",
+                quantity, short_quote if terminal else None),
+        ]
+
+    def rung(self, ordinal=1, terminal=False, effective_cap="10",
+             spot_quote="9.80", short_quote="9.79", suffix="01"):
+        terminal_quantity = "0.098" if terminal else None
+        sizes = bp.new_v2_size_record(
+            Decimal("0.098"), Decimal("9.80"), terminal_quantity,
+            terminal_quantity, terminal_quantity, terminal_quantity)
+        return bp.new_v2_rung_record(
+            SYMBOL, self.CONFIG_EPOCH_DIGEST, "rung-%s" % suffix, ordinal,
+            "OPEN" if terminal else "ENTRY_PENDING", Decimal("0.42"),
+            Decimal(effective_cap), sizes,
+            self.own_orders(terminal, spot_quote, short_quote, suffix),
+            self.EVENT_DIGEST, self.EVENT_SOURCE_MS,
+            self.CREATED_CUT_MS, Decimal("0.11"), Decimal("0.0001"),
+            28800000)
+
+    def transition(self, expected_revision, transition_id="transition-01",
+                   from_state=bp.ST_NONE, to_state=bp.ST_OPENING):
+        return bp.new_v2_transition_record(
+            SYMBOL, self.CONFIG_EPOCH_DIGEST, transition_id, from_state,
+            to_state, expected_revision, "FLAT_ENTRY_PREFLIGHT",
+            self.TRANSITION_EVIDENCE_DIGEST,
+            ["flat-proof-01", "proposal-01"], self.CREATED_CUT_MS)
+
+    def add_rung(self, rung=None):
+        position = bp.load_position(self.receipt_dir)
+        return bp.write_v2_rung(
+            self.receipt_dir, rung or self.rung(), position["revision"])
+
+    def test_v2_receipts_bind_symbol_and_config_epoch_digest(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        transition = self.transition(position["revision"])
+        position = bp.write_v2_transition(
+            self.receipt_dir, transition, position["revision"])
+        loaded = bp.load_position(self.receipt_dir)
+
+        receipts = [loaded["flat_proof"], loaded["rungs"][0],
+                    loaded["rungs"][0]["event"],
+                    *loaded["rungs"][0]["own_orders"],
+                    loaded["transitions"][0]]
+        for receipt in receipts:
+            with self.subTest(record_type=receipt["record_type"]):
+                self.assertEqual(receipt["version"], 2)
+                self.assertEqual(receipt["symbol"], SYMBOL)
+                self.assertEqual(receipt["config_epoch_digest"],
+                                 self.CONFIG_EPOCH_DIGEST)
+
+    def test_v2_own_order_identity_retains_terminal_quantities_and_quotes_for_every_leg(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(terminal=True),
+            position["revision"])
+        orders = bp.load_position(self.receipt_dir)["rungs"][0]["own_orders"]
+        expected = {
+            bp.ENTER_SPOT: ("bc-v2-01-enter-spot", "0.098", "9.80"),
+            bp.ENTER_SHORT: ("bc-v2-01-enter-short", "0.098", "9.79"),
+        }
+        self.assertEqual(set(expected), {order["stage"] for order in orders})
+        for order in orders:
+            self.assertTrue(order["terminal"])
+            self.assertEqual(
+                (order["client_id"], order["terminal_executed_qty"],
+                 order["terminal_quote"]), expected[order["stage"]])
+
+    def test_v2_rung_creation_seals_trigger_event_digest_and_economics(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        rung = bp.load_position(self.receipt_dir)["rungs"][0]
+        self.assertEqual(rung["entry_gap_pct"], "0.42")
+        self.assertEqual(rung["effective_cap_quote"], "10")
+        self.assertEqual(rung["created_cut_ms"], self.CREATED_CUT_MS)
+        self.assertEqual(rung["event"], {
+            "version": 2,
+            "record_type": "TRIGGER_EVENT",
+            "symbol": SYMBOL,
+            "config_epoch_digest": self.CONFIG_EPOCH_DIGEST,
+            "digest": self.EVENT_DIGEST,
+            "source_time_ms": self.EVENT_SOURCE_MS,
+            "age_at_creation_ms": 6000,
+            "entry_gap_pct": "0.42",
+            "exit_gap_pct": "0.11",
+            "funding_rate": "0.0001",
+            "funding_period_ms": 28800000,
+        })
+
+    def test_v2_effective_cap_reconcile_excess_freezes_with_reduce_only_path(self):
+        position = self.enable_v2()
+        rung = self.rung(terminal=True, effective_cap="10",
+                         spot_quote="10.01", short_quote="9.99")
+        position = bp.write_v2_rung(
+            self.receipt_dir, rung, position["revision"])
+        position = bp.reconcile_v2_rung_cap(
+            self.receipt_dir, "rung-01", position["revision"])
+        cap = position["rungs"][0]["cap_reconcile"]
+        self.assertEqual(cap, {
+            "status": "EXCEEDED",
+            "terminal_fill_quote": "10.01",
+            "freeze_increases": True,
+            "reduce_only_path": True,
+        })
+        self.assertEqual(position["rungs"][0]["status"], "REDUCE_ONLY")
+        self.assertTrue(position["increases_frozen"])
+        self.assertTrue(position["reduce_only_path"])
+
+    def test_v2_effective_cap_reconcile_within_cap_clears_pending_freeze(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(terminal=True),
+            position["revision"])
+        self.assertTrue(position["increases_frozen"])
+        position = bp.reconcile_v2_rung_cap(
+            self.receipt_dir, "rung-01", position["revision"])
+        self.assertEqual(position["rungs"][0]["cap_reconcile"]["status"],
+                         "WITHIN_CAP")
+        self.assertFalse(position["increases_frozen"])
+        self.assertFalse(position["reduce_only_path"])
+
+    def test_v2_transition_compare_and_swap_refuses_stale_revision(self):
+        position = self.enable_v2()
+        stale_revision = position["revision"]
+        first = self.transition(stale_revision)
+        position = bp.write_v2_transition(
+            self.receipt_dir, first, stale_revision)
+        replay = self.transition(stale_revision, "transition-replay")
+        with self.assertRaisesRegex(bp.PositionError, "stale"):
+            bp.write_v2_transition(
+                self.receipt_dir, replay, stale_revision)
+        persisted = bp.load_position(self.receipt_dir)
+        self.assertEqual(persisted["revision"], position["revision"])
+        self.assertEqual([row["transition_id"]
+                          for row in persisted["transitions"]],
+                         ["transition-01"])
+
+    def test_v2_transition_receipt_seals_states_revision_and_evidence(self):
+        position = self.enable_v2()
+        expected_revision = position["revision"]
+        transition = self.transition(expected_revision)
+        position = bp.write_v2_transition(
+            self.receipt_dir, transition, expected_revision)
+        receipt = position["transitions"][0]
+        self.assertEqual((receipt["from"], receipt["to"]),
+                         (bp.ST_NONE, bp.ST_OPENING))
+        self.assertEqual(receipt["expected_revision"], expected_revision)
+        self.assertEqual(receipt["evidence"], {
+            "kind": "FLAT_ENTRY_PREFLIGHT",
+            "digest": self.TRANSITION_EVIDENCE_DIGEST,
+            "receipt_ids": ["flat-proof-01", "proposal-01"],
+        })
+        self.assertEqual(position["revision"], expected_revision + 1)
+
+    def test_v2_event_age_uses_sealed_creation_cut_not_current_clock(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        rung = bp.load_position(self.receipt_dir)["rungs"][0]
+        with mock.patch.object(bp.time, "time", return_value=9999999999):
+            self.assertEqual(bp.v2_event_age_at_creation_ms(rung), 6000)
+
+    def test_v2_strict_loader_refuses_unknown_fields_recursively_while_v1_is_permissive(self):
+        legacy = self.raw_position()
+        legacy["future_extension"] = {"accepted": True}
+        self.write_raw_position(legacy)
+        self.assertEqual(bp.load_position(self.receipt_dir)["future_extension"],
+                         {"accepted": True})
+
+        revision = legacy["revision"]
+        proof = self.flat_proof(revision)
+        position = bp.enable_v2_position(
+            self.receipt_dir, SYMBOL, self.CONFIG_EPOCH_DIGEST, proof,
+            revision)
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        valid = self.raw_position()
+        mutations = (
+            lambda value: value.__setitem__("future_extension", {}),
+            lambda value: value["rungs"][0].__setitem__("future", {}),
+            lambda value: value["rungs"][0]["event"].__setitem__(
+                "future", {}),
+        )
+        for mutation in mutations:
+            invalid = json.loads(json.dumps(valid))
+            mutation(invalid)
+            self.write_raw_position(invalid)
+            with self.assertRaisesRegex(bp.PositionError, "unknown field"):
+                bp.load_position(self.receipt_dir)
+        self.write_raw_position(valid)
+
+    def test_v2_strict_loader_refuses_malformed_decimal_text(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        invalid = self.raw_position()
+        invalid["rungs"][0]["entry_gap_pct"] = "not-a-decimal"
+        self.write_raw_position(invalid)
+        with self.assertRaisesRegex(bp.PositionError, "Decimal text"):
+            bp.load_position(self.receipt_dir)
+
+    def test_v2_schema_version_marker_gates_strict_loading(self):
+        legacy = self.raw_position()
+        legacy["version"] = 99
+        self.write_raw_position(legacy)
+        self.assertEqual(bp.load_position(self.receipt_dir)["version"], 99)
+
+        marked = self.raw_position()
+        marked["schema_version"] = 3
+        self.write_raw_position(marked)
+        with self.assertRaisesRegex(bp.PositionError,
+                                    "schema_version is not supported"):
+            bp.load_position(self.receipt_dir)
+
+    def test_v2_strict_loader_refuses_duplicate_rung_ordinals(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(terminal=True),
+            position["revision"])
+        position = bp.reconcile_v2_rung_cap(
+            self.receipt_dir, "rung-01", position["revision"])
+        invalid = self.raw_position()
+        duplicate = json.loads(json.dumps(invalid["rungs"][0]))
+        duplicate["rung_id"] = "rung-02"
+        for order in duplicate["own_orders"]:
+            order["client_id"] += "-02"
+        invalid["rungs"].append(duplicate)
+        self.write_raw_position(invalid)
+        with self.assertRaisesRegex(bp.PositionError, "ordinal is duplicated"):
+            bp.load_position(self.receipt_dir)
+
+    def test_v2_strict_loader_refuses_config_epoch_drift(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        invalid = self.raw_position()
+        invalid["rungs"][0]["config_epoch_digest"] = "e" * 64
+        self.write_raw_position(invalid)
+        with self.assertRaisesRegex(bp.PositionError,
+                                    "config-epoch binding"):
+            bp.load_position(self.receipt_dir)
+
+    def test_v2_requested_rung_size_is_immutable_after_creation(self):
+        position = self.enable_v2()
+        position = bp.write_v2_rung(
+            self.receipt_dir, self.rung(), position["revision"])
+        expected_revision = position["revision"]
+        position["rungs"][0]["sizes"]["requested_quote"] = "9.70"
+        with self.assertRaisesRegex(bp.PositionError,
+                                    "requested rung size is immutable"):
+            bp.save_position(
+                self.receipt_dir, position,
+                expected_revision=expected_revision)
+
+    def test_v2_enablement_requires_current_proven_flat_state(self):
+        legacy = self.raw_position()
+        legacy["state"] = bp.ST_OPEN
+        legacy["verdict"] = "OPEN_EXPOSURE"
+        self.write_raw_position(legacy)
+        with self.assertRaisesRegex(bp.PositionError, "proven flat"):
+            bp.enable_v2_position(
+                self.receipt_dir, SYMBOL, self.CONFIG_EPOCH_DIGEST,
+                self.flat_proof(legacy["revision"]), legacy["revision"])
+        persisted = self.raw_position()
+        self.assertNotIn("schema_version", persisted)
+        self.assertEqual(persisted["state"], bp.ST_OPEN)
+
+    def test_v2_writes_use_atomic_state_path_without_residue(self):
+        position = self.enable_v2()
+        bp.write_v2_rung(self.receipt_dir, self.rung(),
+                         position["revision"])
+        self.assertTrue(self.state_path.is_file())
+        self.assertFalse(Path(str(self.state_path) + ".tmp").exists())
+        self.assertFalse(
+            (Path(self.receipt_dir) / bp.STATE_WRITE_GUARD_FILE).exists())
+
+
 class RatesTests(MachineCase):
     def test_rates_written_atomically_with_rate_values(self):
         code, transport, out = self.run_cmd(bp.cmd_rates, happy_spec())
