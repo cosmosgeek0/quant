@@ -1,8 +1,9 @@
-# NETWORK TAB — brief for the next builder (owner review, 2026-08-16, rev 2)
+# NETWORK TAB — brief for the next builder (owner review, 2026-08-16, rev 3)
 
-Plain words. Decisions first, reasons after. Rev 2 folds in the Codex review of
-rev 1 (ten points, all accepted; the ones that changed this brief are marked
-[codex]). Web sweep sources at the end. ui/DESIGN.md still governs look and
+Plain words. Decisions first, reasons after. Rev 2 folded in the Codex review of
+rev 1 (ten points); rev 3 folds in Codex's FULL research report (connections
+table, status vocabulary, /api/network contract, control classes, exact file
+names). Everything from Codex is marked [codex]. Web sweep sources at the end. ui/DESIGN.md still governs look and
 voice; this file says WHAT belongs on the Network tab, what leaves, what is
 missing, which controls are real, and where to build.
 
@@ -22,6 +23,10 @@ site reachable (browser → Cloudflare Access/edge → tunnel connector → box)
 the outside sources (news) reachable — one aligned story graph on top, and the
 switches to slow down or pause each wire's monitoring or, where real, the
 connection itself.
+Ownership rule [codex]: Machine owns process start/stop and runtime authority;
+Accounts owns balances, permissions and financial caps; Basis/Momentum own
+strategy data; News owns articles and categories; Network shows whether the
+paths connecting those systems are functioning. Nothing else lives here.
 
 ## 2. Verdict on the current page (V5 on the site)
 - V5 is a good HEARTBEAT page (loops vs cadence, worst-first table, hour
@@ -36,22 +41,22 @@ connection itself.
   counts, no websocket connection state in any recorded file that reaches the
   dashboard).
 
-## 3. The wires (one row/lane/card each) [codex — this list replaces rev 1's]
-1. Site ingress: browser → Cloudflare Access/edge (round-trip, auth state)
-2. Cloudflare edge → tunnel connector (cloudflared health: healthy = four edge
-   connections / degraded / down / inactive — Cloudflare's own words)
-3. Tunnel connector → box origin (127.0.0.1:8080 answer time, errors)
-4. Binance Spot public REST (api.binance.com)
-5. Binance Spot public websocket (stream.binance.com)
-6. Binance USD-M public REST (fapi.binance.com)
-7. Binance USD-M public websocket (fstream.binance.com)
-8. Binance signed account-read HTTPS (balances, positions, open orders — GET)
-9. Binance execution HTTPS (orders, margin ops — the runner's path; shown as a
-   wire with its own timing/error/limit rows, never a control)
-10. News-source fan-out (104 public sources)
-Collapsed dependencies (one line each, never the main path): AWS Secrets
-retrieval, SSM administration, the box's 5-second local file mirror (that is
-local freshness, not a network) [codex].
+## 3. The wires — with plane and TODAY's evidence [codex]
+| # | connection | plane | what belongs on the wire | evidence today |
+|---|---|---|---|---|
+| 1 | browser → local serve.py (Mac viewer, legacy) | local | HTTP health, API answer, p50/p95, last success | measured locally |
+| 2 | remote browser → Cloudflare edge / Access | ingress | DNS, TLS, Access result, edge time-to-first-byte, status family | unknown until collected |
+| 3 | Cloudflare edge → tunnel connector → box origin | ingress | connector count, tunnel protocol, origin reachability, 521–526 errors | not surfaced |
+| 4 | Mac mirror ↔ AWS SSM ↔ box receipts (legacy) | management | session result, pull duration, bytes, checksum, freshness | path exists; transport evidence incomplete |
+| 5 | box runtime → AWS Secrets Manager | management (collapsed line) | last successful credential fetch + safe error class — never values | code-confirmed, not normalised |
+| 6 | box ↔ Binance Spot public (api/stream) | market data | REST timing + weight; WSS shards, last event, ping/pong, reconnects, gaps, subscription count | evidence exists in the feed state, not mirrored |
+| 7 | box ↔ Binance USD-M public (fapi/fstream) | market data | separate REST/WSS state, reconnects, continuity, rate budget | evidence exists, not mirrored |
+| 8 | box → Binance signed account reads | private | latency, auth outcome, rate limit, freshness | coarse receipts only |
+| 9 | box → Binance execution API | private / money | connectivity and reconciliation state ONLY — owner-gated, no action here | receipts only |
+| 10 | public sources → news fetcher | public data | success/stale/failure by source, fetch duration | already in News; summarised here |
+Rule [codex]: do not invent VPCs, subnets, gateways, geographic hops or other
+cloud objects because enterprise consoles show them; render a node only after
+the project can prove it exists and collect its state.
 
 ## 4. Truth model — every wire, three states + provenance [codex]
 - States: CONFIGURED (it is set up) → TRANSPORT (DNS/TCP/TLS or socket
@@ -64,6 +69,18 @@ local freshness, not a network) [codex].
   offset vs the exchange (signed requests fail past the recv window — a money
   fact).
 - Missing evidence renders UNKNOWN — never green, never zero.
+- Status words, one per wire [codex]: Operational (every required truth fresh
+  and successful) · Degraded (partial shards, excess latency/loss,
+  reconnecting, reduced capacity) · Outage (confirmed failure) · Stale
+  (evidence older than its freshness contract) · Unknown (absent or
+  contradictory evidence) · Off (intentionally disabled, with a receipt) ·
+  Owner gated (an authority class, shown separately from health). A running
+  cron loop proves none of the three truths; a tunnel marked healthy does not
+  prove the connector reaches the origin — Cloudflare itself separates the two.
+- Selected-wire drawer fields [codex]: protocol/port, direction, purpose,
+  evidence source, last success, last transition, p50/p95/p99, loss or
+  failed-check %, request/message rate, bytes, reconnects, sequence gaps,
+  rate-limit headroom, failure reason, authority, allowed controls.
 
 ## 5. What to measure on the Binance wires (from Binance's own rules)
 - REST: round-trip to the ping/time endpoint every N s; error rate by class;
@@ -82,12 +99,17 @@ local freshness, not a network) [codex].
 ## 6. Page anatomy (top to bottom) [codex, adopted]
 1. KPI strip — truthful only (wires healthy N/10, worst wire, Binance
    round-trip p50/p95, weight headroom, freshest evidence).
-2. Actual path strip — Browser → Cloudflare edge → tunnel → box → Binance,
-   plus box → news; each hop shows its own number; UNKNOWN when unmeasured.
-3. Large aligned story graph — one shared time cursor, one lane per wire, each
-   lane its own unit and colour (milliseconds, message age, percentages never
-   share one Y-axis) [codex]; hovering/clicking a moment shows the linked event
-   beside it; 1H/6H/24H.
+2. Compact trust-zone topology [codex]: five rows — LOCAL UI, HOSTED UI
+   (browser → Cloudflare edge/Access → tunnel → box origin), MIRROR (legacy),
+   MARKET (box ↔ Binance public ↔ account API), NEWS. Nodes are neutral;
+   the STATE sits on the link; arrows show direction; each hop shows its own
+   number; UNKNOWN when unmeasured.
+3. Large aligned story graph — OWNER'S WORD, kept: one shared time cursor, one
+   lane per wire, each lane its own unit and colour (milliseconds, message age,
+   percentages never share one Y-axis) [codex]; hovering/clicking a moment
+   shows the linked event beside it; 1H/6H/24H. (Codex's own mock omits this
+   graph and goes topology → table → drawer; the owner asked for the graph, so
+   it stays, placed here.)
 4. Worst-first wire table — status word (three-state), value, ×limit/headroom,
    late %, trend.
 5. Selected-wire evidence drawer — the click-through: the §4 rows for the wire
@@ -100,9 +122,22 @@ Green requires fresh evidence. Every chart and control labelled and keyboard
 reachable.
 
 ## 7. Backend prerequisites (the tab cannot be honest without these) [codex]
-- Mirror the feed-state file: `market_feed.py` writes connection evidence into
-  its state file, but neither the box's `local_mirror.sh` nor the Mac printer
-  copies it into `ui/live/` — add it to the mirror list (read-only copy).
+- Mirror the feed-state file: `market_feed.py` writes per-venue/shard
+  connection evidence (state, attempts, handshakes, failures, reconnects) into
+  `RECEIPT_DIR/watch/feed_state.json` [codex — exact path]; the box's
+  `local_mirror.sh` and the Mac printer (`host_print_live.sh`) copy
+  `stream_state.json` but not that file — add it to the mirror list
+  (read-only copy).
+- Health identity: host failure rows carry a `stage` field that `/api/health`
+  does not recognise as the service identity [codex] — recognise it.
+- Mac mirror wire (legacy, while it lives): normalise SSM session result,
+  pull duration, bytes, checksum result into one row shape [codex].
+- ONE read-only contract for the page [codex]: `/api/network` returning
+  `nodes[]` and `edges[]` (Grafana node-graph shape). Each edge: source,
+  target, plane, direction, transport, the three truth states, reason,
+  evidence time and source, freshness, latency, reconnect/gap/rate data,
+  authority, allowed controls. Missing values are null with state Unknown.
+  The page renders from this one contract; no page-side guessing.
 - Key mismatch: the pull manifest writer emits `errors` (a list) while
   `serve.py` reads `error` (a string) — the manifest error is silently
   invisible. Fix on the serve side (read both), one test.
@@ -116,8 +151,22 @@ reachable.
   under `ui/live/`.
 
 ## 8. Controls — real ones only, two kinds [codex]
-PAUSE MONITORING (dashboard-side, safe, exists or trivial): Network live
-(page polling), range, wire visibility, monitor interval per wire
+Control classes [codex]: VIEW (time range, refresh, filters, show unknown,
+unhealthy-only, selected metric, pause live view) · MONITORING (probe
+frequency, alert threshold, expiring mute, run one read-only GET/TCP probe) ·
+PUBLIC LIFECYCLE (reconnect/resubscribe/resync the public Binance feed;
+pause/resume mirror or news ingest — only after an authenticated backend
+returns a receipt and the state is re-read) · OWNER NETWORK ACTION (restart
+the tunnel connector, change a Cloudflare route/DNS/Access rule or an AWS
+network policy — through impact preview, reason, confirmation, receipt and
+post-action verification; never a casual toggle) · FORBIDDEN HERE (order,
+cancel, transfer, leverage, notional, loss caps, ACCEPT-ONE, blind retry).
+Rename today's misleading switches [codex]: "Network live" → "Live view" (it
+pauses only the page's polling), the per-wire "cadence" select → "Monitor
+every" (it sets the recorder's sampling, not any host loop), chart toggles →
+"Show".
+PAUSE MONITORING (dashboard-side, safe, exists or trivial): Live view (page
+polling), range, wire visibility, monitor interval per wire
 (`/api/poll_config`), grace per wire (`/api/grace`), probe on/off.
 PAUSE / TOUCH THE CONNECTION (box-side): news loop interval + pause; public
 websocket reconnect / resubscribe / resync; feed pass interval. These change a
@@ -137,6 +186,7 @@ read-only with a link), orders, transfers, leverage.
 | MAC / TRANSPORT / HOST panel | replaced by the actual path strip | descriptive, not measured |
 | grey beat charts | coloured single charts | owner's word |
 | any switch without an endpoint | removed | DESIGN.md §4 |
+| dead files `net_multi.js`, `net_table.js` (not loaded by index.html), plus the box's leftovers `app.js`, `style.css`, `net_spark.js`, `verify.py` | deleted (git history keeps them) | not loaded, confuse the next builder [codex] |
 
 ## 10. Look
 Colour per wire, area fill under each line, ink text, status colour only on
@@ -152,6 +202,14 @@ that time · Grafana state timeline / status history (our raster) · Statuspage
 headers, 429 → 418, 20-s ping, 24-h socket) as the things to measure · IBKR
 TWS "Data connections": one coloured status per data farm · Hummingbot
 `connect` status per connector, `gateway ping` latency.
+Named by Codex's research [codex]: Datadog's directional network map + exact
+source→destination table (strongest operational pattern); ThousandEyes path
+visualisation (honest unknown/incomplete hops); Grafana Node Graph (formal
+node/edge contract → our `/api/network`); AWS Cloud WAN dashboards (topology,
+routes, events, metrics as separate layers, not one colourful graph); Azure
+Connection Monitor (endpoint + test, RTT, failed-check %, explicit failure
+reasons); Cloudflare Tunnel monitoring (connector health separate from
+origin behaviour).
 
 ## 12. Sources
 - https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
