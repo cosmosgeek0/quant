@@ -4,6 +4,9 @@ You get ONE narrow task from the dispatch. Do exactly it, nothing else.
 
 ## Scope
 - Edit ONLY the files your dispatch names. Everything else is read-only.
+- Dashboard / UI work: read ui/DASHBOARD.md first (what runs where, how a
+  change reaches the site, what is read-only). The dashboard never writes
+  into the machine's directories.
 - NEVER touch: /Users/cosmosgeek/Desktop/quant (live checkout), other
   worktrees, ~/.codex, anything AWS/SSM/host, any credential store. Never
   run any git command — the integrator owns git. Never spawn agents.

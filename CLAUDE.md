@@ -232,5 +232,9 @@ LOGS.md = append-only results, newest on top, ≤10 plain rows per entry, no
 raw dumps or secrets, SHAs last-8 in entries and exact in finals.
 AGENTS.md = worker law (codex reads it natively).
 evidence/ = committed sanitized proofs. src/ tests/ ui/ scripts/ = product.
+ui/DASHBOARD.md = the dashboard wiring map (owner order 2026-08-16): what runs
+where — box services, tunnel, ports, live-data paths, the Mac loops, and the
+verified way to put a UI change on arbitrage.cosmosgeek.org. Read it before
+touching ui/ or any dashboard service; nobody re-explains the layout in chat.
 aws-connect/ = owner-placed host rails. Retired: LEAD.md, BUILDER.md,
 TASK.md, STATE.md (2026-08-14 owner-ordered merge; full text in git history).

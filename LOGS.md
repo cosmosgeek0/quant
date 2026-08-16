@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+DASHBOARD LIVE ON THE BOX 2026-08-16 | arbitrage.cosmosgeek.org now serves the latest UI (ce43cd1 + 47655ef) from the execution host | evidence/dashboard-deploy-2026-08-16.txt · ui/DASHBOARD.md
+host | quant-ui.service restarted 12:45:18Z (backend was 2 days old); NEW quant-ui-telemetry.service (recorder, 15 s, QUANT_UI_URL=127.0.0.1:8080) and quant-ui-news.service (fetcher, 120 s) created + enabled; tunnel, Access, receipt mirror, machine directories untouched
+verify | GET / → 200 46973B (= local index.html) · /api/strip ok, ENTRY-SEALED, market pass live · all five services active | MEASURED on the box
+change | ui/telemetry_recorder.py samples QUANT_UI_URL (default 8899 unchanged) — 47655ef; xfer first attempt landed EMPTY (empty-file sha), second XFER_VERIFIED
+first failure | Mac→box ui_sync did not carry the change by itself — sync UNVERIFIED; file pushed by hand | one pre-existing test failure tests/test_ui_telemetry.py
+not verified | the public page in the owner's Chrome (extension not connected to this account) — owner refreshes the site | box history (telemetry, news) starts 12:45Z
+record | ui/DASHBOARD.md written (owner order): wiring map for every worker; pointers in CLAUDE.md file map + AGENTS.md scope
+
 VOLUME DIAGNOSTIC WOUND DOWN 2026-08-16 ~11:00Z | owner order: stop the tape scans, they return nothing and hammer the SSD | MEASURED
 result | V6 --limit 200 real-data run killed after 1h40m with ZERO output rows (the limit bounds events, not the 35 GB tape-prices read; the earlier full run refused after 3h+ the same way) | the commander's V2 out-of-sample expectancy stays UNMEASURED and is not pursued further without the owner's word | MEASURED
 kept | V6 code + tests (7c0fe85): the refusal row names its cost components; synthetic machine-scale policy shows a 1e-50 operation-order remainder between the two totals (INFERRED as the full-tape cause; never measured on the banked events) | MEASURED landing
