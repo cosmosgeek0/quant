@@ -14,8 +14,8 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import limits  # noqa: E402
 import wallet  # noqa: E402
+import limits  # noqa: E402
 from execution import binance_http, binance_transfer  # noqa: E402
 
 
@@ -26,7 +26,7 @@ def history_read(pages):
         return binance_http.HttpResult("ok", feed.pop(0), None, None)
 
     return binance_transfer.read_transfer_history(
-        transport, "https://spot.invalid", "MAIN_UMFUTURE", 0, 1
+        transport, "https://spot.invalid", "MAIN_UMFUTURE", 0, 1700000000000
     )
 
 

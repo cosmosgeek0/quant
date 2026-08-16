@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Read Spot/USD-M balances and make one durable internal transfer.
-
-Every transfer owns a local request ID and baseline before one adapter POST.
-Unresolved receipts use read-only reconciliation and are never resubmitted.
-Credentials and QUANT_SHA come from the environment and are never printed.
-"""
+"""Read balances and make one durable, bounded Spot/USD-M transfer."""
 
 import argparse, json, os, re, secrets, sys, time
 from decimal import Decimal, InvalidOperation
 
-from execution import binance_http, binance_transfer
 from limits import PER_LEG_CAP_USDT as TRANSFER_HARD_CEILING
+from execution import binance_http, binance_transfer
 
 
 SPOT_BASE = os.environ.get("BINANCE_BASE_URL", binance_http.SPOT_BASE_URL)
@@ -60,18 +55,17 @@ def validated_transfer_amount(asset, raw_amount):
 def last4(value): return str(value or "")[-4:]
 
 
-def safe_api_error(kind, error=None):
-    row = {"kind": kind}
+def safe_api_error(kind, error=None, state=None):
+    row = {"kind": kind, **({"state": state} if state is not None else {})}
     if isinstance(error, binance_http.HttpResult):
         if type(error.code) is int: row["code"] = error.code
         if isinstance(error.msg, str): row["error"] = error.msg[:80]
     return row
 
 
-def first_failure(receipt, where, kind, error=None):
+def first_failure(receipt, where, kind, error=None, state=None):
     if "first_failure" not in receipt:
-        receipt["first_failure"] = {"utc": utc(), "where": where,
-                                    **safe_api_error(kind, error)}
+        receipt["first_failure"] = dict(safe_api_error(kind, error, state), utc=utc(), where=where)
 
 
 class ReceiptStore:
@@ -242,10 +236,8 @@ def _projected_balances(result, direction, asset):
             or not isinstance(result.value, binance_transfer.TransferBalances):
         kind = result.kind if isinstance(result, binance_http.ReadResult) else "unclear"
         error = result.error if isinstance(result, binance_http.ReadResult) else None
-        status = _result_status(kind, error)
-        failure = {"status": status, **safe_api_error(kind, error)}
-        return {"source": {"account": source, **failure},
-                "destination": {"account": destination, **failure}}, None
+        failure = {"status": _result_status(kind, error), **safe_api_error(kind, error)}
+        return {"source": {"account": source, **failure}, "destination": {"account": destination, **failure}}, None
     values = {"spot": result.value.spot, "usd_m": result.value.usdm}
     rows = {}
     for label, account in (("source", source), ("destination", destination)):
@@ -257,31 +249,66 @@ def new_request_id(): return "l3w" + format(time.time_ns(), "x") + secrets.token
 
 
 def _intent_record(intent):
-    return {"venue": intent.venue, "operation": intent.operation,
-            "identity": intent.identity, "git_sha": intent.git_sha,
-            "params": [list(pair) for pair in intent.params]}
+    return {"venue": intent.venue, "operation": intent.operation, "identity": intent.identity,
+            "git_sha": intent.git_sha, "params": [list(pair) for pair in intent.params]}
+
+
+def _legacy_receipt_is_queryable(receipt):
+    started, submitted = receipt.get("started_ms"), receipt.get("submission_started_ms")
+    policy = {"local_request_id": receipt.get("request_id"), "exchange_client_id_supported": False,
+              "rule": "single POST; reconcile history before any new action"}
+    return ("intent" not in receipt and type(started) is int and type(submitted) is int
+            and started >= HISTORY_LOOKBACK_MS and submitted >= started
+            and receipt.get("history_start_ms") == started - HISTORY_LOOKBACK_MS
+            and receipt.get("idempotency") == policy)
 
 
 def _receipt_intent(receipt):
-    direction = receipt["direction"]
-    if not isinstance(direction, str): raise binance_http.AdapterRefusal("receipt direction is invalid")
-    intent = binance_transfer.build_transfer(
-        direction.replace("-", "_"), receipt["asset"], decimal(receipt["amount"], "receipt amount"), receipt["request_id"], receipt["sha"],
-    )
-    if receipt.get("intent") != _intent_record(intent) or receipt.get("transfer_type") != dict(intent.params).get("type"): raise binance_http.AdapterRefusal("receipt intent is not exact")
-    return intent
+    direction, request_id, sha = receipt.get("direction"), receipt.get("request_id"), receipt.get("sha")
+    if (receipt.get("kind") != "internal_transfer" or type(direction) is not str or direction not in DIRECTIONS
+            or type(request_id) is not str or not REQUEST_ID_RE.fullmatch(request_id)
+            or type(sha) is not str or not SHA_RE.fullmatch(sha)):
+        raise binance_http.AdapterRefusal("receipt identity is invalid")
+    try: amount = validated_transfer_amount(receipt.get("asset"), receipt.get("amount"))
+    except ValueError: raise binance_http.AdapterRefusal("receipt amount is invalid") from None
+    intent = binance_transfer.build_transfer(direction.replace("-", "_"), TRANSFER_ASSET, amount, request_id, sha)
+    legacy = _legacy_receipt_is_queryable(receipt)
+    if (receipt.get("transfer_type") != dict(intent.params).get("type")
+            or receipt.get("intent") != _intent_record(intent) and not legacy):
+        raise binance_http.AdapterRefusal("receipt intent is not exact")
+    return intent, legacy
+
+
+def _transfer_id(value, allow_text):
+    if type(value) is int and value > 0: return value
+    if allow_text and type(value) is str and re.fullmatch(r"[1-9][0-9]*", value): return int(value)
+    raise binance_http.AdapterRefusal("receipt transfer id is not exact")
 
 
 def _receipt_query_identity(receipt):
     baseline = receipt.get("baseline_tran_ids")
-    if type(baseline) is not list or any(type(value) is not int or value <= 0 for value in baseline) or len(set(baseline)) != len(baseline): raise binance_http.AdapterRefusal("receipt baseline is not exact")
+    if type(baseline) is not list: raise binance_http.AdapterRefusal("receipt baseline is not exact")
+    normalized = [_transfer_id(value, _legacy_receipt_is_queryable(receipt)) for value in baseline]
+    if len(set(normalized)) != len(normalized): raise binance_http.AdapterRefusal("receipt baseline is not exact")
     raw = receipt.get("tran_id")
-    if raw in (None, ""): tran_id = None
-    elif type(raw) is str and re.fullmatch(r"[1-9][0-9]*", raw): tran_id = int(raw)
-    else: raise binance_http.AdapterRefusal("receipt transfer id is not exact")
+    tran_id = None if raw in (None, "") else _transfer_id(raw, True)
     start_ms = receipt.get("history_start_ms")
     if type(start_ms) is not int or start_ms < 0: raise binance_http.AdapterRefusal("receipt history window is not exact")
-    return frozenset(baseline), tran_id, start_ms
+    return frozenset(normalized), tran_id, start_ms
+
+
+def _history_query_record(state, error=None, *, kind=None, legacy=False):
+    actual = error.kind if isinstance(error, binance_http.HttpResult) else kind or "ok"
+    row = {"state": state, **safe_api_error(actual, error)}
+    if legacy: row["receipt_format"] = "legacy"
+    return row
+
+
+def _unqueryable_receipt(store, path, receipt, kind):
+    receipt["history_query"] = _history_query_record("not_started", kind=kind)
+    first_failure(receipt, "transfer_receipt", kind)
+    return finish_transfer(store, path, receipt, "UNKNOWN",
+                           "receipt identity is incomplete; no transfer request was resent")
 
 
 def finish_transfer(store, path, receipt, state, note, release=False):
@@ -291,76 +318,55 @@ def finish_transfer(store, path, receipt, state, note, release=False):
 
 
 def reconcile_transfer(store, path, receipt, transport, *, sleep=time.sleep):
-    # A durable mutation_attempts=0 receipt was saved before any POST.  It is
-    # therefore known-unsent and must never adopt an unrelated history row.
-    if receipt.get("mutation_attempts") != 1:
+    attempts = receipt.get("mutation_attempts")
+    if type(attempts) is not int or attempts not in (0, 1):
+        return _unqueryable_receipt(store, path, receipt, "refusal")
+    if attempts == 0:
         return path, receipt
     try:
-        intent = _receipt_intent(receipt)
+        intent, legacy = _receipt_intent(receipt)
         baseline, tran_id, start_ms = _receipt_query_identity(receipt)
-        query = binance_transfer.query_transfer(
-            transport, SPOT_BASE, intent, baseline, tran_id,
-            start_ms, now_ms(), sleep=sleep,
-        )
-    except (KeyError, TypeError, ValueError, binance_http.AdapterRefusal):
-        first_failure(receipt, "transfer_receipt", "unclear")
-        return finish_transfer(
-            store, path, receipt, "UNKNOWN",
-            "receipt identity is incomplete; no transfer request was resent",
-        )
+        query = binance_transfer.query_transfer(transport, SPOT_BASE, intent, baseline, tran_id,
+                                                start_ms, now_ms(), sleep=sleep)
+        receipt["history_query"] = _history_query_record(query.kind, query.error, legacy=legacy)
+    except binance_http.AdapterRefusal:
+        return _unqueryable_receipt(store, path, receipt, "refusal")
+    except (KeyError, TypeError, ValueError):
+        return _unqueryable_receipt(store, path, receipt, "unclear")
 
     if query.kind == "found" and isinstance(
             query.row, binance_transfer.TransferRow):
         row, row_status = query.row, query.row.status.upper()
         receipt["tran_id"] = str(row.tran_id)
-        receipt["exchange"] = {
-            "asset": row.asset,
-            "amount": decimal_text(row.amount),
-            "status": row_status,
-            "timestamp": row.time_ms,
-            "tran_id": receipt["tran_id"],
-            "type": row.transfer_type,
-        }
+        receipt["exchange"] = {"asset": row.asset, "amount": decimal_text(row.amount),
+                               "status": row_status, "timestamp": row.time_ms,
+                               "tran_id": receipt["tran_id"], "type": row.transfer_type}
         if row_status in TERMINAL_TRANSFER:
             balances = _transfer_balances(transport, receipt["asset"])
-            receipt["after"], _ = _projected_balances(
-                balances, receipt["direction"], receipt["asset"]
-            )
+            receipt["after"], _ = _projected_balances(balances, receipt["direction"], receipt["asset"])
             if any(v.get("status") != "OK" for v in receipt["after"].values()):
-                first_failure(
-                    receipt, "post_transfer_balances", balances.kind,
-                    balances.error,
-                )
+                first_failure(receipt, "post_transfer_balances", balances.kind, balances.error)
             note = "exchange history is terminal; no transfer request was resent"
-            return finish_transfer(
-                store, path, receipt, row_status, note, release=True
-            )
+            return finish_transfer(store, path, receipt, row_status, note, release=True)
         first_failure(receipt, "transfer_history", "nonterminal_status")
-        return finish_transfer(
-            store, path, receipt, "UNKNOWN",
-            "exchange transfer is nonterminal; query this receipt again; do not resend"
-        )
+        return finish_transfer(store, path, receipt, "UNKNOWN",
+                               "exchange transfer is nonterminal; query this receipt again; do not resend")
 
     if query.kind == "not_found" \
             and receipt.get("submission_kind") == "api_error":
-        return finish_transfer(
-            store, path, receipt, "REJECTED",
-            "Binance rejected the single POST and history contains no new match",
-            release=True,
-        )
+        return finish_transfer(store, path, receipt, "REJECTED",
+                               "Binance rejected the single POST and history contains no new match", release=True)
 
-    first_failure(receipt, "transfer_history", query.kind, query.error)
+    typed_kind = receipt["history_query"]["kind"]
+    first_failure(receipt, "transfer_history", typed_kind, query.error, query.kind)
     notes = {
         "ambiguous": "multiple new matching history rows",
         "not_found": "no new matching history row became visible",
         "error": "history query was rejected",
         "pending": "history query remains pending",
     }
-    return finish_transfer(
-        store, path, receipt, "UNKNOWN",
-        notes.get(query.kind, "transfer history is unresolved")
-        + "; no transfer request was resent",
-    )
+    return finish_transfer(store, path, receipt, "UNKNOWN",
+                           notes.get(query.kind, "transfer history is unresolved") + "; no transfer request was resent")
 
 
 def execute_transfer(store, transport, direction, asset, amount, sha, *,
@@ -370,7 +376,6 @@ def execute_transfer(store, transport, direction, asset, amount, sha, *,
     intent = binance_transfer.build_transfer(
         direction.replace("-", "_") if isinstance(direction, str) else direction, asset, amount_value, request_id, sha
     )
-    amount = decimal_text(amount_value)
     if not store.acquire_lock(request_id):
         return None, {
             "request_id": request_id,
@@ -386,7 +391,7 @@ def execute_transfer(store, transport, direction, asset, amount, sha, *,
         "direction": direction,
         "transfer_type": dict(intent.params)["type"],
         "asset": asset,
-        "amount": amount,
+        "amount": decimal_text(amount_value),
         "started_utc": utc(),
         "started_ms": now_ms(),
         "state": "PREPARED",
@@ -418,8 +423,7 @@ def execute_transfer(store, transport, direction, asset, amount, sha, *,
             "both source and destination balances must be factual before transfer",
             release=True,
         )
-    source_free = balances.spot if direction == "spot-to-usdm" else balances.usdm
-    if source_free < amount_value:
+    if (balances.spot if direction == "spot-to-usdm" else balances.usdm) < amount_value:
         first_failure(receipt, "pre_transfer_balance", "insufficient_free")
         return finish_transfer(
             store, path, receipt, "REJECTED_BEFORE_TRANSFER",
@@ -466,21 +470,21 @@ def execute_transfer(store, transport, direction, asset, amount, sha, *,
 
 
 def print_transfer(receipt):
-    row = {
-        "kind": "internal_transfer",
-        "request_id_last4": last4(receipt.get("request_id")),
-        "state": receipt.get("state", "UNKNOWN"),
-    }
-    for key in ("direction", "asset", "amount"):
-        if key in receipt:
-            row[key] = receipt[key]
+    row = {"kind": "internal_transfer", "state": receipt.get("state", "UNKNOWN"),
+           "request_id_last4": last4(receipt.get("request_id"))}
+    row.update({key: receipt[key] for key in (
+        "direction", "asset", "amount", "lock_owner_last4") if receipt.get(key)})
     if receipt.get("tran_id"):
         row["tran_id_last4"] = last4(receipt["tran_id"])
-    if receipt.get("lock_owner_last4"):
-        row["lock_owner_last4"] = receipt["lock_owner_last4"]
     emit(row)
-    if "first_failure" in receipt:
-        emit({"first_failure": receipt["first_failure"]})
+    for key, extra in (("history_query", ("receipt_format",)),
+                       ("first_failure", ("utc", "where"))):
+        if type(receipt.get(key)) is dict:
+            emit({key: {
+                field: value[:80] if type(value) is str else value
+                for field in ("kind", "state", "code", "error") + extra
+                if type(value := receipt[key].get(field)) is (
+                    int if field == "code" else str)}})
 
 
 def run_balances(args, store, transport, sha):
