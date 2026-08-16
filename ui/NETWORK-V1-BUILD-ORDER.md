@@ -324,8 +324,12 @@ STORAGE
 
 Use:
 
-ui/live/network_current.json
-ui/live/network_history.sqlite3
+ui/live/network_current.json            (small current state; public by design)
+/home/ssm-user/quant-ui/data/network_history.sqlite3
+                                        (OUTSIDE the web root — serve.py serves
+                                         any file under ui/, so the database
+                                         must never live there; the API exposes
+                                         only bounded queries)
 
 SQLite uses WAL mode.
 
@@ -408,13 +412,15 @@ NET-01 — CANONICAL EVIDENCE
 
 NET-02 — NETWORK RECORDER
 
-- New ui/network_recorder.py, approximately 500 production lines.
+- New ui/network_recorder.py. Card budget stated up front and reported +/−
+  (owner size law); the budget is a ceiling, never a target to hit.
 - Read mirrored feed and stream evidence.
 - Probe only the named public Binance time endpoints.
 - Scrape the exact cloudflared loopback metrics URL.
 - Probe the configured loopback quant-ui origin.
 - Summarize News.
-- Write atomic current state and bounded SQLite history.
+- Write atomic current state (ui/live) and bounded SQLite history in the data
+  directory outside the web root (see STORAGE).
 - No credential, signed call, duplicate WebSocket or runtime mutation.
 - Add and version quant-ui-network.service.
 - Deploy it.
@@ -506,11 +512,9 @@ Stop after NET-07. Do not expand Network into a cloud administration console.
 
 ADDENDUM — CORRECTIONS ACCEPTED (Codex review of this order, 2026-08-16; folded by the UI seat)
 
-1. Storage: the SQLite history and any bulk store live OUTSIDE the web root
-   (e.g. /home/ssm-user/quant-ui/data/), never under ui/ — serve.py serves any
-   file inside ui/, so a database there would be downloadable. Only bounded
-   API queries expose it. ui/live/network_current.json stays (small, public
-   by design).
+1. Storage: the SQLite history lives OUTSIDE the web root
+   (/home/ssm-user/quant-ui/data/), never under ui/ — folded inline in
+   STORAGE and NET-02 above.
 2. Authority: workers build named files only. Git refresh/branching, xfer,
    host restarts and every AWS deployment are integrator-only (the seated
    Lead), verified by hand, recorded under evidence/. Workers never run git or
@@ -530,11 +534,18 @@ ADDENDUM — CORRECTIONS ACCEPTED (Codex review of this order, 2026-08-16; folde
 6. Engineering: stable edge IDs; UTC timestamps plus monotonic durations;
    migrations/indexes; hard DB size cap; corruption recovery; exact p50/p95
    sample minimum. Line counts are per-card BUDGETS reported +/− (owner size
-   law), never a target to hit.
+   law), never a target — folded inline in NET-02 above.
 7. Fixtures: deterministic test fixtures are required for tests and can never
    feed production.
 8. Particles/animation: skipped in V1 (as ordered); topology + synchronized
    lanes first; motion only when a genuine counter exists.
+
+ROLES (so nobody misreads the boot): the chat that runs this order is the
+SEATED INTEGRATOR (Lead) for Network V1. Codex workers implement named files
+and report; the integrator verifies with its own diff and tests, commits,
+transfers with xfer, restarts services, records evidence, and shows the owner
+the result. Workers never run git or touch the host. The integrator never
+touches the trading runtime, the tunnel, or the machine's directories.
 
 PRECEDENCE: this order supersedes ui/NETWORK-TAB-BRIEF.md wherever they
 differ (branch law, wire list, storage, controls). The brief remains the
