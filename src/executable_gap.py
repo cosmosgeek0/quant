@@ -4,7 +4,9 @@ The input seam follows ``market_stream``: raw book-ticker rows are reduced from
 ``bidPrice``/``askPrice`` (market_stream.py:753-761), then published as the
 Decimal-text fields ``spot_bid``, ``spot_ask``, ``perp_bid``, and ``perp_ask``
 (market_stream.py:1214-1238).  ``quotes_from_stream_record`` binds those prices
-to the venue observation times retained by the caller.
+to the venue observation times retained by the caller.  A caller with only one
+shared time uses ``read_executable_gap_shared_observation``; its result records
+that paired-venue skew was not checked.
 
 This module implements BASIS-LOCKIN-SPEC rows 023-024, 050, 089, 092, and 094.
 Entry is Futures bid minus Spot ask over Spot ask.  Exit is Futures ask minus
@@ -41,8 +43,8 @@ __all__ = [
     "DEFAULT_MAX_QUOTE_AGE_MS", "DEFAULT_MAX_QUOTE_SKEW_MS", "NAMED_WINDOWS",
     "TimedQuote", "ExecutableGapReading", "GapRefusal", "ExecutableGapResult",
     "GapObservation", "WindowStats", "HistoryQueryError",
-    "quotes_from_stream_record", "read_executable_gap", "parse_window",
-    "GapHistoryRing",
+    "quotes_from_stream_record", "read_executable_gap",
+    "read_executable_gap_shared_observation", "parse_window", "GapHistoryRing",
 ]
 
 
@@ -81,6 +83,7 @@ class ExecutableGapReading:
     spot_age_ms: int
     perp_age_ms: int
     verdict: Literal["READY"] = "READY"
+    skew_checked: bool = True
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,7 @@ class GapRefusal:
     spot_age_ms: Optional[int] = None
     perp_age_ms: Optional[int] = None
     verdict: Literal["REFUSED"] = "REFUSED"
+    skew_checked: bool = True
 
 
 ExecutableGapResult = Union[ExecutableGapReading, GapRefusal]
@@ -163,12 +167,83 @@ def _refused(
     reason: RefusalReason,
     spot_age_ms: Optional[int] = None,
     perp_age_ms: Optional[int] = None,
+    *,
+    skew_checked: bool = True,
 ) -> GapRefusal:
     return GapRefusal(
         symbol if type(symbol) is str else "",
         reason,
         spot_age_ms,
         perp_age_ms,
+        skew_checked=skew_checked,
+    )
+
+
+def _read_executable_gap(
+    symbol: Any,
+    spot: Any,
+    perp: Any,
+    now_ms: Any,
+    *,
+    max_age_ms: Any,
+    max_skew_ms: Any,
+    skew_checked: bool,
+) -> ExecutableGapResult:
+    def refused(
+        reason: RefusalReason,
+        spot_age_ms: Optional[int] = None,
+        perp_age_ms: Optional[int] = None,
+    ) -> GapRefusal:
+        return _refused(
+            symbol, reason, spot_age_ms, perp_age_ms,
+            skew_checked=skew_checked,
+        )
+
+    if type(symbol) is not str or SYMBOL_RE.fullmatch(symbol) is None:
+        return refused("SYMBOL_INVALID")
+    if not _valid_ms(now_ms):
+        return refused("NOW_INVALID")
+    if not _valid_ms(max_age_ms) or max_age_ms == 0:
+        return refused("AGE_BOUND_INVALID")
+    if not _valid_ms(max_skew_ms):
+        return refused("SKEW_BOUND_INVALID")
+    if not isinstance(spot, TimedQuote) or not _valid_ms(spot.observed_ms):
+        return refused("SPOT_QUOTE_INVALID")
+    if not isinstance(perp, TimedQuote) or not _valid_ms(perp.observed_ms):
+        return refused("PERP_QUOTE_INVALID")
+
+    spot_age = now_ms - spot.observed_ms
+    perp_age = now_ms - perp.observed_ms
+    if spot_age < 0:
+        return refused("SPOT_QUOTE_IN_FUTURE", spot_age, perp_age)
+    if perp_age < 0:
+        return refused("PERP_QUOTE_IN_FUTURE", spot_age, perp_age)
+    if spot_age > max_age_ms:
+        return refused("SPOT_QUOTE_STALE", spot_age, perp_age)
+    if perp_age > max_age_ms:
+        return refused("PERP_QUOTE_STALE", spot_age, perp_age)
+    if skew_checked \
+            and abs(spot.observed_ms - perp.observed_ms) > max_skew_ms:
+        return refused("QUOTE_SKEW_EXCEEDED", spot_age, perp_age)
+
+    spot_bid, spot_ask = _price(spot.bid), _price(spot.ask)
+    perp_bid, perp_ask = _price(perp.bid), _price(perp.ask)
+    if spot_bid is None or spot_ask is None:
+        return refused("SPOT_QUOTE_INVALID", spot_age, perp_age)
+    if perp_bid is None or perp_ask is None:
+        return refused("PERP_QUOTE_INVALID", spot_age, perp_age)
+    if spot_bid >= spot_ask:
+        return refused("SPOT_BOOK_CROSSED_OR_LOCKED", spot_age, perp_age)
+    if perp_bid >= perp_ask:
+        return refused("PERP_BOOK_CROSSED_OR_LOCKED", spot_age, perp_age)
+
+    entry = kernel_entry_gap_pct(spot_ask, perp_bid)
+    exit_gap = executable_return_pct(perp_ask, spot_bid)
+    if entry is None or exit_gap is None:
+        return refused("GAP_UNAVAILABLE", spot_age, perp_age)
+    return ExecutableGapReading(
+        symbol, now_ms, entry, exit_gap, spot_age, perp_age,
+        skew_checked=skew_checked,
     )
 
 
@@ -181,52 +256,35 @@ def read_executable_gap(
     max_age_ms: Any = DEFAULT_MAX_QUOTE_AGE_MS,
     max_skew_ms: Any = DEFAULT_MAX_QUOTE_SKEW_MS,
 ) -> ExecutableGapResult:
-    """Return one fresh executable reading or one typed refusal."""
-    if type(symbol) is not str or SYMBOL_RE.fullmatch(symbol) is None:
-        return _refused(symbol, "SYMBOL_INVALID")
-    if not _valid_ms(now_ms):
-        return _refused(symbol, "NOW_INVALID")
-    if not _valid_ms(max_age_ms) or max_age_ms == 0:
-        return _refused(symbol, "AGE_BOUND_INVALID")
-    if not _valid_ms(max_skew_ms):
-        return _refused(symbol, "SKEW_BOUND_INVALID")
-    if not isinstance(spot, TimedQuote) or not _valid_ms(spot.observed_ms):
-        return _refused(symbol, "SPOT_QUOTE_INVALID")
-    if not isinstance(perp, TimedQuote) or not _valid_ms(perp.observed_ms):
-        return _refused(symbol, "PERP_QUOTE_INVALID")
+    """Read quotes with genuine per-venue times and enforce their skew."""
+    return _read_executable_gap(
+        symbol, spot, perp, now_ms,
+        max_age_ms=max_age_ms,
+        max_skew_ms=max_skew_ms,
+        skew_checked=True,
+    )
 
-    spot_age = now_ms - spot.observed_ms
-    perp_age = now_ms - perp.observed_ms
-    if spot_age < 0:
-        return _refused(symbol, "SPOT_QUOTE_IN_FUTURE", spot_age, perp_age)
-    if perp_age < 0:
-        return _refused(symbol, "PERP_QUOTE_IN_FUTURE", spot_age, perp_age)
-    if spot_age > max_age_ms:
-        return _refused(symbol, "SPOT_QUOTE_STALE", spot_age, perp_age)
-    if perp_age > max_age_ms:
-        return _refused(symbol, "PERP_QUOTE_STALE", spot_age, perp_age)
-    if abs(spot.observed_ms - perp.observed_ms) > max_skew_ms:
-        return _refused(symbol, "QUOTE_SKEW_EXCEEDED", spot_age, perp_age)
 
-    spot_bid, spot_ask = _price(spot.bid), _price(spot.ask)
-    perp_bid, perp_ask = _price(perp.bid), _price(perp.ask)
-    if spot_bid is None or spot_ask is None:
-        return _refused(symbol, "SPOT_QUOTE_INVALID", spot_age, perp_age)
-    if perp_bid is None or perp_ask is None:
-        return _refused(symbol, "PERP_QUOTE_INVALID", spot_age, perp_age)
-    if spot_bid >= spot_ask:
-        return _refused(
-            symbol, "SPOT_BOOK_CROSSED_OR_LOCKED", spot_age, perp_age)
-    if perp_bid >= perp_ask:
-        return _refused(
-            symbol, "PERP_BOOK_CROSSED_OR_LOCKED", spot_age, perp_age)
-
-    entry = kernel_entry_gap_pct(spot_ask, perp_bid)
-    exit_gap = executable_return_pct(perp_ask, spot_bid)
-    if entry is None or exit_gap is None:
-        return _refused(symbol, "GAP_UNAVAILABLE", spot_age, perp_age)
-    return ExecutableGapReading(
-        symbol, now_ms, entry, exit_gap, spot_age, perp_age)
+def read_executable_gap_shared_observation(
+    symbol: Any,
+    record: Mapping[str, Any],
+    shared_observed_ms: Any,
+    now_ms: Any,
+    *,
+    max_age_ms: Any = DEFAULT_MAX_QUOTE_AGE_MS,
+) -> ExecutableGapResult:
+    """Read both books at one shared time without claiming a skew check."""
+    spot, perp = quotes_from_stream_record(
+        record,
+        spot_observed_ms=shared_observed_ms,
+        perp_observed_ms=shared_observed_ms,
+    )
+    return _read_executable_gap(
+        symbol, spot, perp, now_ms,
+        max_age_ms=max_age_ms,
+        max_skew_ms=DEFAULT_MAX_QUOTE_SKEW_MS,
+        skew_checked=False,
+    )
 
 
 def parse_window(text: str) -> timedelta:

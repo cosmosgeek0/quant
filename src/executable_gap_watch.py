@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Append read-only executable-gap observations from ``stream_state.json``.
 
-The frozen stream schema publishes ``utc``, ``venues``, four touch-price
-fields, and conservative ``freshness_ms`` (market_stream.py:97-118,
-1214-1238,1404-1420).  It has no separate venue times, so both touches use the
-lower bound ``utc - freshness_ms``; missing timing remains unknown and refuses.
+The stream schema publishes ``utc``, ``venues``, four touch-price fields, and
+one shared quote age.  ``book_age_ms`` is preferred when known; older records
+fall back to conservative composite ``freshness_ms``.  No per-venue times are
+present, so accepted rows state that paired-venue skew was not checked.
 
 Startup replay reads at most the final 64 MiB of ``executable_gaps.jsonl``.
 It accepts only OK rows from the last 24 hours, after which BF2 retains at most
@@ -22,15 +22,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Tuple
 
 from executable_gap import (ExecutableGapReading, GapHistoryRing,
-                            quotes_from_stream_record, read_executable_gap)
+                            HistoryQueryError,
+                            read_executable_gap_shared_observation)
 from runtime_paths import PATHS, RuntimePaths
 
 
 OUTPUT_FILENAME = "executable_gaps.jsonl"; REPLAY_MAX_BYTES = 64 * 1024 * 1024
 REPLAY_WINDOW_MS = 24 * 60 * 60 * 1_000
+# Permit only a small producer/consumer UTC clock difference.
+RECORD_UTC_FUTURE_TOLERANCE_MS = 2_000
 VENUES = frozenset(("spot", "perp", "both"))
 STALE_REASONS = frozenset(("SPOT_QUOTE_STALE", "PERP_QUOTE_STALE"))
 CROSSED_REASONS = frozenset(("SPOT_BOOK_CROSSED_OR_LOCKED",
@@ -56,6 +59,23 @@ class WatchPass:
     rows: Tuple[Mapping[str, Any], ...]
     summary: WatchSummary
     history: GapHistoryRing
+
+
+@dataclass(frozen=True)
+class RecordTiming:
+    utc_ms: Optional[int]
+    observed_ms: Optional[int]
+    age_source: Literal["book_age_ms", "freshness_ms"]
+    refusal_reason: Optional[Literal["RECORD_UTC_IN_FUTURE"]] = None
+
+
+@dataclass(frozen=True)
+class RecordRefusal:
+    symbol: str
+    reason: Literal["RECORD_UTC_IN_FUTURE"]
+    spot_age_ms: None = None
+    perp_age_ms: None = None
+    skew_checked: Literal[False] = False
 
 
 def _utc_ms(raw: Any) -> Optional[int]:
@@ -84,13 +104,28 @@ def _utc_text(now_ms: int) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _observed_ms(record: Mapping[str, Any]) -> Optional[int]:
+def _nonnegative_ms(raw: Any) -> Optional[int]:
+    if type(raw) is int and raw >= 0:
+        return raw
+    if type(raw) is str and raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _record_timing(record: Mapping[str, Any], now_ms: int) -> RecordTiming:
     written_ms = _utc_ms(record.get("utc"))
-    freshness = record.get("freshness_ms")
-    if written_ms is None or type(freshness) is not str or not freshness.isdigit():
-        return None
-    age_ms = int(freshness)
-    return written_ms - age_ms if age_ms <= written_ms else None
+    uses_book_age = "book_age_ms" in record \
+        and record.get("book_age_ms") is not None
+    age_source = "book_age_ms" if uses_book_age else "freshness_ms"
+    age_ms = _nonnegative_ms(record.get(age_source))
+    if written_ms is not None \
+            and written_ms - now_ms > RECORD_UTC_FUTURE_TOLERANCE_MS:
+        return RecordTiming(
+            written_ms, None, age_source, "RECORD_UTC_IN_FUTURE")
+    observed_ms = written_ms - age_ms \
+        if written_ms is not None and age_ms is not None and age_ms <= written_ms \
+        else None
+    return RecordTiming(written_ms, observed_ms, age_source)
 
 
 def _book_text(record: Mapping[str, Any]) -> Mapping[str, Optional[str]]:
@@ -121,7 +156,7 @@ def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
 
 
-def _row(utc: str, result: Any) -> Dict[str, Any]:
+def _row(utc: str, result: Any, age_source: str) -> Dict[str, Any]:
     accepted = isinstance(result, ExecutableGapReading)
     return {
         "utc": utc, "symbol": result.symbol,
@@ -129,6 +164,8 @@ def _row(utc: str, result: Any) -> Dict[str, Any]:
         "exit_gap_pct": _decimal_text(result.exit_gap_pct) if accepted else None,
         "spot_age_ms": result.spot_age_ms,
         "perp_age_ms": result.perp_age_ms,
+        "age_source": age_source,
+        "skew_checked": result.skew_checked,
         "result": "OK" if accepted else result.reason,
     }
 
@@ -137,7 +174,7 @@ def build_rows(state: Mapping[str, Mapping[str, Any]], now_ms: int) -> Tuple[
         Tuple[Dict[str, Any], ...], Tuple[ExecutableGapReading, ...], WatchSummary]:
     if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
         raise ExecutableGapWatchError("current time must be nonnegative epoch-ms")
-    utc = _utc_text(now_ms)
+    fallback_utc = _utc_text(now_ms)
     rows = []
     accepted = []
     refusals = []
@@ -145,12 +182,15 @@ def build_rows(state: Mapping[str, Mapping[str, Any]], now_ms: int) -> Tuple[
         record = state[symbol]
         if record.get("venues") != "both":
             continue
-        observed_ms = _observed_ms(record)
-        spot, perp = quotes_from_stream_record(
-            _book_text(record), spot_observed_ms=observed_ms,
-            perp_observed_ms=observed_ms)
-        result = read_executable_gap(symbol, spot, perp, now_ms)
-        rows.append(_row(utc, result))
+        timing = _record_timing(record, now_ms)
+        row_utc = _utc_text(timing.utc_ms) \
+            if timing.utc_ms is not None else fallback_utc
+        if timing.refusal_reason is not None:
+            result = RecordRefusal(symbol, timing.refusal_reason)
+        else:
+            result = read_executable_gap_shared_observation(
+                symbol, _book_text(record), timing.observed_ms, now_ms)
+        rows.append(_row(row_utc, result, timing.age_source))
         if isinstance(result, ExecutableGapReading):
             accepted.append(result)
         else:
@@ -205,11 +245,15 @@ def _replay_reading(raw: bytes, cutoff_ms: int, now_ms: int):
         raise ExecutableGapWatchError("gap receipt OK row has invalid gap text") \
             from None
     ages = (row.get("spot_age_ms"), row.get("perp_age_ms"))
+    skew_checked = row.get("skew_checked", False)
     if any(isinstance(age, bool) or not isinstance(age, int) or age < 0
-           for age in ages) or not entry.is_finite() or not exit_gap.is_finite():
+           for age in ages) or type(skew_checked) is not bool \
+            or not entry.is_finite() or not exit_gap.is_finite():
         raise ExecutableGapWatchError("gap receipt OK row has invalid values")
     return ExecutableGapReading(
-        row.get("symbol"), row_ms, entry, exit_gap, ages[0], ages[1])
+        row.get("symbol"), row_ms, entry, exit_gap, ages[0], ages[1],
+        skew_checked=skew_checked,
+    )
 
 
 def replay_history(path: Path, now_ms: int) -> GapHistoryRing:
@@ -236,14 +280,25 @@ def _append_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         return
     path = Path(path)
     try:
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        encoded_rows = tuple(
+            (json.dumps(dict(row), separators=(",", ":")) + "\n").encode("utf-8")
+            for row in rows
+        )
+        if not path.parent.is_dir():
+            raise ExecutableGapWatchError(
+                f"gap receipt directory is unavailable: {path.parent}")
         if path.is_symlink():
             raise ExecutableGapWatchError("gap receipt ledger must not be a symlink")
-        with open(path, "a", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(dict(row), separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT \
+            | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            for encoded in encoded_rows:
+                if os.write(descriptor, encoded) != len(encoded):
+                    raise OSError("gap receipt append was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     except ExecutableGapWatchError:
         raise
     except (OSError, TypeError, ValueError):
@@ -269,10 +324,35 @@ def run_once(paths: RuntimePaths = PATHS, *, now_ms: Optional[int] = None) -> Wa
     history = replay_history(output_path, current_ms)
     state = load_stream_state(paths.stream_state)
     rows, accepted, summary = build_rows(state, current_ms)
-    _append_rows(output_path, rows)
-    for reading in accepted:
-        history.record(reading)
-    return WatchPass(rows, summary, history)
+    accepted_by_symbol = {reading.symbol: reading for reading in accepted}
+    append_rows = []
+    append_readings = []
+    for row in rows:
+        try:
+            latest = history.series_for(row["symbol"])
+        except HistoryQueryError:
+            latest = ()
+        if latest and latest[-1].utc_text == row["utc"]:
+            continue
+        reading = accepted_by_symbol.get(row["symbol"])
+        if reading is not None:
+            append_readings.append((row, reading))
+        append_rows.append(row)
+    try:
+        for row, reading in append_readings:
+            cut_ms = _utc_ms(row["utc"])
+            if cut_ms is None:
+                raise ValueError("accepted cut time is invalid")
+            history.record(ExecutableGapReading(
+                reading.symbol, cut_ms, reading.entry_gap_pct,
+                reading.exit_gap_pct, reading.spot_age_ms,
+                reading.perp_age_ms, skew_checked=reading.skew_checked,
+            ))
+    except (TypeError, ValueError):
+        raise ExecutableGapWatchError(
+            "stream cuts are not valid ordered history") from None
+    _append_rows(output_path, append_rows)
+    return WatchPass(tuple(append_rows), summary, history)
 
 
 def main(argv: Optional[Sequence[str]] = None, *, paths: RuntimePaths = PATHS,

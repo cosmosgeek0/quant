@@ -57,6 +57,7 @@ class ExecutableGapLawTests(unittest.TestCase):
         self.assertEqual(result.exit_gap_pct, Decimal("12"))
         self.assertEqual((result.spot_age_ms, result.perp_age_ms), (100, 200))
         self.assertEqual(result.verdict, "READY")
+        self.assertTrue(result.skew_checked)
         self.assertNotEqual(result.entry_gap_pct, Decimal("999999"))
         self.assertTrue(all(isinstance(value, Decimal) for value in (
             result.entry_gap_pct, result.exit_gap_pct)))
@@ -96,8 +97,32 @@ class ExecutableGapLawTests(unittest.TestCase):
         floating = read(stream_record(spot_bid=100.0))
 
         self.assertEqual(skewed.reason, "QUOTE_SKEW_EXCEEDED")
+        self.assertTrue(skewed.skew_checked)
         self.assertEqual(floating.reason, "SPOT_QUOTE_INVALID")
         self.assertEqual((skewed.spot_age_ms, skewed.perp_age_ms), (0, 1001))
+
+    def test_shared_observation_records_that_skew_was_not_checked(self):
+        result = gap.read_executable_gap_shared_observation(
+            SYMBOL, stream_record(), NOW_MS - 100, NOW_MS)
+
+        self.assertIsInstance(result, gap.ExecutableGapReading)
+        self.assertFalse(result.skew_checked)
+        self.assertEqual((result.spot_age_ms, result.perp_age_ms), (100, 100))
+
+    def test_reverse_dislocation_stays_normal_signed(self):
+        """src/reverse_rung_intent.py recomputes the reverse capture."""
+        result = read(stream_record(
+            spot_bid="110", spot_ask="111", perp_bid="99", perp_ask="100"))
+
+        self.assertIsInstance(result, gap.ExecutableGapReading)
+        self.assertEqual(
+            result.entry_gap_pct,
+            Decimal("-10.810810810810810810810810810810810810810810810811"),
+        )
+        self.assertEqual(
+            result.exit_gap_pct,
+            Decimal("-9.0909090909090909090909090909090909090909090909091"),
+        )
 
 
 class GapHistoryRingTests(unittest.TestCase):
