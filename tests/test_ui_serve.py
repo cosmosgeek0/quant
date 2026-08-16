@@ -1174,7 +1174,7 @@ class TestReadOnlyGuarantees(ServerHarness):
         self.assertEqual(payload["methods"], ["GET", "HEAD"])
         self.assertEqual(sorted(payload["sources"]), [
             "basis_position", "basis_receipts_dir", "events", "fees",
-            "governor_dir", "governor_lock", "health", "job_receipts_dir",
+            "governor_dir", "governor_lock", "grace", "health", "job_receipts_dir",
             "job_results", "jobs_log", "manifest", "momentum_decisions",
             "momentum_receipts", "momentum_state", "news", "news_sources",
             "poll_config", "proposals_dir", "stop", "stop_jobs",
