@@ -1,0 +1,8 @@
+FIRST MARGIN ACT — attempt 1, 2026-08-16 (owner word GO MARGIN PROOF; release b188351)
+choreography | flat read (no dedicated tool; runner pre/post reads are the evidence) -> ACCEPT-ONE 2.5 -> unseal with 300s dead-man -> job mproof-b668c154de2c MARGIN_BORROW 2.5 USDT intent mrgintent-6fa72d060f146b80fe9fa76c
+runner path | claim ok -> ticket/operator/governor ok (token b644a2e1..., 04:37:03Z) -> final authority read ok (7 digests recorded) -> POST ok -> submission txId 401344857108 -> confirmation read MISMATCH -> verdict UNKNOWN exit 4 -> STOP-JOBS written -> governor lock HELD -> every later tick HALTED (design)
+exchange truth (signed GET-only, same session) | history row: txId 401344857108 (int) asset USDT principal 2.5 status CONFIRMED type MANUAL clientTag "" | account: borrowed 2.5 interest 0.00000438 free 4.5 netAsset 1.99999562 marginLevel 1.7999
+root cause | runner expected history row "type" to echo the request direction (BORROW); Binance's row "type" is the origin class (MANUAL/AUTO); direction is the GET's query param. Correct fail-closed refusal on a wrong expectation. Fix card MJ9.
+deploy scar | one crashed tick at 03:54Z: job_runner.py landed a minute before margin_ops.py — the tick raced file transfers. Rule: pause the tick or land atomically for multi-file deploys.
+choreography scars | read receipts from RECEIPT_DIR/ instead of RECEIPT_DIR/jobs/receipts/; the runner's log is DEPLOY/jobs.log. Both corrected in the card set.
+money state at write | 2.5 USDT liability standing, interest under half a cent; repay planned through the runner after MJ9 lands + reconcile; no manual exchange action taken or planned.
