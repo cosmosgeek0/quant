@@ -173,6 +173,29 @@
         syncSelects();
       }
     });
+    getJSON("/api/grace", function (d) {
+      if (!state) { return; }
+      if (d && d.ok) {
+        state.grace = {
+          allowed: Array.isArray(d.allowed) && d.allowed.length
+            ? d.allowed : [15, 30, 60, 120, 300, 600],
+          grace_s: (typeof d.grace_s === "object" && d.grace_s) || {}
+        };
+        syncSelects();
+        update();
+      }
+    });
+  }
+
+  function postGrace(key, value) {
+    fetch("/api/grace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grace_s: (function () {
+        var g = {}; g[key] = value; return g;
+      })() })
+    }).then(function () { fetchAll(); })
+      .catch(function () { fetchAll(); });
   }
 
   function postCadence(key, sec) {
@@ -218,9 +241,17 @@
         var med = quantile(beatVals, 0.5);
         if (med >= 5 && med <= 3600) { cadence = med; }
       }
-      var thr = cadence
-        ? { warn: cadence * 2, bad: cadence * 4 }
-        : lp.fallback;
+      /* grace (census: Healthchecks pattern) — explicit per-loop
+         seconds override; auto = the 2×/4× cadence policy */
+      var graceVal = state.grace ? state.grace.grace_s[lp.key] : "auto";
+      var thr;
+      if (cadence && num(graceVal) != null) {
+        thr = { warn: cadence + graceVal, bad: cadence + graceVal * 2 };
+      } else if (cadence) {
+        thr = { warn: cadence * 2, bad: cadence * 4 };
+      } else {
+        thr = lp.fallback;
+      }
 
       var ageNow = null;
       if (ages[1].length) {
@@ -249,6 +280,7 @@
       var ageVals = sorted(ages[1]);
       m[lp.key] = {
         loop: lp, ages: ages, beats: beats, cadence: cadence, thr: thr,
+        grace: num(graceVal) != null ? graceVal : "auto",
         ageNow: ageNow, ratio: ratio, cls: cls, late: late,
         stat: {
           min: beatVals.length ? beatVals[0] : null,
@@ -632,6 +664,7 @@
       range: "1h", points: [], telem: null,
       pollConf: { allowed: [5, 10, 15, 30, 60, 120], default_s: 15,
         metrics: {} },
+      grace: { allowed: [15, 30, 60, 120, 300, 600], grace_s: {} },
       paused: !!localPoll.paused,
       localPoll: localPoll,
       els: { tiles: {}, path: {}, rasterRows: {}, tableBody: null,
@@ -696,11 +729,15 @@
       });
     page.appendChild(band);
 
-    /* ---- path strip: the topology as it is wired ---- */
-    var path = el("div", "v5-path");
+    /* ---- control path card: the topology as it is wired, vertical
+       beside the raster (composition: answer layer is two-column) ---- */
+    var pathCard = el("div", "st-card v5-path-card");
+    var pcHead = el("div", "v5-card-head");
+    pcHead.appendChild(el("span", "v5-card-lbl", "Control path"));
+    pathCard.appendChild(pcHead);
     PATH_TIERS.forEach(function (tier) {
-      var col = el("div", "v5-path-col");
-      col.appendChild(el("div", "v5-path-tier", tier[0]));
+      var sec = el("div", "v5-pv-tier");
+      sec.appendChild(el("div", "v5-path-tier", tier[0]));
       tier[1].forEach(function (k) {
         var lp = null;
         for (var i = 0; i < LOOPS.length; i += 1) {
@@ -713,12 +750,11 @@
         row.appendChild(el("span", "st-spacer"));
         var val = el("span", "v5-node-val", "—");
         row.appendChild(val);
-        col.appendChild(row);
+        sec.appendChild(row);
         state.els.path[k] = { dot: dot, val: val };
       });
-      path.appendChild(col);
+      pathCard.appendChild(sec);
     });
-    page.appendChild(path);
 
     /* ---- schedule raster card ---- */
     var rasterCard = el("div", "st-card");
@@ -748,9 +784,11 @@
     rasterCard.appendChild(axis);
     rasterCard.appendChild(el("div", "v5-note",
       "each cell = the worst sample in its time slice · " +
-      "green on schedule · amber past 2× cadence · " +
-      "red past 4×"));
-    page.appendChild(rasterCard);
+      "green on schedule · amber past Degraded · red past Outage"));
+    var duoTop = el("div", "v5-duo");
+    duoTop.appendChild(rasterCard);
+    duoTop.appendChild(pathCard);
+    page.appendChild(duoTop);
 
     /* ---- worst-first table card ---- */
     var tableCard = el("div", "st-card");
@@ -760,8 +798,8 @@
     var tbl = el("table", "v5-table");
     var thead = el("thead");
     var hr = el("tr");
-    [["Loop", "v5-td-name"], ["Tier", ""], ["Status", "c-status"],
-      ["Cadence", ""], ["Age", ""], ["×Sched", ""],
+    [["Loop", "v5-td-name"], ["Status", "c-status"],
+      ["Cadence", ""], ["Grace", ""], ["Age", ""], ["×Sched", ""],
       ["p95 beat", ""], ["Late", ""], ["Trend", ""]]
       .forEach(function (h) {
         var th = el("th", h[1], h[0]);
@@ -774,9 +812,9 @@
     tbl.appendChild(tbody);
     tableCard.appendChild(tbl);
     tableCard.appendChild(el("div", "v5-note",
-      "late = share of window samples past 2× cadence · " +
-      "beats are the loop's measured tick intervals"));
-    page.appendChild(tableCard);
+      "grace: Degraded past cadence+grace, Outage past cadence+2×grace" +
+      " · auto = 2×/4× cadence · late = share of window samples past" +
+      " the Degraded line"));
 
     /* ---- state-change log: the census's most common instrument
        element (86/150 operator surfaces) — what changed, when ---- */
@@ -792,7 +830,10 @@
     var evHost = el("div", "v5-ev-host");
     state.els.evHost = evHost;
     evCard.appendChild(evHost);
-    page.appendChild(evCard);
+    var duoMid = el("div", "v5-duo");
+    duoMid.appendChild(tableCard);
+    duoMid.appendChild(evCard);
+    page.appendChild(duoMid);
 
     /* ---- envelope panels ---- */
     var grid = el("div", "v5-grid");
@@ -815,6 +856,18 @@
         postCadence(lp.key, parseInt(sel.value, 10));
       });
       ph.appendChild(sel);
+      var gsel = null;
+      if (lp.unit === "s") {
+        gsel = el("select", "v5-select");
+        gsel.setAttribute("data-grace", lp.key);
+        gsel.setAttribute("title",
+          "grace: Degraded past cadence+grace, Outage past cadence+2×grace");
+        gsel.addEventListener("change", function () {
+          postGrace(lp.key, gsel.value === "auto"
+            ? "auto" : parseInt(gsel.value, 10));
+        });
+        ph.appendChild(gsel);
+      }
       ph.appendChild(iconBtn("refresh now", REFRESH_D, function () {
         fetchAll();
       }));
@@ -827,7 +880,7 @@
       card.appendChild(stats);
       grid.appendChild(card);
       state.els.panels[lp.key] = { canvas: cv, stats: stats, dot: dot,
-        word: word, select: sel };
+        word: word, select: sel, graceSelect: gsel };
     });
     page.appendChild(grid);
 
@@ -866,6 +919,22 @@
         sel.appendChild(o);
       });
       sel.value = String(want);
+      if (p.graceSelect) {
+        var gs = p.graceSelect;
+        var gWant = state.grace.grace_s[lp.key];
+        gs.textContent = "";
+        var auto = document.createElement("option");
+        auto.value = "auto";
+        auto.textContent = "grace auto";
+        gs.appendChild(auto);
+        state.grace.allowed.forEach(function (s) {
+          var o = document.createElement("option");
+          o.value = String(s);
+          o.textContent = "grace " + fmtDur(s);
+          gs.appendChild(o);
+        });
+        gs.value = num(gWant) != null ? String(gWant) : "auto";
+      }
     });
   }
 
@@ -963,7 +1032,6 @@
       var tdName = el("td", "v5-td-name");
       tdName.appendChild(el("span", "nm", lp.name));
       tr.appendChild(tdName);
-      tr.appendChild(el("td", "v5-td-tier", lp.tier));
       var tdSt = el("td", "v5-td-status");
       var w = el("span", "v5-word" +
         (m.cls && m.cls !== "ok" ? " " + m.cls : ""), "");
@@ -975,6 +1043,13 @@
       tr.appendChild(tdSt);
       tr.appendChild(el("td", "", lp.unit === "ms" ? "—"
         : m.cadence ? fmtDur(m.cadence) : "—"));
+      var tdGrace = el("td", "",
+        lp.unit === "ms" ? "—"
+          : m.grace === "auto" ? "auto" : fmtDur(m.grace));
+      if (m.grace === "auto" || lp.unit === "ms") {
+        tdGrace.style.color = "var(--st-faint)";
+      }
+      tr.appendChild(tdGrace);
       var tdAge = el("td", "", fmtVal(m.ageNow, lp.unit));
       if (m.cls === "warn" || m.cls === "bad") {
         tdAge.style.color = m.cls === "bad"

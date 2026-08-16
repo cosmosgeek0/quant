@@ -9,15 +9,19 @@
   margin: -6px 0 14px;
 }
 
-/* ---- path strip: MAC → TRANSPORT → HOST, the real data path ---- */
-.v5-path {
-  display: flex; align-items: stretch; gap: 0;
-  border: 1px solid var(--st-line, #e5e7eb); border-radius: 14px;
-  background: var(--st-card, #fff);
-  padding: 12px 6px; margin-bottom: 14px;
+/* ---- answer layer composition: two columns, cards top-aligned ---- */
+.v5-duo {
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 14px; align-items: start; margin-bottom: 14px;
 }
-.v5-path-col { flex: 1 1 0; padding: 0 14px; min-width: 0; }
-.v5-path-col + .v5-path-col { border-left: 1px solid var(--st-line, #e5e7eb); }
+.v5-duo > .st-card { margin-bottom: 0; min-width: 0; }
+@media (max-width: 1100px) { .v5-duo { grid-template-columns: 1fr; } }
+
+/* ---- control path card: MAC → TRANSPORT → HOST, vertical ---- */
+.v5-pv-tier { padding: 2px 0 6px; }
+.v5-pv-tier + .v5-pv-tier {
+  border-top: 1px solid var(--st-line, #e5e7eb); padding-top: 8px;
+}
 .v5-path-tier {
   font-size: 9.75px; font-weight: 500; letter-spacing: 0.045em;
   text-transform: uppercase; color: var(--st-faint, #95959d);
@@ -139,7 +143,7 @@
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .v5-p-head .st-spacer { flex: 1; }
-.v5-env { display: block; width: 100%; height: 118px; margin-top: 10px; }
+.v5-env { display: block; width: 100%; height: 106px; margin-top: 10px; }
 .v5-p-stats {
   display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap;
   font-family: var(--mono, "JBMono", monospace);
@@ -182,4 +186,5 @@
 .v5-panel.flash { border-color: var(--focus, #2557d6); }
 
 /* state-change log stays a card, not a page: newest visible, rest scroll */
-.v5-ev-host { max-height: 264px; overflow-y: auto; }
+.v5-ev-host { max-height: 396px; overflow-y: auto; }
+.v5-ev-host .qevents-row { flex-wrap: wrap; }

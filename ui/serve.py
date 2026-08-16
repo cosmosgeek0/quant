@@ -206,6 +206,7 @@ def default_sources():
         "news": LIVE_DIR / "news.jsonl",
         "news_sources": LIVE_DIR / "news_sources.json",
         "telemetry": LIVE_DIR / "telemetry.jsonl",
+        "grace": LIVE_DIR / "grace.json",
     }
 
 
@@ -1761,6 +1762,88 @@ def _write_poll_config_locked(sources, body):
     return output, None
 
 
+# ---- per-loop grace (V5): UI grading preference, its own file --------
+# Kept OUT of poll_config.json so the telemetry recorder (which reads
+# that file) never sees an unknown key. Same read/merge/atomic-write
+# discipline as the poll config.
+
+GRACE_WRITE_LOCK = threading.Lock()
+GRACE_ALLOWED = (15, 30, 60, 120, 300, 600)
+
+
+def _read_grace(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}, False
+    return (payload if isinstance(payload, dict) else {}), True
+
+
+def _resolve_grace(payload):
+    raw = payload.get("grace_s")
+    raw = raw if isinstance(raw, dict) else {}
+    resolved = {}
+    for key in POLL_METRICS:
+        value = raw.get(key)
+        if isinstance(value, bool):
+            value = None
+        resolved[key] = value if value in GRACE_ALLOWED else "auto"
+    return resolved
+
+
+def api_grace(sources, now=None):
+    payload, present = _read_grace(sources["grace"])
+    return {
+        "ok": True,
+        "present": present,
+        "grace_s": _resolve_grace(payload),
+        "allowed": list(GRACE_ALLOWED),
+    }
+
+
+def write_grace(sources, body):
+    """Validate and atomically write the per-loop grace preferences."""
+    if not isinstance(body, dict):
+        return None, "body must be a JSON object"
+    with GRACE_WRITE_LOCK:
+        return _write_grace_locked(sources, body)
+
+
+def _write_grace_locked(sources, body):
+    current, _ = _read_grace(sources["grace"])
+    merged = _resolve_grace(current)
+    grace_in = body.get("grace_s", {})
+    if not isinstance(grace_in, dict):
+        return None, "grace_s must be an object"
+    for key, value in grace_in.items():
+        if key not in POLL_METRICS:
+            return None, "unknown metric %r" % (key,)
+        if value == "auto":
+            merged[key] = "auto"
+            continue
+        if isinstance(value, bool) or value not in GRACE_ALLOWED:
+            return None, "grace for %r must be 'auto' or one of %s" % (
+                key, list(GRACE_ALLOWED))
+        merged[key] = value
+    output = {"grace_s": merged}
+    target = Path(sources["grace"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".%s-" % target.name, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+            json.dump(output, tmp, ensure_ascii=False, separators=(",", ":"))
+            tmp.flush()
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return output, None
+
+
 API_ROUTES = {
     "/api/strip": api_strip,
     "/api/health": api_health,
@@ -1776,6 +1859,7 @@ API_ROUTES = {
     "/api/news": api_news,
     "/api/telemetry": api_telemetry,
     "/api/poll_config": api_poll_config,
+    "/api/grace": api_grace,
 }
 
 
@@ -1998,9 +2082,14 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
                         extra_headers=(("Allow", "GET, HEAD"),))
 
     def do_POST(self):
-        """One narrow write: the page's own recorder poll config."""
+        """Two narrow writes: recorder poll config, V5 grace prefs."""
         clean = urlsplit(self.path).path
-        if clean != "/api/poll_config":
+        writers = {
+            "/api/poll_config": write_poll_config,
+            "/api/grace": write_grace,
+        }
+        writer = writers.get(clean)
+        if writer is None:
             self._refuse()
             return
         try:
@@ -2022,7 +2111,7 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
                                   "error": "body must be valid JSON"})
             return
         try:
-            saved, error = write_poll_config(type(self).sources, body)
+            saved, error = writer(type(self).sources, body)
         except OSError as exc:
             self._send_json(500, {"ok": False, "error": str(exc)})
             return
