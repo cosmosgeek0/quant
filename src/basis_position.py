@@ -201,6 +201,16 @@ V2_TERMINAL_ORDER_STATUSES = frozenset((
     "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED",
     "EXPIRED_IN_MATCH",
 ))
+V2_FILL_TERMINAL_ORDER_STATUSES = V2_TERMINAL_ORDER_STATUSES - {"REJECTED"}
+V2_NONTERMINAL_ORDER_STATUSES = frozenset((
+    "INTENT_SAVED", "NEW", "PARTIALLY_FILLED", "PENDING_NEW", "WORKING",
+    "UNKNOWN",
+))
+V2_ORDER_STATUSES = V2_TERMINAL_ORDER_STATUSES \
+    | V2_NONTERMINAL_ORDER_STATUSES
+V2_MARKETS = frozenset(VENUES)
+V2_SPOT_VENUES = frozenset(("BINANCE_SPOT",))
+V2_FUTURES_VENUES = frozenset(("BINANCE_USDM",))
 V2_LEGAL_TRANSITIONS = {
     ST_NONE: frozenset((ST_OPENING,)),
     ST_OPENING: frozenset((ST_OPEN, ST_CLOSING, ST_UNKNOWN)),
@@ -216,6 +226,68 @@ V2_ADD_TRANSITION_EDGES = frozenset((
     (ST_OPEN, "ADDING"),
 ))
 V2_ADD_STATES = frozenset((ST_OPENING, "ADDING"))
+
+V2_EVIDENCE_FLAT_ENTRY = "FLAT_ENTRY_PREFLIGHT"
+V2_EVIDENCE_ADD = "ADD_AUTHORIZATION"
+V2_EVIDENCE_TERMINAL_RUNG = "TERMINAL_RUNG_FILLS"
+V2_EVIDENCE_REDUCE = "REDUCE_RECEIPT"
+V2_EVIDENCE_REDUCE_RECONCILE = "REDUCE_RECONCILE"
+V2_EVIDENCE_CLOSE = "CLOSE_AUTHORIZATION"
+V2_EVIDENCE_FLAT_CLOSE = "FRESH_FLAT"
+V2_EVIDENCE_AMBIGUOUS = "AMBIGUOUS_STATE"
+_V2_FLAT_EVIDENCE_AMOUNTS = frozenset((
+    "futures_position_qty", "spot_sellable_base_qty", "observed_at_ms",
+))
+_V2_TRANSITION_EVIDENCE = {
+    (ST_NONE, ST_OPENING): (
+        V2_EVIDENCE_FLAT_ENTRY, _V2_FLAT_EVIDENCE_AMOUNTS),
+    (ST_OPENING, ST_OPEN): (
+        V2_EVIDENCE_TERMINAL_RUNG,
+        frozenset(("spot_net_base_qty", "short_base_qty"))),
+    (ST_OPENING, ST_CLOSING): (
+        V2_EVIDENCE_CLOSE, frozenset(("exposed_base_qty",))),
+    (ST_OPENING, ST_UNKNOWN): (
+        V2_EVIDENCE_AMBIGUOUS, frozenset()),
+    (ST_OPEN, "ADDING"): (
+        V2_EVIDENCE_ADD,
+        frozenset(("requested_base_qty", "requested_quote"))),
+    (ST_OPEN, "REDUCING"): (
+        V2_EVIDENCE_REDUCE, frozenset(("reduced_base_qty",))),
+    (ST_OPEN, ST_CLOSING): (
+        V2_EVIDENCE_CLOSE, frozenset(("exposed_base_qty",))),
+    (ST_OPEN, ST_UNKNOWN): (
+        V2_EVIDENCE_AMBIGUOUS, frozenset()),
+    ("ADDING", ST_OPEN): (
+        V2_EVIDENCE_TERMINAL_RUNG,
+        frozenset(("spot_net_base_qty", "short_base_qty"))),
+    ("ADDING", ST_CLOSING): (
+        V2_EVIDENCE_CLOSE, frozenset(("exposed_base_qty",))),
+    ("ADDING", ST_UNKNOWN): (
+        V2_EVIDENCE_AMBIGUOUS, frozenset()),
+    ("REDUCING", ST_OPEN): (
+        V2_EVIDENCE_REDUCE_RECONCILE,
+        frozenset(("remaining_spot_base_qty",
+                   "remaining_short_base_qty"))),
+    ("REDUCING", ST_CLOSING): (
+        V2_EVIDENCE_CLOSE, frozenset(("exposed_base_qty",))),
+    ("REDUCING", ST_CLOSED): (
+        V2_EVIDENCE_FLAT_CLOSE, _V2_FLAT_EVIDENCE_AMOUNTS),
+    ("REDUCING", ST_UNKNOWN): (
+        V2_EVIDENCE_AMBIGUOUS, frozenset()),
+    (ST_CLOSING, ST_CLOSED): (
+        V2_EVIDENCE_FLAT_CLOSE, _V2_FLAT_EVIDENCE_AMOUNTS),
+    (ST_CLOSING, ST_UNKNOWN): (
+        V2_EVIDENCE_AMBIGUOUS, frozenset()),
+    (ST_UNKNOWN, "REDUCING"): (
+        V2_EVIDENCE_REDUCE, frozenset(("reduced_base_qty",))),
+    (ST_UNKNOWN, ST_CLOSING): (
+        V2_EVIDENCE_CLOSE, frozenset(("exposed_base_qty",))),
+}
+V2_EVIDENCE_KINDS = frozenset(
+    rule[0] for rule in _V2_TRANSITION_EVIDENCE.values())
+_V2_EVIDENCE_AMOUNT_FIELDS_BY_KIND = {
+    kind: fields for kind, fields in _V2_TRANSITION_EVIDENCE.values()
+}
 
 # Cross-lane verdict word carried by the state file so the executor's
 # prior-receipt gate always sees a verdict key with an honest value.
@@ -813,9 +885,18 @@ _V2_TRANSITION_FIELDS = frozenset({
     "transition_id", "from", "to", "expected_revision", "evidence",
     "created_cut_ms",
 })
-_V2_EVIDENCE_FIELDS = frozenset({"kind", "digest", "receipt_ids"})
+_V2_EVIDENCE_FIELDS = frozenset({
+    "kind", "digest", "receipt_ids", "amounts",
+})
 _V2_CONFIG_FIELDS = frozenset({
     "symbol", "direction", "schedule", "caps", "venue",
+})
+_V2_CONFIG_SCHEDULE_FIELDS = frozenset({
+    "ordinal", "entry_gap_pct", "quote_cap",
+})
+_V2_CONFIG_CAP_FIELDS = frozenset({"stack_quote", "rung_quote"})
+_V2_CONFIG_VENUE_FIELDS = frozenset({
+    "spot", "futures", "base_asset", "quote_asset",
 })
 _V2_FLAT_PROVENANCE_FIELDS = frozenset({
     "positions", "open_orders", "own_orders",
@@ -836,28 +917,51 @@ _V2_TOP_LEVEL_SENTINELS = frozenset({
     "initialization_cut_ms", "increases_frozen", "reduce_only_path",
     "event", "source_time_ms", "age_at_creation_ms", "entry_gap_pct",
     "exit_gap_pct", "funding_rate", "funding_period_ms",
+    "rung_id", "transition_id",
 })
+_V2_DEEP_SENTINELS = frozenset({
+    "schema_version", "config_epoch_digest", "config_snapshot",
+    "direction", "rungs", "transitions", "flat_proof",
+    "initialization_cut_ms", "increases_frozen", "reduce_only_path",
+    "record_type", "source_revision", "observed_at_ms",
+    "futures_position_qty", "spot_sellable_base_qty",
+    "standard_open_order_count", "algorithmic_open_order_count",
+    "own_orders_terminal", "evidence_digest", "read_provenance",
+    "ordinal", "effective_cap_quote", "sizes", "own_orders", "event",
+    "created_cut_ms", "cap_reconcile", "requested_base_qty",
+    "requested_quote", "spot_terminal_base_qty",
+    "short_terminal_base_qty", "remaining_spot_base_qty",
+    "remaining_short_base_qty", "terminal", "terminal_executed_qty",
+    "terminal_quote", "digest", "source_time_ms", "age_at_creation_ms",
+    "exit_gap_pct", "funding_period_ms", "terminal_fill_quote",
+    "freeze_increases", "transition_id", "expected_revision", "evidence",
+    "receipt_ids", "schedule", "caps", "venue", "quote_cap",
+    "stack_quote", "rung_quote", "quote_asset", "positions",
+    "open_orders",
+})
+_V2_WEAK_DEEP_SENTINELS = frozenset({"rung_id", "transition_id"})
 
 
-def _has_v2_record_shape(value: Any) -> bool:
+def _has_v2_record_shape(value: Any, path: Tuple[str, ...] = ()) -> bool:
+    if isinstance(value, list):
+        return any(_has_v2_record_shape(item, path) for item in value)
     if not isinstance(value, dict):
         return False
-    if set(value) & _V2_TOP_LEVEL_SENTINELS:
+    fields = set(value)
+    if not path and fields & _V2_TOP_LEVEL_SENTINELS:
+        return True
+    if fields & _V2_DEEP_SENTINELS:
         return True
     if value.get("record_type") in _V2_RECORD_TYPES:
         return True
-    for nested in value.values():
-        if isinstance(nested, dict) \
-                and ("config_epoch_digest" in nested
-                     or nested.get("record_type") in _V2_RECORD_TYPES):
-            return True
-        if isinstance(nested, list) and any(
-                isinstance(item, dict)
-                and ("config_epoch_digest" in item
-                     or item.get("record_type") in _V2_RECORD_TYPES)
-                for item in nested):
-            return True
-    return False
+    # The frozen v1 contract already carries a future_extension.rung_receipts
+    # list.  Its lone rung_id stays opaque and permissive; every other weak v2
+    # field, and every strong field even inside that list, selects v2.
+    if fields & _V2_WEAK_DEEP_SENTINELS and "rung_receipts" not in path:
+        return True
+    return any(
+        _has_v2_record_shape(nested, path + (key,))
+        for key, nested in value.items())
 
 
 def _is_v2_position(position: Any) -> bool:
@@ -943,65 +1047,8 @@ def _canonical_json_sha256(value: Any, path: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_v2_config_snapshot(snapshot: Any, symbol: str) -> str:
-    path = "config_snapshot"
-    _v2_exact_fields(snapshot, _V2_CONFIG_FIELDS, path)
-    _v2_json_value(snapshot, path)
-    if snapshot["symbol"] != symbol:
-        raise PositionError("version-2 config snapshot symbol does not "
-                            "match")
-    if snapshot["direction"] != V2_DIRECTION:
-        raise PositionError("version-2 config snapshot direction is not "
-                            "enabled")
-    if not isinstance(snapshot["schedule"], list) \
-            or not snapshot["schedule"] \
-            or any(not isinstance(row, dict)
-                   for row in snapshot["schedule"]):
-        raise PositionError("version-2 config snapshot schedule is invalid")
-    if not isinstance(snapshot["caps"], dict) or not snapshot["caps"]:
-        raise PositionError("version-2 config snapshot caps are invalid")
-    venue = snapshot["venue"]
-    if not isinstance(venue, dict):
-        raise PositionError("version-2 config snapshot venue is invalid")
-    base_asset = venue.get("base_asset")
-    if not isinstance(base_asset, str) \
-            or re.fullmatch(r"[A-Z0-9]{2,20}", base_asset) is None \
-            or not symbol.startswith(base_asset):
-        raise PositionError("version-2 config snapshot base asset is "
-                            "invalid")
-    return base_asset
-
-
-def v2_config_epoch_digest(config_snapshot: Dict[str, Any]) -> str:
-    """Return the canonical-JSON SHA-256 for one frozen v2 config."""
-    if not isinstance(config_snapshot, dict):
-        raise PositionError("version-2 config snapshot must be an object")
-    symbol = config_snapshot.get("symbol")
-    if not isinstance(symbol, str):
-        raise PositionError("version-2 config snapshot symbol is invalid")
-    _validate_v2_config_snapshot(config_snapshot, symbol)
-    return _canonical_json_sha256(config_snapshot, "config_snapshot")
-
-
-def v2_event_digest(event: Dict[str, Any]) -> str:
-    """Return the canonical-JSON SHA-256 for sealed event fields."""
-    if not isinstance(event, dict):
-        raise PositionError("version-2 event must be an object")
-    expected = _V2_EVENT_FIELDS - {"digest"}
-    payload = {field: event[field] for field in expected if field in event}
-    missing = sorted(expected - set(payload))
-    unknown = sorted(set(event) - _V2_EVENT_FIELDS)
-    if missing:
-        raise PositionError("version-2 event digest input is missing "
-                            "field(s): %s" % ", ".join(missing))
-    if unknown:
-        raise PositionError("version-2 event digest input has unknown "
-                            "field(s): %s" % ", ".join(unknown))
-    return _canonical_json_sha256(payload, "event economics")
-
-
-def _v2_decimal_text(value: Any, path: str,
-                     allow_none: bool = False) -> Optional[Decimal]:
+def _v2_parse_decimal_text(value: Any, path: str,
+                           allow_none: bool = False) -> Optional[Decimal]:
     if value is None and allow_none:
         return None
     if not isinstance(value, str) or not value:
@@ -1016,6 +1063,26 @@ def _v2_decimal_text(value: Any, path: str,
     return parsed
 
 
+def _v2_canonical_decimal(parsed: Decimal) -> str:
+    if parsed == 0:
+        return "0"
+    text = format(parsed, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _v2_decimal_text(value: Any, path: str,
+                     allow_none: bool = False) -> Optional[Decimal]:
+    parsed = _v2_parse_decimal_text(value, path, allow_none=allow_none)
+    if parsed is None:
+        return None
+    if value != _v2_canonical_decimal(parsed):
+        raise PositionError("version-2 %s is not canonical Decimal text"
+                            % path)
+    return parsed
+
+
 def _v2_decimal_record_value(value: Any, path: str,
                              allow_none: bool = False) -> Optional[str]:
     if value is None and allow_none:
@@ -1024,9 +1091,185 @@ def _v2_decimal_record_value(value: Any, path: str,
         if not value.is_finite():
             raise PositionError("version-2 %s is not finite Decimal text"
                                 % path)
-        return fmt(value)
-    _v2_decimal_text(value, path, allow_none=allow_none)
-    return value
+        parsed = value
+    else:
+        parsed = _v2_parse_decimal_text(
+            value, path, allow_none=allow_none)
+    if parsed is None:
+        return None
+    return _v2_canonical_decimal(parsed)
+
+
+def _normalize_v2_config_snapshot(
+        snapshot: Any, symbol: str, require_canonical: bool) \
+        -> Tuple[Dict[str, Any], str]:
+    path = "config_snapshot"
+    _v2_exact_fields(snapshot, _V2_CONFIG_FIELDS, path)
+    if not isinstance(symbol, str) or SYMBOL_RE.fullmatch(symbol) is None \
+            or snapshot["symbol"] != symbol:
+        raise PositionError("version-2 config snapshot symbol is invalid or "
+                            "does not match")
+    if snapshot["direction"] != V2_DIRECTION:
+        raise PositionError("version-2 config snapshot direction is not "
+                            "enabled")
+    schedule = snapshot["schedule"]
+    if not isinstance(schedule, list) or not schedule:
+        raise PositionError("version-2 config snapshot schedule is invalid")
+    normalized_schedule = []
+    prior_gap: Optional[Decimal] = None
+    for index, row in enumerate(schedule):
+        row_path = "%s.schedule[%d]" % (path, index)
+        _v2_exact_fields(row, _V2_CONFIG_SCHEDULE_FIELDS, row_path)
+        ordinal = _v2_int(row["ordinal"], row_path + ".ordinal", minimum=1)
+        if ordinal != index + 1:
+            raise PositionError("version-2 config snapshot schedule ordinals "
+                                "must be contiguous")
+        gap_path = row_path + ".entry_gap_pct"
+        cap_path = row_path + ".quote_cap"
+        gap = _v2_decimal_text(row["entry_gap_pct"], gap_path) \
+            if require_canonical else _v2_parse_decimal_text(
+                row["entry_gap_pct"], gap_path)
+        quote_cap = _v2_decimal_text(row["quote_cap"], cap_path) \
+            if require_canonical else _v2_parse_decimal_text(
+                row["quote_cap"], cap_path)
+        if gap <= 0 or quote_cap <= 0 \
+                or prior_gap is not None and gap <= prior_gap:
+            raise PositionError("version-2 config snapshot schedule values "
+                                "are invalid")
+        normalized_schedule.append({
+            "ordinal": ordinal,
+            "entry_gap_pct": _v2_canonical_decimal(gap),
+            "quote_cap": _v2_canonical_decimal(quote_cap),
+        })
+        prior_gap = gap
+
+    caps = snapshot["caps"]
+    _v2_exact_fields(caps, _V2_CONFIG_CAP_FIELDS, path + ".caps")
+    normalized_caps: Dict[str, str] = {}
+    parsed_caps: Dict[str, Decimal] = {}
+    for field in sorted(_V2_CONFIG_CAP_FIELDS):
+        field_path = path + ".caps." + field
+        parsed = _v2_decimal_text(caps[field], field_path) \
+            if require_canonical else _v2_parse_decimal_text(
+                caps[field], field_path)
+        if parsed <= 0:
+            raise PositionError("version-2 config snapshot caps must be "
+                                "positive")
+        parsed_caps[field] = parsed
+        normalized_caps[field] = _v2_canonical_decimal(parsed)
+    if parsed_caps["rung_quote"] > parsed_caps["stack_quote"]:
+        raise PositionError("version-2 config snapshot rung cap exceeds the "
+                            "stack cap")
+    if any(_v2_parse_decimal_text(row["quote_cap"],
+                                  "config_snapshot.schedule.quote_cap")
+           > parsed_caps["rung_quote"] for row in normalized_schedule):
+        raise PositionError("version-2 config snapshot schedule exceeds the "
+                            "rung cap")
+
+    venue = snapshot["venue"]
+    _v2_exact_fields(venue, _V2_CONFIG_VENUE_FIELDS, path + ".venue")
+    if not isinstance(venue["spot"], str) \
+            or venue["spot"] not in V2_SPOT_VENUES \
+            or not isinstance(venue["futures"], str) \
+            or venue["futures"] not in V2_FUTURES_VENUES:
+        raise PositionError("version-2 config snapshot venue is invalid")
+    base_asset = venue["base_asset"]
+    quote_asset = venue["quote_asset"]
+    if not isinstance(base_asset, str) \
+            or re.fullmatch(r"[A-Z0-9]{2,20}", base_asset) is None \
+            or not isinstance(quote_asset, str) \
+            or re.fullmatch(r"[A-Z0-9]{2,20}", quote_asset) is None \
+            or base_asset == quote_asset \
+            or symbol != base_asset + quote_asset:
+        raise PositionError("version-2 config snapshot asset binding is "
+                            "invalid")
+    normalized = {
+        "symbol": symbol,
+        "direction": V2_DIRECTION,
+        "schedule": normalized_schedule,
+        "caps": normalized_caps,
+        "venue": {
+            "spot": venue["spot"],
+            "futures": venue["futures"],
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+        },
+    }
+    return normalized, base_asset
+
+
+def _validate_v2_config_snapshot(snapshot: Any, symbol: str) -> str:
+    _normalized, base_asset = _normalize_v2_config_snapshot(
+        snapshot, symbol, require_canonical=True)
+    return base_asset
+
+
+def v2_config_epoch_digest(config_snapshot: Dict[str, Any]) -> str:
+    """Return the typed canonical SHA-256 for one frozen v2 config."""
+    if not isinstance(config_snapshot, dict):
+        raise PositionError("version-2 config snapshot must be an object")
+    symbol = config_snapshot.get("symbol")
+    if not isinstance(symbol, str):
+        raise PositionError("version-2 config snapshot symbol is invalid")
+    normalized, _base_asset = _normalize_v2_config_snapshot(
+        config_snapshot, symbol, require_canonical=False)
+    return _canonical_json_sha256(normalized, "config_snapshot")
+
+
+def v2_event_digest(event: Dict[str, Any]) -> str:
+    """Return the typed canonical SHA-256 for sealed event fields."""
+    if not isinstance(event, dict):
+        raise PositionError("version-2 event must be an object")
+    expected = _V2_EVENT_FIELDS - {"digest"}
+    missing = sorted(expected - set(event))
+    unknown = sorted(set(event) - _V2_EVENT_FIELDS)
+    if missing:
+        raise PositionError("version-2 event digest input is missing "
+                            "field(s): %s" % ", ".join(missing))
+    if unknown:
+        raise PositionError("version-2 event digest input has unknown "
+                            "field(s): %s" % ", ".join(unknown))
+    if isinstance(event["version"], bool) \
+            or not isinstance(event["version"], int) \
+            or event["version"] != V2_SCHEMA_VERSION \
+            or event["record_type"] != "TRIGGER_EVENT" \
+            or not isinstance(event["symbol"], str) \
+            or SYMBOL_RE.fullmatch(event["symbol"]) is None:
+        raise PositionError("version-2 event digest binding is invalid")
+    _v2_digest(event["config_epoch_digest"],
+               "event economics.config_epoch_digest")
+    if "digest" in event:
+        _v2_digest(event["digest"], "event economics.digest")
+    source_time = _v2_int(event["source_time_ms"],
+                          "event economics.source_time_ms")
+    age = _v2_int(event["age_at_creation_ms"],
+                  "event economics.age_at_creation_ms")
+    funding_period = _v2_int(
+        event["funding_period_ms"],
+        "event economics.funding_period_ms", minimum=1)
+    decimal_fields = {}
+    for field in ("entry_gap_pct", "exit_gap_pct", "funding_rate"):
+        parsed = _v2_parse_decimal_text(
+            event[field], "event economics." + field)
+        decimal_fields[field] = _v2_canonical_decimal(parsed)
+    if Decimal(decimal_fields["entry_gap_pct"]) <= 0:
+        raise PositionError("version-2 event entry gap must be positive")
+    # This seal proves only module-typed canonical event content. Equivalent
+    # Decimal text is deliberate, and the digest does not prove which external
+    # source originally supplied that content.
+    payload = {
+        "version": V2_SCHEMA_VERSION,
+        "record_type": "TRIGGER_EVENT",
+        "symbol": event["symbol"],
+        "config_epoch_digest": event["config_epoch_digest"],
+        "source_time_ms": source_time,
+        "age_at_creation_ms": age,
+        "entry_gap_pct": decimal_fields["entry_gap_pct"],
+        "exit_gap_pct": decimal_fields["exit_gap_pct"],
+        "funding_rate": decimal_fields["funding_rate"],
+        "funding_period_ms": funding_period,
+    }
+    return _canonical_json_sha256(payload, "event economics")
 
 
 def _v2_binding(record: Dict[str, Any], path: str, symbol: str,
@@ -1070,13 +1313,78 @@ def _validate_v2_flat_read_provenance(value: Any, path: str) -> None:
         if client_id in client_ids:
             raise PositionError("version-2 flat proof own-order identity is "
                                 "duplicated")
-        if order["market"] not in ("spot", "usdm"):
+        if not isinstance(order["market"], str) \
+                or order["market"] not in V2_MARKETS:
             raise PositionError("version-2 flat proof own-order market is "
                                 "invalid")
-        if order["status"] not in V2_TERMINAL_ORDER_STATUSES:
+        if not isinstance(order["status"], str) \
+                or order["status"] not in V2_TERMINAL_ORDER_STATUSES:
             raise PositionError("version-2 flat proof own order lacks a "
                                 "terminal status")
         client_ids.add(client_id)
+
+
+def v2_flat_proof_evidence_digest(proof: Dict[str, Any]) -> str:
+    """Compute the typed flat-read digest, including its observation time."""
+    if not isinstance(proof, dict):
+        raise PositionError("version-2 flat proof must be an object")
+    expected = _V2_FLAT_PROOF_FIELDS - {"evidence_digest"}
+    missing = sorted(expected - set(proof))
+    unknown = sorted(set(proof) - _V2_FLAT_PROOF_FIELDS)
+    if missing:
+        raise PositionError("version-2 flat proof digest input is missing "
+                            "field(s): %s" % ", ".join(missing))
+    if unknown:
+        raise PositionError("version-2 flat proof digest input has unknown "
+                            "field(s): %s" % ", ".join(unknown))
+    if isinstance(proof["version"], bool) \
+            or not isinstance(proof["version"], int) \
+            or proof["version"] != V2_SCHEMA_VERSION \
+            or proof["record_type"] != "FLAT_PROOF" \
+            or not isinstance(proof["symbol"], str) \
+            or SYMBOL_RE.fullmatch(proof["symbol"]) is None:
+        raise PositionError("version-2 flat proof digest binding is invalid")
+    _v2_digest(proof["config_epoch_digest"],
+               "flat_proof.config_epoch_digest")
+    if "evidence_digest" in proof:
+        _v2_digest(proof["evidence_digest"],
+                   "flat_proof.evidence_digest")
+    source_revision = _v2_int(
+        proof["source_revision"], "flat_proof.source_revision")
+    observed_at_ms = _v2_int(
+        proof["observed_at_ms"], "flat_proof.observed_at_ms", minimum=1)
+    futures_qty = _v2_parse_decimal_text(
+        proof["futures_position_qty"],
+        "flat_proof.futures_position_qty")
+    spot_qty = _v2_parse_decimal_text(
+        proof["spot_sellable_base_qty"],
+        "flat_proof.spot_sellable_base_qty")
+    standard_count = _v2_int(
+        proof["standard_open_order_count"],
+        "flat_proof.standard_open_order_count")
+    algorithmic_count = _v2_int(
+        proof["algorithmic_open_order_count"],
+        "flat_proof.algorithmic_open_order_count")
+    if not isinstance(proof["own_orders_terminal"], bool):
+        raise PositionError("version-2 flat proof terminal flag must be "
+                            "boolean")
+    _validate_v2_flat_read_provenance(
+        proof["read_provenance"], "flat_proof.read_provenance")
+    payload = {
+        "version": V2_SCHEMA_VERSION,
+        "record_type": "FLAT_PROOF",
+        "symbol": proof["symbol"],
+        "config_epoch_digest": proof["config_epoch_digest"],
+        "source_revision": source_revision,
+        "observed_at_ms": observed_at_ms,
+        "futures_position_qty": _v2_canonical_decimal(futures_qty),
+        "spot_sellable_base_qty": _v2_canonical_decimal(spot_qty),
+        "standard_open_order_count": standard_count,
+        "algorithmic_open_order_count": algorithmic_count,
+        "own_orders_terminal": proof["own_orders_terminal"],
+        "read_provenance": proof["read_provenance"],
+    }
+    return _canonical_json_sha256(payload, "flat proof evidence")
 
 
 def _validate_v2_flat_proof(
@@ -1110,9 +1418,13 @@ def _validate_v2_flat_proof(
             or algorithmic_count != 0 \
             or proof["own_orders_terminal"] is not True:
         raise PositionError("version-2 flat proof does not prove flat state")
-    _v2_digest(proof["evidence_digest"], path + ".evidence_digest")
+    stored_digest = _v2_digest(
+        proof["evidence_digest"], path + ".evidence_digest")
     _validate_v2_flat_read_provenance(
         proof["read_provenance"], path + ".read_provenance")
+    if stored_digest != v2_flat_proof_evidence_digest(proof):
+        raise PositionError("version-2 flat proof evidence digest does not "
+                            "match its typed reads")
 
 
 def _validate_v2_fee_map(value: Any, path: str) -> Dict[str, Decimal]:
@@ -1128,6 +1440,21 @@ def _validate_v2_fee_map(value: Any, path: str) -> Dict[str, Decimal]:
             raise PositionError("version-2 %s amount is negative" % path)
         parsed[asset] = parsed_amount
     return parsed
+
+
+def _normalize_v2_fee_map(value: Any, path: str) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        raise PositionError("version-2 %s must be an object" % path)
+    normalized = {}
+    for asset, amount in value.items():
+        if not isinstance(asset, str) \
+                or re.fullmatch(r"[A-Z0-9]{2,20}", asset) is None:
+            raise PositionError("version-2 %s asset is invalid" % path)
+        parsed = _v2_parse_decimal_text(amount, path + "." + asset)
+        if parsed < 0:
+            raise PositionError("version-2 %s amount is negative" % path)
+        normalized[asset] = _v2_canonical_decimal(parsed)
+    return normalized
 
 
 def _v2_order_is_terminal(order: Dict[str, Any]) -> bool:
@@ -1147,7 +1474,9 @@ def _validate_v2_order(order: Any, path: str, symbol: str,
         raise PositionError("version-2 %s market does not match its leg"
                             % path)
     _v2_id(order["client_id"], path + ".client_id")
-    _v2_text(order["status"], path + ".status")
+    if not isinstance(order["status"], str) \
+            or order["status"] not in V2_ORDER_STATUSES:
+        raise PositionError("version-2 %s.status is invalid" % path)
     if not isinstance(order["terminal"], bool):
         raise PositionError("version-2 %s.terminal must be boolean" % path)
     quantity = _v2_decimal_text(
@@ -1221,6 +1550,10 @@ def _v2_terminal_entry_facts(
     net_spot = spot_qty - fees.get(base_asset, Decimal(0))
     if net_spot < 0:
         raise PositionError("version-2 base-asset fee exceeds the Spot fill")
+    if spot["status"] not in V2_FILL_TERMINAL_ORDER_STATUSES \
+            or short["status"] not in V2_FILL_TERMINAL_ORDER_STATUSES \
+            or net_spot <= 0 or short_qty <= 0:
+        return None
     return [spot_quote, short_quote], net_spot, short_qty
 
 
@@ -1367,6 +1700,84 @@ def _validate_v2_rung(rung: Any, path: str, symbol: str,
                             "cap reconciliation" % path)
 
 
+def _normalize_v2_evidence_values(
+        kind: Any, receipt_ids: Any, amounts: Any,
+        path: str, require_canonical: bool) \
+        -> Tuple[List[str], Dict[str, str]]:
+    if not isinstance(kind, str) or kind not in V2_EVIDENCE_KINDS:
+        raise PositionError("version-2 %s.kind is invalid" % path)
+    if not isinstance(receipt_ids, list) or not receipt_ids:
+        raise PositionError("version-2 %s.receipt_ids must be a nonempty "
+                            "list" % path)
+    normalized_receipts = []
+    for index, receipt_id in enumerate(receipt_ids):
+        normalized_receipts.append(_v2_id(
+            receipt_id, "%s.receipt_ids[%d]" % (path, index)))
+    if len(set(normalized_receipts)) != len(normalized_receipts):
+        raise PositionError("version-2 %s receipt is duplicated" % path)
+    sorted_receipts = sorted(normalized_receipts)
+    if require_canonical and normalized_receipts != sorted_receipts:
+        raise PositionError("version-2 %s receipt ids are not sorted" % path)
+
+    expected_amounts = _V2_EVIDENCE_AMOUNT_FIELDS_BY_KIND[kind]
+    _v2_exact_fields(amounts, expected_amounts, path + ".amounts")
+    normalized_amounts: Dict[str, str] = {}
+    parsed_amounts: Dict[str, Decimal] = {}
+    for field in sorted(expected_amounts):
+        field_path = path + ".amounts." + field
+        parsed = _v2_decimal_text(amounts[field], field_path) \
+            if require_canonical else _v2_parse_decimal_text(
+                amounts[field], field_path)
+        if parsed < 0:
+            raise PositionError("version-2 %s amount is negative" % path)
+        parsed_amounts[field] = parsed
+        normalized_amounts[field] = _v2_canonical_decimal(parsed)
+
+    positive_kinds = {
+        V2_EVIDENCE_ADD, V2_EVIDENCE_TERMINAL_RUNG,
+        V2_EVIDENCE_REDUCE, V2_EVIDENCE_REDUCE_RECONCILE,
+        V2_EVIDENCE_CLOSE,
+    }
+    if kind in positive_kinds \
+            and any(value <= 0 for value in parsed_amounts.values()):
+        raise PositionError("version-2 %s amounts must be positive" % path)
+    if kind == V2_EVIDENCE_TERMINAL_RUNG \
+            and parsed_amounts["spot_net_base_qty"] \
+            != parsed_amounts["short_base_qty"]:
+        raise PositionError("version-2 %s terminal amounts do not agree"
+                            % path)
+    if kind == V2_EVIDENCE_REDUCE_RECONCILE \
+            and parsed_amounts["remaining_spot_base_qty"] \
+            != parsed_amounts["remaining_short_base_qty"]:
+        raise PositionError("version-2 %s remaining amounts do not agree"
+                            % path)
+    if kind in (V2_EVIDENCE_FLAT_ENTRY, V2_EVIDENCE_FLAT_CLOSE):
+        if parsed_amounts["futures_position_qty"] != 0 \
+                or parsed_amounts["spot_sellable_base_qty"] != 0:
+            raise PositionError("version-2 %s does not prove flat amounts"
+                                % path)
+        observed = parsed_amounts["observed_at_ms"]
+        if observed != observed.to_integral_value() \
+                or observed < 1 or observed > MS_SAFE_MAX:
+            raise PositionError("version-2 %s observation time is invalid"
+                                % path)
+    return sorted_receipts, normalized_amounts
+
+
+def v2_evidence_digest(kind: str, receipt_ids: List[str],
+                       amounts: Dict[str, Any]) -> str:
+    """Compute evidence identity from kind, sorted ids, and typed amounts."""
+    normalized_receipts, normalized_amounts = \
+        _normalize_v2_evidence_values(
+            kind, receipt_ids, amounts, "transition.evidence",
+            require_canonical=False)
+    return _canonical_json_sha256({
+        "kind": kind,
+        "receipt_ids": normalized_receipts,
+        "amounts": normalized_amounts,
+    }, "transition evidence")
+
+
 def _validate_v2_transition(transition: Any, path: str, symbol: str,
                             config_epoch_digest: str) -> None:
     _v2_exact_fields(transition, _V2_TRANSITION_FIELDS, path)
@@ -1378,28 +1789,110 @@ def _validate_v2_transition(transition: Any, path: str, symbol: str,
             or transition["to"] not in V2_STATES \
             or transition["from"] == transition["to"]:
         raise PositionError("version-2 %s state change is invalid" % path)
+    edge = (transition["from"], transition["to"])
     if transition["to"] not in V2_LEGAL_TRANSITIONS[transition["from"]]:
         raise PositionError("version-2 %s is not a legal state transition"
                             % path)
     _v2_int(transition["expected_revision"],
             path + ".expected_revision")
-    _v2_int(transition["created_cut_ms"], path + ".created_cut_ms")
+    _v2_int(transition["created_cut_ms"], path + ".created_cut_ms",
+            minimum=1)
     evidence = transition["evidence"]
     _v2_exact_fields(evidence, _V2_EVIDENCE_FIELDS, path + ".evidence")
-    _v2_text(evidence["kind"], path + ".evidence.kind")
-    _v2_digest(evidence["digest"], path + ".evidence.digest")
-    if not isinstance(evidence["receipt_ids"], list) \
-            or not evidence["receipt_ids"]:
-        raise PositionError("version-2 %s.evidence.receipt_ids must be a "
-                            "nonempty list" % path)
-    seen = set()
-    for index, receipt_id in enumerate(evidence["receipt_ids"]):
-        value = _v2_text(receipt_id,
-                         "%s.evidence.receipt_ids[%d]" % (path, index))
-        if value in seen:
-            raise PositionError("version-2 %s evidence receipt is "
-                                "duplicated" % path)
-        seen.add(value)
+    expected_kind, _expected_amounts = _V2_TRANSITION_EVIDENCE[edge]
+    if evidence["kind"] != expected_kind:
+        raise PositionError("version-2 %s evidence kind does not match its "
+                            "state transition" % path)
+    _normalize_v2_evidence_values(
+        evidence["kind"], evidence["receipt_ids"], evidence["amounts"],
+        path + ".evidence", require_canonical=True)
+    stored_digest = _v2_digest(
+        evidence["digest"], path + ".evidence.digest")
+    if stored_digest != v2_evidence_digest(
+            evidence["kind"], evidence["receipt_ids"],
+            evidence["amounts"]):
+        raise PositionError("version-2 %s evidence digest does not match its "
+                            "typed values" % path)
+
+
+def _validate_v2_transition_prerequisites(
+        position: Dict[str, Any], transition: Dict[str, Any],
+        add_authorizations: int) -> None:
+    edge = (transition["from"], transition["to"])
+    evidence = transition["evidence"]
+    amounts = {
+        field: _v2_decimal_text(
+            value, "transition.evidence.amounts." + field)
+        for field, value in evidence["amounts"].items()
+    }
+    receipts = set(evidence["receipt_ids"])
+    if edge == (ST_NONE, ST_OPENING):
+        proof = position["flat_proof"]
+        if proof["evidence_digest"] not in receipts:
+            raise PositionError("version-2 OPENING transition lacks its flat "
+                                "proof receipt")
+        expected = {
+            "futures_position_qty": _v2_decimal_text(
+                proof["futures_position_qty"],
+                "flat_proof.futures_position_qty"),
+            "spot_sellable_base_qty": _v2_decimal_text(
+                proof["spot_sellable_base_qty"],
+                "flat_proof.spot_sellable_base_qty"),
+            "observed_at_ms": Decimal(proof["observed_at_ms"]),
+        }
+        if amounts != expected:
+            raise PositionError("version-2 OPENING transition flat amounts "
+                                "do not match its proof")
+
+    if edge == (ST_OPEN, "ADDING") \
+            and len(position["rungs"]) >= add_authorizations:
+        rung = position["rungs"][add_authorizations - 1]
+        expected = {
+            "requested_base_qty": _v2_decimal_text(
+                rung["sizes"]["requested_base_qty"],
+                "rung.sizes.requested_base_qty"),
+            "requested_quote": _v2_decimal_text(
+                rung["sizes"]["requested_quote"],
+                "rung.sizes.requested_quote"),
+        }
+        if amounts != expected or rung["rung_id"] not in receipts:
+            raise PositionError("version-2 ADDING transition does not match "
+                                "its rung authorization")
+
+    if edge in ((ST_OPENING, ST_OPEN), ("ADDING", ST_OPEN)):
+        if add_authorizations < 1 \
+                or len(position["rungs"]) < add_authorizations:
+            raise PositionError("version-2 OPEN transition requires a rung")
+        rung = position["rungs"][add_authorizations - 1]
+        by_stage = {order["stage"]: order for order in rung["own_orders"]}
+        terminal_facts = _v2_terminal_entry_facts(
+            by_stage, position["config_snapshot"]["venue"]["base_asset"],
+            "transition.terminal_rung")
+        if terminal_facts is None \
+                or terminal_facts[1] != terminal_facts[2] \
+                or rung["cap_reconcile"]["status"] \
+                not in ("WITHIN_CAP", "EXCEEDED"):
+            raise PositionError("version-2 OPEN transition requires positive "
+                                "terminal fills on both legs")
+        required_receipts = {
+            rung["rung_id"], by_stage[ENTER_SPOT]["client_id"],
+            by_stage[ENTER_SHORT]["client_id"],
+        }
+        expected = {
+            "spot_net_base_qty": terminal_facts[1],
+            "short_base_qty": terminal_facts[2],
+        }
+        if not required_receipts.issubset(receipts) or amounts != expected:
+            raise PositionError("version-2 OPEN transition evidence does not "
+                                "match its terminal rung receipts")
+
+    if transition["to"] == ST_CLOSED:
+        observed_at_ms = amounts["observed_at_ms"]
+        cut = Decimal(transition["created_cut_ms"])
+        if observed_at_ms > cut \
+                or cut - observed_at_ms > V2_FLAT_PROOF_MAX_AGE_MS:
+            raise PositionError("version-2 CLOSED transition flat receipt is "
+                                "not fresh")
 
 
 def _validate_v2_position(position: Dict[str, Any]) -> None:
@@ -1471,6 +1964,7 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
 
     transition_ids = set()
     evidence_digests = set()
+    evidence_receipt_ids = set()
     prior_expected_revision = -1
     chain_state = ST_NONE
     add_authorizations = 0
@@ -1492,9 +1986,16 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
             raise PositionError("version-2 transition state chain is invalid")
         transition_ids.add(transition["transition_id"])
         evidence_digests.add(evidence_digest)
+        current_receipts = set(transition["evidence"]["receipt_ids"])
+        if current_receipts & evidence_receipt_ids:
+            raise PositionError("version-2 transition evidence receipt is "
+                                "reused")
+        evidence_receipt_ids.update(current_receipts)
         if (transition["from"], transition["to"]) \
                 in V2_ADD_TRANSITION_EDGES:
             add_authorizations += 1
+        _validate_v2_transition_prerequisites(
+            position, transition, add_authorizations)
         prior_expected_revision = expected
         chain_state = transition["to"]
     if chain_state != position["state"]:
@@ -1503,6 +2004,8 @@ def _validate_v2_position(position: Dict[str, Any]) -> None:
     if len(rungs) > add_authorizations:
         raise PositionError("version-2 rung receipt requires an ADD "
                             "transition")
+    if position["state"] == ST_OPEN and not rungs:
+        raise PositionError("version-2 OPEN state requires a rung")
 
     expected_freeze = any(
         rung["cap_reconcile"]["freeze_increases"] for rung in rungs)
@@ -1778,7 +2281,7 @@ def new_v2_flat_proof(
         observed_at_ms: int, futures_position_qty: Any,
         spot_sellable_base_qty: Any, standard_open_order_count: int,
         algorithmic_open_order_count: int, own_orders_terminal: bool,
-        evidence_digest: str,
+        evidence_digest: Optional[str],
         read_provenance: Optional[Dict[str, Any]] = None) \
         -> Dict[str, Any]:
     """Build the account-flat receipt with explicit completed read sources."""
@@ -1797,10 +2300,17 @@ def new_v2_flat_proof(
         "standard_open_order_count": standard_open_order_count,
         "algorithmic_open_order_count": algorithmic_open_order_count,
         "own_orders_terminal": own_orders_terminal,
-        "evidence_digest": evidence_digest,
         "read_provenance": _copy_v2_record(
             read_provenance, "flat_proof.read_provenance"),
     }
+    computed_digest = v2_flat_proof_evidence_digest(proof)
+    if evidence_digest is not None:
+        supplied_digest = _v2_digest(
+            evidence_digest, "flat_proof.evidence_digest")
+        if supplied_digest != computed_digest:
+            raise PositionError("version-2 supplied flat proof digest does "
+                                "not match its typed reads")
+    proof["evidence_digest"] = computed_digest
     _validate_v2_flat_proof(proof, symbol, config_epoch_digest)
     return proof
 
@@ -1827,7 +2337,7 @@ def new_v2_own_order_record(
             allow_none=True),
         "terminal_quote": _v2_decimal_record_value(
             terminal_quote, "own_order.terminal_quote", allow_none=True),
-        "fee_by_asset": _copy_v2_record(
+        "fee_by_asset": _normalize_v2_fee_map(
             {} if fee_by_asset is None else fee_by_asset,
             "own_order.fee_by_asset"),
     }
@@ -1930,10 +2440,36 @@ def new_v2_rung_record(
 def new_v2_transition_record(
         symbol: str, config_epoch_digest: str, transition_id: str,
         from_state: str, to_state: str, expected_revision: int,
-        evidence_kind: str, evidence_digest: str,
-        evidence_receipt_ids: List[str], created_cut_ms: int) \
+        evidence_kind: str, evidence_digest: Optional[str],
+        evidence_receipt_ids: List[str], created_cut_ms: int,
+        evidence_amounts: Optional[Dict[str, Any]] = None) \
         -> Dict[str, Any]:
     """Build one state-change receipt whose revision is its CAS input."""
+    creation_cut = _v2_int(
+        created_cut_ms, "transition.created_cut_ms", minimum=1)
+    if evidence_amounts is None:
+        if evidence_kind == V2_EVIDENCE_FLAT_ENTRY:
+            evidence_amounts = {
+                "futures_position_qty": "0",
+                "spot_sellable_base_qty": "0",
+                "observed_at_ms": str(creation_cut),
+            }
+        elif evidence_kind == V2_EVIDENCE_AMBIGUOUS:
+            evidence_amounts = {}
+        else:
+            raise PositionError("version-2 transition evidence amounts are "
+                                "required")
+    receipt_ids, normalized_amounts = _normalize_v2_evidence_values(
+        evidence_kind, evidence_receipt_ids, evidence_amounts,
+        "transition.evidence", require_canonical=False)
+    computed_digest = v2_evidence_digest(
+        evidence_kind, receipt_ids, normalized_amounts)
+    if evidence_digest is not None:
+        supplied_digest = _v2_digest(
+            evidence_digest, "transition.evidence.digest")
+        if supplied_digest != computed_digest:
+            raise PositionError("version-2 supplied evidence digest does not "
+                                "match its typed values")
     transition = {
         "version": V2_SCHEMA_VERSION,
         "record_type": "TRANSITION",
@@ -1945,11 +2481,11 @@ def new_v2_transition_record(
         "expected_revision": expected_revision,
         "evidence": {
             "kind": evidence_kind,
-            "digest": evidence_digest,
-            "receipt_ids": _copy_v2_record(
-                evidence_receipt_ids, "transition.evidence.receipt_ids"),
+            "digest": computed_digest,
+            "receipt_ids": receipt_ids,
+            "amounts": normalized_amounts,
         },
-        "created_cut_ms": created_cut_ms,
+        "created_cut_ms": creation_cut,
     }
     _validate_v2_transition(transition, "transition", symbol,
                             config_epoch_digest)
@@ -1973,18 +2509,23 @@ def enable_v2_position(receipt_dir: str, symbol: str,
         raise PositionError("version-2 expected revision %s is stale; "
                             "current revision is %s"
                             % (expected_revision, current_revision))
-    snapshot = _copy_v2_record(config_snapshot, "config_snapshot")
-    _validate_v2_config_snapshot(snapshot, symbol)
+    raw_snapshot = _copy_v2_record(config_snapshot, "config_snapshot")
+    snapshot, _base_asset = _normalize_v2_config_snapshot(
+        raw_snapshot, symbol, require_canonical=False)
     supplied_config_digest = _v2_digest(
         config_epoch_digest, "config_epoch_digest")
     computed_config_digest = v2_config_epoch_digest(snapshot)
     if supplied_config_digest != computed_config_digest:
         raise PositionError("version-2 config snapshot digest does not "
                             "match supplied config_epoch_digest")
-    if initialization_cut_ms is None:
-        initialization_cut_ms = int(time.time() * 1000)
     initialization_cut = _v2_int(
-        initialization_cut_ms, "initialization_cut_ms", minimum=1)
+        default_now_ms(), "module initialization cut", minimum=1)
+    if initialization_cut_ms is not None:
+        supplied_cut = _v2_int(
+            initialization_cut_ms, "initialization_cut_ms", minimum=1)
+        if supplied_cut != initialization_cut:
+            raise PositionError("version-2 initialization cut does not match "
+                                "the module gate time")
     proof = _copy_v2_record(flat_proof, "flat_proof")
     _validate_v2_flat_proof(
         proof, symbol, supplied_config_digest, initialization_cut)
@@ -2071,6 +2612,9 @@ def write_v2_transition(receipt_dir: str,
     """Apply one state transition and its evidence in the same CAS write."""
     position = _load_v2_for_write(receipt_dir, expected_revision)
     record = _copy_v2_record(transition, "transition")
+    if isinstance(record, dict) and record.get("to") == ST_CLOSED:
+        record["created_cut_ms"] = _v2_int(
+            default_now_ms(), "module CLOSED gate time", minimum=1)
     _validate_v2_transition(record, "transition", position["symbol"],
                             position["config_epoch_digest"])
     if record["expected_revision"] != expected_revision:
@@ -2081,6 +2625,14 @@ def write_v2_transition(receipt_dir: str,
     if any(prior["evidence"]["digest"] == record["evidence"]["digest"]
            for prior in position["transitions"]):
         raise PositionError("version-2 transition evidence digest is "
+                            "reused")
+    prior_receipts = {
+        receipt_id
+        for prior in position["transitions"]
+        for receipt_id in prior["evidence"]["receipt_ids"]
+    }
+    if prior_receipts & set(record["evidence"]["receipt_ids"]):
+        raise PositionError("version-2 transition evidence receipt is "
                             "reused")
     position["transitions"].append(record)
     position["state"] = record["to"]
@@ -2122,7 +2674,7 @@ def reconcile_v2_rung_cap(receipt_dir: str, rung_id: str,
         excess = terminal_fill > effective_cap
         rung["cap_reconcile"] = {
             "status": "EXCEEDED" if excess else "WITHIN_CAP",
-            "terminal_fill_quote": fmt(terminal_fill),
+            "terminal_fill_quote": _v2_canonical_decimal(terminal_fill),
             "freeze_increases": excess,
             "reduce_only_path": excess,
         }
