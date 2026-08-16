@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Deterministic offline tests for executable touch gaps and history."""
+
+import sys
+import unittest
+from decimal import Decimal
+from pathlib import Path
+
+
+SRC = Path(__file__).resolve().parent.parent / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+import executable_gap as gap  # noqa: E402
+
+
+SYMBOL = "TESTUSDT"
+NOW_MS = 1_800_000_000_000
+HOUR_MS = 3_600_000
+
+
+def stream_record(**updates):
+    record = {
+        "spot_bid": "100",
+        "spot_ask": "101",
+        "perp_bid": "111.1",
+        "perp_ask": "112",
+        "mark": "999999",
+    }
+    record.update(updates)
+    return record
+
+
+def read(record=None, *, spot_age=100, perp_age=200, **kwargs):
+    spot, perp = gap.quotes_from_stream_record(
+        stream_record() if record is None else record,
+        spot_observed_ms=NOW_MS - spot_age,
+        perp_observed_ms=NOW_MS - perp_age,
+    )
+    return gap.read_executable_gap(SYMBOL, spot, perp, NOW_MS, **kwargs)
+
+
+def reading(at_ms, entry, exit_gap=None):
+    entry_value = Decimal(str(entry))
+    exit_value = entry_value + Decimal("100") \
+        if exit_gap is None else Decimal(str(exit_gap))
+    return gap.ExecutableGapReading(
+        SYMBOL, at_ms, entry_value, exit_value, 0, 0)
+
+
+class ExecutableGapLawTests(unittest.TestCase):
+    def test_stream_touch_shape_uses_owner_entry_and_exit_laws(self):
+        result = read()
+
+        self.assertIsInstance(result, gap.ExecutableGapReading)
+        self.assertEqual(result.entry_gap_pct, Decimal("10"))
+        self.assertEqual(result.exit_gap_pct, Decimal("12"))
+        self.assertEqual((result.spot_age_ms, result.perp_age_ms), (100, 200))
+        self.assertEqual(result.verdict, "READY")
+        self.assertNotEqual(result.entry_gap_pct, Decimal("999999"))
+        self.assertTrue(all(isinstance(value, Decimal) for value in (
+            result.entry_gap_pct, result.exit_gap_pct)))
+
+    def test_quote_at_age_bound_is_fresh_and_older_quote_refuses(self):
+        accepted = read(spot_age=gap.DEFAULT_MAX_QUOTE_AGE_MS,
+                        perp_age=gap.DEFAULT_MAX_QUOTE_AGE_MS)
+        refused = read(spot_age=gap.DEFAULT_MAX_QUOTE_AGE_MS + 1,
+                       perp_age=gap.DEFAULT_MAX_QUOTE_AGE_MS)
+
+        self.assertIsInstance(accepted, gap.ExecutableGapReading)
+        self.assertIsInstance(refused, gap.GapRefusal)
+        self.assertEqual(refused.reason, "SPOT_QUOTE_STALE")
+        self.assertEqual(refused.spot_age_ms, 5001)
+        self.assertFalse(hasattr(refused, "entry_gap_pct"))
+
+    def test_crossed_or_locked_book_refuses_without_gap_values(self):
+        cases = (
+            (stream_record(spot_bid="101", spot_ask="101"),
+             "SPOT_BOOK_CROSSED_OR_LOCKED"),
+            (stream_record(spot_bid="102", spot_ask="101"),
+             "SPOT_BOOK_CROSSED_OR_LOCKED"),
+            (stream_record(perp_bid="112", perp_ask="112"),
+             "PERP_BOOK_CROSSED_OR_LOCKED"),
+            (stream_record(perp_bid="113", perp_ask="112"),
+             "PERP_BOOK_CROSSED_OR_LOCKED"),
+        )
+        for record, reason in cases:
+            with self.subTest(reason=reason, record=record):
+                result = read(record)
+                self.assertIsInstance(result, gap.GapRefusal)
+                self.assertEqual(result.reason, reason)
+                self.assertFalse(hasattr(result, "exit_gap_pct"))
+
+    def test_excess_pair_skew_and_float_price_refuse(self):
+        skewed = read(spot_age=0, perp_age=1001)
+        floating = read(stream_record(spot_bid=100.0))
+
+        self.assertEqual(skewed.reason, "QUOTE_SKEW_EXCEEDED")
+        self.assertEqual(floating.reason, "SPOT_QUOTE_INVALID")
+        self.assertEqual((skewed.spot_age_ms, skewed.perp_age_ms), (0, 1001))
+
+
+class GapHistoryRingTests(unittest.TestCase):
+    def test_named_windows_are_inclusive_and_decimal_only(self):
+        history = gap.GapHistoryRing()
+        start = NOW_MS - 24 * HOUR_MS
+        for value in range(25):
+            history.record(reading(start + value * HOUR_MS, value))
+
+        windows = history.named_windows(SYMBOL)
+
+        expected = {
+            "1h": (2, Decimal("23"), Decimal("24"), Decimal("23.5")),
+            "5h": (6, Decimal("19"), Decimal("24"), Decimal("21.5")),
+            "15h": (16, Decimal("9"), Decimal("24"), Decimal("16.5")),
+            "24h": (25, Decimal("0"), Decimal("24"), Decimal("12")),
+        }
+        self.assertEqual(tuple(windows), gap.NAMED_WINDOWS)
+        for name, (samples, minimum, maximum, mean) in expected.items():
+            with self.subTest(window=name):
+                stats = windows[name]
+                self.assertEqual(stats.samples, samples)
+                self.assertEqual(stats.gap_min, minimum)
+                self.assertEqual(stats.gap_max, maximum)
+                self.assertEqual(stats.gap_mean, mean)
+                self.assertEqual(stats.gap_latest, Decimal("24"))
+                self.assertTrue(all(isinstance(value, Decimal) for value in (
+                    stats.gap_min, stats.gap_max, stats.gap_mean,
+                    stats.gap_latest)))
+
+    def test_exit_metric_uses_the_same_window_shape(self):
+        history = gap.GapHistoryRing()
+        history.record(reading(NOW_MS - HOUR_MS, "1", "7"))
+        history.record(reading(NOW_MS, "2", "9"))
+
+        stats = history.window_stats(SYMBOL, "1h", metric="exit")
+
+        self.assertEqual(stats.samples, 2)
+        self.assertEqual(stats.gap_min, Decimal("7"))
+        self.assertEqual(stats.gap_max, Decimal("9"))
+        self.assertEqual(stats.gap_mean, Decimal("8"))
+        self.assertEqual(stats.gap_latest, Decimal("9"))
+
+    def test_ring_is_capacity_and_time_bounded(self):
+        history = gap.GapHistoryRing(capacity=3)
+        for value in range(4):
+            history.record(reading(NOW_MS + value, value))
+        self.assertEqual(
+            [row.entry_gap_pct for row in history.series_for(SYMBOL)],
+            [Decimal("1"), Decimal("2"), Decimal("3")],
+        )
+
+        elapsed = gap.GapHistoryRing()
+        elapsed.record(reading(NOW_MS - 24 * HOUR_MS - 1, "1"))
+        elapsed.record(reading(NOW_MS, "2"))
+        self.assertEqual(len(elapsed.series_for(SYMBOL)), 1)
+
+    def test_history_refuses_non_decimal_gap_values(self):
+        history = gap.GapHistoryRing()
+        invalid = gap.ExecutableGapReading(SYMBOL, NOW_MS, 1.0,
+                                           Decimal("2"), 0, 0)
+        with self.assertRaisesRegex(ValueError, "finite Decimal"):
+            history.record(invalid)
+
+
+if __name__ == "__main__":
+    unittest.main()
