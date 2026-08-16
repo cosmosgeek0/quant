@@ -64,6 +64,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -116,7 +117,8 @@ from basis_executor import (
     new_run_id,
     parse_trade_capability,
     query_client_order,
-    save,
+    query_client_order_strongest,
+    save as executor_save,
     settle_leg,
     signed_read,
     spot_trades,
@@ -130,6 +132,11 @@ from limits import FIRST_TRADE_CAP_USDT
 
 STATE_FILE = "basis-position.json"
 STATE_WRITE_GUARD_FILE = "basis-position.write.lock"
+# Position writes are short local critical sections. A two-minute heartbeat
+# bound permits slow fsync while still making a stopped owner recoverable.
+POSITION_WRITE_GUARD_STALE_MS = 120_000
+V2_ADD_SEAL_RULE = (
+    "ENTRY_SEALS_BLOCK_UNPOSTED_SPOT_ALLOW_HEDGE_AND_UNWIND")
 RATES_FILE = "commission-rates.json"
 EMERGENCY_FILE = "EMERGENCY"
 STOP_FILE = "STOP"
@@ -270,6 +277,40 @@ RISK_INCREASING = "INCREASING"
 
 class PositionError(Exception):
     """A local refusal before any mutation; factual, never a market outcome."""
+
+
+class _V2AddEntrySeal(Exception):
+    """Carries a pre-POST entry seal out of the shared settlement helper."""
+
+    def __init__(self, seals: List[str]):
+        super().__init__(",".join(seals))
+        self.seals = list(seals)
+
+
+def _fsync_file_and_parent(path: str) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    parent = os.path.dirname(path) or "."
+    descriptor = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def save(state: RunState) -> None:
+    """Durably persist position-command receipts used by ADD recovery."""
+    try:
+        executor_save(state)
+        if state.receipt_path:
+            _fsync_file_and_parent(state.receipt_path)
+    except OSError:
+        raise PositionError(
+            "DURABLE_RECEIPT_WRITE_REFUSED: command receipt was not sealed") \
+            from None
 
 
 # --------------------------------------------------------------------------
@@ -867,7 +908,8 @@ _V2_ADD_UNWIND_INTENT_FIELDS = frozenset({
 _V2_ADD_ABORTED_FIELDS = frozenset({
     "ordinal", "run_id", "reason", "spot_status", "short_status",
     "spot_net_quantity", "unwind_requested_quantity",
-    "unwind_filled_quantity", "dust_quantity", "spot_leg", "unwind_leg",
+    "unwind_filled_quantity", "unwind_base_fee_quantity",
+    "dust_quantity", "spot_leg", "unwind_leg",
 })
 _V2_SPOT_INTENT_FIELDS = frozenset({
     "symbol", "newClientOrderId", "market", "side", "type",
@@ -880,7 +922,9 @@ _V2_UNWIND_INTENT_FIELDS = _V2_SHORT_INTENT_FIELDS
 _V2_ADD_SHORT_TERMINAL_STATUSES = frozenset({
     "NOT_SEALED", "REJECTED", "NOT_FOUND", "ZERO_FILLED",
 })
-_V2_ADD_ABORT_SPOT_STATUSES = frozenset({"NOT_FOUND", "FILLED"})
+_V2_ADD_ABORT_SPOT_STATUSES = frozenset({
+    "NOT_FOUND", "NOT_SUBMITTED", "FILLED",
+})
 _V2_EVENT_FIELDS = {
     "ConfigSnapshot": _V2_EVENT_COMMON_FIELDS | _V2_CONFIG_FIELDS,
     "ReceiptObserved": _V2_EVENT_COMMON_FIELDS | _V2_RECEIPT_FIELDS,
@@ -1822,7 +1866,8 @@ def new_v2_add_aborted_event(
         spot_net_quantity: Any, unwind_requested_quantity: Any,
         unwind_filled_quantity: Any, dust_quantity: Any,
         spot_leg: Optional[Dict[str, Any]],
-        unwind_leg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        unwind_leg: Optional[Dict[str, Any]],
+        unwind_base_fee_quantity: Any = Decimal(0)) -> Dict[str, Any]:
     reason = _v2_id(reason, "AddAborted.reason")
     if spot_status not in _V2_ADD_ABORT_SPOT_STATUSES:
         raise PositionError("version-2 AddAborted Spot status is invalid")
@@ -1833,12 +1878,14 @@ def new_v2_add_aborted_event(
             ("spot_net_quantity", spot_net_quantity),
             ("unwind_requested_quantity", unwind_requested_quantity),
             ("unwind_filled_quantity", unwind_filled_quantity),
+            ("unwind_base_fee_quantity", unwind_base_fee_quantity),
             ("dust_quantity", dust_quantity)):
         quantities[field] = Decimal(_v2_decimal_record_value(
             value, "AddAborted." + field, Decimal(0), V2_MAX_DECIMAL))
     net = quantities["spot_net_quantity"]
     requested = quantities["unwind_requested_quantity"]
     filled = quantities["unwind_filled_quantity"]
+    base_fee = quantities["unwind_base_fee_quantity"]
     dust = quantities["dust_quantity"]
     normalized_unwind = None
     normalized_spot = None
@@ -1852,7 +1899,7 @@ def new_v2_add_aborted_event(
         if Decimal(normalized_unwind["executed_quantity"]) != filled:
             raise PositionError(
                 "version-2 AddAborted unwind fill does not match its leg")
-    if spot_status == "NOT_FOUND":
+    if spot_status in ("NOT_FOUND", "NOT_SUBMITTED"):
         if short_status != "NOT_SEALED" or any(
                 value != 0 for value in quantities.values()) \
                 or normalized_spot is not None or normalized_unwind is not None:
@@ -1863,7 +1910,9 @@ def new_v2_add_aborted_event(
             raise PositionError(
                 "version-2 filled Spot ADD abort lacks its measured leg")
         if net <= 0 or requested > net or filled > requested \
-                or _v2_decimal_subtract(net, filled) != dust:
+                or filled + base_fee > net \
+                or _v2_decimal_subtract(
+                    _v2_decimal_subtract(net, filled), base_fee) != dust:
             raise PositionError(
                 "version-2 AddAborted measured quantities do not reconcile")
         if normalized_unwind is None and (requested != 0 or filled != 0):
@@ -2090,7 +2139,7 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
             event["unwind_requested_quantity"],
             event["unwind_filled_quantity"], event["dust_quantity"],
             event["spot_leg"],
-            event["unwind_leg"])
+            event["unwind_leg"], event["unwind_base_fee_quantity"])
         normalized.pop("event_type")
         if normalized != {
                 key: event[key] for key in _V2_ADD_ABORTED_FIELDS}:
@@ -2544,7 +2593,6 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     last_transition_index = 0
     last_reduction_index = -1
     last_reduction_observed_ms = -1
-    last_reconcile_index = -1
     last_add_terminal: Optional[Dict[str, Any]] = None
 
     for index, event in enumerate(ledger[1:], start=1):
@@ -2561,6 +2609,10 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
                 raise PositionError(
                     "version-2 active ADD permits only its next persisted "
                     "entry or measured-unwind transition")
+        if last_add_terminal is not None:
+            raise PositionError(
+                "ADD_TERMINAL_SINK: version-2 AddAborted refuses every "
+                "later transition, including ReconcileObserved")
         if event_type == "ReceiptObserved":
             if final_flat:
                 raise PositionError(
@@ -2588,7 +2640,6 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             reconcile_ids.add(reconcile_id)
             reconciliation = _v2_reconcile_observed_state(
                 event, rungs, reconcile_baseline)
-            last_reconcile_index = index
             continue
 
         if event_type == "FlatProved":
@@ -2832,7 +2883,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
                     or event["run_id"] != active_add["run_id"]:
                 raise PositionError(
                     "version-2 AddAborted does not bind the active ADD")
-            if event["spot_status"] == "NOT_FOUND":
+            if event["spot_status"] in ("NOT_FOUND", "NOT_SUBMITTED"):
                 if active_add["stage"] != "SPOT_INTENT_PERSISTED":
                     raise PositionError(
                         "version-2 AddAborted missing Spot fact is too late")
@@ -2880,6 +2931,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
                 "unwind_requested_quantity":
                     event["unwind_requested_quantity"],
                 "unwind_filled_quantity": event["unwind_filled_quantity"],
+                "unwind_base_fee_quantity":
+                    event["unwind_base_fee_quantity"],
                 "dust_quantity": event["dust_quantity"],
             }
             _v2_mark_reconcile_required(
@@ -3108,8 +3161,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         _v2_closed_residual(rung) for rung in rungs)
     reconcile_blocking = reconciliation is not None \
         and reconciliation["blocking"]
-    add_terminal_current = last_add_terminal is not None \
-        and last_add_terminal["event_index"] > last_reconcile_index
+    add_terminal_current = last_add_terminal is not None
 
     derived_rungs = []
     dust_rows = []
@@ -3231,7 +3283,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             for event_type in next_types
         ]
     else:
-        legal_next = [] if top_state == ST_CLOSED \
+        legal_next = [] if top_state in (ST_CLOSED, ST_ADD_ABORTED) \
             or ledger_freeze_reasons \
             else [{"event_type": "ReceiptObserved"}]
         if legal_next:
@@ -3450,23 +3502,244 @@ def _position_revision(position: Optional[Dict[str, Any]]) -> int:
 _NO_REVISION_CHECK = object()
 
 
-def _take_position_write_guard(receipt_dir: str) -> bool:
-    os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
-    guard_path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
+_POSITION_GUARD_LOCAL_START = "local:%s:%s" % (
+    os.getpid(), time.monotonic_ns())
+_POSITION_GUARD_FIELDS = frozenset({
+    "owner_pid", "owner_start_marker", "created_epoch_ms",
+    "heartbeat_epoch_ms", "heartbeat_monotonic_ns", "token",
+})
+
+
+@dataclass(frozen=True)
+class _PositionWriteGuardAttempt:
+    token: Optional[str]
+    recovery_row: Optional[Dict[str, str]] = None
+    refusal: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.token is not None
+
+
+def _position_guard_process_start(pid: int) -> Optional[str]:
+    """Return an OS start marker when available, with a local fallback."""
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        with open("/proc/%s/stat" % pid, "rb") as handle:
+            text = handle.read().decode("ascii")
+        closing = text.rfind(")")
+        fields = text[closing + 2:].split() if closing >= 0 else []
+        start_ticks = fields[19]
+        if start_ticks.isdigit():
+            return "linux:" + start_ticks
+    except (IndexError, OSError, UnicodeError):
+        pass
+    if pid == os.getpid():
+        return _POSITION_GUARD_LOCAL_START
+    return None
+
+
+def _position_guard_owner_alive(pid: int) -> Optional[bool]:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _valid_position_guard(owner: Any) -> bool:
+    return isinstance(owner, dict) \
+        and set(owner) == _POSITION_GUARD_FIELDS \
+        and type(owner.get("owner_pid")) is int \
+        and owner["owner_pid"] > 0 \
+        and isinstance(owner.get("owner_start_marker"), str) \
+        and bool(owner["owner_start_marker"]) \
+        and len(owner["owner_start_marker"]) <= 128 \
+        and type(owner.get("created_epoch_ms")) is int \
+        and owner["created_epoch_ms"] >= 0 \
+        and type(owner.get("heartbeat_epoch_ms")) is int \
+        and owner["heartbeat_epoch_ms"] >= owner["created_epoch_ms"] \
+        and type(owner.get("heartbeat_monotonic_ns")) is int \
+        and owner["heartbeat_monotonic_ns"] >= 0 \
+        and isinstance(owner.get("token"), str) \
+        and bool(owner["token"])
+
+
+def _encode_position_guard(owner: Dict[str, Any]) -> bytes:
+    return (json.dumps(owner, sort_keys=True, separators=(",", ":"))
+            + "\n").encode("ascii")
+
+
+def _create_position_write_guard(path: str) -> str:
+    now_ms = time.time_ns() // 1_000_000
+    marker = _position_guard_process_start(os.getpid())
+    if marker is None:
+        raise OSError("position write owner start marker is unavailable")
+    token = secrets.token_hex(16)
+    encoded = _encode_position_guard({
+        "owner_pid": os.getpid(),
+        "owner_start_marker": marker,
+        "created_epoch_ms": now_ms,
+        "heartbeat_epoch_ms": now_ms,
+        "heartbeat_monotonic_ns": time.monotonic_ns(),
+        "token": token,
+    })
+    descriptor = None
     try:
         descriptor = os.open(
-            guard_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        if os.write(descriptor, encoded) != len(encoded):
+            raise OSError("position write guard write was incomplete")
+        os.fsync(descriptor)
+    except OSError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    else:
         os.close(descriptor)
-        return True
-    except FileExistsError:
-        return False
+    return token
 
 
-def _release_position_write_guard(receipt_dir: str) -> None:
+def _take_position_write_guard(
+        receipt_dir: str) -> _PositionWriteGuardAttempt:
+    """Acquire once, or reclaim one provably stale owner with a typed row."""
     try:
-        os.unlink(os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE))
-    except FileNotFoundError:
-        pass
+        os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
+    except OSError:
+        return _PositionWriteGuardAttempt(
+            None, refusal="POSITION_WRITE_GUARD_ACQUIRE_REFUSED")
+    guard_path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
+    recovered = None
+    for attempt in range(2):
+        try:
+            token = _create_position_write_guard(guard_path)
+            return _PositionWriteGuardAttempt(token, recovered)
+        except FileExistsError:
+            if attempt:
+                return _PositionWriteGuardAttempt(
+                    None, refusal="POSITION_WRITE_GUARD_ACTIVE")
+        except OSError:
+            return _PositionWriteGuardAttempt(
+                None, refusal="POSITION_WRITE_GUARD_ACQUIRE_REFUSED")
+
+        try:
+            with open(guard_path, "rb") as handle:
+                encoded = handle.read()
+            stat_result = os.stat(guard_path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return _PositionWriteGuardAttempt(
+                None, refusal="POSITION_WRITE_GUARD_INSPECTION_REFUSED")
+        now_ms = time.time_ns() // 1_000_000
+        owner = None
+        try:
+            decoded = json.loads(encoded.decode("ascii"))
+            if _valid_position_guard(decoded):
+                owner = decoded
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            owner = None
+        stale_reason = None
+        prior_pid = "UNKNOWN"
+        if owner is None:
+            modified_ms = stat_result.st_mtime_ns // 1_000_000
+            if now_ms >= modified_ms \
+                    and now_ms - modified_ms > POSITION_WRITE_GUARD_STALE_MS:
+                stale_reason = "LEGACY_HEARTBEAT_STALE"
+        else:
+            prior_pid = str(owner["owner_pid"])
+            heartbeat_ms = owner["heartbeat_epoch_ms"]
+            if now_ms < heartbeat_ms:
+                return _PositionWriteGuardAttempt(
+                    None, refusal="POSITION_WRITE_GUARD_CLOCK_REFUSED")
+            if now_ms - heartbeat_ms > POSITION_WRITE_GUARD_STALE_MS:
+                stale_reason = "HEARTBEAT_STALE"
+            else:
+                alive = _position_guard_owner_alive(owner["owner_pid"])
+                if alive is False:
+                    stale_reason = "OWNER_NOT_RUNNING"
+                elif alive is True:
+                    current_marker = _position_guard_process_start(
+                        owner["owner_pid"])
+                    if current_marker is not None \
+                            and current_marker != owner[
+                                "owner_start_marker"]:
+                        stale_reason = "OWNER_START_CHANGED"
+                elif alive is None:
+                    return _PositionWriteGuardAttempt(
+                        None, refusal="POSITION_WRITE_GUARD_OWNER_REFUSED")
+        if stale_reason is None:
+            return _PositionWriteGuardAttempt(
+                None, refusal="POSITION_WRITE_GUARD_ACTIVE")
+        try:
+            with open(guard_path, "rb") as handle:
+                if handle.read() != encoded:
+                    return _PositionWriteGuardAttempt(
+                        None, refusal="POSITION_WRITE_GUARD_CHANGED")
+            os.unlink(guard_path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return _PositionWriteGuardAttempt(
+                None, refusal="POSITION_WRITE_GUARD_RECLAIM_REFUSED")
+        recovered = {
+            "row_type": "POSITION_WRITE_GUARD_RECLAIMED",
+            "reason": stale_reason,
+            "prior_owner_pid": prior_pid,
+        }
+    return _PositionWriteGuardAttempt(
+        None, refusal="POSITION_WRITE_GUARD_ACTIVE")
+
+
+def _heartbeat_position_write_guard(
+        receipt_dir: str, token: str) -> bool:
+    path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
+    try:
+        with open(path, encoding="ascii") as handle:
+            owner = json.load(handle)
+        marker = _position_guard_process_start(os.getpid())
+        if not _valid_position_guard(owner) \
+                or owner["token"] != token \
+                or owner["owner_pid"] != os.getpid() \
+                or marker is None \
+                or owner["owner_start_marker"] != marker:
+            return False
+        owner["heartbeat_epoch_ms"] = time.time_ns() // 1_000_000
+        owner["heartbeat_monotonic_ns"] = time.monotonic_ns()
+        encoded = _encode_position_guard(owner)
+        descriptor = os.open(path, os.O_WRONLY | os.O_TRUNC)
+        try:
+            if os.write(descriptor, encoded) != len(encoded):
+                return False
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _release_position_write_guard(receipt_dir: str, token: str) -> None:
+    path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
+    try:
+        with open(path, encoding="ascii") as handle:
+            owner = json.load(handle)
+        if _valid_position_guard(owner) and owner["token"] == token:
+            os.unlink(path)
+    except (FileNotFoundError, OSError, UnicodeError, ValueError,
+            json.JSONDecodeError):
+        return
 
 
 def _atomic_replace_position(path: str, value: Dict[str, Any],
@@ -3482,6 +3755,7 @@ def _atomic_replace_position(path: str, value: Dict[str, Any],
             os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        _fsync_file_and_parent(path)
     except Exception:
         try:
             os.unlink(tmp)
@@ -3497,15 +3771,11 @@ def save_position(receipt_dir: str, position: Dict[str, Any],
         raise PositionError(
             "version-2 state changes require append_v2_event")
     os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
-    guard_path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
-    try:
-        descriptor = os.open(
-            guard_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(descriptor)
-    except FileExistsError:
+    guard = _take_position_write_guard(receipt_dir)
+    if not guard:
         raise PositionError(
-            "basis-position write already in progress; "
-            "refusing concurrent state update") from None
+            "%s: basis-position state update refused"
+            % guard.refusal)
     try:
         current = load_position(receipt_dir)
         if _is_v2_position(current):
@@ -3522,14 +3792,14 @@ def save_position(receipt_dir: str, position: Dict[str, Any],
             candidate_revision, current_revision) + 1
         position["verdict"] = STATE_VERDICT[position["state"]]
         position["updated_utc"] = utc()
+        if not _heartbeat_position_write_guard(receipt_dir, guard.token):
+            raise PositionError(
+                "POSITION_WRITE_GUARD_OWNERSHIP_REFUSED: state update stopped")
         _atomic_replace_position(
             position_path(receipt_dir), position,
             allow_decimal_default=True)
     finally:
-        try:
-            os.unlink(guard_path)
-        except FileNotFoundError:
-            pass
+        _release_position_write_guard(receipt_dir, guard.token)
 
 
 def _seal_v2_event_payload(
@@ -3612,15 +3882,11 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
     if expected_last_digest is not None:
         _v2_digest(expected_last_digest, "expected_last_digest")
     os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
-    guard_path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
-    try:
-        descriptor = os.open(
-            guard_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(descriptor)
-    except FileExistsError:
+    guard = _take_position_write_guard(receipt_dir)
+    if not guard:
         raise PositionError(
-            "basis-position write already in progress; "
-            "refusing concurrent ledger append") from None
+            "%s: version-2 ledger append refused"
+            % guard.refusal)
     try:
         current = load_position(receipt_dir)
         if current is None:
@@ -3663,6 +3929,9 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
                 ledger, "current ledger") + [event],
         }
         _validate_v2_position(candidate)
+        if not _heartbeat_position_write_guard(receipt_dir, guard.token):
+            raise PositionError(
+                "POSITION_WRITE_GUARD_OWNERSHIP_REFUSED: ledger append stopped")
         _atomic_replace_position(
             position_path(receipt_dir), candidate,
             allow_decimal_default=False)
@@ -3674,10 +3943,7 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
             }, allow_decimal_default=False)
         return candidate
     finally:
-        try:
-            os.unlink(guard_path)
-        except FileNotFoundError:
-            pass
+        _release_position_write_guard(receipt_dir, guard.token)
 
 
 def initialize_v2_position(
@@ -5072,7 +5338,39 @@ def _v2_add_plan_receipt(
         "shared_step": fmt(market["shared_step"]),
         "spot_step": fmt(market["spot_step"]),
         "minimum_quantity": fmt(market["min_qty"]),
+        "spot_minimum_quantity": fmt(market["spot_min_qty"]),
+        "spot_minimum_notional": fmt(market["spot_min_notional"]),
+        "measured_spot_bid": fmt(market["spot_bid"]),
+        "futures_minimum_quantity": fmt(market["futures_min_qty"]),
+        "futures_minimum_notional": fmt(market["futures_min_notional"]),
+        "measured_futures_bid": fmt(market["futures_bid"]),
     }
+
+
+def _v2_add_revalidated_spot_bid(receipt: Dict[str, Any]) -> Decimal:
+    try:
+        raw = receipt["entry_revalidation"]["fresh_books"]["spot"]["bid"]
+        bid = d(raw)
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        raise PositionError(
+            "version-2 ADD measured Spot bid is unreadable") from None
+    if not bid.is_finite() or bid <= 0:
+        raise PositionError(
+            "version-2 ADD measured Spot bid is unreadable")
+    return bid
+
+
+def _v2_add_revalidated_futures_bid(receipt: Dict[str, Any]) -> Decimal:
+    try:
+        raw = receipt["entry_revalidation"]["fresh_books"]["perp"]["bid"]
+        bid = d(raw)
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        raise PositionError(
+            "version-2 ADD measured Futures bid is unreadable") from None
+    if not bid.is_finite() or bid <= 0:
+        raise PositionError(
+            "version-2 ADD measured Futures bid is unreadable")
+    return bid
 
 
 def _v2_add_plan_from_receipt(
@@ -5098,6 +5396,12 @@ def _v2_add_plan_from_receipt(
             "shared_step": d(plan["shared_step"]),
             "spot_step": d(plan["spot_step"]),
             "min_qty": d(plan["minimum_quantity"]),
+            "spot_min_qty": d(plan["spot_minimum_quantity"]),
+            "spot_min_notional": d(plan["spot_minimum_notional"]),
+            "spot_bid": d(plan["measured_spot_bid"]),
+            "futures_min_qty": d(plan["futures_minimum_quantity"]),
+            "futures_min_notional": d(plan["futures_minimum_notional"]),
+            "futures_bid": d(plan["measured_futures_bid"]),
         }
     except (ArithmeticError, KeyError, TypeError, ValueError):
         raise PositionError(
@@ -5107,13 +5411,21 @@ def _v2_add_plan_from_receipt(
         restored.funding_rate, restored.spot_quantity,
         restored.short_quantity, restored.spot_quote_cap,
         restored.short_notional, market["shared_step"],
-        market["spot_step"], market["min_qty"],
+        market["spot_step"], market["min_qty"], market["spot_min_qty"],
+        market["spot_min_notional"], market["spot_bid"],
+        market["futures_min_qty"], market["futures_min_notional"],
+        market["futures_bid"],
     )
     if restored.symbol != transition["plan"]["symbol"] \
             or any(not value.is_finite() for value in decimals) \
             or restored.spot_quote_cap <= 0 or restored.short_notional <= 0 \
             or market["shared_step"] <= 0 or market["spot_step"] <= 0 \
-            or market["min_qty"] <= 0:
+            or market["min_qty"] <= 0 or market["spot_min_qty"] < 0 \
+            or market["spot_min_notional"] < 0 \
+            or market["spot_bid"] <= 0 \
+            or market["futures_min_qty"] < 0 \
+            or market["futures_min_notional"] < 0 \
+            or market["futures_bid"] <= 0:
         raise PositionError(
             "version-2 ADD plan receipt is outside its bounds")
     return restored, market
@@ -5133,28 +5445,140 @@ def _v2_add_dislocation(accepted: AcceptedProposal) -> Dict[str, Any]:
     )
 
 
-def _v2_add_matches_rung(
-        position: Dict[str, Any], transition: Dict[str, Any]) -> bool:
+def _v2_add_rung_identity_state(
+        position: Dict[str, Any], transition: Dict[str, Any]) -> str:
+    """Match recovery only on the complete durable ADD identity tuple."""
     ordinal = transition.get("ordinal")
     intents = transition.get("intents")
     if not isinstance(ordinal, int) or not isinstance(intents, dict):
-        return False
+        return "MISMATCH"
     spot = intents.get("spot")
     short = intents.get("short")
-    if not isinstance(spot, dict) or not isinstance(short, dict):
-        return False
-    expected = {
+    if not isinstance(spot, dict):
+        return "MISMATCH"
+    expected_clients = {
         "spot": spot.get("newClientOrderId"),
-        "short": short.get("newClientOrderId"),
+        "short": short.get("newClientOrderId")
+        if isinstance(short, dict) else None,
     }
-    for event in position["ledger"]:
-        if event["event_type"] != "RungFilled" \
-                or event["ordinal"] != ordinal:
+    if not isinstance(expected_clients["spot"], str) \
+            or not expected_clients["spot"]:
+        return "MISMATCH"
+    candidates = []
+    for index, event in enumerate(position["ledger"]):
+        if event["event_type"] != "RungFilled":
             continue
-        return all(
-            event["legs"][role]["client_order_id"] == expected[role]
+        clients = {
+            role: event["legs"][role]["client_order_id"]
+            for role in ("spot", "short")
+        }
+        if event["ordinal"] == ordinal \
+                or clients["spot"] == expected_clients["spot"] \
+                or (expected_clients["short"] is not None \
+                    and clients["short"] == expected_clients["short"]):
+            candidates.append((index, event))
+    if not candidates:
+        return "ABSENT"
+    if not isinstance(short, dict) \
+            or not isinstance(expected_clients["short"], str) \
+            or not expected_clients["short"]:
+        return "MISMATCH"
+    if len(candidates) != 1:
+        return "MISMATCH"
+    fill_index, filled = candidates[0]
+    add_intent = None
+    hedge_intent = None
+    for event in reversed(position["ledger"][:fill_index]):
+        if add_intent is None and event["event_type"] == "AddIntent" \
+                and (event["ordinal"] == filled["ordinal"] \
+                     or event["intent"]["newClientOrderId"] \
+                     == filled["legs"]["spot"]["client_order_id"]):
+            add_intent = event
+        if hedge_intent is None and event["event_type"] == "AddHedgeIntent" \
+                and (event["ordinal"] == filled["ordinal"] \
+                     or event["intent"]["newClientOrderId"] \
+                     == filled["legs"]["short"]["client_order_id"]):
+            hedge_intent = event
+        if add_intent is not None and hedge_intent is not None:
+            break
+    if add_intent is None or hedge_intent is None:
+        return "MISMATCH"
+    complete_match = (
+        filled["ordinal"] == ordinal
+        and add_intent["ordinal"] == ordinal
+        and hedge_intent["ordinal"] == ordinal
+        and add_intent["run_id"] == transition.get("run_id")
+        and hedge_intent["run_id"] == transition.get("run_id")
+        and add_intent["proposal_id"] == transition.get("proposal_id")
+        and add_intent["proposal_digest"]
+        == transition.get("proposal_digest")
+        and add_intent["dislocation"] == transition.get("dislocation")
+        and filled["dislocation"] == transition.get("dislocation")
+        and add_intent["intent"]["newClientOrderId"]
+        == expected_clients["spot"]
+        and hedge_intent["intent"]["newClientOrderId"]
+        == expected_clients["short"]
+        and all(
+            filled["legs"][role]["client_order_id"]
+            == expected_clients[role]
             for role in ("spot", "short"))
-    return False
+    )
+    return "MATCH" if complete_match else "MISMATCH"
+
+
+def _v2_add_matches_rung(
+        position: Dict[str, Any], transition: Dict[str, Any]) -> bool:
+    return _v2_add_rung_identity_state(position, transition) == "MATCH"
+
+
+def _v2_add_abort_identity_state(
+        position: Dict[str, Any], transition: Dict[str, Any]
+        ) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Find one AddAborted terminal and bind it to its complete ADD identity."""
+    terminals = [
+        event for event in position["ledger"]
+        if event["event_type"] == "AddAborted"
+    ]
+    if not terminals:
+        return "ABSENT", None
+    if len(terminals) != 1:
+        return "MISMATCH", None
+    terminal = terminals[0]
+    add_intents = [
+        event for event in position["ledger"]
+        if event["event_type"] == "AddIntent"
+        and event["ordinal"] == terminal["ordinal"]
+        and event["run_id"] == terminal["run_id"]
+    ]
+    intents = transition.get("intents")
+    spot_intent = intents.get("spot") if isinstance(intents, dict) else None
+    if len(add_intents) != 1 or not isinstance(spot_intent, dict):
+        return "MISMATCH", terminal
+    try:
+        normalized_spot_intent = _normalize_v2_entry_intent(
+            spot_intent, "spot", "ADD receipt Spot intent",
+            require_canonical=False)
+    except PositionError:
+        return "MISMATCH", terminal
+    add_intent = add_intents[0]
+    matches = (
+        terminal["ordinal"] == transition.get("ordinal")
+        and terminal["run_id"] == transition.get("run_id")
+        and add_intent["proposal_id"] == transition.get("proposal_id")
+        and add_intent["proposal_digest"]
+        == transition.get("proposal_digest")
+        and add_intent["dislocation"] == transition.get("dislocation")
+        and add_intent["intent"] == normalized_spot_intent
+    )
+    if terminal["spot_leg"] is not None:
+        matches = matches and terminal["spot_leg"]["client_order_id"] \
+            == spot_intent.get("newClientOrderId")
+    unwind_intent = intents.get("unwind") if isinstance(intents, dict) else None
+    if terminal["unwind_leg"] is not None:
+        matches = matches and isinstance(unwind_intent, dict) \
+            and terminal["unwind_leg"]["client_order_id"] \
+            == unwind_intent.get("newClientOrderId")
+    return ("MATCH" if matches else "MISMATCH"), terminal
 
 
 def _active_v2_add_receipt(
@@ -5194,7 +5618,10 @@ def _active_v2_add_receipt(
             continue
         status = transition.get("status")
         committed = _v2_add_matches_rung(position, transition)
-        if status == "ABORTED" and "verdict" in receipt:
+        abort_identity, _terminal = _v2_add_abort_identity_state(
+            position, transition)
+        if status == "ABORTED" and abort_identity == "MATCH" \
+                and "verdict" in receipt:
             continue
         if status == "COMMITTED" and committed \
                 and "verdict" in receipt:
@@ -5250,6 +5677,87 @@ def _save_other_receipt(
         state.receipt = current_receipt
 
 
+def _v2_add_order_observation(
+        transition: Dict[str, Any], role: str,
+        order: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(order, dict):
+        return None
+    intent = transition.get("intents", {}).get(role)
+    if not isinstance(intent, dict):
+        return None
+    venue = VENUES.get(intent.get("market"))
+    if venue is None or order.get("symbol") != transition["plan"]["symbol"] \
+            or order.get("clientOrderId") != intent.get("newClientOrderId"):
+        return None
+    try:
+        executed = d(order.get("executedQty", "0"))
+        quote = d(order.get(venue.quote_field, "0"))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if not executed.is_finite() or executed < 0 \
+            or not quote.is_finite() or quote < 0:
+        return None
+    observed = {
+        "symbol": transition["plan"]["symbol"],
+        "clientOrderId": intent["newClientOrderId"],
+        "status": str(order.get("status", "")),
+        "executedQty": fmt(executed),
+        venue.quote_field: fmt(quote),
+    }
+    order_id = order.get("orderId")
+    if order_id is not None and str(order_id):
+        observed["orderId"] = str(order_id)
+    return observed
+
+
+def _v2_add_prior_order_observation(
+        receipt: Dict[str, Any], role: str) -> Optional[Dict[str, Any]]:
+    stage = {
+        "spot": ENTER_SPOT,
+        "short": ENTER_SHORT,
+        "unwind": UNWIND_SPOT,
+    }[role]
+    rows = [
+        row for row in receipt.get("legs", [])
+        if isinstance(row, dict) and row.get("stage") == stage
+    ]
+    if len(rows) != 1:
+        return None
+    observed = rows[0].get("strongest_order_observation")
+    return dict(observed) if isinstance(observed, dict) else None
+
+
+def _v2_add_pre_post_seal_row(
+        state: RunState, stage: str) -> Dict[str, Any]:
+    """Persist the seal decision immediately before an ADD-owned POST."""
+    present = [
+        seal for seal in (STOP_FILE, STOP_JOBS_FILE)
+        if os.path.exists(os.path.join(state.cfg.receipt_dir, seal))
+    ]
+    exposure_exit = stage in (ENTER_SHORT, UNWIND_SPOT)
+    if present and stage == ENTER_SPOT:
+        action = "REFUSE_UNPOSTED_SPOT"
+    elif present and exposure_exit:
+        action = "ALLOW_EXPOSURE_EXIT"
+    elif stage == ENTER_SPOT:
+        action = "ALLOW_ENTRY"
+    else:
+        action = "ALLOW_EXPOSURE_EXIT"
+    row = {
+        "row_type": "ADD_PRE_POST_SEAL",
+        "rule": V2_ADD_SEAL_RULE,
+        "stage": stage,
+        "present": present,
+        "action": action,
+        "checked_utc": utc(),
+    }
+    transition = state.receipt["add_transition"]
+    transition.setdefault("seal_spec_rows", []).append(row)
+    transition["updated_utc"] = utc()
+    save(state)
+    return row
+
+
 def _settle_v2_add_leg(
         state: RunState, stage: str, plan: CyclePlan,
         quantity: Optional[Decimal] = None):
@@ -5286,6 +5794,21 @@ def _settle_v2_add_leg(
         save(state)
 
     def bound_request(method, base_url, path, params=None, signed=False):
+        if method == "POST" and path.endswith("/order"):
+            seal_row = _v2_add_pre_post_seal_row(state, stage)
+            if seal_row["action"] == "REFUSE_UNPOSTED_SPOT":
+                rows = [
+                    row for row in state.receipt.get("legs", [])
+                    if isinstance(row, dict) and row.get("stage") == stage
+                ]
+                if rows:
+                    rows[-1].update({
+                        "status": "NOT_SUBMITTED",
+                        "seal_refusal": list(seal_row["present"]),
+                        "terminal_utc": utc(),
+                    })
+                    save(state)
+                raise _V2AddEntrySeal(seal_row["present"])
         kind, payload = original_request(
             method, base_url, path, params, signed)
         if not path.endswith("/order") or not isinstance(payload, dict) \
@@ -5321,7 +5844,12 @@ def _settle_v2_add_leg(
 
     state.request = bound_request
     try:
-        result = settle_leg(state, stage, plan, quantity)
+        try:
+            result = settle_leg(
+                state, stage, plan, quantity,
+                query_order=query_client_order_strongest)
+        except _V2AddEntrySeal as seal:
+            result = ("entry_sealed", {"seals": seal.seals}, [])
     finally:
         state.request = original_request
     rows = [
@@ -5334,6 +5862,11 @@ def _settle_v2_add_leg(
             row["submit_order_id"] = observed["submit_order_id"]
         if observed["returned_symbol"] is not None:
             row["confirmed_symbol"] = observed["returned_symbol"]
+        strongest = _v2_add_order_observation(
+            transition, role, result[1])
+        if not refusal and result[0] == "unknown" \
+                and strongest is not None:
+            row["strongest_order_observation"] = strongest
         if refusal:
             row["identity_refusal"] = "ORDER_RESPONSE_IDENTITY_MISMATCH"
             row["identity_reasons"] = sorted(set(refusal))
@@ -5480,8 +6013,12 @@ def _commit_v2_add_receipt(
     if current is None or not _is_v2_position(current):
         raise PositionError(
             "version-2 ADD ledger is missing before commit")
-    if _v2_add_matches_rung(current, transition):
+    rung_identity = _v2_add_rung_identity_state(current, transition)
+    if rung_identity == "MATCH":
         return current
+    if rung_identity == "MISMATCH":
+        raise PositionError(
+            "ADD_RUNG_IDENTITY_MISMATCH: committed rung recovery refused")
     if transition.get("config_event_digest") \
             != current["ledger"][0]["event_digest"]:
         raise PositionError(
@@ -5542,7 +6079,8 @@ def _commit_v2_add_abort(
         spot_net_quantity: Decimal, unwind_requested_quantity: Decimal,
         unwind_filled_quantity: Decimal, dust_quantity: Decimal,
         spot_leg: Optional[Dict[str, Any]],
-        unwind_leg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        unwind_leg: Optional[Dict[str, Any]],
+        unwind_base_fee_quantity: Decimal = Decimal(0)) -> Dict[str, Any]:
     transition = receipt["add_transition"]
     current = load_position(receipt_dir)
     if current is None or not _is_v2_position(current):
@@ -5557,7 +6095,7 @@ def _commit_v2_add_abort(
         transition["ordinal"], transition["run_id"], reason,
         spot_status, short_status, spot_net_quantity,
         unwind_requested_quantity, unwind_filled_quantity, dust_quantity,
-        spot_leg, unwind_leg)
+        spot_leg, unwind_leg, unwind_base_fee_quantity)
     persisted = append_v2_event(
         receipt_dir, payload, len(current["ledger"]),
         expected_last_digest=current["ledger"][-1]["event_digest"])
@@ -5570,6 +6108,7 @@ def _commit_v2_add_abort(
         "spot_net_quantity": fmt(spot_net_quantity),
         "unwind_requested_quantity": fmt(unwind_requested_quantity),
         "unwind_filled_quantity": fmt(unwind_filled_quantity),
+        "unwind_base_fee_quantity": fmt(unwind_base_fee_quantity),
         "dust_quantity": fmt(dust_quantity),
         "after_event_count": len(persisted["ledger"]),
         "after_last_digest": persisted["ledger"][-1]["event_digest"],
@@ -5578,13 +6117,71 @@ def _commit_v2_add_abort(
     return persisted
 
 
+def _v2_add_spot_sellable_quantity(
+        quantity: Decimal, market: Dict[str, Any]) -> Optional[Decimal]:
+    """Return the Spot-valid floor after its own quantity and notional gates."""
+    if not isinstance(quantity, Decimal) or not quantity.is_finite() \
+            or quantity < 0:
+        raise PositionError(
+            "version-2 ADD Spot unwind quantity is unreadable")
+    try:
+        spot_step = market["spot_step"]
+        spot_min_qty = market["spot_min_qty"]
+        spot_min_notional = market["spot_min_notional"]
+        spot_bid = market["spot_bid"]
+    except KeyError:
+        raise PositionError(
+            "version-2 ADD Spot unwind market truth is incomplete") from None
+    values = (spot_step, spot_min_qty, spot_min_notional, spot_bid)
+    if any(not isinstance(value, Decimal) or not value.is_finite()
+           for value in values) \
+            or spot_step <= 0 or spot_min_qty < 0 \
+            or spot_min_notional < 0 or spot_bid <= 0:
+        raise PositionError(
+            "version-2 ADD Spot unwind market truth is unreadable")
+    sellable = quantize_down(quantity, spot_step)
+    if sellable <= 0 or sellable < spot_min_qty \
+            or sellable * spot_bid < spot_min_notional:
+        return None
+    return sellable
+
+
+def _v2_add_hedge_quantity(
+        net_base: Decimal, market: Dict[str, Any],
+        effective_cap: Decimal) -> Tuple[Optional[Decimal], Optional[str]]:
+    """Authorize a full measured hedge only inside filters and quote cap."""
+    values = (
+        net_base, effective_cap, market.get("shared_step"),
+        market.get("futures_min_qty"), market.get("futures_min_notional"),
+        market.get("futures_bid"),
+    )
+    if any(not isinstance(value, Decimal) or not value.is_finite()
+           for value in values) \
+            or net_base <= 0 or effective_cap <= 0 \
+            or market["shared_step"] <= 0 \
+            or market["futures_min_qty"] < 0 \
+            or market["futures_min_notional"] < 0 \
+            or market["futures_bid"] <= 0:
+        raise PositionError(
+            "version-2 ADD Futures hedge authority is unreadable")
+    hedge = quantize_down(net_base, market["shared_step"])
+    if hedge <= 0 or hedge < market["futures_min_qty"]:
+        return None, "FUTURES_QUANTITY_BELOW_MINIMUM"
+    hedge_notional = hedge * market["futures_bid"]
+    if hedge_notional < market["futures_min_notional"]:
+        return None, "FUTURES_NOTIONAL_BELOW_MINIMUM"
+    if hedge_notional > effective_cap:
+        return None, "FUTURES_QUOTE_CAP_EXCEEDED"
+    return hedge, None
+
+
 def _persist_v2_add_unwind_intent(
         state: RunState, plan: CyclePlan, market: Dict[str, Any],
         net_base: Decimal, short_status: str
         ) -> Tuple[Optional[Decimal], Decimal]:
     transition = state.receipt["add_transition"]
-    sellable = quantize_down(net_base, market["shared_step"])
-    if sellable <= 0 or sellable < market["min_qty"]:
+    sellable = _v2_add_spot_sellable_quantity(net_base, market)
+    if sellable is None:
         return None, net_base
     dust = _v2_decimal_subtract(net_base, sellable)
     intent = leg_intent(UNWIND_SPOT, plan, state.run_id, sellable)
@@ -5600,8 +6197,10 @@ def _persist_v2_add_unwind_intent(
         "net_spot_quantity": fmt(net_base),
         "sellable_quantity": fmt(sellable),
         "initial_dust_quantity": fmt(dust),
-        "shared_step": fmt(market["shared_step"]),
-        "minimum_quantity": fmt(market["min_qty"]),
+        "spot_step": fmt(market["spot_step"]),
+        "spot_minimum_quantity": fmt(market["spot_min_qty"]),
+        "spot_minimum_notional": fmt(market["spot_min_notional"]),
+        "measured_spot_bid": fmt(market["spot_bid"]),
     }
     transition["updated_utc"] = utc()
     state.receipt.setdefault("client_ids", {})[
@@ -5723,9 +6322,28 @@ def _execute_v2_add_unwind(
             "UNKNOWN", "ADD Spot unwind fee truth is incomplete",
             "unfinished ADD is frozen; terminal facts were not committed",
         )
-    residual = _v2_decimal_subtract(net_base, sold)
-    if residual < 0 or quantize_down(
-            residual, market["shared_step"]) > 0:
+    try:
+        unwind_base_fee = d(
+            state.receipt["legs"][-1]["fee_by_asset"].get(
+                market["base"], "0"))
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        unwind_base_fee = None
+    if unwind_base_fee is None or not unwind_base_fee.is_finite() \
+            or unwind_base_fee < 0 \
+            or sold + unwind_base_fee > net_base:
+        transition["status"] = "FROZEN"
+        transition["stage"] = "UNWIND_BASE_FEE_REFUSED"
+        transition["updated_utc"] = utc()
+        save(state)
+        return (
+            "UNKNOWN", "ADD Spot unwind base-fee truth exceeds its lot",
+            "terminal facts were refused; no additional order was submitted",
+        )
+    residual = _v2_decimal_subtract(
+        _v2_decimal_subtract(net_base, sold), unwind_base_fee)
+    residual_sellable = None if residual < 0 else \
+        _v2_add_spot_sellable_quantity(residual, market)
+    if residual < 0 or residual_sellable is not None:
         transition["status"] = "FROZEN"
         transition["stage"] = "UNWIND_SELLABLE_RESIDUAL"
         transition["updated_utc"] = utc()
@@ -5740,7 +6358,8 @@ def _execute_v2_add_unwind(
     persisted = _commit_v2_add_abort(
         state.cfg.receipt_dir, state.receipt,
         "HEDGE_NOT_FILLED_SPOT_UNWOUND", "FILLED", short_status,
-        net_base, sellable, sold, residual, spot_leg, unwind_leg)
+        net_base, sellable, sold, residual, spot_leg, unwind_leg,
+        unwind_base_fee)
     transition["after_event_count"] = len(persisted["ledger"])
     save(state)
     return (
@@ -5769,7 +6388,15 @@ def _resume_v2_add_unwind(
             "UNKNOWN", "ADD Spot exposure remains",
             "sealed unwind quantity is unreadable; no order was submitted",
         )
+    measured_sellable = _v2_add_spot_sellable_quantity(net_base, market)
+    if measured_sellable is None or sellable != measured_sellable:
+        return (
+            "UNKNOWN", "ADD Spot exposure remains",
+            "sealed unwind quantity does not match Spot sellability; "
+            "no order was submitted",
+        )
     fills: List[Dict[str, Any]] = []
+    already_filled = Decimal(0)
     if query_state == "not_found":
         rows = [
             row for row in state.receipt.get("legs", [])
@@ -5779,6 +6406,42 @@ def _resume_v2_add_unwind(
             return (
                 "UNKNOWN", "ADD Spot exposure remains",
                 "unwind receipt is not singular; no order was submitted",
+            )
+        observed_attempts = list(
+            transition.get("prior_unwind_attempts", []))
+        observed_attempts.extend(rows)
+        for attempt in observed_attempts:
+            if not isinstance(attempt, dict):
+                continue
+            observation = attempt.get("strongest_order_observation")
+            if not isinstance(observation, dict):
+                continue
+            try:
+                observed_fill = d(observation.get("executedQty", "0"))
+            except (ArithmeticError, TypeError, ValueError):
+                return (
+                    "UNKNOWN", "ADD Spot exposure remains",
+                    "observed unwind fill is unreadable; no order was submitted",
+                )
+            if not observed_fill.is_finite() or observed_fill < 0:
+                return (
+                    "UNKNOWN", "ADD Spot exposure remains",
+                    "observed unwind fill is unreadable; no order was submitted",
+                )
+            already_filled += observed_fill
+        if already_filled > 0:
+            return (
+                "UNKNOWN", "ADD Spot exposure remains",
+                "a partial unwind fill was observed; later absence cannot "
+                "authorize a resend",
+            )
+        remaining = _v2_decimal_subtract(net_base, already_filled)
+        resend_quantity = _v2_add_spot_sellable_quantity(remaining, market)
+        if resend_quantity is None:
+            return (
+                "UNKNOWN", "ADD Spot exposure remains",
+                "remaining measured Spot is below the sellable minimum; "
+                "no order was submitted",
             )
         if rows:
             if transition.get("unwind_resend_count", 0) >= 1:
@@ -5797,7 +6460,7 @@ def _resume_v2_add_unwind(
         transition["updated_utc"] = utc()
         save(state)
         res, order, fills = _settle_v2_add_leg(
-            state, UNWIND_SPOT, plan, sellable)
+            state, UNWIND_SPOT, plan, resend_quantity)
         if res == "identity_mismatch":
             return (
                 "UNKNOWN", "ADD Spot exposure remains",
@@ -5820,12 +6483,13 @@ def _resume_v2_add_unwind(
             "resume queried the sealed unwind identity and submitted nothing",
         )
     sold = d(order.get("executedQty", "0"))
+    total_sold = already_filled + sold
     if sold <= 0:
         return (
             "ONE_LEG_EXPOSED", "ADD Spot exposure remains",
             "measured unwind has no fill; no additional order was inferred",
         )
-    if sold > sellable:
+    if sold > sellable or total_sold > net_base:
         return (
             "UNKNOWN", "ADD Spot unwind fill exceeds its sealed quantity",
             "terminal facts were refused; no additional order was submitted",
@@ -5849,9 +6513,22 @@ def _resume_v2_add_unwind(
                 "terminal facts remain frozen; no additional order was submitted",
             )
         attach_fees(state, leg_index, trades)
-    residual = _v2_decimal_subtract(net_base, sold)
-    if residual < 0 or quantize_down(
-            residual, market["shared_step"]) > 0:
+    try:
+        unwind_base_fee = d(row["fee_by_asset"].get(market["base"], "0"))
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        unwind_base_fee = None
+    if unwind_base_fee is None or not unwind_base_fee.is_finite() \
+            or unwind_base_fee < 0 \
+            or total_sold + unwind_base_fee > net_base:
+        return (
+            "UNKNOWN", "ADD Spot unwind base-fee truth exceeds its lot",
+            "terminal facts were refused; no additional order was submitted",
+        )
+    residual = _v2_decimal_subtract(
+        _v2_decimal_subtract(net_base, total_sold), unwind_base_fee)
+    residual_sellable = None if residual < 0 else \
+        _v2_add_spot_sellable_quantity(residual, market)
+    if residual < 0 or residual_sellable is not None:
         return (
             "ONE_LEG_EXPOSED",
             "ADD Spot unwind left sellable residual %s %s"
@@ -5863,12 +6540,13 @@ def _resume_v2_add_unwind(
     _commit_v2_add_abort(
         state.cfg.receipt_dir, state.receipt,
         "HEDGE_NOT_FILLED_SPOT_UNWOUND", "FILLED", short_status,
-        net_base, sellable, sold, residual, spot_leg, unwind_leg)
+        net_base, sellable, total_sold, residual, spot_leg, unwind_leg,
+        unwind_base_fee)
     save(state)
     return (
         ST_ADD_ABORTED, "none",
         "ADD_ABORTED records measured Spot unwind %s and dust %s %s"
-        % (fmt(sold), fmt(residual), market["base"]),
+        % (fmt(total_sold), fmt(residual), market["base"]),
     )
 
 
@@ -5890,10 +6568,16 @@ def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
         print("ADD | %s | REFUSED | %s" % (
             cfg.symbol, clean(error, 300)))
         return EXIT_CODE["REFUSED"]
-    if not _take_position_write_guard(cfg.receipt_dir):
-        print("ADD | %s | BLOCKED | ADD_START_CONCURRENT: position write "
-              "already in progress" % cfg.symbol)
+    start_guard = _take_position_write_guard(cfg.receipt_dir)
+    if not start_guard:
+        print("ADD | %s | BLOCKED | ADD_START_CONCURRENT: %s"
+              % (cfg.symbol, start_guard.refusal))
         return EXIT_CODE["BLOCKED"]
+    if start_guard.recovery_row is not None:
+        row = start_guard.recovery_row
+        print("ADD | %s | %s | reason=%s prior_owner_pid=%s"
+              % (cfg.symbol, row["row_type"], row["reason"],
+                 row["prior_owner_pid"]))
     try:
         try:
             position = load_position(cfg.receipt_dir)
@@ -5930,7 +6614,8 @@ def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
             })
             save(state)
         finally:
-            _release_position_write_guard(cfg.receipt_dir)
+            _release_position_write_guard(
+                cfg.receipt_dir, start_guard.token)
     except PositionError as error:
         print("ADD | %s | BLOCKED | %s" % (
             cfg.symbol, clean(error, 300)))
@@ -5970,15 +6655,35 @@ def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
             "%s: %s" % (
                 ENTRY_REVALIDATION_FAILED, revalidation_failure))
     try:
+        market["spot_bid"] = _v2_add_revalidated_spot_bid(state.receipt)
+        market["futures_bid"] = _v2_add_revalidated_futures_bid(
+            state.receipt)
+        # market_context exposes the cross-venue maxima. Using those maxima
+        # for the Futures leg is conservative and can never admit a quantity
+        # below either venue's published minimum.
+        market["futures_min_qty"] = market["min_qty"]
+        market["futures_min_notional"] = market["min_notional"]
+    except PositionError as error:
+        return conclude(
+            state, "REJECTED_BEFORE_ENTRY", "none", str(error))
+    try:
         _require_fresh_v2_add_reconcile(reconcile, now_ms())
     except PositionError as error:
         return conclude(
             state, "REJECTED_BEFORE_ENTRY", "none", str(error))
 
-    if not _take_position_write_guard(cfg.receipt_dir):
+    intent_guard = _take_position_write_guard(cfg.receipt_dir)
+    if not intent_guard:
         return conclude(
             state, "BLOCKED", "none",
-            "ADD_START_CONCURRENT: position changed before intent commit")
+            "ADD_START_CONCURRENT: %s" % intent_guard.refusal)
+    if intent_guard.recovery_row is not None:
+        row = intent_guard.recovery_row
+        state.receipt.setdefault("position_write_guard_rows", []).append(row)
+        save(state)
+        print("ADD | %s | %s | reason=%s prior_owner_pid=%s"
+              % (cfg.symbol, row["row_type"], row["reason"],
+                 row["prior_owner_pid"]))
     try:
         try:
             for seal_file in (STOP_FILE, STOP_JOBS_FILE):
@@ -6047,7 +6752,8 @@ def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
             })
             save(state)
         finally:
-            _release_position_write_guard(cfg.receipt_dir)
+            _release_position_write_guard(
+                cfg.receipt_dir, intent_guard.token)
     except PositionError as error:
         return conclude(state, "BLOCKED", "none", str(error))
 
@@ -6076,6 +6782,29 @@ def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
             "no order was submitted: %s" % clean(error, 220))
     res, order, fills = _settle_v2_add_leg(state, ENTER_SPOT, plan)
     transition = state.receipt["add_transition"]
+    if res == "entry_sealed":
+        seals = order.get("seals", []) if isinstance(order, dict) else []
+        try:
+            _commit_v2_add_abort(
+                cfg.receipt_dir, state.receipt,
+                "ENTRY_SEAL_BEFORE_SPOT_POST", "NOT_SUBMITTED",
+                "NOT_SEALED", Decimal(0), Decimal(0), Decimal(0),
+                Decimal(0), None, None)
+        except (ArithmeticError, PositionError, TypeError, ValueError) as error:
+            transition["status"] = "FROZEN"
+            transition["stage"] = "SEAL_ABORT_COMMIT_REFUSED"
+            transition["resume_error"] = clean(error, 220)
+            transition["updated_utc"] = utc()
+            save(state)
+            return conclude(
+                state, "UNKNOWN", "ADD Spot was not submitted",
+                "entry seal abort could not be committed: %s"
+                % clean(error, 220))
+        save(state)
+        return conclude(
+            state, ST_ADD_ABORTED, "none",
+            "ADD_ABORTED records that %s appeared before the Spot POST; "
+            "zero ADD orders were submitted" % (",".join(seals) or "a seal"))
     if res == "identity_mismatch":
         return conclude(
             state, "UNKNOWN", "ADD Spot response identity was refused",
@@ -6118,18 +6847,30 @@ def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
             "unfinished ADD is frozen; an assumed fee cannot size a hedge")
     buy_base_fee = base_fee_of(trades, market["base"])
     net_base = executed - buy_base_fee
-    hedge = quantize_down(net_base, market["shared_step"])
+    try:
+        hedge, hedge_refusal = _v2_add_hedge_quantity(
+            net_base, market, effective_cap)
+    except PositionError as error:
+        transition["status"] = "FROZEN"
+        transition["stage"] = "HEDGE_AUTHORITY_REFUSED"
+        transition["hedge_refusal"] = clean(error, 220)
+        transition["updated_utc"] = utc()
+        save(state)
+        return conclude(
+            state, "UNKNOWN", "ADD Spot fill stands without a proven hedge",
+            "Futures hedge authority is unreadable; no hedge was submitted")
     transition["spot_terminal"] = {
         "executed_quantity": fmt(executed),
         "base_fee": fmt(buy_base_fee),
         "net_base_quantity": fmt(net_base),
-        "hedge_quantity": fmt(hedge),
+        "hedge_quantity": "0" if hedge is None else fmt(hedge),
+        "hedge_refusal": hedge_refusal,
     }
     transition["status"] = "SPOT_TERMINAL"
     transition["stage"] = "SPOT_OWN_ORDER_TERMINAL"
     transition["updated_utc"] = utc()
     save(state)
-    if hedge <= 0 or hedge < market["min_qty"]:
+    if hedge is None:
         verdict, exposure, note = _execute_v2_add_unwind(
             state, plan, market, net_base, "NOT_SEALED")
         return conclude(state, verdict, exposure, note)
@@ -6855,6 +7596,10 @@ def _merge_v2_add_query_truth(
     if len(rows) > 1:
         raise PositionError(
             "version-2 ADD resume found duplicate leg receipts")
+    if query_state == "identity_mismatch":
+        raise PositionError(
+            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD resume "
+            "refused a polled identity")
     returned_order = query_state in ("pending", "terminal") \
         and isinstance(order, dict)
     if returned_order:
@@ -6874,6 +7619,22 @@ def _merge_v2_add_query_truth(
             raise PositionError(
                 "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD resume "
                 "submit and query order ids do not match")
+        strongest = _v2_add_order_observation(transition, role, order)
+        if strongest is None:
+            raise PositionError(
+                "version-2 ADD resume order observation is unreadable")
+        if not rows:
+            row = {
+                "stage": stage,
+                "client_id": client,
+                "market": VENUES[intent["market"]].name,
+                "status": "UNKNOWN",
+                "utc": utc(),
+            }
+            receipt.setdefault("legs", []).append(row)
+            rows = [row]
+        if query_state == "pending":
+            rows[0]["strongest_order_observation"] = strongest
     if query_state != "terminal":
         exact_rejected_absence = bool(
             rows and query_state == "not_found"
@@ -6995,7 +7756,66 @@ def _resume_v2_add(
         return conclude(
             state, "UNKNOWN", "version-2 ADD config epoch mismatch",
             "unfinished ADD remains frozen; no order was submitted")
-    if _v2_add_matches_rung(position, transition):
+    abort_identity, abort_terminal = _v2_add_abort_identity_state(
+        position, transition)
+    if abort_identity == "MISMATCH":
+        transition["status"] = "FROZEN"
+        transition["stage"] = "ABORT_IDENTITY_MISMATCH"
+        transition["identity_refusal"] = {
+            "reason": "ADD_ABORT_IDENTITY_MISMATCH",
+            "fields": [
+                "ordinal", "client_ids", "run_id", "proposal_id",
+                "proposal_digest", "dislocation",
+            ],
+        }
+        transition["updated_utc"] = utc()
+        _save_other_receipt(state, active_path, active_receipt)
+        return conclude(
+            state, "UNKNOWN", "recorded ADD abort identity disagrees",
+            "ADD_ABORT_IDENTITY_MISMATCH; resume submitted nothing")
+    if abort_identity == "MATCH" and abort_terminal is not None:
+        transition.update({
+            "status": "ABORTED",
+            "stage": ST_ADD_ABORTED,
+            "abort_reason": abort_terminal["reason"],
+            "spot_status": abort_terminal["spot_status"],
+            "short_status": abort_terminal["short_status"],
+            "spot_net_quantity": abort_terminal["spot_net_quantity"],
+            "unwind_requested_quantity": abort_terminal[
+                "unwind_requested_quantity"],
+            "unwind_filled_quantity": abort_terminal[
+                "unwind_filled_quantity"],
+            "unwind_base_fee_quantity": abort_terminal[
+                "unwind_base_fee_quantity"],
+            "dust_quantity": abort_terminal["dust_quantity"],
+            "after_event_count": len(position["ledger"]),
+            "after_last_digest": position["ledger"][-1]["event_digest"],
+            "updated_utc": utc(),
+        })
+        dust = d(abort_terminal["dust_quantity"])
+        exposure = "none" if dust == 0 else \
+            "Spot residual %s" % fmt(dust)
+        return finish_recovered(
+            ST_ADD_ABORTED, exposure,
+            "resume repaired the durable AddAborted receipt; no order was "
+            "submitted")
+    rung_identity = _v2_add_rung_identity_state(position, transition)
+    if rung_identity == "MISMATCH":
+        transition["status"] = "FROZEN"
+        transition["stage"] = "RUNG_IDENTITY_MISMATCH"
+        transition["identity_refusal"] = {
+            "reason": "ADD_RUNG_IDENTITY_MISMATCH",
+            "fields": [
+                "ordinal", "client_ids", "run_id", "proposal_id",
+                "proposal_digest", "dislocation",
+            ],
+        }
+        transition["updated_utc"] = utc()
+        _save_other_receipt(state, active_path, active_receipt)
+        return conclude(
+            state, "UNKNOWN", "recorded ADD rung identity disagrees",
+            "ADD_RUNG_IDENTITY_MISMATCH; resume submitted nothing")
+    if rung_identity == "MATCH":
         transition["status"] = "COMMITTED"
         transition["stage"] = "RUNG_FILLED_APPENDED"
         transition["after_event_count"] = len(position["ledger"])
@@ -7018,8 +7838,12 @@ def _resume_v2_add(
     if ledger_active is None \
             or ledger_active["run_id"] != original_run \
             or ledger_active["ordinal"] != transition.get("ordinal") \
+            or ledger_active["proposal_id"] \
+            != transition.get("proposal_id") \
             or ledger_active["proposal_digest"] \
-            != transition.get("proposal_digest"):
+            != transition.get("proposal_digest") \
+            or ledger_active["dislocation"] \
+            != transition.get("dislocation"):
         return conclude(
             state, "UNKNOWN", "unfinished ADD does not bind ledger intent",
             "resume submitted nothing")
@@ -7094,8 +7918,10 @@ def _resume_v2_add(
         for role in roles:
             intent = intents[role]
             client = intent["newClientOrderId"]
-            query_state, order = query_client_order(
-                state, VENUES[intent["market"]], client)
+            query_state, order = query_client_order_strongest(
+                state, VENUES[intent["market"]], client,
+                prior_order=_v2_add_prior_order_observation(
+                    active_receipt, role))
             query_results[role] = query_state
             orders[role] = order
             _merge_v2_add_query_truth(
@@ -7180,7 +8006,6 @@ def _resume_v2_add(
     fee_map = spot_row["fee_by_asset"]
     try:
         base_fee = d(fee_map.get(base_asset, "0"))
-        shared_step = d(transition["plan"]["shared_step"])
     except (ArithmeticError, KeyError, TypeError, ValueError):
         return conclude(
             state, "UNKNOWN", "ADD fee or step truth is unreadable",
@@ -7190,7 +8015,14 @@ def _resume_v2_add(
         return conclude(
             state, "UNKNOWN", "ADD measured Spot net is not positive",
             "resume submitted nothing")
-    hedge = quantize_down(net_base, shared_step)
+    try:
+        effective_cap = d(transition["effective_cap_quote"])
+        hedge, hedge_refusal = _v2_add_hedge_quantity(
+            net_base, market, effective_cap)
+    except (ArithmeticError, KeyError, PositionError, TypeError, ValueError):
+        return conclude(
+            state, "UNKNOWN", "ADD Futures hedge authority is unreadable",
+            "resume submitted nothing")
     if ledger_active["stage"] == "UNWIND_INTENT_PERSISTED":
         verdict, exposure, note = _resume_v2_add_unwind(
             operation_state, plan, market, net_base,
@@ -7201,6 +8033,11 @@ def _resume_v2_add(
         verdict, exposure, note = _execute_v2_add_unwind(
             operation_state, plan, market, net_base, "NOT_SEALED")
         return finish_recovered(verdict, exposure, note)
+    if hedge is None:
+        return conclude(
+            state, "UNKNOWN", "ADD short intent exceeds current authority",
+            "%s; resume submitted nothing"
+            % (hedge_refusal or "HEDGE_AUTHORITY_REFUSED"))
     try:
         intended_hedge = d(intents["short"]["quantity"])
     except (ArithmeticError, KeyError, TypeError, ValueError):

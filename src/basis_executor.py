@@ -465,8 +465,87 @@ def query_client_order(state: RunState, venue: Venue,
     return "pending", last
 
 
+def _query_order_observation_strength(
+        venue: Venue, order: Dict[str, Any]) -> Tuple[int, Decimal, Decimal]:
+    """Order nonterminal observations without weakening Decimal truth."""
+    status_rank = {
+        "NEW": 1,
+        "PARTIALLY_FILLED": 2,
+        "FILLED": 3,
+    }.get(str(order.get("status", "")), 0)
+    try:
+        executed = d(order.get("executedQty", "0"))
+        quote = d(order.get(venue.quote_field, "0"))
+    except (ArithmeticError, TypeError, ValueError):
+        executed, quote = Decimal(-1), Decimal(-1)
+    if not executed.is_finite():
+        executed = Decimal(-1)
+    if not quote.is_finite():
+        quote = Decimal(-1)
+    return status_rank, executed, quote
+
+
+def query_client_order_strongest(
+        state: RunState, venue: Venue, order_client_id: str,
+        *, prior_order: Optional[Dict[str, Any]] = None) -> Tuple[str, Any]:
+    """Poll an exact identity without letting later absence erase a sighting.
+
+    This stricter helper is opt-in so every existing executor caller keeps the
+    legacy polling contract. Exact absence requires -2013 on the complete
+    retry envelope and no order observation in this or an earlier invocation.
+    Every returned row is identity-checked before its state can be retained.
+    """
+    strongest = None
+    if isinstance(prior_order, dict):
+        if prior_order.get("symbol") != state.cfg.symbol \
+                or prior_order.get("clientOrderId") != order_client_id:
+            first_fail(
+                state, "query_order",
+                "returned order identity did not match")
+            return "identity_mismatch", prior_order
+        strongest = dict(prior_order)
+        if strongest.get("status") in TERMINAL:
+            return "terminal", strongest
+    all_missing = strongest is None
+    for _ in range(QUERY_TRIES):
+        kind, order = state.request(
+            "GET", venue.base_url, venue.order_path,
+            {"symbol": state.cfg.symbol,
+             "origClientOrderId": order_client_id}, True)
+        if kind == "ok" and isinstance(order, dict):
+            all_missing = False
+            if order.get("symbol") != state.cfg.symbol \
+                    or order.get("clientOrderId") != order_client_id:
+                first_fail(
+                    state, "query_order",
+                    "returned order identity did not match")
+                return "identity_mismatch", order
+            if strongest is None or _query_order_observation_strength(
+                    venue, order) > _query_order_observation_strength(
+                        venue, strongest):
+                strongest = dict(order)
+            if order.get("status") in TERMINAL:
+                return "terminal", order
+        elif kind == "api_error" and isinstance(order, dict) \
+                and order.get("code") == -2013:
+            pass
+        elif kind == "api_error":
+            all_missing = False
+            first_fail(state, "query_order", api_reason(order))
+            return "error", order
+        else:
+            all_missing = False
+        state.sleep(QUERY_SLEEP)
+    if strongest is not None:
+        return "pending", strongest
+    if all_missing:
+        return "not_found", None
+    return "pending", None
+
+
 def settle_leg(state: RunState, stage: str, plan: CyclePlan,
-               quantity: Optional[Decimal] = None):
+               quantity: Optional[Decimal] = None, *,
+               query_order: Optional[Callable[..., Tuple[str, Any]]] = None):
     """Submit ONE order for a stage, then establish its truth by client id.
 
     Returns ("terminal", order, response_fills) | ("rejected", payload, []) |
@@ -494,7 +573,8 @@ def settle_leg(state: RunState, stage: str, plan: CyclePlan,
 
     kind, response = state.request("POST", venue.base_url, venue.order_path,
                                    dict(wire), True)
-    query_state, order = query_client_order(state, venue, order_client_id)
+    poll_order = query_client_order if query_order is None else query_order
+    query_state, order = poll_order(state, venue, order_client_id)
 
     if query_state == "terminal":
         if order.get("clientOrderId") != order_client_id:
