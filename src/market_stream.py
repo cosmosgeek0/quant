@@ -1312,7 +1312,6 @@ class MarketStream:
         perp_payload = self._read("bulk", FAPI_BASE_URL, FAPI_BOOK_PATH, {})
         perp_book_ms = self.ms_fn()
         premium_payload = self._read("bulk", FAPI_BASE_URL, FAPI_PREMIUM_PATH, {})
-        basis_now_ms = self.ms_fn()
         spot_metadata = exchange_metadata["spot"]
         perp_metadata = exchange_metadata["perp"]
         spot_universe = frozenset(spot_metadata)
@@ -1332,16 +1331,19 @@ class MarketStream:
         if not universe:
             raise DataReadError("bulk reads produced an empty USDT universe")
 
+        feed_now_ms = self.ms_fn()
         feed_load = load_fresh_feed_state(
-            self.feed_state_path, pass_start_ms, self.feed_max_age_ms
+            self.feed_state_path, feed_now_ms, self.feed_max_age_ms
         )
         feed_snapshot = feed_load.snapshot
         if feed_snapshot is not None:
+            feed_now_ms = max(feed_now_ms, feed_snapshot.written_ms)
             self._merge_feed_windows(feed_snapshot, universe)
 
         records: Dict[str, Dict[str, Any]] = {}
         feed_ticker_ages: Dict[str, int] = {}
-        book_quote_ages: Dict[str, int] = {}
+        book_observed_ms: Dict[str, int] = {}
+        complete_pairs = set()
         for symbol in universe:
             venue = venue_for(symbol, spot, perp)
             records[symbol] = self._base_record(
@@ -1367,7 +1369,7 @@ class MarketStream:
                         None
                         if source_age is None
                         else _clamped_age_ms(
-                            pass_start_ms,
+                            feed_now_ms,
                             feed_snapshot.written_ms,
                             source_age,
                         )
@@ -1391,24 +1393,22 @@ class MarketStream:
             records[symbol]["basis_gap_pct"] = _coherent_basis_gap(
                 records[symbol],
                 observations,
-                basis_now_ms,
+                feed_now_ms,
                 self.feed_max_age_ms,
                 self.basis_max_skew_ms,
             )
-            observation_ages: List[int] = []
+            observation_times: List[int] = []
             for venue_name in ("spot", "perp"):
                 observation = observations.get(venue_name)
                 if observation is None:
-                    break
+                    continue
                 source, earliest_ms, _ = observation
-                if source == "feed":
-                    observation_ages.append(feed_ticker_ages[symbol])
-                else:
-                    observation_ages.append(
-                        _clamped_age_ms(pass_start_ms, earliest_ms)
-                    )
-            if len(observation_ages) == 2:
-                book_quote_ages[symbol] = max(observation_ages)
+                observation_times.append(
+                    feed_now_ms - feed_ticker_ages[symbol] if source == "feed" else earliest_ms)
+            if observation_times:
+                book_observed_ms[symbol] = min(observation_times)
+            if len(observation_times) == 2:
+                complete_pairs.add(symbol)
         scores = {
             symbol: move_score(records[symbol], self.state.get(symbol))
             for symbol in universe
@@ -1430,25 +1430,19 @@ class MarketStream:
 
         completed_ms = self.ms_fn()
         completed_utc = self.utc_fn()
-        pass_duration_ms = max(0, completed_ms - pass_start_ms)
+        ref_ms = max(pass_start_ms, spot_book_ms, perp_book_ms, feed_now_ms, focus_now_ms, completed_ms)
+        pass_duration_ms = max(0, ref_ms - pass_start_ms)
         for symbol, record in records.items():
             meta = self.sidecar["symbols"].get(symbol, {})
-            ages = [pass_duration_ms]
-            if symbol in feed_ticker_ages:
-                ages.append(
-                    feed_ticker_ages[symbol] + pass_duration_ms
-                )
+            leg_age = max(0, ref_ms - book_observed_ms[symbol]) if symbol in book_observed_ms else None
+            ages = [pass_duration_ms] + ([] if leg_age is None else [leg_age])
             if record["vol_1m_quote"] is not None and meta.get("last_volume_close_ms"):
-                ages.append(max(0, completed_ms - int(meta["last_volume_close_ms"])))
+                ages.append(max(0, ref_ms - int(meta["last_volume_close_ms"])))
             if record["oi"] is not None and meta.get("last_oi_ms"):
-                ages.append(max(0, completed_ms - int(meta["last_oi_ms"])))
+                ages.append(max(0, ref_ms - int(meta["last_oi_ms"])))
             record["utc"] = completed_utc
             record["freshness_ms"] = str(max(ages))
-            record["book_age_ms"] = (
-                str(book_quote_ages[symbol] + pass_duration_ms)
-                if symbol in book_quote_ages
-                else None
-            )
+            record["book_age_ms"] = str(leg_age) if symbol in complete_pairs else None
             # Construction order and key set are frozen for downstream consumers.
             records[symbol] = {field: record[field] for field in STATE_FIELDS}
 
