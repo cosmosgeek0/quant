@@ -30,6 +30,7 @@ NOW = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
 SHA = "7ac26aa771937f802930dac5eb017d6583d968d8"
 STANDING_REPAY_FACTS = {
     "job_id": "mproofr-2c2a3027d877",
+    "release_sha": "4a7e2634361892dccf41137fbd88fe62ae8e3281",
     "ready_params": {
         "asset": "USDT", "amount": "2.5000387", "type": "REPAY",
     },
@@ -682,7 +683,8 @@ class JobRunnerTests(unittest.TestCase):
             "lock_path": lock_path,
         }
 
-    def prepare_standing_legacy_repay_reconcile(self):
+    def prepare_standing_legacy_repay_reconcile(
+            self, bind_legacy_release=True):
         facts = json.loads(json.dumps(STANDING_REPAY_FACTS))
         job_id = facts["job_id"]
         self.margin.post_payload = {
@@ -715,10 +717,24 @@ class JobRunnerTests(unittest.TestCase):
         source["history_watermark"] = facts["history_watermark"]
         source["verdict"] = "UNKNOWN"
         source["reason"] = "MARGIN_CONFIRMATION_MISMATCH"
+        if bind_legacy_release:
+            source["sha"] = facts["release_sha"]
         Path(source_path).write_text(
             json.dumps(source, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
+        if bind_legacy_release:
+            runner_path = unknown["receipt_path"]
+            runner = json.loads(Path(runner_path).read_text(
+                encoding="utf-8"
+            ))
+            runner["sha"] = facts["release_sha"]
+            runner["measured_sha"] = facts["release_sha"]
+            runner["sha_valid"] = True
+            Path(runner_path).write_text(
+                json.dumps(runner, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
         return facts, unknown, source_path
 
     @staticmethod
@@ -3379,6 +3395,19 @@ class JobRunnerTests(unittest.TestCase):
         source_before = json.loads(
             Path(source_path).read_text(encoding="utf-8")
         )
+        runner_before = json.loads(
+            Path(unknown["receipt_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            jr.LEGACY_REPAY_SHAPE_RELEASES, (facts["release_sha"],)
+        )
+        self.assertEqual(source_before["sha"], facts["release_sha"])
+        self.assertEqual((
+            runner_before["sha"], runner_before["sha_valid"],
+            runner_before["measured_sha"],
+        ), (
+            facts["release_sha"], True, facts["release_sha"],
+        ))
         self.assertNotEqual(set(source_before), set(jr.LEGACY_RECEIPT_FIELDS))
         self.assertEqual(source_before["ready"]["params"],
                          facts["ready_params"])
@@ -3447,6 +3476,160 @@ class JobRunnerTests(unittest.TestCase):
             ({job_id}, False, False),
         )
         self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_modern_repay_four_field_row_is_unconfirmed(
+            self):
+        facts, unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile(
+                bind_legacy_release=False
+            )
+        self.margin.history_payload = {"rows": [facts["history_row"]]}
+        source_before = Path(source_path).read_bytes()
+        runner_before = Path(unknown["receipt_path"]).read_bytes()
+
+        with mock.patch.object(
+                jr, "_evaluate_legacy_repay_confirmation",
+                wraps=jr._evaluate_legacy_repay_confirmation,
+                ) as legacy_evaluator:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        legacy_evaluator.assert_not_called()
+        self.assertEqual(self.results()[-1], {
+            "kind": "RECONCILE_UNCONFIRMED",
+            "job_id": facts["job_id"],
+            "reason": "LEGACY_PROVENANCE_MISMATCH",
+            "utc": utc(NOW),
+        })
+        self.assertEqual(Path(source_path).read_bytes(), source_before)
+        self.assertEqual(
+            Path(unknown["receipt_path"]).read_bytes(), runner_before
+        )
+
+    def test_reconcile_margin_legacy_repay_requires_valid_runner_sha(self):
+        facts, unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        runner = json.loads(Path(unknown["receipt_path"]).read_text(
+            encoding="utf-8"
+        ))
+        runner["sha_valid"] = False
+        Path(unknown["receipt_path"]).write_text(
+            json.dumps(runner, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        self.margin.history_payload = {"rows": [facts["history_row"]]}
+        source_before = Path(source_path).read_bytes()
+        runner_before = Path(unknown["receipt_path"]).read_bytes()
+
+        with mock.patch.object(
+                jr, "_evaluate_legacy_repay_confirmation",
+                wraps=jr._evaluate_legacy_repay_confirmation,
+                ) as legacy_evaluator:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        legacy_evaluator.assert_not_called()
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+        self.assertEqual(Path(source_path).read_bytes(), source_before)
+        self.assertEqual(
+            Path(unknown["receipt_path"]).read_bytes(), runner_before
+        )
+
+    def test_reconcile_margin_legacy_repay_tx_id_mismatch_is_unconfirmed(
+            self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        target_row = dict(facts["history_row"])
+        exact_row = dict(
+            target_row, txId=target_row["txId"] + 1
+        )
+
+        def reads(method, base_url, path, params, signed):
+            self.assertEqual(
+                (method, base_url, signed),
+                ("GET", jr.basis_executor.SPOT.base_url, True),
+            )
+            if path == jr.MARGIN_ACCOUNT_PATH:
+                return "ok", self.margin.account_payload
+            if params.get("txId") == facts["submission"]["transaction_id"]:
+                return "ok", {"rows": [exact_row]}
+            if params.get("type") == "REPAY":
+                return "ok", {"rows": [target_row]}
+            return "ok", {"rows": []}
+
+        self.assertEqual(jr.reconcile_margin(
+            facts["job_id"], True, self.receipt_dir, NOW, reads
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_REPAY_TX_ID_MISMATCH"
+        )
+
+    def test_reconcile_margin_legacy_repay_status_mismatch_is_unconfirmed(
+            self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        self.margin.history_payload = {"rows": [dict(
+            facts["history_row"], status="PENDING"
+        )]}
+
+        self.assertEqual(jr.reconcile_margin(
+            facts["job_id"], True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_REPAY_STATUS_MISMATCH"
+        )
+
+    def test_reconcile_margin_legacy_repay_principal_mismatch_is_unconfirmed(
+            self):
+        facts, _unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        source["account_liability_before"] = {
+            "asset": "USDT",
+            "borrowed": "2.5",
+            "interest": "0.1000387",
+            "total_liability": "2.6000387",
+        }
+        Path(source_path).write_text(
+            json.dumps(source, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        self.margin.history_payload = {"rows": [dict(
+            facts["history_row"],
+            principal="2.4", interest="0.1000387",
+        )]}
+
+        self.assertEqual(jr.reconcile_margin(
+            facts["job_id"], True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_REPAY_PRINCIPAL_MISMATCH"
+        )
+
+    def test_reconcile_margin_legacy_repay_current_interest_is_unconfirmed(
+            self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        self.margin.history_payload = {"rows": [facts["history_row"]]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0", "interest": "0.000001",
+        }]}
+
+        self.assertEqual(jr.reconcile_margin(
+            facts["job_id"], True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"],
+            "LEGACY_REPAY_CURRENT_INTEREST_NOT_ZERO",
+        )
 
     def test_reconcile_margin_standing_repay_nonzero_account_is_unconfirmed(
             self):
