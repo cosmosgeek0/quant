@@ -684,8 +684,10 @@ class JobRunnerTests(unittest.TestCase):
         }
 
     def prepare_standing_legacy_repay_reconcile(
-            self, bind_legacy_release=True):
+            self, bind_legacy_release=True, job_id=None):
         facts = json.loads(json.dumps(STANDING_REPAY_FACTS))
+        if job_id is not None:
+            facts["job_id"] = job_id
         job_id = facts["job_id"]
         self.margin.post_payload = {
             "txId": int(facts["submission"]["transaction_id"]),
@@ -3399,7 +3401,11 @@ class JobRunnerTests(unittest.TestCase):
             Path(unknown["receipt_path"]).read_text(encoding="utf-8")
         )
         self.assertEqual(
-            jr.LEGACY_REPAY_SHAPE_RELEASES, (facts["release_sha"],)
+            jr.LEGACY_REPAY_RECEIPTS, ((
+                facts["job_id"], facts["submission"]["transaction_id"],
+                facts["ready_params"]["asset"],
+                facts["ready_params"]["amount"], facts["release_sha"],
+            ),)
         )
         self.assertEqual(source_before["sha"], facts["release_sha"])
         self.assertEqual((
@@ -3477,7 +3483,7 @@ class JobRunnerTests(unittest.TestCase):
         )
         self.assertEqual(self.governor_releases, [])
 
-    def test_reconcile_margin_modern_repay_four_field_row_is_unconfirmed(
+    def test_reconcile_margin_four_field_repay_with_other_writer_is_unconfirmed(
             self):
         facts, unknown, source_path = \
             self.prepare_standing_legacy_repay_reconcile(
@@ -3486,16 +3492,22 @@ class JobRunnerTests(unittest.TestCase):
         self.margin.history_payload = {"rows": [facts["history_row"]]}
         source_before = Path(source_path).read_bytes()
         runner_before = Path(unknown["receipt_path"]).read_bytes()
+        calls_before = list(self.margin.calls)
 
         with mock.patch.object(
                 jr, "_evaluate_legacy_repay_confirmation",
                 wraps=jr._evaluate_legacy_repay_confirmation,
-                ) as legacy_evaluator:
+                ) as legacy_evaluator, mock.patch("builtins.print") as output:
             self.assertEqual(jr.reconcile_margin(
                 facts["job_id"], True, self.receipt_dir, NOW, self.margin
             ), 3)
 
         legacy_evaluator.assert_not_called()
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | WRITER_RELEASE_SHA"
+        )
+        self.assertEqual(self.margin.calls, calls_before)
         self.assertEqual(self.results()[-1], {
             "kind": "RECONCILE_UNCONFIRMED",
             "job_id": facts["job_id"],
@@ -3507,20 +3519,60 @@ class JobRunnerTests(unittest.TestCase):
             Path(unknown["receipt_path"]).read_bytes(), runner_before
         )
 
-    def test_reconcile_margin_legacy_repay_requires_valid_runner_sha(self):
+    def test_reconcile_margin_nonallowlisted_edited_receipt_is_unconfirmed(
+            self):
         facts, unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile(
+                job_id="mrv13-edited-repay"
+            )
+        runner = json.loads(Path(unknown["receipt_path"]).read_text(
+            encoding="utf-8"
+        ))
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        self.assertEqual(source["sha"], facts["release_sha"])
+        self.assertEqual(
+            source["ready"]["expected_ledger_confirmation"],
+            facts["ready_expected"],
+        )
+        self.assertEqual((
+            runner["measured_sha"], runner["sha_valid"], runner["sha"],
+        ), (
+            facts["release_sha"], True, facts["release_sha"],
+        ))
+        calls_before = list(self.margin.calls)
+
+        with mock.patch.object(
+                jr, "_evaluate_legacy_repay_confirmation",
+                wraps=jr._evaluate_legacy_repay_confirmation,
+                ) as legacy_evaluator, mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        legacy_evaluator.assert_not_called()
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | JOB_ID"
+        )
+        self.assertEqual(self.margin.calls, calls_before)
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+
+    def test_reconcile_margin_legacy_repay_ignores_runner_sha_metadata(self):
+        facts, unknown, _source_path = \
             self.prepare_standing_legacy_repay_reconcile()
         runner = json.loads(Path(unknown["receipt_path"]).read_text(
             encoding="utf-8"
         ))
+        runner["sha"] = SHA
+        runner["measured_sha"] = SHA
         runner["sha_valid"] = False
         Path(unknown["receipt_path"]).write_text(
             json.dumps(runner, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         self.margin.history_payload = {"rows": [facts["history_row"]]}
-        source_before = Path(source_path).read_bytes()
-        runner_before = Path(unknown["receipt_path"]).read_bytes()
 
         with mock.patch.object(
                 jr, "_evaluate_legacy_repay_confirmation",
@@ -3528,16 +3580,118 @@ class JobRunnerTests(unittest.TestCase):
                 ) as legacy_evaluator:
             self.assertEqual(jr.reconcile_margin(
                 facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 0)
+
+        legacy_evaluator.assert_called_once()
+        self.assertEqual(
+            (self.results()[-1]["verdict"], self.results()[-1]["exit_code"]),
+            ("CLOSED", 0),
+        )
+
+    def test_reconcile_margin_allowlisted_job_with_other_tx_is_unconfirmed(
+            self):
+        facts, _unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        source["submission"]["transaction_id"] = "401382497304"
+        Path(source_path).write_text(
+            json.dumps(source, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        calls_before = list(self.margin.calls)
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
             ), 3)
 
-        legacy_evaluator.assert_not_called()
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | SUBMISSION_TRANSACTION_ID"
+        )
+        self.assertEqual(self.margin.calls, calls_before)
         self.assertEqual(
             self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
         )
-        self.assertEqual(Path(source_path).read_bytes(), source_before)
-        self.assertEqual(
-            Path(unknown["receipt_path"]).read_bytes(), runner_before
+
+    def test_reconcile_margin_allowlisted_job_with_other_amount_is_unconfirmed(
+            self):
+        facts, _unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        source["ready"]["params"]["amount"] = "2.5000388"
+        source["ready"]["expected_ledger_confirmation"]["principal"] = \
+            "2.5000388"
+        Path(source_path).write_text(
+            json.dumps(source, separators=(",", ":")) + "\n",
+            encoding="utf-8",
         )
+        calls_before = list(self.margin.calls)
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | REQUESTED_AMOUNT"
+        )
+        self.assertEqual(self.margin.calls, calls_before)
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+
+    def test_reconcile_margin_allowlisted_job_without_ledger_row_is_unconfirmed(
+            self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        results_path = jr._paths(self.receipt_dir)["results"]
+        other_row = self.results()[0]
+        other_row["job_id"] = "other-ledger-job"
+        Path(results_path).write_text(
+            json.dumps(other_row, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        calls_before = list(self.margin.calls)
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | RESULT_LEDGER_JOB_ID"
+        )
+        self.assertEqual(self.margin.calls, calls_before)
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+
+    def test_legacy_repay_result_ledger_binds_operation_and_basename(self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        results_path = jr._paths(self.receipt_dir)["results"]
+        row = self.results()[0]
+        self.assertEqual(jr._legacy_repay_result_ledger_fact(
+            results_path, facts["job_id"]
+        ), "")
+        for changed, fact in (
+                ({"op": "MARGIN_BORROW"}, "RESULT_LEDGER_OPERATION"),
+                ({"receipt_path": os.path.join(
+                    os.path.dirname(row["receipt_path"]), "job-other.json",
+                )}, "RESULT_LEDGER_RECEIPT_PATH")):
+            with self.subTest(fact=fact):
+                candidate = dict(row)
+                candidate.update(changed)
+                Path(results_path).write_text(
+                    json.dumps(candidate, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(jr._legacy_repay_result_ledger_fact(
+                    results_path, facts["job_id"]
+                ), fact)
 
     def test_reconcile_margin_legacy_repay_tx_id_mismatch_is_unconfirmed(
             self):
@@ -3561,12 +3715,77 @@ class JobRunnerTests(unittest.TestCase):
                 return "ok", {"rows": [target_row]}
             return "ok", {"rows": []}
 
-        self.assertEqual(jr.reconcile_margin(
-            facts["job_id"], True, self.receipt_dir, NOW, reads
-        ), 3)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, reads
+            ), 3)
 
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_REPAY_TX_ID_MISMATCH"
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_TRANSACTION_ID"
+        )
+
+    def test_reconcile_margin_legacy_exchange_asset_is_provenance_bound(self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        self.margin.history_payload = {"rows": [dict(
+            facts["history_row"], asset="BUSD"
+        )]}
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_ASSET"
+        )
+
+    def test_reconcile_margin_legacy_exchange_amount_is_provenance_bound(self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        self.margin.history_payload = {"rows": [dict(
+            facts["history_row"], amount="2.5000388"
+        )]}
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_AMOUNT"
+        )
+
+    def test_reconcile_margin_legacy_exchange_split_is_provenance_bound(self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        self.margin.history_payload = {"rows": [dict(
+            facts["history_row"], principal="2.4"
+        )]}
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_PRINCIPAL_INTEREST_TOTAL"
         )
 
     def test_reconcile_margin_legacy_repay_status_mismatch_is_unconfirmed(
@@ -3657,19 +3876,25 @@ class JobRunnerTests(unittest.TestCase):
             Path(unknown["receipt_path"]).read_bytes(), runner_before
         )
 
-    def test_reconcile_margin_standing_repay_names_first_missing_fact(self):
+    def test_reconcile_margin_standing_repay_names_missing_exchange_interest(
+            self):
         facts, _unknown, _source_path = \
             self.prepare_standing_legacy_repay_reconcile()
         row = dict(facts["history_row"])
         row.pop("interest")
         self.margin.history_payload = {"rows": [row]}
 
-        self.assertEqual(jr.reconcile_margin(
-            facts["job_id"], True, self.receipt_dir, NOW, self.margin
-        ), 3)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                facts["job_id"], True, self.receipt_dir, NOW, self.margin
+            ), 3)
 
         self.assertEqual(
-            self.results()[-1]["reason"], "LEGACY_REPAY_INTEREST_MISSING"
+            self.results()[-1]["reason"], "LEGACY_PROVENANCE_MISMATCH"
+        )
+        output.assert_any_call(
+            "JOB-RUNNER | RECONCILE UNCONFIRMED | "
+            "LEGACY_PROVENANCE_MISMATCH | EXCHANGE_INTEREST"
         )
 
     def test_reconcile_margin_modern_missing_field_stays_modern(self):
