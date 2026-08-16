@@ -252,7 +252,8 @@ def _reading_from_replay_row(row: Any, cutoff_ms: int, now_ms: int):
     if not isinstance(row, dict) or row.get("result") != "OK":
         return None
     row_ms = _utc_ms(row.get("utc"))
-    if row_ms is None or not cutoff_ms <= row_ms <= now_ms:
+    if row_ms is None or not cutoff_ms <= row_ms \
+            <= now_ms + RECORD_UTC_FUTURE_TOLERANCE_MS:
         return None
     gap_text = (row.get("entry_gap_pct"), row.get("exit_gap_pct"))
     if any(type(value) is not str for value in gap_text):
