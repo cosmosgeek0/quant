@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
@@ -37,7 +38,6 @@ class Feed:
 
 class TransferAdapterTests(unittest.TestCase):
     def test_builder_maps_directions_and_uses_the_owned_cap(self):
-        self.assertIs(transfer._PER_LEG_CAP_USDT, limits.PER_LEG_CAP_USDT)
         expected = {"spot_to_usdm": "MAIN_UMFUTURE",
                     "usdm_to_spot": "UMFUTURE_MAIN"}
         for direction, transfer_type in expected.items():
@@ -48,10 +48,15 @@ class TransferAdapterTests(unittest.TestCase):
                               ("amount", "32")))
             self.assertEqual((intent.venue, intent.operation),
                              ("BINANCE_TRANSFER", "TRANSFER"))
-        with self.assertRaises(http.AdapterRefusal):
-            transfer.build_transfer("spot_to_usdm", "USDT",
-                                    limits.PER_LEG_CAP_USDT + Decimal("0.1"),
-                                    "l3wrequest2", SHA)
+        with patch.object(limits, "PER_LEG_CAP_USDT", Decimal("1")):
+            transfer.build_transfer("spot_to_usdm", "USDT", Decimal("1"), "l3wrequest2", SHA)
+            with self.assertRaises(http.AdapterRefusal):
+                transfer.build_transfer("spot_to_usdm", "USDT", Decimal("1.1"), "l3wrequest2", SHA)
+        valid = ("spot_to_usdm", "USDT", Decimal("1"), "l3wrequest2", SHA)
+        for index in range(len(valid)):
+            for fault in ([], None, 1):
+                values = list(valid); values[index] = fault
+                with self.assertRaises(http.AdapterRefusal): transfer.build_transfer(*values)
 
     def test_balance_read_requires_one_row_from_each_account(self):
         feed = Feed(
@@ -76,6 +81,11 @@ class TransferAdapterTests(unittest.TestCase):
             "/sapi/v1/asset/transfer",
             (("type", "MAIN_UMFUTURE"), ("startTime", "10"),
              ("endTime", "20"), ("current", "1"), ("size", "100")), True))
+
+    def test_history_refuses_non_positive_amounts(self):
+        for amount in ("0", "-1"):
+            unclear = transfer.read_transfer_history(Feed(result("ok", {"total": 1, "rows": [row(1, amount)]})), BASE, "MAIN_UMFUTURE", 10, 20)
+            self.assertEqual((unclear.kind, unclear.value), ("unclear", None))
 
     def test_history_stops_at_twenty_pages(self):
         calls = []
@@ -112,6 +122,12 @@ class TransferAdapterTests(unittest.TestCase):
             feed, BASE, intent, lambda _intent: None).kind, "unclear")
         self.assertEqual(len(feed.calls), 1)
 
+    def test_submit_transport_unclear_has_no_followup_post(self):
+        intent = transfer.build_transfer("spot_to_usdm", "USDT", Decimal("2"), "l3wrequest7", SHA)
+        feed = Feed(result("unclear"))
+        submitted = transfer.submit_transfer_once(feed, BASE, intent, lambda _intent: None)
+        self.assertEqual((submitted.kind, [call[0] for call in feed.calls]), ("unclear", ["POST"]))
+
     def test_submit_writer_failure_sends_no_request(self):
         intent = transfer.build_transfer(
             "spot_to_usdm", "USDT", Decimal("2"), "l3wrequest4", SHA)
@@ -140,6 +156,13 @@ class TransferAdapterTests(unittest.TestCase):
         query = transfer.query_transfer(
             unique, BASE, intent, frozenset({51}), None, 0, 1)
         self.assertEqual((query.kind, query.row.tran_id), ("found", 52))
+
+    def test_query_known_id_conflict_stays_pending(self):
+        intent = transfer.build_transfer("spot_to_usdm", "USDT", Decimal("2"), "l3wrequest8", SHA)
+        conflict = Feed(result("ok", {"total": 1, "rows": [row(42, asset="BTC")]}))
+        query = transfer.query_transfer(conflict, BASE, intent, frozenset(), 42, 0, 1)
+        self.assertEqual((query.kind, len(conflict.calls)), ("pending", 1))
+        for baseline, selected in (([], None), (frozenset(), [])): self.assertRaises(http.AdapterRefusal, transfer.query_transfer, conflict, BASE, intent, baseline, selected, 0, 1)
 
     def test_query_has_eight_rounds_and_two_second_waits(self):
         intent = transfer.build_transfer(
