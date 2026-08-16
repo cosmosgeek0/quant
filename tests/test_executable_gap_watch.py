@@ -3,6 +3,7 @@
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -38,6 +40,7 @@ def stream_record(venues="both", *, at_ms=NOW_MS, **updates):
         "perp_bid": "111.1" if venues in {"perp", "both"} else None,
         "perp_ask": "112" if venues in {"perp", "both"} else None,
         "freshness_ms": "100",
+        "book_age_ms": "100",
     }
     row.update(updates)
     return row
@@ -66,7 +69,7 @@ class ExecutableGapWatchTests(unittest.TestCase):
             "OKAYUSDT": stream_record(),
             "SPOTUSDT": stream_record("spot"),
             "PERPUSDT": stream_record("perp"),
-            "STALEUSDT": stream_record(freshness_ms="5001"),
+            "STALEUSDT": stream_record(book_age_ms="5001"),
             "CROSSEDUSDT": stream_record(spot_bid="101", spot_ask="101"),
         })
 
@@ -90,7 +93,9 @@ class ExecutableGapWatchTests(unittest.TestCase):
         self.assertEqual(by_symbol["OKAYUSDT"], {
             "utc": utc_text(), "symbol": "OKAYUSDT",
             "entry_gap_pct": "10.0", "exit_gap_pct": "12.00",
-            "spot_age_ms": 100, "perp_age_ms": 100, "result": "OK",
+            "spot_age_ms": 100, "perp_age_ms": 100,
+            "age_source": "book_age_ms", "skew_checked": False,
+            "result": "OK",
         })
         self.assertEqual(
             by_symbol["STALEUSDT"]["result"], "SPOT_QUOTE_STALE")
@@ -103,7 +108,8 @@ class ExecutableGapWatchTests(unittest.TestCase):
             self.assertIsNone(by_symbol[symbol]["exit_gap_pct"])
 
     def test_restart_replay_restores_ring_before_current_reading(self):
-        self.write_state({"OKAYUSDT": stream_record(freshness_ms="0")})
+        self.write_state({
+            "OKAYUSDT": stream_record(freshness_ms="0", book_age_ms="0")})
         first = watch.run_once(self.paths, now_ms=NOW_MS)
         self.assertEqual(len(first.history.series_for("OKAYUSDT")), 1)
 
@@ -115,7 +121,7 @@ class ExecutableGapWatchTests(unittest.TestCase):
         )
         self.write_state({
             "OKAYUSDT": stream_record(
-                at_ms=later_ms, freshness_ms="0",
+                at_ms=later_ms, freshness_ms="0", book_age_ms="0",
                 perp_bid="121.2", perp_ask="122")
         })
         second = watch.run_once(self.paths, now_ms=later_ms)
@@ -145,13 +151,147 @@ class ExecutableGapWatchTests(unittest.TestCase):
         self.assertNotIn('"entry_gap_pct":10', raw)
 
     def test_replay_discards_rows_older_than_24_hours(self):
-        self.write_state({"OKAYUSDT": stream_record(freshness_ms="0")})
+        self.write_state({
+            "OKAYUSDT": stream_record(freshness_ms="0", book_age_ms="0")})
         watch.run_once(self.paths, now_ms=NOW_MS)
         later_ms = NOW_MS + watch.REPLAY_WINDOW_MS + 1
 
         replayed = watch.replay_history(self.output, later_ms)
 
         self.assertEqual(replayed.series_for("OKAYUSDT"), ())
+
+    def test_shared_stream_time_never_claims_a_venue_skew_check(self):
+        self.write_state({
+            "HONESTUSDT": stream_record(basis_gap_pct=None),
+        })
+
+        completed = watch.run_once(self.paths, now_ms=NOW_MS)
+
+        self.assertEqual(completed.summary.computed, 1)
+        row = self.read_rows()[0]
+        self.assertEqual(row["result"], "OK")
+        self.assertFalse(row["skew_checked"])
+
+    def test_quote_age_prefers_book_then_falls_back_for_null_and_old_rows(self):
+        old = stream_record(freshness_ms="300")
+        old.pop("book_age_ms")
+        self.write_state({
+            "BOOKUSDT": stream_record(
+                at_ms=NOW_MS - 1_000,
+                freshness_ms="5001", book_age_ms="40"),
+            "NULLUSDT": stream_record(
+                freshness_ms="200", book_age_ms=None),
+            "OLDUSDT": old,
+        })
+
+        completed = watch.run_once(self.paths, now_ms=NOW_MS)
+
+        self.assertEqual(completed.summary.computed, 3)
+        rows = {row["symbol"]: row for row in self.read_rows()}
+        self.assertEqual(
+            (rows["BOOKUSDT"]["age_source"],
+             rows["BOOKUSDT"]["spot_age_ms"]),
+            ("book_age_ms", 1_040),
+        )
+        self.assertEqual(
+            (rows["NULLUSDT"]["age_source"],
+             rows["NULLUSDT"]["spot_age_ms"]),
+            ("freshness_ms", 200),
+        )
+        self.assertEqual(
+            (rows["OLDUSDT"]["age_source"],
+             rows["OLDUSDT"]["spot_age_ms"]),
+            ("freshness_ms", 300),
+        )
+
+    def test_record_utc_beyond_tolerance_has_typed_future_refusal(self):
+        self.write_state({
+            "FUTUREUSDT": stream_record(
+                at_ms=NOW_MS + 6_000,
+                freshness_ms="7000",
+                book_age_ms=None,
+            ),
+        })
+
+        completed = watch.run_once(self.paths, now_ms=NOW_MS)
+
+        self.assertEqual(completed.summary.computed, 0)
+        row = self.read_rows()[0]
+        self.assertEqual(row["result"], "RECORD_UTC_IN_FUTURE")
+        self.assertEqual(row["age_source"], "freshness_ms")
+        self.assertFalse(row["skew_checked"])
+
+    def test_same_record_cut_is_appended_and_recorded_once(self):
+        self.write_state({"ONCEUSDT": stream_record()})
+
+        first = watch.run_once(self.paths, now_ms=NOW_MS)
+        second = watch.run_once(self.paths, now_ms=NOW_MS + 6_000)
+
+        self.assertEqual(len(first.history.series_for("ONCEUSDT")), 1)
+        self.assertEqual(len(second.history.series_for("ONCEUSDT")), 1)
+        self.assertEqual(len(self.read_rows()), 1)
+        self.assertEqual(second.rows, ())
+
+    def test_append_uses_one_newline_terminated_write_per_row(self):
+        row = {"utc": utc_text(), "symbol": "WRITEUSDT", "result": "OK"}
+        real_open = os.open
+        real_write = os.write
+        with mock.patch.object(
+                watch.os, "open", side_effect=real_open) as opened, \
+                mock.patch.object(
+                    watch.os, "write", side_effect=real_write) as written:
+            watch._append_rows(self.output, (row,))
+
+        opened.assert_called_once()
+        written.assert_called_once()
+        self.assertTrue(opened.call_args.args[1] & os.O_APPEND)
+        payload = written.call_args.args[1]
+        self.assertTrue(payload.endswith(b"\n"))
+        self.assertEqual(payload.count(b"\n"), 1)
+
+    def test_append_refuses_an_absent_receipt_directory(self):
+        output = self.root / "runtime-owned" / watch.OUTPUT_FILENAME
+
+        with self.assertRaisesRegex(
+                watch.ExecutableGapWatchError, "directory is unavailable"):
+            watch._append_rows(output, ({"result": "OK"},))
+
+        self.assertFalse(output.parent.exists())
+
+    def test_replay_skips_a_row_split_at_the_tail_boundary(self):
+        valid = {
+            "utc": utc_text(), "symbol": "TAILUSDT", "result": "OK",
+            "entry_gap_pct": "10", "exit_gap_pct": "12",
+            "spot_age_ms": 0, "perp_age_ms": 0,
+        }
+        encoded = (json.dumps(valid) + "\n").encode("utf-8")
+        partial = b'{"discarded":"' + b"x" * 40 + b'"}\n'
+        self.output.write_bytes(partial + encoded)
+
+        with mock.patch.object(
+                watch, "REPLAY_MAX_BYTES", len(encoded) + 8):
+            replayed = watch.replay_history(self.output, NOW_MS)
+
+        self.assertEqual(
+            [row.entry_gap_pct for row in replayed.series_for("TAILUSDT")],
+            [Decimal("10")],
+        )
+
+    def test_replay_ignores_refusals_and_rejects_malformed_rows(self):
+        refusal = {
+            "utc": utc_text(), "symbol": "REFUSEDUSDT",
+            "result": "SPOT_QUOTE_STALE",
+        }
+        self.output.write_text(json.dumps(refusal) + "\n", encoding="utf-8")
+
+        replayed = watch.replay_history(self.output, NOW_MS)
+        self.assertEqual(replayed.series_for("REFUSEDUSDT"), ())
+
+        with open(self.output, "ab") as handle:
+            handle.write(b"{malformed\n")
+        with self.assertRaisesRegex(
+                watch.ExecutableGapWatchError, "invalid row"):
+            watch.replay_history(self.output, NOW_MS)
 
 
 if __name__ == "__main__":
