@@ -148,11 +148,11 @@
 
   function historyBuckets(value) { return Array.isArray(value) ? value : EMPTY_BUCKETS; }
 
-  function historyGrid(value, rangeName, fallbackNow) {
+  function historyGrid(value, rangeName, fallbackNow, carryMs) {
     var spec = RANGE[rangeName] || RANGE["1h"];
     var buckets = historyBuckets(value), step = spec.bucketMs, end = fallbackNow;
     var start = Math.floor(end / step) * step - (spec.cells - 1) * step;
-    var slots = new Array(spec.cells);
+    var slots = new Array(spec.cells), index, lastFilled = -1;
     buckets.forEach(function (bucket) {
       var slot, prior;
       if (!bucket || !isNumber(bucket.t)) { return; }
@@ -161,6 +161,18 @@
       if (!prior || RANK[healthWord(bucket)] > RANK[healthWord(prior)])
         { slots[slot] = bucket; }
     });
+    /* A wire sampled less often than the cell width (news every 120 s
+       against 60 s cells) keeps its last known state for up to two of its
+       own cadences; such cells are marked carried so the tooltip says so.
+       Nothing is carried past the newest real sample's window. */
+    if (isNumber(carryMs) && carryMs > step) {
+      for (index = 0; index < spec.cells; index += 1) {
+        if (slots[index]) { lastFilled = index; continue; }
+        if (lastFilled >= 0 && (index - lastFilled) * step <= carryMs) {
+          slots[index] = Object.assign({}, slots[lastFilled], { carried: true, t: start + index * step });
+        }
+      }
+    }
     return { slots: slots, count: spec.cells, step: step, start: start, end: end };
   }
 
@@ -229,8 +241,8 @@
       else {
         start = bucket.t; tip.textContent = formatHHMM(start) + "\u2013" +
           formatHHMM(start + drawing.grid.step) + " UTC \u00b7 " +
-          healthWord(bucket) + " \u00b7 " + (isNumber(bucket.n) ? String(bucket.n) : DASH) +
-          " samples";
+          healthWord(bucket) + " \u00b7 " + (bucket.carried ? "carried from the last sample" :
+          (isNumber(bucket.n) ? String(bucket.n) : DASH) + " samples");
       }
       tip.hidden = false; positionTip(event);
     }
@@ -241,7 +253,8 @@
       var slotWidth, markWidth, offset, context, index, paint;
       if (!force && buckets === record.bucketRef && width === record.drawWidth &&
           record.drawRange === activeModel.range && ratio === record.drawRatio) { return; }
-      grid = historyGrid(source, activeModel.range, nowMs(activeModel));
+      grid = historyGrid(source, activeModel.range, nowMs(activeModel),
+        record.edge && isNumber(record.edge.cadence_ms) ? record.edge.cadence_ms * 2 : 0);
       record.bucketRef = buckets; record.drawWidth = width;
       record.drawRange = activeModel.range; record.drawRatio = ratio;
       if (!width) { record.drawing = null; return; }
@@ -347,6 +360,7 @@
         record = rows.get(edge.id);
         if (!record) { record = makeRow(edge); rows.set(edge.id, record); }
         record.historyValue = activeModel.historyByEdge && activeModel.historyByEdge[edge.id];
+        record.edge = edge;
         patchRow(record, edge, events.get(edge.id), activeModel.selectedId === edge.id);
         visible.push(record); wanted.add(edge.id);
       });
