@@ -630,7 +630,9 @@ class JobRunnerTests(unittest.TestCase):
     def make_margin_reconcile_receipt_legacy(artifacts):
         source_path = artifacts["source_path"]
         source = json.loads(Path(source_path).read_text(encoding="utf-8"))
-        source.pop("history_watermark")
+        source = {
+            field: source[field] for field in jr.LEGACY_RECEIPT_FIELDS
+        }
         Path(source_path).write_text(
             json.dumps(source, separators=(",", ":")) + "\n",
             encoding="utf-8",
@@ -2829,6 +2831,16 @@ class JobRunnerTests(unittest.TestCase):
         job_id = "mproof-b668c154de2c"
         artifacts = self.prepare_unknown_margin_reconcile(job_id)
         legacy_source = self.make_margin_reconcile_receipt_legacy(artifacts)
+        self.assertEqual(jr.LEGACY_RECEIPT_FIELDS, (
+            "kind", "job_id", "sha", "ready", "mutation_attempts",
+            "verdict", "reason", "started_utc", "governor_token",
+            "governor_release", "authority_checked_utc",
+            "authority_digests", "authority_stop_jobs_present",
+            "mutation_started_utc", "submission", "finished_utc",
+        ))
+        self.assertEqual(
+            set(legacy_source), set(jr.LEGACY_RECEIPT_FIELDS)
+        )
         real_row = {
             "txId": 401344857108,
             "asset": "USDT",
@@ -2908,9 +2920,11 @@ class JobRunnerTests(unittest.TestCase):
             "asset": "USDT", "borrowed": "2.5",
             "interest": "0.00002726", "total_liability": "2.50002726",
         })
+        self.assertNotIn("account_liability_before", source)
         rows = self.results()
         self.assertEqual([row.get("kind", "RESULT") for row in rows], [
-            "RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT",
+            "RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "LEGACY_PROOF",
+            "RESULT",
         ])
         event = rows[1]
         self.assertEqual(event["transaction_id"], "401344857108")
@@ -2927,8 +2941,20 @@ class JobRunnerTests(unittest.TestCase):
         self.assertNotIn("history_watermark", source)
         self.assertEqual(source["legacy_exclusivity_proof"], proof)
         self.assertEqual(event["legacy_exclusivity_proof"], proof)
+        self.assertNotIn("account_liability_before", event)
         self.assertEqual(event["account_liability"],
                          source["account_liability"])
+        self.assertEqual(rows[2], {
+            "kind": "LEGACY_PROOF",
+            "job_id": job_id,
+            "transaction_id": "401344857108",
+            "history_watermark_substitute":
+                jr.LEGACY_HISTORY_WATERMARK_SUBSTITUTE,
+            "account_liability_before_substitute":
+                jr.LEGACY_ACCOUNT_LIABILITY_BEFORE_SUBSTITUTE,
+            "legacy_exclusivity_proof": proof,
+            "utc": utc(NOW),
+        })
         self.assertEqual((rows[-1]["verdict"], rows[-1]["exit_code"]), (
             "OPEN", 0,
         ))
@@ -2936,6 +2962,49 @@ class JobRunnerTests(unittest.TestCase):
             jr._result_ids(jr._paths(self.receipt_dir)["results"]),
             ({job_id}, False, False),
         )
+        self.assertEqual(
+            jr._release_result(
+                jr._paths(self.receipt_dir), job_id
+            )["verdict"],
+            "OPEN",
+        )
+        self.assertEqual(
+            jr._attest_stuck_margin_lock(
+                jr._paths(self.receipt_dir), self.receipt_dir, job_id
+            ),
+            ("governor-token-1", artifacts["source_path"], True),
+        )
+
+    def test_reconcile_margin_legacy_liability_mismatch_refuses(self):
+        job_id = "margin-reconcile-legacy-liability"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        self.make_margin_reconcile_receipt_legacy(artifacts)
+        self.margin.history_payload = {"rows": [{
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.4", "interest": "0.00003",
+        }]}
+        originals = {
+            name: Path(artifacts[name]).read_bytes()
+            for name in ("source_path", "runner_path", "lock_path")
+        }
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_LIABILITY_MISMATCH"
+        )
+        for name, encoded in originals.items():
+            self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
+        self.assertEqual(self.governor_releases, [])
 
     def test_reconcile_margin_legacy_second_transaction_refuses(self):
         job_id = "margin-reconcile-legacy-second"
@@ -3039,6 +3108,35 @@ class JobRunnerTests(unittest.TestCase):
         event = self.result_events("RECONCILED_FROM_EXCHANGE_TRUTH")[0]
         self.assertEqual(event["history_watermark"], 0)
         self.assertNotIn("legacy_exclusivity_proof", event)
+
+    def test_reconcile_margin_modern_missing_field_stays_modern(self):
+        job_id = "margin-reconcile-modern-missing"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        source_path = artifacts["source_path"]
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        source.pop("history_watermark")
+        self.assertNotEqual(
+            set(source), set(jr.LEGACY_RECEIPT_FIELDS)
+        )
+        Path(source_path).write_text(
+            json.dumps(source, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        calls_before = list(self.margin.calls)
+
+        with mock.patch.object(
+                jr, "_margin_legacy_exclusivity_snapshot",
+                side_effect=AssertionError("legacy branch was entered")
+                ) as legacy_snapshot:
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, self.margin
+            ), 3)
+
+        legacy_snapshot.assert_not_called()
+        self.assertEqual(self.margin.calls, calls_before)
+        self.assertEqual(
+            self.results()[-1]["reason"], "HISTORY_WATERMARK_MISSING"
+        )
 
     def test_reconcile_margin_without_transaction_id_refuses_before_reads(self):
         job_id = "margin-reconcile-no-transaction"
