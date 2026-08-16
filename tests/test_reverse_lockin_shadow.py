@@ -150,7 +150,9 @@ class ReverseLockinShadowTests(unittest.TestCase):
             "REVERSE-LOCKIN-SHADOW | symbols_evaluated=2 "
             "reverse_direction=1 would_intent=0 "
             "top_5_expected_capture_pct=- "
-            "gate_histogram=BORROW_POWER_REQUIRED:1\n",
+            "gate_histogram=BORROW_POWER_REQUIRED:1 "
+            "shadow_assumptions=[\"skew_verified_assumed\"] "
+            "execution_authorized=false\n",
         )
         rows = self.read_rows()
         self.assertEqual(len(rows), 1)
@@ -158,7 +160,11 @@ class ReverseLockinShadowTests(unittest.TestCase):
         self.assertFalse(rows[0]["would_intent"])
         self.assertEqual(
             rows[0]["first_failing_gate"], reverse.BORROW_POWER_REQUIRED)
-        self.assertIsNone(rows[0]["shadow_assumption"])
+        self.assertEqual(
+            rows[0]["shadow_assumptions"],
+            [reverse.SKEW_VERIFIED_ASSUMED],
+        )
+        self.assertFalse(rows[0]["execution_authorized"])
         self.assertEqual(rows[0]["capture_source"], "top_of_book")
         self.assertEqual(rows[0]["drag_source"], "kernel_default_hold")
         self.assertEqual(rows[0]["funding_info_source"], "absent")
@@ -186,9 +192,12 @@ class ReverseLockinShadowTests(unittest.TestCase):
             ((reverse.LADDER_HEADROOM_UNAVAILABLE, 1),),
         )
         rows = self.read_rows()
-        self.assertTrue(all(
-            row["shadow_assumption"] == "borrow_power_assumed"
+        self.assertTrue(all(row["shadow_assumptions"] == [
+            "borrow_power_assumed", reverse.SKEW_VERIFIED_ASSUMED]
             for row in rows))
+        self.assertTrue(all(not row["execution_authorized"] for row in rows))
+        self.assertEqual(completed.summary.shadow_assumptions, (
+            "borrow_power_assumed", reverse.SKEW_VERIFIED_ASSUMED))
         self.assertTrue(all(row["capture_source"] == "top_of_book"
                             and row["drag_source"] == "kernel_default_hold"
                             for row in rows))
@@ -203,7 +212,26 @@ class ReverseLockinShadowTests(unittest.TestCase):
             *shadow._intent_inputs(
                 candidate, record, True, shadow.DEFAULT_LADDER_CONFIG))
         self.assertIsInstance(direct, reverse.ReverseRungIntent)
+        self.assertEqual(
+            direct.assumptions, (reverse.SKEW_VERIFIED_ASSUMED,))
         self.assertEqual(intent_row["intent_id"], direct.intent_id)
+
+    def test_stream_reading_without_skew_assumption_refuses_at_gate_three(self):
+        self.write_rows([ok_row("TESTUSDT")])
+        self.write_stream({"TESTUSDT": stream_record()})
+        candidate = shadow.latest_ok_candidates(self.ledger)[0]
+        state, metadata = shadow.load_stream_inputs(self.paths)
+        record = shadow._stream_record("TESTUSDT", state, metadata)
+
+        with mock.patch.object(
+                shadow, "SHADOW_INTENT_ASSUMPTIONS", frozenset()):
+            row = shadow.evaluate_candidate(candidate, record, True)
+
+        self.assertFalse(row["would_intent"])
+        self.assertEqual(
+            row["first_failing_gate"], reverse.SKEW_NOT_VERIFIED)
+        self.assertEqual(row["shadow_assumptions"], [
+            "borrow_power_assumed"])
 
     def test_intent_decimal_values_are_json_text_and_identity_is_stable(self):
         self.write_rows([ok_row("TESTUSDT")])
