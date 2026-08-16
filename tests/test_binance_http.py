@@ -8,8 +8,8 @@ import inspect
 import json
 import sys
 import unittest
-import urllib.error
-import urllib.parse
+import urllib.error, urllib.parse
+from decimal import Decimal, Inexact
 from pathlib import Path
 from unittest import mock
 
@@ -40,6 +40,17 @@ def _http_error(status, body):
 
 
 class BinanceHttpTests(unittest.TestCase):
+    def test_exact_context_traps_inexact_arithmetic(self):
+        with self.assertRaises(Inexact):
+            with bh.exact_context() as context:
+                self.assertEqual(context.prec, 60)
+                Decimal(1) / Decimal(3)
+
+    def test_exact_guard_maps_decimal_exception_to_refusal(self):
+        with self.assertRaises(bh.AdapterRefusal):
+            with bh.exact_guard():
+                Decimal(1) / Decimal(3)
+
     def test_constructor_refuses_missing_credentials_and_invalid_bounds(self):
         invalid = (
             ("", "secret", 15, 5000),
@@ -70,20 +81,23 @@ class BinanceHttpTests(unittest.TestCase):
     def test_sync_time_is_one_attempt_and_isolated_by_exact_base(self):
         client = bh.BinanceHttp("key", "secret", now_ms=lambda: 1000)
         responses = [_Response('{"serverTime":1500}'),
-                     _Response('{"serverTime":false}'), _Response("{}")]
+                     _Response('{"serverTime":false}'), _Response("{}"),
+                     _Response("{}")]
         with mock.patch.object(bh.urllib.request, "urlopen",
                                side_effect=responses) as wire:
             self.assertEqual(client.sync_time("https://a.test", "/time").kind,
                              "ok")
             self.assertEqual(client.sync_time("https://b.test", "/time").kind,
                              "unclear")
+            self.assertEqual(client.sync_time("https://a.test", "/time").kind,
+                             "unclear")
             signed = client("GET", "https://a.test", "/account", signed=True)
             refused = client("GET", "https://a.test/", "/account", signed=True)
         self.assertEqual(signed.kind, "ok")
         self.assertEqual(refused.msg, "clock_not_synchronized")
-        self.assertEqual(wire.call_count, 3)
+        self.assertEqual(wire.call_count, 4)
         query = urllib.parse.parse_qs(
-            urllib.parse.urlsplit(wire.call_args_list[2].args[0].full_url).query)
+            urllib.parse.urlsplit(wire.call_args_list[3].args[0].full_url).query)
         self.assertEqual(query["timestamp"], ["1500"])
 
     def test_sync_time_invalid_payload_never_enables_signing(self):
@@ -148,6 +162,12 @@ class BinanceHttpTests(unittest.TestCase):
         self.assertEqual(sleeps, [1, 2])
         self.assertEqual([call[0] for call in calls], ["GET"] * 3)
         self.assertTrue(all(call[4] for call in calls))
+        client = bh.BinanceHttp("key", "secret", timeout_seconds=7)
+        with mock.patch.object(bh.urllib.request, "urlopen",
+                               side_effect=TimeoutError) as wire:
+            bh.read(client, "https://a.test", "/x", sleep=lambda _delay: None)
+        self.assertEqual([call.kwargs["timeout"] for call in wire.call_args_list],
+                         [7, 7, 7])
 
     def test_read_stops_on_api_error_and_has_no_method_argument(self):
         answer = bh.HttpResult("api_error", None, -2010, "refused")

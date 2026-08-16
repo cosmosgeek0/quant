@@ -1,19 +1,15 @@
-"""binance_http — signer, ONE-attempt HTTP transport, bounded reads, and the
-shared result types of the Binance hand (frozen interface rows 016-036 of
-study/design/EXECUTION-HAND-INTERFACE.txt).
+"""Shared Binance types, exact-money context, and one-attempt HTTP transport.
 
-Types and constants below are the frozen public surface (rows 016-027); the
-transport itself (BinanceHttp, sync_time, __call__, read — rows 028-036) is
-implemented by shard S1 in this same file. Money values are Decimal; unproved
-truth stays None; nothing here retries a mutation.
+Contract rows 016-036 and 127: study/design/EXECUTION-HAND-INTERFACE.txt.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import (Context, Decimal, DecimalException, DivisionByZero, Inexact,
+                     InvalidOperation, Overflow, Rounded, localcontext)
 from typing import Callable, Generic, Literal, Optional, Tuple, TypeVar
 
-# ---- constants (row 025-027; binance_http is the sole owner) ---------------
 SPOT_BASE_URL = "https://api.binance.com"
 FUTURES_BASE_URL = "https://fapi.binance.com"
 HTTP_TIMEOUT_SECONDS = 15
@@ -27,15 +23,29 @@ TERMINAL_ORDER_STATUSES = frozenset(
     {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"})
 AMBIGUOUS_API_CODES = frozenset({-1006, -1007})
 
-# ---- wire and callback types (rows 016-017) --------------------------------
 Params = Tuple[Tuple[str, str], ...]
-"""Canonical, ordered, duplicate-key-free wire data."""
 
 T = TypeVar("T")
 
 
 class AdapterRefusal(ValueError):
     """The sole caller/schema exception of every adapter (row 012)."""
+
+
+_EXACT_TRAPS = (Inexact, Rounded, InvalidOperation, DivisionByZero, Overflow)
+
+
+def exact_context():
+    return localcontext(Context(prec=60, traps=list(_EXACT_TRAPS)))
+
+
+@contextmanager
+def exact_guard():
+    try:
+        with exact_context():
+            yield
+    except DecimalException as error:
+        raise AdapterRefusal("decimal operation is not exact") from error
 
 
 class IntentNotDurable(RuntimeError):
@@ -67,10 +77,8 @@ class MutationIntent:  # row 020
 
 
 Transport = Callable[[str, str, str, Optional[Params], bool], HttpResult]
-"""method, base_url, path, params, signed -> HttpResult (row 016)."""
 
 IntentWriter = Callable[[MutationIntent], None]
-"""Returns only after file + parent-directory durability (row 017)."""
 
 
 @dataclass(frozen=True)
@@ -138,7 +146,6 @@ class FillCoverage:  # row 024
     complete: bool
     fees: Tuple[Fee, ...]
 
-# ---- transport (rows 028-036): implemented by shard S1 below this line ------
 import hashlib, hmac, json, time
 import urllib.error, urllib.parse, urllib.request
 
@@ -171,8 +178,9 @@ def _classify(status: object, body: object, secrets: Tuple[str, str]) -> HttpRes
     if type(status) is not int: return _unclear("invalid_http_status")
     if status in (408, 409) or status >= 500: return _unclear("http_%d" % status)
     try:
-        payload = json.loads(body, parse_float=Decimal, parse_int=int, parse_constant=_reject_constant)
-    except (TypeError, ValueError, UnicodeError): return _unclear("invalid_json")
+        with exact_context():
+            payload = json.loads(body, parse_float=Decimal, parse_int=int, parse_constant=_reject_constant)
+    except (DecimalException, TypeError, ValueError, UnicodeError): return _unclear("invalid_json")
     code = payload.get("code") if isinstance(payload, dict) else None
     if type(code) is not int: code = None
     msg = _clean_api_msg(payload.get("msg"), secrets) if code is not None else None
