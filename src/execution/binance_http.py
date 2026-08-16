@@ -139,3 +139,133 @@ class FillCoverage:  # row 024
     fees: Tuple[Fee, ...]
 
 # ---- transport (rows 028-036): implemented by shard S1 below this line ------
+import hashlib, hmac, json, time
+import urllib.error, urllib.parse, urllib.request
+
+_MAX_TIMEOUT_SECONDS, _MAX_RECV_WINDOW_MS = 60, 60000
+_RESERVED_PARAMS = frozenset({"signature", "timestamp", "recvWindow"})
+_PRIVATE_MSG_PARTS = ("http://", "https://", "www.", "x-mbx-apikey", "signature", "authorization", "credential", "api key", "api-key", "api_key", "header")
+
+
+def system_now_ms() -> int: return int(time.time() * 1000)
+
+
+def _unclear(msg: str, code: int | None = None) -> HttpResult: return HttpResult("unclear", None, code, msg)
+
+
+def _reject_constant(_value: str) -> None: raise ValueError("non-finite JSON number")
+
+
+def _clean_api_msg(value: object, secrets: Tuple[str, str]) -> str | None:
+    if type(value) is not str: return None
+    cleaned = " ".join("".join(char if char.isprintable() else " " for char in value).split())
+    if not cleaned: return None
+    lowered = cleaned.lower()
+    if (any(part in lowered for part in _PRIVATE_MSG_PARTS)
+            or any(secret.lower() in lowered for secret in secrets)):
+        return "binance_api_error"
+    return cleaned[:160]
+
+
+def _classify(status: object, body: object, secrets: Tuple[str, str]) -> HttpResult:
+    if type(status) is not int: return _unclear("invalid_http_status")
+    if status in (408, 409) or status >= 500: return _unclear("http_%d" % status)
+    try:
+        payload = json.loads(body, parse_float=Decimal, parse_int=int, parse_constant=_reject_constant)
+    except (TypeError, ValueError, UnicodeError): return _unclear("invalid_json")
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if type(code) is not int: code = None
+    msg = _clean_api_msg(payload.get("msg"), secrets) if code is not None else None
+    if code in AMBIGUOUS_API_CODES: return _unclear(msg or "ambiguous_api_result", code)
+    if 200 <= status < 300:
+        if code is not None and code < 0: return HttpResult("api_error", None, code, msg) if msg is not None else _unclear("api_error_incomplete", code)
+        return HttpResult("ok", payload, None, None)
+    if 400 <= status < 500:
+        if code is not None and code < 0: return HttpResult("api_error", None, code, msg) if msg is not None else _unclear("api_error_incomplete", code)
+        return _unclear("http_response_unclear")
+    return _unclear("http_response_unclear")
+
+
+def _canonical_params(params: Params | None) -> Params:
+    if params is None: return ()
+    if type(params) is not tuple: raise AdapterRefusal("params must be a canonical tuple")
+    seen = set()
+    for pair in params:
+        if (type(pair) is not tuple or len(pair) != 2 or type(pair[0]) is not str or not pair[0] or type(pair[1]) is not str):
+            raise AdapterRefusal("params must contain string pairs")
+        if pair[0] in seen or pair[0] in _RESERVED_PARAMS: raise AdapterRefusal("params contain a duplicate or reserved key")
+        seen.add(pair[0])
+    return params
+
+
+class BinanceHttp:
+    def __init__(self, api_key: str, api_secret: str, *, timeout_seconds: int = HTTP_TIMEOUT_SECONDS, recv_window_ms: int = RECV_WINDOW_MS,
+                 now_ms: Callable[[], int] = system_now_ms):
+        if type(api_key) is not str or not api_key.strip() or type(api_secret) is not str or not api_secret.strip(): raise AdapterRefusal("nonempty credentials are required")
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS: raise AdapterRefusal("timeout_seconds is outside its bound")
+        if type(recv_window_ms) is not int or not 1 <= recv_window_ms <= _MAX_RECV_WINDOW_MS: raise AdapterRefusal("recv_window_ms is outside its bound")
+        if not callable(now_ms): raise AdapterRefusal("now_ms must be callable")
+        self._api_key, self._api_secret = api_key, api_secret
+        self._timeout, self._recv_window = timeout_seconds, recv_window_ms
+        self._now_ms, self._offsets = now_ms, {}
+
+    def _clock(self) -> int | None:
+        try:
+            value = self._now_ms()
+        except Exception:
+            return None
+        return value if type(value) is int and value >= 0 else None
+
+    def sync_time(self, base_url: str, time_path: str) -> HttpResult:
+        result = self("GET", base_url, time_path)
+        if result.kind != "ok" or not isinstance(result.payload, dict):
+            return result if result.kind != "ok" else _unclear("invalid_server_time")
+        server_time, local_time = result.payload.get("serverTime"), self._clock()
+        if type(server_time) is not int or server_time <= 0 or local_time is None: return _unclear("invalid_server_time")
+        self._offsets[base_url] = server_time - local_time
+        return result
+
+    def __call__(self, method: str, base_url: str, path: str,
+                 params: Params | None = None, signed: bool = False) -> HttpResult:
+        if (type(method) is not str or not method or type(base_url) is not str
+                or not base_url or type(path) is not str or not path.startswith("/")
+                or type(signed) is not bool):
+            raise AdapterRefusal("method, base_url, and path must be valid strings")
+        values = list(_canonical_params(params))
+        if signed:
+            if base_url not in self._offsets: return _unclear("clock_not_synchronized")
+            local_time = self._clock()
+            if local_time is None: return _unclear("clock_invalid")
+            timestamp = local_time + self._offsets[base_url]
+            if timestamp <= 0: return _unclear("clock_invalid")
+            values.extend((("timestamp", str(timestamp)),
+                           ("recvWindow", str(self._recv_window))))
+        try:
+            query = urllib.parse.urlencode(values)
+            if signed:
+                signature = hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+                query += "&signature=" + signature
+            url = base_url + path + ("?" + query if query else "")
+            request = urllib.request.Request(url, method=method)
+            if signed: request.add_header("X-MBX-APIKEY", self._api_key)
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                status = getattr(response, "status", None)
+                status = response.getcode() if status is None else status
+                return _classify(status, response.read(), (self._api_key, self._api_secret))
+        except urllib.error.HTTPError as error:
+            try:
+                return _classify(error.code, error.read(), (self._api_key, self._api_secret))
+            except Exception:
+                return _unclear("transport_error")
+        except Exception:
+            return _unclear("transport_error")
+
+
+def read(transport: Transport, base_url: str, path: str,
+         params: Params | None = None, *, signed: bool = False,
+         sleep: Callable[[float], None] = time.sleep) -> HttpResult:
+    for attempt in range(READ_ATTEMPTS):
+        result = transport("GET", base_url, path, params, signed)
+        if result.kind != "unclear": return result
+        if attempt < len(READ_BACKOFF_SECONDS): sleep(READ_BACKOFF_SECONDS[attempt])
+    return result
