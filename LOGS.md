@@ -7,6 +7,15 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+SM2 + FB1 DEPLOYED SEALED 2026-08-16 17:48Z / 17:54Z (worker 6.0, owner line) | machine SEALED + FLAT; two one-file atomic deploys + one feed daemon restart via the stop file; no order, transfer, leverage change or ticket
+SM2 stream | release 52b866c0 (late book read) HOST-DEPLOY OK files=1 17:48:44Z | tick 17:50:12Z: first OK gap rows (9/400), 34/357 pairs under 5 s, BTC 3.3 s with basis | feed_used=yes reason=accepted | MEASURED
+FB1 feed | release adcd747b (coalescing) HOST-DEPLOY OK files=1 17:54:39Z, daemon exited 2 s after the stop file, relaunched by the tick | 18:00-18:03Z: spot dropped_frames 0 (was 293,916 and ~14/s), perp drops continue (out-of-universe frames accounted, INFERRED), busy symbols fresh (BTC 437 ms at one read), per-symbol freshness p50 6.7 -> 5.1 s, over-5 s 377 -> 331 of 653 | MEASURED
+stream after both | ticks 18:00/18:02Z: book_age_ms min 2.3-2.5 s, 78-89/357 pairs under 5 s, gap rows OK 26 -> 36 of 400 (was 0/400 this morning, 400/400 STALE), no sub-second pair | MEASURED
+why not sub-second | busy symbols: feed 1 s write cadence + drain residence (now counted honestly) + stream snapshot lag and completion ~1.3 s -> 2.3-3.7 s; quiet symbols: bookTicker pushes only on change so the last change (minutes) reads as age | INFERRED from the numbers
+records | OWNER-CAPABILITIES rows 31-32 refreshed with the measured numbers (HOST_OBSERVED, sub-second not reached stated); evidence file appended | MEASURED
+next smallest move | faster feed flush cadence (sub-second write) + gap watch reading right at publication; owner design word on whether an unchanged book counts as fresh; SR3 not started by order | INFERRED plan
+live | none; SEALED (STOP-JOBS present) at every read; no signed balance read this seat | MEASURED / UNVERIFIED as labeled
+
 SM2 + FB1 BUILT OFFLINE, HELD 2026-08-16 ~18:00Z (worker 6.0) | machine SEALED + FLAT; nothing deployed since SM1; each of the two needs one owner line
 SM2 stream | late book read: the early feed load serves surge windows + a scoring-only ticker copy; after the focus phase a second load builds ONE final observation set (late-feed leg or REST leg per venue; early feed prices never reach publication), basis needs the same source AND snapshot, ages from the SM1 reference clock incl. the late sample | stream 1614 -> 1621; tests +3 | V2 2 -> V2b MERGE-SAFE / DEPLOY-SAFE | sha:52b866c0 lane/lead6-sm1 | payload built | MEASURED
 FB1 feed | one pending latest book per (generation, venue, symbol), exact-subscription admission, perp source-time floor with ASCII-guarded parse, receipt time captured at offer, per-cycle epoch credit, stopped-generation drops folded before the bump, drain status -> books -> FIFO | feed 1363 -> 1489 (honest un-compressed size), tests +18 | VF1 4 -> VF1b 2 -> VF1c size -> VF1d 3 -> VF1e MERGE-SAFE / DEPLOY-SAFE with the stop-file restart | sha:adcd747b lane/lead6-sm1 | payload + restart script built | MEASURED
