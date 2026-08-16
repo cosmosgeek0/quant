@@ -588,6 +588,44 @@ class JobRunnerTests(unittest.TestCase):
                 self.margin_tick()
         return self.results()[0], lock_path
 
+    def prepare_unknown_margin_reconcile(self, job_id):
+        self.margin.post_payload = {"tranId": 401344857108}
+        self.margin.history_payload = {"rows": []}
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0", "interest": "0",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5",
+            "interest": "0.00002726",
+        }]}
+        self.margin_job(job_id, principal="2.5")
+        self.assertEqual(self.margin_tick(), 4)
+        row = self.results()[0]
+        runner_path = row["receipt_path"]
+        with open(runner_path, encoding="utf-8") as handle:
+            runner = json.load(handle)
+        source_path = runner["source_receipt_path"]
+        with open(source_path, encoding="utf-8") as handle:
+            source = json.load(handle)
+        self.assertEqual(source["history_watermark"], 0)
+        lock_path = os.path.join(
+            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "version": 1,
+                "token": runner["governor_token"],
+                "op": "MARGIN_BORROW",
+                "symbol": "USDT",
+                "utc": utc(NOW),
+            }, handle)
+        return {
+            "row": row,
+            "runner_path": runner_path,
+            "source_path": source_path,
+            "lock_path": lock_path,
+        }
+
     @staticmethod
     def margin_halt_row(job_id, token, verdict, source_exists):
         return {
@@ -1502,6 +1540,7 @@ class JobRunnerTests(unittest.TestCase):
             runner = json.load(handle)
         self.assertEqual((source["sha"], runner["sha"]), (SHA, SHA))
         self.assertEqual(source["mutation_attempts"], 1)
+        self.assertEqual(source["history_watermark"], 0)
         self.assertEqual(source["authority_checked_utc"], utc(NOW))
         self.assertFalse(source["authority_stop_jobs_present"])
         self.assertEqual(source["authority_digests"], expected_authority)
@@ -1876,6 +1915,9 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(
             (result["verdict"], self.reason(result)),
             ("OPEN", "BORROW_CONFIRMED"),
+        )
+        self.assertEqual(
+            self.margin_source(result)["history_watermark"], 7201
         )
 
     def test_mrv11_later_unrelated_repay_row_is_unknown(self):
@@ -2743,8 +2785,12 @@ class JobRunnerTests(unittest.TestCase):
         same_tick_id = "margin-same-tick-release"
         self.margin_job(same_tick_id)
 
-        self.assertEqual(self.margin_tick(), 0)
+        with mock.patch.object(
+                jr, "_release_final_outcome_governor",
+                wraps=jr._release_final_outcome_governor) as final_release:
+            self.assertEqual(self.margin_tick(), 0)
 
+        final_release.assert_called_once()
         self.assertEqual(self.governor_releases, [(
             "governor-token-1", self.receipt_dir,
         )])
@@ -2767,6 +2813,301 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.receipt_dir, "STOP-JOBS"
         )))
+
+    def test_reconcile_margin_real_exchange_shape_opens_and_releases(self):
+        job_id = "mproof-b668c154de2c"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        real_row = {
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        self.margin.history_payload = {"rows": [real_row]}
+        calls_before = len(self.margin.calls)
+
+        with mock.patch.object(
+                jr, "_release_final_outcome_governor",
+                wraps=jr._release_final_outcome_governor) as final_release:
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, self.margin
+            ), 0)
+
+        final_release.assert_called_once()
+        reconcile_calls = self.margin.calls[calls_before:]
+        self.assertEqual(reconcile_calls, [
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                jr.MARGIN_ENDPOINT_PATH,
+                {
+                    "asset": "USDT", "type": "BORROW",
+                    "txId": "401344857108",
+                },
+                True,
+            ),
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                jr.MARGIN_ACCOUNT_PATH, {}, True,
+            ),
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                jr.MARGIN_ENDPOINT_PATH,
+                {"asset": "USDT", "type": "BORROW"}, True,
+            ),
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                jr.MARGIN_ENDPOINT_PATH,
+                {"asset": "USDT", "type": "REPAY"}, True,
+            ),
+        ])
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        with open(artifacts["source_path"], encoding="utf-8") as handle:
+            source = json.load(handle)
+        with open(artifacts["runner_path"], encoding="utf-8") as handle:
+            runner = json.load(handle)
+        self.assertEqual((source["verdict"], runner["verdict"]), (
+            "OPEN", "OPEN",
+        ))
+        self.assertEqual((
+            source["governor_release"], runner["governor_release"],
+        ), ("RELEASED", "RELEASED"))
+        self.assertEqual(source["account_liability"], {
+            "asset": "USDT", "borrowed": "2.5",
+            "interest": "0.00002726", "total_liability": "2.50002726",
+        })
+        rows = self.results()
+        self.assertEqual([row.get("kind", "RESULT") for row in rows], [
+            "RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT",
+        ])
+        event = rows[1]
+        self.assertEqual(event["transaction_id"], "401344857108")
+        self.assertEqual(event["history_watermark"], 0)
+        self.assertEqual(event["account_liability"],
+                         source["account_liability"])
+        self.assertEqual((rows[-1]["verdict"], rows[-1]["exit_code"]), (
+            "OPEN", 0,
+        ))
+        self.assertEqual(
+            jr._result_ids(jr._paths(self.receipt_dir)["results"]),
+            ({job_id}, False, False),
+        )
+
+    def test_reconcile_margin_without_transaction_id_refuses_before_reads(self):
+        job_id = "margin-reconcile-no-transaction"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        with open(artifacts["source_path"], encoding="utf-8") as handle:
+            source = json.load(handle)
+        source["submission"]["transaction_id"] = ""
+        Path(artifacts["source_path"]).write_text(
+            json.dumps(source), encoding="utf-8"
+        )
+        calls_before = list(self.margin.calls)
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(self.margin.calls, calls_before)
+        self.assertEqual(self.results()[-1], {
+            "kind": "RECONCILE_UNCONFIRMED",
+            "job_id": job_id,
+            "reason": "MARGIN_TRANSACTION_MISSING",
+            "utc": utc(NOW),
+        })
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_non_unknown_source_refuses_before_reads(self):
+        job_id = "margin-reconcile-final"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        with open(artifacts["source_path"], encoding="utf-8") as handle:
+            source = json.load(handle)
+        source["verdict"] = "OPEN"
+        Path(artifacts["source_path"]).write_text(
+            json.dumps(source), encoding="utf-8"
+        )
+        calls_before = list(self.margin.calls)
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(self.margin.calls, calls_before)
+        self.assertEqual(
+            self.results()[-1]["reason"], "SOURCE_RECEIPT_NOT_UNKNOWN"
+        )
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+
+    def test_reconcile_margin_unconfirmed_reads_preserve_artifacts(self):
+        job_id = "margin-reconcile-unconfirmed"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        originals = {
+            name: Path(artifacts[name]).read_bytes()
+            for name in ("source_path", "runner_path", "lock_path")
+        }
+        self.margin.history_payload = {"rows": []}
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        for name, encoded in originals.items():
+            self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
+        self.assertEqual(self.results()[-1], {
+            "kind": "RECONCILE_UNCONFIRMED",
+            "job_id": job_id,
+            "reason": "MARGIN_CONFIRMATION_MISMATCH",
+            "utc": utc(NOW),
+        })
+        self.assertEqual(self.governor_releases, [])
+        result_ids, bad_results, unresolved = jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        )
+        self.assertEqual(result_ids, {job_id})
+        self.assertFalse(bad_results)
+        self.assertTrue(unresolved)
+
+    def test_reconcile_margin_keeps_cross_direction_activity_fence(self):
+        job_id = "margin-reconcile-concurrent"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        originals = {
+            name: Path(artifacts[name]).read_bytes()
+            for name in ("source_path", "runner_path", "lock_path")
+        }
+        target = {
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        unrelated = {
+            "txId": 401344857109,
+            "asset": "USDT",
+            "principal": "1",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+
+        def concurrent_reads(method, _base_url, path, params, signed):
+            self.assertEqual((method, signed), ("GET", True))
+            if path == jr.MARGIN_ACCOUNT_PATH:
+                return "ok", self.margin.account_payload
+            if params.get("txId") == "401344857108":
+                return "ok", {"rows": [target]}
+            if params.get("type") == "BORROW":
+                return "ok", {"rows": [target]}
+            if params.get("type") == "REPAY":
+                return "ok", {"rows": [unrelated]}
+            raise AssertionError("unexpected reconcile read")
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, concurrent_reads
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "CONCURRENT_MARGIN_ACTIVITY"
+        )
+        for name, encoded in originals.items():
+            self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_repay_retains_dust_verdict(self):
+        job_id = "margin-reconcile-repay-dust"
+        self.margin.post_payload = {"tranId": 7301}
+        self.margin.history_payload = {"rows": []}
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "2.5",
+            "interest": "0.000005",
+        }]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0",
+            "interest": "0.000001",
+        }]}
+        self.margin_job(
+            job_id, op="MARGIN_REPAY", principal="2.500005"
+        )
+        self.assertEqual(self.margin_tick(), 4)
+        self.margin.history_payload = {"rows": [{
+            "txId": 7301,
+            "asset": "USDT",
+            "principal": "2.500005",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }]}
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 0)
+
+        rows = self.results()
+        self.assertEqual((rows[1]["kind"], rows[1]["verdict"]), (
+            "RECONCILED_FROM_EXCHANGE_TRUTH", "CLOSED-WITH-DUST",
+        ))
+        self.assertEqual((rows[2]["verdict"], rows[2]["exit_code"]), (
+            "CLOSED-WITH-DUST", 0,
+        ))
+        source = self.margin_source(rows[2])
+        self.assertEqual(source["follow_up_repay"], {
+            "kind": "INTEREST_ONLY_REPAY",
+            "asset": "USDT",
+            "principal": "0.000001",
+        })
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_operator_digest_change_refuses_before_reads(self):
+        job_id = "margin-reconcile-operator"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        originals = {
+            name: Path(artifacts[name]).read_bytes()
+            for name in ("source_path", "runner_path", "lock_path")
+        }
+        self.write_operator("another-operator")
+        calls_before = list(self.margin.calls)
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(self.margin.calls, calls_before)
+        for name, encoded in originals.items():
+            self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
+        self.assertEqual(
+            self.results()[-1]["reason"], "OPERATOR_DIGEST_MISMATCH"
+        )
+        self.assertEqual(self.governor_releases, [])
+
+    def test_tick_never_calls_margin_reconciliation(self):
+        job_id = "margin-reconcile-tick"
+        self.prepare_unknown_margin_reconcile(job_id)
+
+        with mock.patch.object(jr, "reconcile_margin") as reconcile:
+            self.assertEqual(self.tick(), 3)
+
+        reconcile.assert_not_called()
+
+    def test_reconcile_margin_cli_requires_explicit_confirmation(self):
+        job_id = "margin-reconcile-cli"
+        with mock.patch("sys.stderr"), \
+                self.assertRaises(SystemExit) as refused:
+            jr.main(["reconcile-margin", "--job-id", job_id])
+        self.assertEqual(refused.exception.code, 2)
+
+        with mock.patch.object(
+                jr, "reconcile_margin", return_value=0) as reconcile:
+            self.assertEqual(jr.main([
+                "reconcile-margin", "--job-id", job_id,
+                "--confirm-reconcile",
+            ]), 0)
+        reconcile.assert_called_once_with(job_id, True)
 
     def test_exact_margin_artifact_anomalies_halt_tick_and_manual(self):
         job_id = "margin-exact-anomalies"

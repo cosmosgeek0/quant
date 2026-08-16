@@ -75,6 +75,15 @@ MARGIN_GOVERNOR_ANOMALY_FIELDS = {
     "kind", "job_id", "artifact", "field", "anomaly_type",
     "lock_exists", "utc",
 }
+MARGIN_RECONCILED_FIELDS = {
+    "kind", "job_id", "op", "asset", "verdict", "reason",
+    "transaction_id", "history_watermark", "ledger_confirmation",
+    "account_liability_before", "account_liability",
+    "snapshot_time_note", "utc",
+}
+MARGIN_RECONCILE_UNCONFIRMED_FIELDS = {
+    "kind", "job_id", "reason", "utc",
+}
 TICK_LOCK_RECOVERY_FIELDS = {
     "kind", "pid", "age_seconds", "utc",
 }
@@ -208,6 +217,16 @@ class Outcome:
     receipt_path: str
     reason: str = ""
     ledger: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class MarginConfirmation:
+    verdict: str
+    reason: str
+    ledger_confirmation: Optional[Dict[str, str]] = None
+    account_liability: Optional[Dict[str, str]] = None
+    snapshot_time_note: str = ""
+    follow_up_repay: Optional[Dict[str, str]] = None
 
 
 def _utc_now() -> datetime:
@@ -1051,98 +1070,215 @@ def _release_tick_lock(path: str, token: str) -> None:
         pass
 
 
+def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
+    try:
+        transaction_number = _margin_transaction_number(
+            row.get("transaction_id")
+        )
+        if set(row) != MARGIN_RECONCILED_FIELDS \
+                or row.get("kind") != "RECONCILED_FROM_EXCHANGE_TRUTH" \
+                or any(type(row.get(name)) is not str for name in (
+                    "job_id", "op", "asset", "verdict", "reason",
+                    "transaction_id", "snapshot_time_note", "utc",
+                )) \
+                or JOB_ID_RE.fullmatch(row["job_id"]) is None \
+                or row["op"] not in MARGIN_OPS \
+                or row["asset"] not in MARGIN_ASSET_WHITELIST \
+                or not row["reason"] \
+                or type(row.get("history_watermark")) is not int \
+                or row["history_watermark"] < 0 \
+                or transaction_number is None \
+                or transaction_number <= row["history_watermark"] \
+                or row["snapshot_time_note"] not in {
+                    MARGIN_SNAPSHOT_TIME_VERIFIED,
+                    MARGIN_SNAPSHOT_TIME_UNVERIFIED,
+                }:
+            return False
+        request_type = "BORROW" \
+            if row["op"] == margin_ops.MARGIN_BORROW else "REPAY"
+        if row["verdict"] not in (
+                {"OPEN"} if request_type == "BORROW"
+                else {"CLOSED", "CLOSED-WITH-DUST"}):
+            return False
+        expected = row.get("ledger_confirmation")
+        if type(expected) is not dict or set(expected) != {
+                "asset", "principal", "interest", "status"} \
+                or any(type(expected.get(name)) is not str
+                       for name in expected) \
+                or expected["asset"] != row["asset"] \
+                or expected["status"] != request_type + "_CONFIRMED":
+            return False
+        for name in ("account_liability_before", "account_liability"):
+            liability = row.get(name)
+            if type(liability) is not dict \
+                    or _margin_account_liability({
+                        "userAssets": [liability]
+                    }, row["asset"]) != liability:
+                return False
+        before = row["account_liability_before"]
+        after = row["account_liability"]
+        if request_type == "BORROW":
+            if row["reason"] != expected["status"] \
+                    or not _margin_liability_direction_confirmed(
+                        before, after, expected["principal"], request_type
+                    ):
+                return False
+        else:
+            close_verdict = _margin_repay_close_verdict(
+                before, after, expected["principal"]
+            )
+            expected_reason = "REPAY_CONFIRMED_WITH_DUST" \
+                if close_verdict == "CLOSED-WITH-DUST" \
+                else expected["status"]
+            if close_verdict != row["verdict"] \
+                    or row["reason"] != expected_reason:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _result_ids(path: str) -> Tuple[set, bool, bool]:
     if not os.path.exists(path):
         return set(), False, False
-    identifiers = set()
-    unresolved = False
     try:
         with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    return set(), True, False
-                row = _decode_strict_plain_object(line.encode("utf-8"))
-                fields = set(row)
-                if fields == ADVERSE_STOP_REFUSAL_FIELDS:
-                    if row["kind"] != "adverse_stop_refusal" or any(
-                            type(row[name]) is not str for name in fields):
-                        return set(), True, False
-                    continue
-                if fields == ADVERSE_STOP_BLOCKED_FIELDS:
-                    if row["kind"] != "adverse_stop_blocked_unknown" or any(
-                            type(row[name]) is not str for name in fields):
-                        return set(), True, False
-                    continue
-                if fields == TICK_LOCK_RECOVERY_FIELDS:
-                    if row.get("kind") != "runner_stale_lock_recovered" \
-                            or any(type(row.get(name)) is not str
-                                   for name in fields) \
-                            or not (
-                                row["pid"] == "UNKNOWN"
-                                and row["age_seconds"] == "UNKNOWN"
-                                or row["pid"].isdigit()
-                                and _margin_decimal_text(
-                                    row["age_seconds"]
-                                ) is not None
-                            ):
-                        return set(), True, False
-                    continue
-                if fields == MARGIN_GOVERNOR_HALT_FIELDS:
-                    if row.get("kind") \
-                            != "margin_governor_release_halted" \
-                            or type(row.get("job_id")) is not str \
-                            or any(type(row.get(name)) is not bool for name in (
-                                "lock_exists", "runner_receipt_exists",
-                                "source_receipt_exists",
-                            )) \
-                            or any(type(row.get(name)) is not str for name in (
-                                "lock_token", "lock_op", "lock_symbol",
-                                "runner_verdict", "source_verdict", "utc",
-                            )):
-                        return set(), True, False
-                    continue
-                if fields == MARGIN_GOVERNOR_ANOMALY_FIELDS:
-                    if row.get("kind") \
-                            != "margin_governor_artifact_halted" \
-                            or type(row.get("lock_exists")) is not bool \
-                            or any(type(row.get(name)) is not str for name in (
-                                "job_id", "artifact", "field",
-                                "anomaly_type", "utc",
-                            )):
-                        return set(), True, False
-                    continue
-                if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS):
-                    return set(), True, False
-                if type(row["job_id"]) is not str or row["job_id"] in identifiers:
-                    return set(), True, False
-                if type(row["exit_code"]) is not int:
-                    return set(), True, False
-                if any(type(row[name]) is not str for name in (
-                    "op", "symbol", "verdict", "receipt_path", "utc"
-                )):
-                    return set(), True, False
-                if set(row) == MOMENTUM_RESULT_FIELDS:
-                    if row["op"] not in MOMENTUM_OPS \
-                            or not isinstance(row["fills"], list) \
-                            or not isinstance(row["fees"], list) \
-                            or not isinstance(row["realized"], dict):
-                        return set(), True, False
-                receipt_path = row["receipt_path"]
-                if not receipt_path or not os.path.isfile(receipt_path):
-                    return set(), True, False
-                try:
-                    receipt = _decode_strict_plain_object(
-                        _read_file_bytes(receipt_path)
-                    )
-                except (JobRefusal, OSError, ValueError, UnicodeError,
-                        RecursionError):
-                    return set(), True, False
-                if not isinstance(receipt, dict) \
-                        or receipt.get("verdict") != row["verdict"]:
-                    return set(), True, False
-                unresolved = unresolved or _receipt_is_unresolved(receipt_path)
-                identifiers.add(row["job_id"])
+            encoded_rows = [line for line in handle]
+        if any(not line.strip() for line in encoded_rows):
+            return set(), True, False
+        rows = [
+            _decode_strict_plain_object(line.encode("utf-8"))
+            for line in encoded_rows
+        ]
     except (JobRefusal, OSError, ValueError, UnicodeError, RecursionError):
+        return set(), True, False
+
+    reconciled: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+    for index, row in enumerate(rows):
+        if set(row) != MARGIN_RECONCILED_FIELDS:
+            continue
+        if not _valid_margin_reconciled_row(row) \
+                or row["job_id"] in reconciled:
+            return set(), True, False
+        reconciled[row["job_id"]] = (index, row)
+
+    result_rows: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for index, row in enumerate(rows):
+        fields = set(row)
+        if fields == ADVERSE_STOP_REFUSAL_FIELDS:
+            if row["kind"] != "adverse_stop_refusal" or any(
+                    type(row[name]) is not str for name in fields):
+                return set(), True, False
+            continue
+        if fields == ADVERSE_STOP_BLOCKED_FIELDS:
+            if row["kind"] != "adverse_stop_blocked_unknown" or any(
+                    type(row[name]) is not str for name in fields):
+                return set(), True, False
+            continue
+        if fields == TICK_LOCK_RECOVERY_FIELDS:
+            if row.get("kind") != "runner_stale_lock_recovered" \
+                    or any(type(row.get(name)) is not str
+                           for name in fields) \
+                    or not (
+                        row["pid"] == "UNKNOWN"
+                        and row["age_seconds"] == "UNKNOWN"
+                        or row["pid"].isdigit()
+                        and _margin_decimal_text(
+                            row["age_seconds"]
+                        ) is not None
+                    ):
+                return set(), True, False
+            continue
+        if fields == MARGIN_GOVERNOR_HALT_FIELDS:
+            if row.get("kind") != "margin_governor_release_halted" \
+                    or type(row.get("job_id")) is not str \
+                    or any(type(row.get(name)) is not bool for name in (
+                        "lock_exists", "runner_receipt_exists",
+                        "source_receipt_exists",
+                    )) \
+                    or any(type(row.get(name)) is not str for name in (
+                        "lock_token", "lock_op", "lock_symbol",
+                        "runner_verdict", "source_verdict", "utc",
+                    )):
+                return set(), True, False
+            continue
+        if fields == MARGIN_GOVERNOR_ANOMALY_FIELDS:
+            if row.get("kind") != "margin_governor_artifact_halted" \
+                    or type(row.get("lock_exists")) is not bool \
+                    or any(type(row.get(name)) is not str for name in (
+                        "job_id", "artifact", "field", "anomaly_type",
+                        "utc",
+                    )):
+                return set(), True, False
+            continue
+        if fields == MARGIN_RECONCILED_FIELDS:
+            continue
+        if fields == MARGIN_RECONCILE_UNCONFIRMED_FIELDS:
+            if row.get("kind") != "RECONCILE_UNCONFIRMED" \
+                    or any(type(row.get(name)) is not str for name in fields) \
+                    or JOB_ID_RE.fullmatch(row["job_id"]) is None \
+                    or not row["reason"]:
+                return set(), True, False
+            continue
+        if fields not in (RESULT_FIELDS, MOMENTUM_RESULT_FIELDS) \
+                or type(row.get("job_id")) is not str \
+                or JOB_ID_RE.fullmatch(row["job_id"]) is None \
+                or type(row.get("exit_code")) is not int \
+                or any(type(row.get(name)) is not str for name in (
+                    "op", "symbol", "verdict", "receipt_path", "utc",
+                )):
+            return set(), True, False
+        if fields == MOMENTUM_RESULT_FIELDS and (
+                row["op"] not in MOMENTUM_OPS
+                or not isinstance(row["fills"], list)
+                or not isinstance(row["fees"], list)
+                or not isinstance(row["realized"], dict)):
+            return set(), True, False
+        result_rows.setdefault(row["job_id"], []).append((index, row))
+
+    identifiers = set()
+    unresolved = False
+    for job_id, entries in result_rows.items():
+        reconciliation = reconciled.get(job_id)
+        if reconciliation is None:
+            if len(entries) != 1:
+                return set(), True, False
+            current = entries[0][1]
+        else:
+            if len(entries) != 2:
+                return set(), True, False
+            first_index, first = entries[0]
+            final_index, current = entries[1]
+            event_index, event = reconciliation
+            if not first_index < event_index < final_index \
+                    or set(first) != RESULT_FIELDS \
+                    or set(current) != RESULT_FIELDS \
+                    or (first["verdict"], first["exit_code"]) \
+                    != ("UNKNOWN", 4) \
+                    or (current["verdict"], current["exit_code"]) \
+                    != (event["verdict"], 0) \
+                    or any(first[name] != current[name] for name in (
+                        "job_id", "op", "symbol", "receipt_path",
+                    )) \
+                    or current["op"] != event["op"] \
+                    or current["symbol"] != event["asset"]:
+                return set(), True, False
+        receipt_path = current["receipt_path"]
+        if not receipt_path or not os.path.isfile(receipt_path):
+            return set(), True, False
+        try:
+            receipt = _decode_strict_plain_object(
+                _read_file_bytes(receipt_path)
+            )
+        except (JobRefusal, OSError, ValueError, UnicodeError,
+                RecursionError):
+            return set(), True, False
+        if not isinstance(receipt, dict) \
+                or receipt.get("verdict") != current["verdict"]:
+            return set(), True, False
+        unresolved = unresolved or _receipt_is_unresolved(receipt_path)
+        identifiers.add(job_id)
+    if any(job_id not in result_rows for job_id in reconciled):
         return set(), True, False
     return identifiers, False, unresolved
 
@@ -3915,6 +4051,94 @@ def _margin_liability_direction_confirmed(
     ) == request_type + "_CONFIRMED"
 
 
+def _evaluate_margin_confirmation(
+        history_payload: Any, history_identifiers: Any,
+        transaction_id: Any, history_watermark: Any,
+        expected: Any, request_type: Any, liability_before: Any,
+        account_before_payload: Any, account_after_payload: Any) \
+        -> MarginConfirmation:
+    """Apply the one confirmation law used by completion and reconciliation."""
+    try:
+        fence_status = _margin_history_fence_status(
+            history_identifiers, transaction_id, history_watermark
+        )
+        if fence_status == "CONCURRENT_MARGIN_ACTIVITY":
+            return MarginConfirmation(
+                "UNKNOWN", "CONCURRENT_MARGIN_ACTIVITY"
+            )
+        if fence_status != "CONFIRMED":
+            return MarginConfirmation(
+                "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+            )
+        confirmation = _margin_history_confirmation(
+            history_payload, transaction_id, expected, request_type
+        )
+        if confirmation is None:
+            return MarginConfirmation(
+                "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+            )
+        liability = _margin_account_liability(
+            account_after_payload, expected["asset"]
+        )
+        if liability is None:
+            return MarginConfirmation(
+                "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
+            )
+        snapshot_time_note = _margin_snapshot_time_note(
+            account_before_payload, account_after_payload
+        )
+        if snapshot_time_note is None:
+            return MarginConfirmation(
+                "UNKNOWN", "MARGIN_SNAPSHOT_TIME_MISMATCH",
+                account_liability=liability,
+            )
+        confirmation_status = _margin_liability_confirmation_status(
+            liability_before, liability, expected["principal"],
+            request_type,
+        )
+        exact_confirmation = confirmation_status == expected["status"]
+        if request_type == "BORROW":
+            if not exact_confirmation:
+                return MarginConfirmation(
+                    "UNKNOWN", "MARGIN_LIABILITY_MISMATCH",
+                    account_liability=liability,
+                    snapshot_time_note=snapshot_time_note,
+                )
+            return MarginConfirmation(
+                "OPEN", expected["status"], confirmation, liability,
+                snapshot_time_note,
+            )
+
+        repay_verdict = _margin_repay_close_verdict(
+            liability_before, liability, expected["principal"]
+        )
+        if not repay_verdict \
+                or repay_verdict == "CLOSED" and not exact_confirmation:
+            return MarginConfirmation(
+                "UNKNOWN", "MARGIN_LIABILITY_MISMATCH",
+                confirmation if exact_confirmation else None, liability,
+                snapshot_time_note,
+            )
+        follow_up = None
+        reason = expected["status"]
+        if repay_verdict == "CLOSED-WITH-DUST":
+            follow_up = {
+                "kind": "INTEREST_ONLY_REPAY",
+                "asset": liability["asset"],
+                "principal": liability["interest"],
+            }
+            reason = "REPAY_CONFIRMED_WITH_DUST"
+        return MarginConfirmation(
+            repay_verdict, reason,
+            confirmation if exact_confirmation else None, liability,
+            snapshot_time_note, follow_up,
+        )
+    except Exception:
+        return MarginConfirmation(
+            "UNKNOWN", "MARGIN_CONFIRMATION_UNREADABLE"
+        )
+
+
 def _finish_margin_source(receipt: Dict[str, Any], path: str,
                           verdict: str, exit_code: int, reason: str,
                           now: datetime,
@@ -4272,6 +4496,7 @@ def _run_margin_operation(
         receipt["execution_mode"] = "STOP_JOBS_REPAY"
     receipt["mutation_attempts"] = 1
     receipt["mutation_started_utc"] = _utc_text(authority_now)
+    receipt["history_watermark"] = history_watermark
     receipt["account_liability_before"] = liability_before
     try:
         _persist_margin_source(source_path, receipt)
@@ -4353,98 +4578,30 @@ def _run_margin_operation(
             receipt, source_path, "UNKNOWN", 4,
             history_reason, fresh_now,
         )
-    fence_status = _margin_history_fence_status(
-        history_ids_after, transaction_id, history_watermark
+    confirmation = _evaluate_margin_confirmation(
+        history_after.get(params["type"]), history_ids_after,
+        transaction_id, history_watermark, expected, params["type"],
+        liability_before, account_before_result[1], account_result[1],
     )
-    if fence_status == "CONCURRENT_MARGIN_ACTIVITY":
+    if confirmation.snapshot_time_note:
+        receipt["snapshot_time_note"] = confirmation.snapshot_time_note
+    if confirmation.follow_up_repay is not None:
+        receipt["follow_up_repay"] = confirmation.follow_up_repay
+    if confirmation.verdict == "UNKNOWN":
         return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "CONCURRENT_MARGIN_ACTIVITY", fresh_now,
+            receipt, source_path, "UNKNOWN", 4, confirmation.reason,
+            fresh_now, confirmation.ledger_confirmation,
+            confirmation.account_liability,
         )
-    if fence_status != "CONFIRMED":
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
-        )
-    try:
-        confirmation = _margin_history_confirmation(
-            history_after[params["type"]], transaction_id, expected,
-            params["type"],
-        )
-    except Exception:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
-    if confirmation is None:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
-        )
-
-    try:
-        liability = _margin_account_liability(
-            account_result[1], expected["asset"]
-        )
-        snapshot_time_note = _margin_snapshot_time_note(
-            account_before_result[1], account_result[1]
-        )
-        confirmation_status = _margin_liability_confirmation_status(
-            liability_before, liability, expected["principal"],
-            params["type"],
-        )
-        repay_verdict = _margin_repay_close_verdict(
-            liability_before, liability, expected["principal"]
-        ) if job.op == margin_ops.MARGIN_REPAY else ""
-    except Exception:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_UNREADABLE", fresh_now,
-        )
-    if liability is None:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_CONFIRMATION_MISMATCH", fresh_now,
-        )
-    if snapshot_time_note is None:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_SNAPSHOT_TIME_MISMATCH", fresh_now,
-            liability=liability,
-        )
-    receipt["snapshot_time_note"] = snapshot_time_note
-    exact_confirmation = confirmation_status == expected["status"]
-    if job.op != margin_ops.MARGIN_REPAY and not exact_confirmation:
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_LIABILITY_MISMATCH", fresh_now,
-            liability=liability,
-        )
-    if job.op == margin_ops.MARGIN_REPAY \
-            and (not repay_verdict \
-                 or repay_verdict == "CLOSED" and not exact_confirmation):
-        return _finish_margin_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_LIABILITY_MISMATCH", fresh_now,
-            confirmation if exact_confirmation else None, liability,
-        )
-    verdict = "OPEN" if job.op == margin_ops.MARGIN_BORROW \
-        else repay_verdict
-    if verdict == "CLOSED-WITH-DUST":
-        receipt["follow_up_repay"] = {
-            "kind": "INTEREST_ONLY_REPAY",
-            "asset": liability["asset"],
-            "principal": liability["interest"],
-        }
-    success_reason = "REPAY_CONFIRMED_WITH_DUST" \
-        if verdict == "CLOSED-WITH-DUST" else expected["status"]
+    success_reason = confirmation.reason
     if sealed_repay:
         success_reason = "REPAY_CONFIRMED_WITH_DUST_UNDER_STOP_JOBS" \
-            if verdict == "CLOSED-WITH-DUST" \
+            if confirmation.verdict == "CLOSED-WITH-DUST" \
             else "REPAY_CONFIRMED_UNDER_STOP_JOBS"
     return _finish_margin_source(
-        receipt, source_path, verdict, 0, success_reason, fresh_now,
-        confirmation if exact_confirmation else None, liability,
+        receipt, source_path, confirmation.verdict, 0, success_reason,
+        fresh_now, confirmation.ledger_confirmation,
+        confirmation.account_liability,
     )
 
 
@@ -4536,6 +4693,27 @@ def _release_recovered_governor(token: str, receipt_dir: str) -> bool:
     except JobRefusal:
         return False
     return _release_governor(release, token, receipt_dir)
+
+
+def _release_final_outcome_governor(
+        paths: Dict[str, str], receipt_dir: str, job_id: str, op: str,
+        source_path: str, governor_token: str, now: datetime,
+        release: Optional[Callable[..., Any]] = None) -> bool:
+    """Release and mark one terminal outcome through the common boundary."""
+    if not governor_token:
+        return False
+    if release is None:
+        try:
+            _acquire, release, _record, _budgets, _refusal = \
+                _account_governor_api()
+        except JobRefusal:
+            return False
+    released = _release_governor(release, governor_token, receipt_dir)
+    if released and op == margin_ops.MARGIN_BORROW:
+        released = _mark_margin_governor_released(
+            paths, job_id, source_path, governor_token, now, "RELEASED"
+        )
+    return released
 
 
 def _load_plain_receipt(path: str) -> Optional[Dict[str, Any]]:
@@ -4767,6 +4945,7 @@ def _validate_known_margin_artifact_fields(
             "account_liability_before": dict,
             "account_liability": dict, "authority_digests": dict,
             "authority_stop_jobs_present": bool,
+            "history_watermark": int,
         },
         "LOCK": {"version": int},
     }.get(artifact, {})
@@ -5124,17 +5303,40 @@ def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
             "RESULT", "$", "READ_ERROR", "RESULTS_INVALID_JSON", job_id
         ) from None
     matches = []
-    for row in rows:
+    reconciliations = []
+    for index, row in enumerate(rows):
+        if set(row) == MARGIN_RECONCILED_FIELDS \
+                and row.get("job_id") == job_id:
+            if not _valid_margin_reconciled_row(row):
+                raise JobRefusal("RESULT_RECONCILIATION_INVALID")
+            reconciliations.append((index, row))
+            continue
         if set(row) != RESULT_FIELDS:
             continue
         row_job_id = row.get("job_id") \
             if type(row.get("job_id")) is str else job_id
         _validate_known_margin_artifact_fields(row, "RESULT", row_job_id)
         if row["job_id"] == job_id:
-            matches.append(row)
-    if len(matches) != 1:
+            matches.append((index, row))
+    if len(matches) == 2 and len(reconciliations) == 1:
+        first_index, first = matches[0]
+        final_index, final = matches[1]
+        event_index, event = reconciliations[0]
+        if first_index < event_index < final_index \
+                and (first.get("verdict"), first.get("exit_code")) \
+                == ("UNKNOWN", 4) \
+                and (final.get("verdict"), final.get("exit_code")) \
+                == (event["verdict"], 0) \
+                and all(first.get(name) == final.get(name) for name in (
+                    "job_id", "op", "symbol", "receipt_path",
+                )) \
+                and final.get("op") == event["op"] \
+                and final.get("symbol") == event["asset"]:
+            return final
+        raise JobRefusal("RESULT_RECONCILIATION_INVALID")
+    if len(matches) != 1 or reconciliations:
         raise JobRefusal("RESULT_MISSING" if not matches else "RESULT_DUPLICATE")
-    return matches[0]
+    return matches[0][1]
 
 
 def _release_require(condition: bool, reason: str) -> None:
@@ -5147,6 +5349,393 @@ def _release_compare(label: str, actual: Dict[str, Any],
     for name, value in expected.items():
         _release_require(actual.get(name) == value,
                          "%s_%s_MISMATCH" % (label, name.upper()))
+
+
+def _margin_reconcile_unconfirmed(
+        paths: Dict[str, str], job_id: str, reason: str,
+        now: datetime) -> int:
+    row = {
+        "kind": "RECONCILE_UNCONFIRMED",
+        "job_id": job_id,
+        "reason": reason,
+        "utc": _utc_text(now),
+    }
+    try:
+        _append_results_row(paths, row)
+    except Exception:
+        print("JOB-RUNNER | RECONCILE REFUSED | EVIDENCE_PERSISTENCE_FAILED")
+        return 3
+    print("JOB-RUNNER | RECONCILE UNCONFIRMED | " + reason)
+    return 3
+
+
+def _reconcile_unknown_result(
+        paths: Dict[str, str], job_id: str, op: str, asset: str,
+        runner_path: str) -> None:
+    try:
+        lines = _read_file_bytes(paths["results"]).splitlines()
+        if any(not line for line in lines):
+            raise JobRefusal("RESULTS_INVALID")
+        rows = [
+            _decode_bounded_plain_object(line, "RESULT", "RESULTS")
+            for line in lines
+        ]
+    except FileNotFoundError:
+        raise JobRefusal("RESULT_MISSING") from None
+    except (ArtifactAnomaly, OSError):
+        raise JobRefusal("RESULTS_INVALID") from None
+    matches = [
+        row for row in rows
+        if set(row) == RESULT_FIELDS and row.get("job_id") == job_id
+    ]
+    _release_require(len(matches) == 1, "RESULT_UNKNOWN_MISMATCH")
+    result = matches[0]
+    _release_require(
+        result.get("op") == op
+        and result.get("symbol") == asset
+        and result.get("verdict") == "UNKNOWN"
+        and type(result.get("exit_code")) is int
+        and result["exit_code"] == 4
+        and type(result.get("receipt_path")) is str
+        and os.path.abspath(result["receipt_path"])
+        == os.path.abspath(runner_path),
+        "RESULT_UNKNOWN_MISMATCH",
+    )
+
+
+def _load_margin_reconcile_facts(
+        paths: Dict[str, str], receipt_dir: str, job_id: str) \
+        -> Tuple[
+            str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any],
+            Dict[str, str], Dict[str, str], Dict[str, str], str, int, str,
+        ]:
+    source_path = os.path.join(
+        paths["receipts"], "margin-%s.json" % job_id
+    )
+    runner_path = os.path.join(
+        paths["receipts"], "job-%s.json" % job_id
+    )
+    source = _release_artifact(source_path, "SOURCE_RECEIPT")[0]
+    runner = _release_artifact(runner_path, "RUNNER_RECEIPT")[0]
+    _validate_known_margin_artifact_fields(
+        source, "SOURCE_RECEIPT", job_id
+    )
+    _validate_known_margin_artifact_fields(
+        runner, "RUNNER_RECEIPT", job_id
+    )
+    _release_require(source.get("job_id") == job_id, "SOURCE_JOB_MISMATCH")
+    _release_require(
+        source.get("verdict") == "UNKNOWN", "SOURCE_RECEIPT_NOT_UNKNOWN"
+    )
+    _release_require(
+        runner.get("job_id") == job_id
+        and runner.get("verdict") == "UNKNOWN",
+        "RUNNER_RECEIPT_NOT_UNKNOWN",
+    )
+    ready = _artifact_value(
+        source, "SOURCE_RECEIPT", "ready", dict, job_id
+    )
+    ready_fields = {
+        "verdict", "op", "client_tag", "intent_id", "expires_utc",
+        "endpoint_path", "params", "expected_ledger_confirmation",
+        "evidence",
+    }
+    _release_require(
+        set(ready) == ready_fields and ready.get("verdict") == "READY"
+        and type(ready.get("op")) is str and ready["op"] in MARGIN_OPS
+        and type(ready.get("endpoint_path")) is str
+        and ready["endpoint_path"] == MARGIN_ENDPOINT_PATH
+        and all(type(ready.get(name)) is str for name in (
+            "client_tag", "intent_id", "expires_utc",
+        ))
+        and type(ready.get("evidence")) is list
+        and all(type(value) is str for value in ready["evidence"]),
+        "SOURCE_READY_MISMATCH",
+    )
+    params = ready.get("params")
+    expected = ready.get("expected_ledger_confirmation")
+    _release_require(
+        type(params) is dict
+        and set(params) == {"asset", "amount", "type"}
+        and all(type(params.get(name)) is str for name in params)
+        and params["asset"] in MARGIN_ASSET_WHITELIST
+        and params["type"] in {"BORROW", "REPAY"}
+        and ready["op"] == "MARGIN_" + params["type"]
+        and _margin_decimal_text(params["amount"]) == params["amount"]
+        and Decimal(params["amount"]) > Decimal("0"),
+        "SOURCE_READY_MISMATCH",
+    )
+    expected_row = {
+        "asset": params["asset"],
+        "principal": params["amount"],
+        "interest": "0",
+        "status": params["type"] + "_CONFIRMED",
+    }
+    _release_require(
+        type(expected) is dict and expected == expected_row,
+        "SOURCE_READY_MISMATCH",
+    )
+    submission = _artifact_value(
+        source, "SOURCE_RECEIPT", "submission", dict, job_id
+    )
+    transaction_id = submission.get("transaction_id")
+    _release_require(
+        set(submission) == {"kind", "transaction_id"}
+        and submission.get("kind") == "ok"
+        and type(transaction_id) is str
+        and _margin_transaction_number(transaction_id) is not None,
+        "MARGIN_TRANSACTION_MISSING",
+    )
+    history_watermark = source.get("history_watermark")
+    _release_require(
+        type(history_watermark) is int and history_watermark >= 0,
+        "HISTORY_WATERMARK_MISSING",
+    )
+    _release_require(
+        type(source.get("mutation_attempts")) is int
+        and source["mutation_attempts"] == 1,
+        "SOURCE_MUTATION_ATTEMPTS_MISMATCH",
+    )
+    liability_before = _artifact_value(
+        source, "SOURCE_RECEIPT", "account_liability_before", dict,
+        job_id,
+    )
+    _release_require(
+        _margin_account_liability({
+            "userAssets": [liability_before]
+        }, params["asset"]) == liability_before,
+        "SOURCE_ACCOUNT_LIABILITY_BEFORE_MISMATCH",
+    )
+    _release_require(
+        runner.get("op") == ready["op"]
+        and runner.get("symbol") == params["asset"]
+        and type(runner.get("source_receipt_path")) is str
+        and os.path.abspath(runner["source_receipt_path"])
+        == os.path.abspath(source_path),
+        "RUNNER_RECEIPT_MISMATCH",
+    )
+    governor_token = source.get("governor_token", "")
+    if ready["op"] == margin_ops.MARGIN_BORROW:
+        _release_require(
+            type(governor_token) is str and bool(governor_token)
+            and runner.get("governor_token") == governor_token
+            and source.get("governor_release") == "PENDING"
+            and runner.get("governor_release") == "PENDING",
+            "GOVERNOR_RECEIPT_MISMATCH",
+        )
+        lock_path = os.path.join(
+            receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+        lock = _margin_lock_fact(lock_path, job_id)
+        _release_require(
+            isinstance(lock, dict)
+            and set(lock) == {"version", "token", "op", "symbol", "utc"}
+            and lock.get("version") == 1
+            and lock.get("token") == governor_token
+            and lock.get("op") == ready["op"]
+            and lock.get("symbol") == params["asset"],
+            "LOCK_MISMATCH",
+        )
+    else:
+        _release_require(
+            governor_token in {"", None}, "GOVERNOR_RECEIPT_MISMATCH"
+        )
+        governor_token = ""
+    digests = _artifact_value(
+        source, "SOURCE_RECEIPT", "authority_digests", dict, job_id
+    )
+    _validate_artifact_string_map(
+        source, "SOURCE_RECEIPT", "authority_digests", job_id
+    )
+    operator_digest = digests.get("operator")
+    _release_require(
+        type(operator_digest) is str
+        and re.fullmatch(r"[0-9a-f]{64}", operator_digest) is not None,
+        "OPERATOR_DIGEST_MISSING",
+    )
+    try:
+        operator_encoded = _read_file_bytes(paths["operator"])
+    except FileNotFoundError:
+        operator_encoded = None
+    except OSError:
+        raise JobRefusal("OPERATOR_DIGEST_MISMATCH") from None
+    _release_require(
+        _authority_digest(operator_encoded) == operator_digest,
+        "OPERATOR_DIGEST_MISMATCH",
+    )
+    _reconcile_unknown_result(
+        paths, job_id, ready["op"], params["asset"], runner_path
+    )
+    return (
+        source_path, runner_path, source, runner, ready, params, expected,
+        liability_before, transaction_id, history_watermark,
+        governor_token,
+    )
+
+
+def reconcile_margin(
+        job_id: str, confirm_reconcile: bool,
+        receipt_dir: Optional[str] = None,
+        now: Optional[datetime] = None,
+        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> int:
+    if confirm_reconcile is not True:
+        print("JOB-RUNNER | RECONCILE REFUSED | CONFIRM_RECONCILE_REQUIRED")
+        return 3
+    if type(job_id) is not str or JOB_ID_RE.fullmatch(job_id) is None:
+        print("JOB-RUNNER | RECONCILE REFUSED | BAD_JOB_ID")
+        return 3
+    receipt_dir = os.path.abspath(os.path.expanduser(
+        receipt_dir or os.environ.get("RECEIPT_DIR", "~/quant_receipts")
+    ))
+    paths = _paths(receipt_dir)
+    now = now or _utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    try:
+        facts = _load_margin_reconcile_facts(
+            paths, receipt_dir, job_id
+        )
+    except ArtifactAnomaly as anomaly:
+        return _margin_reconcile_unconfirmed(
+            paths, job_id, anomaly.reason, now
+        )
+    except JobRefusal as refusal:
+        return _margin_reconcile_unconfirmed(
+            paths, job_id, refusal.reason, now
+        )
+    (
+        source_path, runner_path, source, runner, ready, params, expected,
+        liability_before, transaction_id, history_watermark,
+        governor_token,
+    ) = facts
+
+    try:
+        transport = request or basis_executor.live_request_factory(
+            os.environ.get("BINANCE_API_KEY", ""),
+            os.environ.get("BINANCE_API_SECRET", ""),
+        )
+        history_result = transport(
+            "GET", basis_executor.SPOT.base_url,
+            ready["endpoint_path"], {
+                "asset": params["asset"],
+                "type": params["type"],
+                "txId": transaction_id,
+            }, True,
+        )
+        if type(history_result) is not tuple \
+                or len(history_result) != 2 \
+                or history_result[0] != "ok":
+            return _margin_reconcile_unconfirmed(
+                paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+            )
+        history_payload = history_result[1]
+        history_identifiers = _margin_history_transaction_ids(
+            history_payload, params["asset"]
+        )
+        if history_identifiers is None \
+                or _margin_history_confirmation(
+                    history_payload, transaction_id, expected,
+                    params["type"],
+                ) is None:
+            return _margin_reconcile_unconfirmed(
+                paths, job_id, "MARGIN_CONFIRMATION_MISMATCH", now
+            )
+        account_result = transport(
+            "GET", basis_executor.SPOT.base_url,
+            MARGIN_ACCOUNT_PATH, {}, True,
+        )
+        if type(account_result) is not tuple \
+                or len(account_result) != 2 \
+                or account_result[0] != "ok":
+            return _margin_reconcile_unconfirmed(
+                paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+            )
+        # The exact-id read binds the target row.  The unfiltered two-way
+        # snapshot retains the deployed cross-direction activity fence.
+        history_reason, _history_after, history_identifiers = \
+            _margin_history_snapshot(
+                transport, basis_executor.SPOT.base_url,
+                ready["endpoint_path"], params["asset"],
+            )
+        if history_reason:
+            return _margin_reconcile_unconfirmed(
+                paths, job_id, history_reason, now
+            )
+    except Exception:
+        return _margin_reconcile_unconfirmed(
+            paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
+        )
+
+    account_before_payload = {"userAssets": [liability_before]}
+    confirmation = _evaluate_margin_confirmation(
+        history_payload, history_identifiers, transaction_id,
+        history_watermark, expected, params["type"], liability_before,
+        account_before_payload, account_result[1],
+    )
+    if confirmation.verdict == "UNKNOWN" \
+            or confirmation.ledger_confirmation is None \
+            or confirmation.account_liability is None \
+            or not confirmation.snapshot_time_note:
+        return _margin_reconcile_unconfirmed(
+            paths, job_id, confirmation.reason, now
+        )
+
+    source_final = dict(source)
+    source_final.update({
+        "verdict": confirmation.verdict,
+        "reason": confirmation.reason,
+        "finished_utc": _utc_text(now),
+        "ledger_confirmation": confirmation.ledger_confirmation,
+        "account_liability": confirmation.account_liability,
+        "snapshot_time_note": confirmation.snapshot_time_note,
+    })
+    if confirmation.follow_up_repay is None:
+        source_final.pop("follow_up_repay", None)
+    else:
+        source_final["follow_up_repay"] = confirmation.follow_up_repay
+    runner_final = dict(runner)
+    runner_final.update({
+        "verdict": confirmation.verdict,
+        "reason": confirmation.reason,
+        "utc": _utc_text(now),
+    })
+    event = {
+        "kind": "RECONCILED_FROM_EXCHANGE_TRUTH",
+        "job_id": job_id,
+        "op": ready["op"],
+        "asset": params["asset"],
+        "verdict": confirmation.verdict,
+        "reason": confirmation.reason,
+        "transaction_id": transaction_id,
+        "history_watermark": history_watermark,
+        "ledger_confirmation": confirmation.ledger_confirmation,
+        "account_liability_before": liability_before,
+        "account_liability": confirmation.account_liability,
+        "snapshot_time_note": confirmation.snapshot_time_note,
+        "utc": _utc_text(now),
+    }
+    try:
+        _persist_margin_source(source_path, source_final)
+        _persist_json_receipt(runner_path, runner_final)
+        _append_results_row(paths, event)
+        _append_result(
+            paths, job_id, ready["op"], params["asset"],
+            Outcome(confirmation.verdict, 0, runner_path), now,
+        )
+    except Exception:
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | RECONCILE REFUSED | PERSISTENCE_FAILED")
+        return 3
+
+    if governor_token and not _release_final_outcome_governor(
+            paths, receipt_dir, job_id, ready["op"], source_path,
+            governor_token, now):
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | RECONCILED | GOVERNOR_RELEASE_PENDING")
+        return 3
+    print("JOB-RUNNER | RECONCILED | " + job_id)
+    return 0
 
 
 def _attest_stuck_margin_lock(
@@ -5270,6 +5859,13 @@ def _attest_stuck_margin_lock(
             "governor_token", "governor_release", "authority_checked_utc",
             "authority_digests", "authority_stop_jobs_present",
         }
+        if "history_watermark" in source:
+            source_fields.add("history_watermark")
+            _release_require(
+                type(source["history_watermark"]) is int
+                and source["history_watermark"] >= 0,
+                "SOURCE_HISTORY_WATERMARK_MISMATCH",
+            )
         if already_released:
             source_fields.add("governor_released_utc")
         if result["verdict"] == "OPEN":
@@ -5872,14 +6468,11 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
             # A token acquired by this tick is released inline when that same
             # tick reaches a terminal outcome, as for every other entry op.
             if governor_token and _entry_outcome_terminal(outcome):
-                governor_released = _release_governor(
-                    release_governor, governor_token, receipt_dir
+                governor_released = _release_final_outcome_governor(
+                    paths, receipt_dir, job.job_id, job.op,
+                    outcome.receipt_path, governor_token, now,
+                    release_governor,
                 )
-                if governor_released and job.op == margin_ops.MARGIN_BORROW:
-                    governor_released = _mark_margin_governor_released(
-                        paths, job.job_id, outcome.receipt_path,
-                        governor_token, now, "RELEASED",
-                    )
                 if not governor_released:
                     _touch_stop(paths["stop"])
             return code
@@ -5908,14 +6501,28 @@ def main(argv=None) -> int:
     release.add_argument(
         "--confirm-release", action="store_true", required=True
     )
+    reconcile = commands.add_parser(
+        "reconcile-margin",
+        help="reconcile one UNKNOWN Margin receipt from exchange reads",
+    )
+    reconcile.add_argument("--job-id", required=True)
+    reconcile.add_argument(
+        "--confirm-reconcile", action="store_true", required=True
+    )
     args = parser.parse_args(argv)
     if args.command == "release-stuck-lock":
         if args.tick:
             parser.error("choose either --tick or release-stuck-lock")
         return release_stuck_lock(args.job_id, args.confirm_release)
+    if args.command == "reconcile-margin":
+        if args.tick:
+            parser.error("choose either --tick or reconcile-margin")
+        return reconcile_margin(args.job_id, args.confirm_reconcile)
     if args.tick:
         return tick()
-    parser.error("--tick or release-stuck-lock is required")
+    parser.error(
+        "--tick, release-stuck-lock, or reconcile-margin is required"
+    )
 
 
 if __name__ == "__main__":
