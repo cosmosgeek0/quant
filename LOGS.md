@@ -7,6 +7,16 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+SHARED HAND DAY 1 + FEED DELIVERY 2026-08-16 (worker 5.0, closed on STOP-WIDTH order) | machine SEALED + FLAT; no live action; lane/lead5-hand = SHELF, not for merge
+feed | FD1-FD4 on lane/lead5-feed 7b283a0: bounded FIFO queue (FR2 3 -> FR5 0), ticker sockets on the measured stream shapes (perp !bookTicker on /stream, spot per-symbol @bookTicker shards); deployed 13:1xZ release 7b283a06 + daemon restart; proof: feed delivers 480 spot / 524 perp symbols with live bid+ask; stream still REST-sourced (book_age 10.7-15.7 s, 357/357 STALE) | MEASURED
+hand | frozen interface v1 (131 rows) + src/execution/ adapters http/spot/futures/margin/transfer 990 non-blank, 102 tests; round-1 review findings 5/7/10/4/4, all repaired, no clean round-2 verdict yet | MEASURED
+migrations committed | spot_roundtrip -94 (WR1a MERGE-SAFE, WR1b 5), wallet -145, mechanics_reconcile -100, basis_position -196 (SR1 MERGE-SAFE); shims 7+3 lines temporary | committed production delta vs main +509 | MEASURED
+stashed unreviewed | job_runner -548 (WR6B 3: F1/F3 closed, fixtures retargeted, 226/227), basis_executor -250 (gate red), futures_hand shard -295, spot_roundtrip WR1b repairs | stash@{0} + ref shelf/lead5-hand-wip 16609ba | MEASURED
+records | OWNER-CAPABILITIES.md 43 rows on main; TR1 volume inventory 33 files / 17,365 lines (nothing moved); AL1 feed-blind watchdog alarm built (not deployed) | MEASURED
+laws | Lead-invented "PARALLEL ARMY" law replaced by the owner's WIDTH law (few workers, one bit each, ~500 lines, net-negative or flat) on lane and main | MEASURED
+scars | shared-worktree parallel writers broke importers transiently (in-place W8, W1's deleted exports) — shard files for anything that cannot land at once; type maps must carry every field the live callers read (rows 128-129); one repair (S4rt) gated but left uncommitted for an hour | MEASURED
+live | none this seat; last account truth SEALED + FLAT (11:00Z host read); no fresh flat read taken | MEASURED / UNVERIFIED as labeled
+
 VOLUME DIAGNOSTIC WOUND DOWN 2026-08-16 ~11:00Z | owner order: stop the tape scans, they return nothing and hammer the SSD | MEASURED
 result | V6 --limit 200 real-data run killed after 1h40m with ZERO output rows (the limit bounds events, not the 35 GB tape-prices read; the earlier full run refused after 3h+ the same way) | the commander's V2 out-of-sample expectancy stays UNMEASURED and is not pursued further without the owner's word | MEASURED
 kept | V6 code + tests (7c0fe85): the refusal row names its cost components; synthetic machine-scale policy shows a 1e-50 operation-order remainder between the two totals (INFERRED as the full-tape cause; never measured on the banked events) | MEASURED landing
