@@ -7,3 +7,7 @@ lane-logs/
 .ui-sync-state.json
 study/data/
 study/out/
+study/data-1m-history/
+study/data-daily/
+study/data-episode-tape/
+study/data-funding/
