@@ -76,7 +76,7 @@ EVENT_QUEUE_STATUS_RESERVE = 256
 TICKER_STALE_MS = 15_000
 KLINE_INTERVAL_MS = 60_000
 RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-FeedEvent = Tuple[str, str, int, int, Optional[str]]
+FeedEvent = Tuple[str, str, int, int, Optional[str], int, int]
 
 METADATA_FIELDS = (
     "spot_min_qty",
@@ -123,13 +123,75 @@ class WebSocketProtocolError(WebSocketError):
 class EventQueue(queue.Queue[FeedEvent]):
     def __init__(self) -> None:
         super().__init__(maxsize=EVENT_QUEUE_MAX + EVENT_QUEUE_STATUS_RESERVE)
+        self.pending_books: Dict[Tuple[int, str, str], Tuple[int, FeedEvent]] = {}
+        self.pending_messages: Dict[Tuple[int, str, int], FeedEvent] = {}
         self.dropped: Dict[Tuple[int, str], int] = {}
+        self.subscriptions, self.epochs = set(), {}
 
-    def offer(self, event: FeedEvent) -> None:
+    def offer(self, event: Tuple[str, str, int, int, Optional[str], int]) -> None:
+        try:
+            stream_name, rows = (
+                parse_combined_message(event[4] or "")
+                if event[0] == "text" else ("", [{}])
+            )
+        except MarketStreamError:
+            stream_name, rows = "", [{}]
         with self.not_full:
+            self.epochs[(event[3], event[1], event[2])] = epoch = self.epochs.get(
+                (event[3], event[1], event[2]), 0
+            ) + (event[0] == "attempt")
+            offered = (*event, epoch)
+            if (
+                (symbol := valid_symbol(rows[0].get("s"))) is not None
+                and stream_name == (
+                    "!bookticker" if event[1] == "perp"
+                    else f"{symbol.lower()}@bookticker"
+                )
+            ):
+                if (
+                    (event[3], event[1], event[2], symbol)
+                    not in self.subscriptions
+                ):
+                    key = (event[3], event[1])
+                    self.dropped[key] = self.dropped.get(key, 0) + 1
+                    return
+                raw_source = (
+                    str(rows[0].get("T", rows[0].get("E"))).strip()
+                    if event[1] == "perp"
+                    else ""
+                )
+                source_digits = raw_source.removeprefix("+")
+                try:
+                    source_ms = (
+                        int(raw_source)
+                        if source_digits.isascii() and source_digits.isdigit()
+                        else event[5]
+                    )
+                except (TypeError, ValueError):
+                    source_ms = event[5]
+                if source_ms < 0:
+                    source_ms = event[5]
+                book_key = (event[3], event[1], symbol)
+                self.pending_messages[(event[3], event[1], event[2])] = offered
+                (
+                    event[1] == "spot"
+                    or source_ms >= self.pending_books.get(
+                        book_key, (source_ms, offered)
+                    )[0]
+                ) and self.pending_books.__setitem__(
+                    book_key, (source_ms, offered)
+                )
+                self.not_empty.notify()
+                return
+            if (
+                stream_name.endswith(KLINE_STREAM_SUFFIX)
+                and isinstance(rows[0].get("k"), dict)
+                and rows[0]["k"].get("x") is not True
+            ):
+                return
             limit = EVENT_QUEUE_MAX if event[0] == "text" else self.maxsize
             if self._qsize() < limit:
-                self._put(event)
+                self._put(offered)
                 self.unfinished_tasks += 1
                 self.not_empty.notify()
                 return
@@ -137,7 +199,7 @@ class EventQueue(queue.Queue[FeedEvent]):
                 for offset, queued in enumerate(reversed(self.queue)):
                     if queued[0] == "text" and queued[1:4] == event[1:4]:
                         del self.queue[-offset - 1]
-                        self._put(event)
+                        self._put(offered)
                         break
             key = (event[3], event[1])
             self.dropped[key] = self.dropped.get(key, 0) + 1
@@ -824,13 +886,6 @@ def merge_ticker_rows(state: Dict[str, Dict[str, Any]], venue: str, stream_name:
         if (record is None or record["venues"] not in {venue, "both"} or (stream_symbol
                 is not None and symbol != stream_symbol)):
             continue
-        bid = optional_decimal_string(row, "b", f"{venue} {symbol}", positive=True)
-        ask = optional_decimal_string(row, "a", f"{venue} {symbol}", positive=True)
-        if (bid is None or ask is None or
-                decimal_value(bid, "ticker bid") > decimal_value(ask, "ticker ask")):
-            bid, ask = None, None
-        record[bid_field] = bid
-        record[ask_field] = ask
         # Spot bookTicker has no event time, so its book time is received_ms.
         event_ms = row.get("T", row.get("E")) if venue == "perp" else received_ms
         try:
@@ -839,6 +894,19 @@ def merge_ticker_rows(state: Dict[str, Dict[str, Any]], venue: str, stream_name:
             source_ms = received_ms
         if source_ms < 0:
             source_ms = received_ms
+        bid = optional_decimal_string(row, "b", f"{venue} {symbol}", positive=True)
+        ask = optional_decimal_string(row, "a", f"{venue} {symbol}", positive=True)
+        if (
+            bid is None
+            or ask is None
+            or decimal_value(bid, "ticker bid") > decimal_value(ask, "ticker ask")
+        ):
+            bid, ask = None, None
+        if venue == "perp" and source_ms < seen_ms.get(symbol, {}).get(
+            venue, source_ms
+        ):
+            continue
+        record[bid_field], record[ask_field] = bid, ask
         seen_ms.setdefault(symbol, {})[venue] = source_ms
         record["utc"] = utc
         record["basis_gap_pct"] = _basis_gap(record)
@@ -1077,7 +1145,7 @@ class MarketFeed:
     def _worker(self, venue: str, shard: int, url: str, generation: int,
                 worker_stop: threading.Event) -> None:
         def emit(kind: str, text: Optional[str] = None) -> None:
-            self.events.offer((kind, venue, shard, generation, text))
+            self.events.offer((kind, venue, shard, generation, text, self.ms_fn()))
 
         run_reconnect_loop(
             url,
@@ -1165,6 +1233,8 @@ class MarketFeed:
         elif kind == "connected":
             connection["successful_handshakes"] += 1
             connection["connected"] = True
+            if shard < 0:
+                connection["last_message_ms"] = None
         elif kind == "handshake_failed":
             connection["handshake_failures"] += 1
             connection["connected"] = False
@@ -1188,6 +1258,30 @@ class MarketFeed:
             for group, group_urls in enumerate(_split_socket_urls(urls.get(venue, ())))
             for index, url in enumerate(group_urls)
         ]
+        with self.events.mutex:
+            self.events.dropped.update({
+                (generation, venue): self.events.dropped.get(
+                    (generation, venue), 0
+                ) + sum(
+                    key[1] == venue for key in self.events.pending_books
+                )
+                for venue in {key[1] for key in self.events.pending_books}
+            })
+            self.events.subscriptions = {
+                (generation, venue, shard, symbol)
+                for venue, shard, url in worker_rows
+                if shard < 0
+                for symbol, row in self.state.items()
+                if row.get("venues") in {venue, "both"}
+                and (
+                    venue == "perp"
+                    or f"{symbol.lower()}{BOOK_TICKER_STREAM_SUFFIX}"
+                    in url.partition("?streams=")[2].lower().split("/")
+                )
+            }
+            self.events.pending_books, self.events.pending_messages, self.events.epochs = (
+                {}, {}, {}
+            )
         workers = [
             threading.Thread(target=self._worker,
                 args=(venue, shard, url, generation, worker_stop), daemon=True,
@@ -1237,14 +1331,13 @@ class MarketFeed:
         def handle_event(event: FeedEvent) -> None:
             nonlocal dirty, handshake_failures, invalid_messages
             nonlocal reconnects, ticker_updates, websocket_messages
-            kind, venue, shard, event_generation, text = event
+            kind, venue, shard, event_generation, text, receipt_ms, event_epoch = event
             connection_key = (event_generation, venue, shard)
-            if kind == "attempt":
-                prior_attempts = attempt_counts.get(connection_key, 0)
-                attempt_counts[connection_key] = prior_attempts + 1
-                if prior_attempts:
-                    reconnects += 1
-            elif kind == "handshake_failed":
+            prior_attempts = attempt_counts.get(connection_key, 0)
+            if event_epoch > prior_attempts:
+                attempt_counts[connection_key] = event_epoch
+                reconnects += event_epoch - max(prior_attempts, 1)
+            if kind == "handshake_failed":
                 handshake_failures += 1
             if event_generation != generation:
                 return
@@ -1257,14 +1350,29 @@ class MarketFeed:
                 self._record_connection_event(kind, venue, shard)
                 dirty = True
                 return
+            if kind == "message":
+                if shard < 0 and event_epoch == attempt_counts.get(connection_key, 0):
+                    self._record_connection_event(
+                        "message", venue, shard, self.ms_fn()
+                    )
+                    dirty = True
+                return
             if kind != "text" or text is None:
                 return
             websocket_messages += 1
-            if shard < 0:
-                self._record_connection_event("message", venue, shard, self.ms_fn())
-                dirty = True
             try:
                 stream_name, rows = parse_combined_message(text)
+                if (
+                    venue == "spot"
+                    and stream_name.endswith(BOOK_TICKER_STREAM_SUFFIX)
+                    and stream_name != (
+                        f"{str(rows[0].get('s')).lower()}"
+                        f"{BOOK_TICKER_STREAM_SUFFIX}"
+                    )
+                ):
+                    raise DataReadError(
+                        "Binance book stream symbol does not match payload"
+                    )
                 if stream_name.endswith(KLINE_STREAM_SUFFIX):
                     changed = merge_kline_rows(
                         self.state,
@@ -1282,7 +1390,7 @@ class MarketFeed:
                         stream_name,
                         rows,
                         self.utc_fn(),
-                        self.ms_fn(),
+                        receipt_ms,
                         self.seen_ms,
                     )
                     ticker_changed = True
@@ -1298,17 +1406,35 @@ class MarketFeed:
         def drain_events(timeout: float = 0.0) -> None:
             nonlocal dirty
             with self.events.not_empty:
-                if not self.events._qsize():
+                if (
+                    not self.events._qsize()
+                    and not self.events.pending_books
+                    and not self.events.pending_messages
+                ):
                     self.events.not_empty.wait(timeout)
-                batch_size = self.events._qsize()
-            for unused in range(batch_size):
-                handle_event(self.events.get_nowait())
+                queued = [
+                    self.events._get() for unused in range(self.events._qsize())
+                ]
+                books, self.events.pending_books = (
+                    [row[1] for row in self.events.pending_books.values()], {}
+                )
+                messages, self.events.pending_messages = (
+                    list(self.events.pending_messages.values()), {}
+                )
+            for event in (
+                [row for row in queued if row[0] != "text"]
+                + [("message", *row[1:4], None, *row[5:]) for row in messages]
+                + books
+                + [row for row in queued if row[0] == "text"]
+            ):
+                handle_event(event)
             with self.events.mutex:
-                dropped, self.events.dropped = self.events.dropped, {}
-            for (drop_generation, venue), count in dropped.items():
-                if drop_generation == generation and venue in self.connections:
+                for (_drop_generation, venue), count in self.events.dropped.items():
+                    if venue not in self.connections:
+                        continue
                     self.connections[venue]["dropped_frames"] += count
                     dirty = True
+                self.events.dropped = {}
 
         try:
             while not self._stopped():
