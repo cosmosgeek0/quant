@@ -220,6 +220,219 @@ class MarginTransport:
         raise AssertionError("unexpected margin request")
 
 
+class ReverseTransport:
+    """Serve one stateful, fully offline reverse-mechanics exchange."""
+
+    def __init__(self, stop_path=""):
+        self.calls = []
+        self.stop_path = stop_path
+        self.stop_after = ""
+        self.unknown_leg = ""
+        self.sell_not_filled = False
+        self.long_open_fails = False
+        self.close_fails = False
+        self.margin_post_unclear = False
+        self.margin_query_omits_fills = False
+        self.price = Decimal("100")
+        self.free = Decimal("0.5")
+        self.borrowed = Decimal("0")
+        self.interest = Decimal("0")
+        self.position = Decimal("0")
+        self.next_tx = 8100
+        self.next_order = 9100
+        self.history = {"BORROW": [], "REPAY": []}
+        self.margin_orders = {}
+        self.futures_orders = {}
+        self.futures_trades = {}
+
+    @staticmethod
+    def text(value):
+        return format(value, "f")
+
+    def spot_exchange(self):
+        return {"symbols": [{
+            "symbol": "TSTUSDT", "status": "TRADING",
+            "baseAsset": "TST", "quoteAsset": "USDT",
+            "isMarginTradingAllowed": True,
+            "orderTypes": ["MARKET"],
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.001",
+                 "minQty": "0.001", "maxQty": "1000"},
+                {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001",
+                 "minQty": "0.001", "maxQty": "1000"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+            ],
+        }]}
+
+    def futures_exchange(self):
+        info = momentum_symbol_info()
+        return {"symbols": [info]}
+
+    def account(self):
+        return {"userAssets": [{
+            "asset": "TST", "free": self.text(self.free),
+            "borrowed": self.text(self.borrowed),
+            "interest": self.text(self.interest),
+            "maxBorrowable": "1", "interestRateHourly": "0",
+        }]}
+
+    def maybe_stop(self, leg):
+        if self.stop_after == leg and self.stop_path:
+            Path(self.stop_path).touch()
+
+    def margin_mutation(self, params):
+        request_type = params["type"]
+        leg = "BORROW" if request_type == "BORROW" else "REPAY"
+        if self.unknown_leg == leg:
+            return "unclear", {}
+        amount = Decimal(params["amount"])
+        self.next_tx += 1
+        transaction_id = self.next_tx
+        if request_type == "BORROW":
+            self.borrowed += amount
+            self.free += amount
+            row = {
+                "txId": transaction_id, "asset": "TST",
+                "principal": self.text(amount), "status": "CONFIRMED",
+                "clientTag": "", "type": "MANUAL",
+            }
+        else:
+            principal, interest = self.borrowed, self.interest
+            self.free -= amount
+            self.borrowed = Decimal("0")
+            self.interest = Decimal("0")
+            row = {
+                "txId": transaction_id, "asset": "TST",
+                "amount": self.text(amount),
+                "principal": self.text(principal),
+                "interest": self.text(interest), "status": "CONFIRMED",
+                "clientTag": "", "type": "MANUAL",
+            }
+        self.history[request_type].append(row)
+        self.maybe_stop(leg)
+        return "ok", {"tranId": transaction_id}
+
+    def margin_order(self, params):
+        side = params["side"]
+        leg = "MARGIN_SELL" if side == "SELL" else "MARGIN_BUY"
+        quantity = Decimal(params["quantity"])
+        client_id = params["newClientOrderId"]
+        self.next_order += 1
+        status = "FILLED"
+        executed = quantity
+        if self.sell_not_filled and side == "SELL":
+            status, executed = "CANCELED", Decimal("0")
+        if self.unknown_leg == leg:
+            status, executed = "NEW", Decimal("0")
+        if status == "FILLED":
+            self.free += quantity if side == "BUY" else -quantity
+            if side == "SELL":
+                self.interest = Decimal("0.0005")
+        quote = executed * self.price
+        fills = [] if executed == 0 else [{
+            "price": self.text(self.price),
+            "qty": self.text(executed), "commission": "0",
+            "commissionAsset": "USDT",
+        }]
+        payload = {
+            "symbol": "TSTUSDT", "clientOrderId": client_id,
+            "status": status, "orderId": self.next_order,
+            "executedQty": self.text(executed),
+            "cummulativeQuoteQty": self.text(quote), "fills": fills,
+        }
+        self.margin_orders[client_id] = payload
+        self.maybe_stop(leg)
+        if self.margin_post_unclear:
+            return "unclear", {}
+        return "ok", payload
+
+    def futures_order(self, params):
+        is_close = str(params.get("reduceOnly", "")).lower() == "true"
+        leg = "FUTURES_CLOSE" if is_close else "FUTURES_LONG_OPEN"
+        client_id = params["newClientOrderId"]
+        if self.long_open_fails and not is_close:
+            return "api_error", {"code": -2010, "msg": "order refused"}
+        if self.close_fails and is_close:
+            return "api_error", {"code": -2010, "msg": "order refused"}
+        quantity = Decimal(params["quantity"])
+        self.next_order += 1
+        status = "NEW" if self.unknown_leg == leg else "FILLED"
+        executed = Decimal("0") if status == "NEW" else quantity
+        if status == "FILLED":
+            self.position += -quantity if is_close else quantity
+        payload = {
+            "symbol": "TSTUSDT", "clientOrderId": client_id,
+            "status": status, "orderId": self.next_order,
+            "executedQty": self.text(executed),
+            "cumQuote": self.text(executed * self.price),
+            "reduceOnly": is_close,
+        }
+        self.futures_orders[client_id] = payload
+        self.futures_trades[self.next_order] = [] if executed == 0 else [{
+            "orderId": self.next_order, "price": self.text(self.price),
+            "qty": self.text(executed), "commission": "0.001",
+            "commissionAsset": "USDT",
+        }]
+        self.maybe_stop(leg)
+        return "ok", payload
+
+    def __call__(self, method, base_url, path, params=None, signed=False):
+        params = dict(params or {})
+        self.calls.append((method, base_url, path, params, signed))
+        if method == "GET" and path == jr.basis_executor.SPOT.exchange_info_path:
+            return "ok", self.spot_exchange()
+        if method == "GET" and path == jr.basis_executor.SPOT_BOOK_PATH:
+            return "ok", {
+                "bidPrice": self.text(self.price),
+                "askPrice": self.text(self.price),
+            }
+        if method == "GET" and path == jr.basis_executor.USDM.exchange_info_path:
+            return "ok", self.futures_exchange()
+        if method == "GET" and path == jr.basis_executor.USDM_BOOK_PATH:
+            return "ok", {
+                "bidPrice": self.text(self.price),
+                "askPrice": self.text(self.price),
+            }
+        if method == "GET" and path == jr.basis_executor.USDM_PREMIUM_PATH:
+            return "ok", {"markPrice": self.text(self.price)}
+        if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
+            return "ok", self.account()
+        if method == "GET" and path == jr.basis_executor.USDM_POSITION_PATH:
+            return "ok", [{
+                "symbol": "TSTUSDT", "positionSide": "BOTH",
+                "positionAmt": self.text(self.position),
+            }]
+        if method == "GET" and path == jr.MARGIN_ENDPOINT_PATH:
+            return "ok", {"rows": list(self.history[params["type"]])}
+        if method == "POST" and path == jr.MARGIN_ENDPOINT_PATH:
+            return self.margin_mutation(params)
+        if method == "POST" and path == jr.margin_orders.MARGIN_ORDER_PATH:
+            return self.margin_order(params)
+        if method == "GET" and path == jr.margin_orders.MARGIN_ORDER_QUERY_PATH \
+                and base_url == jr.margin_orders.MARGIN_BASE_URL:
+            order = self.margin_orders.get(params["origClientOrderId"])
+            if order is not None and self.margin_query_omits_fills:
+                order = dict(order)
+                order.pop("fills", None)
+            return ("ok", order) if order is not None else (
+                "api_error", {"code": -2013}
+            )
+        if method == "POST" and path == jr.basis_executor.USDM.order_path:
+            return self.futures_order(params)
+        if method == "GET" and path == jr.basis_executor.USDM.order_path:
+            order = self.futures_orders.get(params["origClientOrderId"])
+            return ("ok", order) if order is not None else (
+                "api_error", {"code": -2013}
+            )
+        if method == "GET" and path == "/fapi/v1/userTrades":
+            return "ok", list(self.futures_trades.get(
+                int(params["orderId"]), []
+            ))
+        raise AssertionError("unexpected reverse request: %s %s" % (
+            method, path
+        ))
+
+
 class MomentumReadTransport:
     """Serve complete signed momentum snapshots at the HTTP boundary."""
 
@@ -429,6 +642,30 @@ class JobRunnerTests(unittest.TestCase):
             json.dump(value, handle)
         return path
 
+    def reverse_job(self, job_id, directory=None, **overrides):
+        root = directory or self.receipt_dir
+        jobs = os.path.join(root, "jobs")
+        os.makedirs(jobs, exist_ok=True)
+        digest = hashlib.sha256(job_id.encode("ascii")).hexdigest()[:24]
+        value = {
+            "job_id": job_id,
+            "op": jr.REVERSE_OP,
+            "symbol": "TSTUSDT",
+            "quote_cap": "8",
+            "borrow_asset": "TST",
+            "intent_id": "reverse-" + digest,
+            "client_tag": "reverse-client-" + digest,
+            "created_utc": utc(NOW - timedelta(minutes=1)),
+            "expires_utc": utc(NOW + timedelta(minutes=10)),
+            "requested_by": "lead",
+            "operator_token": "lead",
+        }
+        value.update(overrides)
+        path = os.path.join(jobs, "job-%s.json" % job_id)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        return path
+
     def write_operator(self, operator="lead"):
         path = os.path.join(self.receipt_dir, "OPERATOR")
         with open(path, "w", encoding="utf-8") as handle:
@@ -496,6 +733,14 @@ class JobRunnerTests(unittest.TestCase):
                 ):
             return self.tick(margin_request=transport)
 
+    def reverse_tick(self, transport, directory=None):
+        root = directory or self.receipt_dir
+        with mock.patch.object(jr, "_utc_now", return_value=NOW), \
+                mock.patch.object(jr.time, "sleep", return_value=None):
+            return jr.tick(
+                receipt_dir=root, now=NOW, margin_request=transport
+            )
+
     def results(self):
         path = os.path.join(self.jobs_dir, "results.jsonl")
         if not os.path.exists(path):
@@ -514,6 +759,27 @@ class JobRunnerTests(unittest.TestCase):
                 runner_receipt["source_receipt_path"],
                 encoding="utf-8") as handle:
             return json.load(handle)
+
+    def reverse_source(self, row, root=None):
+        with open(row["receipt_path"], encoding="utf-8") as handle:
+            runner_receipt = json.load(handle)
+        with open(
+                runner_receipt["source_receipt_path"],
+                encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def write_reverse_controls(self, root):
+        with open(os.path.join(root, "OPERATOR"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"operator": "lead"}, handle)
+        with open(os.path.join(root, "ACCEPT-ONE"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({
+                "operator": "lead",
+                "created_utc": utc(NOW - timedelta(minutes=1)),
+                "expires_utc": utc(NOW + timedelta(minutes=10)),
+                "max_notional": "8",
+            }, handle)
 
     def result_events(self, kind):
         return [row for row in self.results() if row.get("kind") == kind]
@@ -1199,6 +1465,8 @@ class JobRunnerTests(unittest.TestCase):
                     job_id = "stopped-%s" % sequence
                     if op in jr.MARGIN_OPS:
                         self.margin_job(job_id, op=op)
+                    elif op == jr.REVERSE_OP:
+                        self.reverse_job(job_id)
                     else:
                         self.job(job_id, op=op)
                     for name in ("STOP", "STOP-JOBS"):
@@ -1215,7 +1483,9 @@ class JobRunnerTests(unittest.TestCase):
                     self.assertEqual(row["job_id"], job_id)
                     self.assertEqual(row["verdict"], "REFUSED")
                     expected_reason = "STOP_JOBS_SEALED" \
-                        if marker == "STOP-JOBS" and op in jr.MARGIN_OPS \
+                        if marker == "STOP-JOBS" and (
+                            op in jr.MARGIN_OPS or op == jr.REVERSE_OP
+                        ) \
                         else "ENTRY_BLOCKED_NOT_ACCEPTED"
                     self.assertEqual(
                         self.reason(row), expected_reason
@@ -5291,6 +5561,228 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(row["verdict"], "CLOSED")
         self.assertEqual(row["exit_code"], 0)
         self.assertTrue(os.path.isfile(row["receipt_path"]))
+
+    def test_reverse_mechanics_happy_path_is_closed_with_full_receipt(self):
+        self.reverse_job("reverse-happy")
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        ))
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "CLOSED")
+        source = self.reverse_source(result)
+        self.assertEqual(
+            [row["leg"] for row in source["legs"]],
+            list(jr.reverse_mechanics.LEG_ORDER),
+        )
+        self.assertEqual(source["final_truth"], {
+            "liability": "0", "futures_position": "0",
+            "base_balance_delta": "-0.0005", "dust": "0.001",
+        })
+        self.assertLessEqual(
+            Decimal(source["plan"]["quote_notional"]), Decimal("8")
+        )
+        self.assertEqual(source["legs"][-1]["params"]["amount"], "0.0795")
+        self.assertTrue(all(
+            row["status"] == "DONE" and row["finished_utc"]
+            and "fills" in row and "fees_by_asset" in row
+            for row in source["legs"]
+        ))
+        self.assertTrue(source["legs"][0]["submission"]["transaction_id"])
+        self.assertTrue(source["legs"][-1]["submission"]["transaction_id"])
+        self.assertEqual(source["governor_release"], "RELEASED")
+
+    def test_reverse_sell_not_filled_repays_without_market_unwind(self):
+        self.reverse_job("reverse-sell-empty")
+        transport = ReverseTransport()
+        transport.sell_not_filled = True
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        source = self.reverse_source(self.results()[0])
+        self.assertEqual(
+            [row["leg"] for row in source["legs"]],
+            ["BORROW", "MARGIN_SELL", "REPAY"],
+        )
+        self.assertEqual(source["legs"][1]["status"], "FAILED")
+        self.assertFalse(any(
+            call[0] == "POST"
+            and call[2] == jr.basis_executor.USDM.order_path
+            for call in transport.calls
+        ))
+
+    def test_reverse_long_refusal_buys_back_then_repays(self):
+        self.reverse_job("reverse-long-refused")
+        transport = ReverseTransport()
+        transport.long_open_fails = True
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        source = self.reverse_source(self.results()[0])
+        self.assertEqual(
+            [row["leg"] for row in source["legs"]],
+            ["BORROW", "MARGIN_SELL", "FUTURES_LONG_OPEN",
+             "MARGIN_BUY", "REPAY"],
+        )
+        self.assertEqual(source["verdict"], "CLOSED")
+        self.assertEqual(source["legs"][2]["mutation_attempts"], 1)
+
+    def test_reverse_known_close_failure_names_open_exposure(self):
+        self.reverse_job("reverse-close-open")
+        transport = ReverseTransport()
+        transport.close_fails = True
+
+        self.assertEqual(self.reverse_tick(transport), 3)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "OPEN_EXPOSURE")
+        source = self.reverse_source(result)
+        self.assertEqual(
+            source["reason"],
+            "OPEN_EXPOSURE:FUTURES_CLOSE,MARGIN_BUY,REPAY",
+        )
+        self.assertEqual(source["legs"][-1]["leg"], "FUTURES_CLOSE")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reverse_seal_after_entry_allows_ordered_exit_legs(self):
+        self.reverse_job("reverse-sealed-exit")
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        ))
+        transport.stop_after = "FUTURES_LONG_OPEN"
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        source = self.reverse_source(self.results()[0])
+        self.assertEqual(source["verdict"], "CLOSED")
+        self.assertEqual(
+            [row["leg"] for row in source["legs"][-3:]],
+            ["FUTURES_CLOSE", "MARGIN_BUY", "REPAY"],
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_reverse_seal_after_borrow_refuses_sell_and_allows_repay(self):
+        self.reverse_job("reverse-sealed-sell")
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        ))
+        transport.stop_after = "BORROW"
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        source = self.reverse_source(self.results()[0])
+        self.assertEqual(
+            [row["leg"] for row in source["legs"]],
+            ["BORROW", "MARGIN_SELL", "REPAY"],
+        )
+        self.assertEqual(source["legs"][1]["mutation_attempts"], 0)
+        self.assertEqual(source["legs"][1]["reason"], "STOP_JOBS_SEALED")
+        self.assertEqual(source["legs"][2]["status"], "DONE")
+
+    def test_reverse_unknown_at_each_leg_freezes_and_keeps_governor(self):
+        for leg in jr.reverse_mechanics.LEG_ORDER:
+            with self.subTest(leg=leg), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-unknown-" + leg.lower(), root)
+                transport = ReverseTransport(os.path.join(root, "STOP-JOBS"))
+                transport.unknown_leg = leg
+                releases_before = len(self.governor_releases)
+
+                self.assertEqual(self.reverse_tick(transport, root), 4)
+
+                results_path = os.path.join(root, "jobs", "results.jsonl")
+                with open(results_path, encoding="utf-8") as handle:
+                    result = json.loads(handle.readline())
+                self.assertEqual(result["verdict"], "UNKNOWN")
+                self.assertTrue(os.path.isfile(os.path.join(
+                    root, "STOP-JOBS"
+                )))
+                self.assertEqual(len(self.governor_releases), releases_before)
+                with open(result["receipt_path"], encoding="utf-8") as handle:
+                    runner = json.load(handle)
+                self.assertEqual(runner["governor_release"], "PENDING")
+                mutation_ids = [
+                    (call[2], call[3].get("newClientOrderId")
+                     or call[3].get("type"))
+                    for call in transport.calls if call[0] == "POST"
+                ]
+                self.assertEqual(len(mutation_ids), len(set(mutation_ids)))
+
+    def test_reverse_query_without_fee_fills_freezes_unknown(self):
+        self.reverse_job("reverse-query-fees")
+        transport = ReverseTransport()
+        transport.margin_post_unclear = True
+        transport.margin_query_omits_fills = True
+
+        self.assertEqual(self.reverse_tick(transport), 4)
+
+        result = self.results()[0]
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        source = self.reverse_source(result)
+        self.assertEqual(
+            source["legs"][-1]["reason"],
+            "MARGIN_ORDER_FILL_DATA_UNKNOWN",
+        )
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        )))
+
+    def test_reverse_job_fields_cap_and_principal_ceiling_are_enforced(self):
+        cases = (
+            ("reverse-extra", {"extra": "value"}, "UNKNOWN_FIELD", None),
+            ("reverse-number-cap", {"quote_cap": 8}, "BAD_TYPE", None),
+            ("reverse-over-cap", {"quote_cap": "8.01"},
+             "QUOTE_NOTIONAL_CAP_EXCEEDED", None),
+            ("reverse-principal", {}, "BORROW_CLAMP_EXCEEDED", Decimal("1")),
+        )
+        for job_id, changes, reason, price in cases:
+            with self.subTest(job_id=job_id), \
+                    tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job(job_id, root, **changes)
+                transport = ReverseTransport()
+                if price is not None:
+                    transport.price = price
+
+                self.assertEqual(self.reverse_tick(transport, root), 2)
+
+                with open(os.path.join(
+                        root, "jobs", "results.jsonl"
+                ), encoding="utf-8") as handle:
+                    result = json.loads(handle.readline())
+                with open(result["receipt_path"], encoding="utf-8") as handle:
+                    runner = json.load(handle)
+                self.assertEqual(runner["reason"], reason)
+                self.assertFalse(any(
+                    call[0] == "POST" for call in transport.calls
+                ))
+
+    def test_reverse_claim_once_never_reposts(self):
+        self.reverse_job("reverse-once")
+        transport = ReverseTransport()
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+        post_count = sum(call[0] == "POST" for call in transport.calls)
+        result_count = len(self.results())
+        self.write_accept_one(max_notional="8")
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        self.assertEqual(
+            sum(call[0] == "POST" for call in transport.calls), post_count
+        )
+        self.assertEqual(len(self.results()), result_count)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.jobs_dir, "claims", "job-reverse-once.claim"
+        )))
 
 
 class SpotMomentumJobRunnerTests(unittest.TestCase):

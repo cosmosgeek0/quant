@@ -190,6 +190,23 @@ class MarginOrderParseTests(unittest.TestCase):
 
 
 class MarginOrderQueryTests(unittest.TestCase):
+    def test_terminal_query_without_fills_keeps_measured_row_truth(self):
+        payload = fill_payload()
+        payload.pop("fills")
+
+        def transport(_method, _base_url, _path, _params=None, _signed=False):
+            return "ok", payload
+
+        result = margin_orders.query_margin_order(
+            transport, SYMBOL, CLIENT_ID,
+        )
+        self.assertIsInstance(result, margin_orders.MarginFill)
+        self.assertEqual(
+            (result.status, result.executed_qty, result.cum_quote,
+             result.fills),
+            ("FILLED", Decimal("0.020"), Decimal("6.000"), None),
+        )
+
     def test_not_found_is_typed_and_query_is_exactly_one_signed_get(self):
         calls = []
 
@@ -241,6 +258,18 @@ class MarginOrderFeeTests(unittest.TestCase):
                 self.assertEqual(
                     margin_orders.net_base_after_fees(fill, "BTC"), expected,
                 )
+
+    def test_missing_query_fills_returns_typed_fee_unknown(self):
+        fill = margin_orders.MarginFill(
+            "FILLED", Decimal("0.020"), Decimal("6"), None,
+            481516, CLIENT_ID,
+        )
+        result = margin_orders.net_base_after_fees(fill, "BTC")
+        self.assertIsInstance(result, margin_orders.MarginFeeUnknown)
+        self.assertEqual(
+            (result.status, result.reason, result.fields),
+            ("UNKNOWN", "FILL_DATA_UNKNOWN", ("fills",)),
+        )
 
 
 if __name__ == "__main__":

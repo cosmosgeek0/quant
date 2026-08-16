@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN
-from typing import Any, Dict, List, Literal, Mapping, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 
 MARGIN_BASE_URL = "https://api.binance.com"
@@ -60,7 +60,7 @@ class MarginFill:
     status: str
     executed_qty: Decimal
     cum_quote: Decimal
-    fills: List[FillRow]
+    fills: Optional[List[FillRow]]
     order_id: int
     client_id: str
 
@@ -98,6 +98,11 @@ class MarginOrderParseError(MarginOrderError):
 
 @dataclass(frozen=True)
 class MarginOrderTransportError(MarginOrderError):
+    pass
+
+
+@dataclass(frozen=True)
+class MarginFeeUnknown(MarginOrderError):
     pass
 
 
@@ -209,6 +214,7 @@ def _parse_fills(payload: Mapping[str, Any]) -> List[FillRow]:
 
 def _parse_for_identity(
     payload: Any, expected_symbol: str, expected_client_id: str,
+    *, require_fills: bool,
 ) -> MarginFill | MarginOrderError:
     if not isinstance(payload, Mapping):
         return _error(
@@ -246,14 +252,17 @@ def _parse_for_identity(
     try:
         executed = _decimal_field(payload, "executedQty")
         cum_quote = _decimal_field(payload, "cummulativeQuoteQty")
-        fills = _parse_fills(payload)
+        fills = _parse_fills(payload) if require_fills \
+            or payload.get("fills") is not None else None
     except ValueError as problem:
         return _error(
             MarginOrderParseError, "MALFORMED", "BAD_FILL_DATA",
             expected_client_id, str(problem),
         )
-    covered = sum((row[1] for row in fills), Decimal("0"))
-    if executed > Decimal("0") and covered < executed:
+    covered = None if fills is None else sum(
+        (row[1] for row in fills), Decimal("0"),
+    )
+    if covered is not None and executed > Decimal("0") and covered < executed:
         return _error(
             MarginOrderParseError, "MALFORMED", "INCOMPLETE_FILL_DATA",
             expected_client_id, "fills",
@@ -277,7 +286,9 @@ def parse_margin_order_response(
             MarginOrderParseError, "MALFORMED", "BAD_EXPECTED_ORDER", "",
             "expected",
         )
-    return _parse_for_identity(payload, expected.symbol, expected.client_id)
+    return _parse_for_identity(
+        payload, expected.symbol, expected.client_id, require_fills=True,
+    )
 
 
 def query_margin_order(
@@ -320,7 +331,9 @@ def query_margin_order(
         )
     kind, payload = response
     if kind == "ok":
-        return _parse_for_identity(payload, symbol, client_id)
+        return _parse_for_identity(
+            payload, symbol, client_id, require_fills=False,
+        )
     if kind == "api_error" and isinstance(payload, Mapping) \
             and payload.get("code") == -2013:
         return _error(
@@ -333,12 +346,19 @@ def query_margin_order(
     )
 
 
-def net_base_after_fees(fill: MarginFill, base_asset: str) -> Decimal:
-    """Return executed base less commissions charged in that same asset."""
+def net_base_after_fees(
+    fill: MarginFill, base_asset: str,
+) -> Decimal | MarginFeeUnknown:
+    """Return fee-net base, or typed UNKNOWN when fills were not returned."""
     if not isinstance(fill, MarginFill):
         raise ValueError("fill must be a MarginFill")
     if type(base_asset) is not str or ASSET_RE.fullmatch(base_asset) is None:
         raise ValueError("base_asset is malformed")
+    if fill.fills is None:
+        return _error(
+            MarginFeeUnknown, "UNKNOWN", "FILL_DATA_UNKNOWN",
+            fill.client_id, "fills",
+        )
     base_fee = sum(
         (commission for _price, _qty, commission, asset in fill.fills
          if asset == base_asset),
