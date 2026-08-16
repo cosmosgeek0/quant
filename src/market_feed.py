@@ -76,9 +76,11 @@ DEFAULT_BACKOFF_MAX = 30.0
 MAX_FRAME_BYTES = 32_000_000
 MAX_HANDSHAKE_BYTES = 64_000
 MAX_STREAMS_PER_CONNECTION = 200
+EVENT_QUEUE_MAX = 4096
 TICKER_STALE_MS = 15_000
 KLINE_INTERVAL_MS = 60_000
 RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+FeedEvent = Tuple[str, str, int, int, Optional[str]]
 
 METADATA_FIELDS = (
     "spot_min_qty",
@@ -121,6 +123,26 @@ class WebSocketClosed(WebSocketError):
 
 class WebSocketProtocolError(WebSocketError):
     """The peer sent a frame that violates the supported RFC6455 subset."""
+
+
+class EventQueue(queue.Queue[FeedEvent]):
+    def __init__(self) -> None:
+        super().__init__(maxsize=EVENT_QUEUE_MAX)
+        self.dropped: Dict[Tuple[int, str], int] = {}
+
+    def offer(self, event: FeedEvent) -> None:
+        with self.not_full:
+            if self._qsize() < self.maxsize:
+                self._put(event)
+                self.unfinished_tasks += 1
+                self.not_empty.notify()
+                return
+            for offset, queued in enumerate(reversed(self.queue)):
+                if queued[1:4] == event[1:4]:
+                    self.queue[-offset - 1] = event
+                    break
+            key = (event[3], event[1])
+            self.dropped[key] = self.dropped.get(key, 0) + 1
 
 
 @dataclass(frozen=True)
@@ -1019,37 +1041,32 @@ class MarketFeed:
                 record["freshness_ms"] = None
         self.seen_ms: Dict[str, Dict[str, int]] = {}
         self.connections: Dict[str, Dict[str, Any]] = {}
-        self.events: queue.Queue[
-            Tuple[str, str, int, int, Optional[str]]
-        ] = queue.Queue()
+        self.events = EventQueue()
+        self.connection_events: queue.SimpleQueue[FeedEvent] = queue.SimpleQueue()
         self.stop_event = threading.Event()
 
     def _stopped(self) -> bool:
         return self.stop_event.is_set() or self.stop_path.exists()
 
-    def _wait(
-        self, delay: float, worker_stop: Optional[threading.Event] = None
-    ) -> bool:
+    def _wait(self, delay: float,
+              worker_stop: Optional[threading.Event] = None) -> bool:
         deadline = self.monotonic_fn() + delay
         while not self._stopped() and not (
-            worker_stop is not None and worker_stop.is_set()
-        ):
+            worker_stop is not None and worker_stop.is_set()):
             remaining = deadline - self.monotonic_fn()
             if remaining <= 0:
                 return False
             self.stop_event.wait(min(remaining, 0.25))
         return True
 
-    def _worker(
-        self,
-        venue: str,
-        shard: int,
-        url: str,
-        generation: int,
-        worker_stop: threading.Event,
-    ) -> None:
+    def _worker(self, venue: str, shard: int, url: str, generation: int,
+                worker_stop: threading.Event) -> None:
         def emit(kind: str, text: Optional[str] = None) -> None:
-            self.events.put((kind, venue, shard, generation, text))
+            event = (kind, venue, shard, generation, text)
+            if kind == "text":
+                self.events.offer(event)
+            else:
+                self.connection_events.put(event)
 
         run_reconnect_loop(
             url,
@@ -1112,15 +1129,14 @@ class MarketFeed:
                 "status": "broken",
                 "expected_connections": len(venue_urls),
                 "successful_handshakes": 0,
-                "handshake_failures": 0,
-                "reconnects": 0,
+                "handshake_failures": 0, "reconnects": 0,
+                "dropped_frames": 0,
                 "ticker": ticker,
                 "shards": shards,
             }
 
-    def _record_connection_event(
-        self, kind: str, venue: str, shard: int, message_ms: Optional[int] = None
-    ) -> None:
+    def _record_connection_event(self, kind: str, venue: str, shard: int,
+                                 message_ms: Optional[int] = None) -> None:
         venue_state = self.connections.get(venue)
         if venue_state is None:
             return
@@ -1162,12 +1178,8 @@ class MarketFeed:
         else:
             venue_state["status"] = "degraded"
 
-    def _start_workers(
-        self,
-        urls: Mapping[str, Sequence[str]],
-        generation: int,
-        worker_stop: threading.Event,
-    ) -> List[threading.Thread]:
+    def _start_workers(self, urls: Mapping[str, Sequence[str]], generation: int,
+                       worker_stop: threading.Event) -> List[threading.Thread]:
         workers = [
             threading.Thread(
                 target=self._worker,
@@ -1183,17 +1195,9 @@ class MarketFeed:
         return workers
 
     def _write_state(self) -> None:
-        payload: Any
-        if self.serve:
-            payload = feed_snapshot_payload(
-                self.state,
-                self.windows,
-                self.window,
-                self.ms_fn(),
-                self.connections,
-            )
-        else:
-            payload = self.state
+        payload: Any = (feed_snapshot_payload(
+            self.state, self.windows, self.window, self.ms_fn(), self.connections
+        ) if self.serve else self.state)
         atomic_write_json(self.state_path, payload)
 
     def run(self, duration_seconds: Optional[float] = None) -> FeedStats:
@@ -1225,15 +1229,9 @@ class MarketFeed:
         attempt_counts: Dict[Tuple[int, str, int], int] = {}
         dirty = False
 
-        def handle_event(
-            event: Tuple[str, str, int, int, Optional[str]]
-        ) -> None:
-            nonlocal dirty
-            nonlocal handshake_failures
-            nonlocal invalid_messages
-            nonlocal reconnects
-            nonlocal ticker_updates
-            nonlocal websocket_messages
+        def handle_event(event: FeedEvent) -> None:
+            nonlocal dirty, handshake_failures, invalid_messages
+            nonlocal reconnects, ticker_updates, websocket_messages
             kind, venue, shard, event_generation, text = event
             connection_key = (event_generation, venue, shard)
             if kind == "attempt":
@@ -1292,6 +1290,23 @@ class MarketFeed:
                         ticker_updates += len(changed)
                     dirty = True
 
+        def drain_events(timeout: float = 0.0) -> None:
+            nonlocal dirty
+            for unused in range(self.connection_events.qsize()):
+                handle_event(self.connection_events.get_nowait())
+            try:
+                handle_event(self.events.get(timeout=timeout))
+            except queue.Empty:
+                pass
+            for unused in range(self.events.qsize()):
+                handle_event(self.events.get_nowait())
+            with self.events.mutex:
+                dropped, self.events.dropped = self.events.dropped, {}
+            for (drop_generation, venue), count in dropped.items():
+                if drop_generation == generation and venue in self.connections:
+                    self.connections[venue]["dropped_frames"] += count
+                    dirty = True
+
         try:
             while not self._stopped():
                 now = self.monotonic_fn()
@@ -1315,19 +1330,12 @@ class MarketFeed:
                             self._reset_connections(urls)
                             self._write_state()
                             dirty = False
-                            workers = self._start_workers(
-                                urls, generation, worker_stop
-                            )
+                            workers = self._start_workers(urls, generation, worker_stop)
                     next_metadata = now + self.metadata_seconds
                 timeout = min(0.25, max(0.0, next_flush - now))
                 if deadline is not None:
                     timeout = min(timeout, max(0.0, deadline - now))
-                try:
-                    event = self.events.get(timeout=timeout)
-                except queue.Empty:
-                    event = None
-                if event is not None:
-                    handle_event(event)
+                drain_events(timeout)
                 now = self.monotonic_fn()
                 if now >= next_flush:
                     if dirty:
@@ -1340,11 +1348,7 @@ class MarketFeed:
             worker_stop.set()
             for worker in workers:
                 worker.join(timeout=DEFAULT_SOCKET_TIMEOUT + 1.0)
-            while True:
-                try:
-                    handle_event(self.events.get_nowait())
-                except queue.Empty:
-                    break
+            drain_events()
             if dirty:
                 refresh_freshness(self.state, self.seen_ms, self.ms_fn())
                 self._write_state()
