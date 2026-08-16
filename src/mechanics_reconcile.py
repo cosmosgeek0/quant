@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Read mechanics receipts and reconcile them against signed exchange truth.
-
-Without ``--signed`` this module only reads local receipt JSON.  Signed mode
-uses shared GET-only readers for Spot trades, USD-M trades, and the USD-M
-income ledger.  It never owns an order or account mutation.
-"""
+"""Read local mechanics receipts and optionally reconcile signed GET truth."""
 
 from __future__ import annotations
 
@@ -23,6 +18,8 @@ from execution import binance_futures, binance_http, binance_spot
 WINDOW_PAD_MS = 5000
 SYMBOL_RE = re.compile(r"[A-Z0-9]{5,20}")
 ASSET_RE = re.compile(r"[A-Z0-9]{1,20}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+ROUNDTRIP_IDENTITY_ISSUE = "roundtrip order intents are not bound"
 
 
 class ReceiptError(ValueError):
@@ -39,6 +36,7 @@ class LegClaim:
     quote: Optional[Decimal]
     order_id: str
     order_id_last4: str
+    client_id: str
     fee_by_asset: Optional[Dict[str, Decimal]]
 
 
@@ -48,6 +46,7 @@ class ReceiptClaim:
     name: str
     kind: str
     symbol: str
+    git_sha: Optional[str]
     started_ms: Optional[int]
     finished_ms: Optional[int]
     legs: Tuple[LegClaim, ...]
@@ -69,15 +68,6 @@ class FillMeasurement:
 
 
 @dataclass(frozen=True)
-class IncomeMeasurement:
-    commissions: Optional[Dict[str, Decimal]]
-    realized_pnl: Optional[Decimal]
-    funding: Optional[Decimal]
-    commission_present: bool
-    realized_present: bool
-
-
-@dataclass(frozen=True)
 class Reconciliation:
     name: str
     verdict: str
@@ -93,13 +83,22 @@ def _shown(value: Optional[Decimal]) -> str:
     return "UNKNOWN" if value is None else fmt(value)
 
 
+def _difference(left: Optional[Decimal], right: Optional[Decimal]) -> Optional[Decimal]:
+    return left - right if left is not None and right is not None else None
+
+
+def _delta_verdict(*deltas: Optional[Decimal]) -> str:
+    if any(delta is None for delta in deltas):
+        return "UNKNOWN"
+    return "MISMATCH" if any(delta != 0 for delta in deltas) else "MATCHED"
+
+
 def _clean(value: Any, limit: int = 120) -> str:
-    text = " ".join(str(value).split())
-    return text[:limit]
+    return " ".join(str(value).split())[:limit]
 
 
-def _decimal(value: Any) -> Optional[Decimal]:
-    if value is None or isinstance(value, bool):
+def _decimal(value: Any, text: bool = False) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool) or (text and type(value) is not str):
         return None
     try:
         parsed = Decimal(str(value))
@@ -114,11 +113,9 @@ def _nonnegative(value: Any) -> Optional[Decimal]:
 
 
 def _strict_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ReceiptError("duplicate receipt field")
-        result[key] = value
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ReceiptError("duplicate receipt field")
     return result
 
 
@@ -131,13 +128,12 @@ def _utc_ms(value: Any) -> Optional[int]:
         return None
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        if parsed.tzinfo is None:
+            raise ValueError
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        return None
-    parsed = parsed.astimezone(timezone.utc)
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    delta = parsed - epoch
+    delta = parsed.astimezone(timezone.utc) - epoch
     return ((delta.days * 86400 + delta.seconds) * 1000
             + delta.microseconds // 1000)
 
@@ -160,39 +156,24 @@ def _fee_map(value: Any, issues: List[str], label: str) \
     return result
 
 
-def _leg_fees(value: Dict[str, Any], issues: List[str], label: str) \
-        -> Optional[Dict[str, Decimal]]:
-    for field in ("fee_by_asset", "commission_by_asset", "commissions"):
-        if field in value:
-            return _fee_map(value.get(field), issues, label + "." + field)
-    return None
-
-
-def _complete_fee_claim(raw: Dict[str, Any], issues: List[str]) \
-        -> Optional[Dict[str, Decimal]]:
-    candidates = [
-        (raw, "fee_by_asset"),
-        (raw, "commission_by_asset"),
-        (raw, "commissions"),
-    ]
+def _claim_owners(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], ...]:
     result = raw.get("result")
-    if isinstance(result, dict):
-        candidates.extend([
-            (result, "fee_by_asset"),
-            (result, "commission_by_asset"),
-            (result, "commissions"),
-        ])
-    for owner, field in candidates:
-        if field in owner:
-            return _fee_map(owner.get(field), issues, field)
+    return (raw, result) if isinstance(result, dict) else (raw,)
+
+
+def _fee_claim(owners: Sequence[Dict[str, Any]], issues: List[str],
+               label: str = "") \
+        -> Optional[Dict[str, Decimal]]:
+    for owner in owners:
+        for field in ("fee_by_asset", "commission_by_asset", "commissions"):
+            if field in owner:
+                issue_label = label + "." + field if label else field
+                return _fee_map(owner.get(field), issues, issue_label)
     return None
 
 
 def _funding_claim(raw: Dict[str, Any], issues: List[str]) -> Optional[Decimal]:
-    owners = [raw]
-    if isinstance(raw.get("result"), dict):
-        owners.append(raw["result"])
-    for owner in owners:
+    for owner in _claim_owners(raw):
         for field in ("funding_usdt", "funding"):
             if field in owner:
                 value = _decimal(owner.get(field))
@@ -200,6 +181,27 @@ def _funding_claim(raw: Dict[str, Any], issues: List[str]) -> Optional[Decimal]:
                     issues.append(field + " is unreadable")
                 return value
     return None
+
+
+def _leg_claim(stage: str, market: str, side: str, value: Dict[str, Any],
+               quote_value: Any,
+               issues: List[str]) -> LegClaim:
+    quantity = _nonnegative(value.get("executed_qty", value.get("executedQty")))
+    quote = _nonnegative(quote_value)
+    if quantity is None:
+        issues.append(stage + " quantity is unreadable")
+    if quote is None:
+        issues.append(stage + " quote is unreadable")
+    order_id = value.get("order_id", value.get("orderId", ""))
+    last4 = value.get("order_id_last4", "")
+    if order_id in (None, "") and last4 in (None, ""):
+        issues.append(stage + " order identifier is missing")
+    return LegClaim(
+        stage, market, side, _clean(value.get("status", "UNKNOWN"), 30).upper(),
+        quantity, quote, str(order_id) if order_id not in (None, "") else "",
+        str(last4) if last4 not in (None, "") else "",
+        value.get("client_id", ""), _fee_claim((value,), issues, stage),
+    )
 
 
 def _futures_leg(stage: str, value: Any, default_side: str,
@@ -213,33 +215,13 @@ def _futures_leg(stage: str, value: Any, default_side: str,
     if side not in ("BUY", "SELL"):
         issues.append(stage + " side is invalid")
         side = "UNKNOWN"
-    quantity = _nonnegative(value.get("executed_qty", value.get("executedQty")))
-    quote = _nonnegative(value.get(
+    quote_value = value.get(
         "cum_quote", value.get("cumQuote", value.get("quote"))
-    ))
-    if quantity is None:
-        issues.append(stage + " quantity is unreadable")
-    if quote is None:
-        issues.append(stage + " quote is unreadable")
-    order_id = value.get("order_id", value.get("orderId", ""))
-    last4 = value.get("order_id_last4", "")
-    if order_id in (None, "") and last4 in (None, ""):
-        issues.append(stage + " order identifier is missing")
-    return LegClaim(
-        stage=stage,
-        market="usdm",
-        side=side,
-        status=_clean(value.get("status", "UNKNOWN"), 30).upper(),
-        quantity=quantity,
-        quote=quote,
-        order_id=str(order_id) if order_id not in (None, "") else "",
-        order_id_last4=str(last4) if last4 not in (None, "") else "",
-        fee_by_asset=_leg_fees(value, issues, stage),
     )
+    return _leg_claim(stage, "usdm", side, value, quote_value, issues)
 
 
-def _parse_futures(raw: Dict[str, Any], issues: List[str]) \
-        -> Tuple[LegClaim, ...]:
+def _parse_futures(raw: Dict[str, Any], issues: List[str]) -> Tuple[LegClaim, ...]:
     hand = str(raw.get("hand", "")).lower()
     open_side = "SELL" if hand == "short" else "BUY"
     close_side = "BUY" if open_side == "SELL" else "SELL"
@@ -251,8 +233,7 @@ def _parse_futures(raw: Dict[str, Any], issues: List[str]) \
     )
 
 
-def _parse_basis(raw: Dict[str, Any], issues: List[str]) \
-        -> Tuple[LegClaim, ...]:
+def _parse_basis(raw: Dict[str, Any], issues: List[str]) -> Tuple[LegClaim, ...]:
     raw_legs = raw.get("legs")
     if not isinstance(raw_legs, list) or not raw_legs:
         raise ReceiptError("basis receipt has no legs")
@@ -270,33 +251,64 @@ def _parse_basis(raw: Dict[str, Any], issues: List[str]) \
         if side not in ("BUY", "SELL"):
             issues.append(stage + " side is invalid")
             side = "UNKNOWN"
-        quantity = _nonnegative(value.get(
-            "executed_qty", value.get("executedQty")
+        quote_value = value.get("quote", value.get(
+            "cum_quote", value.get("cumQuote")
         ))
-        quote = _nonnegative(value.get(
-            "quote", value.get("cum_quote", value.get("cumQuote"))
-        ))
-        if quantity is None:
-            issues.append(stage + " quantity is unreadable")
-        if quote is None:
-            issues.append(stage + " quote is unreadable")
-        order_id = value.get("order_id", value.get("orderId", ""))
-        last4 = value.get("order_id_last4", "")
-        if order_id in (None, "") and last4 in (None, ""):
-            issues.append(stage + " order identifier is missing")
-        legs.append(LegClaim(
-            stage=stage,
-            market=market,
-            side=side,
-            status=_clean(value.get("status", "UNKNOWN"), 30).upper(),
-            quantity=quantity,
-            quote=quote,
-            order_id=str(order_id) if order_id not in (None, "") else "",
-            order_id_last4=str(last4) if last4 not in (None, "") else "",
-            fee_by_asset=_leg_fees(value, issues, stage),
-        ))
+        legs.append(_leg_claim(stage, market, side, value, quote_value, issues))
     if not legs:
         raise ReceiptError("basis receipt has no readable legs")
+    return tuple(legs)
+
+
+def _roundtrip_intent_is_bound(raw: Dict[str, Any], side: str,
+                               client_id: Any) -> Optional[bool]:
+    value = raw.get(side)
+    intent = value.get("intent") if isinstance(value, dict) else None
+    if not isinstance(intent, dict):
+        return False if isinstance(value, dict) and "intent" in value else None
+    bound_name = "quoteOrderQty" if side == "buy" else "quantity"
+    bound_value = raw.get("max_quote") if side == "buy" \
+        else value.get("quantity")
+    try:
+        names, values = zip(*intent.get("params", ()))
+    except (TypeError, ValueError):
+        return False
+    return tuple(intent.get(field) for field in (
+        "venue", "operation", "identity", "git_sha"
+    )) == ("BINANCE_SPOT", "ORDER", client_id, raw.get("sha")) \
+        and names == (
+            "symbol", "side", "type", bound_name,
+            "newClientOrderId", "newOrderRespType",
+        ) \
+        and values[:3] + values[4:] == (
+            raw.get("symbol"), side.upper(), "MARKET", client_id, "FULL"
+        ) \
+        and _decimal(values[3], text=True) is not None \
+        and _decimal(values[3], text=True) > Decimal(0) \
+        and _decimal(values[3], text=True) == _decimal(bound_value, text=True)
+
+
+def _parse_roundtrip(raw: Dict[str, Any], issues: List[str]) -> Tuple[LegClaim, ...]:
+    client_ids = tuple(raw.get(side + "_client_id") for side in ("buy", "sell"))
+    bindings = tuple(_roundtrip_intent_is_bound(raw, side, client_id)
+                     for side, client_id in zip(("buy", "sell"), client_ids))
+    if not all(isinstance(value, str) and value for value in client_ids) \
+            or client_ids[0] == client_ids[1] or False in bindings \
+            or raw.get("verdict") == "CLOSED" and not all(bindings):
+        issues.append(ROUNDTRIP_IDENTITY_ISSUE)
+    if isinstance(raw.get("legs"), list):
+        return _parse_basis(raw, issues)
+    legs = []
+    for binding, (stage, field, side, quote_field) in zip(bindings, (
+        ("BUY", "buy", "BUY", "quote_spent"),
+        ("SELL", "sell", "SELL", "quote_received"),
+    )):
+        value = raw.get(field)
+        value = dict(value) if isinstance(value, dict) else {}
+        value["client_id"] = raw.get(field + "_client_id", "") if binding else ""
+        legs.append(
+            _leg_claim(stage, "spot", side, value, value.get(quote_field), issues)
+        )
     return tuple(legs)
 
 
@@ -318,14 +330,20 @@ def read_receipt(path: str) -> ReceiptClaim:
     symbol = raw.get("symbol")
     if not isinstance(symbol, str) or not SYMBOL_RE.fullmatch(symbol):
         raise ReceiptError("receipt symbol is invalid")
-    if name.startswith("futures-hand-"):
-        kind = "futures"
-        legs = _parse_futures(raw, issues)
-    elif name.startswith("basis-executor-"):
-        kind = "basis"
-        legs = _parse_basis(raw, issues)
-    else:
+    git_sha = raw.get("sha")
+    if not isinstance(git_sha, str) or not SHA_RE.fullmatch(git_sha):
+        issues.append("receipt git sha is unreadable")
+        git_sha = None
+    parsers = (
+        ("futures-hand-", "futures", _parse_futures),
+        ("basis-executor-", "basis", _parse_basis),
+        ("roundtrip-", "spot", _parse_roundtrip),
+    )
+    selected = next((item for item in parsers if name.startswith(item[0])), None)
+    if selected is None:
         raise ReceiptError("receipt filename is unsupported")
+    _prefix, kind, parser = selected
+    legs = parser(raw, issues)
     started = _utc_ms(raw.get("started_utc"))
     finished = _utc_ms(raw.get("finished_utc"))
     if started is None or finished is None or finished < started:
@@ -335,24 +353,17 @@ def read_receipt(path: str) -> ReceiptClaim:
         issues.append("receipt verdict is unreadable")
         verdict = "UNKNOWN"
     return ReceiptClaim(
-        path=path,
-        name=name,
-        kind=kind,
-        symbol=symbol,
-        started_ms=started,
-        finished_ms=finished,
-        legs=legs,
-        receipt_verdict=verdict,
-        complete_fee_claim=_complete_fee_claim(raw, issues),
-        funding_claim=_funding_claim(raw, issues),
-        issues=tuple(issues),
+        path, name, kind, symbol, git_sha, started, finished, legs, verdict,
+        _fee_claim(_claim_owners(raw), issues), _funding_claim(raw, issues),
+        tuple(issues),
     )
 
 
 def receipt_paths(receipt_dir: str) -> List[str]:
-    paths = []
-    for pattern in ("futures-hand-*.json", "basis-executor-*.json"):
-        paths.extend(glob.glob(os.path.join(receipt_dir, pattern)))
+    patterns = ("futures-hand-*.json", "basis-executor-*.json",
+                "roundtrip-*.json")
+    paths = [path for pattern in patterns
+             for path in glob.glob(os.path.join(receipt_dir, pattern))]
     return sorted(path for path in set(paths) if os.path.isfile(path))
 
 
@@ -366,108 +377,84 @@ def _claimed_fees(receipt: ReceiptClaim) \
     if receipt.complete_fee_claim is not None:
         return dict(receipt.complete_fee_claim), True
     values: Dict[str, Decimal] = {}
-    complete = True
+    complete = all(leg.fee_by_asset is not None for leg in receipt.legs)
     for leg in receipt.legs:
-        if leg.fee_by_asset is None:
-            complete = False
-        else:
+        if leg.fee_by_asset is not None:
             _add_amounts(values, leg.fee_by_asset)
     return values, complete
 
 
 def _claimed_pnl(receipt: ReceiptClaim, market: str) -> Optional[Decimal]:
     result = Decimal(0)
-    found = False
     for leg in receipt.legs:
         if leg.market != market:
             continue
         if leg.quote is None or leg.side not in ("BUY", "SELL"):
             return None
         result += leg.quote if leg.side == "SELL" else -leg.quote
-        found = True
-    return result if found else Decimal(0)
+    return result
 
 
 def offline_reconciliation(receipt: ReceiptClaim) -> Reconciliation:
     rows: List[str] = []
     for leg in receipt.legs:
         rows.append(
-            "%s | CLAIMED | FILL | stage=%s market=%s side=%s "
-            "status=%s quantity=%s quote=%s" % (
-                receipt.name, leg.stage, leg.market, leg.side, leg.status,
-                _shown(leg.quantity), _shown(leg.quote),
-            )
+            f"{receipt.name} | CLAIMED | FILL | stage={leg.stage} "
+            f"market={leg.market} side={leg.side} status={leg.status} "
+            f"quantity={_shown(leg.quantity)} quote={_shown(leg.quote)}"
         )
     fees, complete = _claimed_fees(receipt)
+    scope = "COMPLETE" if complete else "PARTIAL"
     if fees:
         for asset in sorted(fees):
             rows.append(
-                "%s | CLAIMED | COMMISSION | asset=%s amount=%s scope=%s" % (
-                    receipt.name, asset, fmt(fees[asset]),
-                    "COMPLETE" if complete else "PARTIAL",
-                )
+                f"{receipt.name} | CLAIMED | COMMISSION | asset={asset} "
+                f"amount={fmt(fees[asset])} scope={scope}"
             )
     else:
         rows.append(
-            "%s | CLAIMED | COMMISSION | asset=UNKNOWN amount=UNKNOWN "
-            "scope=%s" % (
-                receipt.name, "COMPLETE" if complete else "PARTIAL"
-            )
+            f"{receipt.name} | CLAIMED | COMMISSION | asset=UNKNOWN "
+            f"amount=UNKNOWN scope={scope}"
         )
-    rows.append(
-        "%s | CLAIMED | REALIZED_PNL | market=usdm amount=%s asset=USDT" % (
-            receipt.name, _shown(_claimed_pnl(receipt, "usdm"))
-        )
-    )
-    rows.append(
-        "%s | CLAIMED | FUNDING | amount=%s asset=USDT" % (
-            receipt.name, _shown(receipt.funding_claim)
-        )
-    )
-    rows.append(
-        "%s | CLAIMED | VERDICT | receipt=%s reconciliation=UNKNOWN" % (
-            receipt.name, _clean(receipt.receipt_verdict, 40)
-        )
-    )
-    rows.append(
-        "%s | TOTAL | measured_round_trip_cost_usdt=UNKNOWN | "
-        "verdict=UNKNOWN" % receipt.name
-    )
+    rows.append(f"{receipt.name} | CLAIMED | REALIZED_PNL | market=usdm "
+                f"amount={_shown(_claimed_pnl(receipt, 'usdm'))} asset=USDT")
+    rows.append(f"{receipt.name} | CLAIMED | FUNDING | "
+                f"amount={_shown(receipt.funding_claim)} asset=USDT")
+    rows.append(f"{receipt.name} | CLAIMED | VERDICT | "
+                f"receipt={_clean(receipt.receipt_verdict, 40)} "
+                "reconciliation=UNKNOWN")
+    rows.append(f"{receipt.name} | TOTAL | "
+                "measured_round_trip_cost_usdt=UNKNOWN | verdict=UNKNOWN")
     return Reconciliation(receipt.name, "UNKNOWN", None, tuple(rows))
 
 
 def _matches_trade(fill: binance_http.Fill, leg: LegClaim) -> bool:
     if not isinstance(fill, binance_http.Fill) or fill.side != leg.side:
         return False
-    order_id = fill.order_id
     if leg.order_id:
-        return str(order_id) == leg.order_id
-    if leg.order_id_last4:
-        return str(order_id).endswith(leg.order_id_last4)
-    return True
+        return str(fill.order_id) == leg.order_id
+    return not leg.order_id_last4 \
+        or str(fill.order_id).endswith(leg.order_id_last4)
 
 
 def _base_asset(symbol: str) -> Optional[str]:
-    if symbol.endswith("USDT") and len(symbol) > 4:
-        return symbol[:-4]
-    return None
+    return symbol[:-4] if symbol.endswith("USDT") and len(symbol) > 4 else None
 
 
 def _measure_leg(leg: LegClaim, symbol: str,
                  payload: Optional[Tuple[binance_http.Fill, ...]],
                  used: set) -> FillMeasurement:
+    unknown = FillMeasurement(leg, None, None, None, None, None, ())
     if payload is None:
-        return FillMeasurement(leg, None, None, None, None, None, ())
+        return unknown
     indexes = [
         index for index, fill in enumerate(payload)
         if index not in used and _matches_trade(fill, leg)
     ]
-    if not indexes:
-        return FillMeasurement(leg, None, None, None, None, None, ())
     fills = [payload[index] for index in indexes]
+    if not fills or len({fill.order_id for fill in fills}) != 1:
+        return unknown
     used.update(indexes)
-    if len({fill.order_id for fill in fills}) != 1:
-        return FillMeasurement(leg, None, None, None, None, None, ())
     quantity = Decimal(0)
     quote = Decimal(0)
     realized = Decimal(0)
@@ -483,34 +470,30 @@ def _measure_leg(leg: LegClaim, symbol: str,
         one_quote = _nonnegative(fill.quote_quantity)
         commission = _nonnegative(fill.fee.amount)
         asset = fill.fee.asset
-        if not isinstance(asset, str) or not ASSET_RE.fullmatch(asset.upper()):
-            asset = None
+        asset = asset.upper() if isinstance(asset, str) else ""
         one_realized = Decimal(0) if leg.market == "spot" \
             else _decimal(fill.realized_pnl)
         if qty is None or one_quote is None or commission is None \
-                or asset is None or one_realized is None:
-            return FillMeasurement(leg, None, None, None, None, None, ())
+                or not ASSET_RE.fullmatch(asset) or one_realized is None:
+            return unknown
         trade_id = "" if fill.trade_id is None else str(fill.trade_id)
-        if leg.market == "usdm" and not trade_id:
-            return FillMeasurement(leg, None, None, None, None, None, ())
+        if (leg.market == "usdm" and not trade_id) \
+                or trade_id in seen_ids:
+            return unknown
         if trade_id:
-            if trade_id in seen_ids:
-                return FillMeasurement(leg, None, None, None, None, None, ())
             seen_ids.add(trade_id)
             trade_ids.append(trade_id)
-        asset = asset.upper()
         quantity += qty
         quote += one_quote
         realized += one_realized
         fees[asset] = fees.get(asset, Decimal(0)) + commission
-        if commission == 0:
-            pass
-        elif asset == "USDT":
-            fee_usdt += commission
-        elif asset == base_asset and price is not None:
-            fee_usdt += commission * price
-        else:
-            unvalued_fee = True
+        if commission != 0:
+            if asset == "USDT":
+                fee_usdt += commission
+            elif asset == base_asset and price is not None:
+                fee_usdt += commission * price
+            else:
+                unvalued_fee = True
     return FillMeasurement(
         leg, quantity, quote, fees, None if unvalued_fee else fee_usdt,
         realized if leg.market == "usdm" else Decimal(0),
@@ -518,25 +501,17 @@ def _measure_leg(leg: LegClaim, symbol: str,
     )
 
 
-def _relevant_income(row: binance_futures.Income, symbol: str,
-                     trade_ids: set) -> bool:
-    if row.symbol != symbol:
-        return False
-    trade_id = row.trade_id
-    if trade_ids and trade_id not in (None, 0):
-        return str(trade_id) in trade_ids
-    return True
-
-
 def _measure_income(payload: Optional[Tuple[binance_futures.Income, ...]],
                     symbol: str,
-                    trade_ids: set) -> IncomeMeasurement:
+                    trade_ids: set) \
+        -> Tuple[Optional[Dict[str, Decimal]], Optional[Decimal],
+                 Optional[Decimal], bool]:
+    unknown = (None, None, None, False)
     if payload is None:
-        return IncomeMeasurement(None, None, None, False, False)
+        return unknown
     commissions: Dict[str, Decimal] = {}
     realized = Decimal(0)
     funding = Decimal(0)
-    commission_present = False
     realized_present = False
     for row in payload:
         income_type = row.income_type
@@ -545,33 +520,30 @@ def _measure_income(payload: Optional[Tuple[binance_futures.Income, ...]],
         trade_id = row.trade_id
         if trade_ids and income_type in ("COMMISSION", "REALIZED_PNL") \
                 and trade_id in (None, 0):
-            return IncomeMeasurement(None, None, None, False, False)
-        if not _relevant_income(row, symbol, trade_ids):
+            return unknown
+        unrelated = row.symbol != symbol
+        unrelated = unrelated or trade_ids and trade_id not in (None, 0) \
+            and str(trade_id) not in trade_ids
+        if unrelated:
             continue
         value = _decimal(row.amount)
         if value is None:
-            return IncomeMeasurement(None, None, None, False, False)
+            return unknown
         if income_type == "COMMISSION":
             asset = row.asset
             if not isinstance(asset, str) \
                     or not ASSET_RE.fullmatch(asset.upper()):
-                return IncomeMeasurement(None, None, None, False, False)
+                return unknown
             asset = asset.upper()
             commissions[asset] = commissions.get(asset, Decimal(0)) - value
-            commission_present = True
+        elif row.asset != "USDT":
+            return unknown
         elif income_type == "REALIZED_PNL":
-            if row.asset != "USDT":
-                return IncomeMeasurement(None, None, None, False, False)
             realized += value
             realized_present = True
         else:
-            if row.asset != "USDT":
-                return IncomeMeasurement(None, None, None, False, False)
             funding += value
-    return IncomeMeasurement(
-        commissions, realized, funding,
-        commission_present, realized_present,
-    )
+    return commissions, realized, funding, realized_present
 
 
 def _sum_measure_fees(measurements: Sequence[FillMeasurement],
@@ -587,28 +559,19 @@ def _sum_measure_fees(measurements: Sequence[FillMeasurement],
     return result
 
 
-def _sum_realized(measurements: Sequence[FillMeasurement]) \
+def _sum_pnl(measurements: Sequence[FillMeasurement], market: str) \
         -> Optional[Decimal]:
     result = Decimal(0)
     for measurement in measurements:
-        if measurement.leg.market != "usdm":
+        if measurement.leg.market != market:
             continue
-        if measurement.realized_pnl is None:
+        value = measurement.quote if market == "spot" \
+            else measurement.realized_pnl
+        if value is None:
             return None
-        result += measurement.realized_pnl
-    return result
-
-
-def _sum_spot_pnl(measurements: Sequence[FillMeasurement]) \
-        -> Optional[Decimal]:
-    result = Decimal(0)
-    for measurement in measurements:
-        if measurement.leg.market != "spot":
-            continue
-        if measurement.quote is None:
-            return None
-        result += measurement.quote \
-            if measurement.leg.side == "SELL" else -measurement.quote
+        if market == "spot" and measurement.leg.side == "BUY":
+            value = -value
+        result += value
     return result
 
 
@@ -626,44 +589,138 @@ def _covered_fee_totals(measurements: Sequence[FillMeasurement]) \
 
 
 def _read_value(reader: Callable[..., binance_http.ReadResult[Any]],
-                *args: Any, **kwargs: Any) -> Any:
+                *args: Any, **kwargs: Any) \
+        -> Tuple[str, Optional[Tuple[Any, ...]]]:
     try:
         result = reader(*args, **kwargs)
     except binance_http.AdapterRefusal:
+        return "refusal", None
+    if isinstance(result, binance_http.ReadResult):
+        if result.kind in ("api_error", "unclear"):
+            return result.kind, None
+        if result.kind == "ok" and isinstance(result.value, tuple):
+            return ("ok", result.value) if len(result.value) < 1000 \
+                else ("unclear", None)
+    return "refusal", None
+
+
+def _ledger_value(read_kinds: Dict[str, str], ledger: str,
+                  reader: Callable[..., binance_http.ReadResult[Any]],
+                  *args: Any, **kwargs: Any) \
+        -> Optional[Tuple[Any, ...]]:
+    kind, payload = _read_value(reader, *args, **kwargs)
+    read_kinds[ledger] = kind
+    return payload
+
+
+def _read_spot_order(request: binance_http.Transport, symbol: str,
+                     leg: LegClaim) \
+        -> Tuple[str, Optional[binance_http.OrderResult]]:
+    try:
+        order = binance_spot.query_order(
+            request, binance_http.SPOT_BASE_URL, symbol, leg.client_id
+        )
+    except binance_http.AdapterRefusal:
+        return "refusal", None
+    if not isinstance(order, binance_http.OrderResult) \
+            or not isinstance(order.identity, binance_http.OrderIdentity):
+        return "refusal", None
+    if order.tag != "terminal":
+        error = order.error
+        kind = error.kind if isinstance(error, binance_http.HttpResult) else "unclear"
+        return (kind, None) if kind in ("api_error", "unclear") else ("unclear", None)
+    identity = order.identity
+    agrees = identity.symbol == symbol and identity.client_id == leg.client_id
+    agrees = agrees and order.returned_client_id == leg.client_id
+    agrees = agrees and order.side == leg.side
+    agrees = agrees and (not leg.order_id or str(identity.order_id) == leg.order_id)
+    agrees = agrees and (leg.status == "UNKNOWN" or order.status == leg.status)
+    return ("ok", order) if agrees else ("unclear", None)
+
+
+def _spot_roundtrip_payload(
+        receipt: ReceiptClaim,
+        request: binance_http.Transport,
+        read_kinds: Dict[str, str],
+) -> Optional[Tuple[binance_http.Fill, ...]]:
+    legs = [leg for leg in receipt.legs if leg.client_id]
+    orders = []
+    for leg in legs:
+        kind, order = _read_spot_order(request, receipt.symbol, leg)
+        status = order.status if order is not None else "UNKNOWN"
+        ledger = "spot_order_" + leg.side.lower()
+        read_kinds[ledger] = f"{kind} status_exchange={status}"
+        orders.append(order)
+    if any(order is None and (leg.order_id or leg.status != "UNKNOWN")
+           for leg, order in zip(legs, orders)):
         return None
-    if not isinstance(result, binance_http.ReadResult) or result.kind != "ok":
-        return None
-    return result.value
+    fills = []
+    for leg, order in zip(legs, orders):
+        if order is None:
+            continue
+        payload = _ledger_value(
+            read_kinds, "spot_trades_" + leg.side.lower(),
+            binance_spot.read_my_trades, request,
+            binance_http.SPOT_BASE_URL, receipt.symbol,
+            order_id=order.identity.order_id,
+        )
+        measurement = _measure_leg(leg, receipt.symbol, payload, set())
+        prior_ids = {str(fill.trade_id) for fill in fills}
+        if payload is None \
+                or len(measurement.trade_ids) != len(payload) \
+                or prior_ids.intersection(measurement.trade_ids) \
+                or (measurement.quantity, measurement.quote) != (
+                order.executed_quantity, order.quote_quantity):
+            return None
+        fills.extend(payload)
+    return tuple(fills) if fills else None
 
 
 def signed_reconciliation(receipt: ReceiptClaim,
                           request: binance_http.Transport) -> Reconciliation:
     rows: List[str] = []
+    read_kinds: Dict[str, str] = {}
     mismatch = False
     unknown = bool(receipt.issues) or receipt.receipt_verdict != "CLOSED"
-    if receipt.started_ms is None or receipt.finished_ms is None:
+    if ROUNDTRIP_IDENTITY_ISSUE in receipt.issues \
+            or receipt.started_ms is None or receipt.finished_ms is None:
         spot_payload = None
         usdm_payload = None
         income_payload = None
     else:
         start_ms = max(0, receipt.started_ms - WINDOW_PAD_MS)
         end_ms = receipt.finished_ms + WINDOW_PAD_MS
-        has_spot = any(leg.market == "spot" for leg in receipt.legs)
-        has_usdm = any(leg.market == "usdm" for leg in receipt.legs)
-        spot_payload = _read_value(
-            binance_spot.read_my_trades, request,
-            binance_http.SPOT_BASE_URL, receipt.symbol,
-            start_ms=start_ms, end_ms=end_ms,
-        ) if has_spot else ()
-        usdm_payload = _read_value(
-            binance_futures.read_user_trades, request,
-            binance_http.FUTURES_BASE_URL, receipt.symbol,
-            start_ms=start_ms, end_ms=end_ms,
-        ) if has_usdm else ()
-        income_payload = _read_value(
-            binance_futures.read_income, request,
-            binance_http.FUTURES_BASE_URL, receipt.symbol, start_ms, end_ms,
-        ) if has_usdm else ()
+        spot_payload = ()
+        usdm_payload = ()
+        income_payload = ()
+        if receipt.kind == "spot":
+            spot_payload = _spot_roundtrip_payload(
+                receipt, request, read_kinds
+            )
+        elif any(leg.market == "spot" for leg in receipt.legs):
+            spot_payload = _ledger_value(
+                read_kinds, "spot_trades",
+                binance_spot.read_my_trades, request,
+                binance_http.SPOT_BASE_URL, receipt.symbol,
+                start_ms=start_ms, end_ms=end_ms,
+            )
+        if any(leg.market == "usdm" for leg in receipt.legs):
+            usdm_payload = _ledger_value(
+                read_kinds, "usdm_trades",
+                binance_futures.read_user_trades, request,
+                binance_http.FUTURES_BASE_URL, receipt.symbol,
+                start_ms=start_ms, end_ms=end_ms,
+            )
+            income_payload = _ledger_value(
+                read_kinds, "income",
+                binance_futures.read_income, request,
+                binance_http.FUTURES_BASE_URL, receipt.symbol,
+                start_ms, end_ms,
+            )
+
+    for ledger, kind in read_kinds.items():
+        rows.append(f"{receipt.name} | EXCHANGE | READ | "
+                    f"ledger={ledger} kind={kind}")
 
     used = {"spot": set(), "usdm": set()}
     measurements: List[FillMeasurement] = []
@@ -673,31 +730,20 @@ def signed_reconciliation(receipt: ReceiptClaim,
             leg, receipt.symbol, payload, used.get(leg.market, set())
         )
         measurements.append(measurement)
-        quantity_delta = measurement.quantity - leg.quantity \
-            if measurement.quantity is not None and leg.quantity is not None \
-            else None
-        quote_delta = measurement.quote - leg.quote \
-            if measurement.quote is not None and leg.quote is not None \
-            else None
-        if quantity_delta is None or quote_delta is None:
-            fill_verdict = "UNKNOWN"
-            unknown = True
-        elif quantity_delta != 0 or quote_delta != 0:
-            fill_verdict = "MISMATCH"
-            mismatch = True
-        else:
-            fill_verdict = "MATCHED"
+        quantity_delta = _difference(measurement.quantity, leg.quantity)
+        quote_delta = _difference(measurement.quote, leg.quote)
+        fill_verdict = _delta_verdict(quantity_delta, quote_delta)
+        unknown = unknown or fill_verdict == "UNKNOWN"
+        mismatch = mismatch or fill_verdict == "MISMATCH"
         rows.append(
-            "%s | EXCHANGE | FILL | stage=%s market=%s "
-            "status_claimed=%s quantity_claimed=%s quantity_exchange=%s "
-            "quantity_delta=%s "
-            "quote_claimed=%s quote_exchange=%s quote_delta=%s "
-            "verdict=%s" % (
-                receipt.name, leg.stage, leg.market, leg.status,
-                _shown(leg.quantity), _shown(measurement.quantity),
-                _shown(quantity_delta), _shown(leg.quote),
-                _shown(measurement.quote), _shown(quote_delta), fill_verdict,
-            )
+            f"{receipt.name} | EXCHANGE | FILL | stage={leg.stage} "
+            f"market={leg.market} status_claimed={leg.status} "
+            f"quantity_claimed={_shown(leg.quantity)} "
+            f"quantity_exchange={_shown(measurement.quantity)} "
+            f"quantity_delta={_shown(quantity_delta)} "
+            f"quote_claimed={_shown(leg.quote)} "
+            f"quote_exchange={_shown(measurement.quote)} "
+            f"quote_delta={_shown(quote_delta)} verdict={fill_verdict}"
         )
 
     claimed_fees, claim_complete = _claimed_fees(receipt)
@@ -709,52 +755,48 @@ def signed_reconciliation(receipt: ReceiptClaim,
         if measurement.leg.market == "usdm"
         for trade_id in measurement.trade_ids
     }
-    income = _measure_income(income_payload, receipt.symbol, trade_ids)
+    income_commissions, ledger_realized, funding, realized_present = \
+        _measure_income(income_payload, receipt.symbol, trade_ids)
 
     if exchange_fees is None or futures_fees is None \
-            or income.commissions is None:
+            or income_commissions is None:
         unknown = True
-    ledger_commissions = dict(income.commissions or {})
     income_fee_complete = False
     ledger_fee_mismatch = False
-    if futures_fees is not None and income.commissions is not None:
-        income_fee_complete = True
-        for asset, trade_value in futures_fees.items():
-            if asset not in income.commissions:
-                if trade_value != 0:
-                    unknown = True
-                    income_fee_complete = False
-                else:
-                    ledger_commissions[asset] = Decimal(0)
-                continue
-            if trade_value != income.commissions[asset]:
-                mismatch = True
-                ledger_fee_mismatch = True
-        for asset, ledger_value in income.commissions.items():
-            if asset not in futures_fees and ledger_value != 0:
-                mismatch = True
-                ledger_fee_mismatch = True
+    if futures_fees is not None and income_commissions is not None:
+        income_fee_complete = all(
+            asset in income_commissions or value == 0
+            for asset, value in futures_fees.items()
+        )
+        ledger_fee_mismatch = any(
+            asset in income_commissions and value != income_commissions[asset]
+            for asset, value in futures_fees.items()
+        )
+        ledger_fee_mismatch = ledger_fee_mismatch or any(
+            asset not in futures_fees and value != 0
+            for asset, value in income_commissions.items()
+        )
+        unknown = unknown or not income_fee_complete
+        mismatch = mismatch or ledger_fee_mismatch
 
     if receipt.complete_fee_claim is not None and exchange_fees is not None:
         covered_claimed = claimed_fees
         covered_exchange = exchange_fees
-    for asset in set(covered_claimed) | set(covered_exchange):
-        if covered_exchange.get(asset, Decimal(0)) \
-                != covered_claimed.get(asset, Decimal(0)):
-            mismatch = True
-
-    assets = sorted(
-        set(claimed_fees)
-        | set(exchange_fees or {})
-        | set(ledger_commissions)
+    covered_assets = set(covered_claimed) | set(covered_exchange)
+    mismatch = mismatch or any(
+        covered_exchange.get(asset, Decimal(0))
+        != covered_claimed.get(asset, Decimal(0))
+        for asset in covered_assets
     )
+
+    assets = sorted(set(claimed_fees) | set(exchange_fees or {})
+                    | set(income_commissions or {}))
     if not assets:
         assets = ["UNKNOWN"]
-    base_asset = _base_asset(receipt.symbol)
     unvalued_assets = {
         asset for measurement in measurements
         for asset, amount in (measurement.fees or {}).items()
-        if amount != 0 and asset not in ("USDT", base_asset)
+        if amount != 0 and asset not in ("USDT", _base_asset(receipt.symbol))
     }
     for asset in assets:
         claimed = claimed_fees.get(
@@ -762,27 +804,24 @@ def signed_reconciliation(receipt: ReceiptClaim,
         ) if asset != "UNKNOWN" else None
         exchange = (exchange_fees or {}).get(asset, Decimal(0)) \
             if exchange_fees is not None and asset != "UNKNOWN" else None
-        delta = exchange - claimed \
-            if claim_complete and exchange is not None and claimed is not None \
-            else None
+        delta = _difference(exchange, claimed) if claim_complete else None
         covered_delta = None
-        if asset != "UNKNOWN" and asset in set(covered_claimed) \
-                | set(covered_exchange):
-            covered_delta = covered_exchange.get(asset, Decimal(0)) \
-                - covered_claimed.get(asset, Decimal(0))
+        if asset != "UNKNOWN" and asset in covered_assets:
+            covered_delta = _difference(
+                covered_exchange.get(asset, Decimal(0)),
+                covered_claimed.get(asset, Decimal(0)),
+            )
         futures_value = (futures_fees or {}).get(asset, Decimal(0)) \
             if futures_fees is not None and asset != "UNKNOWN" else None
         ledger = None
-        if income.commissions is not None and asset != "UNKNOWN":
-            ledger = ledger_commissions.get(
+        if income_commissions is not None and asset != "UNKNOWN":
+            ledger = income_commissions.get(
                 asset, Decimal(0) if income_fee_complete else None
             )
-        ledger_delta = ledger - futures_value \
-            if ledger is not None and futures_value is not None else None
-        row_mismatch = (delta is not None and delta != 0) \
-            or (covered_delta is not None and covered_delta != 0) \
-            or (ledger_delta is not None and ledger_delta != 0)
-        if row_mismatch:
+        ledger_delta = _difference(ledger, futures_value)
+        if (delta is not None and delta != 0) \
+                or (covered_delta is not None and covered_delta != 0) \
+                or (ledger_delta is not None and ledger_delta != 0):
             row_verdict = "MISMATCH"
         elif exchange is None or ledger_delta is None \
                 or asset in unvalued_assets:
@@ -790,52 +829,37 @@ def signed_reconciliation(receipt: ReceiptClaim,
         else:
             row_verdict = "MATCHED"
         rows.append(
-            "%s | EXCHANGE | COMMISSION | asset=%s claimed=%s exchange=%s "
-            "delta=%s covered_delta=%s income=%s income_delta=%s "
-            "verdict=%s" % (
-                receipt.name, asset, _shown(claimed), _shown(exchange),
-                _shown(delta), _shown(covered_delta), _shown(ledger),
-                _shown(ledger_delta), row_verdict,
-            )
+            f"{receipt.name} | EXCHANGE | COMMISSION | asset={asset} "
+            f"claimed={_shown(claimed)} exchange={_shown(exchange)} "
+            f"delta={_shown(delta)} covered_delta={_shown(covered_delta)} "
+            f"income={_shown(ledger)} income_delta={_shown(ledger_delta)} "
+            f"verdict={row_verdict}"
         )
 
     claimed_realized = _claimed_pnl(receipt, "usdm")
-    exchange_realized = _sum_realized(measurements)
-    ledger_realized = income.realized_pnl
+    exchange_realized = _sum_pnl(measurements, "usdm")
     if exchange_realized is not None and exchange_realized == 0 \
-            and not income.realized_present and ledger_realized is not None:
+            and not realized_present and ledger_realized is not None:
         ledger_realized = Decimal(0)
     if exchange_realized is not None and exchange_realized != 0 \
-            and not income.realized_present:
+            and not realized_present:
         ledger_realized = None
         unknown = True
-    realized_delta = exchange_realized - claimed_realized \
-        if exchange_realized is not None and claimed_realized is not None \
-        else None
-    income_realized_delta = ledger_realized - exchange_realized \
-        if ledger_realized is not None and exchange_realized is not None \
-        else None
-    if realized_delta is None or income_realized_delta is None:
-        realized_verdict = "UNKNOWN"
-        unknown = True
-    elif realized_delta != 0 or income_realized_delta != 0:
-        realized_verdict = "MISMATCH"
-        mismatch = True
-    else:
-        realized_verdict = "MATCHED"
+    realized_delta = _difference(exchange_realized, claimed_realized)
+    income_realized_delta = _difference(ledger_realized, exchange_realized)
+    realized_verdict = _delta_verdict(realized_delta, income_realized_delta)
+    unknown = unknown or realized_verdict == "UNKNOWN"
+    mismatch = mismatch or realized_verdict == "MISMATCH"
     rows.append(
-        "%s | EXCHANGE | REALIZED_PNL | market=usdm claimed=%s "
-        "exchange=%s delta=%s income=%s income_delta=%s verdict=%s" % (
-            receipt.name, _shown(claimed_realized),
-            _shown(exchange_realized), _shown(realized_delta),
-            _shown(ledger_realized), _shown(income_realized_delta),
-            realized_verdict,
-        )
+        f"{receipt.name} | EXCHANGE | REALIZED_PNL | market=usdm "
+        f"claimed={_shown(claimed_realized)} "
+        f"exchange={_shown(exchange_realized)} delta={_shown(realized_delta)} "
+        f"income={_shown(ledger_realized)} "
+        f"income_delta={_shown(income_realized_delta)} "
+        f"verdict={realized_verdict}"
     )
 
-    funding = income.funding
-    funding_delta = funding - receipt.funding_claim \
-        if funding is not None and receipt.funding_claim is not None else None
+    funding_delta = _difference(funding, receipt.funding_claim)
     if funding is None:
         funding_verdict = "UNKNOWN"
         unknown = True
@@ -845,11 +869,9 @@ def signed_reconciliation(receipt: ReceiptClaim,
     else:
         funding_verdict = "MATCHED"
     rows.append(
-        "%s | EXCHANGE | FUNDING | claimed=%s exchange=%s delta=%s "
-        "asset=USDT verdict=%s" % (
-            receipt.name, _shown(receipt.funding_claim), _shown(funding),
-            _shown(funding_delta), funding_verdict,
-        )
+        f"{receipt.name} | EXCHANGE | FUNDING | "
+        f"claimed={_shown(receipt.funding_claim)} exchange={_shown(funding)} "
+        f"delta={_shown(funding_delta)} asset=USDT verdict={funding_verdict}"
     )
 
     fee_usdt: Optional[Decimal] = Decimal(0)
@@ -859,26 +881,21 @@ def signed_reconciliation(receipt: ReceiptClaim,
             unknown = True
             break
         fee_usdt += measurement.fee_usdt
-    spot_pnl = _sum_spot_pnl(measurements)
-    ledger_consistent = income_fee_complete \
-        and not ledger_fee_mismatch and income_realized_delta == 0
+    spot_pnl = _sum_pnl(measurements, "spot")
     total = None
     if spot_pnl is not None and exchange_realized is not None \
             and funding is not None and fee_usdt is not None \
-            and ledger_consistent:
+            and income_fee_complete and not ledger_fee_mismatch \
+            and not unknown and income_realized_delta == 0:
         total = -(spot_pnl + exchange_realized + funding) + fee_usdt
 
     verdict = "MISMATCH" if mismatch else "UNKNOWN" if unknown else "MATCHED"
-    rows.append(
-        "%s | EXCHANGE | VERDICT | claimed=%s reconciliation=%s" % (
-            receipt.name, _clean(receipt.receipt_verdict, 40), verdict
-        )
-    )
-    rows.append(
-        "%s | TOTAL | measured_round_trip_cost_usdt=%s | verdict=%s" % (
-            receipt.name, _shown(total), verdict
-        )
-    )
+    claimed_verdict = _clean(receipt.receipt_verdict, 40)
+    rows.append(f"{receipt.name} | EXCHANGE | VERDICT | "
+                f"claimed={claimed_verdict} reconciliation={verdict}")
+    rows.append(f"{receipt.name} | TOTAL | "
+                f"measured_round_trip_cost_usdt={_shown(total)} | "
+                f"verdict={verdict}")
     return Reconciliation(receipt.name, verdict, total, tuple(rows))
 
 
@@ -924,17 +941,12 @@ def run(receipt_dir: str, signed: bool = False,
             emit(row)
     if not signed:
         return 0
-    if any(result.verdict == "MISMATCH" for result in results):
-        return 3
-    if any(result.verdict == "UNKNOWN" for result in results):
-        return 4
-    return 0
+    verdicts = {result.verdict for result in results}
+    return 3 if "MISMATCH" in verdicts else 4 if "UNKNOWN" in verdicts else 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="GET-only mechanics receipt reconciliation reader"
-    )
+    parser = argparse.ArgumentParser(description="GET-only mechanics receipt reader")
     parser.add_argument("--receipt-dir", required=True)
     parser.add_argument("--signed", action="store_true")
     args = parser.parse_args(argv)
@@ -943,14 +955,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         api_key = os.environ.get("BINANCE_API_KEY", "")
         api_secret = os.environ.get("BINANCE_API_SECRET", "")
         if not api_key or not api_secret:
-            print(
-                "MECHANICS-RECONCILE | BLOCKED | missing "
-                "BINANCE_API_KEY / BINANCE_API_SECRET"
-            )
+            print("MECHANICS-RECONCILE | BLOCKED | missing "
+                  "BINANCE_API_KEY / BINANCE_API_SECRET")
             return 2
         request = binance_http.BinanceHttp(
-            api_key, api_secret,
-            timeout_seconds=binance_http.HTTP_TIMEOUT_SECONDS,
+            api_key, api_secret, timeout_seconds=binance_http.HTTP_TIMEOUT_SECONDS
         )
         request.sync_time(binance_http.SPOT_BASE_URL, "/api/v3/time")
         request.sync_time(binance_http.FUTURES_BASE_URL, "/fapi/v1/time")
