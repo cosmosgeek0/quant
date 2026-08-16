@@ -83,6 +83,12 @@
     if (!host || typeof host.appendChild !== "function") {
       throw new TypeError("NetV1Ledger.render requires a host element"); }
     var onSelect = opts && typeof opts.onSelect === "function" ? opts.onSelect : null;
+    if (!host.querySelector || !host.querySelector(".st-card-head")) {
+      var cardHead = element("div", "st-card-head");
+      cardHead.appendChild(element("div", "n1-led-title", "What changed"));
+      cardHead.appendChild(element("div", "n1-led-sub", "transitions only \u00b7 newest first"));
+      host.appendChild(cardHead);
+    }
     var table = element("table", "v5-table n1-ledger-t");
     var head = element("thead"), headRow = element("tr"), body = element("tbody");
     ["Time", "Connection", "Change", "Reason"].forEach(function (label) {

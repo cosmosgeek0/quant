@@ -270,3 +270,7 @@
 
 /* detail styling on table cells must not turn the cell into a block */
 td.n1-detail { display: table-cell; vertical-align: middle; white-space: normal; margin-top: 0; }
+
+.n1-led-title { color: var(--ink, #161618); font: 500 13.5px/18px InterVariable, Inter, sans-serif; }
+.n1-led-sub { color: var(--muted, #787882); font: 400 11px/16px InterVariable, Inter, sans-serif; }
+.n1-grid td.n1-detail { white-space: nowrap; }
