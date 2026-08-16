@@ -35,9 +35,10 @@ the layout again.
   | service | does | since |
   |---|---|---|
   | `quant-ui.service` | `python3 ui/serve.py --port 8080` (loopback) | restarted 2026-08-16 13:28Z serving Network V5 (lane/ui-network-v5, the version the owner reviewed on the Mac at :8901) |
-  | `quant-ui-mirror.service` | `local_mirror.sh`: every 5 s copies the machine's receipt files into `ui/live/` (see §4) | 2026-08-15 |
+  | `quant-ui-mirror.service` | `local_mirror.sh` (in git: `ui/host/local_mirror.sh`): every 5 s copies the machine's receipt files into `ui/live/` only when their size or mtime changed; it does not copy the feed state file (see §4) | 2026-08-15 |
   | `quant-ui-telemetry.service` | `python3 ui/telemetry_recorder.py --loop 15 -q` with `QUANT_UI_URL=http://127.0.0.1:8080` → `ui/live/telemetry.jsonl` | created 2026-08-16 12:45Z |
   | `quant-ui-news.service` | `python3 ui/news_fetcher.py --loop 120 -q` → `ui/live/news.jsonl`, `news_sources.json` | created 2026-08-16 12:45Z |
+  | `quant-ui-network.service` | `python3 ui/network_recorder.py --tick 5 -q --feed-source /home/ssm-user/quant_receipts/watch/feed_state.json` → `ui/live/network_current.json`, `ui/live/feed_connections.json`, history in `/home/ssm-user/quant-ui/data/network_history.sqlite3` (WAL, 48 h samples / 30 d events, outside the web root); reads the feed's state file read-only at its source, probes only public Binance `/time`, scrapes cloudflared's loopback metrics (127.0.0.1:20241), probes the loopback origin; unit file `ui/host/quant-ui-network.service` | created 2026-08-16 17:44Z (Network V1) |
   | `cloudflared.service` | the tunnel | 2026-07-26 |
 - Data the dashboard reads on the box: `/home/ssm-user/quant-ui/ui/live/`
   (filled by the mirror + the two recorders). The dashboard never reads the
@@ -68,12 +69,7 @@ the layout again.
   numbers. The Mac is a viewer. The site is the truth.
 
 ## 4. What the pages mean
-- **Network**: 8 loops sampled every 15 s, each graded against its own
-  cadence — Web server (Mac or box, whichever serves), News fetch loop, Data
-  mirror, Market feed, Supervisor, Basis watch, Basis supervisor, Job runner.
-  Strip and health rows come from the live files; the history table, heatmap
-  and per-loop charts come from `telemetry.jsonl`. On the box the "Data
-  mirror" is the 5-second local mirror (`pull_manifest.json` interval 5000).
+- **Network** (V1, 2026-08-16 evening): the wires, not the loops — Browser → Cloudflare → tunnel connector → origin, Spot/USD-M REST and websocket, Feed → Machine, News; each with health word + reason, one reading, GitHub-style history cells (1H/6H/24H), worst-first, click → drawer with facts and a per-wire chart, a compact "What changed" ledger, and the three monitoring controls (monitor every, pause monitor, probe now — receipts + re-read). Data: `/api/network`, `/api/network/history`, `/api/network/events`, POST `/api/network/config|probe` (contract: `ui/NETWORK-V1-CONTRACT.md`; page: `ui/NETWORK-V1-PAGE-SPEC.md`; order: `ui/NETWORK-V1-BUILD-ORDER.md`). Files: `ui/network_*.py`, `ui/network*.js`, `ui/network.css`, host scripts `ui/host/`. The V5 heartbeat page files (`net_v5.js`, `net_chart.js`, …) are no longer loaded by `index.html`; `quant-ui-telemetry` still records for a future Machine tab.
 - **News**: items from 104 public sources with impact High/Medium/Low, day
   histogram, category and impact filters, a sources board with per-source
   live/delayed/error status. Master toggle "News on" is a real control.
@@ -132,3 +128,9 @@ the layout again.
   (`test_only_consecutive_double_failures_are_suppressed`).
 - The Mac→box auto-sync is unverified (see §3); the Mac pull/sync loops are
   still running and should be retired once the box is the only viewer.
+- Network V1 (2026-08-16 evening): history cells show "no data" (not Stale) for a
+  window when the recorder was stopped — the ledger records collector
+  stopped/started; Feed → Machine "source" is Unknown because the runtime does
+  not record it; the whole box still writes ~5 MB/s to disk because the feed
+  daemon rewrites its 5.4 MB state file every second (main lane's file, not the
+  dashboard's).

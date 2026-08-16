@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+NETWORK V1 LANDED 2026-08-16 23:0xZ (Network integrator seat) | tab live at arbitrage.cosmosgeek.org/#network on release e64ef38 | trading runtime, tunnel, machine directories untouched
+built | recorder service quant-ui-network (reads feed state at its source read-only, probes public Binance /time, scrapes cloudflared 127.0.0.1:20241, probes loopback origin, summarizes news; SQLite history outside the web root) + /api/network, history, events, config, probe on the live serve.py (V5 routes preserved, cutover with rollback copy) + the page (strip, worst-first wires with history cells, drawer, ledger, controls) | 63 codex workers across builds, two review rounds, three repair waves | MEASURED
+proofs | stop recorder → every wire Stale within its own freshness window (REST 45 s … news 319 s), never Outage or green; restart → two successes before Operational; 10-min recorder 0.35 % CPU / 30 MB RSS; /api/network 19.7 KB in ≤ 15 ms; identifier scan clean; verified through the real URL in the owner's browser | evidence/network-v1-*.txt | MEASURED
+findings for the main lane | feed → machine Degraded all evening (books 8–10 s old while the socket is fresh; 0–53 of 656 symbols under 5 s); the perp socket dropped ~200 frames per 15 s; the feed daemon rewrites 5.4 MB every second (~5 MB/s disk writes) | MEASURED
+disk | the UI mirror copied ~10 MB every 5 s (feed state + receipts) — now change-only and no feed copy: whole-box writes 6.8 → 5.0 MB/s | MEASURED
+records | ui/NETWORK-V1-CONTRACT.md, ui/NETWORK-V1-PAGE-SPEC.md, ui/DASHBOARD.md refreshed; lane lane/ui-network-v1 merged to main | MEASURED
+open | dead V5 page files on disk (not loaded) — cleanup on the owner's word; quant-ui-telemetry kept for the Machine tab | UNVERIFIED as labeled
+
 SHARED HAND DAY 1 + FEED DELIVERY 2026-08-16 (worker 5.0, closed on STOP-WIDTH order) | machine SEALED + FLAT; no live action; lane/lead5-hand = SHELF, not for merge
 feed | FD1-FD4 on lane/lead5-feed 7b283a0: bounded FIFO queue (FR2 3 -> FR5 0), ticker sockets on the measured stream shapes (perp !bookTicker on /stream, spot per-symbol @bookTicker shards); deployed 13:1xZ release 7b283a06 + daemon restart; proof: feed delivers 480 spot / 524 perp symbols with live bid+ask; stream still REST-sourced (book_age 10.7-15.7 s, 357/357 STALE) | MEASURED
 hand | frozen interface v1 (131 rows) + src/execution/ adapters http/spot/futures/margin/transfer 990 non-blank, 102 tests; round-1 review findings 5/7/10/4/4, all repaired, no clean round-2 verdict yet | MEASURED
