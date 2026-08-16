@@ -648,20 +648,27 @@ class RestartTests(unittest.TestCase):
 
 
 class ReconnectTests(unittest.TestCase):
-    def test_bounded_queue_keeps_latest_book_and_reports_drops(self):
+    def test_bounded_queue_preserves_connection_order_and_latest_book(self):
         def reader(base, unused_path, unused_params):
             symbol = (spot_info("AAAUSDT") if base == mf.SPOT_BASE_URL
                       else perp_info("AAAUSDT"))
             return {"symbols": [symbol]}
 
         def flood(unused_url, on_text, **callbacks):
-            callbacks["on_attempt"]()
-            callbacks["on_connect"]()
-            for value in range(mf.EVENT_QUEUE_MAX + 2):
-                on_text(json.dumps({"stream": "!bookTicker", "data": {
+            def frame(value):
+                return json.dumps({"stream": "!bookTicker", "data": {
                     "s": "AAAUSDT", "b": str(value + 1), "a": str(value + 2),
                     "T": FIXED_MS + value,
-                }}))
+                }})
+
+            for value in range(mf.EVENT_QUEUE_MAX):
+                on_text(frame(value))
+            callbacks["on_attempt"]()
+            callbacks["on_connect"]()
+            on_text(frame(mf.EVENT_QUEUE_MAX))
+            callbacks["on_disconnect"]()
+            callbacks["on_attempt"]()
+            callbacks["on_connect"]()
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -676,18 +683,27 @@ class ReconnectTests(unittest.TestCase):
                 worker.join(1)
             self.assertFalse(worker.is_alive())
             self.assertEqual((feed.events.qsize(), feed.events.maxsize),
-                             (mf.EVENT_QUEUE_MAX, mf.EVENT_QUEUE_MAX))
+                (mf.EVENT_QUEUE_MAX + 5,
+                 mf.EVENT_QUEUE_MAX + mf.EVENT_QUEUE_STATUS_RESERVE))
+            status_queue = mf.EventQueue()
+            status = ("attempt", "spot", -1, 1, None)
+            for unused in range(status_queue.maxsize + 1):
+                status_queue.offer(status)
+            self.assertEqual((status_queue.qsize(), status_queue.dropped),
+                (status_queue.maxsize, {(1, "spot"): 1}))
             feed._start_workers = lambda *unused: []
             stats = feed.run(0.1)
             payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
         perp = payload["connections"]["perp"]
         self.assertEqual((perp["dropped_frames"], perp["ticker"]["attempts"],
-                          perp["ticker"]["successful_handshakes"]), (2, 1, 1))
+                          perp["ticker"]["successful_handshakes"],
+                          perp["ticker"]["last_message_ms"],
+                          perp["ticker"]["status"]), (1, 2, 2, None, "stale"))
         self.assertEqual(stats.websocket_messages, mf.EVENT_QUEUE_MAX)
         self.assertEqual((payload["symbols"]["AAAUSDT"]["perp_bid"],
                           payload["symbols"]["AAAUSDT"]["perp_ask"]),
-                         (str(mf.EVENT_QUEUE_MAX + 2),
-                          str(mf.EVENT_QUEUE_MAX + 3)))
+                         (str(mf.EVENT_QUEUE_MAX + 1),
+                          str(mf.EVENT_QUEUE_MAX + 2)))
 
     def test_exponential_reconnect_with_injected_clients(self):
         stopped = {"value": False}
@@ -750,6 +766,9 @@ class ReconnectTests(unittest.TestCase):
             )
             urls = mf.websocket_urls({"AAAUSDT": mf.empty_record(FIXED_UTC, "both")})
             feed._reset_connections(urls)
+            feed.connections["spot"]["dropped_frames"] = 7
+            feed._reset_connections(urls)
+            self.assertEqual(feed.connections["spot"]["dropped_frames"], 7)
             self.assertEqual(set(feed.connections), {"spot", "perp"})
             for venue in feed.connections:
                 ticker = feed.connections[venue]["ticker"]
