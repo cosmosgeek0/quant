@@ -89,6 +89,39 @@ run_stage() {
   return 0
 }
 
+monotonic_ms() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1000000)'
+}
+
+append_observe_health() {
+  local stage=$1
+  local code=$2
+  local duration_ms=$3
+  local utc
+  utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '{"stage":"%s","exit":%d,"duration_ms":%d,"utc":"%s"}\n' \
+    "$stage" "$code" "$duration_ms" "$utc" >> "$HEALTH"
+}
+
+run_observe_stage() {
+  local stage=$1
+  local code started_ms finished_ms duration_ms
+  shift
+  started_ms=$(monotonic_ms)
+  "$@"
+  code=$?
+  finished_ms=$(monotonic_ms)
+  duration_ms=$((finished_ms - started_ms))
+  if [ "$duration_ms" -lt 0 ]; then
+    duration_ms=0
+  fi
+  append_observe_health "$stage" "$code" "$duration_ms"
+  if [ "$code" -ne 0 ]; then
+    overall=1
+  fi
+  return 0
+}
+
 momentum_position_standing() {
   [ -r "$MOMENTUM_POSITION" ] \
     && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("state") in {"OPEN", "OPENING", "CLOSING", "EXIT_PENDING", "UNKNOWN"} else 1)' \
@@ -228,6 +261,14 @@ run_stage basis_recorder "0" \
   python3 "$DEPLOY_DIR/src/basis_recorder.py" \
     --stream-state "$STREAM_STATE" \
     --receipt-dir "$RECEIPT_DIR"
+
+# OBSERVE remains read-only and runs while either entry seal is present.
+run_observe_stage executable_gap_watch \
+  python3 "$DEPLOY_DIR/src/executable_gap_watch.py" --once
+
+run_observe_stage reverse_lockin_shadow \
+  python3 "$DEPLOY_DIR/src/reverse_lockin_shadow.py" --once \
+    --assume-borrow-power
 
 if [ -e "$STOP_FILE" ] || [ -e "$STOP_JOBS_FILE" ]; then
   run_stage basis_watch "0" \
