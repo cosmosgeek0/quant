@@ -1,0 +1,85 @@
+DEPLOY RELEASE CANDIDATE b188351b67d262c8f041fe3ebcdaca53593f9f09 2026-08-16T03:49:06Z
+STAGED src/basis_events.py local_sha=2948279e5988a87551b0d41510da42e5c4ee8d7a4f9e502aa722a6fe5ce56249
+STAGED src/basis_ladder.py local_sha=4e9e05bad8c40255e9cf76cf0209eefaca45a00af85603afb8ee156b64030f9a
+STAGED src/job_runner.py local_sha=3ef3f43e1ce8851f150666f0916e57ab20fd1659002bf317f964bcc34373fc24
+STAGED src/margin_ops.py local_sha=9b992998b2380091c63693dceec25a2fff5ed77116d761d525058603cca7a783
+STAGED src/margin_reconcile.py local_sha=6c74ca4c94d8601f34cdaef6b536b1778b52790fba79c6b68a07ed3278f32f4a
+STAGED src/reverse_basis_lifecycle.py local_sha=edaef004a7befe4999744bedc78307eb35dc7f54fe3e93021d00a135c35be72e
+XFER src/basis_events.py START 03:49:06
+src=basis_events.py bytes=23955 lines=18 batch=600
+head: illegal line count -- 0
+batch 1 ok: 18/18 lines (31940 bytes staged)
+local_sha =2948279e5988a87551b0d41510da42e5c4ee8d7a4f9e502aa722a6fe5ce56249
+remote_sha=2948279e5988a87551b0d41510da42e5c4ee8d7a4f9e502aa722a6fe5ce56249
+XFER_VERIFIED
+XFER src/basis_events.py RC=0
+XFER src/basis_ladder.py START 03:50:35
+src=basis_ladder.py bytes=20750 lines=16 batch=600
+head: illegal line count -- 0
+batch 1 ok: 16/16 lines (27668 bytes staged)
+local_sha =4e9e05bad8c40255e9cf76cf0209eefaca45a00af85603afb8ee156b64030f9a
+remote_sha=4e9e05bad8c40255e9cf76cf0209eefaca45a00af85603afb8ee156b64030f9a
+XFER_VERIFIED
+XFER src/basis_ladder.py RC=0
+XFER src/job_runner.py START 03:52:04
+src=job_runner.py bytes=207617 lines=154 batch=600
+head: illegal line count -- 0
+batch 1 ok: 154/154 lines (276824 bytes staged)
+local_sha =3ef3f43e1ce8851f150666f0916e57ab20fd1659002bf317f964bcc34373fc24
+remote_sha=3ef3f43e1ce8851f150666f0916e57ab20fd1659002bf317f964bcc34373fc24
+XFER_VERIFIED
+XFER src/job_runner.py RC=0
+XFER src/margin_ops.py START 03:53:33
+src=margin_ops.py bytes=11541 lines=9 batch=600
+head: illegal line count -- 0
+batch 1 ok: 9/9 lines (15388 bytes staged)
+local_sha =9b992998b2380091c63693dceec25a2fff5ed77116d761d525058603cca7a783
+remote_sha=9b992998b2380091c63693dceec25a2fff5ed77116d761d525058603cca7a783
+XFER_VERIFIED
+XFER src/margin_ops.py RC=0
+XFER src/margin_reconcile.py START 03:55:03
+src=margin_reconcile.py bytes=18116 lines=14 batch=600
+head: illegal line count -- 0
+batch 1 ok: 14/14 lines (24156 bytes staged)
+local_sha =6c74ca4c94d8601f34cdaef6b536b1778b52790fba79c6b68a07ed3278f32f4a
+remote_sha=6c74ca4c94d8601f34cdaef6b536b1778b52790fba79c6b68a07ed3278f32f4a
+XFER_VERIFIED
+XFER src/margin_reconcile.py RC=0
+XFER src/reverse_basis_lifecycle.py START 03:56:32
+src=reverse_basis_lifecycle.py bytes=29307 lines=22 batch=600
+head: illegal line count -- 0
+batch 1 ok: 22/22 lines (39076 bytes staged)
+local_sha =edaef004a7befe4999744bedc78307eb35dc7f54fe3e93021d00a135c35be72e
+remote_sha=edaef004a7befe4999744bedc78307eb35dc7f54fe3e93021d00a135c35be72e
+XFER_VERIFIED
+XFER src/reverse_basis_lifecycle.py RC=0
+src=host-verify.sh bytes=658 lines=1 batch=600
+head: illegal line count -- 0
+batch 1 ok: 1/1 lines (880 bytes staged)
+local_sha =b22eade286b2216246b896af98a59b886165b83d3e4b757cedd6ab0f564051ec
+remote_sha=b22eade286b2216246b896af98a59b886165b83d3e4b757cedd6ab0f564051ec
+XFER_VERIFIED
+
+Starting session with SessionId: cosmos-routine-operator-r1-20260721-u5aqknub8t8gzc7avnutvvvu5y
+$ bash /home/ssm-user/host-verify-margin.sh
+
+echo __SSMRUN_DONE__
+HOST-VERIFY-BEGIN
+HOST src/basis_events.py sha=2948279e5988a87551b0d41510da42e5c4ee8d7a4f9e502aa722a6fe5ce56249
+HOST src/basis_ladder.py sha=4e9e05bad8c40255e9cf76cf0209eefaca45a00af85603afb8ee156b64030f9a
+HOST src/job_runner.py sha=3ef3f43e1ce8851f150666f0916e57ab20fd1659002bf317f964bcc34373fc24
+HOST src/margin_ops.py sha=9b992998b2380091c63693dceec25a2fff5ed77116d761d525058603cca7a783
+HOST src/margin_reconcile.py sha=6c74ca4c94d8601f34cdaef6b536b1778b52790fba79c6b68a07ed3278f32f4a
+HOST src/reverse_basis_lifecycle.py sha=edaef004a7befe4999744bedc78307eb35dc7f54fe3e93021d00a135c35be72e
+RELEASE=b188351b67d262c8f041fe3ebcdaca53593f9f09
+STOP-PRESENT=STOP
+STOP-JOBS=present
+STOP=absent
+HOST-VERIFY-END
+$ $ __SSMRUN_DONE__
+$ exit
+
+
+Exiting session with sessionId: cosmos-routine-operator-r1-20260721-u5aqknub8t8gzc7avnutvvvu5y.
+
+DEPLOY DRIVER COMPLETE 2026-08-16T04:00:22Z
