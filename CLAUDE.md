@@ -9,11 +9,17 @@ WORKERS (codex CLI, Opus subagents) build in narrow tasks under AGENTS.md.
 BOOT: this file auto-loads → read NOW.md (orders + truth) → newest LOGS.md
 rows → continue the open work. Reality on disk beats remembered context.
 
-## WIDTH (owner word 2026-08-16, corrects a Lead-invented "PARALLEL ARMY" law)
-Width is a few workers, one bit each, about 500 lines per card, net-negative
-or flat. Never a flood; never "10-50 at a time" as policy. A card carries one
-narrow scope and one file owner; the Lead verifies each landing with its own
-hands and commits only what is verified and reviewed clean.
+## WIDTH (owner word 2026-08-16 evening, in-channel; replaces the earlier text
+of this section, which the owner says was never his word)
+There is NO limit on parallel workers. Use as many as the work can take — 50
+at once when the files are disjoint; the owner asked for 50 and was pushing
+every chat toward MORE width, not less. The owner's time is the only limit;
+the fleet is never the limit. Serial-by-default is the named defect: ten
+locked doors get ten workers at once, not one after another. What still
+bounds a burst is physics, not policy: one writer per file (shard when a
+file cannot land at once), each card one narrow scope with a line budget
+(AGENTS.md Size), and the Lead verifying every landing with its own diff and
+tests before it is committed.
 
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.

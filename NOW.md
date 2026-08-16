@@ -2,7 +2,7 @@
 
 ## Orders in force
 - MACHINE STAYS SEALED (STOP-JOBS present) and FLAT. No lane landing authorizes a deploy, order, transfer, leverage change, or live proof. Every first live proof of a migrated seam runs on the deployed host on ONE owner line. | MEASURED record state
-- STOP-WIDTH (owner word 2026-08-16): no new cards; width is a few workers, one bit each, about 500 lines per card, net-negative or flat (CLAUDE.md WIDTH). The "PARALLEL ARMY 10-50 workers" section was Lead-invented and is replaced. | MEASURED owner word
+- WIDTH corrected (owner word 2026-08-16 evening, in-channel): the "few workers" row that stood here was NOT the owner's word. There is no limit on parallel workers — use as many as the work can take, 50 at once when files are disjoint; only file ownership, per-card line budgets and Lead verification bound a burst (CLAUDE.md WIDTH). Card size law (about 500 lines, net-negative or flat for repairs) still stands. | MEASURED owner word
 - lane/lead5-hand is a SHELF: not for merge. Its pieces come to main one seam per owner paste, each seam re-running its proven receipt live, only AFTER the reverse round trip. | MEASURED owner word
 - Owner words still open: reverse gate / borrow for the live reverse round trip (MRV16 F1/F2 repairs NOT started), re-arm, volume PARK vs one probe (TR1 move list ready; nothing moved), donor permit numbers, BNB fee float, tuner advisory. | MEASURED record
 
