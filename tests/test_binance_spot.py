@@ -153,14 +153,26 @@ class SpotAdapterTests(unittest.TestCase):
 
         result = spot.submit_order_once(
             transport, BASE, plan(), lambda intent: events.append(("intent", intent)))
-        self.assertEqual((events[0][0], result.tag, len(result.response_fills)),
-                         ("intent", "terminal", 1))
-        self.assertEqual(sum(event[:2] == ("wire", "POST") for event in events), 1)
+        self.assertEqual((sum(event[0] == "intent" for event in events),
+                          sum(event[:2] == ("wire", "POST") for event in events),
+                          events[0][0], events[1][:2], result.tag, len(result.response_fills)),
+                         (1, 1, "intent", ("wire", "POST"), "terminal", 1))
         feed = Feed(ok(posted))
         with self.assertRaises(http.IntentNotDurable):
             spot.submit_order_once(feed, BASE, plan(),
                                    lambda _intent: (_ for _ in ()).throw(RuntimeError("write unavailable")))
         self.assertEqual(feed.calls, [])
+
+    def test_crafted_invalid_plan_is_refused_before_receipt_or_post(self):
+        built = plan()
+        params = tuple((key, "NaN") if key == "quantity" else (key, value)
+                       for key, value in built.intent.params)
+        crafted = replace(built, quantity=1.0,
+                          intent=replace(built.intent, params=params))
+        feed, writes = Feed(), []
+        with self.assertRaises(http.AdapterRefusal):
+            spot.submit_order_once(feed, BASE, crafted, writes.append)
+        self.assertEqual((writes, feed.calls), ([], []))
 
     def test_returned_id_mismatch_stays_pending_without_resend(self):
         feed = Feed(ok({"clientOrderId": "other-id"}), ok(order_payload()))

@@ -54,6 +54,16 @@ def _wire(value: Decimal) -> str:
     text = format(value, "f"); return text.rstrip("0").rstrip(".") if "." in text else text
 
 
+def _checked_plan(plan: object) -> _http.OrderPlan:
+    if not isinstance(plan, _http.OrderPlan) or not isinstance(plan.intent, _http.MutationIntent): raise _http.AdapterRefusal("order plan is invalid")
+    intent, quantity, quote, residual = plan.intent, plan.quantity, plan.quote_limit, plan.residual
+    if (quantity is None) == (quote is None) or quote is not None and plan.side != "BUY": raise _http.AdapterRefusal("one side-compatible bound is required")
+    bound = ("quantity", _wire(_input(quantity))) if quantity is not None else ("quoteOrderQty", _wire(_input(quote))); _input(residual, False)
+    expected = (("symbol", plan.symbol), ("side", plan.side), ("type", "MARKET"), bound, ("newClientOrderId", intent.identity), ("newOrderRespType", "FULL"))
+    if not _named(plan.symbol, _SYMBOL) or plan.side not in ("BUY", "SELL") or intent.venue != "BINANCE_SPOT" or intent.operation != "ORDER" or not _named(intent.identity, _CLIENT_ID) or not _named(intent.git_sha, _SHA) or intent.params != expected or plan.reduce_only is not False: raise _http.AdapterRefusal("order plan facts do not agree")
+    return plan
+
+
 def _bad(note: str) -> _http.ReadResult:
     return _http.ReadResult("unclear", None, _http.HttpResult("unclear", None, None, note))
 
@@ -136,20 +146,18 @@ def read_account_state(transport: _http.Transport, base_url: str, symbol: str, *
 def build_market_order(market: SpotMarket, side: _Literal["BUY", "SELL"], client_id: str, git_sha: str, *, quantity: Decimal | None = None, quote_limit: Decimal | None = None) -> _http.OrderPlan:
     if not isinstance(market, SpotMarket) or market.status != "TRADING": raise _http.AdapterRefusal("market is not tradable")
     for value in (market.step_size, market.min_quantity, market.min_notional, market.bid, market.ask): _input(value)
-    if not _named(market.symbol, _SYMBOL) or not _named(market.base_asset, _ASSET) or not _named(market.quote_asset, _ASSET) or market.bid >= market.ask or side not in ("BUY", "SELL") or not _named(client_id, _CLIENT_ID) or not _named(git_sha, _SHA): raise _http.AdapterRefusal("market or identity is invalid")
-    if (quantity is None) == (quote_limit is None) or (quote_limit is not None and side != "BUY"): raise _http.AdapterRefusal("one side-compatible bound is required")
+    if not _named(market.symbol, _SYMBOL) or not _named(market.base_asset, _ASSET) or not _named(market.quote_asset, _ASSET) or market.bid >= market.ask: raise _http.AdapterRefusal("market is invalid")
     residual = Decimal(0)
     if quantity is not None:
         requested = _input(quantity); quantity = requested - requested % market.step_size; residual = requested - quantity
         if quantity < market.min_quantity or quantity * (market.ask if side == "BUY" else market.bid) < market.min_notional: raise _http.AdapterRefusal("order is below filters")
-        bound = ("quantity", _wire(quantity)); quote_limit = None
+        bound = ("quantity", _wire(quantity))
     else:
         quote_limit = _input(quote_limit)
         if quote_limit < market.min_notional or quote_limit / market.ask < market.min_quantity: raise _http.AdapterRefusal("order is below filters")
         bound = ("quoteOrderQty", _wire(quote_limit))
     params = (("symbol", market.symbol), ("side", side), ("type", "MARKET"), bound, ("newClientOrderId", client_id), ("newOrderRespType", "FULL"))
-    intent = _http.MutationIntent("BINANCE_SPOT", "ORDER", client_id, git_sha, params)
-    return _http.OrderPlan(intent, market.symbol, side, quantity, quote_limit, residual, False)
+    intent = _http.MutationIntent("BINANCE_SPOT", "ORDER", client_id, git_sha, params); return _checked_plan(_http.OrderPlan(intent, market.symbol, side, quantity, quote_limit, residual, False))
 
 
 def _empty(tag: str, symbol: str, client_id: str, error: _http.HttpResult | None = None) -> _http.OrderResult:
@@ -205,11 +213,7 @@ def _full_fills(payload: object, order_id: int) -> tuple[_http.Fill, ...]:
 
 def submit_order_once(transport: _http.Transport, base_url: str, plan: _http.OrderPlan, write_intent: _http.IntentWriter, *, sleep: _Callable[[float], None] = _time.sleep) -> _http.OrderResult:
     _text(base_url, "base_url")
-    if not isinstance(plan, _http.OrderPlan) or not isinstance(plan.intent, _http.MutationIntent): raise _http.AdapterRefusal("order plan is invalid")
-    params = plan.intent.params
-    if not isinstance(params, tuple) or any(not isinstance(x, tuple) or len(x) != 2 or not all(isinstance(y, str) for y in x) for x in params): raise _http.AdapterRefusal("order params are invalid")
-    wire = dict(params)
-    if len(wire) != len(params) or plan.intent.venue != "BINANCE_SPOT" or plan.intent.operation != "ORDER" or not _named(plan.intent.identity, _CLIENT_ID) or not _named(plan.intent.git_sha, _SHA) or wire.get("newClientOrderId") != plan.intent.identity or wire.get("symbol") != plan.symbol or wire.get("side") != plan.side or wire.get("type") != "MARKET" or wire.get("newOrderRespType") != "FULL" or plan.reduce_only: raise _http.AdapterRefusal("order plan facts do not agree")
+    plan = _checked_plan(plan)
     try: write_intent(plan.intent)
     except _http.IntentNotDurable: raise
     except Exception: raise _http.IntentNotDurable("intent was not durably written") from None
