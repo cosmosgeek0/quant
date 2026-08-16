@@ -550,3 +550,50 @@ touches the trading runtime, the tunnel, or the machine's directories.
 PRECEDENCE: this order supersedes ui/NETWORK-TAB-BRIEF.md wherever they
 differ (branch law, wire list, storage, controls). The brief remains the
 design background and the record of the research.
+
+OWNER WORD — LATE 2026-08-16 (binds; overrides earlier "big story graph" wording)
+
+- A master multi-lane graph is NOT required. The story surface is: a small
+  fixed path strip on top (Browser → Cloudflare → box → Spot/USD-M REST+WSS,
+  News, Feed→Machine) and, under it, GitHub-style status boxes over time —
+  LEFT the wires (each with up/not, one number, one control), RIGHT the time
+  axis (1H = 60 × 1-minute cells, 6H = 72 × 5-minute, 24H = 96 × 15-minute).
+  Green/amber/red/grey by health, grey = Unknown/Off, always with the word.
+- Keep: worst-first table, click a wire → the reason and its facts (drawer),
+  the short "what changed" ledger, and the monitoring controls (pause one
+  monitor, monitor every, probe now, live view, range).
+- Not required in V1: aligned multi-lane graph with shared cursor and event
+  markers, particles, mobile list, the audit/idempotency machinery beyond a
+  receipt and Origin check for the two tiny POSTs. History lanes per wire may
+  come later if the owner asks.
+- Speed: there is no width limit on workers. Ten locks, ten workers, at once.
+  Serial-by-default is the defect. Nobody waits per card.
+
+COMMANDER CORRECTION 2026-08-16 ~21:20 IST (NETWORK_V1_STATUS_AND_CORRECTION.md, accepted)
+
+- Two owner gates only: (1) the static visual arrangement once, before final
+  NET-04 wiring; (2) the monitoring-control list once, before NET-06. Every
+  other card continues automatically when the previous card has real AWS
+  evidence and its checks pass.
+- Do NOT replace the live V5 server with main's older serve.py during NET-03:
+  main lacks routes the deployed V5 serves (telemetry, grace, polling). Build
+  from fresh main for runtime truth; import only the exact UI shell/server
+  features required from lane/ui-network-v5; deploy the NET-01 mirror and
+  NET-02 recorder WITHOUT touching the current web server; run the combined
+  new server on an unused loopback port and verify every old and new
+  endpoint; cut the live 8080 service over only when the combined page is
+  ready; keep a rollback copy.
+- Fast sequence: Block A (1–3 h) read the deployed feed_state.json schema →
+  mirror it + fix the manifest field mismatch → freeze the /api/network
+  contract → recorder/history and API/query built in parallel → deploy the
+  recorder, prove rows on AWS. Block B (3–6 h elapsed) keep the shell and
+  News, replace only the inner Network page: path strip + status boxes +
+  worst-first table wired to real /api/network, then drawer + ledger,
+  deployed to the protected URL; missing evidence = Unknown, never fake
+  green. Block C (6–12 h elapsed) monitoring controls with receipts; stop the
+  recorder → page becomes Stale; restart → recovers after two successes;
+  CPU/memory/DB/endpoint-size measured; verified through
+  arbitrage.cosmosgeek.org; sanitized transcript in evidence/.
+- 6H/24H views fill after deployment; they never block completion.
+- The 24-hour wait for history is not build time: ship with the available
+  history and say "Collecting history" until more samples exist.
