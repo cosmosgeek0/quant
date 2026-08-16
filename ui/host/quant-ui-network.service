@@ -1,0 +1,18 @@
+[Unit]
+Description=Quant UI network recorder
+After=network.target quant-ui-mirror.service
+
+[Service]
+Type=simple
+User=ssm-user
+WorkingDirectory=/home/ssm-user/quant-ui
+Environment=QUANT_UI_DATA_DIR=/home/ssm-user/quant-ui/data
+ExecStart=/usr/bin/python3 ui/network_recorder.py --tick 5 -q
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/home/ssm-user/quant-ui/ui/live /home/ssm-user/quant-ui/data
+
+[Install]
+WantedBy=multi-user.target

@@ -1636,5 +1636,191 @@ class TestPollConfigEndpoint(ServerHarness):
         self.assertEqual(status, 405)
 
 
+class TestNetworkRouteRegistration(ServerHarness):
+
+    def bound_handler(self, sources, path, method="GET", body=b"", headers=None):
+        fake_server = mock.Mock()
+        with mock.patch.object(
+                serve, "ThreadingHTTPServer", return_value=fake_server) as factory:
+            serve.make_server(sources, port=0)
+        handler_type = factory.call_args.args[1]
+        handler = handler_type.__new__(handler_type)
+        handler.path = path
+        handler.command = method
+        message = http.client.HTTPMessage()
+        for name, value in (headers or {}).items():
+            message[name] = value
+        if body and message.get("Content-Length") is None:
+            message["Content-Length"] = str(len(body))
+        handler.headers = message
+        handler.rfile = io.BytesIO(body)
+        handler.wfile = io.BytesIO()
+        handler._send = mock.Mock()
+        return handler
+
+    def response_json(self, handler):
+        call = handler._send.call_args
+        self.assertIsNotNone(call)
+        return call.args[0], json.loads(call.args[2])
+
+    @staticmethod
+    def network_module():
+        module = type(sys)("ui.network_api")
+        module.api_network = lambda sources, now=None: {
+            "schema_version": 1,
+            "generated_at": None,
+            "collector": {
+                "status": "running" if Path(
+                    sources["network_current"]).is_file() else "unknown",
+            },
+            "edges": [],
+        }
+        module.api_network_history = lambda sources, query: (
+            400, {"ok": False, "error": "bad history", "query": query})
+        module.api_network_events = lambda sources, query: (
+            400, {"ok": False, "error": "bad events", "query": query})
+        module.write_network_config = mock.Mock(
+            return_value=({"key": "rest_probe_s"}, None))
+        module.write_network_probe = mock.Mock(
+            return_value=({"edge_id": "spot_rest"}, None))
+        return module
+
+    def test_network_current_route_is_json_when_source_is_missing(self):
+        root = self.tempdir()
+        data_dir = root / "data"
+        current = root / "live" / "network_current.json"
+        module = self.network_module()
+        with mock.patch.dict(
+                os.environ, {"QUANT_UI_DATA_DIR": str(data_dir)}), \
+                mock.patch.dict(sys.modules, {"ui.network_api": module}):
+            handler = self.bound_handler(
+                {"network_current": current}, "/api/network")
+            handler._handle(head_only=False)
+        status, payload = self.response_json(handler)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["collector"]["status"], "unknown")
+        self.assertIn("/api/network", serve.API_ROUTES)
+        self.assertIn("/api/network/history", serve.QUERY_ROUTES)
+        self.assertIn("/api/network/events", serve.QUERY_ROUTES)
+        sources = type(handler).sources
+        self.assertEqual(sources["network_current"], current)
+        self.assertEqual(sources["network_config"],
+                         UI_DIR / "live" / "network_config.json")
+        self.assertEqual(sources["network_probe_request"],
+                         UI_DIR / "live" / "network_probe_request.json")
+        self.assertEqual(sources["network_db"],
+                         data_dir / "network_history.sqlite3")
+        self.assertEqual(sources["ui_release"], UI_DIR / "RELEASE")
+
+    def test_network_query_routes_preserve_400_and_parsed_query(self):
+        module = self.network_module()
+        cases = (
+            ("/api/network/history?range=bad&edge_id=",
+             {"range": ["bad"], "edge_id": [""]}),
+            ("/api/network/events?limit=0", {"limit": ["0"]}),
+        )
+        with mock.patch.dict(sys.modules, {"ui.network_api": module}):
+            for path, expected_query in cases:
+                with self.subTest(path=path):
+                    handler = self.bound_handler({}, path)
+                    handler._handle(head_only=False)
+                    status, payload = self.response_json(handler)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(payload["query"], expected_query)
+
+    def test_network_post_writers_receive_headers_and_write_temp_files(self):
+        root = self.tempdir()
+        live = root / "live"
+        live.mkdir()
+        sources = {
+            "network_config": live / "network_config.json",
+            "network_probe_request": live / "network_probe_request.json",
+        }
+        seen_headers = []
+        module = self.network_module()
+
+        def write_config(call_sources, body, headers=None):
+            seen_headers.append(headers)
+            Path(call_sources["network_config"]).write_text(
+                json.dumps(body), encoding="utf-8")
+            return {"key": body["key"], "new": body["value"]}, None
+
+        def write_probe(call_sources, body, headers=None):
+            seen_headers.append(headers)
+            Path(call_sources["network_probe_request"]).write_text(
+                json.dumps(body), encoding="utf-8")
+            return {"edge_id": body["edge_id"]}, None
+
+        module.write_network_config = write_config
+        module.write_network_probe = write_probe
+        headers = {
+            "Host": "127.0.0.1:8080",
+            "Origin": "http://127.0.0.1:8080",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        cases = (
+            ("/api/network/config",
+             {"key": "rest_probe_s", "value": 30},
+             sources["network_config"]),
+            ("/api/network/probe", {"edge_id": "spot_rest"},
+             sources["network_probe_request"]),
+        )
+        with mock.patch.dict(sys.modules, {"ui.network_api": module}):
+            for path, payload, target in cases:
+                with self.subTest(path=path):
+                    encoded = json.dumps(payload).encode("utf-8")
+                    handler = self.bound_handler(
+                        sources, path, method="POST", body=encoded,
+                        headers=headers)
+                    handler.do_POST()
+                    status, response = self.response_json(handler)
+                    self.assertEqual(status, 200)
+                    self.assertTrue(response["ok"])
+                    self.assertEqual(json.loads(target.read_text(
+                        encoding="utf-8")), payload)
+        self.assertEqual(len(seen_headers), 2)
+        self.assertTrue(all(item["Origin"] == headers["Origin"]
+                            for item in seen_headers))
+
+    def test_network_post_foreign_origin_returns_403(self):
+        module = self.network_module()
+        module.write_network_config = mock.Mock(
+            return_value=(None, ("403", "origin is not allowed")))
+        body = json.dumps({"key": "rest_probe_s", "value": 30}).encode(
+            "utf-8")
+        handler = self.bound_handler(
+            {}, "/api/network/config", method="POST", body=body,
+            headers={"Host": "127.0.0.1:8080",
+                     "Origin": "https://elsewhere.example"})
+        with mock.patch.dict(sys.modules, {"ui.network_api": module}):
+            handler.do_POST()
+        status, payload = self.response_json(handler)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "origin is not allowed")
+        forwarded = module.write_network_config.call_args.args[2]
+        self.assertEqual(forwarded["Origin"], "https://elsewhere.example")
+
+    def test_manifest_error_shapes_render_the_same_pull_facts(self):
+        root = self.tempdir()
+        now = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+        pulls = []
+        for name, error_fields in (
+                ("singular", {"error": "x"}),
+                ("plural", {"errors": ["x"]})):
+            sources = self.empty_sources(root / name)
+            sources["manifest"].parent.mkdir(parents=True)
+            sources["manifest"].write_text(json.dumps({
+                "utc": self.utc_text(now), "ok": False, **error_fields,
+            }), encoding="utf-8")
+            pulls.append(serve.api_strip(sources, now=now)["pull"])
+        for pull in pulls:
+            self.assertEqual(pull["error"], "x")
+            self.assertEqual(pull["errors"], ["x"])
+        self.assertEqual(
+            {key: pulls[0][key] for key in ("ok", "error", "errors", "level")},
+            {key: pulls[1][key] for key in ("ok", "error", "errors", "level")})
+
+
 if __name__ == "__main__":
     unittest.main()

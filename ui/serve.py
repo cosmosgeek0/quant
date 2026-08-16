@@ -21,6 +21,8 @@ repaired. GET and HEAD are the only accepted methods. The server never writes a
 file and never calls the network.
 """
 
+from __future__ import annotations
+
 import argparse
 import gzip
 import hashlib
@@ -207,6 +209,18 @@ def default_sources():
         "news_sources": LIVE_DIR / "news_sources.json",
         "telemetry": LIVE_DIR / "telemetry.jsonl",
         "grace": LIVE_DIR / "grace.json",
+        "network_current": LIVE_DIR / "network_current.json",
+        "network_config": LIVE_DIR / "network_config.json",
+        "network_probe_request": LIVE_DIR / "network_probe_request.json",
+    }
+
+
+def _network_external_sources():
+    """Resolve Network files that intentionally live outside ui/live/."""
+    data_dir = Path(os.environ.get("QUANT_UI_DATA_DIR") or (ROOT_DIR / "data"))
+    return {
+        "network_db": data_dir / "network_history.sqlite3",
+        "ui_release": UI_DIR / "RELEASE",
     }
 
 
@@ -1128,6 +1142,8 @@ def api_health(sources, now=None):
         "sources": {
             name: str(source) for name, source in sources.items()
             if name != "telemetry"
+            and not name.startswith("network_")
+            and name != "ui_release"
         },
     }
 
@@ -1504,13 +1520,18 @@ def _strip_pull_facts(sources, now):
     path = Path(sources.get("manifest", LIVE_DIR / "pull_manifest.json"))
     present, manifest, parse_errors = _read_json(path)
     utc = ok = error = cycle_ms = interval_ms = None
+    errors = []
     if present and isinstance(manifest, dict):
         if isinstance(manifest.get("utc"), str):
             utc = manifest["utc"]
         if isinstance(manifest.get("ok"), bool):
             ok = manifest["ok"]
-        if isinstance(manifest.get("error"), str):
-            error = manifest["error"]
+        if isinstance(manifest.get("errors"), list):
+            errors = [item for item in manifest["errors"]
+                      if isinstance(item, str)]
+        if isinstance(manifest.get("error"), str) and not errors:
+            errors = [manifest["error"]]
+        error = "; ".join(errors) if errors else None
         if isinstance(manifest.get("cycle_ms"), (int, float)):
             cycle_ms = manifest["cycle_ms"]
         if isinstance(manifest.get("interval_ms"), (int, float)):
@@ -1553,6 +1574,7 @@ def _strip_pull_facts(sources, now):
         "cycle_ms": cycle_ms,
         "interval_ms": interval_ms,
         "error": error,
+        "errors": errors,
         "level": level,
         "parse_errors": parse_errors,
     }
@@ -1844,6 +1866,32 @@ def _write_grace_locked(sources, body):
     return output, None
 
 
+def _network_api():
+    """Resolve ui.network_api through sys.modules so tests may substitute it."""
+    import importlib
+    return importlib.import_module("ui.network_api")
+
+
+def api_network(sources):
+    return _network_api().api_network(sources)
+
+
+def api_network_history(sources, query):
+    return _network_api().api_network_history(sources, query)
+
+
+def api_network_events(sources, query):
+    return _network_api().api_network_events(sources, query)
+
+
+def write_network_config(sources, body, headers=None):
+    return _network_api().write_network_config(sources, body, headers)
+
+
+def write_network_probe(sources, body, headers=None):
+    return _network_api().write_network_probe(sources, body, headers)
+
+
 API_ROUTES = {
     "/api/strip": api_strip,
     "/api/health": api_health,
@@ -1860,6 +1908,12 @@ API_ROUTES = {
     "/api/telemetry": api_telemetry,
     "/api/poll_config": api_poll_config,
     "/api/grace": api_grace,
+    "/api/network": api_network,
+}
+
+QUERY_ROUTES = {
+    "/api/network/history": api_network_history,
+    "/api/network/events": api_network_events,
 }
 
 
@@ -2026,6 +2080,14 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
                 404, "text/plain; charset=utf-8", b"not found\n",
                 head_only, cache_control="no-cache")
             return
+        query_route = QUERY_ROUTES.get(path)
+        if query_route is not None:
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            status, payload = query_route(type(self).sources, query)
+            self._send_json(
+                status, payload, head_only,
+                cache_control="no-cache")
+            return
         route = API_ROUTES.get(path)
         if route is not None:
             if route is api_telemetry:
@@ -2082,11 +2144,13 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
                         extra_headers=(("Allow", "GET, HEAD"),))
 
     def do_POST(self):
-        """Two narrow writes: recorder poll config, V5 grace prefs."""
+        """Four narrow writes for dashboard monitoring preferences."""
         clean = urlsplit(self.path).path
         writers = {
             "/api/poll_config": write_poll_config,
             "/api/grace": write_grace,
+            "/api/network/config": write_network_config,
+            "/api/network/probe": write_network_probe,
         }
         writer = writers.get(clean)
         if writer is None:
@@ -2111,12 +2175,21 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
                                   "error": "body must be valid JSON"})
             return
         try:
-            saved, error = writer(type(self).sources, body)
+            if clean in ("/api/network/config", "/api/network/probe"):
+                saved, error = writer(
+                    type(self).sources, body, dict(self.headers))
+            else:
+                saved, error = writer(type(self).sources, body)
         except OSError as exc:
             self._send_json(500, {"ok": False, "error": str(exc)})
             return
         if error:
-            self._send_json(400, {"ok": False, "error": error})
+            status = 400
+            if isinstance(error, tuple) and len(error) == 2:
+                error_status, error = error
+                if error_status == "403":
+                    status = 403
+            self._send_json(status, {"ok": False, "error": error})
             return
         self._send_json(200, {"ok": True, "saved": saved})
 
@@ -2140,6 +2213,7 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
 def make_server(sources=None, port=DEFAULT_PORT, quiet=True):
     """Build the loopback-only server; the caller owns its lifecycle."""
     resolved = dict(default_sources())
+    resolved.update(_network_external_sources())
     if sources:
         resolved.update(sources)
     handler = type("BoundHandler", (ReadOnlyHandler,), {
