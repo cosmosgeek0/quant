@@ -160,6 +160,21 @@ class PreflightRefusal(Exception):
     """A signed read-only account proof failed before any order was sent."""
 
 
+class ReceiptWriteError(OSError):
+    """A receipt write could not prove its documented durability boundary."""
+
+    def __init__(self, path: str, phase: str, rename_landed: bool):
+        self.path = path
+        self.phase = phase
+        self.rename_landed = rename_landed
+        if rename_landed:
+            detail = "rename landed but its directory durability is unproven"
+        else:
+            detail = "file fsync failed; temp removed; target untouched"
+        self.row = "RECEIPT_WRITE | %s | target=%s" % (detail, path)
+        super().__init__(self.row)
+
+
 @dataclass(frozen=True)
 class ExecutorConfig:
     symbol: str
@@ -196,19 +211,56 @@ def new_run_id() -> str:
 
 
 def _save_receipt(path: str, receipt: Dict[str, Any], *, private: bool) -> None:
-    """Atomically replace one receipt and seal its file and directory."""
+    """Replace a receipt through a same-directory mode-0600 temp.
+
+    The temp is flushed and file-fsynced before the rename. A file-fsync
+    failure raises ReceiptWriteError after removing the temp, with the target
+    untouched. The parent directory is fsynced after the rename; a failure
+    there raises ReceiptWriteError whose row states that the rename landed but
+    its directory durability is unproven. ``private`` remains for caller
+    compatibility; every receipt temp is private.
+    """
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(receipt, handle, indent=2, default=str)
-        handle.flush()
-        if private:
-            os.chmod(tmp, 0o600)
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-    parent = os.path.dirname(path) or "."
-    descriptor = os.open(parent, os.O_RDONLY)
+    descriptor = os.open(
+        tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        os.fsync(descriptor)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        os.unlink(tmp)
+        raise
+    try:
+        with handle:
+            json.dump(receipt, handle, indent=2, default=str)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError as exc:
+                raise ReceiptWriteError(path, "file_fsync", False) from exc
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    parent = os.path.dirname(path) or "."
+    try:
+        descriptor = os.open(parent, os.O_RDONLY)
+    except OSError as exc:
+        raise ReceiptWriteError(path, "parent_open", True) from exc
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise ReceiptWriteError(path, "parent_fsync", True) from exc
     finally:
         os.close(descriptor)
 

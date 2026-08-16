@@ -289,27 +289,45 @@ class ReceiptDurabilityTests(ExecutorCase):
         state.receipt = receipt or {"legs": []}
         return state
 
-    def sync_kinds(self, action):
-        observed = []
-        parent = os.stat(self.dir)
+    def write_events(self, path, action):
+        events_seen = []
+        tmp = path + ".tmp"
+        parent_path = os.path.dirname(path) or "."
+        parent = os.stat(parent_path)
         parent_identity = (parent.st_dev, parent.st_ino)
+        real_replace = os.replace
 
         def observe(descriptor):
             details = os.fstat(descriptor)
             identity = (details.st_dev, details.st_ino)
             if stat.S_ISREG(details.st_mode):
-                observed.append("file")
+                temp = os.stat(tmp)
+                self.assertEqual(identity, (temp.st_dev, temp.st_ino))
+                events_seen.append(("file_fsync", tmp))
             elif stat.S_ISDIR(details.st_mode) \
                     and identity == parent_identity:
-                observed.append("parent")
+                events_seen.append(("parent_fsync", parent_path))
             else:
-                observed.append("other")
+                self.fail("unexpected receipt fsync descriptor")
+
+        def observe_replace(source, target):
+            self.assertEqual((source, target), (tmp, path))
+            events_seen.append(("replace", target))
+            return real_replace(source, target)
 
         with mock.patch.object(basis_executor.os, "fsync",
-                               side_effect=observe) as fsync:
+                               side_effect=observe), mock.patch.object(
+                                   basis_executor.os, "replace",
+                                   side_effect=observe_replace):
             action()
-        self.assertEqual(fsync.call_count, len(observed))
-        return observed
+        return events_seen
+
+    def expected_write(self, path):
+        return [
+            ("file_fsync", path + ".tmp"),
+            ("replace", path),
+            ("parent_fsync", os.path.dirname(path) or "."),
+        ]
 
     def plan(self):
         return basis_cycle.CyclePlan(
@@ -321,13 +339,14 @@ class ReceiptDurabilityTests(ExecutorCase):
             short_notional=HAPPY_SHORT_NOTIONAL, leverage=1,
             reason="offline durability test")
 
-    def test_direct_save_syncs_file_and_parent(self):
+    def test_save_orders_file_sync_replace_and_parent_sync(self):
         state = self.state()
         self.assertEqual(
-            self.sync_kinds(lambda: basis_executor.save(state)),
-            ["file", "parent"])
+            self.write_events(
+                state.receipt_path, lambda: basis_executor.save(state)),
+            self.expected_write(state.receipt_path))
 
-    def test_settle_leg_syncs_file_and_parent_for_each_save(self):
+    def test_settle_leg_orders_each_receipt_write(self):
         def request(method, _base_url, _path, _params, _signed):
             self.assertEqual(method, "POST")
             return "ok", {"fills": []}
@@ -340,41 +359,91 @@ class ReceiptDurabilityTests(ExecutorCase):
             }
 
         state = self.state(request=request)
-        self.assertEqual(self.sync_kinds(lambda: basis_executor.settle_leg(
-            state, basis_cycle.ENTER_SPOT, self.plan(),
-            query_order=query_order)),
-            ["file", "parent", "file", "parent"])
+        self.assertEqual(self.write_events(
+            state.receipt_path, lambda: basis_executor.settle_leg(
+                state, basis_cycle.ENTER_SPOT, self.plan(),
+                query_order=query_order)),
+            self.expected_write(state.receipt_path) * 2)
 
-    def test_attach_fees_syncs_file_and_parent(self):
+    def test_attach_fees_orders_receipt_write(self):
         state = self.state({"legs": [{}]})
         trades = [{"commission": "0.001", "commissionAsset": "BTC"}]
-        self.assertEqual(self.sync_kinds(
+        self.assertEqual(self.write_events(
+            state.receipt_path,
             lambda: basis_executor.attach_fees(state, 0, trades)),
-            ["file", "parent"])
+            self.expected_write(state.receipt_path))
 
-    def test_mark_source_syncs_file_and_parent(self):
+    def test_mark_source_orders_receipt_write(self):
         path = os.path.join(self.dir, "source.json")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({"run_id": "source"}, handle)
-        self.assertEqual(self.sync_kinds(lambda: basis_executor.mark_source(
-            path, {"run_id": "source"}, RID, "sold", "0.1")),
-            ["file", "parent"])
+        self.assertEqual(self.write_events(
+            path, lambda: basis_executor.mark_source(
+                path, {"run_id": "source"}, RID, "sold", "0.1")),
+            self.expected_write(path))
 
-    def test_fsync_failure_propagates_as_oserror(self):
-        for failure_call in (1, 2):
-            with self.subTest(failure_call=failure_call):
-                calls = {"count": 0}
+    def test_mark_source_replacement_keeps_mode_0600_under_umask_022(self):
+        path = os.path.join(self.dir, "source.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "source"}, handle)
+        os.chmod(path, 0o600)
+        prior_umask = os.umask(0o022)
+        try:
+            basis_executor.mark_source(
+                path, {"run_id": "source"}, RID, "sold", "0.1")
+        finally:
+            os.umask(prior_umask)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
-                def refuse_one_sync(_descriptor):
-                    calls["count"] += 1
-                    if calls["count"] == failure_call:
-                        raise OSError("simulated receipt sync refusal")
+    def test_file_fsync_failure_removes_temp_and_preserves_target(self):
+        state = self.state({"legs": [{"stage": "new"}]})
+        original = b'{"legs": [{"stage": "prior"}]}\n'
+        with open(state.receipt_path, "wb") as handle:
+            handle.write(original)
 
-                with mock.patch.object(
-                        basis_executor.os, "fsync",
-                        side_effect=refuse_one_sync):
-                    with self.assertRaises(OSError):
-                        basis_executor.save(self.state())
+        def refuse_file_sync(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("simulated receipt file sync refusal")
+
+        with mock.patch.object(basis_executor.os, "fsync",
+                               side_effect=refuse_file_sync):
+            with self.assertRaises(
+                    basis_executor.ReceiptWriteError) as raised:
+                basis_executor.save(state)
+        self.assertEqual(raised.exception.phase, "file_fsync")
+        self.assertFalse(raised.exception.rename_landed)
+        self.assertIn("target untouched", raised.exception.row)
+        with open(state.receipt_path, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertFalse(os.path.exists(state.receipt_path + ".tmp"))
+
+    def test_parent_fsync_failure_reports_landed_rename(self):
+        state = self.state({"legs": [{"stage": "new"}]})
+        with open(state.receipt_path, "w", encoding="utf-8") as handle:
+            json.dump({"legs": [{"stage": "prior"}]}, handle)
+        parent_descriptors = []
+
+        def refuse_parent_sync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                parent_descriptors.append(descriptor)
+                raise OSError("simulated receipt parent sync refusal")
+
+        with mock.patch.object(basis_executor.os, "fsync",
+                               side_effect=refuse_parent_sync):
+            with self.assertRaises(
+                    basis_executor.ReceiptWriteError) as raised:
+                basis_executor.save(state)
+        self.assertEqual(raised.exception.phase, "parent_fsync")
+        self.assertTrue(raised.exception.rename_landed)
+        self.assertIn(
+            "rename landed but its directory durability is unproven",
+            raised.exception.row)
+        with open(state.receipt_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), state.receipt)
+        self.assertFalse(os.path.exists(state.receipt_path + ".tmp"))
+        self.assertEqual(len(parent_descriptors), 1)
+        with self.assertRaises(OSError):
+            os.fstat(parent_descriptors[0])
 
 
 class PlanRefusalTests(ExecutorCase):
