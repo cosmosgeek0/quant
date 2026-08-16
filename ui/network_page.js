@@ -372,8 +372,19 @@
         }
         updateTable(view);
         if (receipt.config && receipt.success) {
-          setReceipt(view, token, receipt.text + " · server now " +
-            shown(configValue(current, receipt.key, receipt.group)), receipt.warn);
+          /* The file is saved and re-read at once; the recorder picks the
+             new value up on its next tick (within 5 s) — say which is which. */
+          setReceipt(view, token, receipt.text + " · recorder still on " +
+            shown(configValue(current, receipt.key, receipt.group)) + " until its next tick", receipt.warn);
+          view.timers.push(setTimeout(function () {
+            if (!active(view) || view.controlToken !== token) { return; }
+            data.fetchCurrent().then(function (later) {
+              if (!active(view) || view.controlToken !== token) { return; }
+              if (later && typeof later === "object") { view.current = later; updateTable(view); }
+              setReceipt(view, token, receipt.text + " · recorder now " +
+                shown(configValue(later, receipt.key, receipt.group)), receipt.warn);
+            });
+          }, 7000));
         }
         return current;
       });
