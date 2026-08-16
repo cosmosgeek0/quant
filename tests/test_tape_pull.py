@@ -107,6 +107,38 @@ class FakeResponse:
         return self._url
 
 
+class RepeatingMemberHandle:
+    def __init__(self, size, block_size):
+        self.remaining = size
+        self.block = b"x" * block_size
+        self.read_sizes = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, error, traceback):
+        return False
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        if self.remaining == 0:
+            return b""
+        requested = self.remaining if size < 0 else size
+        count = min(requested, self.remaining, len(self.block))
+        self.remaining -= count
+        return self.block if count == len(self.block) else self.block[:count]
+
+
+class RepeatingMemberArchive:
+    def __init__(self, size, block_size):
+        self.handle = RepeatingMemberHandle(size, block_size)
+
+    def open(self, member, mode):
+        if mode != "r" or member.file_size != self.handle.remaining:
+            raise AssertionError("unexpected synthetic member open")
+        return self.handle
+
+
 class TapePullTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -374,6 +406,46 @@ class TapePullTests(unittest.TestCase):
                 DAY,
                 max_member_bytes=len(payload) + 1,
             )
+
+    def test_public_member_reader_streams_above_retired_private_bound(self):
+        retired_bound = 512_000_000
+        declared_size = retired_bound + 1
+        block_size = 4 * 1024 * 1024
+        member = zipfile.ZipInfo(
+            "%s-aggTrades-%s.csv" % (SYMBOL, DAY.isoformat())
+        )
+        member.file_size = declared_size
+        archive = RepeatingMemberArchive(declared_size, block_size)
+
+        with mock.patch.object(tp, "READ_CHUNK_BYTES", block_size):
+            streamed_size = sum(
+                len(chunk)
+                for chunk in tp.stream_verified_member(
+                    archive, member, tp.MAX_MEMBER_BYTES
+                )
+            )
+
+        self.assertEqual(streamed_size, declared_size)
+        self.assertGreater(len(archive.handle.read_sizes), 2)
+        self.assertLessEqual(max(archive.handle.read_sizes), block_size)
+
+    def test_public_member_reader_refuses_declared_size_above_one_gibibyte(self):
+        member = zipfile.ZipInfo(
+            "%s-aggTrades-%s.csv" % (SYMBOL, DAY.isoformat())
+        )
+        member.file_size = tp.MAX_MEMBER_BYTES + 1
+        archive = mock.Mock()
+
+        with self.assertRaises(tp.ArchiveError) as raised:
+            list(
+                tp.stream_verified_member(
+                    archive, member, tp.MAX_MEMBER_BYTES
+                )
+            )
+
+        self.assertEqual(raised.exception.measured_value, tp.MAX_MEMBER_BYTES + 1)
+        self.assertEqual(raised.exception.bound, tp.MAX_MEMBER_BYTES)
+        archive.open.assert_not_called()
 
     def test_above_bound_archive_is_identified_and_batch_continues(self):
         large_symbol = "LARGEUSDT"

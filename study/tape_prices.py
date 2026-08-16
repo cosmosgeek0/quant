@@ -4,21 +4,25 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import sys
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 try:
-    from study import policy_sim, stage_b
+    from study import policy_sim, stage_b, tape_pull
 except ModuleNotFoundError as error:
     if error.name != "study":
         raise
     import policy_sim  # type: ignore
     import stage_b  # type: ignore
+    import tape_pull  # type: ignore
 
 
 STUDY_DIR = Path(__file__).resolve().parent
@@ -124,6 +128,148 @@ def _merged(windows: Sequence[Window]) -> Tuple[Window, ...]:
     return tuple((start_ms, end_ms) for start_ms, end_ms in result)
 
 
+class _ChunkStream(io.RawIOBase):
+    """Expose shared verified chunks as a buffered-reader source."""
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+        self._pending = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target: Any) -> int:
+        view = memoryview(target)
+        while len(self._pending) == 0:
+            try:
+                self._pending = memoryview(next(self._chunks))
+            except StopIteration:
+                return 0
+        size = min(len(view), len(self._pending))
+        view[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+    def close(self) -> None:
+        close_chunks = getattr(self._chunks, "close", None)
+        if callable(close_chunks):
+            close_chunks()
+        super().close()
+
+
+def _archive_csv_rows(
+    path: Path, expected: str
+) -> Iterable[Tuple[int, List[str]]]:
+    identity = f"{path.name}:{expected}"
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            members = [
+                member for member in archive.infolist() if not member.is_dir()
+            ]
+            if len(members) != 1 or members[0].filename != expected:
+                raise TapePricesError(
+                    f"{path.name} does not contain only {expected}"
+                )
+            member = members[0]
+            if member.flag_bits & 0x1:
+                raise TapePricesError(f"{identity} is encrypted")
+            chunks = tape_pull.stream_verified_member(
+                archive, member, tape_pull.MAX_MEMBER_BYTES
+            )
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with io.TextIOWrapper(
+                raw, encoding="utf-8-sig", newline=""
+            ) as handle:
+                yield from enumerate(csv.reader(handle), start=1)
+    except TapePricesError:
+        raise
+    except tape_pull.ArchiveError as error:
+        details = ""
+        if error.measured_value is not None:
+            details += f" | measured={error.measured_value}"
+        if error.bound is not None:
+            details += f" | bound={error.bound}"
+        raise TapePricesError(f"{identity} {error}{details}") from None
+    except (
+        OSError,
+        UnicodeError,
+        csv.Error,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
+        raise TapePricesError(f"cannot parse {path.name}: {error}") from None
+
+
+def _agg_trade_rows(
+    path: Path,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+) -> Iterable[Any]:
+    parsed = stage_b._archive_name_match(path, stage_b.AGG_ARCHIVE)
+    if parsed is None or parsed[1] != symbol:
+        raise stage_b.StageBError(
+            f"aggTrades archive does not match {symbol}: {path.name}"
+        )
+    archive_day = stage_b._archive_day(path, stage_b.AGG_ARCHIVE)
+    expected = path.stem + ".csv"
+    found = False
+    for line_number, row in _archive_csv_rows(path, expected):
+        if not row or not any(cell.strip() for cell in row):
+            continue
+        first = row[0].strip().lower().replace(" ", "_")
+        if not found and first in {
+            "agg_trade_id",
+            "aggregate_trade_id",
+            "aggtradeid",
+        }:
+            continue
+        source = f"{path.name}:{expected}:{line_number}"
+        if len(row) < 7:
+            raise stage_b.StageBError(
+                f"{source} has fewer than seven aggTrades columns"
+            )
+        aggregate_id = stage_b._integer(
+            row[0], f"{source} aggregate id", non_negative=True
+        )
+        price = stage_b._decimal(row[1], f"{source} price", positive=True)
+        quantity = stage_b._decimal(
+            row[2], f"{source} quantity", positive=True
+        )
+        first_trade_id = stage_b._integer(
+            row[3], f"{source} first trade id", non_negative=True
+        )
+        last_trade_id = stage_b._integer(
+            row[4], f"{source} last trade id", non_negative=True
+        )
+        if last_trade_id < first_trade_id:
+            raise stage_b.StageBError(f"{source} has reversed trade ids")
+        timestamp_ms = stage_b._timestamp_ms(
+            row[5], f"{source} transact time"
+        )
+        actual_day = (EPOCH + timedelta(milliseconds=timestamp_ms)).date()
+        if actual_day != archive_day:
+            raise stage_b.StageBError(f"{source} is outside archive day")
+        buyer_is_maker = stage_b._boolean(
+            row[6], f"{source} buyer-is-maker"
+        )
+        found = True
+        if start_ms <= timestamp_ms < end_ms:
+            yield stage_b.AggTrade(
+                symbol,
+                aggregate_id,
+                timestamp_ms,
+                price,
+                quantity,
+                buyer_is_maker,
+            )
+    if not found:
+        raise stage_b.StageBError(
+            f"{path.name}:{expected} has no aggTrades rows"
+        )
+
+
 def _price_rows(
     grouped: Mapping[Key, Sequence[Window]], tape_dir: Path
 ) -> Iterable[Dict[str, Any]]:
@@ -134,7 +280,7 @@ def _price_rows(
             for day in _days(start_ms, end_ms):
                 path = _archive_path(tape_dir, key, day)
                 try:
-                    trades = stage_b._agg_trade_rows(
+                    trades = _agg_trade_rows(
                         path, symbol, start_ms, end_ms + 1
                     )
                     for trade in trades:

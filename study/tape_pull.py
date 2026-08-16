@@ -576,12 +576,13 @@ def _validate_member_byte_bound(max_member_bytes: int) -> int:
     return max_member_bytes
 
 
-def _stream_verified_member(
+def stream_verified_member(
     archive: zipfile.ZipFile,
     member: zipfile.ZipInfo,
-    max_member_bytes: int,
-) -> None:
-    """Read one member in bounded chunks while accounting for every byte."""
+    max_member_bytes: int = MAX_MEMBER_BYTES,
+) -> Iterable[bytes]:
+    """Yield one member in bounded chunks while accounting for every byte."""
+    max_member_bytes = _validate_member_byte_bound(max_member_bytes)
     declared_bytes = member.file_size
     if declared_bytes <= 0 or declared_bytes > max_member_bytes:
         raise ArchiveError(
@@ -604,6 +605,7 @@ def _stream_verified_member(
                         measured_value=streamed_bytes,
                         bound=max_member_bytes,
                     )
+                yield chunk
     except zipfile.BadZipFile as error:
         raise ArchiveError(
             "archive CRC failed",
@@ -635,7 +637,10 @@ def _verify_single_member_zip(
             member = members[0]
             if member.flag_bits & 0x1:
                 raise ArchiveError("encrypted archive member is not accepted")
-            _stream_verified_member(archive, member, max_member_bytes)
+            for _chunk in stream_verified_member(
+                archive, member, max_member_bytes
+            ):
+                pass
     except ArchiveError:
         raise
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:

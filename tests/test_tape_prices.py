@@ -8,6 +8,7 @@ import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 from study import policy_sim as sim
@@ -181,6 +182,73 @@ class TapePricesTests(unittest.TestCase):
 
         self.assertEqual(summary, {"events": 1, "absent": 0, "rows": 1})
         self.assertEqual(self.rows()[0]["symbol"], "FIRSTUSDT")
+
+    def test_member_above_retired_private_bound_uses_shared_stream(self):
+        symbol = "SHAREDUSDT"
+        write_events(self.events, [event_row("shared", symbol)])
+        path = write_archive(self.data, symbol, [(1, BASE_MS, "5")])
+        expected = path.stem + ".csv"
+        declared_size = 512_000_001
+        row = b"1,5,1,1,1,%d,false,true\n" % BASE_MS
+
+        class SyntheticArchive:
+            def __init__(self, archive_path, mode):
+                self.member = zipfile.ZipInfo(expected)
+                self.member.file_size = declared_size
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, error_type, error, traceback):
+                return False
+
+            def infolist(self):
+                return [self.member]
+
+        with mock.patch.object(
+            tape_prices.zipfile, "ZipFile", SyntheticArchive
+        ), mock.patch.object(
+            tape_prices.tape_pull,
+            "stream_verified_member",
+            return_value=iter([row]),
+        ) as shared_reader:
+            summary = tape_prices.run_tape_prices(
+                self.events, self.data, self.output
+            )
+
+        self.assertEqual(summary, {"events": 1, "absent": 0, "rows": 1})
+        archive, member, bound = shared_reader.call_args.args
+        self.assertIsInstance(archive, SyntheticArchive)
+        self.assertEqual(member.file_size, declared_size)
+        self.assertEqual(bound, tape_prices.tape_pull.MAX_MEMBER_BYTES)
+
+    def test_shared_ceiling_refusal_has_archive_and_member_identity(self):
+        symbol = "BOUNDUSDT"
+        write_events(self.events, [event_row("bound", symbol)])
+        path = write_archive(self.data, symbol, [(1, BASE_MS, "6")])
+        expected = path.stem + ".csv"
+        ceiling = tape_prices.tape_pull.MAX_MEMBER_BYTES
+        shared_error = tape_prices.tape_pull.ArchiveError(
+            "archive member size is outside bounds",
+            measured_value=ceiling + 1,
+            bound=ceiling,
+        )
+
+        with mock.patch.object(
+            tape_prices.tape_pull,
+            "stream_verified_member",
+            side_effect=shared_error,
+        ):
+            with self.assertRaises(tape_prices.TapePricesError) as raised:
+                tape_prices.run_tape_prices(
+                    self.events, self.data, self.output
+                )
+
+        message = str(raised.exception)
+        self.assertIn(f"{path.name}:{expected}", message)
+        self.assertIn("archive member size is outside bounds", message)
+        self.assertIn(f"measured={ceiling + 1}", message)
+        self.assertIn(f"bound={ceiling}", message)
 
 
 if __name__ == "__main__":
