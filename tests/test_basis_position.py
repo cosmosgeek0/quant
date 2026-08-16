@@ -2138,6 +2138,126 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         self.assertEqual(self.state_path.read_bytes(), before_position)
         self.assertEqual(self.head_path.read_bytes(), before_head)
 
+    def test_br6_offsetting_rung_quantity_drift_freezes_each_rung(self):
+        self.ready()
+        self.append(self.filled(1, spot_quantity="0.1",
+                                short_quantity="0.1"))
+        self.append(self.filled(2, spot_quantity="0.2",
+                                short_quantity="0.2"))
+        observation = self.reconcile_observation(
+            "reconcile-offsetting-rungs", own_overrides={
+                "own-1-spot": {
+                    "client_order_id": "own-1-spot",
+                    "market": "BINANCE_SPOT",
+                    "status": "FILLED",
+                    "executed_quantity": "0.15",
+                },
+                "own-2-spot": {
+                    "client_order_id": "own-2-spot",
+                    "market": "BINANCE_SPOT",
+                    "status": "FILLED",
+                    "executed_quantity": "0.15",
+                },
+            })
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["reduce_only"])
+        self.assertEqual(
+            [rung["reconcile_status"] for rung in derived["rungs"]],
+            ["DRIFTED", "DRIFTED"])
+        self.assertEqual(
+            [row for row in derived["reconcile_rows"]
+             if row["row_type"] == "AGGREGATE_MISMATCH"], [])
+
+    def test_br6_mixed_rung_unknown_withholds_next_rung(self):
+        config = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
+        config["schedule"].append({
+            "ordinal": 3,
+            "entry_gap_pct": "0.65",
+            "quote_cap": "6",
+        })
+        config["caps"] = {"stack_quote": "30", "entry_quote": "10"}
+        self.ready(config)
+        self.append(self.filled(1))
+        self.append(self.filled(2))
+        observation = self.reconcile_observation(
+            "reconcile-mixed-rung-unknown", own_overrides={
+                "own-2-short": {
+                    "client_order_id": "own-2-short",
+                    "market": "BINANCE_USDM",
+                    "status": "UNKNOWN",
+                    "executed_quantity": None,
+                },
+            })
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["reduce_only"])
+        self.assertEqual(
+            [rung["reconcile_status"] for rung in derived["rungs"]],
+            ["CONFIRMED", "UNKNOWN"])
+        self.assertEqual(derived["next_ordinal"], None)
+        self.assertNotIn(
+            {"event_type": "RungFilled", "ordinal": 3},
+            derived["legal_next_transitions"])
+
+    def test_br6_past_age_reconcile_read_refuses_before_append(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-past-age")
+        self.assertEqual(bp.V2_RECONCILE_READ_MAX_AGE_MS, 60_000)
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        with mock.patch.object(
+                bp, "default_now_ms",
+                return_value=observation["observed_at_ms"] + 86_400_000):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "STALE_RECONCILE_READ"):
+                bp.derive_resume(
+                    self.current(), observation,
+                    receipt_dir=self.receipt_dir)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_br6_terminal_status_drift_freezes_with_both_statuses(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-terminal-status", own_overrides={
+                "own-1-spot": {
+                    "client_order_id": "own-1-spot",
+                    "market": "BINANCE_SPOT",
+                    "status": "CANCELED",
+                    "executed_quantity": "0.1",
+                },
+            })
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["reduce_only"])
+        self.assertEqual(derived["rungs"][0]["reconcile_status"],
+                         "DRIFTED")
+        leg = derived["reconcile_rows"][0]["legs"]["spot"]
+        self.assertEqual(leg["status"], "DRIFTED")
+        self.assertEqual(leg["derived_terminal_status"], "FILLED")
+        self.assertEqual(leg["exchange_terminal_status"], "CANCELED")
+
+    def test_br6_spot_balance_conflict_freezes_in_isolation(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-balance-conflict")
+        observation["balances"]["spot_base_free_quantity"] = "0.09"
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertEqual(derived["freeze_reasons"], ["BALANCE_MISMATCH"])
+        rows = [
+            row for row in derived["reconcile_rows"]
+            if row["row_type"] == "BALANCE_MISMATCH"
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["position_total"], "0.1")
+        self.assertEqual(rows[0]["balance_total"], "0.09")
+
     def test_build03_missing_own_order_freezes_as_unknown(self):
         self.ready()
         self.append(self.filled(1))
@@ -2222,6 +2342,42 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         self.assertIn("OPEN_ORDER_STANDING", row_types)
         self.assertIn("RECONCILE_UNKNOWN", derived["freeze_reasons"])
         self.assertIn("OPEN_ORDER_STANDING", derived["freeze_reasons"])
+
+    def assert_open_order_space_freezes(self, field):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-" + field.replace("_client_order_ids", ""))
+        observation["open_orders"][field] = ["external-order"]
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertEqual(derived["freeze_reasons"],
+                         ["OPEN_ORDER_STANDING"])
+        rows = [
+            row for row in derived["reconcile_rows"]
+            if row["row_type"] == "OPEN_ORDER_STANDING"
+        ]
+        self.assertEqual(rows, [{
+            "row_type": "OPEN_ORDER_STANDING",
+            "field": field,
+            "client_order_id": "external-order",
+        }])
+
+    def test_br6_spot_standard_open_order_space_freezes(self):
+        self.assert_open_order_space_freezes(
+            "spot_standard_client_order_ids")
+
+    def test_br6_spot_algorithmic_open_order_space_freezes(self):
+        self.assert_open_order_space_freezes(
+            "spot_algorithmic_client_order_ids")
+
+    def test_br6_futures_standard_open_order_space_freezes(self):
+        self.assert_open_order_space_freezes(
+            "futures_standard_client_order_ids")
+
+    def test_br6_futures_algorithmic_open_order_space_freezes(self):
+        self.assert_open_order_space_freezes(
+            "futures_algorithmic_client_order_ids")
 
     def test_build03_zero_baseline_cannot_be_moved_to_hide_exposure(self):
         self.ready()

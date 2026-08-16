@@ -184,6 +184,9 @@ V2_MIN_EPOCH_MS = 946684800000
 # Exchange observations may lead the local clock by at most two seconds,
 # matching the program's existing public-market future-time allowance.
 V2_EVENT_FUTURE_SKEW_MS = 2000
+# A private reconcile read may be at most one minute old at append time;
+# older account truth cannot confirm the current ledger state.
+V2_RECONCILE_READ_MAX_AGE_MS = 60_000
 # Event zero uses a fixed in-range cut so its digest remains config-bound;
 # every later event must advance beyond this sentinel.
 V2_GENESIS_CUT_MS = V2_MIN_EPOCH_MS
@@ -1935,6 +1938,8 @@ def _v2_reconcile_observed_state(
             elif exchange_status not in V2_TERMINAL_ORDER_STATUSES \
                     or exchange_quantity is None:
                 status = "UNKNOWN"
+            elif exchange_status != expected["terminal_status"]:
+                status = "DRIFTED"
             elif not _v2_quantities_agree(
                     Decimal(expected["executed_quantity"]),
                     Decimal(exchange_quantity)):
@@ -2825,6 +2830,11 @@ def _seal_v2_event_payload(
     if previous_cut is not None and cut <= previous_cut:
         raise PositionError(
             "version-2 event cut is not strictly greater than the prior cut")
+    if event_type == "ReconcileObserved" \
+            and module_now - cut > V2_RECONCILE_READ_MAX_AGE_MS:
+        raise PositionError(
+            "STALE_RECONCILE_READ: version-2 reconcile observation "
+            "exceeds the documented maximum age")
     copied["cut_ms"] = cut
     copied["previous_digest"] = previous_digest
     copied["event_digest"] = V2_GENESIS_DIGEST
