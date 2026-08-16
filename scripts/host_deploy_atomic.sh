@@ -8,13 +8,22 @@ cleanup() {
   [ -z "$RELEASE_TEMP" ] || rm -f -- "$RELEASE_TEMP"
   if [ -n "$WORK_DIR" ]; then
     rm -f -- "$WORK_DIR/entries" "$WORK_DIR/expected" \
-      "$WORK_DIR/actual" "$WORK_DIR/landed" "$WORK_DIR/verified"
+      "$WORK_DIR/actual" "$WORK_DIR/unexpected" "$WORK_DIR/missing" \
+      "$WORK_DIR/landed" "$WORK_DIR/verified"
     rmdir "$WORK_DIR" 2>/dev/null || true
   fi
 }
 refuse() {
   printf 'HOST-DEPLOY | REFUSED | %s\n' "$1" >&2
   exit 2
+}
+refuse_path() {
+  printf 'HOST-DEPLOY | REFUSED | %s | path=%q\n' "$1" "$2" >&2
+  exit 2
+}
+report_manifest_difference() {
+  printf 'HOST-DEPLOY | REFUSED | MANIFEST_STAGE_MISMATCH | %s | path=%s\n' \
+    "$1" "$2" >&2
 }
 device_id() {
   stat -c '%d' -- "$1" 2>/dev/null || stat -f '%d' -- "$1"
@@ -42,7 +51,7 @@ trap 'refuse INTERRUPTED' HUP INT TERM
 [ "$#" -eq 4 ] || \
   refuse USAGE_STAGING_DEPLOY_MANIFEST_RELEASE_SHA
 STAGING_DIR=$1 DEPLOY_DIR=$2 MANIFEST=$3 RELEASE_SHA=$4
-for tool in chmod cmp cut dirname find mkdir mktemp mv realpath sha256sum sort stat; do
+for tool in chmod cmp comm cut dirname find mkdir mktemp mv realpath sha256sum sort stat; do
   command -v "$tool" >/dev/null 2>&1 || refuse "TOOL_UNAVAILABLE_$tool"
 done
 [ -d "$STAGING_DIR" ] && [ ! -L "$STAGING_DIR" ] || \
@@ -59,10 +68,6 @@ DEPLOY_DIR=$(realpath -- "$DEPLOY_DIR") || refuse DEPLOY_DIR_UNRESOLVED
 MANIFEST=$(realpath -- "$MANIFEST") || refuse MANIFEST_UNRESOLVED
 case "$STAGING_DIR/" in "$DEPLOY_DIR/"*) refuse DEPLOY_DIRS_OVERLAP ;; esac
 case "$DEPLOY_DIR/" in "$STAGING_DIR/"*) refuse DEPLOY_DIRS_OVERLAP ;; esac
-MARKER="$DEPLOY_DIR/DEPLOYING"
-if ! (set -C; printf '%s\n' "$RELEASE_SHA" > "$MARKER") 2>/dev/null; then
-  refuse DEPLOYING_MARKER_PRESENT
-fi
 [ "$(device_id "$STAGING_DIR")" = "$(device_id "$DEPLOY_DIR")" ] || \
   refuse CROSS_FILESYSTEM
 [ ! -L "$DEPLOY_DIR/RELEASE" ] && [ ! -d "$DEPLOY_DIR/RELEASE" ] || \
@@ -111,7 +116,7 @@ while IFS= read -r -d '' source; do
   rel=${source#"$STAGING_DIR"/}
   case "$rel" in
     ''|/*|.|..|../*|*/..|*/../*|*[!A-Za-z0-9._/-]*) \
-      refuse STAGING_PATH_UNSAFE ;;
+      refuse_path STAGING_PATH_UNSAFE "$rel" ;;
   esac
   printf '%s\n' "$rel" >> "$WORK_DIR/actual" || refuse WORK_DIR_UNAVAILABLE
 done < <(find "$STAGING_DIR" -type f -print0)
@@ -119,9 +124,24 @@ done < <(find "$STAGING_DIR" -type f -print0)
   refuse STAGING_ENTRY_UNSAFE
 LC_ALL=C sort -o "$WORK_DIR/actual" "$WORK_DIR/actual" || \
   refuse STAGING_SORT_FAILED
-cmp -s "$WORK_DIR/expected" "$WORK_DIR/actual" || \
-  refuse MANIFEST_STAGE_MISMATCH
+if ! cmp -s "$WORK_DIR/expected" "$WORK_DIR/actual"; then
+  LC_ALL=C comm -13 "$WORK_DIR/expected" "$WORK_DIR/actual" \
+    > "$WORK_DIR/unexpected" || refuse MANIFEST_COMPARE_FAILED
+  LC_ALL=C comm -23 "$WORK_DIR/expected" "$WORK_DIR/actual" \
+    > "$WORK_DIR/missing" || refuse MANIFEST_COMPARE_FAILED
+  while IFS= read -r rel; do
+    report_manifest_difference UNEXPECTED_STAGED_PATH "$rel"
+  done < "$WORK_DIR/unexpected"
+  while IFS= read -r rel; do
+    report_manifest_difference MISSING_MANIFEST_PATH "$rel"
+  done < "$WORK_DIR/missing"
+  exit 2
+fi
 : > "$WORK_DIR/landed" || refuse WORK_DIR_UNAVAILABLE
+MARKER="$DEPLOY_DIR/DEPLOYING"
+if ! (set -C; printf '%s\n' "$RELEASE_SHA" > "$MARKER") 2>/dev/null; then
+  refuse DEPLOYING_MARKER_PRESENT
+fi
 while IFS=$'\t' read -r rel digest manifest_mode; do
   source="$STAGING_DIR/$rel"
   target="$DEPLOY_DIR/$rel"

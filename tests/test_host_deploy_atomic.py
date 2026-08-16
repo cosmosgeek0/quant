@@ -1,6 +1,7 @@
 """Shell-level tests for the host atomic-deploy gate."""
 
 import hashlib
+import os
 import shutil
 import stat
 import subprocess
@@ -43,7 +44,7 @@ class TestHostDeployAtomic(unittest.TestCase):
             rows.append(row + "\n")
         self.manifest.write_text("".join(rows), encoding="utf-8")
 
-    def run_deploy(self, release_sha=RELEASE_SHA):
+    def run_deploy(self, release_sha=RELEASE_SHA, env=None):
         return subprocess.run(
             ["bash", str(DEPLOY_SCRIPT), str(self.stage),
              str(self.deploy), str(self.manifest), release_sha],
@@ -52,6 +53,7 @@ class TestHostDeployAtomic(unittest.TestCase):
             text=True,
             timeout=15,
             check=False,
+            env=env,
         )
 
     def test_lands_all_files_then_publishes_release(self):
@@ -145,16 +147,32 @@ class TestHostDeployAtomic(unittest.TestCase):
             OLD_RELEASE_SHA + "\n",
         )
 
-    def test_landed_digest_mismatch_keeps_gate_and_old_release(self):
+    def test_hash_mismatch_after_rename_keeps_gate_and_old_release(self):
         relpath = "src/job_runner.py"
-        self.stage_files(
-            {relpath: b"new runner\n"},
-            {relpath: hashlib.sha256(b"expected runner\n").hexdigest()},
-        )
+        self.stage_files({relpath: b"new runner\n"})
         (self.deploy / "RELEASE").write_text(
             OLD_RELEASE_SHA + "\n", encoding="ascii")
+        shim_dir = self.root / "bin"
+        shim_dir.mkdir()
+        mv_shim = shim_dir / "mv"
+        mv_shim.write_text(
+            "#!/bin/bash\n"
+            "command -p mv \"$@\"\n"
+            "status=$?\n"
+            "[ \"$status\" -eq 0 ] || exit \"$status\"\n"
+            "target=\n"
+            "for value in \"$@\"; do target=$value; done\n"
+            "if [ \"$target\" = \"$HASH_MISMATCH_TARGET\" ]; then\n"
+            "  printf 'changed during rename\\n' >> \"$target\"\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        mv_shim.chmod(0o700)
+        env = os.environ.copy()
+        env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
+        env["HASH_MISMATCH_TARGET"] = str((self.deploy / relpath).resolve())
 
-        result = self.run_deploy()
+        result = self.run_deploy(env=env)
 
         self.assertEqual(result.returncode, 2)
         self.assertIn(
@@ -179,9 +197,48 @@ class TestHostDeployAtomic(unittest.TestCase):
             "HOST-DEPLOY | REFUSED | MANIFEST_STAGE_MISMATCH",
             result.stderr,
         )
-        self.assertTrue((self.deploy / "DEPLOYING").is_file())
+        self.assertIn(
+            "UNEXPECTED_STAGED_PATH | path=src/margin_ops.py",
+            result.stderr,
+        )
+        self.assertFalse((self.deploy / "DEPLOYING").exists())
         self.assertTrue(extra.is_file())
         self.assertFalse((self.deploy / "RELEASE").exists())
+
+    def test_manifest_missing_staged_file_names_path_without_gate(self):
+        files = {
+            "src/job_runner.py": b"runner\n",
+            "src/margin_ops.py": b"margin\n",
+        }
+        self.stage_files(files)
+        missing = self.stage / "src" / "margin_ops.py"
+        missing.unlink()
+
+        result = self.run_deploy()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "MISSING_MANIFEST_PATH | path=src/margin_ops.py",
+            result.stderr,
+        )
+        self.assertFalse((self.deploy / "DEPLOYING").exists())
+        self.assertTrue((self.stage / "src" / "job_runner.py").is_file())
+
+    def test_unsafe_staged_path_names_path_without_gate(self):
+        self.stage_files({"src/job_runner.py": b"runner\n"})
+        unsafe = self.stage / "src" / "margin ops.py"
+        unsafe.write_bytes(b"margin\n")
+
+        result = self.run_deploy()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "HOST-DEPLOY | REFUSED | STAGING_PATH_UNSAFE | "
+            "path=src/margin\\ ops.py",
+            result.stderr,
+        )
+        self.assertFalse((self.deploy / "DEPLOYING").exists())
+        self.assertTrue(unsafe.is_file())
 
     def test_job_tick_refuses_while_marker_is_present(self):
         scripts = self.deploy / "scripts"
