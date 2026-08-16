@@ -598,6 +598,61 @@ def _sum_values(values: Sequence[Mapping[str, Decimal]], name: str) -> Decimal:
     return sum((value[name] for value in values), Decimal("0"))
 
 
+def _cost_reconciliation_detail(
+    event: LabelledEvent,
+    entry_fills: Sequence[Mapping[str, Any]],
+    *,
+    gross_entry: Decimal,
+    gross_exit: Decimal,
+    executed_entry: Decimal,
+    executed_exit: Decimal,
+    entry_fee: Decimal,
+    exit_fee: Decimal,
+    entry_spread: Decimal,
+    exit_spread: Decimal,
+    entry_slippage: Decimal,
+    exit_slippage: Decimal,
+    fee_cost: Decimal,
+    spread_cost: Decimal,
+    slippage_cost: Decimal,
+    total_cost: Decimal,
+    gross_pnl: Decimal,
+    net_pnl: Decimal,
+    cash_net: Decimal,
+) -> str:
+    """Name every Decimal operand used by the reconciliation guard."""
+    stage_index = entry_fills[-1]["stage_index"]
+    fields = (
+        ("fee_in", entry_fee),
+        ("fee_out", exit_fee),
+        ("fee", fee_cost),
+        ("spread_in", entry_spread),
+        ("spread_out", exit_spread),
+        ("spread", spread_cost),
+        ("slippage_in", entry_slippage),
+        ("slippage_out", exit_slippage),
+        ("slippage", slippage_cost),
+        ("total_cost", total_cost),
+        ("gross_in", gross_entry),
+        ("gross_out", gross_exit),
+        ("gross", gross_pnl),
+        ("executed_in", executed_entry),
+        ("executed_out", executed_exit),
+        ("net", net_pnl),
+        ("cash_net", cash_net),
+        ("compared_total_costs", net_pnl),
+        ("compared_total_cash", cash_net),
+        ("difference", cash_net - net_pnl),
+    )
+    detail = " | ".join(
+        f"{name}={decimal_text(value)}" for name, value in fields
+    )
+    return (
+        "cost decomposition does not reconcile | "
+        f"event_id={event.event_id} | stage_index={stage_index} | {detail}"
+    )
+
+
 def simulate_event(
     event: LabelledEvent,
     tape_prices: Sequence[TapePrice],
@@ -774,7 +829,29 @@ def simulate_event(
         net_pnl = gross_pnl - total_cost
         cash_net = executed_exit - executed_entry - fee_cost
         if cash_net != net_pnl:
-            raise PolicySimError("cost decomposition does not reconcile")
+            raise PolicySimError(
+                _cost_reconciliation_detail(
+                    event,
+                    entry_fills,
+                    gross_entry=gross_entry,
+                    gross_exit=gross_exit,
+                    executed_entry=executed_entry,
+                    executed_exit=executed_exit,
+                    entry_fee=entry_fee,
+                    exit_fee=exit_fee,
+                    entry_spread=entry_spread,
+                    exit_spread=exit_spread,
+                    entry_slippage=entry_slippage,
+                    exit_slippage=exit_slippage,
+                    fee_cost=fee_cost,
+                    spread_cost=spread_cost,
+                    slippage_cost=slippage_cost,
+                    total_cost=total_cost,
+                    gross_pnl=gross_pnl,
+                    net_pnl=net_pnl,
+                    cash_net=cash_net,
+                )
+            )
         if executed_entry > policy.max_alloc_usdt:
             raise PolicySimError("entry allocation exceeded policy cap")
         gross_return = gross_pnl / executed_entry * Decimal("100")
@@ -981,7 +1058,13 @@ def tape_price_from_mapping(row: Mapping[str, Any], source: str) -> TapePrice:
     )
 
 
-def load_events(path: Path) -> Tuple[LabelledEvent, ...]:
+def load_events(
+    path: Path, *, limit: Optional[int] = None
+) -> Tuple[LabelledEvent, ...]:
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise PolicySimError("limit must be a positive integer")
     events: List[LabelledEvent] = []
     for line_number, row in _read_jsonl(Path(path), Path(path).name):
         if row.get("kind") == "summary":
@@ -989,6 +1072,8 @@ def load_events(path: Path) -> Tuple[LabelledEvent, ...]:
         events.append(
             event_from_mapping(row, f"{Path(path).name}:{line_number}")
         )
+        if limit is not None and len(events) >= limit:
+            break
     if not events:
         raise PolicySimError("events JSONL has no labelled events")
     return tuple(events)
@@ -1034,8 +1119,10 @@ def run_policy(
     tape_path: Path,
     output_path: Path,
     policy: Policy,
+    *,
+    limit: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], ...]:
-    events = load_events(events_path)
+    events = load_events(events_path, limit=limit)
     prices = load_tape_prices(tape_path)
     rows = simulate_policy(events, prices, policy)
     write_trades(output_path, rows)
@@ -1076,6 +1163,18 @@ def _decimal_argument(raw: str) -> Decimal:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+def _positive_limit(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "limit must be a positive integer"
+        ) from None
+    if value <= 0 or str(value) != raw.strip():
+        raise argparse.ArgumentTypeError("limit must be a positive integer")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="simulate an explicit policy over offline labelled events"
@@ -1083,6 +1182,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--events", type=Path, default=DEFAULT_EVENTS_PATH)
     parser.add_argument("--tape", type=Path, default=DEFAULT_TAPE_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument(
+        "--limit",
+        type=_positive_limit,
+        help=(
+            "process only the first N events; limited results are "
+            "diagnostic only"
+        ),
+    )
     parser.add_argument("--entry-delay-min", type=int, required=True)
     parser.add_argument(
         "--stage",
@@ -1130,14 +1237,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         policy = _policy_from_args(args)
-        rows = run_policy(args.events, args.tape, args.output, policy)
+        rows = run_policy(
+            args.events,
+            args.tape,
+            args.output,
+            policy,
+            limit=args.limit,
+        )
     except PolicySimError as error:
         print(f"POLICY-SIM | REFUSED | {error}", file=sys.stderr)
         return 2
     closed = sum(row["status"] == "CLOSED" for row in rows)
+    diagnostic = " | diagnostic_only=true" if args.limit is not None else ""
     print(
         f"POLICY-SIM | events={len(rows)} | closed={closed} | "
-        f"unknown={len(rows) - closed} | output={args.output}"
+        f"unknown={len(rows) - closed} | output={args.output}{diagnostic}"
     )
     return 0
 

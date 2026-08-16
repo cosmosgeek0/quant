@@ -2,10 +2,13 @@
 """Exact offline tests for the Volume Dataset v2 policy simulator."""
 
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 from study import policy_sim as sim
@@ -69,6 +72,74 @@ def assert_no_float(test, value):
             assert_no_float(test, nested)
 
 
+def cli_fixture(root, event_count):
+    events_path = root / "events.jsonl"
+    tape_path = root / "tape.jsonl"
+    output_path = root / "trades.jsonl"
+    event_rows = [
+        {
+            "event_id": f"runner-{index}",
+            "symbol": SYMBOL,
+            "label": "GenuineRunner",
+            "venue_class": "spot_only",
+            "event_time_ms": BASE_MS,
+        }
+        for index in range(1, event_count + 1)
+    ]
+    tape_rows = [
+        {
+            "symbol": SYMBOL,
+            "venue": "spot",
+            "timestamp_ms": BASE_MS,
+            "price": "100",
+        },
+        {
+            "symbol": SYMBOL,
+            "venue": "spot",
+            "timestamp_ms": BASE_MS + 5 * sim.MINUTE_MS,
+            "price": "100",
+        },
+    ]
+    events_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in event_rows),
+        encoding="utf-8",
+    )
+    tape_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in tape_rows),
+        encoding="utf-8",
+    )
+    return events_path, tape_path, output_path
+
+
+def cli_arguments(events_path, tape_path, output_path):
+    return [
+        "--events",
+        str(events_path),
+        "--tape",
+        str(tape_path),
+        "--output",
+        str(output_path),
+        "--entry-delay-min",
+        "0",
+        "--stage",
+        "1:0",
+        "--max-alloc-usdt",
+        "1000",
+        "--stop-pct",
+        "5",
+        "--final-exit",
+        "5",
+        "--spot-taker-fee",
+        "0",
+        "--perp-taker-fee",
+        "0",
+        "--spread-cost",
+        "0",
+        "--slippage-conservative",
+        "0",
+    ]
+
+
 class PolicySymbolValidationTests(unittest.TestCase):
     def test_fixture_and_plain_ascii_symbols_pass_value_validation(self):
         fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -119,6 +190,26 @@ class PolicySymbolValidationTests(unittest.TestCase):
 
 
 class PolicySimulationTests(unittest.TestCase):
+    def test_reconciling_costs_keep_the_exact_result(self):
+        exact_costs = policy(
+            spread_cost=Decimal("0.125"),
+            slippage_conservative=Decimal("0.125"),
+            spot_taker_fee=Decimal("0.01"),
+            perp_taker_fee=Decimal("0.01"),
+            stop_pct=Decimal("50"),
+        )
+
+        row = sim.simulate_event(
+            event(),
+            (price(0, "100"), price(5, "125")),
+            exact_costs,
+        )
+
+        self.assertEqual(row["status"], "CLOSED")
+        self.assertEqual(row["gross_pnl_usdt"], "200")
+        self.assertEqual(row["total_cost_usdt"], "467.5")
+        self.assertEqual(row["net_pnl_usdt"], "-267.5")
+
     def test_scripted_runner_matches_hand_computed_net_after_every_cost(self):
         fixed = policy(
             entry_delay_min=1,
@@ -281,6 +372,64 @@ class PolicySimulationTests(unittest.TestCase):
         self.assertEqual(row["taker_fee_rate_per_side"], "0.0005")
         self.assertEqual(row["fee_cost_usdt"], "1")
         self.assertEqual(row["net_pnl_usdt"], "-1")
+
+
+class PolicyDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def test_cost_refusal_names_every_compared_number(self):
+        events_path, tape_path, output_path = cli_fixture(self.root, 1)
+        original_exit_fill = sim._exit_fill
+
+        def adjusted_exit_fill(*args, **kwargs):
+            fill, values = original_exit_fill(*args, **kwargs)
+            adjusted = dict(values)
+            adjusted["executed"] -= Decimal("1")
+            return fill, adjusted
+
+        stderr = io.StringIO()
+        with mock.patch.object(sim, "_exit_fill", adjusted_exit_fill):
+            with redirect_stderr(stderr):
+                result = sim.main(
+                    cli_arguments(events_path, tape_path, output_path)
+                )
+
+        expected = (
+            "POLICY-SIM | REFUSED | cost decomposition does not reconcile | "
+            "event_id=runner-1 | stage_index=0 | fee_in=0 | fee_out=0 | "
+            "fee=0 | spread_in=0 | spread_out=0 | spread=0 | "
+            "slippage_in=0 | slippage_out=0 | slippage=0 | total_cost=0 | "
+            "gross_in=1000 | gross_out=1000 | gross=0 | executed_in=1000 | "
+            "executed_out=999 | net=0 | cash_net=-1 | "
+            "compared_total_costs=0 | compared_total_cash=-1 | difference=-1"
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(stderr.getvalue().strip(), expected)
+        self.assertFalse(output_path.exists())
+
+    def test_limit_two_processes_exactly_the_first_two_events(self):
+        events_path, tape_path, output_path = cli_fixture(self.root, 3)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = sim.main(
+                cli_arguments(events_path, tape_path, output_path)
+                + ["--limit", "2"]
+            )
+
+        rows = [
+            json.loads(line)
+            for line in output_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual([row["event_id"] for row in rows], ["runner-1", "runner-2"])
+        self.assertIn("POLICY-SIM | events=2 | closed=2 | unknown=0", stdout.getvalue())
+        self.assertIn("diagnostic_only=true", stdout.getvalue())
 
 
 if __name__ == "__main__":
