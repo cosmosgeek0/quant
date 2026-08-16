@@ -106,6 +106,24 @@ class ReverseLockinShadowTests(unittest.TestCase):
             shadow.METADATA_FILENAME).write_text(
                 json.dumps(metadata), encoding="utf-8")
 
+    def write_basis_inputs(self, symbol):
+        (self.root / shadow.DEPTH_FILENAME).write_text(json.dumps({
+            symbol: {
+                "spot_depth": {
+                    "bids": [["102", "1"]], "asks": [["103", "1"]]},
+                "perp_depth": {
+                    "bids": [["99", "1"]], "asks": [["100", "1"]]},
+            },
+        }), encoding="utf-8")
+        (self.root / shadow.FUNDING_INFO_FILENAME).write_text(json.dumps([
+            {
+                "symbol": symbol,
+                "adjustedFundingRateCap": "0.001",
+                "adjustedFundingRateFloor": "-0.001",
+                "fundingIntervalHours": 8,
+            },
+        ]), encoding="utf-8")
+
     def read_rows(self):
         return [json.loads(line) for line in self.output.read_text(
             encoding="utf-8").splitlines()]
@@ -141,6 +159,10 @@ class ReverseLockinShadowTests(unittest.TestCase):
         self.assertEqual(
             rows[0]["first_failing_gate"], reverse.BORROW_POWER_REQUIRED)
         self.assertIsNone(rows[0]["shadow_assumption"])
+        self.assertEqual(rows[0]["capture_source"], "top_of_book")
+        self.assertEqual(rows[0]["drag_source"], "kernel_default_hold")
+        self.assertEqual(rows[0]["funding_info_source"], "absent")
+        self.assertIsNone(rows[0]["settlements_crossed"])
         self.assertFalse(self.paths.jobs_dir.exists())
 
     def test_assumption_stamps_every_row_and_preserves_direct_intent_id(self):
@@ -167,6 +189,9 @@ class ReverseLockinShadowTests(unittest.TestCase):
         self.assertTrue(all(
             row["shadow_assumption"] == "borrow_power_assumed"
             for row in rows))
+        self.assertTrue(all(row["capture_source"] == "top_of_book"
+                            and row["drag_source"] == "kernel_default_hold"
+                            for row in rows))
         intent_row = next(row for row in rows if row["would_intent"])
 
         candidates = shadow.latest_ok_candidates(self.ledger)
@@ -197,6 +222,24 @@ class ReverseLockinShadowTests(unittest.TestCase):
         raw = self.output.read_text(encoding="utf-8")
         self.assertIn('"quote_notional":"3"', raw)
         self.assertNotIn('"quote_notional":3', raw)
+
+    def test_optional_receipt_inputs_drive_both_stamped_sources(self):
+        self.write_rows([ok_row("TESTUSDT")])
+        self.write_stream({"TESTUSDT": stream_record()})
+        self.write_basis_inputs("TESTUSDT")
+
+        completed = shadow.run_once(
+            self.paths, assume_borrow_power=True)
+
+        row = completed.rows[0]
+        self.assertTrue(row["would_intent"])
+        self.assertEqual(row["expected_capture_pct"], "2")
+        self.assertEqual(row["capture_source"], "depth_walk")
+        self.assertEqual(row["drag_source"], "funding_ruler_worst_case")
+        self.assertEqual(row["funding_info_source"],
+                         shadow.FUNDING_INFO_FILENAME)
+        self.assertEqual(row["settlements_crossed"], 1)
+        self.assertEqual(row["drag_pct"], "0.1004")
 
     def test_latest_ok_row_wins_and_tail_remains_bounded(self):
         old = ok_row("TESTUSDT", "104", "105", "99", "100",
