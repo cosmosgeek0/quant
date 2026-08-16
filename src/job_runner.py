@@ -81,6 +81,12 @@ MARGIN_RECONCILED_FIELDS = {
     "account_liability_before", "account_liability",
     "snapshot_time_note", "utc",
 }
+MARGIN_LEGACY_RECONCILED_FIELDS = (
+    MARGIN_RECONCILED_FIELDS - {"history_watermark"}
+) | {"legacy_exclusivity_proof"}
+MARGIN_LEGACY_EXCLUSIVITY_PROOF_FIELDS = {
+    "kind", "window_start_utc", "window_end_utc", "row_count",
+}
 MARGIN_RECONCILE_UNCONFIRMED_FIELDS = {
     "kind", "job_id", "reason", "utc",
 }
@@ -116,6 +122,9 @@ MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
 MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
 # Margin history type records request origin, not BORROW or REPAY direction.
 MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
+MARGIN_LEGACY_HISTORY_PAGE_SIZE = 100
+MARGIN_LEGACY_HISTORY_PAGE_CAP = 20
+MARGIN_LEGACY_HISTORY_WINDOW_PAD = timedelta(seconds=60)
 MARGIN_DECIMAL_TEXT_MAX = 64
 MARGIN_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 # A zero-borrow residual must stay below both this USDT ceiling and the
@@ -1070,12 +1079,32 @@ def _release_tick_lock(path: str, token: str) -> None:
         pass
 
 
+def _valid_margin_legacy_exclusivity_proof(proof: Any) -> bool:
+    try:
+        if type(proof) is not dict \
+                or set(proof) != MARGIN_LEGACY_EXCLUSIVITY_PROOF_FIELDS \
+                or proof.get("kind") != "LEGACY_EXCLUSIVITY_PROOF" \
+                or type(proof.get("window_start_utc")) is not str \
+                or type(proof.get("window_end_utc")) is not str \
+                or type(proof.get("row_count")) is not int \
+                or proof["row_count"] != 1:
+            return False
+        return _timestamp(proof["window_start_utc"]) \
+            <= _timestamp(proof["window_end_utc"])
+    except Exception:
+        return False
+
+
 def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
     try:
+        fields = set(row)
+        legacy = fields == MARGIN_LEGACY_RECONCILED_FIELDS
         transaction_number = _margin_transaction_number(
             row.get("transaction_id")
         )
-        if set(row) != MARGIN_RECONCILED_FIELDS \
+        if fields not in (
+                MARGIN_RECONCILED_FIELDS,
+                MARGIN_LEGACY_RECONCILED_FIELDS) \
                 or row.get("kind") != "RECONCILED_FROM_EXCHANGE_TRUTH" \
                 or any(type(row.get(name)) is not str for name in (
                     "job_id", "op", "asset", "verdict", "reason",
@@ -1085,14 +1114,20 @@ def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
                 or row["op"] not in MARGIN_OPS \
                 or row["asset"] not in MARGIN_ASSET_WHITELIST \
                 or not row["reason"] \
-                or type(row.get("history_watermark")) is not int \
-                or row["history_watermark"] < 0 \
                 or transaction_number is None \
-                or transaction_number <= row["history_watermark"] \
                 or row["snapshot_time_note"] not in {
                     MARGIN_SNAPSHOT_TIME_VERIFIED,
                     MARGIN_SNAPSHOT_TIME_UNVERIFIED,
                 }:
+            return False
+        if legacy:
+            proof = row.get("legacy_exclusivity_proof")
+            if not _valid_margin_legacy_exclusivity_proof(proof) \
+                    or proof["window_end_utc"] != row["utc"]:
+                return False
+        elif type(row.get("history_watermark")) is not int \
+                or row["history_watermark"] < 0 \
+                or transaction_number <= row["history_watermark"]:
             return False
         request_type = "BORROW" \
             if row["op"] == margin_ops.MARGIN_BORROW else "REPAY"
@@ -1155,7 +1190,9 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
 
     reconciled: Dict[str, Tuple[int, Dict[str, Any]]] = {}
     for index, row in enumerate(rows):
-        if set(row) != MARGIN_RECONCILED_FIELDS:
+        if set(row) not in (
+                MARGIN_RECONCILED_FIELDS,
+                MARGIN_LEGACY_RECONCILED_FIELDS):
             continue
         if not _valid_margin_reconciled_row(row) \
                 or row["job_id"] in reconciled:
@@ -1211,7 +1248,9 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                     )):
                 return set(), True, False
             continue
-        if fields == MARGIN_RECONCILED_FIELDS:
+        if fields in (
+                MARGIN_RECONCILED_FIELDS,
+                MARGIN_LEGACY_RECONCILED_FIELDS):
             continue
         if fields == MARGIN_RECONCILE_UNCONFIRMED_FIELDS:
             if row.get("kind") != "RECONCILE_UNCONFIRMED" \
@@ -3701,6 +3740,108 @@ def _margin_history_snapshot(
         return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
 
 
+def _margin_history_epoch_milliseconds(
+        value: datetime, round_up: bool = False) -> int:
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = value.astimezone(timezone.utc) - epoch
+    microseconds = (
+        (delta.days * 86400 + delta.seconds) * 1_000_000
+        + delta.microseconds
+    )
+    return (microseconds + 999) // 1000 if round_up \
+        else microseconds // 1000
+
+
+def _margin_legacy_exclusivity_snapshot(
+        transport: Callable[..., Tuple[str, Any]], base_url: str,
+        endpoint_path: str, asset: str, transaction_id: str,
+        mutation_started_utc: Any, now: datetime) \
+        -> Tuple[str, Dict[str, Any], List[int], Optional[Dict[str, Any]]]:
+    """Prove one legacy receipt owns the only row in its full window."""
+    try:
+        try:
+            mutation_started = _timestamp(mutation_started_utc)
+        except (JobRefusal, TypeError):
+            return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+        target = _margin_transaction_number(transaction_id)
+        if target is None or mutation_started > now:
+            return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+        window_start = mutation_started - MARGIN_LEGACY_HISTORY_WINDOW_PAD
+        # Millisecond request bounds cover the full recorded UTC window.
+        window_start_ms = str(_margin_history_epoch_milliseconds(
+            window_start
+        ))
+        window_end_ms = str(_margin_history_epoch_milliseconds(
+            now, round_up=True
+        ))
+        payloads = {}
+        identifiers = []
+        for request_type in ("BORROW", "REPAY"):
+            rows = []
+            total = None
+            complete = False
+            for page in range(1, MARGIN_LEGACY_HISTORY_PAGE_CAP + 1):
+                result = transport(
+                    "GET", base_url, endpoint_path, {
+                        "asset": asset,
+                        "type": request_type,
+                        "startTime": window_start_ms,
+                        "endTime": window_end_ms,
+                        "current": str(page),
+                        "size": str(MARGIN_LEGACY_HISTORY_PAGE_SIZE),
+                    }, True,
+                )
+                if type(result) is not tuple or len(result) != 2 \
+                        or result[0] != "ok":
+                    return "MARGIN_CONFIRMATION_UNREADABLE", {}, [], None
+                payload = result[1]
+                if type(payload) is not dict:
+                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                page_rows = payload.get("rows", [])
+                page_total = payload.get("total")
+                if type(page_rows) is not list \
+                        or len(page_rows) > MARGIN_LEGACY_HISTORY_PAGE_SIZE \
+                        or page_total is not None \
+                        and (type(page_total) is not int or page_total < 0):
+                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                page_identifiers = _margin_history_transaction_ids(
+                    {"rows": page_rows}, asset
+                )
+                if page_identifiers is None:
+                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                if page_total is not None:
+                    if total is None:
+                        total = page_total
+                    elif total != page_total:
+                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                rows.extend(page_rows)
+                identifiers.extend(page_identifiers)
+                if total is not None and len(rows) > total:
+                    return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                complete = len(page_rows) < MARGIN_LEGACY_HISTORY_PAGE_SIZE \
+                    or total is not None and len(rows) == total
+                if complete:
+                    if total is not None and len(rows) != total:
+                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                    if page == MARGIN_LEGACY_HISTORY_PAGE_CAP:
+                        return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+                    break
+            if not complete:
+                return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+            payloads[request_type] = {"rows": rows}
+        if identifiers != [target]:
+            return "LEGACY_WINDOW_NOT_EXCLUSIVE", {}, [], None
+        proof = {
+            "kind": "LEGACY_EXCLUSIVITY_PROOF",
+            "window_start_utc": _utc_text(window_start),
+            "window_end_utc": _utc_text(now),
+            "row_count": len(identifiers),
+        }
+        return "", payloads, identifiers, proof
+    except Exception:
+        return "MARGIN_CONFIRMATION_UNREADABLE", {}, [], None
+
+
 def _margin_history_fence_status(
         identifiers: Any, transaction_id: Any, watermark: Any) -> str:
     try:
@@ -4946,6 +5087,7 @@ def _validate_known_margin_artifact_fields(
             "account_liability": dict, "authority_digests": dict,
             "authority_stop_jobs_present": bool,
             "history_watermark": int,
+            "legacy_exclusivity_proof": dict,
         },
         "LOCK": {"version": int},
     }.get(artifact, {})
@@ -5305,7 +5447,9 @@ def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
     matches = []
     reconciliations = []
     for index, row in enumerate(rows):
-        if set(row) == MARGIN_RECONCILED_FIELDS \
+        if set(row) in (
+                MARGIN_RECONCILED_FIELDS,
+                MARGIN_LEGACY_RECONCILED_FIELDS) \
                 and row.get("job_id") == job_id:
             if not _valid_margin_reconciled_row(row):
                 raise JobRefusal("RESULT_RECONCILIATION_INVALID")
@@ -5407,7 +5551,8 @@ def _load_margin_reconcile_facts(
         paths: Dict[str, str], receipt_dir: str, job_id: str) \
         -> Tuple[
             str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any],
-            Dict[str, str], Dict[str, str], Dict[str, str], str, int, str,
+            Dict[str, str], Dict[str, str], Dict[str, str], str,
+            Optional[int], str,
         ]:
     source_path = os.path.join(
         paths["receipts"], "margin-%s.json" % job_id
@@ -5486,10 +5631,17 @@ def _load_margin_reconcile_facts(
         and _margin_transaction_number(transaction_id) is not None,
         "MARGIN_TRANSACTION_MISSING",
     )
-    history_watermark = source.get("history_watermark")
+    # Receipts written before RELEASE ca13e37 have no watermark field.
+    history_watermark = None
+    if "history_watermark" in source:
+        history_watermark = source["history_watermark"]
+        _release_require(
+            type(history_watermark) is int and history_watermark >= 0,
+            "HISTORY_WATERMARK_MISSING",
+        )
     _release_require(
-        type(history_watermark) is int and history_watermark >= 0,
-        "HISTORY_WATERMARK_MISSING",
+        "legacy_exclusivity_proof" not in source,
+        "SOURCE_LEGACY_EXCLUSIVITY_PROOF_UNEXPECTED",
     )
     _release_require(
         type(source.get("mutation_attempts")) is int
@@ -5609,6 +5761,8 @@ def reconcile_margin(
         liability_before, transaction_id, history_watermark,
         governor_token,
     ) = facts
+    legacy_exclusivity_proof = None
+    evaluation_watermark = history_watermark
 
     try:
         transport = request or basis_executor.live_request_factory(
@@ -5651,13 +5805,28 @@ def reconcile_margin(
             return _margin_reconcile_unconfirmed(
                 paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
             )
-        # The exact-id read binds the target row.  The unfiltered two-way
-        # snapshot retains the deployed cross-direction activity fence.
-        history_reason, _history_after, history_identifiers = \
-            _margin_history_snapshot(
-                transport, basis_executor.SPOT.base_url,
-                ready["endpoint_path"], params["asset"],
-            )
+        # The exact-id read binds the target row. Modern receipts retain the
+        # deployed watermark fence. Legacy receipts use their stricter full
+        # window proof only when the durable watermark field is absent.
+        if history_watermark is None:
+            history_reason, _history_after, history_identifiers, \
+                legacy_exclusivity_proof = \
+                _margin_legacy_exclusivity_snapshot(
+                    transport, basis_executor.SPOT.base_url,
+                    ready["endpoint_path"], params["asset"], transaction_id,
+                    source.get("mutation_started_utc"), now,
+                )
+            transaction_number = _margin_transaction_number(transaction_id)
+            if not history_reason and transaction_number is not None:
+                # This adapter is evaluation-only and is never persisted as a
+                # historical watermark. Exclusivity already proved one row.
+                evaluation_watermark = transaction_number - 1
+        else:
+            history_reason, _history_after, history_identifiers = \
+                _margin_history_snapshot(
+                    transport, basis_executor.SPOT.base_url,
+                    ready["endpoint_path"], params["asset"],
+                )
         if history_reason:
             return _margin_reconcile_unconfirmed(
                 paths, job_id, history_reason, now
@@ -5670,7 +5839,7 @@ def reconcile_margin(
     account_before_payload = {"userAssets": [liability_before]}
     confirmation = _evaluate_margin_confirmation(
         history_payload, history_identifiers, transaction_id,
-        history_watermark, expected, params["type"], liability_before,
+        evaluation_watermark, expected, params["type"], liability_before,
         account_before_payload, account_result[1],
     )
     if confirmation.verdict == "UNKNOWN" \
@@ -5694,6 +5863,9 @@ def reconcile_margin(
         source_final.pop("follow_up_repay", None)
     else:
         source_final["follow_up_repay"] = confirmation.follow_up_repay
+    if legacy_exclusivity_proof is not None:
+        source_final["legacy_exclusivity_proof"] = \
+            legacy_exclusivity_proof
     runner_final = dict(runner)
     runner_final.update({
         "verdict": confirmation.verdict,
@@ -5708,13 +5880,16 @@ def reconcile_margin(
         "verdict": confirmation.verdict,
         "reason": confirmation.reason,
         "transaction_id": transaction_id,
-        "history_watermark": history_watermark,
         "ledger_confirmation": confirmation.ledger_confirmation,
         "account_liability_before": liability_before,
         "account_liability": confirmation.account_liability,
         "snapshot_time_note": confirmation.snapshot_time_note,
         "utc": _utc_text(now),
     }
+    if legacy_exclusivity_proof is None:
+        event["history_watermark"] = history_watermark
+    else:
+        event["legacy_exclusivity_proof"] = legacy_exclusivity_proof
     try:
         _persist_margin_source(source_path, source_final)
         _persist_json_receipt(runner_path, runner_final)
@@ -5859,12 +6034,22 @@ def _attest_stuck_margin_lock(
             "governor_token", "governor_release", "authority_checked_utc",
             "authority_digests", "authority_stop_jobs_present",
         }
-        if "history_watermark" in source:
+        has_history_watermark = "history_watermark" in source
+        has_legacy_exclusivity_proof = \
+            "legacy_exclusivity_proof" in source
+        if has_history_watermark:
             source_fields.add("history_watermark")
             _release_require(
                 type(source["history_watermark"]) is int
                 and source["history_watermark"] >= 0,
                 "SOURCE_HISTORY_WATERMARK_MISMATCH",
+            )
+        if has_legacy_exclusivity_proof:
+            source_fields.add("legacy_exclusivity_proof")
+            _release_require(
+                _valid_margin_legacy_exclusivity_proof(
+                    source["legacy_exclusivity_proof"]),
+                "SOURCE_LEGACY_EXCLUSIVITY_PROOF_MISMATCH",
             )
         if already_released:
             source_fields.add("governor_released_utc")
@@ -5927,6 +6112,26 @@ def _attest_stuck_margin_lock(
         if result["verdict"] == "OPEN":
             principal = _canonical_decimal_text(validated.requested_max_notional)
             submission = source["submission"]
+            _release_require(
+                has_history_watermark != has_legacy_exclusivity_proof,
+                "SOURCE_HISTORY_PROOF_MISMATCH",
+            )
+            if has_legacy_exclusivity_proof:
+                proof = source["legacy_exclusivity_proof"]
+                try:
+                    expected_window_start = _utc_text(
+                        _timestamp(source["mutation_started_utc"])
+                        - MARGIN_LEGACY_HISTORY_WINDOW_PAD
+                    )
+                except (JobRefusal, TypeError):
+                    raise JobRefusal(
+                        "SOURCE_LEGACY_EXCLUSIVITY_PROOF_MISMATCH"
+                    ) from None
+                _release_require(
+                    proof["window_start_utc"] == expected_window_start
+                    and proof["window_end_utc"] == source["finished_utc"],
+                    "SOURCE_LEGACY_EXCLUSIVITY_PROOF_MISMATCH",
+                )
             _release_require(source["snapshot_time_note"] in {
                 MARGIN_SNAPSHOT_TIME_VERIFIED,
                 MARGIN_SNAPSHOT_TIME_UNVERIFIED,

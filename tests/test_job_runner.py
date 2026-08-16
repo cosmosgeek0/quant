@@ -627,6 +627,17 @@ class JobRunnerTests(unittest.TestCase):
         }
 
     @staticmethod
+    def make_margin_reconcile_receipt_legacy(artifacts):
+        source_path = artifacts["source_path"]
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        source.pop("history_watermark")
+        Path(source_path).write_text(
+            json.dumps(source, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return source
+
+    @staticmethod
     def margin_halt_row(job_id, token, verdict, source_exists):
         return {
             "kind": "margin_governor_release_halted", "job_id": job_id,
@@ -2814,9 +2825,10 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "STOP-JOBS"
         )))
 
-    def test_reconcile_margin_real_exchange_shape_opens_and_releases(self):
+    def test_reconcile_margin_legacy_receipt_opens_and_releases(self):
         job_id = "mproof-b668c154de2c"
         artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        legacy_source = self.make_margin_reconcile_receipt_legacy(artifacts)
         real_row = {
             "txId": 401344857108,
             "asset": "USDT",
@@ -2854,12 +2866,28 @@ class JobRunnerTests(unittest.TestCase):
             (
                 "GET", jr.basis_executor.SPOT.base_url,
                 jr.MARGIN_ENDPOINT_PATH,
-                {"asset": "USDT", "type": "BORROW"}, True,
+                {
+                    "asset": "USDT", "type": "BORROW",
+                    "startTime": str(int(
+                        (NOW - timedelta(seconds=60)).timestamp() * 1000
+                    )),
+                    "endTime": str(int(NOW.timestamp() * 1000)),
+                    "current": "1",
+                    "size": str(jr.MARGIN_LEGACY_HISTORY_PAGE_SIZE),
+                }, True,
             ),
             (
                 "GET", jr.basis_executor.SPOT.base_url,
                 jr.MARGIN_ENDPOINT_PATH,
-                {"asset": "USDT", "type": "REPAY"}, True,
+                {
+                    "asset": "USDT", "type": "REPAY",
+                    "startTime": str(int(
+                        (NOW - timedelta(seconds=60)).timestamp() * 1000
+                    )),
+                    "endTime": str(int(NOW.timestamp() * 1000)),
+                    "current": "1",
+                    "size": str(jr.MARGIN_LEGACY_HISTORY_PAGE_SIZE),
+                }, True,
             ),
         ])
         self.assertEqual(self.governor_releases, [(
@@ -2886,7 +2914,19 @@ class JobRunnerTests(unittest.TestCase):
         ])
         event = rows[1]
         self.assertEqual(event["transaction_id"], "401344857108")
-        self.assertEqual(event["history_watermark"], 0)
+        proof = {
+            "kind": "LEGACY_EXCLUSIVITY_PROOF",
+            "window_start_utc": utc(
+                datetime.fromisoformat(
+                    legacy_source["mutation_started_utc"][:-1] + "+00:00"
+                ) - timedelta(seconds=60)
+            ),
+            "window_end_utc": utc(NOW),
+            "row_count": 1,
+        }
+        self.assertNotIn("history_watermark", source)
+        self.assertEqual(source["legacy_exclusivity_proof"], proof)
+        self.assertEqual(event["legacy_exclusivity_proof"], proof)
         self.assertEqual(event["account_liability"],
                          source["account_liability"])
         self.assertEqual((rows[-1]["verdict"], rows[-1]["exit_code"]), (
@@ -2896,6 +2936,109 @@ class JobRunnerTests(unittest.TestCase):
             jr._result_ids(jr._paths(self.receipt_dir)["results"]),
             ({job_id}, False, False),
         )
+
+    def test_reconcile_margin_legacy_second_transaction_refuses(self):
+        job_id = "margin-reconcile-legacy-second"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        self.make_margin_reconcile_receipt_legacy(artifacts)
+        target = {
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        unrelated = dict(target, txId=401344857109, principal="1")
+        self.margin.history_payload = {"rows": [target, unrelated]}
+        originals = {
+            name: Path(artifacts[name]).read_bytes()
+            for name in ("source_path", "runner_path", "lock_path")
+        }
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_WINDOW_NOT_EXCLUSIVE"
+        )
+        for name, encoded in originals.items():
+            self.assertEqual(Path(artifacts[name]).read_bytes(), encoded)
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_legacy_page_cap_refuses(self):
+        job_id = "margin-reconcile-legacy-page-cap"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        self.make_margin_reconcile_receipt_legacy(artifacts)
+        target = {
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        page_calls = []
+
+        def capped_reads(method, base_url, path, params, signed):
+            self.assertEqual(
+                (method, base_url, signed),
+                ("GET", jr.basis_executor.SPOT.base_url, True),
+            )
+            if path == jr.MARGIN_ACCOUNT_PATH:
+                return "ok", self.margin.account_payload
+            if params.get("txId") == "401344857108":
+                return "ok", {"rows": [target]}
+            page_calls.append(dict(params))
+            page = int(params["current"])
+            return "ok", {"rows": [dict(
+                target, txId=401344857107 + page
+            )]}
+
+        with mock.patch.object(
+                jr, "MARGIN_LEGACY_HISTORY_PAGE_SIZE", 1), \
+                mock.patch.object(
+                    jr, "MARGIN_LEGACY_HISTORY_PAGE_CAP", 2):
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, capped_reads
+            ), 3)
+
+        self.assertEqual([row["current"] for row in page_calls], ["1", "2"])
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_WINDOW_NOT_EXCLUSIVE"
+        )
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_modern_receipt_skips_legacy_branch(self):
+        job_id = "margin-reconcile-modern"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        self.margin.history_payload = {"rows": [{
+            "txId": 401344857108,
+            "asset": "USDT",
+            "principal": "2.5",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }]}
+
+        with mock.patch.object(
+                jr, "_margin_legacy_exclusivity_snapshot",
+                side_effect=AssertionError("legacy branch was entered")
+                ) as legacy_snapshot:
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, self.margin
+            ), 0)
+
+        legacy_snapshot.assert_not_called()
+        with open(artifacts["source_path"], encoding="utf-8") as handle:
+            source = json.load(handle)
+        self.assertEqual(source["history_watermark"], 0)
+        self.assertNotIn("legacy_exclusivity_proof", source)
+        event = self.result_events("RECONCILED_FROM_EXCHANGE_TRUTH")[0]
+        self.assertEqual(event["history_watermark"], 0)
+        self.assertNotIn("legacy_exclusivity_proof", event)
 
     def test_reconcile_margin_without_transaction_id_refuses_before_reads(self):
         job_id = "margin-reconcile-no-transaction"
