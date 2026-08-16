@@ -1,0 +1,23 @@
+FEED -> STREAM ACCEPTANCE (SM1) — host proof, 2026-08-16, worker 6.0 seat | machine SEALED (STOP-JOBS present, STOP absent) + FLAT at last read; no order, transfer, leverage change or ticket by this seat | all rows MEASURED by read-only host reads unless labeled
+
+BEFORE (host read 14:41Z, release 7b283a06d2db7cb773827e74d2f25ec13e10f405)
+feed_state.json | mtime age 102 ms | connections.spot healthy dropped_frames 54782 | connections.perp healthy dropped_frames 10944 | symbols 656 | BTCUSDT freshness_ms 3958, ETHUSDT 1796, both legs bid+ask present, book_age_ms null in the feed rows
+stream_state.json | mtime age 70 s | 656 rows | BTCUSDT book_age_ms 8462, ETHUSDT 13082 | executable_gaps.jsonl last 400 rows: spot_age_ms = perp_age_ms = 9838, age_source book_age_ms, result SPOT_QUOTE_STALE
+cause (reproduced offline by five independent read-only lanes D1-D5, then fixed) | run_once handed the stale pass_start_ms to load_fresh_feed_state after 10-15 s of bulk REST reads: written_ms - pass_start_ms > FUTURE_SKEW_MS -> written_ms_future -> whole feed refused -> REST books; and the final age math added the whole pass duration to feed book ages
+
+DEPLOY (sealed, one file, atomic tool /home/ssm-user/host_deploy_atomic.sh, sha256 5e3601d78153c52c... = repo scripts/host_deploy_atomic.sh)
+payload | src/market_stream.py sha256 05d64d7289b8384e87501c4176114091be684b54ddd4366f7d6a059ec205dfbf mode 644 | manifest one row | stage /home/ssm-user/quant-run/sm1-74955571 | XFER_VERIFIED both files
+result 16:29:07Z | HOST-DEPLOY | LANDED path=src/market_stream.py sha256 05d64d72... mode 644 | HOST-DEPLOY | OK files=1 release=7495557122a1d5eff792cdddc22929ebc676071f | DEPLOYING absent after | RELEASE = 7495557122a1d5eff792cdddc22929ebc676071f
+runner bytes on host unchanged (f4fa89fa release lineage); feed daemon untouched (release 7b283a06 file)
+
+AFTER (host reads 16:32-16:38Z)
+tick pass 16:32:11Z (first pass on the new file) | 357 both-venue rows book_age_ms min 7282 median 7282 max 11287; le_1000 0, le_5000 0, gt_5000 357 | gaps last 400 rows: result SPOT_QUOTE_STALE 400, age_source book_age_ms 400 | BTCUSDT book_age 7282 basis present, ETHUSDT 7282 basis present (was null)
+loader check 16:36:50Z (deployed load_fresh_feed_state on the live feed file, read-only) | reason=accepted snapshot=True | version 1, written_ms age 1896 ms, symbols 656 | per-symbol freshness_ms n=656 min 2 p50 6601 p95 94814 max 825390, over 5000: 386, none 0
+scratch pass 16:38Z (deployed src/market_stream.py --once into /home/ssm-user/quant-run/probe/scratch, public reads only, runtime files untouched) | stdout: feed_used=yes reason=accepted | 656 rows, 357 pairs, book_age_ms min 8182 p50 8182 p95 12352 max 12726, le_1000 0, le_5000 0 | BTCUSDT 12650 (feed pair), ETHUSDT 8182, SOLUSDT 8182 (REST pairs) | freshness_ms 53177 (volume/OI term)
+feed at 16:38Z | connections.spot healthy dropped_frames 203227 | connections.perp healthy dropped_frames 33412 | mtime age 330 ms | BTCUSDT freshness 1969, ETHUSDT 1798
+
+READING (INFERRED from the numbers above and the code path)
+the stream now accepts the feed (feed_used=yes) — the SM1 defect is closed; the published pair ages stay 8-13 s because the pass reads books BEFORE the ~7-8 s focus REST phase and publishes after it (REST pairs uniform = pass-relative; a merged feed pair = its total age + the focus phase); the feed's own per-symbol freshness (p50 6.6 s, 386/656 over the 5 s bound) is limited by the bounded-queue drops that evict a shard's newest frame (study FQ1)
+next smallest moves | SM2 = read the feed's books late in the pass, right before completion (stream file, ~40 lines, built offline as card B2, review pending) | FB1 = coalesce one pending latest book per symbol so drops stop aging quiet symbols (feed file, built offline FB1..FB1c, review round 3 pending; NOT-DEPLOY-SAFE until clean) | each needs its own owner line to deploy
+
+account truth | STOP-JOBS present, STOP absent at every read; no signed balance/position read taken by this seat (last SEALED + FLAT read 11:00Z, worker 5.0) | UNVERIFIED beyond the flags
