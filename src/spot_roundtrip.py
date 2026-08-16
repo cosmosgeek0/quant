@@ -37,6 +37,14 @@ def d(value):
 def fmt(value): return format(value, "f")
 
 
+
+def balances_of(acct, *assets):
+    """TEMPORARY (Lead, W1 landed): kept only for job_runner's Spot-momentum
+    path until W6D routes it through execution.binance_spot.read_account_state
+    and deletes this use (map rows 006, 007, 121)."""
+    free = {b["asset"]: d(b["free"]) for b in acct.get("balances", [])}
+    return {a: free.get(a, Decimal(0)) for a in assets}
+
 def floor_step(quantity, step):
     if not isinstance(quantity, Decimal) or not isinstance(step, Decimal) or step <= 0: raise ValueError("quantity and step must be positive Decimals")
     return (quantity // step) * step
