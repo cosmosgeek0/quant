@@ -1,0 +1,20 @@
+WHAT THE VOLUME TAPE TEST DID — plain words, for the owner to read later (2026-08-16)
+
+WHAT WAS BEING TESTED
+- Your volume thesis: dead tokens that suddenly get bought. The question the commander set: if the machine enters on its own alarms and exits by simple rules, does it make money after real fees, out of sample?
+
+WHAT WAS BUILT TO ANSWER IT (all on the Mac, no live money)
+- Pulled Binance's public history: six months of 1-minute candles for all 659 tokens, plus the raw trade tape (29 GB) for the minutes before every real pump.
+- Census: 3,429 real pumps in six months (+25% in a day on 3x volume). 846 HELD, 2,583 COLLAPSED (78% give back half or more within a day). 64% launched from the bottom of their yearly range — your dead-low class is where pumps start.
+- Signals before the pump: in the two days before real pumps, 4 of 5 "absorption" signals fired (buying without price moving, smaller prints, price pinned). Median lead time ~47 hours. BUT the same signals fire before the ones that collapse too — nothing measured could tell HELD from COLLAPSED in advance.
+- The raw tape did show your accumulation signature (smaller prints, pinned price, bursty arrivals; AUC 0.78 base-vs-control) — but coarse cutoffs gave only ~7% precision.
+- Then the money test: enter on the machine's actual alarms, exit with the ladders. Result: LOSES 6 to 9 percentage-points per symbol-day at every setting; 62% of entries stop out. From KNOWN pump bases the same ladders win 99% — so all the money is in picking the base, and nothing measured picks it.
+
+WHAT THE LAST RUN DID (the one killed today)
+- The full "policy simulation" over all 199,095 events refused after 3+ hours: its own arithmetic guard said the cost pieces did not add up. A diagnostic was written so the refusal names the numbers (V6). The 200-event diagnostic run was killed after 1h40m with zero output — reading the 35 GB tape file was the SSD load, not the event count. So the commander's out-of-sample number was NEVER produced. Best reading of the refusal (not measured on the banked events): a 1e-50 rounding remainder between two ways of summing the same costs.
+
+WHAT IT COST YOU
+- Zero live money. Several terabytes of SSD reads and about a day of compute. Data stays on disk (35 GB tape prices, 29 GB episode tape, census results) — untouched now.
+
+WHAT REMAINS YOURS
+- PARK volume, or ONE bounded probe later (seconds-resolution exits, tape-based). No volume job runs on the Mac now.
