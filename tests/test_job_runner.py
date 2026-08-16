@@ -102,6 +102,7 @@ class MarginTransport:
         self.history_payload = None
         self.history_before_payloads = {}
         self.history_after_payloads = {}
+        self.history_after_sequences = {}
         self.account_kind = "ok"
         self.account_before_payload = None
         self.account_payload = None
@@ -124,6 +125,9 @@ class MarginTransport:
                     request_type, {"rows": []}
                 )
                 return self.history_kind, payload
+            sequence = self.history_after_sequences.get(request_type)
+            if sequence:
+                return self.history_kind, sequence.pop(0)
             if request_type in self.history_after_payloads:
                 return (
                     self.history_kind,
@@ -235,6 +239,7 @@ class JobRunnerTests(unittest.TestCase):
         self.hand_exit = 0
         self.leverage = LeverageTransport(self.events)
         self.margin = MarginTransport()
+        self.margin_sleep_delays = []
         self.momentum_reads = MomentumReadTransport(self.events)
         self.momentum_intents = []
         self.momentum_order = None
@@ -436,7 +441,11 @@ class JobRunnerTests(unittest.TestCase):
     def margin_tick(self, mutation_now=NOW, request=None):
         transport = request or self.margin
         transport.operation = None
-        with mock.patch.object(jr, "_utc_now", return_value=mutation_now):
+        with mock.patch.object(jr, "_utc_now", return_value=mutation_now), \
+                mock.patch.object(
+                    jr.time, "sleep",
+                    side_effect=self.margin_sleep_delays.append,
+                ):
             return self.tick(margin_request=transport)
 
     def results(self):
@@ -2038,6 +2047,96 @@ class JobRunnerTests(unittest.TestCase):
             {"asset": "USDT", "type": "REPAY"},
         ])
 
+    def test_margin_history_retry_then_visible_confirms(self):
+        target = {
+            "txId": 7301,
+            "asset": "USDT",
+            "principal": "3",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        self.margin.history_after_sequences["BORROW"] = [
+            {"rows": []},
+            {"rows": [target]},
+        ]
+        self.margin_job("margin-history-retry-visible")
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(self.margin_tick(), 0)
+
+        attempts = []
+        for call in output.call_args_list:
+            if len(call.args) != 1 or type(call.args[0]) is not str \
+                    or not call.args[0].startswith("{"):
+                continue
+            row = json.loads(call.args[0])
+            if row.get("kind") == "margin_history_confirmation_attempt":
+                attempts.append(row)
+        self.assertEqual(self.margin_sleep_delays, [1])
+        self.assertEqual(attempts, [{
+            "kind": "margin_history_confirmation_attempt",
+            "job_id": "margin-history-retry-visible",
+            "direction": "BORROW",
+            "transaction_id": "7301",
+            "attempt": 1,
+            "max_attempts": 4,
+            "delay_seconds": 0,
+            "status": "IDENTITY_NOT_VISIBLE",
+            "utc": utc(NOW),
+        }, {
+            "kind": "margin_history_confirmation_attempt",
+            "job_id": "margin-history-retry-visible",
+            "direction": "BORROW",
+            "transaction_id": "7301",
+            "attempt": 2,
+            "max_attempts": 4,
+            "delay_seconds": 1,
+            "status": "IDENTITY_VISIBLE",
+            "utc": utc(NOW),
+        }])
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("OPEN", "BORROW_CONFIRMED"),
+        )
+
+    def test_margin_history_never_visible_stays_unknown(self):
+        self.margin.history_payload = {"rows": []}
+        self.margin_job("margin-history-never-visible")
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(self.margin_tick(), 4)
+
+        attempts = []
+        for call in output.call_args_list:
+            if len(call.args) != 1 or type(call.args[0]) is not str \
+                    or not call.args[0].startswith("{"):
+                continue
+            row = json.loads(call.args[0])
+            if row.get("kind") == "margin_history_confirmation_attempt":
+                attempts.append(row)
+        self.assertEqual(self.margin_sleep_delays, [1, 2, 4])
+        self.assertEqual(
+            [row["attempt"] for row in attempts], [1, 2, 3, 4]
+        )
+        self.assertEqual(
+            [row["delay_seconds"] for row in attempts], [0, 1, 2, 4]
+        )
+        self.assertEqual(
+            [row["status"] for row in attempts],
+            ["IDENTITY_NOT_VISIBLE"] * 4,
+        )
+        result = self.results()[0]
+        self.assertEqual(
+            (result["verdict"], self.reason(result)),
+            ("UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"),
+        )
+        self.assertEqual(
+            len([call for call in self.margin.calls if call[0] == "POST"]),
+            1,
+        )
+
     def test_margin_history_rejects_target_identity_conflicts_and_duplicates(
             self):
         expected = {
@@ -3095,19 +3194,125 @@ class JobRunnerTests(unittest.TestCase):
         with mock.patch.object(
                 jr, "_margin_legacy_exclusivity_snapshot",
                 side_effect=AssertionError("legacy branch was entered")
-                ) as legacy_snapshot:
+                ) as legacy_snapshot, mock.patch.object(
+                    jr, "_evaluate_margin_confirmation",
+                    wraps=jr._evaluate_margin_confirmation,
+                ) as evaluator:
             self.assertEqual(jr.reconcile_margin(
                 job_id, True, self.receipt_dir, NOW, self.margin
             ), 0)
 
         legacy_snapshot.assert_not_called()
+        evaluator.assert_called_once()
+        self.assertEqual(evaluator.call_args.args[5], "BORROW")
         with open(artifacts["source_path"], encoding="utf-8") as handle:
             source = json.load(handle)
+        self.assertEqual((source["verdict"], source["reason"]), (
+            "OPEN", "BORROW_CONFIRMED",
+        ))
         self.assertEqual(source["history_watermark"], 0)
         self.assertNotIn("legacy_exclusivity_proof", source)
         event = self.result_events("RECONCILED_FROM_EXCHANGE_TRUTH")[0]
         self.assertEqual(event["history_watermark"], 0)
         self.assertNotIn("legacy_exclusivity_proof", event)
+
+    def test_reconcile_margin_standing_repay_closes_and_appends_result(self):
+        job_id = "mproofr-2c2a3027d877"
+        transaction_id = "401382497303"
+        liability_before = {
+            "asset": "USDT",
+            "borrowed": "2.5",
+            "interest": "0.0000387",
+            "total_liability": "2.5000387",
+        }
+        liability_after = {
+            "asset": "USDT",
+            "borrowed": "0",
+            "interest": "0",
+            "total_liability": "0",
+        }
+        self.margin.post_payload = {"txId": int(transaction_id)}
+        self.margin.history_payload = {"rows": []}
+        self.margin.account_before_payload = {
+            "userAssets": [{
+                "asset": "USDT", "borrowed": "2.5",
+                "interest": "0.0000387",
+            }],
+        }
+        self.margin.account_payload = {
+            "userAssets": [{
+                "asset": "USDT", "borrowed": "0", "interest": "0",
+            }],
+        }
+        self.margin_job(
+            job_id, op="MARGIN_REPAY", principal="2.5000387"
+        )
+        self.assertEqual(self.margin_tick(), 4)
+        unknown = self.results()[0]
+        self.assertEqual((unknown["verdict"], self.reason(unknown)), (
+            "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH",
+        ))
+        source_before = self.margin_source(unknown)
+        self.assertNotEqual(set(source_before), set(jr.LEGACY_RECEIPT_FIELDS))
+        self.assertEqual(source_before["submission"], {
+            "kind": "ok", "transaction_id": transaction_id,
+        })
+        self.assertEqual(
+            source_before["account_liability_before"], liability_before
+        )
+
+        target = {
+            "txId": int(transaction_id),
+            "asset": "USDT",
+            "principal": "2.5000387",
+            "status": "CONFIRMED",
+            "clientTag": "",
+            "type": "MANUAL",
+        }
+        self.margin.history_payload = {"rows": [target]}
+        with mock.patch.object(
+                jr, "_evaluate_margin_confirmation",
+                wraps=jr._evaluate_margin_confirmation,
+                ) as evaluator:
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, self.margin
+            ), 0)
+
+        evaluator.assert_called_once()
+        self.assertEqual(evaluator.call_args.args[5], "REPAY")
+        self.assertEqual(evaluator.call_args.args[6], liability_before)
+        rows = self.results()
+        self.assertEqual(
+            [row.get("kind", "RESULT") for row in rows],
+            ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT"],
+        )
+        event = rows[1]
+        final = rows[2]
+        self.assertEqual((event["verdict"], event["reason"]), (
+            "CLOSED", "REPAY_CONFIRMED",
+        ))
+        self.assertEqual(event["transaction_id"], transaction_id)
+        self.assertEqual(event["account_liability_before"], liability_before)
+        self.assertEqual(event["account_liability"], liability_after)
+        self.assertEqual(final, {
+            "job_id": job_id,
+            "op": "MARGIN_REPAY",
+            "symbol": "USDT",
+            "verdict": "CLOSED",
+            "exit_code": 0,
+            "receipt_path": unknown["receipt_path"],
+            "utc": utc(NOW),
+        })
+        source_final = self.margin_source(final)
+        self.assertEqual((source_final["verdict"], source_final["reason"]), (
+            "CLOSED", "REPAY_CONFIRMED",
+        ))
+        self.assertEqual(source_final["account_liability"], liability_after)
+        self.assertEqual(
+            jr._result_ids(jr._paths(self.receipt_dir)["results"]),
+            ({job_id}, False, False),
+        )
+        self.assertEqual(self.governor_releases, [])
 
     def test_reconcile_margin_modern_missing_field_stays_modern(self):
         job_id = "margin-reconcile-modern-missing"

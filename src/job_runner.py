@@ -141,6 +141,10 @@ MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
 MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
 # Margin history type records request origin, not BORROW or REPAY direction.
 MARGIN_HISTORY_ORIGIN_TYPES = frozenset(("MANUAL", "AUTO"))
+# Keep the immediate history read, then retry it at most three times.
+MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT = 3
+# Fixed 1s, 2s, and 4s delays bound the added confirmation wait at 7s.
+MARGIN_HISTORY_CONFIRMATION_BACKOFF_SECONDS = (1, 2, 4)
 MARGIN_LEGACY_HISTORY_PAGE_SIZE = 100
 MARGIN_LEGACY_HISTORY_PAGE_CAP = 20
 MARGIN_LEGACY_HISTORY_WINDOW_PAD = timedelta(seconds=60)
@@ -3956,6 +3960,70 @@ def _margin_history_fence_status(
         return ""
 
 
+def _margin_history_confirmation_attempt(
+        job_id: str, request_type: str, transaction_id: str,
+        attempt: int, delay_seconds: int, status: str) -> None:
+    row = {
+        "kind": "margin_history_confirmation_attempt",
+        "job_id": job_id,
+        "direction": request_type,
+        "transaction_id": transaction_id,
+        "attempt": attempt,
+        "max_attempts": MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT + 1,
+        "delay_seconds": delay_seconds,
+        "status": status,
+        "utc": _utc_text(_utc_now()),
+    }
+    print(json.dumps(row, separators=(",", ":")))
+
+
+def _margin_post_history_snapshot(
+        transport: Callable[..., Tuple[str, Any]], base_url: str,
+        endpoint_path: str, asset: str, request_type: str,
+        transaction_id: str, history_watermark: int, job_id: str) \
+        -> Tuple[str, Dict[str, Any], List[int]]:
+    """Retry only while a valid submitted identity is not yet visible."""
+    target = _margin_transaction_number(transaction_id)
+    delays = (0,) + MARGIN_HISTORY_CONFIRMATION_BACKOFF_SECONDS[
+        :MARGIN_HISTORY_CONFIRMATION_RETRY_LIMIT
+    ]
+    latest: Tuple[str, Dict[str, Any], List[int]] = ("", {}, [])
+    for attempt, delay_seconds in enumerate(delays, start=1):
+        if delay_seconds:
+            try:
+                time.sleep(delay_seconds)
+            except Exception:
+                return "MARGIN_CONFIRMATION_UNREADABLE", {}, []
+        history_reason, history_after, history_identifiers = \
+            _margin_history_snapshot(
+                transport, base_url, endpoint_path, asset
+            )
+        latest = history_reason, history_after, history_identifiers
+        fence_status = ""
+        if not history_reason:
+            fence_status = _margin_history_fence_status(
+                history_identifiers, transaction_id, history_watermark
+            )
+        if history_reason:
+            status = history_reason
+        elif target is None or type(history_watermark) is not int \
+                or target <= history_watermark:
+            status = "MARGIN_CONFIRMATION_MISMATCH"
+        elif fence_status == "CONCURRENT_MARGIN_ACTIVITY":
+            status = fence_status
+        elif target in history_identifiers:
+            status = "IDENTITY_VISIBLE"
+        else:
+            status = "IDENTITY_NOT_VISIBLE"
+        _margin_history_confirmation_attempt(
+            job_id, request_type, transaction_id, attempt,
+            delay_seconds, status,
+        )
+        if status != "IDENTITY_NOT_VISIBLE":
+            return latest
+    return latest
+
+
 def _margin_decimal_text(value: Any) -> Optional[str]:
     if type(value) is not str or not value \
             or len(value) > MARGIN_DECIMAL_TEXT_MAX \
@@ -4843,9 +4911,10 @@ def _run_margin_operation(
         )
 
     history_reason, history_after, history_ids_after = \
-        _margin_history_snapshot(
+        _margin_post_history_snapshot(
             transport, base_url, operation["endpoint_path"],
-            params["asset"],
+            params["asset"], params["type"], transaction_id,
+            history_watermark, job.job_id,
         )
     if history_reason:
         return _finish_margin_source(
