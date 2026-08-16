@@ -1,6 +1,7 @@
 # NOW.md — current orders and measured truth (one page, rewritten in place)
 
 ## Orders in force — 2026-08-16
+- PARALLEL ARMY (owner word 2026-08-16 ~17:20 IST): 10-50 codex workers at a time from now on; every freed slot refilled with disjoint work; shard maps first for big targets. Folded into CLAUDE.md top same turn. | MEASURED owner word
 - MACHINE STAYS SEALED. STOP-JOBS remains present, the account remains FLAT, and host RELEASE fe4445b9 remains unchanged. No lane landing authorizes a deploy, order, transfer, leverage change, or live proof. | MEASURED record state
 - VOLUME remains the owner's PARK-versus-one-bounded-seconds-probe word. The strongest measured 1m cell is still p99 R3 at -0.010795009 net pp/symbol-day with 0/9 positive cells; no further study expansion or live probe proceeds without the owner's word. | MEASURED
 - BASIS remains BUILD, REVERSE-FIRST. Each transition stays at or below 8 USDT, the total stack cap remains owner-set, rungs add only after reconciliation, reductions remain LIFO, and borrow power stays CLOSED in configuration until the owner's explicit opening word. | MEASURED record state
