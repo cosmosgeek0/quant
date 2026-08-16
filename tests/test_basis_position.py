@@ -1214,6 +1214,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.receipt_dir = self.temp.name
         self.state_path = Path(self.receipt_dir) / bp.STATE_FILE
+        self.head_path = Path(str(self.state_path) + ".head")
 
     def current(self):
         return bp.load_position(self.receipt_dir)
@@ -1315,8 +1316,9 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             "spot_quantity": spot_quantity,
             "short_quantity": short_quantity,
         }
+        observed_at_ms = self.current()["ledger"][-1]["cut_ms"] + 1
         return self.append(bp.new_v2_receipt_observed_event(
-            receipt_id, "REDUCTION", self.MODULE_TIME_MS + ordinal,
+            receipt_id, "REDUCTION", observed_at_ms,
             "own-reduce-receipt", facts))
 
     def reduce(self, receipt_id, ordinal,
@@ -1341,6 +1343,12 @@ class VersionTwoPersistenceTests(unittest.TestCase):
     def write_raw_position(self, position):
         self.state_path.write_text(
             json.dumps(position, indent=2), encoding="utf-8")
+
+    def write_raw_head(self, position):
+        self.head_path.write_text(json.dumps({
+            "event_count": len(position["ledger"]),
+            "last_event_digest": position["ledger"][-1]["event_digest"],
+        }, indent=2), encoding="utf-8")
 
     def test_br3_finding_1_second_rung_is_structurally_next_event(self):
         self.ready()
@@ -1593,7 +1601,8 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             {"event_type": "RungReduced", "ordinal": 1},
             derived["legal_next_transitions"])
         with self.assertRaisesRegex(bp.PositionError, "receipt evidence"):
-            self.append(self.filled(2))
+            self.append(self.filled(
+                2, cut_ms=position["ledger"][-1]["cut_ms"] + 1))
 
     def test_v2_loader_refuses_unknown_fields_at_nested_levels(self):
         self.ready()
@@ -1620,8 +1629,9 @@ class VersionTwoPersistenceTests(unittest.TestCase):
     def test_v2_atomic_replace_failure_preserves_prior_ledger(self):
         self.ready()
         before = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
         payload = bp.new_v2_receipt_observed_event(
-            "atomic-receipt", "REDUCTION", self.MODULE_TIME_MS,
+            "atomic-receipt", "REDUCTION", self.MODULE_TIME_MS + 1,
             "atomic-source", {
                 "ordinal": 1,
                 "spot_quantity": "0.01",
@@ -1632,7 +1642,151 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.append(payload)
         self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
         self.assertFalse(Path(str(self.state_path) + ".tmp").exists())
+
+    def test_v2_head_write_interruption_leaves_detectable_state(self):
+        self.ready()
+        before_head = self.head_path.read_bytes()
+        payload = bp.new_v2_receipt_observed_event(
+            "head-interruption", "REDUCTION", self.MODULE_TIME_MS + 1,
+            "head-source", {
+                "ordinal": 1,
+                "spot_quantity": "0.01",
+                "short_quantity": "0.01",
+            })
+        real_replace = os.replace
+
+        def interrupt_head(source, target):
+            if target == str(self.head_path):
+                raise OSError("simulated head interruption")
+            return real_replace(source, target)
+
+        with mock.patch.object(bp.os, "replace", side_effect=interrupt_head):
+            with self.assertRaises(OSError):
+                self.append(payload)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+        self.assertFalse(Path(str(self.head_path) + ".tmp").exists())
+        with self.assertRaisesRegex(bp.PositionError, "committed head"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br4_event_time_regression_and_future_cut_refuse(self):
+        self.ready()
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        regressed = self.filled(
+            1, source_time_ms=self.MODULE_TIME_MS - 6000,
+            cut_ms=self.MODULE_TIME_MS - 5000)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=self.MODULE_TIME_MS):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "strictly greater"):
+                self.append(regressed)
+        future = self.filled(
+            1, cut_ms=self.MODULE_TIME_MS
+            + bp.V2_EVENT_FUTURE_SKEW_MS + 1)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=self.MODULE_TIME_MS):
+            with self.assertRaisesRegex(bp.PositionError, "future skew"):
+                self.append(future)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+        persisted = self.raw_position()
+        event = regressed
+        event["previous_digest"] = persisted["ledger"][-1]["event_digest"]
+        event["event_digest"] = bp.V2_GENESIS_DIGEST
+        event["event_digest"] = bp.v2_event_digest(event)
+        persisted["ledger"].append(event)
+        self.write_raw_position(persisted)
+        self.write_raw_head(persisted)
+        derived = bp.derive_v2_state(bp.load_position(self.receipt_dir))
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertIn(
+            "NON_MONOTONIC_EVENT_TIME", derived["freeze_reasons"])
+
+    def test_br4_derived_residual_uses_shared_quantity_floor(self):
+        self.ready()
+        quantity = "1.000000000000000000000000001e-28"
+        self.append(self.filled(
+            1, spot_quantity=quantity, short_quantity=quantity))
+        position = self.reduce(
+            "reduce-to-dust", 1, "1e-28", "1e-28")
+        derived = bp.derive_v2_state(position)
+        residual = "0.0000000000000000000000000000000000000000000000000000001"
+        self.assertEqual(
+            derived["rungs"][0]["status"], bp.V2_CLOSED_RESIDUAL)
+        self.assertEqual(derived["remaining_spot_quantity"], residual)
+        self.assertEqual(derived["remaining_short_quantity"], residual)
+        self.assertEqual(derived["next_ordinal"], None)
+        self.assertNotIn(
+            {"event_type": "RungFilled", "ordinal": 2},
+            derived["legal_next_transitions"])
+        self.assertEqual(derived["dust_rows"], [{
+            "row_type": "DUST",
+            "status": bp.V2_CLOSED_RESIDUAL,
+            "ordinal": 1,
+            "reason": "BELOW_MINIMUM_QUANTITY_FLOOR",
+            "quantity_floor": "0.0000000000000000000000000001",
+            "spot_quantity": residual,
+            "short_quantity": residual,
+        }])
+        self.assertEqual(
+            bp.V2_MIN_QUANTITY_FLOOR,
+            Decimal("0.0000000000000000000000000001"))
+        with self.assertRaisesRegex(
+                bp.PositionError, "minimum nonzero bound"):
+            bp.new_v2_receipt_observed_event(
+                "below-floor", "REDUCTION", self.MODULE_TIME_MS + 100,
+                "floor-source", {
+                    "ordinal": 1,
+                    "spot_quantity": residual,
+                    "short_quantity": "0",
+                })
+
+    def test_br4_committed_head_refuses_missing_and_prefix_truncation(self):
+        prefix = self.ready()
+        prefix_bytes = self.state_path.read_bytes()
+        self.append(self.filled(1))
+        self.reduce("reduce-all", 1, "0.1", "0.1")
+        self.close_proof()
+
+        self.write_raw_position(prefix)
+        with self.assertRaisesRegex(bp.PositionError, "committed head"):
+            bp.load_position(self.receipt_dir)
+
+        self.state_path.write_bytes(prefix_bytes)
+        self.head_path.unlink()
+        with self.assertRaisesRegex(bp.PositionError, "committed head"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br4_committed_head_refuses_old_suffix_replay(self):
+        self.ready()
+        self.append(self.filled(1))
+        prefix = self.raw_position()
+        old = self.reduce("reduce-old", 1, "0.02", "0.02")
+
+        self.write_raw_position(prefix)
+        self.write_raw_head(prefix)
+        self.reduce("reduce-current", 1, "0.09", "0.09")
+        current_head = self.head_path.read_bytes()
+        self.write_raw_position(old)
+        self.assertEqual(self.head_path.read_bytes(), current_head)
+        with self.assertRaisesRegex(bp.PositionError, "committed head"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br4_second_persistence_cycle_reloads_committed_head(self):
+        self.ready()
+        first = self.append(self.filled(1))
+        self.assertEqual(self.current(), first)
+        second = self.reduce("reduce-second-cycle", 1, "0.04", "0.04")
+        reloaded = self.current()
+        self.assertEqual(reloaded, second)
+        self.assertEqual(json.loads(self.head_path.read_text(
+            encoding="utf-8")), {
+                "event_count": len(second["ledger"]),
+                "last_event_digest": second["ledger"][-1]["event_digest"],
+            })
 
 
 class RatesTests(MachineCase):

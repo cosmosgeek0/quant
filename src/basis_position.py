@@ -181,10 +181,21 @@ V2_DIRECTION = "long_spot_short_perp"
 V2_FLAT_PROOF_MAX_AGE_MS = 30000
 V2_GENESIS_DIGEST = "0" * 64
 V2_MIN_EPOCH_MS = 946684800000
+# Exchange observations may lead the local clock by at most two seconds,
+# matching the program's existing public-market future-time allowance.
+V2_EVENT_FUTURE_SKEW_MS = 2000
+# Event zero uses a fixed in-range cut so its digest remains config-bound;
+# every later event must advance beyond this sentinel.
+V2_GENESIS_CUT_MS = V2_MIN_EPOCH_MS
 V2_MAX_LEDGER_EVENTS = 10000
 V2_MAX_DECIMAL = Decimal("9999999999999999999999999999")
 V2_MAX_GAP_PCT = Decimal("1000000")
 V2_MAX_RATE = Decimal("1")
+# The v2 snapshot does not yet persist a venue quantity step.  Until it does,
+# receipt quantities and derived remainders share this exact Decimal floor.
+V2_MIN_QUANTITY_FLOOR = Decimal(
+    "0.0000000000000000000000000001")
+V2_CLOSED_RESIDUAL = "CLOSED_RESIDUAL"
 V2_EVENT_TYPES = frozenset((
     "ConfigSnapshot", "ReceiptObserved", "RungFilled", "RungReduced",
     "FlatProved",
@@ -755,7 +766,7 @@ class HandoffLane:
 
 _V2_POSITION_FIELDS = frozenset({"version", "schema_version", "ledger"})
 _V2_EVENT_COMMON_FIELDS = frozenset({
-    "event_type", "previous_digest", "event_digest",
+    "event_type", "cut_ms", "previous_digest", "event_digest",
 })
 _V2_CONFIG_FIELDS = frozenset({
     "symbol", "direction", "schedule", "caps", "venue",
@@ -781,7 +792,7 @@ _V2_FLAT_FACT_FIELDS = frozenset({
     "own_orders_digest",
 })
 _V2_RUNG_FILLED_FIELDS = frozenset({
-    "ordinal", "legs", "dislocation", "cut_ms",
+    "ordinal", "legs", "dislocation",
 })
 _V2_LEGS_FIELDS = frozenset({"spot", "short"})
 _V2_LEG_FIELDS = frozenset({
@@ -810,16 +821,18 @@ _V2_EVENT_FIELDS = {
     "FlatProved": _V2_EVENT_COMMON_FIELDS | _V2_FLAT_PROVED_FIELDS,
 }
 _V2_EVENT_PAYLOAD_FIELDS = {
-    kind: fields - {"previous_digest", "event_digest"}
+    kind: fields - {"previous_digest", "event_digest", "cut_ms"}
     for kind, fields in _V2_EVENT_FIELDS.items()
 }
+_V2_EVENT_PAYLOAD_FIELDS["RungFilled"] = (
+    _V2_EVENT_PAYLOAD_FIELDS["RungFilled"] | {"cut_ms"})
 _V2_SHAPE_SENTINELS = frozenset({
     "schema_version", "ledger", "event_type", "previous_digest",
     "event_digest", "receipt_digest",
 })
-_V2_MIN_POSITIVE_DECIMAL = Decimal(
-    "0.0000000000000000000000000001")
+_V2_MIN_POSITIVE_DECIMAL = V2_MIN_QUANTITY_FLOOR
 _V2_DERIVED_CONTEXT_PRECISION = 128
+_V2_HEAD_FIELDS = frozenset({"event_count", "last_event_digest"})
 
 
 def _v2_exact_fields(value: Any, expected: frozenset, path: str) -> None:
@@ -1071,7 +1084,11 @@ def new_v2_config_snapshot_event(
 def v2_config_epoch_digest(config_snapshot: Dict[str, Any]) -> str:
     """Return the digest used by the ConfigSnapshot event at ledger zero."""
     payload = new_v2_config_snapshot_event(config_snapshot)
-    sealed = {**payload, "previous_digest": V2_GENESIS_DIGEST}
+    sealed = {
+        **payload,
+        "cut_ms": V2_GENESIS_CUT_MS,
+        "previous_digest": V2_GENESIS_DIGEST,
+    }
     return _canonical_json_sha256(sealed, "ConfigSnapshot")
 
 
@@ -1465,11 +1482,15 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
     if event_type not in V2_EVENT_TYPES:
         raise PositionError("version-2 %s event type is invalid" % path)
     _v2_exact_fields(event, _V2_EVENT_FIELDS[event_type], path)
+    cut = _v2_epoch_ms(event["cut_ms"], path + ".cut_ms")
     _v2_digest(event["previous_digest"], path + ".previous_digest")
     stored_digest = _v2_digest(
         event["event_digest"], path + ".event_digest")
 
     if event_type == "ConfigSnapshot":
+        if cut != V2_GENESIS_CUT_MS:
+            raise PositionError(
+                "version-2 ConfigSnapshot cut is not the genesis cut")
         normalized = _normalize_v2_config_snapshot(
             {key: event[key] for key in _V2_CONFIG_FIELDS},
             require_canonical=True)
@@ -1483,6 +1504,9 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
             raise PositionError(
                 "version-2 ReceiptObserved kind is invalid")
         _v2_epoch_ms(event["observed_at_ms"], path + ".observed_at_ms")
+        if cut != event["observed_at_ms"]:
+            raise PositionError(
+                "version-2 ReceiptObserved cut does not match observation")
         _v2_id(event["source"], path + ".source")
         normalized_facts = _normalize_v2_receipt_facts(
             event["receipt_kind"], event["facts"], path + ".facts",
@@ -1514,7 +1538,6 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
         if normalized_dislocation != event["dislocation"]:
             raise PositionError(
                 "version-2 RungFilled dislocation is not canonical")
-        cut = _v2_epoch_ms(event["cut_ms"], path + ".cut_ms")
         if event["dislocation"]["source_time_ms"] > cut:
             raise PositionError(
                 "version-2 dislocation source time is later than its cut")
@@ -1541,7 +1564,11 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
                 "version-2 RungReduced amounts are not canonical")
     else:
         _v2_id(event["receipt_id"], path + ".receipt_id")
-        _v2_epoch_ms(event["module_time_ms"], path + ".module_time_ms")
+        module_time = _v2_epoch_ms(
+            event["module_time_ms"], path + ".module_time_ms")
+        if cut != module_time:
+            raise PositionError(
+                "version-2 FlatProved cut does not match module time")
 
     if stored_digest != v2_event_digest(event):
         raise PositionError(
@@ -1566,6 +1593,19 @@ def _validate_v2_ledger_chain(ledger: Any) -> None:
             raise PositionError(
                 "version-2 ConfigSnapshot is allowed only at event zero")
         previous = event["event_digest"]
+
+
+def _v2_non_monotonic_cut_indices(
+        ledger: List[Dict[str, Any]]) -> List[int]:
+    """Return persisted event indexes whose sealed cut did not advance."""
+    invalid = []
+    previous_cut: Optional[int] = None
+    for index, event in enumerate(ledger):
+        cut = event["cut_ms"]
+        if previous_cut is not None and cut <= previous_cut:
+            invalid.append(index)
+        previous_cut = cut
+    return invalid
 
 
 def _v2_record_ledger(value: Any) -> List[Dict[str, Any]]:
@@ -1597,7 +1637,14 @@ def _v2_decimal_subtract(left: Decimal, right: Decimal) -> Decimal:
 
 
 def _v2_active(rung: Dict[str, Any]) -> bool:
-    return rung["remaining_spot"] > 0 or rung["remaining_short"] > 0
+    return rung["remaining_spot"] >= V2_MIN_QUANTITY_FLOOR \
+        or rung["remaining_short"] >= V2_MIN_QUANTITY_FLOOR
+
+
+def _v2_closed_residual(rung: Dict[str, Any]) -> bool:
+    remaining = (rung["remaining_spot"], rung["remaining_short"])
+    return any(value > 0 for value in remaining) \
+        and all(value < V2_MIN_QUANTITY_FLOOR for value in remaining)
 
 
 def _v2_current_freeze_reasons(rung: Dict[str, Any]) -> List[str]:
@@ -1640,6 +1687,9 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     """Purely derive all v2 operational state from one validated ledger."""
     ledger = _v2_record_ledger(value)
     _validate_v2_ledger_chain(ledger)
+    non_monotonic_cuts = _v2_non_monotonic_cut_indices(ledger)
+    ledger_freeze_reasons = ["NON_MONOTONIC_EVENT_TIME"] \
+        if non_monotonic_cuts else []
     config = ledger[0]
     schedule = config["schedule"]
     stack_cap = Decimal(config["caps"]["stack_quote"])
@@ -1895,14 +1945,30 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     pending_active_evidence = bool(active_rungs and pending_receipts)
 
     derived_rungs = []
+    dust_rows = []
     for rung in rungs:
         reasons = _v2_current_freeze_reasons(rung)
         if pending_active_evidence \
                 and rung["ordinal"] == top_active_ordinal:
             reasons.append("RECEIPT_EVIDENCE_PENDING")
         active = _v2_active(rung)
-        status = "CLOSED" if not active \
+        closed_residual = _v2_closed_residual(rung)
+        status = V2_CLOSED_RESIDUAL if closed_residual \
+            else "CLOSED" if not active \
             else "FROZEN" if reasons else ST_OPEN
+        if closed_residual:
+            dust_rows.append({
+                "row_type": "DUST",
+                "status": V2_CLOSED_RESIDUAL,
+                "ordinal": rung["ordinal"],
+                "reason": "BELOW_MINIMUM_QUANTITY_FLOOR",
+                "quantity_floor": _v2_canonical_decimal(
+                    V2_MIN_QUANTITY_FLOOR),
+                "spot_quantity": _v2_canonical_decimal(
+                    rung["remaining_spot"]),
+                "short_quantity": _v2_canonical_decimal(
+                    rung["remaining_short"]),
+            })
         derived_rungs.append({
             "ordinal": rung["ordinal"],
             "status": status,
@@ -1947,7 +2013,9 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             Decimal(receipt["facts"]["short_quantity"])
             for receipt in pending_receipts]) \
             <= top_active_rung["remaining_short"]
-    if final_flat:
+    if ledger_freeze_reasons:
+        top_state = "FROZEN"
+    elif final_flat:
         top_state = ST_CLOSED
     elif not initial_flat:
         top_state = "UNPROVEN" if flat_transition_ready \
@@ -1967,6 +2035,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     if top_state in ("READY", ST_OPEN) and len(rungs) < len(schedule):
         next_ordinal = len(rungs) + 1
     legal_next = [] if top_state == ST_CLOSED \
+        or ledger_freeze_reasons \
         else [{"event_type": "ReceiptObserved"}]
     if top_state in ("UNPROVEN", "AWAITING_FLAT_PROOF") \
             and flat_transition_ready:
@@ -1975,7 +2044,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         legal_next.append({
             "event_type": "RungFilled", "ordinal": next_ordinal,
         })
-    if reduction_transition_ready:
+    if reduction_transition_ready and not ledger_freeze_reasons:
         legal_next.append({
             "event_type": "RungReduced",
             "ordinal": top_active_ordinal,
@@ -1986,7 +2055,9 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         "direction": config["direction"],
         "config_event_digest": config["event_digest"],
         "top_state": top_state,
+        "freeze_reasons": ledger_freeze_reasons,
         "rungs": derived_rungs,
+        "dust_rows": dust_rows,
         "remaining_spot_quantity": _v2_canonical_decimal(
             _v2_decimal_sum([
                 rung["remaining_spot"] for rung in rungs])),
@@ -1999,7 +2070,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         "increases_frozen":
             top_state in (
                 "UNPROVEN", "FROZEN", "AWAITING_FLAT_PROOF", ST_CLOSED),
-        "reduce_only": top_state == "FROZEN" and bool(active_rungs),
+        "reduce_only": top_state == "FROZEN" and bool(active_rungs)
+            and not ledger_freeze_reasons,
         "legal_next_transitions": legal_next,
     }
 
@@ -2052,11 +2124,56 @@ def position_path(receipt_dir: str) -> str:
     return os.path.join(receipt_dir, STATE_FILE)
 
 
+def position_head_path(receipt_dir: str) -> str:
+    return position_path(receipt_dir) + ".head"
+
+
+def _load_v2_committed_head(receipt_dir: str) -> Dict[str, Any]:
+    try:
+        with open(position_head_path(receipt_dir),
+                  encoding="utf-8") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        raise PositionError(
+            "version-2 committed head is missing; ledger refused") from None
+    except OSError:
+        raise PositionError(
+            "version-2 committed head is unreadable; ledger refused") \
+            from None
+    try:
+        head = json.loads(raw, object_pairs_hook=_v2_no_duplicate_fields)
+    except (_DuplicateV2Field, json.JSONDecodeError):
+        raise PositionError(
+            "version-2 committed head is duplicated or unreadable; "
+            "ledger refused") from None
+    _v2_exact_fields(head, _V2_HEAD_FIELDS, "committed head")
+    _v2_int(
+        head["event_count"], "committed head.event_count",
+        1, V2_MAX_LEDGER_EVENTS)
+    _v2_digest(
+        head["last_event_digest"],
+        "committed head.last_event_digest")
+    return head
+
+
+def _match_v2_committed_head(
+        position: Dict[str, Any], head: Dict[str, Any]) -> None:
+    ledger = position["ledger"]
+    if head["event_count"] != len(ledger) \
+            or head["last_event_digest"] != ledger[-1]["event_digest"]:
+        raise PositionError(
+            "version-2 ledger disagrees with its committed head")
+
+
 def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
     try:
         with open(position_path(receipt_dir), encoding="utf-8") as handle:
             raw = handle.read()
     except FileNotFoundError:
+        if os.path.exists(position_head_path(receipt_dir)):
+            raise PositionError(
+                "version-2 committed head exists without its ledger") \
+                from None
         return None
     except OSError:
         raise PositionError(
@@ -2079,7 +2196,12 @@ def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
                 "basis-position.json version-2 fields are duplicated or "
                 "unreadable") from None
         _require_v2_schema_marker(loaded)
+        head = _load_v2_committed_head(receipt_dir)
         _validate_v2_position(loaded)
+        _match_v2_committed_head(loaded, head)
+    elif os.path.exists(position_head_path(receipt_dir)):
+        raise PositionError(
+            "version-2 committed head cannot bind a non-version-2 record")
     return loaded
 
 
@@ -2160,21 +2282,46 @@ def save_position(receipt_dir: str, position: Dict[str, Any],
 
 
 def _seal_v2_event_payload(
-        payload: Dict[str, Any], previous_digest: str) -> Dict[str, Any]:
+        payload: Dict[str, Any], previous_digest: str,
+        previous_cut: Optional[int]) -> Dict[str, Any]:
     copied = _copy_v2_record(payload, "event payload")
     event_type = copied.get("event_type")
     if event_type not in V2_EVENT_TYPES:
         raise PositionError("version-2 event payload type is invalid")
+    module_now = _v2_epoch_ms(
+        default_now_ms(), "module append time")
     if event_type == "FlatProved":
         _v2_exact_fields(
             copied, _V2_FLAT_PROVED_INPUT_FIELDS,
             "FlatProved payload")
-        copied["module_time_ms"] = _v2_epoch_ms(
-            default_now_ms(), "FlatProved.module_time_ms")
+        cut = module_now
+        copied["module_time_ms"] = cut
     else:
         _v2_exact_fields(
             copied, _V2_EVENT_PAYLOAD_FIELDS[event_type],
             event_type + " payload")
+        if event_type == "ConfigSnapshot":
+            cut = V2_GENESIS_CUT_MS
+        elif event_type == "ReceiptObserved":
+            cut = _v2_epoch_ms(
+                copied["observed_at_ms"], "ReceiptObserved.cut_ms")
+        elif event_type == "RungFilled":
+            cut = _v2_epoch_ms(copied["cut_ms"], "RungFilled.cut_ms")
+        else:
+            if previous_cut is None:
+                raise PositionError(
+                    "version-2 RungReduced lacks a prior event cut")
+            # A reduction has no external timestamp.  Its sealed logical cut
+            # advances one millisecond and still passes the append-clock gate.
+            cut = _v2_epoch_ms(
+                previous_cut + 1, "RungReduced.cut_ms")
+    if cut > module_now + V2_EVENT_FUTURE_SKEW_MS:
+        raise PositionError(
+            "version-2 event cut exceeds the documented future skew bound")
+    if previous_cut is not None and cut <= previous_cut:
+        raise PositionError(
+            "version-2 event cut is not strictly greater than the prior cut")
+    copied["cut_ms"] = cut
     copied["previous_digest"] = previous_digest
     copied["event_digest"] = V2_GENESIS_DIGEST
     copied["event_digest"] = v2_event_digest(copied)
@@ -2183,7 +2330,7 @@ def _seal_v2_event_payload(
 
 def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
                     expected_length: int) -> Dict[str, Any]:
-    """CAS-append one event and atomically replace the ledger file."""
+    """CAS-append; replace the ledger, then its committed head sidecar."""
     expected_length = _v2_int(
         expected_length, "expected_length", 0, V2_MAX_LEDGER_EVENTS - 1)
     os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
@@ -2211,9 +2358,14 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
         if len(ledger) >= V2_MAX_LEDGER_EVENTS:
             raise PositionError(
                 "version-2 ledger has reached its event bound")
+        if ledger and _v2_non_monotonic_cut_indices(ledger):
+            raise PositionError(
+                "version-2 current ledger has non-monotonic event time")
         previous = V2_GENESIS_DIGEST if not ledger \
             else ledger[-1]["event_digest"]
-        event = _seal_v2_event_payload(event_payload, previous)
+        previous_cut = None if not ledger else ledger[-1]["cut_ms"]
+        event = _seal_v2_event_payload(
+            event_payload, previous, previous_cut)
         if not ledger and event["event_type"] != "ConfigSnapshot":
             raise PositionError(
                 "version-2 first append must be ConfigSnapshot")
@@ -2230,6 +2382,12 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
         _atomic_replace_position(
             position_path(receipt_dir), candidate,
             allow_decimal_default=False)
+        _atomic_replace_position(
+            position_head_path(receipt_dir), {
+                "event_count": len(candidate["ledger"]),
+                "last_event_digest":
+                    candidate["ledger"][-1]["event_digest"],
+            }, allow_decimal_default=False)
         return candidate
     finally:
         try:
