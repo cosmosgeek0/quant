@@ -6,3 +6,11 @@ root cause | runner expected history row "type" to echo the request direction (B
 deploy scar | one crashed tick at 03:54Z: job_runner.py landed a minute before margin_ops.py — the tick raced file transfers. Rule: pause the tick or land atomically for multi-file deploys.
 choreography scars | read receipts from RECEIPT_DIR/ instead of RECEIPT_DIR/jobs/receipts/; the runner's log is DEPLOY/jobs.log. Both corrected in the card set.
 money state at write | 2.5 USDT liability standing, interest under half a cent; repay planned through the runner after MJ9 lands + reconcile; no manual exchange action taken or planned.
+
+CLOSE — 2026-08-16 07:2xZ (release 4a7e263)
+reconcile | reconcile-margin on mproof-b668c154de2c CONFIRMED via legacy exclusivity proof (1 transaction in window, borrowed == principal 2.5) -> OPEN, lock RELEASED through the shared final-outcome path (LEGACY_PROOF + RECONCILED rows on the result log)
+repay | job mproofr-2c2a3027d877 MARGIN_REPAY principal 2.5000387 (borrowed 2.5 + measured interest 0.0000387) placed under seal; manual tick (cron was silent: deploy tool dropped the tick script's executable bit — fixed on host, D2 card) -> POST ok, txId 401382497303 -> confirmation read UNKNOWN MARGIN_CONFIRMATION_MISMATCH (repay row not visible under the direction-filtered history read at read time) -> resealed, receipt written
+exchange truth after | account USDT: borrowed 0, interest 0, netAsset 1.9999613; marginLevel 999; totalLiability 0 -> the margin account is FLAT
+economics of the whole proof | borrowed 2.5 for ~2h51m; interest paid 0.0000387 USDT (~0.004 cents); zero trading; margin-TRADE key permission PROVEN live in both directions
+what it taught | (1) Binance history row "type" is origin class MANUAL/AUTO, direction is the query param; (2) txId integer, clientTag not echoed; (3) repay history row visibility lags the account state — the confirmation stage needs a bounded re-read; (4) atomic deploys must preserve file modes; (5) receipts written by earlier releases need a frozen legacy shape + a stricter substitute proof
+open | the repay job's receipt stands UNKNOWN pending a reconcile-margin run (repay direction) once the history row is visible — closes the receipt loop; account is already flat
