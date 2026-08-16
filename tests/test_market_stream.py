@@ -253,6 +253,7 @@ class SchemaCompletenessTests(OfflineCase):
             "freshness_ms",
         )
 
+        self.assertEqual(ms.STATE_PREFIX_FIELDS, prior_fields)
         self.assertEqual(ms.STATE_FIELDS[:-1], prior_fields)
         self.assertEqual(ms.STATE_FIELDS[-1], "book_age_ms")
 
@@ -758,6 +759,38 @@ class LiveFeedMergeTests(OfflineCase):
         self.assertEqual(record["basis_gap_pct"], "0")
         self.assertEqual(record["book_age_ms"], "4")
 
+    def test_future_feed_clock_does_not_understate_book_age(self):
+        both = feed_row("spot", "89", "90")
+        both.update(
+            {
+                "venues": "both",
+                "perp_bid": "90",
+                "perp_ask": "91",
+                "freshness_ms": "6000",
+                "book_age_ms": "6000",
+            }
+        )
+        self.write_feed(
+            {"AAAUSDT": both},
+            written_ms=FIXED_MS + ms.FUTURE_SKEW_MS,
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            feed_max_age_ms=7_000,
+        ).run_once()
+
+        self.assertEqual(self.read_state()["AAAUSDT"]["book_age_ms"], "6000")
+
     def test_feed_leg_age_uncertainty_over_skew_bound_keeps_basis_unknown(self):
         both = feed_row("spot", "89", "90")
         both.update(
@@ -829,14 +862,14 @@ class FeedDispositionTests(OfflineCase):
         self.assertIsNone(result.snapshot)
         self.assertEqual(result.reason, "written_ms_future")
 
-    def test_negative_feed_age_clamps_to_zero(self):
+    def test_future_feed_clock_keeps_the_source_age_bound(self):
         self.assertEqual(
             ms._clamped_age_ms(
-                FIXED_MS,
-                FIXED_MS + ms.FUTURE_SKEW_MS,
-                source_age_ms=1,
+                10_000,
+                12_000,
+                source_age_ms=6_000,
             ),
-            0,
+            6_000,
         )
 
     def test_every_feed_rejection_path_has_a_stable_reason(self):

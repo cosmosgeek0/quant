@@ -94,7 +94,7 @@ EXIT_HTTP = 3
 EXIT_DATA = 4
 SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{5,40}")
 
-STATE_FIELDS = (
+STATE_PREFIX_FIELDS = (
     "utc",
     "venues",
     "spot_bid",
@@ -115,8 +115,8 @@ STATE_FIELDS = (
     "next_funding_ms",
     "basis_gap_pct",
     "freshness_ms",
-    "book_age_ms",
 )
+STATE_FIELDS = STATE_PREFIX_FIELDS + ("book_age_ms",)
 SIZING_FIELDS = frozenset({
     "spot_step",
     "perp_step",
@@ -200,7 +200,7 @@ def epoch_ms() -> int:
 def _clamped_age_ms(
     now_ms: int, observed_ms: int, source_age_ms: int = 0
 ) -> int:
-    return max(0, now_ms - observed_ms + source_age_ms)
+    return max(source_age_ms, now_ms - observed_ms + source_age_ms)
 
 
 def decimal_value(raw: Any, source: str) -> Decimal:
