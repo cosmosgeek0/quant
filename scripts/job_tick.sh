@@ -17,6 +17,11 @@ RUNNER_LOG="$DEPLOY_DIR/jobs.log"
 exec >> "$RUNNER_LOG" 2>&1
 echo "=== $(date -u +%FT%TZ)"
 
+if [ -e "$DEPLOY_DIR/DEPLOYING" ]; then
+  echo "JOB-TICK | REFUSED | DEPLOYING marker present" >&2
+  exit 2
+fi
+
 if ! PATH_ASSIGNMENTS=$(PYTHONDONTWRITEBYTECODE=1 python3 -c \
   'import sys; sys.path.insert(0, sys.argv[1]); import runtime_paths; print(runtime_paths.render_shell(runtime_paths.PATHS))' \
   "$DEPLOY_DIR/src"); then
