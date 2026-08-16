@@ -88,6 +88,10 @@ MARGIN_LEGACY_RECONCILED_FIELDS = (
 ) | {"legacy_exclusivity_proof"}
 LEGACY_REPAY_SHAPE = "LEGACY_REPAY_SHAPE"
 LEGACY_REPAY_SHAPE_VERSION = 1
+# Frozen releases that wrote the four-field REPAY expectation.
+LEGACY_REPAY_SHAPE_RELEASES = (
+    "4a7e2634361892dccf41137fbd88fe62ae8e3281",
+)
 MARGIN_LEGACY_REPAY_RECONCILED_FIELDS = MARGIN_RECONCILED_FIELDS | {
     "receipt_shape", "receipt_shape_version",
 }
@@ -1205,7 +1209,8 @@ def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
             return False
         if legacy_repay and (
                 row.get("receipt_shape") != LEGACY_REPAY_SHAPE
-                or row.get("receipt_shape_version")
+                or type(row.get("receipt_shape_version")) is not int
+                or row["receipt_shape_version"]
                 != LEGACY_REPAY_SHAPE_VERSION):
             return False
         request_type = "BORROW" \
@@ -4620,24 +4625,19 @@ def _legacy_repay_history_confirmation(
                 or type(history_payload.get("rows")) is not list:
             return None, "LEGACY_REPAY_HISTORY_ROWS_MISSING"
         target = _margin_transaction_number(transaction_id)
-        matches = []
-        for row in history_payload["rows"]:
-            if type(row) is not dict:
-                continue
-            aliases = _margin_identity_aliases(row)
-            if aliases is None:
-                return None, "LEGACY_REPAY_TX_ID_MISSING"
-            if aliases and aliases[0] == transaction_id:
-                matches.append(row)
-        if target is None or len(matches) != 1:
+        rows = history_payload["rows"]
+        if target is None or len(rows) != 1 or type(rows[0]) is not dict:
             return None, "LEGACY_REPAY_TX_ID_MISSING"
-        row = matches[0]
+        row = rows[0]
+        aliases = _margin_identity_aliases(row)
+        if aliases is None or len(aliases) != 1:
+            return None, "LEGACY_REPAY_TX_ID_MISSING"
         row_target = _margin_transaction_number(
             _margin_transaction_id({"txId": row.get("txId")})
         )
         if row_target is None:
             return None, "LEGACY_REPAY_TX_ID_MISSING"
-        if row_target != target:
+        if aliases[0] != transaction_id or row_target != target:
             return None, "LEGACY_REPAY_TX_ID_MISMATCH"
         for field in ("asset", "amount", "principal", "interest",
                       "status", "type"):
@@ -6039,7 +6039,7 @@ def _load_margin_reconcile_facts(
         -> Tuple[
             str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any],
             Dict[str, str], Dict[str, str], Optional[Dict[str, str]],
-            str, Optional[int], str, str,
+            str, Optional[int], str, bool,
         ]:
     source_path = os.path.join(
         paths["receipts"], "margin-%s.json" % job_id
@@ -6147,14 +6147,23 @@ def _load_margin_reconcile_facts(
             }, params["asset"]) == liability_before,
             "SOURCE_ACCOUNT_LIABILITY_BEFORE_MISMATCH",
         )
-    receipt_shape = ""
+    legacy_repay = False
     if params["type"] == "REPAY" and not legacy_receipt:
-        modern_expected = _margin_repay_expected_ledger_confirmation(
-            params, liability_before
-        )
-        if expected == expected_row and modern_expected is not None:
-            receipt_shape = LEGACY_REPAY_SHAPE
+        if expected == expected_row:
+            recorded_sha = source.get("sha")
+            legacy_repay = (
+                recorded_sha in LEGACY_REPAY_SHAPE_RELEASES
+                and runner.get("sha_valid") is True
+                and runner.get("sha") == recorded_sha
+                and runner.get("measured_sha") == recorded_sha
+            )
+            _release_require(
+                legacy_repay, "LEGACY_PROVENANCE_MISMATCH"
+            )
         else:
+            modern_expected = _margin_repay_expected_ledger_confirmation(
+                params, liability_before
+            )
             _release_require(
                 modern_expected is not None and expected == modern_expected,
                 "SOURCE_READY_MISMATCH",
@@ -6224,7 +6233,7 @@ def _load_margin_reconcile_facts(
     return (
         source_path, runner_path, source, runner, ready, params, expected,
         liability_before, transaction_id, history_watermark,
-        governor_token, receipt_shape,
+        governor_token, legacy_repay,
     )
 
 
@@ -6262,10 +6271,9 @@ def reconcile_margin(
     (
         source_path, runner_path, source, runner, ready, params, expected,
         liability_before, transaction_id, history_watermark,
-        governor_token, receipt_shape,
+        governor_token, legacy_repay,
     ) = facts
     legacy_receipt = set(source) == set(LEGACY_RECEIPT_FIELDS)
-    legacy_repay_shape = receipt_shape == LEGACY_REPAY_SHAPE
     legacy_exclusivity_proof = None
 
     try:
@@ -6288,7 +6296,7 @@ def reconcile_margin(
                 paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
             )
         history_payload = history_result[1]
-        if legacy_repay_shape:
+        if legacy_repay:
             history_confirmation, history_fact_reason = \
                 _legacy_repay_history_confirmation(
                     history_payload, transaction_id, expected,
@@ -6321,8 +6329,8 @@ def reconcile_margin(
             return _margin_reconcile_unconfirmed(
                 paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
             )
-        # The exact-id read binds the target row. Only the frozen b188351
-        # shape may replace its absent durable facts with the legacy proof.
+        # The exact-id read binds the target row. Only frozen release
+        # provenance may use the four-field REPAY confirmation law.
         if legacy_receipt:
             history_reason, _history_after, history_identifiers, \
                 legacy_exclusivity_proof = \
@@ -6346,7 +6354,7 @@ def reconcile_margin(
             paths, job_id, "MARGIN_CONFIRMATION_UNREADABLE", now
         )
 
-    if legacy_repay_shape:
+    if legacy_repay:
         confirmation = _evaluate_legacy_repay_confirmation(
             history_payload, history_identifiers, transaction_id,
             history_watermark, expected, liability_before,
@@ -6411,7 +6419,7 @@ def reconcile_margin(
     if not legacy_receipt:
         event["history_watermark"] = history_watermark
         event["account_liability_before"] = liability_before
-        if legacy_repay_shape:
+        if legacy_repay:
             event["receipt_shape"] = LEGACY_REPAY_SHAPE
             event["receipt_shape_version"] = LEGACY_REPAY_SHAPE_VERSION
     else:
