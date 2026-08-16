@@ -7,6 +7,16 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+DAY LANDINGS 2026-08-16 | machine SEALED | first margin act CLOSED and account FLAT | records use Git SHA suffixes of eight characters
+margin act | borrowed 2.5 USDT for about 2h51m; repaid 2.5000387 including 0.0000387 interest; borrowed/interest/liability=0; zero trading; margin key proven both directions; repay receipt reconcile pending | sha:5f8fb8a2 | MEASURED
+runner review | MRV1-11 + MJ2-16 closed through bounded 1s/2s/4s identity-absence retries and REPAY-direction reconcile; 184/184 focused checks green; proof releases live on host | sha:df21c96a | MEASURED
+position ledger | BR1-7 reviewed the additive shape, shelved it, rebuilt the append-only typed ledger, and reduced findings to zero; BUILD-02 and BUILD-03 merged, BUILD-04 in flight | sha:1d9a89b3,9908c5a1 | MEASURED
+volume bench | OF3 p90/p95/p99 best cells=-0.40377914/-0.098654092/-0.010795009 net pp/symbol-day; 0/9 cells positive; ride/trap separation remains unseen | sha:42293108 | MEASURED
+basis bench | close-gap >2%/>5%/>10%=572/1368,320/1368,118/1368; funding crossings received/paid=155/2 and median net=1.3149142%; executable sample n=1 pending AB28 | sha:98703455,3669e3e0,fa69ea9b | MEASURED
+deploy scars | the tick raced split file transfer, fixed by the DEPLOYING gate plus atomic verified renames; the tick script lost its executable bit, fixed by mode preservation and stat verification | sha:c4a5d91e,f3cddbab | MEASURED
+design landings | volume presents PARK versus one bounded seconds-exit probe without recommendation; basis specifies the violent-move executable lock-in build under the 8-USDT transition clamp | sha:d27b0c5a,9087a93f | MEASURED
+fleet hook | NOW exposes the next bounded work to every lane: BUILD-04 and AB28 may proceed; volume choice, re-arm, donor permits, and BNB float remain owner words | MEASURED record state
+
 ACCOUNT-SWITCH SNAPSHOT 2026-08-16 ~04:15Z | owner switching accounts | full resume state in the Lead vault (memory dir, survives switch) + all task cards preserved at worktrees/lead2-v2fix/lane-logs/cards/
 money safety | GO MARGIN PROOF word given, borrow NOT yet run: no margin job queued, no ACCEPT-ONE, STOP-JOBS present, machine SEALED+FLAT | deploy mid-transfer is resumable file movement only
 in flight, all resumable | margin deploy (rerun cards/margin-deploy.sh) | V2 final chain (tape_prices -> policy_sim -> validate) | five codex lanes: B2 position-v2 schema (fresh-eyes review required), FS1 fine-slice script, AB15 exit profiles, AB16 fresh-listing class, MDV1 evidence digest

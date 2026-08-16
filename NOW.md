@@ -1,51 +1,22 @@
 # NOW.md — current orders and measured truth (one page, rewritten in place)
 
-## Orders (in force, 2026-08-15 night)
-- MACHINE STAYS SEALED. Open owner words: re-arm (criterion unchanged: a
-  configuration clears fees plus slippage on replay first, then smallest
-  cap the same hour), the 12-item donor permit numbers (against the
-  measured PORT-PLANS costs), the BNB fee-float purchase, and the M2 line
-  below. Tuner stays advisory.
-- M2 MARGIN PROOF is armed at the record level: runner margin operations
-  (MARGIN_BORROW / MARGIN_REPAY) are MERGED on main after EIGHT adversarial
-  review rounds — NOT deployed. Sequence when the owner says the word:
-  hash-gated host deploy -> owner's ONE line -> borrow ~2.5 USDT -> read
-  the real liability including accrued interest -> repay the measured
-  total -> reconcile flat. Two live-proof items ride along: endpoint
-  semantics, and accrued-interest behavior on full repay (an UNKNOWN there
-  is honest fail-closed, not failure).
-- PRODUCT LANE PRIORITY (owner order tonight): learn ONLY from tokens that
-  actually pumped. The pump census (30 days, all 659 symbols, HELD vs
-  COLLAPSED, prior-48h component scoreboard) is the standing study; no
-  formula adoption words before its numbers; no test without a one-line
-  purpose an owner can read.
-- BASIS ENGINE: ladder + events landed on main; the supervisor wiring is
-  SHELVED (three review rounds proved the projection shape wrong;
-  shelf/ladder-wiring-v1 preserves it). The POSITION-ADD railroad is the
-  build: BUILD-01 contract freeze DONE; BUILD-02 (v2 rung/transition
-  receipts) next, carrying IR3's nine findings as schema requirements.
-  Reverse basis waits only on the M2 proof.
+## Orders in force — 2026-08-16
+- MACHINE STAYS SEALED. Owner words remain open for re-arm, the twelve donor permit numbers against measured PORT-PLANS costs, and the BNB fee float. Re-arm criterion is unchanged: a configuration must clear fees plus slippage on replay first, then use the smallest cap in the same hour. Tuner stays advisory.
+- VOLUME design word: the owner chooses between PARKING volume while basis is built, or ONE bounded seconds-exit probe with the OF2 entry sets, 40/30/30 ladder, 24-hour horizon, and stated costs held fixed. Minimal scope is p99 at 84 fires/82 candle comparables; stronger nested scope is p90 at 834/756. The closest current cell is p99 R3 at -0.010795009 net pp/symbol-day, so a probe must improve by more than 0.010795009 and finish strictly above zero. VOLUME-VERDICT makes no recommendation.
+- BASIS design word: BUILD the lock-in engine to BASIS-LOCKIN-SPEC. A fresh violent-move dislocation may propose the 2%/5%/10% ladder only after live executable-gap revalidation; each transition stays at or below 8 USDT, the total stack cap is owner-set, rungs add one at a time after reconciliation, and reductions are LIFO from executable gap-close, time-cap, or funding facts. No record word authorizes an order, deploy, transfer, or live proof.
 
-## Truth (measured 2026-08-15 night)
-- Machine SEALED + FLAT the entire day; zero live actions; host release
-  unchanged (4ba03977 deployed); aliveness watchdog and mirror loops live.
-- First autonomous trade receipt stands (05:41Z OPENUSDT, net -0.0123
-  USDT, cost of proof); first_autonomous_close_passed -> 32 cap unlocked.
-- Bench day: surge-alone is fee-negative at any bar (413/day, coin flip).
-  Absorption: before BOTH real ignitions, four of five components fired;
-  the hard 30-day lows gate was the single blindness; OPENUSDT sat at
-  0.017 of its YEARLY range (the thesis held, the memory was short);
-  AAOIBUSDT is a fresh listing — its own class. Class-routed shadow
-  scoring is instrumented (production untouched); the full-universe
-  tape-side baseline builds overnight; the pump census runs now.
-- Runner margin ops merged a4d3b42: intent-keyed run-at-most-once, final
-  authority read at the POST boundary, strict identity confirmations,
-  halt-only recovery with a manually attested release command, total halt
-  surface (typed anomalies, never bare exceptions). 147 focused and 1172
-  full tests green. NOT deployed to the host.
-- V2 volume pipeline: full tape complete including the named 166.8MB
-  AKEUSDT day; Stage B feature extraction running; the verdict, when it
-  lands, is read as a blind-spot map of the tested policies per the
-  engine-completeness law — never a strategy obituary.
-- Canonical checkout remains diverged (UI seat's local commits vs origin)
-  — coordination item; work runs from worktrees pinned to origin/main.
+## Measured truth — 2026-08-16
+- FIRST MARGIN ACT CLOSED: 2.5 USDT was borrowed for about 2h51m; 2.5000387 USDT was repaid, including 0.0000387 USDT interest. Final account facts were borrowed=0, interest=0, totalLiability=0, marginLevel=999, with zero trading. The margin key was proven live in both directions and the account is FLAT.
+- The margin runner releases used for the act are live on the host. The bounded 1s/2s/4s history-lag retry and REPAY-direction reconcile path are landed with 184/184 focused checks green; the machine remains sealed.
+- Position pipeline: BUILD-01, BUILD-02, and BUILD-03 are merged. The additive projection shape was shelved, the append-only typed v2 ledger and rung-aware reconciliation are merged, and BUILD-04 (the ADD transition through the canonical entry chain — add-while-holding at the position layer) is in flight.
+- V2 volume is answered end to end: the six-month census covered 659/659 symbols and 3,429 episodes, HELD=846 and COLLAPSED=2,583; selection measured 3,401 complete signatures at a 24.52% HELD base, and the best eligible pair was 25.81%, only +1.28 percentage points.
+- Order flow separated bases from controls at AUC=0.7529284 but HELD from COLLAPSED only at AUC=0.5374367. Precision at p90/p95/p99 was 4.097280%/7.872350%/17.55108%, with density 0.2454577/0.07567196/0.007686831 fires per symbol-day and 161.75664/49.867825/5.0656218 entries per day across 659 symbols.
+- Unconditional aggregate-family >=3 R1/R2/R3 economics were -8.6284014/-9.0896691/-8.4621846 net pp/symbol-day. OF3 p90 was -0.40820976/-0.41030542/-0.40377914, p95 -0.10392965/-0.12266663/-0.098654092, and p99 -0.012427743/-0.018293922/-0.010795009; positive cells=0/9. Entry precision improved with tighter order flow, but no measured 1m-candle-exit cell cleared costs and the ride/trap split remained unseen.
+- Basis gap facts: 1,368/1,369 eligible both-venue episodes measured; close-gap exceeded 2% in 572/1,368=41.812865%, 5% in 320/1,368=23.391813%, and 10% in 118/1,368=8.6257310%. COLLAPSED versus HELD median maximum gap was 1.7365269% versus 0.70838253%.
+- Basis funding facts: 549 close-proxy lock-ins had median gap capture 1.4348947%, median net 1.3149142% after 0.30% fees, and 548/549 net-positive; median/p90 hold was 40/255.8 minutes. Of 157 crossed settlements, 155 were received and 2 paid. This is a candle-close selection result, not executable proof.
+- V2 pipeline state is COMPLETE through census, selection, trade-sequencing, unconditional candle-exit economics, and VOLUME-VERDICT; its remaining volume action is the owner's PARK-versus-one-probe word, not another automatic study expansion.
+
+## Known limitations
+- Repay receipt reconciliation is pending: the account is already flat, but the live repay receipt remains UNKNOWN until reconcile-margin closes its direction-specific history loop.
+- Executable basis evidence is n=1: the one paired episode measured 7.7744% capture and 6.6744% net, while 473 selected outcomes lacked executable inputs. AB28 must complete the sample before any executable distribution claim.
+- Canonical checkout remains diverged between the UI seat's local commits and origin; worktree records are pinned to their measured landing history.
