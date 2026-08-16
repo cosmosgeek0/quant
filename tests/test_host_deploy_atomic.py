@@ -2,6 +2,7 @@
 
 import hashlib
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -27,7 +28,7 @@ class TestHostDeployAtomic(unittest.TestCase):
         self.stage.mkdir()
         self.deploy.mkdir()
 
-    def stage_files(self, files, digests=None):
+    def stage_files(self, files, digests=None, modes=None):
         rows = []
         for relpath, payload in files.items():
             path = self.stage / relpath
@@ -36,7 +37,10 @@ class TestHostDeployAtomic(unittest.TestCase):
             digest = hashlib.sha256(payload).hexdigest()
             if digests and relpath in digests:
                 digest = digests[relpath]
-            rows.append("%s  %s\n" % (digest, relpath))
+            row = "%s  %s" % (digest, relpath)
+            if modes and relpath in modes:
+                row += " %s" % modes[relpath]
+            rows.append(row + "\n")
         self.manifest.write_text("".join(rows), encoding="utf-8")
 
     def run_deploy(self, release_sha=RELEASE_SHA):
@@ -74,6 +78,72 @@ class TestHostDeployAtomic(unittest.TestCase):
         )
         self.assertFalse((self.deploy / "DEPLOYING").exists())
         self.assertIn("HOST-DEPLOY | OK | files=2", result.stdout)
+        for relpath, payload in files.items():
+            self.assertIn(
+                "HOST-DEPLOY | LANDED | path=%s | sha256=%s | mode=" % (
+                    relpath, hashlib.sha256(payload).hexdigest()),
+                result.stdout,
+            )
+
+    def test_preserves_executable_mode_when_replacing_file(self):
+        relpath = "scripts/job_tick.sh"
+        payload = b"#!/bin/bash\nprintf 'tick\\n'\n"
+        self.stage_files({relpath: payload})
+        staged = self.stage / relpath
+        staged.chmod(0o600)
+        target = self.deploy / relpath
+        target.parent.mkdir()
+        target.write_bytes(b"#!/bin/bash\nprintf 'old tick\\n'\n")
+        target.chmod(0o751)
+
+        result = self.run_deploy()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o751)
+        self.assertIn(
+            "HOST-DEPLOY | LANDED | path=scripts/job_tick.sh | "
+            "sha256=%s | mode=751" % hashlib.sha256(payload).hexdigest(),
+            result.stdout,
+        )
+
+    def test_applies_and_verifies_explicit_manifest_mode(self):
+        relpath = "scripts/job_tick.sh"
+        payload = b"#!/bin/bash\nprintf 'tick\\n'\n"
+        self.stage_files({relpath: payload}, modes={relpath: "700"})
+        target = self.deploy / relpath
+        target.parent.mkdir()
+        target.write_bytes(b"old tick\n")
+        target.chmod(0o600)
+
+        result = self.run_deploy()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+        self.assertIn("path=scripts/job_tick.sh", result.stdout)
+        self.assertIn("mode=700", result.stdout)
+
+    def test_execute_mode_regression_keeps_gate_and_old_release(self):
+        relpath = "scripts/job_tick.sh"
+        self.stage_files(
+            {relpath: b"#!/bin/bash\nprintf 'tick\\n'\n"},
+            modes={relpath: "600"},
+        )
+        target = self.deploy / relpath
+        target.parent.mkdir()
+        target.write_bytes(b"old tick\n")
+        target.chmod(0o700)
+        (self.deploy / "RELEASE").write_text(
+            OLD_RELEASE_SHA + "\n", encoding="ascii")
+
+        result = self.run_deploy()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HOST-DEPLOY | REFUSED | MODE_REGRESSION", result.stderr)
+        self.assertTrue((self.deploy / "DEPLOYING").is_file())
+        self.assertEqual(
+            (self.deploy / "RELEASE").read_text(encoding="ascii"),
+            OLD_RELEASE_SHA + "\n",
+        )
 
     def test_landed_digest_mismatch_keeps_gate_and_old_release(self):
         relpath = "src/job_runner.py"

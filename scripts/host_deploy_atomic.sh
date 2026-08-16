@@ -8,7 +8,7 @@ cleanup() {
   [ -z "$RELEASE_TEMP" ] || rm -f -- "$RELEASE_TEMP"
   if [ -n "$WORK_DIR" ]; then
     rm -f -- "$WORK_DIR/entries" "$WORK_DIR/expected" \
-      "$WORK_DIR/actual"
+      "$WORK_DIR/actual" "$WORK_DIR/landed" "$WORK_DIR/verified"
     rmdir "$WORK_DIR" 2>/dev/null || true
   fi
 }
@@ -19,12 +19,30 @@ refuse() {
 device_id() {
   stat -c '%d' -- "$1" 2>/dev/null || stat -f '%d' -- "$1"
 }
+file_mode() {
+  stat -c '%a' -- "$1" 2>/dev/null || stat -f '%Lp' -- "$1"
+}
+normalize_mode() {
+  local value=$1
+  while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+    value=${value#0}
+  done
+  printf '%s\n' "$value"
+}
+mode_has_execute_bit() {
+  local value=$1
+  [ "${#value}" -lt 4 ] || value=${value#?}
+  case "$value" in
+    *[1357]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 trap cleanup EXIT
 trap 'refuse INTERRUPTED' HUP INT TERM
 [ "$#" -eq 4 ] || \
   refuse USAGE_STAGING_DEPLOY_MANIFEST_RELEASE_SHA
 STAGING_DIR=$1 DEPLOY_DIR=$2 MANIFEST=$3 RELEASE_SHA=$4
-for tool in cmp cut dirname find mkdir mktemp mv realpath sha256sum sort stat; do
+for tool in chmod cmp cut dirname find mkdir mktemp mv realpath sha256sum sort stat; do
   command -v "$tool" >/dev/null 2>&1 || refuse "TOOL_UNAVAILABLE_$tool"
 done
 [ -d "$STAGING_DIR" ] && [ ! -L "$STAGING_DIR" ] || \
@@ -53,8 +71,8 @@ WORK_DIR=$(mktemp -d /tmp/host-deploy-atomic.XXXXXX) || \
   refuse WORK_DIR_UNAVAILABLE
 : > "$WORK_DIR/entries" || refuse WORK_DIR_UNAVAILABLE
 FILE_COUNT=0
-while IFS=' ' read -r digest rel extra || \
-    [ -n "${digest:-}${rel:-}${extra:-}" ]; do
+while IFS=' ' read -r digest rel manifest_mode extra || \
+    [ -n "${digest:-}${rel:-}${manifest_mode:-}${extra:-}" ]; do
   [ -n "${digest:-}" ] && [ -n "${rel:-}" ] && [ -z "${extra:-}" ] || \
     refuse MANIFEST_ROW_INVALID
   case "$digest" in
@@ -66,7 +84,21 @@ while IFS=' ' read -r digest rel extra || \
       refuse MANIFEST_PATH_UNSAFE ;;
     RELEASE|DEPLOYING) refuse MANIFEST_PATH_RESERVED ;;
   esac
-  printf '%s\t%s\n' "$rel" "$digest" >> "$WORK_DIR/entries" || \
+  if [ -n "${manifest_mode:-}" ]; then
+    case "$manifest_mode" in
+      *[!0-7]*) refuse MANIFEST_MODE_INVALID ;;
+    esac
+    case "${#manifest_mode}" in
+      3|4) ;;
+      *) refuse MANIFEST_MODE_INVALID ;;
+    esac
+    manifest_mode=$(normalize_mode "$manifest_mode") || \
+      refuse MANIFEST_MODE_INVALID
+  else
+    manifest_mode=-
+  fi
+  printf '%s\t%s\t%s\n' "$rel" "$digest" "$manifest_mode" \
+    >> "$WORK_DIR/entries" || \
     refuse WORK_DIR_UNAVAILABLE
   FILE_COUNT=$((FILE_COUNT + 1))
 done < "$MANIFEST"
@@ -89,7 +121,8 @@ LC_ALL=C sort -o "$WORK_DIR/actual" "$WORK_DIR/actual" || \
   refuse STAGING_SORT_FAILED
 cmp -s "$WORK_DIR/expected" "$WORK_DIR/actual" || \
   refuse MANIFEST_STAGE_MISMATCH
-while IFS=$'\t' read -r rel digest; do
+: > "$WORK_DIR/landed" || refuse WORK_DIR_UNAVAILABLE
+while IFS=$'\t' read -r rel digest manifest_mode; do
   source="$STAGING_DIR/$rel"
   target="$DEPLOY_DIR/$rel"
   parent=$(dirname -- "$target")
@@ -102,16 +135,47 @@ while IFS=$'\t' read -r rel digest; do
   [ "$(device_id "$source")" = "$(device_id "$parent")" ] || \
     refuse CROSS_FILESYSTEM
   [ ! -L "$target" ] && [ ! -d "$target" ] || refuse TARGET_PATH_UNSAFE
+  previous_mode=-
+  if [ -e "$target" ]; then
+    previous_mode=$(file_mode "$target") || refuse TARGET_MODE_UNAVAILABLE
+  fi
   mv -f -- "$source" "$target" || refuse ATOMIC_RENAME_FAILED
+  expected_mode=$manifest_mode
+  if [ "$expected_mode" = - ]; then
+    expected_mode=$previous_mode
+  fi
+  if [ "$expected_mode" != - ]; then
+    chmod "$expected_mode" "$target" || refuse LANDED_CHMOD_FAILED
+  else
+    expected_mode=$(file_mode "$target") || refuse LANDED_MODE_UNAVAILABLE
+  fi
+  printf '%s\t%s\t%s\t%s\n' \
+    "$rel" "$digest" "$previous_mode" "$expected_mode" \
+    >> "$WORK_DIR/landed" || refuse WORK_DIR_UNAVAILABLE
 done < "$WORK_DIR/entries"
-while IFS=$'\t' read -r rel digest; do
+: > "$WORK_DIR/verified" || refuse WORK_DIR_UNAVAILABLE
+while IFS=$'\t' read -r rel digest previous_mode expected_mode; do
   landed=$(sha256sum -- "$DEPLOY_DIR/$rel") || refuse LANDED_SHA256_UNAVAILABLE
   [ "${landed%% *}" = "$digest" ] || refuse LANDED_SHA256_MISMATCH
-done < "$WORK_DIR/entries"
+  actual_mode=$(file_mode "$DEPLOY_DIR/$rel") || refuse LANDED_MODE_UNAVAILABLE
+  [ "$actual_mode" = "$expected_mode" ] || refuse LANDED_MODE_MISMATCH
+  printf '%s\t%s\t%s\t%s\n' \
+    "$rel" "$digest" "$previous_mode" "$actual_mode" \
+    >> "$WORK_DIR/verified" || refuse WORK_DIR_UNAVAILABLE
+done < "$WORK_DIR/landed"
+while IFS=$'\t' read -r rel digest previous_mode actual_mode; do
+  if [ "$previous_mode" != - ] && mode_has_execute_bit "$previous_mode"; then
+    mode_has_execute_bit "$actual_mode" || refuse MODE_REGRESSION
+  fi
+done < "$WORK_DIR/verified"
 RELEASE_TEMP=$(mktemp "$DEPLOY_DIR/.RELEASE.XXXXXX") || \
   refuse RELEASE_TEMP_UNAVAILABLE
 printf '%s\n' "$RELEASE_SHA" > "$RELEASE_TEMP" || refuse RELEASE_WRITE_FAILED
 mv -f -- "$RELEASE_TEMP" "$DEPLOY_DIR/RELEASE" || refuse RELEASE_RENAME_FAILED
 RELEASE_TEMP=
 rm -f -- "$MARKER" || refuse MARKER_REMOVE_FAILED
+while IFS=$'\t' read -r rel digest previous_mode actual_mode; do
+  printf 'HOST-DEPLOY | LANDED | path=%s | sha256=%s | mode=%s\n' \
+    "$rel" "$digest" "$actual_mode"
+done < "$WORK_DIR/verified"
 printf 'HOST-DEPLOY | OK | files=%d | release=%s\n' "$FILE_COUNT" "$RELEASE_SHA"
