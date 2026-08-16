@@ -12,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import market_stream as ms
+import executable_gap_watch as gap_watch
 
 
 FIXED_UTC = "2026-08-13T12:00:00.000Z"
@@ -570,6 +571,429 @@ class LiveFeedMergeTests(OfflineCase):
         self.assertEqual(kline_symbols, ["AAAUSDT"])
         self.assertTrue(stats.feed_used)
         self.assertEqual(stats.feed_reason, "accepted")
+
+    def test_delayed_bulk_reads_use_feed_time_and_oldest_pair_leg(self):
+        feed_pair = feed_row("spot", "10", "11")
+        feed_pair.update(
+            {
+                "venues": "both",
+                "perp_bid": "12",
+                "perp_ask": "13",
+                "freshness_ms": "200",
+                "book_age_ms": "200",
+            }
+        )
+        feed_spot = feed_row("spot", "20", "21")
+        feed_spot.update({"freshness_ms": "200", "book_age_ms": "200"})
+        self.write_feed(
+            {"AAAUSDT": feed_pair, "BBBUSDT": feed_spot},
+            written_ms=FIXED_MS + 11_000,
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
+            perp=[book("AAAUSDT", "5", "6"), book("BBBUSDT", "7", "8")],
+            premiums=[premium("AAAUSDT", "5"), premium("BBBUSDT", "7")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        clock = iter(
+            (
+                FIXED_MS,
+                FIXED_MS + 500,
+                FIXED_MS + 1_000,
+                FIXED_MS + 12_000,
+                FIXED_MS + 12_000,
+                FIXED_MS + 13_000,
+            )
+        )
+
+        stats = self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        state = self.read_state()
+
+        self.assertTrue(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "accepted")
+        self.assertEqual(
+            (
+                state["AAAUSDT"]["spot_bid"],
+                state["AAAUSDT"]["spot_ask"],
+                state["AAAUSDT"]["perp_bid"],
+                state["AAAUSDT"]["perp_ask"],
+            ),
+            ("10", "11", "12", "13"),
+        )
+        self.assertEqual(state["AAAUSDT"]["book_age_ms"], "2200")
+        self.assertLess(int(state["AAAUSDT"]["book_age_ms"]), 5_000)
+        self.assertEqual(state["BBBUSDT"]["spot_bid"], "20")
+        self.assertEqual(state["BBBUSDT"]["perp_bid"], "7")
+        self.assertEqual(state["BBBUSDT"]["book_age_ms"], "12000")
+        self.assertEqual(state["BBBUSDT"]["freshness_ms"], "13000")
+
+    def test_single_feed_leg_remains_in_composite_freshness(self):
+        feed_spot = feed_row("spot", "89", "90")
+        feed_spot.update({"freshness_ms": "4000", "book_age_ms": "4000"})
+        self.write_feed(
+            {"AAAUSDT": feed_spot}, written_ms=FIXED_MS + 1_000
+        )
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS,
+            FIXED_MS,
+            FIXED_MS + 1_000,
+            FIXED_MS + 1_000,
+            FIXED_MS + 2_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            kline_batches={
+                "AAAUSDT": [klines(
+                    ("1", "1", "1"),
+                    first_close=FIXED_MS + 999 - 120_000,
+                )]
+            },
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+
+        self.assertEqual(record["spot_bid"], "89")
+        self.assertGreaterEqual(int(record["freshness_ms"]), 5_000)
+        self.assertIsNone(record["book_age_ms"])
+
+    def test_backward_completion_clock_keeps_feed_pair_age_floor(self):
+        both = feed_row("spot", "89", "90")
+        both.update({
+            "venues": "both",
+            "perp_bid": "90",
+            "perp_ask": "91",
+            "freshness_ms": "4000",
+            "book_age_ms": "4000",
+        })
+        self.write_feed(
+            {"AAAUSDT": both}, written_ms=FIXED_MS + 10_000
+        )
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS,
+            FIXED_MS,
+            FIXED_MS + 10_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 8_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        watch_now_ms = gap_watch._utc_ms(record["utc"])
+        rows, _, summary = gap_watch.build_rows(
+            {"AAAUSDT": record}, watch_now_ms
+        )
+
+        self.assertEqual(record["book_age_ms"], "4000")
+        self.assertEqual(summary.computed, 1)
+        self.assertEqual(
+            (rows[0]["spot_age_ms"], rows[0]["perp_age_ms"]),
+            (4_000, 4_000),
+        )
+
+    def test_post_sample_feed_write_keeps_basis_and_source_age_floor(self):
+        source_age_ms = 200
+        feed_now_ms = FIXED_MS + 1_000
+        feed_written_ms = feed_now_ms + 500
+        both = feed_row("spot", "89", "90")
+        both.update({
+            "venues": "both",
+            "perp_bid": "90",
+            "perp_ask": "91",
+            "freshness_ms": str(source_age_ms),
+            "book_age_ms": str(source_age_ms),
+        })
+        self.write_feed({"AAAUSDT": both}, written_ms=feed_written_ms)
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS,
+            FIXED_MS,
+            feed_now_ms,
+            feed_written_ms,
+            FIXED_MS + 2_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "100", "101")],
+            premiums=[premium("AAAUSDT", "100")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        stats = self.stream(
+            reader,
+            focus_cap=1,
+            feed_state_path=self.feed_path,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        earlier_clock_age = ms._clamped_age_ms(
+            feed_now_ms, feed_written_ms, source_age_ms
+        )
+
+        self.assertTrue(stats.feed_used)
+        self.assertEqual(stats.feed_reason, "accepted")
+        self.assertEqual(record["basis_gap_pct"], "0")
+        self.assertEqual(record["book_age_ms"], "700")
+        self.assertGreaterEqual(int(record["book_age_ms"]), earlier_clock_age)
+
+    def test_backward_completion_clock_keeps_rest_pair_selection_age_floor(self):
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 1_000,
+            FIXED_MS + 4_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 2_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "101", "102")],
+            premiums=[premium("AAAUSDT", "101")],
+            kline_batches={
+                "AAAUSDT": [klines(
+                    ("1", "1", "1"),
+                    first_close=FIXED_MS + 9_999 - 120_000,
+                )]
+            },
+            oi={"AAAUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        watch_now_ms = gap_watch._utc_ms(record["utc"])
+        rows, accepted, summary = gap_watch.build_rows(
+            {"AAAUSDT": record}, watch_now_ms
+        )
+
+        self.assertGreaterEqual(int(record["book_age_ms"]), 9_000)
+        self.assertEqual(accepted, ())
+        self.assertEqual(summary.computed, 0)
+        self.assertEqual(summary.refused_stale, 1)
+        self.assertIn(rows[0]["result"], gap_watch.STALE_REASONS)
+
+    def test_latest_rest_sample_sets_backward_clock_pair_age_floor(self):
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 1_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 2_000,
+            FIXED_MS + 2_000,
+            FIXED_MS + 3_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "101", "102")],
+            premiums=[premium("AAAUSDT", "101")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        watch_now_ms = gap_watch._utc_ms(record["utc"])
+        rows, accepted, summary = gap_watch.build_rows(
+            {"AAAUSDT": record}, watch_now_ms
+        )
+
+        self.assertGreaterEqual(int(record["book_age_ms"]), 9_000)
+        self.assertEqual(accepted, ())
+        self.assertEqual(summary.computed, 0)
+        self.assertEqual(summary.refused_stale, 1)
+        self.assertEqual(rows[0]["result"], "SPOT_QUOTE_STALE")
+
+    def test_latest_focus_sample_sets_backward_clock_pair_age_floor(self):
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 1_000,
+            FIXED_MS + 2_000,
+            FIXED_MS + 3_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 4_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "101", "102")],
+            premiums=[premium("AAAUSDT", "101")],
+            kline_batches={
+                "AAAUSDT": [klines(
+                    ("1", "1", "1"),
+                    first_close=FIXED_MS + 9_999 - 120_000,
+                )]
+            },
+            oi={"AAAUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+        watch_now_ms = gap_watch._utc_ms(record["utc"])
+        rows, accepted, summary = gap_watch.build_rows(
+            {"AAAUSDT": record}, watch_now_ms
+        )
+
+        self.assertGreaterEqual(int(record["book_age_ms"]), 9_000)
+        self.assertEqual(accepted, ())
+        self.assertEqual(summary.computed, 0)
+        self.assertEqual(summary.refused_stale, 1)
+        self.assertEqual(rows[0]["result"], "SPOT_QUOTE_STALE")
+
+    def test_latest_focus_sample_sets_backward_clock_composite_age_floor(self):
+        clock = iter((
+            FIXED_MS,
+            FIXED_MS + 9_000,
+            FIXED_MS + 9_000,
+            FIXED_MS + 9_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 1_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("AAAUSDT", "101", "102")],
+            premiums=[premium("AAAUSDT", "101")],
+            kline_batches={
+                "AAAUSDT": [klines(("1",), first_close=FIXED_MS)]
+            },
+            oi={"AAAUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=1,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        record = self.read_state()["AAAUSDT"]
+
+        self.assertGreaterEqual(int(record["freshness_ms"]), 10_000)
+
+    def test_single_rest_leg_keeps_selection_age_in_freshness(self):
+        clock = iter((
+            FIXED_MS + 5_000,
+            FIXED_MS + 1_000,
+            FIXED_MS + 4_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 10_000,
+            FIXED_MS + 2_000,
+        ))
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "99", "100")],
+            perp=[book("BBBUSDT", "101", "102")],
+            premiums=[premium("BBBUSDT", "101")],
+            kline_batches={
+                "AAAUSDT": [klines(
+                    ("1", "1", "1"),
+                    first_close=FIXED_MS + 9_999 - 120_000,
+                )],
+                "BBBUSDT": [klines(
+                    ("1", "1", "1"),
+                    first_close=FIXED_MS + 9_999 - 120_000,
+                )],
+            },
+            oi={"BBBUSDT": "10"},
+        )
+
+        self.stream(
+            reader,
+            focus_cap=2,
+            ms_fn=lambda: next(clock),
+        ).run_once()
+        state = self.read_state()
+        spot_record = state["AAAUSDT"]
+        perp_record = state["BBBUSDT"]
+
+        self.assertEqual(spot_record["venues"], "spot")
+        self.assertEqual(spot_record["freshness_ms"], "9000")
+        self.assertIsNone(spot_record["book_age_ms"])
+        self.assertEqual(perp_record["venues"], "perp")
+        self.assertEqual(perp_record["freshness_ms"], "6000")
+        self.assertIsNone(perp_record["book_age_ms"])
+
+    def test_feed_basis_uses_time_sampled_after_bulk_parsing(self):
+        old_basis_now_ms = FIXED_MS + 10_000
+        feed_written_ms = old_basis_now_ms + 300
+        feed_now_ms = feed_written_ms + 700
+        clock = {"now": old_basis_now_ms}
+        feed_pair = feed_row("spot", "10", "11")
+        feed_pair.update(
+            {
+                "venues": "both",
+                "perp_bid": "12",
+                "perp_ask": "13",
+                "freshness_ms": "200",
+                "book_age_ms": "200",
+            }
+        )
+        self.write_feed(
+            {
+                "AAAUSDT": feed_pair,
+                "BBBUSDT": feed_row("spot", "20", "21"),
+            },
+            written_ms=feed_written_ms,
+        )
+        reader = FixtureReader(
+            spot=[book("AAAUSDT", "1", "2"), book("BBBUSDT", "3", "4")],
+            perp=[book("AAAUSDT", "5", "6"), book("BBBUSDT", "7", "8")],
+            premiums=[premium("AAAUSDT", "5"), premium("BBBUSDT", "7")],
+            kline_batches={"AAAUSDT": [klines(("1", "1", "1"))]},
+            oi={"AAAUSDT": "10"},
+        )
+        real_book_map = ms.book_map
+
+        def parse_with_delay(payload, source):
+            parsed = real_book_map(payload, source)
+            clock["now"] = feed_now_ms
+            return parsed
+
+        with patch.object(ms, "book_map", side_effect=parse_with_delay):
+            self.stream(
+                reader,
+                focus_cap=1,
+                feed_state_path=self.feed_path,
+                ms_fn=lambda: clock["now"],
+            ).run_once()
+        state = self.read_state()
+
+        self.assertEqual(
+            state["AAAUSDT"]["basis_gap_pct"],
+            "9.0909090909090909090909090909090909090909090909091",
+        )
+        self.assertIsNone(state["BBBUSDT"]["basis_gap_pct"])
 
     def test_feed_windows_compute_surges_outside_the_focus_set(self):
         closes = (1_000_000, 1_060_000, 1_120_000)
