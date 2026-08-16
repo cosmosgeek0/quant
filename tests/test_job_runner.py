@@ -28,6 +28,38 @@ import job_runner as jr  # noqa: E402
 
 NOW = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
 SHA = "7ac26aa771937f802930dac5eb017d6583d968d8"
+STANDING_REPAY_FACTS = {
+    "job_id": "mproofr-2c2a3027d877",
+    "ready_params": {
+        "asset": "USDT", "amount": "2.5000387", "type": "REPAY",
+    },
+    "ready_expected": {
+        "asset": "USDT", "principal": "2.5000387", "interest": "0",
+        "status": "REPAY_CONFIRMED",
+    },
+    "account_liability_before": {
+        "asset": "USDT", "borrowed": "2.5", "interest": "0.0000387",
+        "total_liability": "2.5000387",
+    },
+    "submission": {
+        "kind": "ok", "transaction_id": "401382497303",
+    },
+    "history_watermark": 401344857108,
+    "history_row": {
+        "timestamp": 1786865269293,
+        "txId": 401382497303,
+        "asset": "USDT",
+        "amount": "2.5000387",
+        "principal": "2.5",
+        "interest": "0.0000387",
+        "status": "CONFIRMED",
+        "clientTag": "",
+        "type": "MANUAL",
+    },
+    "account_after": {
+        "asset": "USDT", "borrowed": "0", "interest": "0",
+    },
+}
 
 
 def utc(value):
@@ -143,14 +175,29 @@ class MarginTransport:
             transaction_id = self.post_payload.get(
                 "tranId", self.post_payload.get("txId", "")
             )
-            return self.history_kind, {"rows": [{
+            row = {
                 "txId": transaction_id,
                 "asset": self.operation["asset"],
-                "principal": self.operation["amount"],
                 "status": "CONFIRMED",
                 "clientTag": "",
                 "type": "MANUAL",
-            }]}
+            }
+            if self.operation["type"] == "REPAY":
+                before_rows = (
+                    self.account_before_payload or {"userAssets": []}
+                ).get("userAssets", [])
+                before = next(
+                    value for value in before_rows
+                    if value.get("asset") == self.operation["asset"]
+                )
+                row.update({
+                    "amount": self.operation["amount"],
+                    "principal": before["borrowed"],
+                    "interest": before["interest"],
+                })
+            else:
+                row["principal"] = self.operation["amount"]
+            return self.history_kind, {"rows": [row]}
         if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
             if self.operation is None:
                 if self.account_before_payload is not None:
@@ -634,6 +681,45 @@ class JobRunnerTests(unittest.TestCase):
             "source_path": source_path,
             "lock_path": lock_path,
         }
+
+    def prepare_standing_legacy_repay_reconcile(self):
+        facts = json.loads(json.dumps(STANDING_REPAY_FACTS))
+        job_id = facts["job_id"]
+        self.margin.post_payload = {
+            "txId": int(facts["submission"]["transaction_id"]),
+        }
+        self.margin.history_payload = {"rows": []}
+        before = facts["account_liability_before"]
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": before["asset"],
+            "borrowed": before["borrowed"],
+            "interest": before["interest"],
+        }]}
+        self.margin.account_payload = {
+            "userAssets": [facts["account_after"]],
+        }
+        self.margin_job(
+            job_id, op="MARGIN_REPAY",
+            principal=facts["ready_params"]["amount"],
+        )
+        self.assertEqual(self.margin_tick(), 4)
+        unknown = self.results()[0]
+        with open(unknown["receipt_path"], encoding="utf-8") as handle:
+            source_path = json.load(handle)["source_receipt_path"]
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        source["ready"]["params"] = facts["ready_params"]
+        source["ready"]["expected_ledger_confirmation"] = \
+            facts["ready_expected"]
+        source["account_liability_before"] = before
+        source["submission"] = facts["submission"]
+        source["history_watermark"] = facts["history_watermark"]
+        source["verdict"] = "UNKNOWN"
+        source["reason"] = "MARGIN_CONFIRMATION_MISMATCH"
+        Path(source_path).write_text(
+            json.dumps(source, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return facts, unknown, source_path
 
     @staticmethod
     def make_margin_reconcile_receipt_legacy(artifacts):
@@ -2615,7 +2701,7 @@ class JobRunnerTests(unittest.TestCase):
         }]}
         self.margin_job(
             "mrv11-borrowed-residual", op="MARGIN_REPAY",
-            principal="2.5",
+            principal="2.500005",
         )
 
         self.assertEqual(self.margin_tick(), 4)
@@ -2667,16 +2753,41 @@ class JobRunnerTests(unittest.TestCase):
             [call for call in self.margin.calls if call[0] == "POST"], []
         )
 
-    def test_margin_repay_measured_total_closes_cleanly(self):
+    def test_margin_repay_split_must_equal_requested_amount_before_post(self):
         self.margin.account_before_payload = {"userAssets": [{
-            "asset": "USDT", "borrowed": "2.5", "interest": "0.000005",
+            "asset": "USDT", "borrowed": "1", "interest": "0.001",
+        }]}
+        self.margin_job(
+            "margin-repay-split", op="MARGIN_REPAY", principal="1",
+        )
+
+        self.assertEqual(self.margin_tick(), 2)
+
+        result = self.results()[0]
+        self.assertEqual((result["verdict"], self.reason(result)), (
+            "REFUSED", "REPAY_PRINCIPAL_INTEREST_MISMATCH",
+        ))
+        self.assertEqual(
+            [call for call in self.margin.calls if call[0] == "POST"], []
+        )
+
+    def test_margin_repay_measured_total_closes_cleanly(self):
+        facts = json.loads(json.dumps(STANDING_REPAY_FACTS))
+        self.margin.post_payload = {
+            "txId": facts["history_row"]["txId"],
+        }
+        self.margin.history_payload = {"rows": [facts["history_row"]]}
+        before = facts["account_liability_before"]
+        self.margin.account_before_payload = {"userAssets": [{
+            "asset": before["asset"], "borrowed": before["borrowed"],
+            "interest": before["interest"],
         }]}
         self.margin.account_payload = {"userAssets": [{
             "asset": "USDT", "borrowed": "0", "interest": "0",
         }]}
         self.margin_job(
             "margin-repay-measured-total", op="MARGIN_REPAY",
-            principal="2.500005",
+            principal=facts["ready_params"]["amount"],
         )
 
         self.assertEqual(self.margin_tick(), 0)
@@ -2687,11 +2798,40 @@ class JobRunnerTests(unittest.TestCase):
             ("CLOSED", "REPAY_CONFIRMED"),
         )
         source = self.margin_source(result)
+        modern_expected = {
+            "asset": "USDT",
+            "amount": "2.5000387",
+            "principal": "2.5",
+            "interest": "0.0000387",
+            "status": "REPAY_CONFIRMED",
+        }
+        self.assertEqual(
+            source["ready"]["expected_ledger_confirmation"],
+            modern_expected,
+        )
+        self.assertEqual(source["ledger_confirmation"], modern_expected)
         self.assertEqual(
             source["snapshot_time_note"],
             jr.MARGIN_SNAPSHOT_TIME_UNVERIFIED,
         )
         self.assertNotIn("follow_up_repay", source)
+
+    def test_margin_repay_principal_only_history_row_is_mismatch(self):
+        expected = {
+            "asset": "USDT",
+            "amount": "2.5000387",
+            "principal": "2.5",
+            "interest": "0.0000387",
+            "status": "REPAY_CONFIRMED",
+        }
+        principal_only = dict(
+            STANDING_REPAY_FACTS["history_row"],
+            principal="2.5000387", interest="0",
+        )
+
+        self.assertIsNone(jr._margin_history_confirmation(
+            {"rows": [principal_only]}, "401382497303", expected, "REPAY"
+        ))
 
     def test_margin_repay_residual_interest_has_typed_dust_verdict(self):
         self.margin.account_before_payload = {"userAssets": [{
@@ -2701,7 +2841,8 @@ class JobRunnerTests(unittest.TestCase):
             "asset": "USDT", "borrowed": "0", "interest": "0.000006",
         }]}
         self.margin_job(
-            "margin-repay-dust", op="MARGIN_REPAY", principal="2.5"
+            "margin-repay-dust", op="MARGIN_REPAY",
+            principal="2.500005",
         )
 
         self.assertEqual(self.margin_tick(), 0)
@@ -2712,7 +2853,11 @@ class JobRunnerTests(unittest.TestCase):
             ("CLOSED-WITH-DUST", "REPAY_CONFIRMED_WITH_DUST"),
         )
         source = self.margin_source(result)
-        self.assertNotIn("ledger_confirmation", source)
+        self.assertEqual(source["ledger_confirmation"], {
+            "asset": "USDT", "amount": "2.500005",
+            "principal": "2.5", "interest": "0.000005",
+            "status": "REPAY_CONFIRMED",
+        })
         self.assertEqual(source["account_liability"], {
             "asset": "USDT", "borrowed": "0", "interest": "0.000006",
             "total_liability": "0.000006",
@@ -2818,7 +2963,7 @@ class JobRunnerTests(unittest.TestCase):
             "asset": "USDT", "borrowed": "0.01", "interest": "0",
         }]}
         self.margin_job("margin-repay-open", op="MARGIN_REPAY",
-                        principal="0.01")
+                        principal="0.02")
 
         self.assertEqual(self.margin_tick(request=nonzero), 4)
 
@@ -3217,70 +3362,46 @@ class JobRunnerTests(unittest.TestCase):
         self.assertNotIn("legacy_exclusivity_proof", event)
 
     def test_reconcile_margin_standing_repay_closes_and_appends_result(self):
-        job_id = "mproofr-2c2a3027d877"
-        transaction_id = "401382497303"
-        liability_before = {
-            "asset": "USDT",
-            "borrowed": "2.5",
-            "interest": "0.0000387",
-            "total_liability": "2.5000387",
-        }
+        facts, unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        job_id = facts["job_id"]
+        transaction_id = facts["submission"]["transaction_id"]
+        liability_before = facts["account_liability_before"]
         liability_after = {
             "asset": "USDT",
             "borrowed": "0",
             "interest": "0",
             "total_liability": "0",
         }
-        self.margin.post_payload = {"txId": int(transaction_id)}
-        self.margin.history_payload = {"rows": []}
-        self.margin.account_before_payload = {
-            "userAssets": [{
-                "asset": "USDT", "borrowed": "2.5",
-                "interest": "0.0000387",
-            }],
-        }
-        self.margin.account_payload = {
-            "userAssets": [{
-                "asset": "USDT", "borrowed": "0", "interest": "0",
-            }],
-        }
-        self.margin_job(
-            job_id, op="MARGIN_REPAY", principal="2.5000387"
-        )
-        self.assertEqual(self.margin_tick(), 4)
-        unknown = self.results()[0]
         self.assertEqual((unknown["verdict"], self.reason(unknown)), (
             "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH",
         ))
-        source_before = self.margin_source(unknown)
+        source_before = json.loads(
+            Path(source_path).read_text(encoding="utf-8")
+        )
         self.assertNotEqual(set(source_before), set(jr.LEGACY_RECEIPT_FIELDS))
-        self.assertEqual(source_before["submission"], {
-            "kind": "ok", "transaction_id": transaction_id,
-        })
+        self.assertEqual(source_before["ready"]["params"],
+                         facts["ready_params"])
+        self.assertEqual(
+            source_before["ready"]["expected_ledger_confirmation"],
+            facts["ready_expected"],
+        )
+        self.assertEqual(source_before["submission"], facts["submission"])
         self.assertEqual(
             source_before["account_liability_before"], liability_before
         )
 
-        target = {
-            "txId": int(transaction_id),
-            "asset": "USDT",
-            "principal": "2.5000387",
-            "status": "CONFIRMED",
-            "clientTag": "",
-            "type": "MANUAL",
-        }
-        self.margin.history_payload = {"rows": [target]}
+        self.margin.history_payload = {"rows": [facts["history_row"]]}
         with mock.patch.object(
-                jr, "_evaluate_margin_confirmation",
-                wraps=jr._evaluate_margin_confirmation,
+                jr, "_evaluate_legacy_repay_confirmation",
+                wraps=jr._evaluate_legacy_repay_confirmation,
                 ) as evaluator:
             self.assertEqual(jr.reconcile_margin(
                 job_id, True, self.receipt_dir, NOW, self.margin
             ), 0)
 
         evaluator.assert_called_once()
-        self.assertEqual(evaluator.call_args.args[5], "REPAY")
-        self.assertEqual(evaluator.call_args.args[6], liability_before)
+        self.assertEqual(evaluator.call_args.args[5], liability_before)
         rows = self.results()
         self.assertEqual(
             [row.get("kind", "RESULT") for row in rows],
@@ -3294,6 +3415,15 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(event["transaction_id"], transaction_id)
         self.assertEqual(event["account_liability_before"], liability_before)
         self.assertEqual(event["account_liability"], liability_after)
+        self.assertEqual(event["receipt_shape"], jr.LEGACY_REPAY_SHAPE)
+        self.assertEqual(
+            event["receipt_shape_version"], jr.LEGACY_REPAY_SHAPE_VERSION
+        )
+        self.assertEqual(event["ledger_confirmation"], {
+            "asset": "USDT", "amount": "2.5000387",
+            "principal": "2.5", "interest": "0.0000387",
+            "status": "REPAY_CONFIRMED",
+        })
         self.assertEqual(final, {
             "job_id": job_id,
             "op": "MARGIN_REPAY",
@@ -3307,12 +3437,57 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual((source_final["verdict"], source_final["reason"]), (
             "CLOSED", "REPAY_CONFIRMED",
         ))
+        self.assertEqual(
+            source_final["ready"]["expected_ledger_confirmation"],
+            facts["ready_expected"],
+        )
         self.assertEqual(source_final["account_liability"], liability_after)
         self.assertEqual(
             jr._result_ids(jr._paths(self.receipt_dir)["results"]),
             ({job_id}, False, False),
         )
         self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_margin_standing_repay_nonzero_account_is_unconfirmed(
+            self):
+        facts, unknown, source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        self.margin.history_payload = {"rows": [facts["history_row"]]}
+        self.margin.account_payload = {"userAssets": [{
+            "asset": "USDT", "borrowed": "0.1", "interest": "0",
+        }]}
+        source_before = Path(source_path).read_bytes()
+        runner_before = Path(unknown["receipt_path"]).read_bytes()
+
+        self.assertEqual(jr.reconcile_margin(
+            facts["job_id"], True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(self.results()[-1], {
+            "kind": "RECONCILE_UNCONFIRMED",
+            "job_id": facts["job_id"],
+            "reason": "LEGACY_REPAY_CURRENT_BORROWED_NOT_ZERO",
+            "utc": utc(NOW),
+        })
+        self.assertEqual(Path(source_path).read_bytes(), source_before)
+        self.assertEqual(
+            Path(unknown["receipt_path"]).read_bytes(), runner_before
+        )
+
+    def test_reconcile_margin_standing_repay_names_first_missing_fact(self):
+        facts, _unknown, _source_path = \
+            self.prepare_standing_legacy_repay_reconcile()
+        row = dict(facts["history_row"])
+        row.pop("interest")
+        self.margin.history_payload = {"rows": [row]}
+
+        self.assertEqual(jr.reconcile_margin(
+            facts["job_id"], True, self.receipt_dir, NOW, self.margin
+        ), 3)
+
+        self.assertEqual(
+            self.results()[-1]["reason"], "LEGACY_REPAY_INTEREST_MISSING"
+        )
 
     def test_reconcile_margin_modern_missing_field_stays_modern(self):
         job_id = "margin-reconcile-modern-missing"
@@ -3484,7 +3659,9 @@ class JobRunnerTests(unittest.TestCase):
         self.margin.history_payload = {"rows": [{
             "txId": 7301,
             "asset": "USDT",
-            "principal": "2.500005",
+            "amount": "2.500005",
+            "principal": "2.5",
+            "interest": "0.000005",
             "status": "CONFIRMED",
             "clientTag": "",
             "type": "MANUAL",
