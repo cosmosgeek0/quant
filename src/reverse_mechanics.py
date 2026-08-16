@@ -12,7 +12,7 @@ There is no I/O or execution.
 from __future__ import annotations
 
 import hashlib, json, re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, DecimalException, ROUND_DOWN, localcontext
 from math import gcd
 from typing import Any, Literal, Mapping, Optional, Tuple, Union
@@ -46,6 +46,11 @@ class ReverseLeg:
     name: str; client_id_seed: str; base_qty: Decimal; reduce_only: bool
     lifecycle_states: Tuple[str, ...]
 
+    @property
+    def quantity(self) -> Decimal:
+        """Exact quantity carried by this plan or action leg."""
+        return self.base_qty
+
 
 @dataclass(frozen=True)
 class ReversePlan:
@@ -55,9 +60,11 @@ class ReversePlan:
     spot_notional: Decimal; perp_notional: Decimal; common_step: Decimal
     legs: Tuple[ReverseLeg, ...]
     verdict: Literal["READY"] = "READY"
+    spot_step: Optional[Decimal] = None
 
     @property
-    def dust(self) -> Decimal: return self.common_step
+    def dust(self) -> Decimal:
+        return self.spot_step if self.spot_step is not None else self.common_step
 
     def __post_init__(self) -> None:
         if self.base_qty != self.borrow_principal:
@@ -78,6 +85,8 @@ ReversePlanResult = Union[ReversePlan, ReversePlanRefusal]
 @dataclass(frozen=True)
 class LegOutcome:
     status: str = NOT_STARTED; fills: Tuple[Decimal, ...] = ()
+    executed_qty: Optional[Decimal] = None
+    net_base_after_fees: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
@@ -222,7 +231,7 @@ def plan_reverse_mechanics(
     ) for name in LEG_ORDER)
     return ReversePlan(symbol, intent_id, base_qty, borrow_asset, base_qty,
         borrowable, interest_rate_hourly, quote_cap, quote_notional,
-        spot_notional, perp_notional, common_step, legs)
+        spot_notional, perp_notional, common_step, legs, spot_step=spot_step)
 
 
 def _fill_amount(value: Any) -> Decimal:
@@ -243,14 +252,30 @@ def _outcome(value: Any) -> LegOutcome:
     if value is None: return LegOutcome()
     if isinstance(value, LegOutcome):
         status, raw_fills = value.status, value.fills
+        executed, net_base = value.executed_qty, value.net_base_after_fees
     elif type(value) is str:
-        status, raw_fills = value, ()
+        status, raw_fills, executed, net_base = value, (), None, None
     elif isinstance(value, Mapping):
         status, raw_fills = value.get("status", NOT_STARTED), value.get("fills", ())
+        executed = _value(value, "executed_qty", "executedQty")
+        net_base = _value(value, "net_base_after_fees", "netBaseAfterFees")
     else: raise ValueError("leg outcome is malformed")
+    if raw_fills is None:
+        raw_fills = ()
     if status not in LEDGER_STATUSES or not isinstance(raw_fills, (list, tuple)):
         raise ValueError("leg status or fills are malformed")
-    return LegOutcome(status, tuple(_fill_amount(fill) for fill in raw_fills))
+    fills = tuple(_fill_amount(fill) for fill in raw_fills)
+    if executed is None and fills:
+        executed = sum(fills, ZERO)
+    if executed is not None and not _valid_decimal(executed):
+        raise ValueError("executed quantity is unavailable")
+    if net_base is not None and not _valid_decimal(net_base):
+        raise ValueError("net base after fees is unavailable")
+    if executed is not None and sum(fills, ZERO) > executed:
+        raise ValueError("fills exceed executed quantity")
+    if executed is not None and net_base is not None and net_base > executed:
+        raise ValueError("net base exceeds executed quantity")
+    return LegOutcome(status, fills, executed, net_base)
 
 
 def _ledger(value: Any) -> Mapping[str, LegOutcome]:
@@ -281,9 +306,127 @@ def _is_flat(plan: ReversePlan, truth: ExchangeTruth) -> bool:
     return truth.liability == truth.futures_position == ZERO and abs(truth.base_balance_delta) < plan.dust
 
 
+def _floor_quantity(quantity: Decimal, step: Decimal) -> Decimal:
+    with localcontext() as context:
+        context.prec = 60
+        return (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _action_leg(plan: ReversePlan, name: str, quantity: Decimal) -> ReverseLeg:
+    if not _valid_decimal(quantity, positive=True):
+        raise ValueError(name + "_QUANTITY_UNKNOWN")
+    planned = next(leg for leg in plan.legs if leg.name == name)
+    return replace(planned, base_qty=quantity)
+
+
+def _measurement_problem(ledger: Mapping[str, LegOutcome]) -> Optional[str]:
+    for name in LEG_ORDER:
+        row = ledger[name]
+        if row.status == UNKNOWN:
+            return name + "_UNKNOWN"
+        if row.status == NOT_STARTED:
+            if row.executed_qty not in (None, ZERO) \
+                    or row.net_base_after_fees not in (None, ZERO):
+                return "LEDGER_TRUTH_MISMATCH"
+            continue
+        if row.executed_qty is None:
+            return name + "_EXECUTED_QTY_UNKNOWN"
+        if row.status == DONE_STATUS and row.executed_qty <= ZERO:
+            return name + "_DONE_WITHOUT_FILLS"
+        if name in (MARGIN_SELL, MARGIN_BUY) \
+                and row.executed_qty > ZERO \
+                and row.net_base_after_fees is None:
+            return name + "_NET_BASE_UNKNOWN"
+    return None
+
+
+def _quantity(ledger: Mapping[str, LegOutcome], name: str) -> Decimal:
+    row = ledger[name]
+    return ZERO if row.status == NOT_STARTED else row.executed_qty  # type: ignore[return-value]
+
+
+def _net_base(ledger: Mapping[str, LegOutcome], name: str) -> Decimal:
+    row = ledger[name]
+    if row.status == NOT_STARTED or row.executed_qty == ZERO:
+        return ZERO
+    return row.net_base_after_fees  # type: ignore[return-value]
+
+
+def _ledger_truth_problem(
+    plan: ReversePlan, ledger: Mapping[str, LegOutcome], truth: ExchangeTruth,
+) -> Optional[str]:
+    borrowed = _quantity(ledger, BORROW)
+    sold = _quantity(ledger, MARGIN_SELL)
+    sold_net = _net_base(ledger, MARGIN_SELL)
+    opened = _quantity(ledger, FUTURES_LONG_OPEN)
+    closed = _quantity(ledger, FUTURES_CLOSE)
+    bought_net = _net_base(ledger, MARGIN_BUY)
+    repaid = _quantity(ledger, REPAY)
+
+    if truth.liability > ZERO and (
+            ledger[BORROW].status == NOT_STARTED or borrowed <= ZERO):
+        return "LEDGER_TRUTH_MISMATCH"
+    if borrowed > ZERO and truth.liability == ZERO and repaid == ZERO:
+        return "LEDGER_TRUTH_MISMATCH"
+    if sold > ZERO and borrowed <= ZERO:
+        return "LEDGER_TRUTH_MISMATCH"
+    if opened > ZERO and sold_net <= ZERO:
+        return "LEDGER_TRUTH_MISMATCH"
+    if closed > opened or bought_net > sold_net + plan.dust:
+        return "LEDGER_TRUTH_MISMATCH"
+    if repaid > ZERO and borrowed <= ZERO:
+        return "LEDGER_TRUTH_MISMATCH"
+    if truth.futures_position > ZERO and (
+            opened <= ZERO or truth.futures_position != opened):
+        return "LEDGER_TRUTH_MISMATCH"
+    if truth.futures_position == ZERO and opened > closed:
+        return "LEDGER_TRUTH_MISMATCH"
+
+    expected_delta = borrowed - sold + bought_net - repaid
+    # Base reconciliation uses the Spot venue step. A negative difference of
+    # one full step is sale evidence, not flatness; one step is the
+    # inclusive reconciliation allowance, while DONE remains strictly inside.
+    if abs(truth.base_balance_delta - expected_delta) > plan.dust:
+        return "LEDGER_TRUTH_MISMATCH"
+    if borrowed == sold == bought_net == repaid == ZERO \
+            and truth.base_balance_delta != ZERO:
+        return "LEDGER_TRUTH_MISMATCH"
+    return None
+
+
+def _cleanup_action(
+    plan: ReversePlan, ledger: Mapping[str, LegOutcome], truth: ExchangeTruth,
+) -> ReverseAction:
+    names_and_quantities = []
+    if truth.futures_position > ZERO:
+        names_and_quantities.append((
+            FUTURES_CLOSE, _quantity(ledger, FUTURES_LONG_OPEN),
+        ))
+    buy_remaining = max(
+        _net_base(ledger, MARGIN_SELL) - _net_base(ledger, MARGIN_BUY), ZERO,
+    )
+    buy_quantity = _floor_quantity(buy_remaining, plan.dust)
+    if buy_quantity > ZERO:
+        names_and_quantities.append((MARGIN_BUY, buy_quantity))
+    if truth.liability > ZERO:
+        names_and_quantities.append((REPAY, truth.liability))
+    if not names_and_quantities:
+        return DONE if _is_flat(plan, truth) \
+            else FREEZE("RECOVERY_TRUTH_NOT_FLAT")
+    try:
+        return UNWIND(tuple(
+            _action_leg(plan, name, quantity)
+            for name, quantity in names_and_quantities
+        ))
+    except ValueError as error:
+        return FREEZE(str(error))
+
+
 def next_action(plan, ledger_of_completed_legs, exchange_truth) -> ReverseAction:
     """Return the sole next pure action under the frozen failure ladder."""
-    if not isinstance(plan, ReversePlan):
+    if not isinstance(plan, ReversePlan) \
+            or not _valid_decimal(plan.dust, positive=True) \
+            or not _valid_decimal(plan.common_step, positive=True):
         return FREEZE("PLAN_NOT_READY")
     try:
         ledger = _ledger(ledger_of_completed_legs)
@@ -291,16 +434,13 @@ def next_action(plan, ledger_of_completed_legs, exchange_truth) -> ReverseAction
     except (LookupError, ValueError) as error:
         return FREEZE(str(error))
 
-    for name in LEG_ORDER:
-        row = ledger[name]
-        if row.status == UNKNOWN:
-            return FREEZE(name + "_UNKNOWN")
-        if row.status == DONE_STATUS and sum(row.fills, ZERO) <= ZERO:
-            return FREEZE(name + "_DONE_WITHOUT_FILLS")
+    problem = _measurement_problem(ledger)
+    if problem is not None:
+        return FREEZE(problem)
 
     failures = [name for name in LEG_ORDER if ledger[name].status == FAILED]
+    first_open = len(LEG_ORDER)
     if not failures:
-        first_open = len(LEG_ORDER)
         for index, name in enumerate(LEG_ORDER):
             if ledger[name].status == NOT_STARTED:
                 first_open = index
@@ -310,36 +450,45 @@ def next_action(plan, ledger_of_completed_legs, exchange_truth) -> ReverseAction
         if any(ledger[name].status != NOT_STARTED
                for name in LEG_ORDER[first_open:]):
             return FREEZE("LEDGER_OUT_OF_ORDER")
-        if first_open < len(LEG_ORDER):
-            return NEXT_LEG(plan.legs[first_open])
+    else:
+        first_failure = LEG_ORDER.index(failures[0])
+        if any(ledger[name].status != DONE_STATUS
+               for name in LEG_ORDER[:first_failure]):
+            return FREEZE("LEDGER_OUT_OF_ORDER")
+
+    problem = _ledger_truth_problem(plan, ledger, truth)
+    if problem is not None:
+        return FREEZE(problem)
+
+    # Exchange position truth outranks a completed close row. While any long
+    # stands, cleanup starts with its exact measured standing quantity.
+    if truth.futures_position > ZERO:
+        return _cleanup_action(plan, ledger, truth)
+    if failures:
+        return _cleanup_action(plan, ledger, truth)
+    if first_open == len(LEG_ORDER):
         return DONE if _is_flat(plan, truth) \
             else FREEZE("TERMINAL_TRUTH_NOT_FLAT")
 
-    first_failure = LEG_ORDER.index(failures[0])
-    if any(ledger[name].status != DONE_STATUS
-           for name in LEG_ORDER[:first_failure]):
-        return FREEZE("LEDGER_OUT_OF_ORDER")
-
-    filled = lambda name: sum(ledger[name].fills, ZERO) > ZERO
-    borrow_stands = first_failure > 0 or filled(BORROW) \
-        or truth.liability > ZERO
-    sell_filled = ledger[MARGIN_SELL].status == DONE_STATUS \
-        or filled(MARGIN_SELL) or truth.base_balance_delta < -plan.dust
-    long_filled = ledger[FUTURES_LONG_OPEN].status == DONE_STATUS \
-        or filled(FUTURES_LONG_OPEN) or truth.futures_position > ZERO
-
-    if long_filled and ledger[FUTURES_CLOSE].status != DONE_STATUS \
-            and ledger[MARGIN_BUY].status == DONE_STATUS:
-        return FREEZE("REDUCE_ONLY_CLOSE_MUST_PRECEDE_MARGIN_BUY")
-    if borrow_stands and ledger[REPAY].status == DONE_STATUS \
-            and truth.liability != ZERO:
-        return FREEZE("REPAY_TRUTH_MISMATCH")
-
-    names = [name for name, needed in (
-        (FUTURES_CLOSE, long_filled), (MARGIN_BUY, sell_filled),
-        (REPAY, borrow_stands)) if needed and ledger[name].status != DONE_STATUS]
-    if names:
-        by_name = {leg.name: leg for leg in plan.legs}
-        return UNWIND(tuple(by_name[name] for name in names))
-    return DONE if _is_flat(plan, truth) \
-        else FREEZE("RECOVERY_TRUTH_NOT_FLAT")
+    name = LEG_ORDER[first_open]
+    if name == BORROW:
+        quantity = plan.borrow_principal
+    elif name == MARGIN_SELL:
+        quantity = _floor_quantity(_quantity(ledger, BORROW), plan.dust)
+    elif name == FUTURES_LONG_OPEN:
+        quantity = _floor_quantity(
+            _net_base(ledger, MARGIN_SELL), plan.common_step,
+        )
+    elif name == FUTURES_CLOSE:
+        return FREEZE("LEDGER_TRUTH_MISMATCH")
+    elif name == MARGIN_BUY:
+        quantity = _floor_quantity(
+            max(_net_base(ledger, MARGIN_SELL)
+                - _net_base(ledger, MARGIN_BUY), ZERO), plan.dust,
+        )
+    else:
+        quantity = truth.liability
+    try:
+        return NEXT_LEG(_action_leg(plan, name, quantity))
+    except ValueError as error:
+        return FREEZE(str(error))
