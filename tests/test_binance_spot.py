@@ -252,6 +252,28 @@ class SpotAdapterTests(unittest.TestCase):
         with self.assertRaises(http.AdapterRefusal):
             spot.net_base_quantity(Decimal("-1"), "BTC", fees)
 
+    def test_small_fee_increment_and_net_quantity_stay_exact(self):
+        fees = spot.fees_by_asset((fill(1, fee="1"), fill(2, fee="1E-29")))
+        self.assertEqual(fees[0].amount, Decimal("1.00000000000000000000000000001"))
+        net = spot.net_base_quantity(Decimal("1"), "BTC", (http.Fee("BTC", Decimal("1E-29")),))
+        self.assertEqual(net, Decimal("0.99999999999999999999999999999"))
+
+    def test_near_complete_fill_coverage_stays_incomplete(self):
+        quantity = "0.99999999999999999999999999999"
+        result = spot.read_fills(Feed(*[ok([]) for _ in range(5)]), BASE, terminal("1"), (fill(quantity=quantity),), sleep=lambda _delay: None)
+        self.assertEqual((result.value.complete, result.value.covered_quantity), (False, Decimal(quantity)))
+
+    def test_large_quantity_uses_adapter_refusal(self):
+        with self.assertRaises(http.AdapterRefusal): spot.build_market_order(market(), "BUY", CLIENT, SHA, quantity=Decimal("1E+100"))
+
+    def test_filter_text_beyond_exact_domain_is_unclear(self):
+        filters = [{"filterType": "LOT_SIZE", "stepSize": "0." + "1" * 61, "minQty": "0.01"},
+                   {"filterType": "MIN_NOTIONAL", "minNotional": "10"}]
+        info = {"symbols": [{"symbol": SYMBOL, "status": "TRADING", "baseAsset": "BTC", "quoteAsset": "USDT", "filters": filters}]}
+        feed = Feed(ok(info), ok({"symbol": SYMBOL, "bidPrice": "100", "askPrice": "101"}))
+        result = spot.read_market(feed, BASE, SYMBOL, sleep=lambda _delay: None)
+        self.assertEqual((result.kind, len(feed.calls)), ("unclear", 1))
+
 
 if __name__ == "__main__":
     unittest.main()

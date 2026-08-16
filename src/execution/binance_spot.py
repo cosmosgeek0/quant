@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass as _dataclass, replace as _replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import math as _math, re as _re, time as _time
 from typing import Callable as _Callable, Literal as _Literal
 from execution import binance_http as _http
@@ -33,15 +33,13 @@ def _text(value: object, label: str) -> str:
     return value
 
 
-def _named(value: object, pattern: _re.Pattern) -> bool:
-    return isinstance(value, str) and pattern.fullmatch(value) is not None
+def _named(value: object, pattern: _re.Pattern) -> bool: return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
 def _money(value: object, positive: bool = False) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (str, Decimal)): raise _http.AdapterRefusal("money is not exact")
-    try: amount = Decimal(value)
-    except (InvalidOperation, ValueError): raise _http.AdapterRefusal("money is unreadable") from None
-    if not amount.is_finite() or amount < 0 or (positive and amount <= 0): raise _http.AdapterRefusal("money is outside its bounds")
+    with _http.exact_guard(): amount = +Decimal(value); invalid = not amount.is_finite() or amount < 0 or (positive and amount <= 0)
+    if invalid: raise _http.AdapterRefusal("money is outside its bounds")
     return amount
 
 
@@ -64,33 +62,31 @@ def _checked_plan(plan: object) -> _http.OrderPlan:
     return plan
 
 
-def _bad(note: str) -> _http.ReadResult:
-    return _http.ReadResult("unclear", None, _http.HttpResult("unclear", None, None, note))
+def _bad(note: str) -> _http.ReadResult: return _http.ReadResult("unclear", None, _http.HttpResult("unclear", None, None, note))
 
 
-def _failed(result: _http.HttpResult) -> _http.ReadResult:
-    return _http.ReadResult(result.kind, None, result)
+def _failed(result: _http.HttpResult) -> _http.ReadResult: return _http.ReadResult(result.kind, None, result)
 
 
 def _step(first: Decimal, second: Decimal) -> Decimal:
-    unit = Decimal(1).scaleb(min(first.as_tuple().exponent, second.as_tuple().exponent)); left, right = int(first / unit), int(second / unit)
-    return Decimal(abs(left * right) // _math.gcd(left, right)) * unit
+    with _http.exact_guard(): unit = Decimal(1).scaleb(min(first.as_tuple().exponent, second.as_tuple().exponent)); left, right = int(first // unit), int(second // unit); return Decimal(abs(left * right) // _math.gcd(left, right)) * unit
 
 
 def _filters(rows: object) -> tuple[Decimal, Decimal, Decimal]:
-    if not isinstance(rows, list) or any(not isinstance(x, dict) for x in rows): raise _http.AdapterRefusal("filters are malformed")
-    names = [x.get("filterType") for x in rows]
-    if any(not isinstance(x, str) for x in names) or len(names) != len(set(names)): raise _http.AdapterRefusal("filters are not unique")
-    filters = dict(zip(names, rows)); lot = filters.get("LOT_SIZE")
-    notions = [filters[x] for x in ("NOTIONAL", "MIN_NOTIONAL") if x in filters]
-    if not isinstance(lot, dict) or len(notions) != 1: raise _http.AdapterRefusal("required filters are absent")
-    step, minimum = _money(lot.get("stepSize"), True), _money(lot.get("minQty"), True)
-    market = filters.get("MARKET_LOT_SIZE")
-    if market is not None:
-        if not isinstance(market, dict): raise _http.AdapterRefusal("market filter is malformed")
-        market_step = _money(market.get("stepSize")); minimum = max(minimum, _money(market.get("minQty")))
-        if market_step: step = _step(step, market_step)
-    return step, minimum, _money(notions[0].get("minNotional"), True)
+    with _http.exact_guard():
+        if not isinstance(rows, list) or any(not isinstance(x, dict) for x in rows): raise _http.AdapterRefusal("filters are malformed")
+        names = [x.get("filterType") for x in rows]
+        if any(not isinstance(x, str) for x in names) or len(names) != len(set(names)): raise _http.AdapterRefusal("filters are not unique")
+        filters = dict(zip(names, rows)); lot = filters.get("LOT_SIZE")
+        notions = [filters[x] for x in ("NOTIONAL", "MIN_NOTIONAL") if x in filters]
+        if not isinstance(lot, dict) or len(notions) != 1: raise _http.AdapterRefusal("required filters are absent")
+        step, minimum = _money(lot.get("stepSize"), True), _money(lot.get("minQty"), True)
+        market = filters.get("MARKET_LOT_SIZE")
+        if market is not None:
+            if not isinstance(market, dict): raise _http.AdapterRefusal("market filter is malformed")
+            market_step = _money(market.get("stepSize")); minimum = max(minimum, _money(market.get("minQty")))
+            if market_step: step = _step(step, market_step)
+        return step, minimum, _money(notions[0].get("minNotional"), True)
 
 
 def read_market(transport: _http.Transport, base_url: str, symbol: str, *, sleep: _Callable[[float], None] = _time.sleep) -> _http.ReadResult[SpotMarket]:
@@ -144,20 +140,21 @@ def read_account_state(transport: _http.Transport, base_url: str, symbol: str, *
 
 
 def build_market_order(market: SpotMarket, side: _Literal["BUY", "SELL"], client_id: str, git_sha: str, *, quantity: Decimal | None = None, quote_limit: Decimal | None = None) -> _http.OrderPlan:
-    if not isinstance(market, SpotMarket) or market.status != "TRADING": raise _http.AdapterRefusal("market is not tradable")
-    for value in (market.step_size, market.min_quantity, market.min_notional, market.bid, market.ask): _input(value)
-    if not _named(market.symbol, _SYMBOL) or not _named(market.base_asset, _ASSET) or not _named(market.quote_asset, _ASSET) or market.bid >= market.ask: raise _http.AdapterRefusal("market is invalid")
-    residual = Decimal(0)
-    if quantity is not None:
-        requested = _input(quantity); quantity = requested - requested % market.step_size; residual = requested - quantity
-        if quantity < market.min_quantity or quantity * (market.ask if side == "BUY" else market.bid) < market.min_notional: raise _http.AdapterRefusal("order is below filters")
-        bound = ("quantity", _wire(quantity))
-    else:
-        quote_limit = _input(quote_limit)
-        if quote_limit < market.min_notional or quote_limit / market.ask < market.min_quantity: raise _http.AdapterRefusal("order is below filters")
-        bound = ("quoteOrderQty", _wire(quote_limit))
-    params = (("symbol", market.symbol), ("side", side), ("type", "MARKET"), bound, ("newClientOrderId", client_id), ("newOrderRespType", "FULL"))
-    intent = _http.MutationIntent("BINANCE_SPOT", "ORDER", client_id, git_sha, params); return _checked_plan(_http.OrderPlan(intent, market.symbol, side, quantity, quote_limit, residual, False))
+    with _http.exact_guard():
+        if not isinstance(market, SpotMarket) or market.status != "TRADING": raise _http.AdapterRefusal("market is not tradable")
+        for value in (market.step_size, market.min_quantity, market.min_notional, market.bid, market.ask): _input(value)
+        if not _named(market.symbol, _SYMBOL) or not _named(market.base_asset, _ASSET) or not _named(market.quote_asset, _ASSET) or market.bid >= market.ask: raise _http.AdapterRefusal("market is invalid")
+        residual = Decimal(0)
+        if quantity is not None:
+            requested = _input(quantity); quantity = requested // market.step_size * market.step_size; residual = requested - quantity
+            if quantity < market.min_quantity or quantity * (market.ask if side == "BUY" else market.bid) < market.min_notional: raise _http.AdapterRefusal("order is below filters")
+            bound = ("quantity", _wire(quantity))
+        else:
+            quote_limit = _input(quote_limit)
+            if quote_limit < market.min_notional or quote_limit < market.min_quantity * market.ask: raise _http.AdapterRefusal("order is below filters")
+            bound = ("quoteOrderQty", _wire(quote_limit))
+        params = (("symbol", market.symbol), ("side", side), ("type", "MARKET"), bound, ("newClientOrderId", client_id), ("newOrderRespType", "FULL"))
+        intent = _http.MutationIntent("BINANCE_SPOT", "ORDER", client_id, git_sha, params); return _checked_plan(_http.OrderPlan(intent, market.symbol, side, quantity, quote_limit, residual, False))
 
 
 def _empty(tag: str, symbol: str, client_id: str, error: _http.HttpResult | None = None) -> _http.OrderResult:
@@ -206,7 +203,7 @@ def _full_fills(payload: object, order_id: int) -> tuple[_http.Fill, ...]:
             asset = row.get("commissionAsset")
             if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is invalid")
             fee = _http.Fee(asset, _money(row.get("commission")))
-            found.append(_http.Fill(trade_id, order_id, price, quantity, price * quantity, fee))
+            with _http.exact_guard(): found.append(_http.Fill(trade_id, order_id, price, quantity, price * quantity, fee))
     except _http.AdapterRefusal: return ()
     return tuple(found)
 
@@ -271,31 +268,30 @@ def _merge(found: dict, fills: tuple[_http.Fill, ...], order_id: int) -> None:
 
 def read_fills(transport: _http.Transport, base_url: str, order: _http.OrderResult, response_fills: tuple[_http.Fill, ...] = (), *, sleep: _Callable[[float], None] = _time.sleep) -> _http.ReadResult[_http.FillCoverage]:
     if not isinstance(order, _http.OrderResult) or not order.terminal or order.identity.order_id is None or not isinstance(order.executed_quantity, Decimal) or not isinstance(order.response_fills, tuple) or not isinstance(response_fills, tuple): return _bad("spot_order_fill_identity")
-    executed, found = _money(order.executed_quantity), {}
-    try: _merge(found, tuple(order.response_fills) + tuple(response_fills), order.identity.order_id)
-    except (TypeError, _http.AdapterRefusal): return _bad("spot_response_fills_schema")
-    for attempt in range(6):
-        fills = tuple(found.values()); covered = sum((x.quantity for x in fills), Decimal(0))
-        if covered > executed: return _bad("spot_fill_coverage_conflict")
-        if covered == executed or attempt == 5:
-            value = _http.FillCoverage(fills, covered, executed, covered == executed, fees_by_asset(fills))
-            return _http.ReadResult("ok", value, None)
-        sleep(1); readback = read_my_trades(transport, base_url, order.identity.symbol, order_id=order.identity.order_id, sleep=sleep)
-        if readback.kind == "ok":
-            try: _merge(found, readback.value, order.identity.order_id)
-            except _http.AdapterRefusal: return _bad("spot_trade_fill_conflict")
-    return _bad("spot_fill_coverage")
+    found = {}
+    try:
+        executed = _money(order.executed_quantity); _merge(found, tuple(order.response_fills) + tuple(response_fills), order.identity.order_id)
+        for attempt in range(6):
+            fills = tuple(found.values())
+            with _http.exact_guard(): covered = sum((x.quantity for x in fills), Decimal(0))
+            if covered > executed: return _bad("spot_fill_coverage_conflict")
+            if covered == executed or attempt == 5:
+                value = _http.FillCoverage(fills, covered, executed, covered == executed, fees_by_asset(fills)); return _http.ReadResult("ok", value, None)
+            sleep(1); readback = read_my_trades(transport, base_url, order.identity.symbol, order_id=order.identity.order_id, sleep=sleep)
+            if readback.kind == "ok": _merge(found, readback.value, order.identity.order_id)
+    except (TypeError, _http.AdapterRefusal): return _bad("spot_fill_arithmetic_or_schema")
 
 
 def fees_by_asset(fills: tuple[_http.Fill, ...]) -> tuple[_http.Fee, ...]:
     if not isinstance(fills, tuple): raise _http.AdapterRefusal("fills must be immutable")
     totals = {}
     try:
-        for fill in fills:
-            if not isinstance(fill, _http.Fill) or not isinstance(fill.fee, _http.Fee) or not isinstance(fill.fee.amount, Decimal): raise _http.AdapterRefusal("fill commission is missing")
-            asset = fill.fee.asset
-            if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is missing")
-            totals[asset] = totals.get(asset, Decimal(0)) + _money(fill.fee.amount)
+        with _http.exact_guard():
+            for fill in fills:
+                if not isinstance(fill, _http.Fill) or not isinstance(fill.fee, _http.Fee) or not isinstance(fill.fee.amount, Decimal): raise _http.AdapterRefusal("fill commission is missing")
+                asset = fill.fee.asset
+                if not _named(asset, _ASSET): raise _http.AdapterRefusal("fee asset is missing")
+                totals[asset] = totals.get(asset, Decimal(0)) + _money(fill.fee.amount)
     except TypeError: raise _http.AdapterRefusal("fills must be immutable") from None
     return tuple(_http.Fee(asset, totals[asset]) for asset in sorted(totals))
 
@@ -303,12 +299,13 @@ def fees_by_asset(fills: tuple[_http.Fill, ...]) -> tuple[_http.Fee, ...]:
 def net_base_quantity(executed_quantity: Decimal, base_asset: str, fees: tuple[_http.Fee, ...]) -> Decimal:
     if not isinstance(executed_quantity, Decimal): raise _http.AdapterRefusal("executed quantity must be Decimal")
     if not _named(base_asset, _ASSET) or not isinstance(fees, tuple): raise _http.AdapterRefusal("base asset or fees are invalid")
-    executed, base_fee = _money(executed_quantity), Decimal(0)
     try:
-        for fee in fees:
-            if not isinstance(fee, _http.Fee) or not isinstance(fee.amount, Decimal): raise _http.AdapterRefusal("fee is unproved")
-            if not _named(fee.asset, _ASSET): raise _http.AdapterRefusal("fee asset is unproved")
-            amount = _money(fee.amount); base_fee += amount if fee.asset == base_asset else Decimal(0)
+        with _http.exact_guard():
+            executed, base_fee = _money(executed_quantity), Decimal(0)
+            for fee in fees:
+                if not isinstance(fee, _http.Fee) or not isinstance(fee.amount, Decimal): raise _http.AdapterRefusal("fee is unproved")
+                if not _named(fee.asset, _ASSET): raise _http.AdapterRefusal("fee asset is unproved")
+                amount = _money(fee.amount); base_fee += amount if fee.asset == base_asset else Decimal(0)
+            if base_fee > executed: raise _http.AdapterRefusal("base fee exceeds execution")
+            return executed - base_fee
     except TypeError: raise _http.AdapterRefusal("fees must be immutable") from None
-    if base_fee > executed: raise _http.AdapterRefusal("base fee exceeds execution")
-    return executed - base_fee
