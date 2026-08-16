@@ -7,18 +7,15 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
-DASHBOARD V5 ON THE BOX 2026-08-16 13:28Z | arbitrage.cosmosgeek.org now serves Network V5 (lane/ui-network-v5 0cd1dfa + test fix 12f49cc) — the version the owner reviewed at :8901 | first deploy at 12:45Z had put UI 4.0 (Desktop main) on the site by mistake; corrected
-files | net_v5.css, net_v5.js, shell.js, serve.py, index.html — five xfers, all XFER_VERIFIED; quant-ui restarted; index 200 47049B, /api/grace answers, /net_v5.js 200 40013B; telemetry 177 rows, news 884 rows on the box
-seen | owner's Chrome, hard reload: 7/7 loops on rhythm, heatmap all green, Data mirror 12 s (local 5-s mirror), zero state changes — the Mac copy's job-runner Degraded flapping is absent on the box, as predicted (transport artifact)
-tests | tests.test_ui_serve green after adding the V5 grace source to the exact read-only list (test lagged the landing); ui/DASHBOARD.md updated to V5
-
-DASHBOARD LIVE ON THE BOX 2026-08-16 | arbitrage.cosmosgeek.org now serves the latest UI (ce43cd1 + 47655ef) from the execution host | evidence/dashboard-deploy-2026-08-16.txt · ui/DASHBOARD.md
-host | quant-ui.service restarted 12:45:18Z (backend was 2 days old); NEW quant-ui-telemetry.service (recorder, 15 s, QUANT_UI_URL=127.0.0.1:8080) and quant-ui-news.service (fetcher, 120 s) created + enabled; tunnel, Access, receipt mirror, machine directories untouched
-verify | GET / → 200 46973B (= local index.html) · /api/strip ok, ENTRY-SEALED, market pass live · all five services active | MEASURED on the box
-change | ui/telemetry_recorder.py samples QUANT_UI_URL (default 8899 unchanged) — 47655ef; xfer first attempt landed EMPTY (empty-file sha), second XFER_VERIFIED
-first failure | Mac→box ui_sync did not carry the change by itself — sync UNVERIFIED; file pushed by hand | one pre-existing test failure tests/test_ui_telemetry.py
-not verified | the public page in the owner's Chrome (extension not connected to this account) — owner refreshes the site | box history (telemetry, news) starts 12:45Z
-record | ui/DASHBOARD.md written (owner order): wiring map for every worker; pointers in CLAUDE.md file map + AGENTS.md scope
+SHARED HAND DAY 1 + FEED DELIVERY 2026-08-16 (worker 5.0, closed on STOP-WIDTH order) | machine SEALED + FLAT; no live action; lane/lead5-hand = SHELF, not for merge
+feed | FD1-FD4 on lane/lead5-feed 7b283a0: bounded FIFO queue (FR2 3 -> FR5 0), ticker sockets on the measured stream shapes (perp !bookTicker on /stream, spot per-symbol @bookTicker shards); deployed 13:1xZ release 7b283a06 + daemon restart; proof: feed delivers 480 spot / 524 perp symbols with live bid+ask; stream still REST-sourced (book_age 10.7-15.7 s, 357/357 STALE) | MEASURED
+hand | frozen interface v1 (131 rows) + src/execution/ adapters http/spot/futures/margin/transfer 990 non-blank, 102 tests; round-1 review findings 5/7/10/4/4, all repaired, no clean round-2 verdict yet | MEASURED
+migrations committed | spot_roundtrip -94 (WR1a MERGE-SAFE, WR1b 5), wallet -145, mechanics_reconcile -100, basis_position -196 (SR1 MERGE-SAFE); shims 7+3 lines temporary | committed production delta vs main +509 | MEASURED
+stashed unreviewed | job_runner -548 (WR6B 3: F1/F3 closed, fixtures retargeted, 226/227), basis_executor -250 (gate red), futures_hand shard -295, spot_roundtrip WR1b repairs | stash@{0} + ref shelf/lead5-hand-wip 16609ba | MEASURED
+records | OWNER-CAPABILITIES.md 43 rows on main; TR1 volume inventory 33 files / 17,365 lines (nothing moved); AL1 feed-blind watchdog alarm built (not deployed) | MEASURED
+laws | Lead-invented "PARALLEL ARMY" law replaced by the owner's WIDTH law (few workers, one bit each, ~500 lines, net-negative or flat) on lane and main | MEASURED
+scars | shared-worktree parallel writers broke importers transiently (in-place W8, W1's deleted exports) — shard files for anything that cannot land at once; type maps must carry every field the live callers read (rows 128-129); one repair (S4rt) gated but left uncommitted for an hour | MEASURED
+live | none this seat; last account truth SEALED + FLAT (11:00Z host read); no fresh flat read taken | MEASURED / UNVERIFIED as labeled
 
 VOLUME DIAGNOSTIC WOUND DOWN 2026-08-16 ~11:00Z | owner order: stop the tape scans, they return nothing and hammer the SSD | MEASURED
 result | V6 --limit 200 real-data run killed after 1h40m with ZERO output rows (the limit bounds events, not the 35 GB tape-prices read; the earlier full run refused after 3h+ the same way) | the commander's V2 out-of-sample expectancy stays UNMEASURED and is not pursued further without the owner's word | MEASURED
