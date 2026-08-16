@@ -77,6 +77,7 @@ MAX_FRAME_BYTES = 32_000_000
 MAX_HANDSHAKE_BYTES = 64_000
 MAX_STREAMS_PER_CONNECTION = 200
 EVENT_QUEUE_MAX = 4096
+EVENT_QUEUE_STATUS_RESERVE = 256
 TICKER_STALE_MS = 15_000
 KLINE_INTERVAL_MS = 60_000
 RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -127,20 +128,23 @@ class WebSocketProtocolError(WebSocketError):
 
 class EventQueue(queue.Queue[FeedEvent]):
     def __init__(self) -> None:
-        super().__init__(maxsize=EVENT_QUEUE_MAX)
+        super().__init__(maxsize=EVENT_QUEUE_MAX + EVENT_QUEUE_STATUS_RESERVE)
         self.dropped: Dict[Tuple[int, str], int] = {}
 
     def offer(self, event: FeedEvent) -> None:
         with self.not_full:
-            if self._qsize() < self.maxsize:
+            limit = EVENT_QUEUE_MAX if event[0] == "text" else self.maxsize
+            if self._qsize() < limit:
                 self._put(event)
                 self.unfinished_tasks += 1
                 self.not_empty.notify()
                 return
-            for offset, queued in enumerate(reversed(self.queue)):
-                if queued[1:4] == event[1:4]:
-                    self.queue[-offset - 1] = event
-                    break
+            if event[0] == "text":
+                for offset, queued in enumerate(reversed(self.queue)):
+                    if queued[0] == "text" and queued[1:4] == event[1:4]:
+                        del self.queue[-offset - 1]
+                        self._put(event)
+                        break
             key = (event[3], event[1])
             self.dropped[key] = self.dropped.get(key, 0) + 1
 
@@ -1042,7 +1046,6 @@ class MarketFeed:
         self.seen_ms: Dict[str, Dict[str, int]] = {}
         self.connections: Dict[str, Dict[str, Any]] = {}
         self.events = EventQueue()
-        self.connection_events: queue.SimpleQueue[FeedEvent] = queue.SimpleQueue()
         self.stop_event = threading.Event()
 
     def _stopped(self) -> bool:
@@ -1062,11 +1065,7 @@ class MarketFeed:
     def _worker(self, venue: str, shard: int, url: str, generation: int,
                 worker_stop: threading.Event) -> None:
         def emit(kind: str, text: Optional[str] = None) -> None:
-            event = (kind, venue, shard, generation, text)
-            if kind == "text":
-                self.events.offer(event)
-            else:
-                self.connection_events.put(event)
+            self.events.offer((kind, venue, shard, generation, text))
 
         run_reconnect_loop(
             url,
@@ -1110,6 +1109,7 @@ class MarketFeed:
         return old_urls != websocket_urls(self.state)
 
     def _reset_connections(self, urls: Mapping[str, Sequence[str]]) -> None:
+        prior_connections = self.connections
         self.connections = {}
         for venue in ("spot", "perp"):
             venue_urls = list(urls.get(venue, ()))
@@ -1130,7 +1130,8 @@ class MarketFeed:
                 "expected_connections": len(venue_urls),
                 "successful_handshakes": 0,
                 "handshake_failures": 0, "reconnects": 0,
-                "dropped_frames": 0,
+                "dropped_frames": prior_connections.get(venue, {}).get(
+                    "dropped_frames", 0),
                 "ticker": ticker,
                 "shards": shards,
             }
@@ -1292,13 +1293,11 @@ class MarketFeed:
 
         def drain_events(timeout: float = 0.0) -> None:
             nonlocal dirty
-            for unused in range(self.connection_events.qsize()):
-                handle_event(self.connection_events.get_nowait())
-            try:
-                handle_event(self.events.get(timeout=timeout))
-            except queue.Empty:
-                pass
-            for unused in range(self.events.qsize()):
+            with self.events.not_empty:
+                if not self.events._qsize():
+                    self.events.not_empty.wait(timeout)
+                batch_size = self.events._qsize()
+            for unused in range(batch_size):
                 handle_event(self.events.get_nowait())
             with self.events.mutex:
                 dropped, self.events.dropped = self.events.dropped, {}
