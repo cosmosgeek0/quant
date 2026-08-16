@@ -1189,14 +1189,18 @@ class VersionOneContractTests(unittest.TestCase):
 
 
 class VersionTwoPersistenceTests(unittest.TestCase):
+    MODULE_TIME_MS = 1755000010000
+    SOURCE_TIME_MS = 1755000004000
     CONFIG_SNAPSHOT = {
         "symbol": SYMBOL,
         "direction": bp.V2_DIRECTION,
         "schedule": [
             {"ordinal": 1, "entry_gap_pct": "0.42",
              "quote_cap": "10"},
+            {"ordinal": 2, "entry_gap_pct": "0.55",
+             "quote_cap": "8"},
         ],
-        "caps": {"stack_quote": "20", "rung_quote": "10"},
+        "caps": {"stack_quote": "20", "entry_quote": "10"},
         "venue": {
             "spot": "BINANCE_SPOT",
             "futures": "BINANCE_USDM",
@@ -1204,785 +1208,431 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             "quote_asset": "USDT",
         },
     }
-    CONFIG_EPOCH_DIGEST = bp.v2_config_epoch_digest(CONFIG_SNAPSHOT)
-    CREATED_CUT_MS = 1755000010000
-    EVENT_SOURCE_MS = 1755000004000
-    FLAT_READ_PROVENANCE = {
-        "positions": {"spot": True, "usdm": True},
-        "open_orders": {
-            "spot": True,
-            "usdm_standard": True,
-            "usdm_algorithmic": True,
-        },
-        "own_orders": [
-            {"client_id": "bc-cafe01-enter_spot", "market": "spot",
-             "status": "FILLED"},
-            {"client_id": "bc-cafe01-enter_short", "market": "usdm",
-             "status": "FILLED"},
-            {"client_id": "bc-cafe04-exit_short", "market": "usdm",
-             "status": "FILLED"},
-            {"client_id": "bc-cafe04-exit_spot", "market": "spot",
-             "status": "FILLED"},
-        ],
-    }
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.receipt_dir = self.temp.name
         self.state_path = Path(self.receipt_dir) / bp.STATE_FILE
-        self.state_path.write_bytes(V1_CONTRACT_PATH.read_bytes())
+
+    def current(self):
+        return bp.load_position(self.receipt_dir)
+
+    def length(self):
+        position = self.current()
+        return 0 if position is None else len(position["ledger"])
+
+    def append(self, payload, expected_length=None):
+        if expected_length is None:
+            expected_length = self.length()
+        return bp.append_v2_event(
+            self.receipt_dir, payload, expected_length)
+
+    def initialize(self, config=None):
+        return bp.initialize_v2_position(
+            self.receipt_dir, config or self.CONFIG_SNAPSHOT)
+
+    def flat_facts(self):
+        return {
+            "futures_position_quantity": "0",
+            "spot_sellable_base_quantity": "0",
+            "standard_open_order_count": 0,
+            "algorithmic_open_order_count": 0,
+            "own_orders_terminal": True,
+            "positions_digest": "a" * 64,
+            "open_orders_digest": "b" * 64,
+            "own_orders_digest": "c" * 64,
+        }
+
+    def observe_flat(self, receipt_id, observed_at_ms=None):
+        if observed_at_ms is None:
+            observed_at_ms = self.MODULE_TIME_MS - 100
+        return self.append(bp.new_v2_receipt_observed_event(
+            receipt_id, "FLAT", observed_at_ms,
+            "private-read-bundle", self.flat_facts()))
+
+    def prove_flat(self, receipt_id, module_time_ms=None):
+        if module_time_ms is None:
+            module_time_ms = self.MODULE_TIME_MS
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=module_time_ms):
+            return self.append(bp.new_v2_flat_proved_event(receipt_id))
+
+    def ready(self, config=None):
+        self.initialize(config)
+        self.observe_flat("flat-initial")
+        return self.prove_flat("flat-initial")
+
+    def leg(self, role, ordinal, quantity, quote, fees=None,
+            status="FILLED"):
+        if role == "spot":
+            stage = bp.ENTER_SPOT
+            market = "BINANCE_SPOT"
+        else:
+            stage = bp.ENTER_SHORT
+            market = "BINANCE_USDM"
+        return {
+            "stage": stage,
+            "market": market,
+            "client_order_id": "own-%d-%s" % (ordinal, role),
+            "exchange_order_id": "exchange-%d-%s" % (ordinal, role),
+            "terminal_status": status,
+            "executed_quantity": quantity,
+            "executed_quote": quote,
+            "fee_by_asset": fees or {},
+        }
+
+    def filled(self, ordinal, spot_quantity="0.1",
+               short_quantity="0.1", spot_quote=None,
+               short_quote=None, spot_fees=None, entry_gap=None,
+               source_time_ms=None, cut_ms=None):
+        if spot_quote is None:
+            spot_quote = "9" if ordinal == 1 else "7.5"
+        if short_quote is None:
+            short_quote = "8.9" if ordinal == 1 else "7.4"
+        if entry_gap is None:
+            entry_gap = "0.5" if ordinal == 1 else "0.6"
+        if source_time_ms is None:
+            source_time_ms = self.SOURCE_TIME_MS + ordinal
+        if cut_ms is None:
+            cut_ms = self.MODULE_TIME_MS + ordinal
+        dislocation = bp.new_v2_dislocation_event(
+            "dislocation-%d" % ordinal, source_time_ms,
+            entry_gap, "0.1", "0.0001", 28800000)
+        return bp.new_v2_rung_filled_event(
+            ordinal, {
+                "spot": self.leg(
+                    "spot", ordinal, spot_quantity, spot_quote,
+                    spot_fees),
+                "short": self.leg(
+                    "short", ordinal, short_quantity, short_quote),
+            }, dislocation, cut_ms)
+
+    def observe_reduction(self, receipt_id, ordinal,
+                          spot_quantity, short_quantity):
+        facts = {
+            "ordinal": ordinal,
+            "spot_quantity": spot_quantity,
+            "short_quantity": short_quantity,
+        }
+        return self.append(bp.new_v2_receipt_observed_event(
+            receipt_id, "REDUCTION", self.MODULE_TIME_MS + ordinal,
+            "own-reduce-receipt", facts))
+
+    def reduce(self, receipt_id, ordinal,
+               spot_quantity, short_quantity):
+        self.observe_reduction(
+            receipt_id, ordinal, spot_quantity, short_quantity)
+        return self.append(bp.new_v2_rung_reduced_event(
+            ordinal, [receipt_id], {
+                "spot_quantity": spot_quantity,
+                "short_quantity": short_quantity,
+            }))
+
+    def close_proof(self):
+        observed = self.MODULE_TIME_MS + 900
+        self.observe_flat("flat-final", observed)
+        return self.prove_flat(
+            "flat-final", self.MODULE_TIME_MS + 1000)
 
     def raw_position(self):
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
     def write_raw_position(self, position):
-        self.state_path.write_text(json.dumps(position, indent=2),
-                                   encoding="utf-8")
+        self.state_path.write_text(
+            json.dumps(position, indent=2), encoding="utf-8")
 
-    def flat_proof(self, source_revision=None, observed_at_ms=None,
-                   config_epoch_digest=None, read_provenance=None):
-        if source_revision is None:
-            source_revision = self.raw_position()["revision"]
-        if observed_at_ms is None:
-            observed_at_ms = self.CREATED_CUT_MS
-        if config_epoch_digest is None:
-            config_epoch_digest = self.CONFIG_EPOCH_DIGEST
-        if read_provenance is None:
-            read_provenance = self.FLAT_READ_PROVENANCE
-        return bp.new_v2_flat_proof(
-            SYMBOL, config_epoch_digest, source_revision,
-            observed_at_ms, Decimal("0"), Decimal("0"), 0, 0, True,
-            None, read_provenance)
-
-    def enable_raw(self, config_epoch_digest, flat_proof, revision,
-                   config_snapshot, initialization_cut_ms):
-        with mock.patch.object(
-                bp, "default_now_ms",
-                return_value=initialization_cut_ms):
-            return bp.enable_v2_position(
-                self.receipt_dir, SYMBOL, config_epoch_digest, flat_proof,
-                revision, config_snapshot, initialization_cut_ms)
-
-    def enable_v2(self, config_epoch_digest=None, config_snapshot=None,
-                  initialization_cut_ms=None):
-        revision = self.raw_position()["revision"]
-        if config_epoch_digest is None:
-            config_epoch_digest = self.CONFIG_EPOCH_DIGEST
-        if config_snapshot is None:
-            config_snapshot = self.CONFIG_SNAPSHOT
-        if initialization_cut_ms is None:
-            initialization_cut_ms = self.CREATED_CUT_MS
-        return self.enable_raw(
-            config_epoch_digest,
-            self.flat_proof(revision,
-                            config_epoch_digest=config_epoch_digest),
-            revision, config_snapshot, initialization_cut_ms)
-
-    def own_orders(self, terminal=False, spot_quote="9.80",
-                   short_quote="9.79", suffix="01",
-                   spot_quantity="0.098", short_quantity="0.098",
-                   terminal_status=None, spot_fee_by_asset=None):
-        spot_terminal_quantity = spot_quantity if terminal else None
-        short_terminal_quantity = short_quantity if terminal else None
-        if terminal_status is None:
-            terminal_status = "FILLED" if terminal else "INTENT_SAVED"
-        return [
-            bp.new_v2_own_order_record(
-                SYMBOL, self.CONFIG_EPOCH_DIGEST, bp.ENTER_SPOT, "spot",
-                "bc-v2-%s-enter-spot" % suffix, terminal,
-                terminal_status, spot_terminal_quantity,
-                spot_quote if terminal else None, spot_fee_by_asset or {}),
-            bp.new_v2_own_order_record(
-                SYMBOL, self.CONFIG_EPOCH_DIGEST, bp.ENTER_SHORT, "usdm",
-                "bc-v2-%s-enter-short" % suffix, terminal,
-                terminal_status, short_terminal_quantity,
-                short_quote if terminal else None, {}),
-        ]
-
-    def rung(self, ordinal=1, terminal=False, effective_cap="10",
-             spot_quote="9.80", short_quote="9.79", suffix="01",
-             spot_quantity="0.098", short_quantity="0.098",
-             terminal_status=None, spot_fee_by_asset=None):
-        spot_terminal_quantity = spot_quantity if terminal else None
-        short_terminal_quantity = short_quantity if terminal else None
-        remaining_spot = spot_terminal_quantity
-        if terminal and spot_fee_by_asset:
-            remaining_spot = str(
-                Decimal(spot_quantity)
-                - Decimal(spot_fee_by_asset.get("BTC", "0")))
-        sizes = bp.new_v2_size_record(
-            Decimal("0.098"), Decimal("9.80"), spot_terminal_quantity,
-            short_terminal_quantity, remaining_spot,
-            short_terminal_quantity)
-        return bp.new_v2_rung_record(
-            SYMBOL, self.CONFIG_EPOCH_DIGEST, "rung-%s" % suffix, ordinal,
-            "ENTRY_PENDING", Decimal("0.42"),
-            Decimal(effective_cap), sizes,
-            self.own_orders(
-                terminal, spot_quote, short_quote, suffix, spot_quantity,
-                short_quantity, terminal_status, spot_fee_by_asset),
-            None, self.EVENT_SOURCE_MS,
-            self.CREATED_CUT_MS, Decimal("0.11"), Decimal("0.0001"),
-            28800000)
-
-    def transition(self, expected_revision, transition_id="transition-01",
-                   from_state=bp.ST_NONE, to_state=bp.ST_OPENING,
-                   evidence_digest=None, evidence_kind=None,
-                   receipt_ids=None, amounts=None, created_cut_ms=None):
-        if created_cut_ms is None:
-            created_cut_ms = self.CREATED_CUT_MS
-        if evidence_kind is None \
-                and (from_state, to_state) == (bp.ST_NONE, bp.ST_OPENING):
-            proof = self.raw_position()["flat_proof"]
-            evidence_kind = bp.V2_EVIDENCE_FLAT_ENTRY
-            receipt_ids = [proof["evidence_digest"], "proposal-01"]
-            amounts = {
-                "futures_position_qty": proof["futures_position_qty"],
-                "spot_sellable_base_qty":
-                    proof["spot_sellable_base_qty"],
-                "observed_at_ms": str(proof["observed_at_ms"]),
-            }
-        elif evidence_kind is None \
-                and (from_state, to_state) \
-                in ((bp.ST_OPENING, bp.ST_OPEN), ("ADDING", bp.ST_OPEN)):
-            rung = self.raw_position()["rungs"][-1]
-            by_stage = {row["stage"]: row for row in rung["own_orders"]}
-            spot = by_stage[bp.ENTER_SPOT]
-            short = by_stage[bp.ENTER_SHORT]
-            base_asset = self.CONFIG_SNAPSHOT["venue"]["base_asset"]
-            net_spot = Decimal(spot["terminal_executed_qty"]) \
-                - Decimal(spot["fee_by_asset"].get(base_asset, "0"))
-            evidence_kind = bp.V2_EVIDENCE_TERMINAL_RUNG
-            receipt_ids = [
-                rung["rung_id"], spot["client_id"], short["client_id"],
-            ]
-            amounts = {
-                "spot_net_base_qty": str(net_spot),
-                "short_base_qty": short["terminal_executed_qty"],
-            }
-        elif evidence_kind is None:
-            evidence_kind = bp.V2_EVIDENCE_AMBIGUOUS
-            receipt_ids = ["evidence-01"]
-            amounts = {}
-        return bp.new_v2_transition_record(
-            SYMBOL, self.CONFIG_EPOCH_DIGEST, transition_id, from_state,
-            to_state, expected_revision, evidence_kind, evidence_digest,
-            receipt_ids, created_cut_ms, amounts)
-
-    def authorize_add(self, position, rung):
-        from_state = position["state"]
-        to_state = bp.ST_OPENING if from_state == bp.ST_NONE else "ADDING"
-        revision = position["revision"]
-        if from_state == bp.ST_NONE:
-            transition = self.transition(
-                revision, "add-transition-%d" % revision,
-                from_state, to_state)
-        else:
-            transition = self.transition(
-                revision, "add-transition-%d" % revision,
-                from_state, to_state, evidence_kind=bp.V2_EVIDENCE_ADD,
-                receipt_ids=[rung["rung_id"],
-                             "add-plan-%d" % revision],
-                amounts={
-                    "requested_base_qty":
-                        rung["sizes"]["requested_base_qty"],
-                    "requested_quote": rung["sizes"]["requested_quote"],
-                })
-        return bp.write_v2_transition(
-            self.receipt_dir, transition, revision)
-
-    def add_rung(self, rung=None):
-        record = rung or self.rung()
-        position = bp.load_position(self.receipt_dir)
-        if position["state"] in (bp.ST_NONE, bp.ST_OPEN):
-            position = self.authorize_add(position, record)
-        return bp.write_v2_rung(
-            self.receipt_dir, record, position["revision"])
-
-    def test_v2_receipts_bind_symbol_and_config_epoch_digest(self):
-        self.enable_v2()
-        self.add_rung()
-        loaded = bp.load_position(self.receipt_dir)
-
-        self.assertEqual(loaded["config_snapshot"], self.CONFIG_SNAPSHOT)
+    def test_br3_finding_1_second_rung_is_structurally_next_event(self):
+        self.ready()
+        self.append(self.filled(1))
+        position = self.append(self.filled(2))
+        derived = bp.derive_v2_state(position)
         self.assertEqual(
-            bp.v2_config_epoch_digest(loaded["config_snapshot"]),
-            self.CONFIG_EPOCH_DIGEST)
-        receipts = [loaded["flat_proof"], loaded["rungs"][0],
-                    loaded["rungs"][0]["event"],
-                    *loaded["rungs"][0]["own_orders"],
-                    loaded["transitions"][0]]
-        for receipt in receipts:
-            with self.subTest(record_type=receipt["record_type"]):
-                self.assertEqual(receipt["version"], 2)
-                self.assertEqual(receipt["symbol"], SYMBOL)
-                self.assertEqual(receipt["config_epoch_digest"],
-                                 self.CONFIG_EPOCH_DIGEST)
+            [rung["ordinal"] for rung in derived["rungs"]], [1, 2])
+        self.assertEqual(derived["top_state"], bp.ST_OPEN)
+        self.assertEqual(
+            [event["event_type"] for event in position["ledger"][-2:]],
+            ["RungFilled", "RungFilled"])
 
-    def test_v2_own_order_identity_retains_terminal_quantities_and_quotes_for_every_leg(self):
-        self.enable_v2()
-        self.add_rung(self.rung(terminal=True))
-        orders = bp.load_position(self.receipt_dir)["rungs"][0]["own_orders"]
-        expected = {
-            bp.ENTER_SPOT: ("bc-v2-01-enter-spot", "0.098", "9.8"),
-            bp.ENTER_SHORT: ("bc-v2-01-enter-short", "0.098", "9.79"),
-        }
-        self.assertEqual(set(expected), {order["stage"] for order in orders})
-        for order in orders:
-            self.assertTrue(order["terminal"])
-            self.assertEqual(order["fee_by_asset"], {})
-            self.assertEqual(
-                (order["client_id"], order["terminal_executed_qty"],
-                 order["terminal_quote"]), expected[order["stage"]])
-
-    def test_v2_rung_creation_seals_trigger_event_digest_and_economics(self):
-        self.enable_v2()
-        self.add_rung()
-        rung = bp.load_position(self.receipt_dir)["rungs"][0]
-        self.assertEqual(rung["entry_gap_pct"], "0.42")
-        self.assertEqual(rung["effective_cap_quote"], "10")
-        self.assertEqual(rung["created_cut_ms"], self.CREATED_CUT_MS)
-        self.assertEqual(rung["event"], {
-            "version": 2,
-            "record_type": "TRIGGER_EVENT",
+    def test_br3_finding_2_cap_is_derived_from_row_headroom_and_entry_cap(self):
+        config = {
             "symbol": SYMBOL,
-            "config_epoch_digest": self.CONFIG_EPOCH_DIGEST,
-            "digest": rung["event"]["digest"],
-            "source_time_ms": self.EVENT_SOURCE_MS,
-            "age_at_creation_ms": 6000,
-            "entry_gap_pct": "0.42",
-            "exit_gap_pct": "0.11",
-            "funding_rate": "0.0001",
-            "funding_period_ms": 28800000,
-        })
-        self.assertEqual(bp.v2_event_digest(rung["event"]),
-                         rung["event"]["digest"])
-
-    def test_v2_effective_cap_reconcile_excess_freezes_with_reduce_only_path(self):
-        self.enable_v2()
-        rung = self.rung(terminal=True, effective_cap="10",
-                         spot_quote="10.01", short_quote="9.99")
-        position = self.add_rung(rung)
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        cap = position["rungs"][0]["cap_reconcile"]
-        self.assertEqual(cap, {
-            "status": "EXCEEDED",
-            "terminal_fill_quote": "10.01",
-            "freeze_increases": True,
-            "reduce_only_path": True,
-        })
-        self.assertEqual(position["rungs"][0]["status"], "REDUCE_ONLY")
-        self.assertTrue(position["increases_frozen"])
-        self.assertTrue(position["reduce_only_path"])
-
-    def test_v2_effective_cap_reconcile_within_cap_clears_pending_freeze(self):
-        self.enable_v2()
-        position = self.add_rung(self.rung(terminal=True))
-        self.assertTrue(position["increases_frozen"])
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        self.assertEqual(position["rungs"][0]["cap_reconcile"]["status"],
-                         "WITHIN_CAP")
-        self.assertFalse(position["increases_frozen"])
-        self.assertFalse(position["reduce_only_path"])
-
-    def test_v2_transition_compare_and_swap_refuses_stale_revision(self):
-        position = self.enable_v2()
-        stale_revision = position["revision"]
-        first = self.transition(stale_revision)
-        position = bp.write_v2_transition(
-            self.receipt_dir, first, stale_revision)
-        replay = self.transition(stale_revision, "transition-replay")
-        with self.assertRaisesRegex(bp.PositionError, "stale"):
-            bp.write_v2_transition(
-                self.receipt_dir, replay, stale_revision)
-        persisted = bp.load_position(self.receipt_dir)
-        self.assertEqual(persisted["revision"], position["revision"])
-        self.assertEqual([row["transition_id"]
-                          for row in persisted["transitions"]],
-                         ["transition-01"])
-
-    def test_v2_transition_receipt_seals_states_revision_and_evidence(self):
-        position = self.enable_v2()
-        expected_revision = position["revision"]
-        transition = self.transition(expected_revision)
-        position = bp.write_v2_transition(
-            self.receipt_dir, transition, expected_revision)
-        receipt = position["transitions"][0]
-        self.assertEqual((receipt["from"], receipt["to"]),
-                         (bp.ST_NONE, bp.ST_OPENING))
-        self.assertEqual(receipt["expected_revision"], expected_revision)
-        self.assertEqual(receipt["evidence"], transition["evidence"])
-        self.assertEqual(receipt["evidence"]["kind"],
-                         bp.V2_EVIDENCE_FLAT_ENTRY)
+            "direction": bp.V2_DIRECTION,
+            "schedule": [
+                {"ordinal": 1, "entry_gap_pct": "0.4",
+                 "quote_cap": "7"},
+                {"ordinal": 2, "entry_gap_pct": "0.5",
+                 "quote_cap": "7"},
+            ],
+            "caps": {"stack_quote": "8", "entry_quote": "6"},
+            "venue": dict(self.CONFIG_SNAPSHOT["venue"]),
+        }
+        self.ready(config)
+        self.append(self.filled(
+            1, spot_quote="4", short_quote="3.9", entry_gap="0.5"))
+        position = self.append(self.filled(
+            2, spot_quote="5", short_quote="4.9", entry_gap="0.6"))
+        event = position["ledger"][-1]
+        self.assertNotIn("cap", event)
+        self.assertNotIn("effective_cap", event)
+        derived = bp.derive_v2_state(position)
         self.assertEqual(
-            receipt["evidence"]["digest"],
-            bp.v2_evidence_digest(
-                receipt["evidence"]["kind"],
-                receipt["evidence"]["receipt_ids"],
-                receipt["evidence"]["amounts"]))
-        self.assertEqual(position["revision"], expected_revision + 1)
+            derived["rungs"][1]["effective_cap_quote"], "4")
+        self.assertTrue(derived["rungs"][1]["cap_exceeded"])
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["reduce_only"])
 
-    def test_v2_event_age_uses_sealed_creation_cut_not_current_clock(self):
-        self.enable_v2()
-        self.add_rung()
-        rung = bp.load_position(self.receipt_dir)["rungs"][0]
-        with mock.patch.object(bp.time, "time", return_value=9999999999):
-            self.assertEqual(bp.v2_event_age_at_creation_ms(rung), 6000)
+    def test_br3_finding_3_decimal_quote_and_precision_edges_refuse(self):
+        self.ready()
+        zero_quote = {
+            "spot": self.leg("spot", 1, "0.1", "0"),
+            "short": self.leg("short", 1, "0.1", "9"),
+        }
+        dislocation = bp.new_v2_dislocation_event(
+            "value-edge", self.SOURCE_TIME_MS,
+            "0.5", "0.1", "0.0001", 28800000)
+        with self.assertRaisesRegex(bp.PositionError, "bounds"):
+            bp.new_v2_rung_filled_event(
+                1, zero_quote, dislocation, self.MODULE_TIME_MS)
 
-    def test_v2_strict_loader_refuses_unknown_fields_recursively_while_v1_is_permissive(self):
-        legacy = self.raw_position()
-        legacy["future_extension"] = {"accepted": True}
-        self.write_raw_position(legacy)
-        self.assertEqual(bp.load_position(self.receipt_dir)["future_extension"],
-                         {"accepted": True})
+        too_precise = "1.00000000000000000000000000004"
+        with self.assertRaisesRegex(
+                bp.PositionError, "28 significant digits"):
+            self.filled(
+                1, spot_quantity=too_precise, short_quantity="1")
 
-        revision = legacy["revision"]
-        proof = self.flat_proof(revision)
-        position = self.enable_raw(
-            self.CONFIG_EPOCH_DIGEST, proof, revision,
-            self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-        position = self.add_rung()
-        valid = self.raw_position()
+        boundary = "1.000000000000000000000000001"
+        position = self.append(self.filled(
+            1, spot_quantity=boundary, short_quantity="1",
+            spot_fees={"BTC": "0.000000000000000000000000001"}))
+        derived = bp.derive_v2_state(position)
+        self.assertEqual(
+            derived["rungs"][0]["spot_net_filled_quantity"], "1")
+        self.assertEqual(derived["top_state"], bp.ST_OPEN)
+
+        invalid = self.raw_position()
+        config_event = invalid["ledger"][0]
+        config_event["caps"]["entry_quote"] = "10.0"
+        config_event["event_digest"] = bp.v2_event_digest(config_event)
+        self.write_raw_position(invalid)
+        with self.assertRaisesRegex(bp.PositionError, "canonical"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br3_finding_4_top_and_rungs_are_not_persisted(self):
+        self.ready()
+        position = self.append(self.filled(1))
+        self.assertEqual(
+            set(position), {"version", "schema_version", "ledger"})
+        self.assertEqual(
+            position["ledger"][0]["event_digest"],
+            bp.v2_config_epoch_digest(self.CONFIG_SNAPSHOT))
+        for forbidden in (
+                "state", "rungs", "remaining_spot_quantity",
+                "remaining_short_quantity", "cap_headroom_quote",
+                "reduce_only", "revision", "verdict"):
+            self.assertNotIn(forbidden, position)
+        self.assertEqual(
+            bp.derive_v2_state(position)["rungs"][0]["status"],
+            bp.ST_OPEN)
+
+        invalid = json.loads(json.dumps(position))
+        invalid["state"] = bp.ST_CLOSED
+        self.write_raw_position(invalid)
+        with self.assertRaisesRegex(bp.PositionError, "unknown field"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br3_finding_5_reduction_amounts_must_match_observed_receipts(self):
+        self.ready()
+        self.append(self.filled(1))
+        self.observe_reduction(
+            "reduce-bound", 1, "0.05", "0.05")
+        before = self.state_path.read_bytes()
+        mismatched = bp.new_v2_rung_reduced_event(
+            1, ["reduce-bound"], {
+                "spot_quantity": "0.04",
+                "short_quantity": "0.04",
+            })
+        with self.assertRaisesRegex(
+                bp.PositionError, "do not match receipts"):
+            self.append(mismatched)
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_br3_finding_6_ids_timestamps_and_decimal_bounds_refuse(self):
+        with self.assertRaisesRegex(bp.PositionError, "bounded"):
+            bp.new_v2_dislocation_event(
+                "early-time", 0, "0.5", "0.1",
+                "0.0001", 28800000)
+        with self.assertRaisesRegex(bp.PositionError, "identifier"):
+            bp.new_v2_receipt_observed_event(
+                "", "FLAT", self.MODULE_TIME_MS,
+                "source", self.flat_facts())
+        oversized = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
+        oversized["caps"]["stack_quote"] = "1" * 100001
+        with self.assertRaises(bp.PositionError):
+            bp.new_v2_config_snapshot_event(oversized)
+        dislocation = bp.new_v2_dislocation_event(
+            "valid-time", self.SOURCE_TIME_MS,
+            "0.5", "0.1", "0.0001", 28800000)
+        with self.assertRaisesRegex(bp.PositionError, "bounded"):
+            bp.new_v2_rung_filled_event(
+                1, {
+                    "spot": self.leg("spot", 1, "0.1", "9"),
+                    "short": self.leg("short", 1, "0.1", "9"),
+                }, dislocation, 0)
+
+    def test_v2_full_two_rung_add_reduce_close_ledger_walk(self):
+        self.ready()
+        self.append(self.filled(1, spot_quantity="0.1",
+                                short_quantity="0.1"))
+        position = self.append(self.filled(
+            2, spot_quantity="0.2", short_quantity="0.2"))
+        self.assertEqual(
+            bp.derive_v2_state(position)["top_state"], bp.ST_OPEN)
+
+        position = self.reduce("reduce-rung-2", 2, "0.2", "0.2")
+        middle = bp.derive_v2_state(position)
+        self.assertEqual(
+            [row["status"] for row in middle["rungs"]],
+            [bp.ST_OPEN, bp.ST_CLOSED])
+        position = self.reduce("reduce-rung-1", 1, "0.1", "0.1")
+        self.assertEqual(
+            bp.derive_v2_state(position)["top_state"],
+            "AWAITING_FLAT_PROOF")
+        position = self.close_proof()
+        derived = bp.derive_v2_state(position)
+        self.assertEqual(derived["top_state"], bp.ST_CLOSED)
+        self.assertEqual(derived["remaining_spot_quantity"], "0")
+        self.assertEqual(derived["remaining_short_quantity"], "0")
+        self.assertEqual(
+            [row["status"] for row in derived["rungs"]],
+            [bp.ST_CLOSED, bp.ST_CLOSED])
+        self.assertEqual(len(position["ledger"]), 11)
+
+    def test_v2_hash_chain_break_refuses_load(self):
+        self.ready()
+        invalid = self.raw_position()
+        flat_event = invalid["ledger"][2]
+        flat_event["previous_digest"] = bp.V2_GENESIS_DIGEST
+        flat_event["event_digest"] = bp.v2_event_digest(flat_event)
+        self.write_raw_position(invalid)
+        with self.assertRaisesRegex(bp.PositionError, "chain is broken"):
+            bp.load_position(self.receipt_dir)
+
+    def test_v2_append_cas_refusal_changes_nothing(self):
+        position = self.ready()
+        before = self.state_path.read_bytes()
+        with self.assertRaisesRegex(bp.PositionError, "append_v2_event"):
+            bp.save_position(self.receipt_dir, position)
+        payload = bp.new_v2_receipt_observed_event(
+            "cas-receipt", "REDUCTION", self.MODULE_TIME_MS,
+            "cas-source", {
+                "ordinal": 1,
+                "spot_quantity": "0.01",
+                "short_quantity": "0.01",
+            })
+        with self.assertRaisesRegex(bp.PositionError, "expected_length"):
+            self.append(payload, expected_length=self.length() - 1)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertFalse(Path(str(self.state_path) + ".tmp").exists())
+
+    def test_v2_receipt_registry_refuses_missing_or_reused_receipts(self):
+        self.ready()
+        self.append(self.filled(1))
+        before = self.state_path.read_bytes()
+        missing_reduction = bp.new_v2_rung_reduced_event(
+            1, ["not-observed"], {
+                "spot_quantity": "0.01",
+                "short_quantity": "0.01",
+            })
+        with self.assertRaisesRegex(bp.PositionError, "not observed"):
+            self.append(missing_reduction)
+        with self.assertRaisesRegex(bp.PositionError, "not observed"):
+            self.append(bp.new_v2_flat_proved_event("flat-not-observed"))
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+        self.reduce("reduce-once", 1, "0.05", "0.05")
+        before_reuse = self.state_path.read_bytes()
+        reuse = bp.new_v2_rung_reduced_event(
+            1, ["reduce-once"], {
+                "spot_quantity": "0.05",
+                "short_quantity": "0.05",
+            })
+        with self.assertRaisesRegex(bp.PositionError, "consumed"):
+            self.append(reuse)
+        self.assertEqual(self.state_path.read_bytes(), before_reuse)
+
+    def test_v2_derived_state_is_equal_after_reload(self):
+        self.ready()
+        position = self.append(self.filled(1))
+        before_record = json.dumps(position, sort_keys=True)
+        before = bp.derive_v2_state(position)
+        reloaded = bp.load_position(self.receipt_dir)
+        after = bp.derive_v2_state(reloaded)
+        self.assertEqual(after, before)
+        self.assertEqual(json.dumps(position, sort_keys=True), before_record)
+
+    def test_v2_legal_next_transitions_follow_ledger_evidence(self):
+        position = self.ready()
+        self.assertIn(
+            {"event_type": "RungFilled", "ordinal": 1},
+            bp.derive_v2_state(position)["legal_next_transitions"])
+        position = self.append(self.filled(1))
+        transitions = bp.derive_v2_state(position)[
+            "legal_next_transitions"]
+        self.assertNotIn(
+            {"event_type": "RungReduced", "ordinal": 1}, transitions)
+        position = self.observe_reduction(
+            "legal-reduce", 1, "0.1", "0.1")
+        derived = bp.derive_v2_state(position)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["reduce_only"])
+        self.assertNotIn(
+            {"event_type": "RungFilled", "ordinal": 2},
+            derived["legal_next_transitions"])
+        self.assertIn(
+            {"event_type": "RungReduced", "ordinal": 1},
+            derived["legal_next_transitions"])
+        with self.assertRaisesRegex(bp.PositionError, "receipt evidence"):
+            self.append(self.filled(2))
+
+    def test_v2_loader_refuses_unknown_fields_at_nested_levels(self):
+        self.ready()
+        valid = self.append(self.filled(1))
         mutations = (
-            lambda value: value.__setitem__("future_extension", {}),
-            lambda value: value["rungs"][0].__setitem__("future", {}),
-            lambda value: value["rungs"][0]["event"].__setitem__(
-                "future", {}),
-        )
-        for mutation in mutations:
-            invalid = json.loads(json.dumps(valid))
-            mutation(invalid)
-            self.write_raw_position(invalid)
-            with self.assertRaisesRegex(bp.PositionError, "unknown field"):
-                bp.load_position(self.receipt_dir)
-        self.write_raw_position(valid)
-
-    def test_v2_strict_loader_refuses_malformed_decimal_text(self):
-        self.enable_v2()
-        self.add_rung()
-        invalid = self.raw_position()
-        invalid["rungs"][0]["entry_gap_pct"] = "not-a-decimal"
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError, "Decimal text"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_schema_version_marker_gates_strict_loading(self):
-        legacy = self.raw_position()
-        legacy["version"] = 99
-        self.write_raw_position(legacy)
-        self.assertEqual(bp.load_position(self.receipt_dir)["version"], 99)
-
-        marked = self.raw_position()
-        marked["schema_version"] = 3
-        self.write_raw_position(marked)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "schema_version is not supported"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_strict_loader_refuses_duplicate_rung_ordinals(self):
-        self.enable_v2()
-        position = self.add_rung(self.rung(terminal=True))
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        invalid = self.raw_position()
-        duplicate = json.loads(json.dumps(invalid["rungs"][0]))
-        duplicate["rung_id"] = "rung-02"
-        for order in duplicate["own_orders"]:
-            order["client_id"] += "-02"
-        invalid["rungs"].append(duplicate)
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError, "ordinal is duplicated"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_strict_loader_refuses_config_epoch_drift(self):
-        self.enable_v2()
-        self.add_rung()
-        invalid = self.raw_position()
-        invalid["rungs"][0]["config_epoch_digest"] = "e" * 64
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "config-epoch binding"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_deleted_schema_marker_refuses_legacy_fallback(self):
-        self.enable_v2()
-        invalid = self.raw_position()
-        del invalid["schema_version"]
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError, "schema_version"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_supplied_config_digest_must_match_canonical_snapshot(self):
-        revision = self.raw_position()["revision"]
-        supplied = "a" * 64
-        self.assertNotEqual(supplied, self.CONFIG_EPOCH_DIGEST)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "config snapshot digest"):
-            self.enable_raw(
-                supplied,
-                self.flat_proof(
-                    revision, config_epoch_digest=supplied),
-                revision, self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-
-    def test_v2_stored_config_snapshot_edit_refuses_on_load(self):
-        self.enable_v2()
-        invalid = self.raw_position()
-        invalid["config_snapshot"]["caps"]["stack_quote"] = "21"
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "config snapshot digest"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_transition_table_refuses_illegal_edge(self):
-        position = self.enable_v2()
-        with self.assertRaisesRegex(bp.PositionError, "legal"):
-            self.transition(position["revision"], from_state=bp.ST_NONE,
-                            to_state=bp.ST_CLOSED)
-
-    def test_v2_transition_evidence_digest_is_consumed_once(self):
-        position = self.enable_v2()
-        first = self.transition(position["revision"])
-        position = bp.write_v2_transition(
-            self.receipt_dir, first, position["revision"])
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "supplied evidence digest"):
-            self.transition(
-                position["revision"], "transition-02", bp.ST_OPENING,
-                bp.ST_UNKNOWN, first["evidence"]["digest"],
-                bp.V2_EVIDENCE_AMBIGUOUS, ["ambiguous-01"], {})
-
-    def test_v2_rung_append_requires_recorded_add_authorization(self):
-        position = self.enable_v2()
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "ADD transition"):
-            bp.write_v2_rung(
-                self.receipt_dir, self.rung(), position["revision"])
-
-        invalid = self.raw_position()
-        pre_reconciled = self.rung(terminal=True)
-        pre_reconciled["status"] = "OPEN"
-        invalid["rungs"].append(pre_reconciled)
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "ADD transition|cap reconciliation"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_event_funding_edit_refuses_digest_recheck(self):
-        self.enable_v2()
-        self.add_rung()
-        invalid = self.raw_position()
-        invalid["rungs"][0]["event"]["funding_rate"] = "0.9"
-        self.write_raw_position(invalid)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "event digest"):
-            bp.load_position(self.receipt_dir)
-
-    def test_v2_intent_saved_orders_keep_cap_safety_flags(self):
-        self.enable_v2()
-        position = self.add_rung(self.rung(
-            terminal=True, terminal_status="INTENT_SAVED"))
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        self.assertEqual(position["rungs"][0]["cap_reconcile"]["status"],
-                         "UNKNOWN")
-        self.assertTrue(position["increases_frozen"])
-        self.assertTrue(position["reduce_only_path"])
-
-    def test_v2_base_asset_fee_enters_terminal_exposure_agreement(self):
-        self.enable_v2()
-        rung = self.rung(
-            terminal=True, spot_quantity="0.099", short_quantity="0.098",
-            spot_fee_by_asset={"BTC": "0.001"})
-        position = self.add_rung(rung)
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        self.assertEqual(position["rungs"][0]["cap_reconcile"]["status"],
-                         "WITHIN_CAP")
-        self.assertFalse(position["increases_frozen"])
-        self.assertFalse(position["reduce_only_path"])
-
-    def test_v2_terminal_quantity_disagreement_keeps_safety_flags(self):
-        self.enable_v2()
-        rung = self.rung(
-            terminal=True, spot_quantity="0.099", short_quantity="0.098")
-        position = self.add_rung(rung)
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        self.assertEqual(position["rungs"][0]["cap_reconcile"]["status"],
-                         "UNKNOWN")
-        self.assertTrue(position["increases_frozen"])
-        self.assertTrue(position["reduce_only_path"])
-
-    def test_v2_stale_flat_proof_refuses_initialization(self):
-        revision = self.raw_position()["revision"]
-        proof = self.flat_proof(
-            revision, self.CREATED_CUT_MS - 30001)
-        with self.assertRaisesRegex(bp.PositionError, "freshness"):
-            self.enable_raw(
-                self.CONFIG_EPOCH_DIGEST, proof, revision,
-                self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-
-    def test_v2_working_legacy_leg_refuses_initialization(self):
-        legacy = self.raw_position()
-        legacy["legs"][0]["status"] = "WORKING"
-        legacy["legs"][0]["outcome"] = "working"
-        self.write_raw_position(legacy)
-        revision = legacy["revision"]
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "legacy leg is not terminal"):
-            self.enable_raw(
-                self.CONFIG_EPOCH_DIGEST, self.flat_proof(revision),
-                revision, self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-
-    def test_v2_missing_flat_read_provenance_refuses_initialization(self):
-        revision = self.raw_position()["revision"]
-        proof = self.flat_proof(revision)
-        del proof["read_provenance"]
-        with self.assertRaisesRegex(bp.PositionError, "read_provenance"):
-            self.enable_raw(
-                self.CONFIG_EPOCH_DIGEST, proof, revision,
-                self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-
-    def test_v2_flat_proof_must_enumerate_every_legacy_own_order(self):
-        revision = self.raw_position()["revision"]
-        provenance = json.loads(json.dumps(self.FLAT_READ_PROVENANCE))
-        provenance["own_orders"].pop()
-        proof = self.flat_proof(revision, read_provenance=provenance)
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "own-order enumeration"):
-            self.enable_raw(
-                self.CONFIG_EPOCH_DIGEST, proof, revision,
-                self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-
-    def test_v2_flat_proof_own_order_provenance_requires_terminal_status(self):
-        provenance = json.loads(json.dumps(self.FLAT_READ_PROVENANCE))
-        provenance["own_orders"] = [{
-            "client_id": "bc-v2-prior-order",
-            "market": "spot",
-            "status": "INTENT_SAVED",
-        }]
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "terminal status"):
-            self.flat_proof(read_provenance=provenance)
-
-    def test_br2_finding_1_nested_v2_fields_select_strict_schema(self):
-        mutations = (
-            lambda value: value.__setitem__(
-                "future_extension", {
-                    "payload": {"config_epoch_digest": "a" * 64},
-                }),
-            lambda value: value.__setitem__(
-                "future_extension", {"rung_id": "rung-hidden"}),
+            lambda value: value.__setitem__("extra", True),
+            lambda value: value["ledger"][0]["schedule"][0].__setitem__(
+                "extra", True),
+            lambda value: value["ledger"][-1]["legs"]["spot"].__setitem__(
+                "extra", True),
+            lambda value: value["ledger"][-1]["dislocation"].__setitem__(
+                "extra", True),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):
-                self.state_path.write_bytes(V1_CONTRACT_PATH.read_bytes())
-                legacy = self.raw_position()
-                mutation(legacy)
-                self.write_raw_position(legacy)
-                with self.assertRaisesRegex(bp.PositionError,
-                                            "schema_version"):
+                invalid = json.loads(json.dumps(valid))
+                mutation(invalid)
+                self.write_raw_position(invalid)
+                with self.assertRaisesRegex(
+                        bp.PositionError, "unknown field"):
                     bp.load_position(self.receipt_dir)
+        self.write_raw_position(valid)
 
-    def test_br2_finding_2_config_epoch_uses_typed_canonical_schema(self):
-        equivalent = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
-        equivalent["caps"]["rung_quote"] = "10.0"
-        self.assertEqual(
-            bp.v2_config_epoch_digest(self.CONFIG_SNAPSHOT),
-            bp.v2_config_epoch_digest(equivalent))
-        self.enable_v2(config_snapshot=equivalent)
-        self.assertEqual(
-            self.raw_position()["config_snapshot"]["caps"]["rung_quote"],
-            "10")
-
-        invalid_snapshots = []
-        hollow = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
-        hollow["schedule"] = [{}]
-        invalid_snapshots.append(hollow)
-        hollow = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
-        hollow["caps"] = {"optional": None}
-        invalid_snapshots.append(hollow)
-        hollow = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
-        hollow["venue"] = {"base_asset": "BTC"}
-        invalid_snapshots.append(hollow)
-        wrong_venue = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
-        wrong_venue["venue"]["spot"] = "CALLER_SPOT"
-        invalid_snapshots.append(wrong_venue)
-        for snapshot in invalid_snapshots:
-            with self.subTest(snapshot=snapshot):
-                with self.assertRaises(bp.PositionError):
-                    bp.v2_config_epoch_digest(snapshot)
-
-    def test_br2_finding_3_state_graph_requires_transition_evidence(self):
-        position = self.enable_v2()
-        position = bp.write_v2_transition(
-            self.receipt_dir, self.transition(position["revision"]),
-            position["revision"])
-        no_rung_open = self.transition(
-            position["revision"], "zero-rung-open", bp.ST_OPENING,
-            bp.ST_OPEN, evidence_kind=bp.V2_EVIDENCE_TERMINAL_RUNG,
-            receipt_ids=["missing-rung", "missing-short", "missing-spot"],
-            amounts={"spot_net_base_qty": "1", "short_base_qty": "1"})
-        with self.assertRaisesRegex(bp.PositionError, "requires a rung"):
-            bp.write_v2_transition(
-                self.receipt_dir, no_rung_open, position["revision"])
-
-        self.state_path.write_bytes(V1_CONTRACT_PATH.read_bytes())
-        self.enable_v2()
-        position = self.add_rung(self.rung(terminal=True))
-        position = bp.reconcile_v2_rung_cap(
-            self.receipt_dir, "rung-01", position["revision"])
-        position = bp.write_v2_transition(
-            self.receipt_dir,
-            self.transition(
-                position["revision"], "terminal-open", bp.ST_OPENING,
-                bp.ST_OPEN),
-            position["revision"])
-        with self.assertRaisesRegex(bp.PositionError, "evidence kind"):
-            self.transition(
-                position["revision"], "missing-reduce", bp.ST_OPEN,
-                "REDUCING")
-        reducing = self.transition(
-            position["revision"], "reduce-01", bp.ST_OPEN, "REDUCING",
-            evidence_kind=bp.V2_EVIDENCE_REDUCE,
-            receipt_ids=["reduce-receipt-01"],
-            amounts={"reduced_base_qty": "0.01"})
-        position = bp.write_v2_transition(
-            self.receipt_dir, reducing, position["revision"])
-        stale_flat = self.transition(
-            position["revision"], "flat-close-stale", "REDUCING",
-            bp.ST_CLOSED, evidence_kind=bp.V2_EVIDENCE_FLAT_CLOSE,
-            receipt_ids=["flat-close-stale-receipt"], amounts={
-                "futures_position_qty": "0",
-                "spot_sellable_base_qty": "0",
-                "observed_at_ms": str(self.CREATED_CUT_MS - 30001),
+    def test_v2_atomic_replace_failure_preserves_prior_ledger(self):
+        self.ready()
+        before = self.state_path.read_bytes()
+        payload = bp.new_v2_receipt_observed_event(
+            "atomic-receipt", "REDUCTION", self.MODULE_TIME_MS,
+            "atomic-source", {
+                "ordinal": 1,
+                "spot_quantity": "0.01",
+                "short_quantity": "0.01",
             })
         with mock.patch.object(
-                bp, "default_now_ms", return_value=self.CREATED_CUT_MS):
-            with self.assertRaisesRegex(bp.PositionError, "not fresh"):
-                bp.write_v2_transition(
-                    self.receipt_dir, stale_flat, position["revision"])
-        fresh_flat = self.transition(
-            position["revision"], "flat-close-fresh", "REDUCING",
-            bp.ST_CLOSED, evidence_kind=bp.V2_EVIDENCE_FLAT_CLOSE,
-            receipt_ids=["flat-close-fresh-receipt"], amounts={
-                "futures_position_qty": "0",
-                "spot_sellable_base_qty": "0",
-                "observed_at_ms": str(self.CREATED_CUT_MS),
-            })
-        with mock.patch.object(
-                bp, "default_now_ms", return_value=self.CREATED_CUT_MS):
-            position = bp.write_v2_transition(
-                self.receipt_dir, fresh_flat, position["revision"])
-        self.assertEqual(position["state"], bp.ST_CLOSED)
-
-    def test_br2_finding_4_evidence_receipts_cannot_change_kind(self):
-        position = self.enable_v2()
-        first = self.transition(position["revision"])
-        position = bp.write_v2_transition(
-            self.receipt_dir, first, position["revision"])
-        changed_kind = self.transition(
-            position["revision"], "same-receipts-new-kind",
-            bp.ST_OPENING, bp.ST_UNKNOWN,
-            evidence_kind=bp.V2_EVIDENCE_AMBIGUOUS,
-            receipt_ids=list(first["evidence"]["receipt_ids"]), amounts={})
-        self.assertNotEqual(first["evidence"]["digest"],
-                            changed_kind["evidence"]["digest"])
-        with self.assertRaisesRegex(bp.PositionError, "receipt is reused"):
-            bp.write_v2_transition(
-                self.receipt_dir, changed_kind, position["revision"])
-
-    def test_br2_finding_5_event_decimal_equivalence_is_deliberate(self):
-        event = self.rung()["event"]
-        equivalent = json.loads(json.dumps(event))
-        equivalent["funding_rate"] = "1E-4"
-        self.assertEqual(bp.v2_event_digest(event),
-                         bp.v2_event_digest(equivalent))
-
-    def test_br2_finding_6_zero_or_fee_consumed_fills_do_not_open(self):
-        cases = (
-            {
-                "terminal_status": "REJECTED",
-                "spot_quantity": "0", "short_quantity": "0",
-                "spot_quote": "0", "short_quote": "0",
-            },
-            {
-                "terminal_status": "FILLED",
-                "spot_quantity": "0.098", "short_quantity": "0",
-                "spot_quote": "9.8", "short_quote": "0",
-                "spot_fee_by_asset": {"BTC": "0.098"},
-            },
-        )
-        for values in cases:
-            with self.subTest(values=values):
-                self.state_path.write_bytes(V1_CONTRACT_PATH.read_bytes())
-                self.enable_v2()
-                position = self.add_rung(self.rung(terminal=True, **values))
-                position = bp.reconcile_v2_rung_cap(
-                    self.receipt_dir, "rung-01", position["revision"])
-                self.assertEqual(position["rungs"][0]["status"], "UNKNOWN")
-                self.assertEqual(
-                    position["rungs"][0]["cap_reconcile"]["status"],
-                    "UNKNOWN")
-                self.assertTrue(position["increases_frozen"])
-
-    def test_br2_finding_7_flat_gate_uses_module_time_and_bound_digest(self):
-        revision = self.raw_position()["revision"]
-        historical = self.flat_proof(revision, observed_at_ms=1)
-        with mock.patch.object(
-                bp, "default_now_ms", return_value=self.CREATED_CUT_MS):
-            with self.assertRaisesRegex(bp.PositionError,
-                                        "module gate time"):
-                bp.enable_v2_position(
-                    self.receipt_dir, SYMBOL, self.CONFIG_EPOCH_DIGEST,
-                    historical, revision, self.CONFIG_SNAPSHOT, 1)
-
-        stale = self.flat_proof(
-            revision, observed_at_ms=self.CREATED_CUT_MS - 30001)
-        original_digest = stale["evidence_digest"]
-        stale["observed_at_ms"] = self.CREATED_CUT_MS
-        self.assertNotEqual(
-            original_digest, bp.v2_flat_proof_evidence_digest(stale))
-        with self.assertRaisesRegex(bp.PositionError, "evidence digest"):
-            self.enable_raw(
-                self.CONFIG_EPOCH_DIGEST, stale, revision,
-                self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-
-    def test_v2_requested_rung_size_is_immutable_after_creation(self):
-        self.enable_v2()
-        position = self.add_rung()
-        expected_revision = position["revision"]
-        position["rungs"][0]["sizes"]["requested_quote"] = "9.7"
-        with self.assertRaisesRegex(bp.PositionError,
-                                    "requested rung size is immutable"):
-            bp.save_position(
-                self.receipt_dir, position,
-                expected_revision=expected_revision)
-
-    def test_v2_enablement_requires_current_proven_flat_state(self):
-        legacy = self.raw_position()
-        legacy["state"] = bp.ST_OPEN
-        legacy["verdict"] = "OPEN_EXPOSURE"
-        self.write_raw_position(legacy)
-        with self.assertRaisesRegex(bp.PositionError, "proven flat"):
-            self.enable_raw(
-                self.CONFIG_EPOCH_DIGEST,
-                self.flat_proof(legacy["revision"]), legacy["revision"],
-                self.CONFIG_SNAPSHOT, self.CREATED_CUT_MS)
-        persisted = self.raw_position()
-        self.assertNotIn("schema_version", persisted)
-        self.assertEqual(persisted["state"], bp.ST_OPEN)
-
-    def test_v2_writes_use_atomic_state_path_without_residue(self):
-        self.enable_v2()
-        self.add_rung()
-        self.assertTrue(self.state_path.is_file())
+                bp.os, "replace", side_effect=OSError("simulated")):
+            with self.assertRaises(OSError):
+                self.append(payload)
+        self.assertEqual(self.state_path.read_bytes(), before)
         self.assertFalse(Path(str(self.state_path) + ".tmp").exists())
-        self.assertFalse(
-            (Path(self.receipt_dir) / bp.STATE_WRITE_GUARD_FILE).exists())
 
 
 class RatesTests(MachineCase):
