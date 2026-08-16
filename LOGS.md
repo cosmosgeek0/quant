@@ -7,6 +7,15 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+SR3 REVERSE OP STAGED PAUSED 2026-08-16 18:14Z (worker 6.0, owner paste) | machine SEALED + FLAT; three-file atomic deploy of the reverse runner, no trade
+lane | lane/lead6-rev 585e0ecd = main + FD1-FD4 + minimum reverse commits + SR1/SR1b + SR2 + SM1/SM2/FB1 (so RELEASE matches every deployed file); suite 1495 green | MEASURED
+deploy | job_runner 15f6d26a, margin_orders 0e160f6a (new), reverse_mechanics 3c5f5e6f | HOST-DEPLOY OK files=3 release 585e0ecda9a7ef239cf52625fe6d17ead79bc725 at 18:14:48Z | STOP-JOBS present before and after | MEASURED
+flat read | signed GET-only on the host: spot USDT 84.35 + dust, 0 open orders; USD-M 0 positions, 0 open orders, USDT 10.97; cross-margin borrowed 0 interest 0 liability 0 marginLevel 999, 0 open orders | VERDICT FLAT | MEASURED
+shadow | last 300 rows: would_intent False 300/300; gates GAP_NOT_EXECUTABLE_OR_STALE 284, LADDER_HEADROOM_UNAVAILABLE 16; gaps all negative (p50 -0.21 %) | sees fresh gaps for the fresh minority, would not emit a candidate now | MEASURED
+candidate example ZROUSDT | maxBorrowable 10.377 ZRO (limit 11000); futures min notional 5, step 0.1, leverage currently 5x (SR1b sets 1x at entry under authority); spot min notional 5; fits the 8-USDT cap | MEASURED
+would refuse now | the shadow gates (no proposal until an executable negative gap with ladder headroom is fresh) | INFERRED
+next | owner's REVERSE LIVE word; honest expectation: an attempt now most likely refuses at the gates and that refusal is the receipt | INFERRED
+
 SM2 + FB1 DEPLOYED SEALED 2026-08-16 17:48Z / 17:54Z (worker 6.0, owner line) | machine SEALED + FLAT; two one-file atomic deploys + one feed daemon restart via the stop file; no order, transfer, leverage change or ticket
 SM2 stream | release 52b866c0 (late book read) HOST-DEPLOY OK files=1 17:48:44Z | tick 17:50:12Z: first OK gap rows (9/400), 34/357 pairs under 5 s, BTC 3.3 s with basis | feed_used=yes reason=accepted | MEASURED
 FB1 feed | release adcd747b (coalescing) HOST-DEPLOY OK files=1 17:54:39Z, daemon exited 2 s after the stop file, relaunched by the tick | 18:00-18:03Z: spot dropped_frames 0 (was 293,916 and ~14/s), perp drops continue (out-of-universe frames accounted, INFERRED), busy symbols fresh (BTC 437 ms at one read), per-symbol freshness p50 6.7 -> 5.1 s, over-5 s 377 -> 331 of 653 | MEASURED
