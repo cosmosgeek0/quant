@@ -308,6 +308,10 @@ class WssHealthTests(unittest.TestCase):
     def test_healthy_feed_is_operational_and_first_delta_is_unknown(self):
         edge = health.derive_edge("spot_wss", wss(), None, CONFIG, NOW)
         self.assertEqual(edge["health"], "Operational")
+        self.assertEqual(
+            edge["evidence"]["source"],
+            "feed_state.json at its source (read-only)",
+        )
         self.assertIsNone(edge["metrics"]["dropped_frames_delta"])
         self.assertEqual(edge["truth"], {
             "configured": "Pass", "transport": "Pass", "application": "Pass",
@@ -343,6 +347,10 @@ class WssHealthTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 edge = health.derive_edge("usdm_wss", wss(**changes), None, CONFIG, NOW)
                 self.assertEqual(edge["health"], "Degraded")
+                self.assertEqual(
+                    edge["evidence"]["source"],
+                    "feed_state.json at its source (read-only)",
+                )
 
     def test_unexposed_feed_status_or_message_age_is_unknown(self):
         for changes in ({"feed_status": "other"}, {"last_message_age_ms": None}):
@@ -388,6 +396,10 @@ class FeedMachineHealthTests(unittest.TestCase):
                     None, CONFIG, NOW,
                 )
                 self.assertEqual(edge["health"], expected)
+                self.assertEqual(
+                    edge["evidence"]["source"],
+                    "feed_state.json at its source (read-only) and mirrored stream_state.json",
+                )
                 self.assertIsNone(edge["metrics"]["source"])
 
     def test_p9_three_mirror_intervals_keep_feed_machine_assessment_stable(self):

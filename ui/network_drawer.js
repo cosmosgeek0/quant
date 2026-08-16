@@ -5,6 +5,14 @@
   var EMPTY_BUCKETS = [];
   var RANGE_MS = { "1h": 3600000, "6h": 21600000, "24h": 86400000 };
   var BUCKET_WORD = { "1h": "1 min", "6h": "5 min", "24h": "15 min" };
+  var WIRE_COLORS = {
+    browser_site: "#7a8fa8", cf_connector: "#b08a4a",
+    connector_origin: "#9a8b6a", spot_rest: "#4f7fb2",
+    spot_wss: "#3f8f9a", usdm_rest: "#6d6fb0", usdm_wss: "#5b9a7a",
+    feed_machine: "#8a7ab5", news_fetch: "#7c8f5a",
+    binance_account: "#8f8f8f", binance_exec: "#8f8f8f",
+    aws_secrets: "#8f8f8f", aws_ssm: "#8f8f8f"
+  };
   var NODE_LABELS = {
     browser: "Browser", cloudflare: "Cloudflare edge", cloudflared: "Tunnel connector",
     quant_ui: "Quant UI origin", box: "Execution box", binance_spot: "Binance Spot",
@@ -57,6 +65,19 @@
   function own(value, key) { return Object.prototype.hasOwnProperty.call(value || {}, key); }
 
   function finiteNumber(value) { return typeof value === "number" && Number.isFinite(value); }
+
+  function wireColor(edgeId) { return WIRE_COLORS[edgeId] || "#8f8f8f"; }
+
+  function chartSegments(points, gap) {
+    var segments = [];
+    points.forEach(function (point) {
+      var segment = segments.length ? segments[segments.length - 1] : null;
+      var prior = segment && segment.length ? segment[segment.length - 1] : null;
+      if (!prior || point.t - prior.t > gap) { segment = []; segments.push(segment); }
+      segment.push(point);
+    });
+    return segments;
+  }
 
   function shown(value) { return value === null || value === undefined || value === "" ? DASH : String(value); }
 
@@ -151,7 +172,8 @@
       throw new TypeError("NetV1Drawer needs a host element");
     }
     var state = { edge: null, buckets: EMPTY_BUCKETS, opts: {}, metric: null, destroyed: false };
-    var drawnBuckets = null, drawnWidth = -1, metricRows = Object.create(null);
+    var drawnBuckets = null, drawnWidth = -1, drawnEdgeId = null;
+    var metricRows = Object.create(null);
     var card = element("section", "st-card n1-drawer");
     var head = element("div", "st-card-head"), dot = element("span", "n1-dot");
     var name = element("span", "n1-dr-name", DASH), status = element("span", "v5-word", "Unknown");
@@ -189,7 +211,9 @@
 
     var chartHead = element("div", "n1-chart-head"), select = element("select", "st-select");
     select.setAttribute("aria-label", "Chart metric");
-    var caption = element("span", "st-t-meta", DASH);
+    var caption = element("span", "st-t-meta");
+    var captionName = element("span", "", DASH), captionDetail = document.createTextNode("");
+    caption.appendChild(captionName); caption.appendChild(captionDetail);
     chartHead.appendChild(select); chartHead.appendChild(caption); chart.appendChild(chartHead);
     var canvas = element("canvas");
     canvas.setAttribute("role", "img"); canvas.textContent = "Metric history chart";
@@ -269,15 +293,15 @@
       if (state.destroyed || state.buckets.length < 2 || card.hidden) { return; }
       var size = chartSize();
       if (!size.width || !size.height) { return; }
-      if (state.buckets === drawnBuckets && size.width === drawnWidth) { return; }
-      drawnBuckets = state.buckets; drawnWidth = size.width;
+      var edgeId = state.edge && state.edge.id ? String(state.edge.id) : "";
+      if (state.buckets === drawnBuckets && size.width === drawnWidth && edgeId === drawnEdgeId) { return; }
+      drawnBuckets = state.buckets; drawnWidth = size.width; drawnEdgeId = edgeId;
       var dpr = Math.max(1, root.devicePixelRatio || 1), context = canvas.getContext("2d");
       if (!context) { return; }
       canvas.width = Math.round(size.width * dpr); canvas.height = Math.round(size.height * dpr);
       context.setTransform(dpr, 0, 0, dpr, 0, 0); context.clearRect(0, 0, size.width, size.height);
-      var ink = cssColor(["--ink", "--st-ink"], "#161618");
-      var muted = cssColor(["--muted", "--st-mid"], "#787882");
       var faint = cssColor(["--faint", "--st-faint"], "#95959d");
+      var seriesColor = wireColor(edgeId);
       var points = state.buckets.filter(function (bucket) {
         return bucket && finiteNumber(bucket.t) && finiteNumber(bucket.avg);
       });
@@ -297,17 +321,26 @@
       context.fillText(metricAxisWord(state.metric, maximum), 0, top);
       context.fillText(metricAxisWord(state.metric, minimum), 0, bottom);
       context.textAlign = "right"; context.textBaseline = "top"; context.fillText("now", right, bottom + 4);
-      context.strokeStyle = ink; context.lineWidth = 1.25; context.beginPath();
-      var prior = null, gap = (duration / ({ "1h": 60, "6h": 72, "24h": 96 }[state.opts.range] || 60)) * 1.5;
-      points.forEach(function (point) {
-        if (!prior || point.t - prior.t > gap) { context.moveTo(x(point), y(point.avg)); }
-        else { context.lineTo(x(point), y(point.avg)); } prior = point;
+      var gap = (duration / ({ "1h": 60, "6h": 72, "24h": 96 }[state.opts.range] || 60)) * 1.5;
+      var segments = chartSegments(points, gap);
+      context.fillStyle = seriesColor; context.globalAlpha = 0.08;
+      segments.forEach(function (segment) {
+        context.beginPath(); context.moveTo(x(segment[0]), bottom);
+        segment.forEach(function (point) { context.lineTo(x(point), y(point.avg)); });
+        context.lineTo(x(segment[segment.length - 1]), bottom); context.closePath(); context.fill();
       });
-      context.stroke(); context.fillStyle = muted;
+      context.globalAlpha = 1; context.strokeStyle = seriesColor; context.lineWidth = 1.25;
+      context.beginPath();
+      segments.forEach(function (segment) {
+        context.moveTo(x(segment[0]), y(segment[0].avg));
+        segment.slice(1).forEach(function (point) { context.lineTo(x(point), y(point.avg)); });
+      });
+      context.stroke(); context.fillStyle = seriesColor; context.globalAlpha = 0.7;
       points.forEach(function (point) {
         if (!finiteNumber(point.max)) { return; }
         context.beginPath(); context.arc(x(point), y(point.max), 1.75, 0, Math.PI * 2); context.fill();
       });
+      context.globalAlpha = 1;
     }
 
     function syncFacts(currentEdge) {
@@ -346,7 +379,8 @@
       var next = Array.isArray(nextBuckets) ? nextBuckets : EMPTY_BUCKETS;
       state.buckets = next; collecting.textContent = "Collecting history \u2014 " + next.length + " cells so far";
       collecting.hidden = next.length >= 2; canvas.hidden = next.length < 2;
-      caption.textContent = shown(state.opts.range && String(state.opts.range).toUpperCase())
+      captionName.textContent = shown(state.edge && state.edge.label);
+      captionDetail.nodeValue = " \u00b7 " + shown(state.opts.range && String(state.opts.range).toUpperCase())
         + " \u00b7 avg per " + shown(BUCKET_WORD[state.opts.range]) + " cell \u00b7 max as dots \u00b7 UTC";
       canvas.setAttribute("aria-label", (state.metric && METRICS[state.metric] ? METRICS[state.metric][0] : "Metric")
         + " history, " + next.length + " cells");

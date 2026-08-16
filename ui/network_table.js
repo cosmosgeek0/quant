@@ -2,6 +2,8 @@
   "use strict";
 
   var DASH = "\u2014";
+  var HISTORY_HEIGHT = 22;
+  var HISTORY_GAP = 2;
   var RANGE = {
     "1h": { cells: 60, bucketMs: 60000 },
     "6h": { cells: 72, bucketMs: 300000 },
@@ -284,17 +286,19 @@
       record.drawRange = activeModel.range; record.drawRatio = ratio;
       if (!width) { record.drawing = null; return; }
       slotWidth = Math.max(1, Math.floor(width / grid.count));
-      markWidth = Math.max(1, slotWidth - 1); offset = Math.max(0, width - slotWidth * grid.count);
-      record.canvas.width = Math.round(width * ratio); record.canvas.height = Math.round(14 * ratio);
+      markWidth = Math.max(1, slotWidth - HISTORY_GAP);
+      offset = Math.max(0, width - slotWidth * grid.count);
+      record.canvas.width = Math.round(width * ratio);
+      record.canvas.height = Math.round(HISTORY_HEIGHT * ratio);
       context = record.canvas.getContext("2d"); record.drawing = {
         grid: grid, slotWidth: slotWidth, offset: offset };
       if (!context) { return; }
       if (typeof context.setTransform === "function") { context.setTransform(ratio, 0, 0, ratio, 0, 0); }
-      context.clearRect(0, 0, width, 14);
+      context.clearRect(0, 0, width, HISTORY_HEIGHT);
       for (index = 0; index < grid.count; index += 1) {
         paint = cellPaint(record.canvas, grid.slots[index] ? healthWord(grid.slots[index]) : null);
         context.fillStyle = paint.color; context.globalAlpha = paint.alpha;
-        context.fillRect(offset + index * slotWidth, 0, markWidth, 14);
+        context.fillRect(offset + index * slotWidth, 0, markWidth, HISTORY_HEIGHT);
       }
       context.globalAlpha = 1;
     }

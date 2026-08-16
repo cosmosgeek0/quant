@@ -47,9 +47,12 @@ DEPENDENCIES = {
 }
 PROBE_COOLDOWN_MS = 30_000
 PRUNE_INTERVAL_MS = 3_600_000
+# "quorum" is deliberately NOT seeded: after every recorder start an edge
+# must prove two successes before it reads Operational again (build order
+# NET-07 step 8), so a restart shows "recovering 1/2" first, never green at once.
 SEED_COUNTER_KEYS = frozenset((
     "count_429", "count_418", "consecutive_failures",
-    "probes", "failures", "quorum",
+    "probes", "failures",
 ))
 SEED_METRIC_KEYS = frozenset((
     "dropped_frames_total", "total_requests", "request_errors",

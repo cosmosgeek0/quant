@@ -112,7 +112,7 @@
 .n1-grid th, .n1-grid td {
   border-color: var(--hair, var(--line, var(--st-line, #e5e7eb)));
 }
-.n1-grid td, .n1-grid tbody tr { height: 40px; }
+.n1-grid td, .n1-grid tbody tr { height: 44px; }
 .n1-grid th:nth-last-child(2), .n1-grid td:nth-last-child(2) {
   width: 100%; min-width: 320px;
 }
@@ -145,7 +145,7 @@
   color: var(--muted, var(--st-mid, #787882));
   font: 400 11px/14px InterVariable, Inter, sans-serif;
 }
-.n1-cells { display: block; width: 100%; min-width: 320px; height: 14px; }
+.n1-cells { display: block; width: 100%; min-width: 320px; height: 22px; }
 .n1-axis {
   display: flex; justify-content: space-between;
   width: max(320px, calc(100% - 920px)); min-width: 320px;
@@ -255,6 +255,13 @@
 .n1-chart-head .st-select {
   flex: 0 1 auto; font-size: 12.5px; font-weight: 500;
 }
+.n1-chart-head .st-t-meta {
+  color: var(--muted, var(--st-mid, #787882));
+  font: 400 11px/16px InterVariable, Inter, sans-serif;
+}
+.n1-chart-head .st-t-meta > span {
+  color: var(--ink, var(--st-ink, #161618));
+}
 .n1-chart canvas { display: block; width: 100%; height: 210px; }
 .n1-tip {
   position: fixed; z-index: 20; max-width: 240px; padding: 5px 7px;
@@ -279,11 +286,15 @@
   color: var(--muted, var(--st-mid, #787882));
   font: 400 11px/16px InterVariable, Inter, sans-serif;
 }
+.n1-ledger-t { table-layout: fixed; }
 .n1-ledger-t th, .n1-ledger-t td {
   border-bottom: 1px solid var(--hair, var(--line, var(--st-line, #e5e7eb)));
-  text-align: left;
+  overflow: hidden; text-align: left; white-space: nowrap;
 }
-.n1-ledger-t td, .n1-ledger-t tbody tr { height: 40px; }
+.n1-ledger-t th:first-child, .n1-ledger-t td:first-child { width: 88px; }
+.n1-ledger-t th:nth-child(2), .n1-ledger-t td:nth-child(2) { width: 24%; }
+.n1-ledger-t th:nth-child(3), .n1-ledger-t td:nth-child(3) { width: 24%; }
+.n1-ledger-t td, .n1-ledger-t tbody tr { height: 26px; }
 .n1-ledger-t tbody tr[data-edge] { cursor: pointer; }
 .n1-ledger-t td:nth-child(2) {
   color: var(--ink, var(--st-ink, #161618));
@@ -292,7 +303,11 @@
 .n1-ledger-t td:nth-child(3), .n1-ledger-t td:nth-child(4) {
   color: var(--muted, var(--st-mid, #787882));
   font: 400 11px/16px InterVariable, Inter, sans-serif;
-  white-space: normal;
+  white-space: nowrap;
+}
+.n1-ledger-t td:nth-child(4) { text-overflow: ellipsis; }
+.n1-ledger-t .v5-word {
+  display: inline; color: inherit; font: inherit;
 }
 .n1-ledger-t .warn { color: #d4a406; }
 .n1-ledger-t .bad { color: #cc2f3c; }

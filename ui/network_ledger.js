@@ -104,13 +104,15 @@
     function patch(record, item) {
       var event = item.event, edgeId = event.edge_id;
       var transition = splitTransition(event.transition), stateClass = healthClass(transition.health);
+      var reason = shown(event.reason);
       record.time.textContent = formatUtcTime(event.ts);
       record.connection.textContent = edgeLabel(edgeId);
       record.prefix.nodeValue = transition.prefix;
       record.health.textContent = transition.health;
       record.health.className = "v5-word" + (stateClass ? " " + stateClass : "");
       record.health.hidden = !transition.health;
-      record.reason.textContent = shown(event.reason);
+      record.reason.textContent = reason;
+      record.reason.title = reason;
       record.row.setAttribute("data-event-id", item.key);
       if (edgeId === null || edgeId === undefined) { record.row.removeAttribute("data-edge"); }
       else { record.row.setAttribute("data-edge", String(edgeId)); }

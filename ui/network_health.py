@@ -58,7 +58,7 @@ METRIC_KEYS = {
 SOURCES = {
     "browser_site": "browser session", "cf_connector": "cloudflared loopback metrics", "connector_origin": "Quant UI loopback origin",
     "spot_rest": "Binance Spot public time endpoint", "usdm_rest": "Binance USD-M public time endpoint",
-    "spot_wss": "mirrored feed_state.json", "usdm_wss": "mirrored feed_state.json", "feed_machine": "mirrored feed_state.json and stream_state.json",
+    "spot_wss": "feed_state.json at its source (read-only)", "usdm_wss": "feed_state.json at its source (read-only)", "feed_machine": "feed_state.json at its source (read-only) and mirrored stream_state.json",
     "news_fetch": "mirrored news source state", "binance_exec": "mirrored job result",
     "binance_account": "no mirrored signed-read source", "aws_secrets": "no mirrored secrets-read source", "aws_ssm": "no mirrored SSM source",
 }
