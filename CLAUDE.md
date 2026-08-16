@@ -130,8 +130,12 @@ freeze-time fact.
   TRADING; futures status TRADING AND contractType PERPETUAL (quarterlies
   have no funding). The exchange reserves worst-case market-order margin
   ≈ notional × PERCENT_PRICE multiplierUp — preflight with the band.
-- Deploy = xfer each file + compare sha256 host vs local. Evidence of any
-  host state change is committed sanitized under evidence/.
+- Deploy = the atomic tool (host_deploy_atomic.sh <staging> <deploy> <manifest>
+  <sha>: gate, verified renames, modes, RELEASE last). Build the payload with
+  COPYFILE_DISABLE=1 (macOS tar ships ._ AppleDouble strays and the tool
+  refuses a stage that is not exactly the manifest); a refusal after the gate
+  is created leaves DEPLOYING up by design — clear it only after reading it.
+  Evidence of any host state change is committed sanitized under evidence/.
 
 ## Owner channel
 Plain simple words; a code block ONLY for text the owner will paste or run;

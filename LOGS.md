@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+REPAY RECEIPT CLOSED 2026-08-16T09:39Z | first margin act complete end to end | release f4fa89fa deployed by the atomic tool | machine SEALED + FLAT
+cause | exchange REPAY row = principal 2.5 + interest 0.0000387 (amount 2.5000387); the runner had expected the whole amount as principal | signed GET-only read on host | MEASURED
+repair | MJ17 READY split + exact confirmation; MJ18/MJ19 legacy exception bound to a frozen one-tuple allowlist + results-ledger row + exchange row by txId | MRV12 1+4 hollow -> MRV13 1 -> MRV14 MERGE-SAFE | sha:3f87225f,2b65de05,11c62c45 -> main f4fa89fa | MEASURED
+live | reconcile-margin -> RECONCILED_FROM_EXCHANGE_TRUTH verdict CLOSED REPAY_CONFIRMED, account borrowed/interest/liability 0, no locks | evidence CLOSE-2 line | MEASURED
+scars | macOS tar AppleDouble strays -> MANIFEST_STAGE_MISMATCH (COPYFILE_DISABLE=1 from now); refused pre-flight left the DEPLOYING gate ~4 min (D3 card reorders pre-flight before the marker) | MEASURED
+standing | BUILD-04 in its tripwire review round (BR14a/b/c); gap pair round-three repairs (BF14); reverse intent + shadow + depth walk + funding ruler on lane | owner words open: volume park/probe, reverse gate, permits, BNB float, re-arm | MEASURED
+
 DAY LANDINGS 2026-08-16 AFTER b9716fa | nothing merged to main today | all twelve landings below are LANE ONLY and remain pending a clean review round or a repair and re-review | source: git log --oneline b9716fa..HEAD; baseline: NOW.md and LOGS.md | MEASURED
 BUILD-04 landings | B11 added the position-layer ADD transition; B12 repaired the first review's cap, abort, unwind, identity, and single-owner findings | sha:63284ec6,0f342188 | LANE ONLY; further repair and review pending | MEASURED
 BUILD-04 review | BR8 round 1 FINDINGS-BLOCK with five confirmed findings; BR10 round 2 FINDINGS-BLOCK with seven confirmed findings; 5 to 7 is not converging | source: lane-logs/BR8-report.txt,lane-logs/BR10-report.txt | MEASURED verdicts; INFERRED convergence label from counts
