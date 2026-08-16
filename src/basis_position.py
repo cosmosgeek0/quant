@@ -100,6 +100,7 @@ from basis_executor import (
     USDM_SYMBOL_CONFIG_PATH,
     VENUES,
     ExecutorConfig,
+    ExecutorExit,
     PreflightRefusal,
     Refusal,
     RunState,
@@ -121,6 +122,7 @@ from basis_executor import (
     save as executor_save,
     settle_leg,
     signed_read,
+    sold_leg_result,
     spot_trades,
     symbol_leverage,
     utc,
@@ -135,8 +137,6 @@ STATE_WRITE_GUARD_FILE = "basis-position.write.lock"
 # Position writes are short local critical sections. A two-minute heartbeat
 # bound permits slow fsync while still making a stopped owner recoverable.
 POSITION_WRITE_GUARD_STALE_MS = 120_000
-V2_ADD_SEAL_RULE = (
-    "ENTRY_SEALS_BLOCK_UNPOSTED_SPOT_ALLOW_HEDGE_AND_UNWIND")
 RATES_FILE = "commission-rates.json"
 EMERGENCY_FILE = "EMERGENCY"
 STOP_FILE = "STOP"
@@ -279,8 +279,12 @@ class PositionError(Exception):
     """A local refusal before any mutation; factual, never a market outcome."""
 
 
-class _V2AddEntrySeal(Exception):
-    """Carries a pre-POST entry seal out of the shared settlement helper."""
+class _EntryBlocked(PositionError):
+    """A standing local authority blocks a new entry before transport."""
+
+
+class _EntrySealBeforeSpot(Exception):
+    """Carries a shared entry-seal decision to the entry core."""
 
     def __init__(self, seals: List[str]):
         super().__init__(",".join(seals))
@@ -302,11 +306,9 @@ def _fsync_file_and_parent(path: str) -> None:
 
 
 def save(state: RunState) -> None:
-    """Durably persist position-command receipts used by ADD recovery."""
+    """Use the executor's single durable command-receipt writer."""
     try:
         executor_save(state)
-        if state.receipt_path:
-            _fsync_file_and_parent(state.receipt_path)
     except OSError:
         raise PositionError(
             "DURABLE_RECEIPT_WRITE_REFUSED: command receipt was not sealed") \
@@ -2776,9 +2778,12 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             active_add = {
                 "stage": "SPOT_INTENT_PERSISTED",
                 "ordinal": ordinal,
+                "rung_id": event["event_digest"],
                 "run_id": event["run_id"],
                 "proposal_id": event["proposal_id"],
                 "proposal_digest": event["proposal_digest"],
+                "config_event_digest": event["config_event_digest"],
+                "reconcile_id": reconciliation["reconcile_id"],
                 "effective_cap_quote": event["effective_cap_quote"],
                 "schedule_entry_gap_pct":
                     event["schedule_entry_gap_pct"],
@@ -2923,7 +2928,21 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             last_add_terminal = {
                 "event_index": index,
                 "ordinal": event["ordinal"],
+                "rung_id": active_add["rung_id"],
                 "run_id": event["run_id"],
+                "proposal_id": active_add["proposal_id"],
+                "proposal_digest": active_add["proposal_digest"],
+                "config_event_digest": active_add[
+                    "config_event_digest"],
+                "reconcile_id": active_add["reconcile_id"],
+                "schedule_entry_gap_pct": active_add[
+                    "schedule_entry_gap_pct"],
+                "effective_cap_quote": active_add[
+                    "effective_cap_quote"],
+                "dislocation": active_add["dislocation"],
+                "spot_intent": active_add["spot_intent"],
+                "short_intent": active_add["short_intent"],
+                "unwind_intent": active_add.get("unwind_intent"),
                 "reason": event["reason"],
                 "spot_status": event["spot_status"],
                 "short_status": event["short_status"],
@@ -3040,8 +3059,27 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             if Decimal(event["dislocation"]["entry_gap_pct"]) \
                     < Decimal(row["entry_gap_pct"]):
                 permanent_reasons.append("SCHEDULE_GAP_NOT_MET")
+            if completing_add:
+                rung_identity = {
+                    key: active_add[key] for key in (
+                        "rung_id", "run_id", "proposal_id",
+                        "proposal_digest", "config_event_digest",
+                        "reconcile_id", "dislocation")
+                }
+            else:
+                rung_identity = {
+                    "rung_id": event["event_digest"],
+                    "run_id": None,
+                    "proposal_id": None,
+                    "proposal_digest": None,
+                    "config_event_digest": config["event_digest"],
+                    "reconcile_id": None if reconciliation is None else
+                        reconciliation["reconcile_id"],
+                    "dislocation": event["dislocation"],
+                }
             rungs.append({
                 "ordinal": ordinal,
+                **rung_identity,
                 "fill_index": index,
                 "cut_ms": event["cut_ms"],
                 "schedule_entry_gap": Decimal(row["entry_gap_pct"]),
@@ -3197,6 +3235,14 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             })
         derived_rungs.append({
             "ordinal": rung["ordinal"],
+            "rung_id": rung["rung_id"],
+            "run_id": rung["run_id"],
+            "proposal_id": rung["proposal_id"],
+            "proposal_digest": rung["proposal_digest"],
+            "config_event_digest": rung["config_event_digest"],
+            "reconcile_id": rung["reconcile_id"],
+            "dislocation": _copy_v2_record(
+                rung["dislocation"], "rung dislocation projection"),
             "status": status,
             "schedule_entry_gap_pct":
                 _v2_canonical_decimal(rung["schedule_entry_gap"]),
@@ -3441,12 +3487,27 @@ def _load_v2_committed_head(receipt_dir: str) -> Dict[str, Any]:
 
 
 def _match_v2_committed_head(
-        position: Dict[str, Any], head: Dict[str, Any]) -> None:
+        position: Dict[str, Any], head: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the committed view, ignoring one validated prepared tail.
+
+    The ledger replace is PREPARE and the head replace is COMMIT.  A reader
+    may therefore see exactly one complete event beyond the committed head.
+    Every other disagreement remains a refusal.
+    """
     ledger = position["ledger"]
-    if head["event_count"] != len(ledger) \
-            or head["last_event_digest"] != ledger[-1]["event_digest"]:
-        raise PositionError(
-            "version-2 ledger disagrees with its committed head")
+    count = head["event_count"]
+    if count == len(ledger) \
+            and head["last_event_digest"] == ledger[-1]["event_digest"]:
+        return position
+    if count == len(ledger) - 1 and count > 0 \
+            and head["last_event_digest"] \
+            == ledger[count - 1]["event_digest"]:
+        committed = _copy_v2_record(position, "committed ledger view")
+        committed["ledger"] = committed["ledger"][:count]
+        _validate_v2_position(committed)
+        return committed
+    raise PositionError(
+        "version-2 ledger disagrees with its committed head")
 
 
 def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
@@ -3482,7 +3543,7 @@ def load_position(receipt_dir: str) -> Optional[Dict[str, Any]]:
         _require_v2_schema_marker(loaded)
         head = _load_v2_committed_head(receipt_dir)
         _validate_v2_position(loaded)
-        _match_v2_committed_head(loaded, head)
+        loaded = _match_v2_committed_head(loaded, head)
     elif os.path.exists(position_head_path(receipt_dir)):
         raise PositionError(
             "version-2 committed head cannot bind a non-version-2 record")
@@ -3663,22 +3724,26 @@ def _take_position_write_guard(
             if now_ms < heartbeat_ms:
                 return _PositionWriteGuardAttempt(
                     None, refusal="POSITION_WRITE_GUARD_CLOCK_REFUSED")
-            if now_ms - heartbeat_ms > POSITION_WRITE_GUARD_STALE_MS:
+            alive = _position_guard_owner_alive(owner["owner_pid"])
+            if alive is False:
+                stale_reason = "OWNER_NOT_RUNNING"
+            elif alive is True:
+                current_marker = _position_guard_process_start(
+                    owner["owner_pid"])
+                if current_marker is not None \
+                        and current_marker != owner["owner_start_marker"]:
+                    stale_reason = "OWNER_START_CHANGED"
+                else:
+                    # A living matching process remains the owner regardless
+                    # of heartbeat age.  Slow local fsync cannot transfer its
+                    # token to another writer.
+                    return _PositionWriteGuardAttempt(
+                        None, refusal="POSITION_WRITE_GUARD_ACTIVE")
+            elif now_ms - heartbeat_ms > POSITION_WRITE_GUARD_STALE_MS:
                 stale_reason = "HEARTBEAT_STALE"
             else:
-                alive = _position_guard_owner_alive(owner["owner_pid"])
-                if alive is False:
-                    stale_reason = "OWNER_NOT_RUNNING"
-                elif alive is True:
-                    current_marker = _position_guard_process_start(
-                        owner["owner_pid"])
-                    if current_marker is not None \
-                            and current_marker != owner[
-                                "owner_start_marker"]:
-                        stale_reason = "OWNER_START_CHANGED"
-                elif alive is None:
-                    return _PositionWriteGuardAttempt(
-                        None, refusal="POSITION_WRITE_GUARD_OWNER_REFUSED")
+                return _PositionWriteGuardAttempt(
+                    None, refusal="POSITION_WRITE_GUARD_OWNER_REFUSED")
         if stale_reason is None:
             return _PositionWriteGuardAttempt(
                 None, refusal="POSITION_WRITE_GUARD_ACTIVE")
@@ -3935,6 +4000,10 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
         _atomic_replace_position(
             position_path(receipt_dir), candidate,
             allow_decimal_default=False)
+        if not _heartbeat_position_write_guard(receipt_dir, guard.token):
+            raise PositionError(
+                "POSITION_WRITE_GUARD_OWNERSHIP_REFUSED: prepared ledger "
+                "tail was not committed")
         _atomic_replace_position(
             position_head_path(receipt_dir), {
                 "event_count": len(candidate["ledger"]),
@@ -3996,78 +4065,12 @@ def _prior_receipt_blocker(receipt_dir: str) -> Optional[str]:
 
 def persist_intent(receipt_dir: str, position: Dict[str, Any], stage: str,
                    plan: CyclePlan, run_id: str,
-                   quantity: Optional[Decimal] = None,
-                   *, state: Optional[RunState] = None) -> str:
+                   quantity: Optional[Decimal] = None) -> str:
     """Persist the EXACT intent and client id BEFORE the mutation. The wire
     intent is rebuilt deterministically by settle_leg from the same inputs,
     so what is persisted is what is sent."""
     intent = leg_intent(stage, plan, run_id, quantity)
     client = intent["newClientOrderId"]
-    if _is_v2_position(position):
-        if state is None or state.run_id != run_id:
-            raise PositionError(
-                "version-2 ADD intent requires its command receipt")
-        transition = state.receipt.get("add_transition")
-        if not isinstance(transition, dict) \
-                or transition.get("kind") != "ADD" \
-                or transition.get("run_id") != run_id:
-            raise PositionError(
-                "version-2 ADD transition receipt is missing or mismatched")
-        intents = transition.setdefault("intents", {})
-        role = "spot" if stage == ENTER_SPOT else "short" \
-            if stage == ENTER_SHORT else None
-        if role is None:
-            raise PositionError(
-                "version-2 ADD intent stage is not an entry leg")
-        prior = intents.get(role)
-        if prior is not None and prior != intent:
-            raise PositionError(
-                "version-2 ADD intent identity changed before execution")
-        intents[role] = dict(intent)
-        transition["stage"] = "%s_INTENT_PERSISTED" % role.upper()
-        transition["updated_utc"] = utc()
-        state.receipt.setdefault("client_ids", {})[client] = {
-            "stage": stage, "market": intent["market"],
-            "run_id": run_id,
-        }
-        save(state)
-        current = load_position(receipt_dir)
-        if current is None or not _is_v2_position(current):
-            raise PositionError(
-                "version-2 ADD ledger disappeared before intent append")
-        ledger = current["ledger"]
-        if role == "spot":
-            if len(ledger) != transition["before_event_count"] \
-                    or ledger[-1]["event_digest"] \
-                    != transition["before_last_digest"]:
-                raise PositionError(
-                    "version-2 ADD ledger changed before Spot intent")
-            payload = new_v2_add_intent_event(
-                transition["ordinal"], run_id,
-                transition["proposal_id"],
-                transition["proposal_digest"],
-                transition["config_event_digest"],
-                transition["effective_cap_quote"],
-                transition["schedule_entry_gap_pct"],
-                transition["dislocation"], intent)
-        else:
-            active = derive_v2_state(current)["active_transition"]
-            if active is None or active["run_id"] != run_id \
-                    or active["stage"] != "SPOT_INTENT_PERSISTED":
-                raise PositionError(
-                    "version-2 ADD Spot intent is not the active ledger tail")
-            payload = new_v2_add_hedge_intent_event(
-                transition["ordinal"], run_id,
-                _v2_add_receipt_leg(state.receipt, "spot"), intent)
-        persisted = append_v2_event(
-            receipt_dir, payload, len(ledger),
-            expected_last_digest=ledger[-1]["event_digest"])
-        transition["intent_event_count"] = len(persisted["ledger"])
-        transition["intent_event_digest"] = persisted["ledger"][-1][
-            "event_digest"]
-        transition["updated_utc"] = utc()
-        save(state)
-        return client
     position["pending_intent"] = {
         "stage": stage, "run_id": run_id, "client_id": client,
         "intent": dict(intent), "persisted_utc": utc(),
@@ -4515,7 +4518,8 @@ def load_entry_proposal(receipt_dir: str, proposal_id: Optional[str],
 
 def _proposal_plan(accepted: AcceptedProposal,
                    market: Dict[str, Any],
-                   effective_cap: Optional[Decimal] = None) -> CyclePlan:
+                   effective_cap: Optional[Decimal] = None,
+                   *, enforce_first_trade_cap: bool = False) -> CyclePlan:
     """Build the entry plan only from proposal facts plus venue filters."""
     payload = accepted.payload
     quantity = accepted.quantity
@@ -4628,8 +4632,9 @@ def _proposal_plan(accepted: AcceptedProposal,
         if not isinstance(effective_cap, Decimal) \
                 or not effective_cap.is_finite() or effective_cap <= 0:
             raise PositionError("effective entry cap is invalid")
-        if spot_quote_cap > FIRST_TRADE_CAP_USDT \
-                or short_notional > FIRST_TRADE_CAP_USDT:
+        if enforce_first_trade_cap and (
+                spot_quote_cap > FIRST_TRADE_CAP_USDT
+                or short_notional > FIRST_TRADE_CAP_USDT):
             raise PositionError(
                 "ADD_HARD_CAP_PROPOSAL: proposal execution notional exceeds "
                 "the shared first-trade authority %s USDT"
@@ -5019,229 +5024,75 @@ def _revalidate_entry(state: RunState,
     return detail
 
 
-def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
-             now_ms: Callable[[], int] = default_now_ms,
-             proposal_id: Optional[str] = None) -> int:
-    # Both seals are global ENTRY interlocks.  This must remain the first
-    # command check: do not inspect a proposal, receipt, state file, or
-    # transport first.
-    for seal_file in (STOP_FILE, STOP_JOBS_FILE):
-        if os.path.exists(os.path.join(cfg.receipt_dir, seal_file)):
-            print("OPEN | %s | BLOCKED | %s file present; entry is disabled"
-                  % (cfg.symbol, seal_file))
-            return EXIT_CODE["BLOCKED"]
-    proposal_now_ms = now_ms()
-    try:
-        accepted = load_entry_proposal(
-            cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha,
-            proposal_now_ms)
-    except PositionError as error:
-        print("OPEN | %s | REFUSED | %s" % (cfg.symbol, clean(error, 300)))
-        return EXIT_CODE["REFUSED"]
+@dataclass(frozen=True)
+class EntryAuthority:
+    command: str
+    ordinal: int
+    rung_id: Optional[str]
+    schedule_entry_gap_pct: Optional[Decimal]
+    schedule_quote_cap: Optional[Decimal]
+    effective_cap_quote: Optional[Decimal]
+    config_event_digest: Optional[str]
+    reconcile_id: Optional[str]
+    dislocation: Dict[str, Any]
 
-    # Owner-decision thesis fields are required BEFORE anything happens:
-    # the spec forbids inventing max-hold / edge / divergence defaults.
-    missing = [name for name, value in (
-        ("MAX_HOLD_MS", cfg.max_hold_ms),
-        ("MIN_REMAINING_EDGE_PCT", cfg.min_remaining_edge_pct),
-        ("MAX_ADVERSE_MOVE_PCT", cfg.max_adverse_move_pct)) if value is None]
-    if missing:
-        print("OPEN | %s | REFUSED | owner decision required: %s have no "
-              "spec default and must be set in the environment"
-              % (cfg.symbol, ", ".join(missing)))
-        return EXIT_CODE["REFUSED"]
-    receipt_blocker = _prior_receipt_blocker(cfg.receipt_dir)
-    if receipt_blocker:
-        print("OPEN | %s | BLOCKED | %s" % (cfg.symbol, receipt_blocker))
-        return EXIT_CODE["BLOCKED"]
-    try:
-        position = load_position(cfg.receipt_dir)
-    except PositionError as error:
-        print("OPEN | %s | BLOCKED | %s" % (cfg.symbol, clean(error, 300)))
-        return EXIT_CODE["BLOCKED"]
-    if position and position.get("state") in STANDING_STATES:
-        print("OPEN | %s | BLOCKED | position state %s stands; one-position "
-              "machine — run --check/--close/--resume first"
-              % (cfg.symbol, position.get("state")))
-        return EXIT_CODE["BLOCKED"]
 
-    state = make_state(cfg, request, sleep, "open")
-    state.receipt.update({
-        "proposal_id": accepted.proposal_id,
-        "proposal_digest": accepted.digest,
-    })
-    save(state)
-    if not take_lock(state):
-        return conclude(state, "BLOCKED", "none",
-                        "lane lock exists; another or unreconciled run owns "
-                        "the lane")
-    try:
-        market = market_context(state)
-    except Refusal as refusal:
-        release_lock(state)
-        return conclude(state, "REJECTED_BEFORE_ENTRY", "none", str(refusal))
-    try:
-        plan = _proposal_plan(accepted, market)
-    except PositionError as error:
-        release_lock(state)
-        return conclude(state, "REJECTED_BEFORE_ENTRY", "none",
-                        str(error))
+def _entry_seals(receipt_dir: str) -> List[str]:
+    return [name for name in (STOP_FILE, STOP_JOBS_FILE)
+            if os.path.exists(os.path.join(receipt_dir, name))]
 
-    # Every account/order/position/balance/margin proof completes while the
-    # account is unchanged.  The current leverage only has to be readable
-    # here; set-and-verify to exactly 1x is deliberately the final pre-order
-    # account action below.
+
+def _entry_runner_cap(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    if isinstance(value, (bool, float)):
+        raise PositionError("runner entry cap must be an exact decimal")
     try:
-        _read_only_entry_preflight(state, plan, market)
-    except PreflightRefusal as refusal:
-        release_lock(state)
-        return conclude(state, "PREFLIGHT_REFUSED", "none",
-                        str(refusal))
+        cap = d(value)
+    except (ArithmeticError, TypeError, ValueError):
+        raise PositionError("runner entry cap must be an exact decimal") \
+            from None
+    if not cap.is_finite() or cap <= 0:
+        raise PositionError("runner entry cap must be positive")
+    return cap
 
-    # Last read-only gate before leverage or an order can mutate the account:
-    # the immutable proposal cannot authorize entry on stale economics.
-    revalidation_failure = _revalidate_entry(state, accepted)
-    if revalidation_failure is not None:
-        release_lock(state)
-        return conclude(
-            state, "REJECTED_BEFORE_ENTRY", "none",
-            "%s: %s" % (ENTRY_REVALIDATION_FAILED, revalidation_failure))
 
-    # Persist the accepted authority and opening state before the sole
-    # pre-entry account mutation.
-    opened_at = now_ms()
-    position = {
-        "version": 1,
-        "symbol": cfg.symbol,
-        "sha": cfg.sha,
-        "state": ST_OPENING,
-        "open_run_id": state.run_id,
-        "proposal_id": accepted.proposal_id,
-        "proposal_digest": accepted.digest,
-        "thesis": {
-            "opened_at_ms": None,
-            "max_hold_ms": cfg.max_hold_ms,
-            "watch_gap_pct": fmt(cfg.watch_gap_pct),
-            "min_remaining_edge_pct": fmt(cfg.min_remaining_edge_pct),
-            "max_adverse_move_pct": fmt(cfg.max_adverse_move_pct),
-        },
-        "entry": None,
-        "legs": [],
-        "client_ids": {},
-        "pending_intent": None,
+def _entry_dislocation(
+        accepted: AcceptedProposal, command: str) -> Dict[str, Any]:
+    return new_v2_dislocation_event(
+        "%s:%s" % (command.lower(), accepted.digest[:32]),
+        _proposal_utc_ms(accepted.payload["created_utc"], "created_utc"),
+        _proposal_decimal(
+            accepted.payload, "entry_gap_pct", (("entry_gap_pct",),)),
+        _proposal_decimal(
+            accepted.payload, "exit_gap_pct", (("exit_gap_pct",),)),
+        _proposal_decimal(
+            accepted.payload, "funding_rate", (("funding_rate",),)),
+        accepted.payload["funding_period_ms"],
+    )
+
+
+def _authority_row(
+        authority: EntryAuthority, rung_id: Optional[str] = None
+        ) -> Dict[str, Any]:
+    return {
+        "command": authority.command,
+        "ordinal": authority.ordinal,
+        "rung_id": authority.rung_id if rung_id is None else rung_id,
+        "schedule_entry_gap_pct": None
+            if authority.schedule_entry_gap_pct is None else
+            fmt(authority.schedule_entry_gap_pct),
+        "schedule_quote_cap": None
+            if authority.schedule_quote_cap is None else
+            fmt(authority.schedule_quote_cap),
+        "effective_cap_quote": None
+            if authority.effective_cap_quote is None else
+            fmt(authority.effective_cap_quote),
+        "config_event_digest": authority.config_event_digest,
+        "reconcile_id": authority.reconcile_id,
+        "dislocation": _copy_v2_record(
+            authority.dislocation, "entry authority dislocation"),
     }
-    save_position(cfg.receipt_dir, position)
-
-    # Leverage SET-AND-VERIFY exactly 1x (the one owner-approved account
-    # mutation), last after every read-only proof and directly before entry.
-    if set_leverage_1x.run(cfg.symbol, request) != 0:
-        position["state"] = ST_NONE
-        save_position(cfg.receipt_dir, position)
-        release_lock(state)
-        return conclude(state, "PREFLIGHT_REFUSED", "none",
-                        "leverage could not be proven exactly 1x; nothing "
-                        "submitted")
-    state.receipt["preflight"]["symbol_leverage_after"] = 1
-    state.receipt["preflight"]["leverage_verified_utc"] = utc()
-    save(state)
-
-    # Leg 1 — spot BUY, quote-bounded; intent persisted before the POST.
-    client = persist_intent(cfg.receipt_dir, position, ENTER_SPOT, plan,
-                            state.run_id)
-    res, order, fills = settle_leg(state, ENTER_SPOT, plan)
-    record_leg(cfg.receipt_dir, position, ENTER_SPOT, client, "spot", res,
-               order)
-    if res == "rejected" or (res == "terminal"
-                             and d(order.get("executedQty", "0")) <= 0):
-        position["state"] = ST_NONE
-        save_position(cfg.receipt_dir, position)
-        release_lock(state)
-        return conclude(state, "REJECTED_BEFORE_ENTRY", "none",
-                        "spot entry rejected or zero-filled; nothing held")
-    if res == "unknown":
-        position["state"] = ST_UNKNOWN
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "UNKNOWN",
-                        "spot BUY unconfirmed: spend exchange-bounded at %s "
-                        "USDT via quoteOrderQty; query %s before anything"
-                        % (fmt(plan.spot_quote_cap), client),
-                        "lane frozen; nothing resent")
-    executed = d(order.get("executedQty", "0"))
-    quote_spent = d(order.get(SPOT.quote_field, "0"))
-    trades, covered = spot_trades(
-        state, state.receipt["legs"][-1].get("order_id", ""), executed, fills)
-    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
-    attach_position_fees(cfg.receipt_dir, position, state)
-    if covered < executed:
-        position["state"] = ST_ONE_LEG
-        position["one_leg_since_ms"] = now_ms()
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "ONE_LEG_EXPOSED",
-                        "holding up to %s %s from the spot BUY; fee truth "
-                        "never loaded" % (fmt(executed), market["base"]),
-                        "sizing a hedge on an assumed fee is forbidden; "
-                        "no repair trade")
-    buy_base_fee = base_fee_of(trades, market["base"])
-    net_base = executed - buy_base_fee
-    hedge = quantize_down(net_base, market["shared_step"])
-    entry = {
-        "opened_utc": utc(),
-        "entry_gap_bps": fmt(plan.entry_gap_bps),
-        "entry_gap_pct": fmt(plan.entry_gap_bps / Decimal(100)),
-        "funding_rate": fmt(plan.funding_rate),   # per-period FRACTION
-        "proposal_net_edge_pct": fmt(accepted.net_edge_pct),
-        "spot": {"executed_qty": fmt(executed),
-                 "quote_spent": fmt(quote_spent),
-                 "base_fee": fmt(buy_base_fee),
-                 "net_base": fmt(net_base)},
-        "shared_step": fmt(market["shared_step"]),
-        "spot_step": fmt(market["spot_step"]),
-        "base_asset": market["base"],
-        "hedge_qty": fmt(hedge),
-    }
-    position["entry"] = entry
-    save_position(cfg.receipt_dir, position)
-    if hedge <= 0 or hedge < market["min_qty"]:
-        # Unwind through the ordered path; never hold un-hedgeable spot.
-        return _unwind_spot(cfg, state, position, plan, market, net_base,
-                            now_ms)
-
-    # Leg 2 — futures SELL short exactly the acquired quantity.
-    client = persist_intent(cfg.receipt_dir, position, ENTER_SHORT, plan,
-                            state.run_id, hedge)
-    res, order, _ = settle_leg(state, ENTER_SHORT, plan, hedge)
-    record_leg(cfg.receipt_dir, position, ENTER_SHORT, client, "usdm", res,
-               order)
-    if res == "unknown":
-        position["state"] = ST_UNKNOWN
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "UNKNOWN",
-                        "holding spot %s %s; short SELL unconfirmed — state "
-                        "is either unhedged spot or the full pair; query %s"
-                        % (fmt(net_base), market["base"], client),
-                        "lane frozen; nothing resent")
-    short_filled = d(order.get("executedQty", "0")) if res == "terminal" \
-        else Decimal(0)
-    if short_filled <= 0:
-        return _unwind_spot(cfg, state, position, plan, market, net_base,
-                            now_ms)
-    short_quote = d(order.get(USDM.quote_field, "0"))
-    entry["short"] = {"filled_qty": fmt(short_filled),
-                      "cum_quote": fmt(short_quote)}
-    position["thesis"]["opened_at_ms"] = opened_at
-    position["state"] = ST_OPEN
-    if short_filled != hedge:
-        entry["hedge_note"] = ("short filled %s of %s; imperfect hedge "
-                               "recorded" % (fmt(short_filled), fmt(hedge)))
-        first_fail(state, "enter_short", "short filled %s of %s"
-                   % (fmt(short_filled), fmt(hedge)))
-    save_position(cfg.receipt_dir, position)
-    return conclude(state, "OPEN",
-                    "hedged pair standing: spot %s %s + short %s"
-                    % (fmt(net_base), market["base"], fmt(short_filled)),
-                    "entry gap %s bps; funding %s per period; lane lock held "
-                    "while the position stands"
-                    % (fmt(plan.entry_gap_bps), fmt(plan.funding_rate)))
 
 
 def _latest_v2_reconcile_event(
@@ -5268,10 +5119,538 @@ def _require_fresh_v2_add_reconcile(
             "documented maximum age")
 
 
-def _v2_add_authority(
-        position: Dict[str, Any], now: int
-        ) -> Tuple[Dict[str, Any], Dict[str, Any], int, Decimal, Decimal]:
-    """Return frozen config, reconcile, ordinal, gap, and effective cap."""
+class _EntryPersistence:
+    """Small persistence boundary used by the one shared entry core."""
+
+    def __init__(self, cfg: PositionConfig, accepted: AcceptedProposal,
+                 authority: EntryAuthority):
+        self.cfg = cfg
+        self.accepted = accepted
+        self.authority = authority
+        self.plan: Optional[CyclePlan] = None
+        self.market: Optional[Dict[str, Any]] = None
+        self.opened_at_ms: Optional[int] = None
+
+    def preflight(self, state: RunState, plan: CyclePlan,
+                  market: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def prepare(self, state: RunState, plan: CyclePlan,
+                market: Dict[str, Any], now_ms: int) -> None:
+        self.plan = plan
+        self.market = market
+        self.opened_at_ms = now_ms
+
+    def persist_spot_intent(
+            self, state: RunState, plan: CyclePlan) -> str:
+        raise NotImplementedError
+
+    def persist_short_intent(
+            self, state: RunState, plan: CyclePlan,
+            spot_leg: Dict[str, Any], quantity: Decimal) -> str:
+        raise NotImplementedError
+
+    def persist_unwind_intent(
+            self, state: RunState, plan: CyclePlan,
+            spot_leg: Dict[str, Any], short_status: str,
+            quantity: Decimal) -> str:
+        raise NotImplementedError
+
+    def commit_filled(
+            self, state: RunState, spot_leg: Dict[str, Any],
+            short_leg: Dict[str, Any], cut_ms: int) -> Any:
+        raise NotImplementedError
+
+    def commit_aborted(
+            self, state: RunState, reason: str,
+            measured_facts: Dict[str, Any]) -> Any:
+        raise NotImplementedError
+
+    def record_leg(self, state: RunState, stage: str, client: str,
+                   outcome: str, order: Any) -> None:
+        return
+
+    def attach_spot_fees(self, state: RunState) -> None:
+        return
+
+    def stage_spot_result(
+            self, state: RunState, spot_leg: Dict[str, Any],
+            hedge: Optional[Decimal]) -> None:
+        return
+
+    def freeze(self, state: RunState, detail: str,
+               *, one_leg: bool = False) -> None:
+        state.receipt.setdefault("entry_transition", {})["status"] = \
+            "FROZEN"
+        state.receipt["entry_transition"]["detail"] = clean(detail, 220)
+        save(state)
+
+    def observation_sink(self, state: RunState):
+        def observe(role: str, order: Dict[str, Any]) -> None:
+            observations = state.receipt.setdefault(
+                "entry_observations", {})
+            observations[str(role)] = dict(order)
+            save(state)
+        return observe
+
+    def market_name(self, role: str) -> str:
+        return "spot" if role in ("spot", "unwind") else "usdm"
+
+
+class _LegacyOpenPersistence(_EntryPersistence):
+    def __init__(self, cfg: PositionConfig, accepted: AcceptedProposal,
+                 authority: EntryAuthority,
+                 prior_position: Optional[Dict[str, Any]]):
+        super().__init__(cfg, accepted, authority)
+        self.position = prior_position
+
+    def preflight(self, state: RunState, plan: CyclePlan,
+                  market: Dict[str, Any]) -> None:
+        _read_only_entry_preflight(state, plan, market)
+
+    def prepare(self, state: RunState, plan: CyclePlan,
+                market: Dict[str, Any], now_ms: int) -> None:
+        super().prepare(state, plan, market, now_ms)
+        self.position = {
+            "version": 1,
+            "symbol": self.cfg.symbol,
+            "sha": self.cfg.sha,
+            "state": ST_OPENING,
+            "open_run_id": state.run_id,
+            "proposal_id": self.accepted.proposal_id,
+            "proposal_digest": self.accepted.digest,
+            "thesis": {
+                "opened_at_ms": None,
+                "max_hold_ms": self.cfg.max_hold_ms,
+                "watch_gap_pct": fmt(self.cfg.watch_gap_pct),
+                "min_remaining_edge_pct": fmt(
+                    self.cfg.min_remaining_edge_pct),
+                "max_adverse_move_pct": fmt(
+                    self.cfg.max_adverse_move_pct),
+            },
+            "entry": None,
+            "legs": [],
+            "client_ids": {},
+            "pending_intent": None,
+        }
+        save_position(self.cfg.receipt_dir, self.position)
+        if set_leverage_1x.run(self.cfg.symbol, state.request) != 0:
+            self.position["state"] = ST_NONE
+            save_position(self.cfg.receipt_dir, self.position)
+            raise PreflightRefusal(
+                "leverage could not be proven exactly 1x; nothing submitted")
+        state.receipt["preflight"]["symbol_leverage_after"] = 1
+        state.receipt["preflight"]["leverage_verified_utc"] = utc()
+        save(state)
+
+    def persist_spot_intent(
+            self, state: RunState, plan: CyclePlan) -> str:
+        return persist_intent(
+            self.cfg.receipt_dir, self.position, ENTER_SPOT,
+            plan, state.run_id)
+
+    def persist_short_intent(
+            self, state: RunState, plan: CyclePlan,
+            spot_leg: Dict[str, Any], quantity: Decimal) -> str:
+        return persist_intent(
+            self.cfg.receipt_dir, self.position, ENTER_SHORT,
+            plan, state.run_id, quantity)
+
+    def persist_unwind_intent(
+            self, state: RunState, plan: CyclePlan,
+            spot_leg: Dict[str, Any], short_status: str,
+            quantity: Decimal) -> str:
+        return persist_intent(
+            self.cfg.receipt_dir, self.position, UNWIND_SPOT,
+            plan, state.run_id, quantity)
+
+    def record_leg(self, state: RunState, stage: str, client: str,
+                   outcome: str, order: Any) -> None:
+        market = "spot" if stage in (ENTER_SPOT, UNWIND_SPOT) else "usdm"
+        record_leg(
+            self.cfg.receipt_dir, self.position, stage, client,
+            market, outcome, order)
+
+    def attach_spot_fees(self, state: RunState) -> None:
+        attach_position_fees(self.cfg.receipt_dir, self.position, state)
+
+    def stage_spot_result(
+            self, state: RunState, spot_leg: Dict[str, Any],
+            hedge: Optional[Decimal]) -> None:
+        market = self.market
+        plan = self.plan
+        executed = Decimal(spot_leg["executed_quantity"])
+        quote = Decimal(spot_leg["executed_quote"])
+        base_fee = Decimal(
+            spot_leg["fee_by_asset"].get(market["base"], "0"))
+        net_base = _v2_decimal_subtract(executed, base_fee)
+        self.position["entry"] = {
+            "opened_utc": utc(),
+            "entry_gap_bps": fmt(plan.entry_gap_bps),
+            "entry_gap_pct": fmt(plan.entry_gap_bps / Decimal(100)),
+            "funding_rate": fmt(plan.funding_rate),
+            "proposal_net_edge_pct": fmt(self.accepted.net_edge_pct),
+            "spot": {
+                "executed_qty": fmt(executed),
+                "quote_spent": fmt(quote),
+                "base_fee": fmt(base_fee),
+                "net_base": fmt(net_base),
+            },
+            "shared_step": fmt(market["shared_step"]),
+            "spot_step": fmt(market["spot_step"]),
+            "base_asset": market["base"],
+            "hedge_qty": "0" if hedge is None else fmt(hedge),
+        }
+        save_position(self.cfg.receipt_dir, self.position)
+
+    def commit_filled(
+            self, state: RunState, spot_leg: Dict[str, Any],
+            short_leg: Dict[str, Any], cut_ms: int) -> Dict[str, Any]:
+        market = self.market
+        plan = self.plan
+        short_quantity = Decimal(short_leg["executed_quantity"])
+        hedge = Decimal(state.receipt["entry_result"]["hedge_quantity"])
+        entry = self.position.get("entry")
+        if not isinstance(entry, dict):
+            raise PositionError("legacy Spot entry snapshot is missing")
+        entry["short"] = {
+            "filled_qty": fmt(short_quantity),
+            "cum_quote": short_leg["executed_quote"],
+        }
+        if short_quantity != hedge:
+            entry["hedge_note"] = (
+                "short filled %s of %s; imperfect hedge recorded"
+                % (fmt(short_quantity), fmt(hedge)))
+            first_fail(
+                state, "enter_short", "short filled %s of %s"
+                % (fmt(short_quantity), fmt(hedge)))
+        self.position["entry"] = entry
+        self.position["thesis"]["opened_at_ms"] = self.opened_at_ms
+        self.position["state"] = ST_OPEN
+        save_position(self.cfg.receipt_dir, self.position)
+        return self.position
+
+    def commit_aborted(
+            self, state: RunState, reason: str,
+            measured_facts: Dict[str, Any]) -> Dict[str, Any]:
+        residual = measured_facts.get("dust_quantity", Decimal(0))
+        completed = measured_facts.get("unwind_completed", False)
+        no_spot = measured_facts.get("spot_status") in (
+            "NOT_FOUND", "NOT_SUBMITTED")
+        if completed or no_spot:
+            self.position["state"] = ST_NONE
+            if completed:
+                self.position["unwound"] = {
+                    "sold_qty": fmt(measured_facts[
+                        "unwind_filled_quantity"]),
+                    "residual_base": fmt(residual),
+                }
+            save_position(self.cfg.receipt_dir, self.position)
+            release_lock(state)
+        else:
+            self.position["state"] = ST_ONE_LEG
+            self.position["one_leg_since_ms"] = default_now_ms()
+            save_position(self.cfg.receipt_dir, self.position)
+        return self.position
+
+    def freeze(self, state: RunState, detail: str,
+               *, one_leg: bool = False) -> None:
+        self.position["state"] = ST_ONE_LEG if one_leg else ST_UNKNOWN
+        if one_leg:
+            self.position["one_leg_since_ms"] = default_now_ms()
+        save_position(self.cfg.receipt_dir, self.position)
+        super().freeze(state, detail, one_leg=one_leg)
+
+
+class _V2RungPersistence(_EntryPersistence):
+    def __init__(self, cfg: PositionConfig, accepted: AcceptedProposal,
+                 authority: EntryAuthority, position: Dict[str, Any],
+                 reconcile: Dict[str, Any]):
+        super().__init__(cfg, accepted, authority)
+        self.position = position
+        self.reconcile = reconcile
+        self.expected_length = len(position["ledger"])
+        self.expected_digest = position["ledger"][-1]["event_digest"]
+        self.rung_id: Optional[str] = authority.rung_id
+        self.audit_path: Optional[str] = None
+
+    def preflight(self, state: RunState, plan: CyclePlan,
+                  market: Dict[str, Any]) -> None:
+        _read_only_add_preflight(
+            state, plan, market, derive_v2_state(self.position),
+            self.reconcile)
+
+    def prepare(self, state: RunState, plan: CyclePlan,
+                market: Dict[str, Any], now_ms: int) -> None:
+        super().prepare(state, plan, market, now_ms)
+        if market["base"] != self.position["ledger"][0]["venue"][
+                "base_asset"]:
+            raise PositionError(
+                "venue base asset no longer matches the frozen config")
+        _require_fresh_v2_add_reconcile(self.reconcile, now_ms)
+
+    def _activate_receipt(
+            self, state: RunState, intent: Dict[str, Any],
+            persisted: Dict[str, Any]) -> None:
+        active = derive_v2_state(persisted)["active_transition"]
+        if active is None or active["run_id"] != state.run_id:
+            raise PositionError(
+                "committed AddIntent is not the active ledger transition")
+        self.rung_id = active["rung_id"]
+        self.position = persisted
+        self.audit_path = os.path.join(
+            self.cfg.receipt_dir,
+            "basis-position-%s.json" % state.run_id)
+        state.receipt_path = self.audit_path
+        state.receipt.update({
+            "kind": "position-add",
+            "run_id": state.run_id,
+            "sha": self.cfg.sha,
+            "symbol": self.cfg.symbol,
+            "proposal_id": self.accepted.proposal_id,
+            "proposal_digest": self.accepted.digest,
+            "ordinal": self.authority.ordinal,
+            "rung_id": self.rung_id,
+            "entry_authority": _authority_row(
+                self.authority, self.rung_id),
+            "entry_intents": {"spot": dict(active["spot_intent"])},
+            "entry_transition": {
+                "status": "ACTIVE",
+                "stage": "SPOT_INTENT_PERSISTED",
+                "rung_id": self.rung_id,
+                "updated_utc": utc(),
+            },
+            "client_ids": {
+                active["spot_intent"]["newClientOrderId"]: {
+                    "stage": ENTER_SPOT, "market": "spot",
+                    "run_id": state.run_id,
+                },
+            },
+        })
+        save(state)
+
+    def persist_spot_intent(
+            self, state: RunState, plan: CyclePlan) -> str:
+        if os.path.exists(os.path.join(
+                self.cfg.receipt_dir,
+                "basis-position-%s.json" % state.run_id)):
+            raise PositionError(
+                "ADD run id already has a command receipt")
+        current = load_position(self.cfg.receipt_dir)
+        if current is None or not _is_v2_position(current):
+            raise PositionError("version-2 ADD ledger disappeared")
+        if len(current["ledger"]) != self.expected_length \
+                or current["ledger"][-1]["event_digest"] \
+                != self.expected_digest:
+            raise PositionError(
+                "ADD_AUTHORITY_CHANGED: ledger changed before Spot intent")
+        intent = leg_intent(ENTER_SPOT, plan, state.run_id)
+        payload = new_v2_add_intent_event(
+            self.authority.ordinal, state.run_id,
+            self.accepted.proposal_id, self.accepted.digest,
+            self.authority.config_event_digest,
+            self.authority.effective_cap_quote,
+            self.authority.schedule_entry_gap_pct,
+            self.authority.dislocation, intent)
+        persisted = append_v2_event(
+            self.cfg.receipt_dir, payload, self.expected_length,
+            expected_last_digest=self.expected_digest)
+        self._activate_receipt(state, intent, persisted)
+        return intent["newClientOrderId"]
+
+    def persist_short_intent(
+            self, state: RunState, plan: CyclePlan,
+            spot_leg: Dict[str, Any], quantity: Decimal) -> str:
+        intent = leg_intent(ENTER_SHORT, plan, state.run_id, quantity)
+        current = load_position(self.cfg.receipt_dir)
+        active = derive_v2_state(current)["active_transition"]
+        if active is None or active["rung_id"] != self.rung_id \
+                or active["stage"] != "SPOT_INTENT_PERSISTED":
+            raise PositionError(
+                "active rung no longer licenses a short intent")
+        persisted = append_v2_event(
+            self.cfg.receipt_dir,
+            new_v2_add_hedge_intent_event(
+                self.authority.ordinal, state.run_id, spot_leg, intent),
+            len(current["ledger"]),
+            expected_last_digest=current["ledger"][-1]["event_digest"])
+        self.position = persisted
+        active = derive_v2_state(persisted)["active_transition"]
+        state.receipt["entry_intents"]["short"] = dict(
+            active["short_intent"])
+        state.receipt["entry_transition"].update({
+            "stage": "SHORT_INTENT_PERSISTED", "updated_utc": utc(),
+        })
+        state.receipt["client_ids"][intent["newClientOrderId"]] = {
+            "stage": ENTER_SHORT, "market": "usdm",
+            "run_id": state.run_id,
+        }
+        save(state)
+        return intent["newClientOrderId"]
+
+    def persist_unwind_intent(
+            self, state: RunState, plan: CyclePlan,
+            spot_leg: Dict[str, Any], short_status: str,
+            quantity: Decimal) -> str:
+        intent = leg_intent(UNWIND_SPOT, plan, state.run_id, quantity)
+        current = load_position(self.cfg.receipt_dir)
+        active = derive_v2_state(current)["active_transition"]
+        if active is None or active["rung_id"] != self.rung_id:
+            raise PositionError(
+                "active rung no longer licenses a Spot unwind")
+        net = Decimal(spot_leg["executed_quantity"]) - Decimal(
+            spot_leg["fee_by_asset"].get(
+                current["ledger"][0]["venue"]["base_asset"], "0"))
+        dust = _v2_decimal_subtract(net, quantity)
+        persisted = append_v2_event(
+            self.cfg.receipt_dir,
+            new_v2_add_unwind_intent_event(
+                self.authority.ordinal, state.run_id, spot_leg,
+                short_status, net, quantity, dust, intent),
+            len(current["ledger"]),
+            expected_last_digest=current["ledger"][-1]["event_digest"])
+        self.position = persisted
+        active = derive_v2_state(persisted)["active_transition"]
+        state.receipt["entry_intents"]["unwind"] = dict(
+            active["unwind_intent"])
+        state.receipt["entry_transition"].update({
+            "stage": "UNWIND_INTENT_PERSISTED", "updated_utc": utc(),
+        })
+        state.receipt["client_ids"][intent["newClientOrderId"]] = {
+            "stage": UNWIND_SPOT, "market": "spot",
+            "run_id": state.run_id,
+        }
+        save(state)
+        return intent["newClientOrderId"]
+
+    def commit_filled(
+            self, state: RunState, spot_leg: Dict[str, Any],
+            short_leg: Dict[str, Any], cut_ms: int) -> Dict[str, Any]:
+        current = load_position(self.cfg.receipt_dir)
+        active = derive_v2_state(current)["active_transition"]
+        if active is None or active["rung_id"] != self.rung_id \
+                or active["stage"] != "SHORT_INTENT_PERSISTED":
+            raise PositionError(
+                "active rung no longer licenses RungFilled")
+        event_cut = max(
+            _v2_epoch_ms(cut_ms, "entry fill cut"),
+            current["ledger"][-1]["cut_ms"] + 1)
+        persisted = append_v2_event(
+            self.cfg.receipt_dir,
+            new_v2_rung_filled_event(
+                self.authority.ordinal,
+                {"spot": spot_leg, "short": short_leg},
+                self.authority.dislocation, event_cut),
+            len(current["ledger"]),
+            expected_last_digest=current["ledger"][-1]["event_digest"])
+        state.receipt["entry_transition"].update({
+            "status": "COMMITTED",
+            "stage": "RUNG_FILLED_COMMITTED",
+            "ledger_event_count": len(persisted["ledger"]),
+            "updated_utc": utc(),
+        })
+        save(state)
+        self.position = persisted
+        return persisted
+
+    def commit_aborted(
+            self, state: RunState, reason: str,
+            measured_facts: Dict[str, Any]) -> Dict[str, Any]:
+        current = load_position(self.cfg.receipt_dir)
+        active = derive_v2_state(current)["active_transition"]
+        if active is None or active["rung_id"] != self.rung_id:
+            raise PositionError(
+                "active rung no longer licenses AddAborted")
+        payload = new_v2_add_aborted_event(
+            self.authority.ordinal, state.run_id, reason,
+            measured_facts["spot_status"],
+            measured_facts.get("short_status", "NOT_SEALED"),
+            measured_facts.get("spot_net_quantity", Decimal(0)),
+            measured_facts.get("unwind_requested_quantity", Decimal(0)),
+            measured_facts.get("unwind_filled_quantity", Decimal(0)),
+            measured_facts.get("dust_quantity", Decimal(0)),
+            measured_facts.get("spot_leg"),
+            measured_facts.get("unwind_leg"),
+            measured_facts.get("unwind_base_fee_quantity", Decimal(0)))
+        persisted = append_v2_event(
+            self.cfg.receipt_dir, payload, len(current["ledger"]),
+            expected_last_digest=current["ledger"][-1]["event_digest"])
+        state.receipt["entry_transition"].update({
+            "status": "ABORTED",
+            "stage": ST_ADD_ABORTED,
+            "reason": reason,
+            "ledger_event_count": len(persisted["ledger"]),
+            "updated_utc": utc(),
+        })
+        save(state)
+        self.position = persisted
+        return persisted
+
+    def market_name(self, role: str) -> str:
+        venue = self.position["ledger"][0]["venue"]
+        return venue["spot"] if role in ("spot", "unwind") \
+            else venue["futures"]
+
+
+def _prepare_open_entry(
+        cfg: PositionConfig, accepted: AcceptedProposal,
+        runner_cap: Any = None
+        ) -> Tuple[EntryAuthority, _LegacyOpenPersistence]:
+    missing = [name for name, value in (
+        ("MAX_HOLD_MS", cfg.max_hold_ms),
+        ("MIN_REMAINING_EDGE_PCT", cfg.min_remaining_edge_pct),
+        ("MAX_ADVERSE_MOVE_PCT", cfg.max_adverse_move_pct))
+        if value is None]
+    if missing:
+        raise PositionError(
+            "owner decision required: %s have no spec default and must be set"
+            % ", ".join(missing))
+    blocker = _prior_receipt_blocker(cfg.receipt_dir)
+    if blocker:
+        raise _EntryBlocked(blocker)
+    try:
+        position = load_position(cfg.receipt_dir)
+    except PositionError as error:
+        raise _EntryBlocked(str(error)) from None
+    if position and _is_v2_position(position):
+        raise _EntryBlocked(
+            "version-2 position stands; OPEN cannot replace it")
+    if position and position.get("state") in STANDING_STATES:
+        raise _EntryBlocked(
+            "position state %s stands; one-position machine"
+            % position.get("state"))
+    authority = EntryAuthority(
+        command="OPEN", ordinal=1, rung_id=None,
+        schedule_entry_gap_pct=None, schedule_quote_cap=None,
+        effective_cap_quote=_entry_runner_cap(runner_cap),
+        config_event_digest=accepted.payload["config_digest"],
+        reconcile_id=None,
+        dislocation=_entry_dislocation(accepted, "OPEN"))
+    return authority, _LegacyOpenPersistence(
+        cfg, accepted, authority, position)
+
+
+def _prepare_add_entry(
+        cfg: PositionConfig, accepted: AcceptedProposal, now: int,
+        runner_cap: Any = None
+        ) -> Tuple[EntryAuthority, _V2RungPersistence]:
+    position = load_position(cfg.receipt_dir)
+    if position is None or not _is_v2_position(position):
+        raise PositionError(
+            "cmd_add requires a version-2 ledger; version-1 is unchanged")
+    for event in position["ledger"]:
+        if event["event_type"] == "AddIntent" \
+                and event["proposal_digest"] == accepted.digest:
+            raise PositionError(
+                "proposal digest already owns a version-2 entry rung")
+        if cfg.run_id and event["event_type"] == "AddIntent" \
+                and event["run_id"] == cfg.run_id:
+            raise PositionError(
+                "ADD run id already owns a version-2 entry rung")
+    if cfg.run_id and os.path.exists(os.path.join(
+            cfg.receipt_dir,
+            "basis-position-%s.json" % cfg.run_id)):
+        raise PositionError("ADD run id already has a command receipt")
     derived = derive_v2_state(position)
     if V2_DUST_STANDING in derived["freeze_reasons"] \
             or derived["dust_rows"]:
@@ -5281,9 +5660,9 @@ def _v2_add_authority(
             "version-2 ADD requires derived OPEN; current state is %s"
             % derived["top_state"])
     if derived["increases_frozen"] or derived["freeze_reasons"]:
-        reasons = ",".join(derived["freeze_reasons"]) or "UNKNOWN"
         raise PositionError(
-            "version-2 ADD is blocked by derived freeze: %s" % reasons)
+            "version-2 ADD is blocked by derived freeze: %s"
+            % (",".join(derived["freeze_reasons"]) or "UNKNOWN"))
     if derived["reconciliation_status"] != "CONFIRMED":
         raise PositionError(
             "version-2 ADD requires a confirmed ReconcileObserved read")
@@ -5304,1700 +5683,569 @@ def _v2_add_authority(
     entry_cap = Decimal(config["caps"]["entry_quote"])
     if schedule_cap > FIRST_TRADE_CAP_USDT:
         raise PositionError(
-            "ADD_HARD_CAP_SCHEDULE: frozen schedule cap %s exceeds %s USDT"
-            % (fmt(schedule_cap), fmt(FIRST_TRADE_CAP_USDT)))
+            "ADD_HARD_CAP_SCHEDULE: frozen schedule cap exceeds 8 USDT")
     if entry_cap > FIRST_TRADE_CAP_USDT:
         raise PositionError(
-            "ADD_HARD_CAP_ENTRY: frozen entry cap %s exceeds %s USDT"
-            % (fmt(entry_cap), fmt(FIRST_TRADE_CAP_USDT)))
-    effective_cap = min(
-        schedule_cap,
-        entry_cap,
-        Decimal(derived["cap_headroom_quote"]),
-        FIRST_TRADE_CAP_USDT,
-    )
-    if effective_cap <= 0:
+            "ADD_HARD_CAP_ENTRY: frozen entry cap exceeds 8 USDT")
+    effective = min(
+        schedule_cap, entry_cap,
+        Decimal(derived["cap_headroom_quote"]), FIRST_TRADE_CAP_USDT)
+    cap = _entry_runner_cap(runner_cap)
+    if cap is not None:
+        effective = min(effective, cap)
+    if effective <= 0:
+        raise PositionError("version-2 ADD has no positive cap headroom")
+    proposal_gap = _proposal_decimal(
+        accepted.payload, "entry_gap_pct", (("entry_gap_pct",),))
+    if proposal_gap < schedule_gap:
         raise PositionError(
-            "version-2 ADD frozen schedule has no positive cap headroom")
-    return config, reconcile, ordinal, schedule_gap, effective_cap
+            "proposal entry gap is below the frozen schedule row")
+    authority = EntryAuthority(
+        command="ADD", ordinal=ordinal, rung_id=None,
+        schedule_entry_gap_pct=schedule_gap,
+        schedule_quote_cap=schedule_cap,
+        effective_cap_quote=effective,
+        config_event_digest=config["event_digest"],
+        reconcile_id=reconcile["reconcile_id"],
+        dislocation=_entry_dislocation(accepted, "ADD"))
+    return authority, _V2RungPersistence(
+        cfg, accepted, authority, position, reconcile)
 
 
-def _v2_add_plan_receipt(
-        plan: CyclePlan, market: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "symbol": plan.symbol,
-        "entry_gap_bps": fmt(plan.entry_gap_bps),
-        "exit_gap_bps": fmt(plan.exit_gap_bps),
-        "funding_rate": fmt(plan.funding_rate),
-        "spot_quantity_estimate": fmt(plan.spot_quantity),
-        "short_quantity_estimate": fmt(plan.short_quantity),
-        "spot_quote_cap": fmt(plan.spot_quote_cap),
-        "short_notional": fmt(plan.short_notional),
-        "leverage": plan.leverage,
-        "base_asset": market["base"],
-        "shared_step": fmt(market["shared_step"]),
-        "spot_step": fmt(market["spot_step"]),
-        "minimum_quantity": fmt(market["min_qty"]),
-        "spot_minimum_quantity": fmt(market["spot_min_qty"]),
-        "spot_minimum_notional": fmt(market["spot_min_notional"]),
-        "measured_spot_bid": fmt(market["spot_bid"]),
-        "futures_minimum_quantity": fmt(market["futures_min_qty"]),
-        "futures_minimum_notional": fmt(market["futures_min_notional"]),
-        "measured_futures_bid": fmt(market["futures_bid"]),
-    }
+def _entry_state(
+        cfg: PositionConfig, request, sleep,
+        accepted: AcceptedProposal, authority: EntryAuthority) -> RunState:
+    receipted = authority.command == "OPEN"
+    state = make_state(
+        cfg, request, sleep, authority.command.lower(),
+        receipted=receipted)
+    if not receipted:
+        state.receipt.update({
+            "kind": "position-add",
+            "run_id": state.run_id,
+            "sha": cfg.sha,
+            "symbol": cfg.symbol,
+            "started_utc": utc(),
+            "legs": [],
+        })
+        start = base_event(state, "run_start")
+        start["note"] = contract_note("basis-position add", ())
+        state.events.append(start)
+    state.receipt.update({
+        "proposal_id": accepted.proposal_id,
+        "proposal_digest": accepted.digest,
+        "entry_authority": _authority_row(authority),
+    })
+    save(state)
+    return state
 
 
-def _v2_add_revalidated_spot_bid(receipt: Dict[str, Any]) -> Decimal:
+def _entry_order_leg(
+        state: RunState, persistence: _EntryPersistence,
+        role: str, client: str, order: Any) -> Dict[str, Any]:
+    if not isinstance(order, dict) \
+            or order.get("symbol") != state.cfg.symbol \
+            or order.get("clientOrderId") != client:
+        raise PositionError(
+            "ORDER_RESPONSE_IDENTITY_MISMATCH: terminal order does not bind")
+    order_id = order.get("orderId")
+    if order_id is None or not str(order_id):
+        raise PositionError(
+            "ORDER_RESPONSE_IDENTITY_MISMATCH: exchange order id is missing")
+    venue = SPOT if role in ("spot", "unwind") else USDM
     try:
-        raw = receipt["entry_revalidation"]["fresh_books"]["spot"]["bid"]
-        bid = d(raw)
+        executed = d(order["executedQty"])
+        quote = d(order[venue.quote_field])
     except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise PositionError(
-            "version-2 ADD measured Spot bid is unreadable") from None
-    if not bid.is_finite() or bid <= 0:
-        raise PositionError(
-            "version-2 ADD measured Spot bid is unreadable")
-    return bid
-
-
-def _v2_add_revalidated_futures_bid(receipt: Dict[str, Any]) -> Decimal:
-    try:
-        raw = receipt["entry_revalidation"]["fresh_books"]["perp"]["bid"]
-        bid = d(raw)
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise PositionError(
-            "version-2 ADD measured Futures bid is unreadable") from None
-    if not bid.is_finite() or bid <= 0:
-        raise PositionError(
-            "version-2 ADD measured Futures bid is unreadable")
-    return bid
-
-
-def _v2_add_plan_from_receipt(
-        transition: Dict[str, Any]) -> Tuple[CyclePlan, Dict[str, Any]]:
-    plan = transition.get("plan")
-    if not isinstance(plan, dict):
-        raise PositionError("version-2 ADD plan receipt is missing")
-    try:
-        restored = CyclePlan(
-            symbol=str(plan["symbol"]),
-            entry_gap_bps=d(plan["entry_gap_bps"]),
-            exit_gap_bps=d(plan["exit_gap_bps"]),
-            funding_rate=d(plan["funding_rate"]),
-            spot_quantity=d(plan["spot_quantity_estimate"]),
-            short_quantity=d(plan["short_quantity_estimate"]),
-            spot_quote_cap=d(plan["spot_quote_cap"]),
-            short_notional=d(plan["short_notional"]),
-            leverage=int(plan["leverage"]),
-            reason="restored version-2 ADD plan",
-        )
-        market = {
-            "base": str(plan["base_asset"]),
-            "shared_step": d(plan["shared_step"]),
-            "spot_step": d(plan["spot_step"]),
-            "min_qty": d(plan["minimum_quantity"]),
-            "spot_min_qty": d(plan["spot_minimum_quantity"]),
-            "spot_min_notional": d(plan["spot_minimum_notional"]),
-            "spot_bid": d(plan["measured_spot_bid"]),
-            "futures_min_qty": d(plan["futures_minimum_quantity"]),
-            "futures_min_notional": d(plan["futures_minimum_notional"]),
-            "futures_bid": d(plan["measured_futures_bid"]),
-        }
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise PositionError(
-            "version-2 ADD plan receipt is unreadable") from None
-    decimals = (
-        restored.entry_gap_bps, restored.exit_gap_bps,
-        restored.funding_rate, restored.spot_quantity,
-        restored.short_quantity, restored.spot_quote_cap,
-        restored.short_notional, market["shared_step"],
-        market["spot_step"], market["min_qty"], market["spot_min_qty"],
-        market["spot_min_notional"], market["spot_bid"],
-        market["futures_min_qty"], market["futures_min_notional"],
-        market["futures_bid"],
-    )
-    if restored.symbol != transition["plan"]["symbol"] \
-            or any(not value.is_finite() for value in decimals) \
-            or restored.spot_quote_cap <= 0 or restored.short_notional <= 0 \
-            or market["shared_step"] <= 0 or market["spot_step"] <= 0 \
-            or market["min_qty"] <= 0 or market["spot_min_qty"] < 0 \
-            or market["spot_min_notional"] < 0 \
-            or market["spot_bid"] <= 0 \
-            or market["futures_min_qty"] < 0 \
-            or market["futures_min_notional"] < 0 \
-            or market["futures_bid"] <= 0:
-        raise PositionError(
-            "version-2 ADD plan receipt is outside its bounds")
-    return restored, market
-
-
-def _v2_add_dislocation(accepted: AcceptedProposal) -> Dict[str, Any]:
-    return new_v2_dislocation_event(
-        "add:" + accepted.digest[:32],
-        _proposal_utc_ms(accepted.payload["created_utc"], "created_utc"),
-        _proposal_decimal(
-            accepted.payload, "entry_gap_pct", (("entry_gap_pct",),)),
-        _proposal_decimal(
-            accepted.payload, "exit_gap_pct", (("exit_gap_pct",),)),
-        _proposal_decimal(
-            accepted.payload, "funding_rate", (("funding_rate",),)),
-        accepted.payload["funding_period_ms"],
-    )
-
-
-def _v2_add_rung_identity_state(
-        position: Dict[str, Any], transition: Dict[str, Any]) -> str:
-    """Match recovery only on the complete durable ADD identity tuple."""
-    ordinal = transition.get("ordinal")
-    intents = transition.get("intents")
-    if not isinstance(ordinal, int) or not isinstance(intents, dict):
-        return "MISMATCH"
-    spot = intents.get("spot")
-    short = intents.get("short")
-    if not isinstance(spot, dict):
-        return "MISMATCH"
-    expected_clients = {
-        "spot": spot.get("newClientOrderId"),
-        "short": short.get("newClientOrderId")
-        if isinstance(short, dict) else None,
-    }
-    if not isinstance(expected_clients["spot"], str) \
-            or not expected_clients["spot"]:
-        return "MISMATCH"
-    candidates = []
-    for index, event in enumerate(position["ledger"]):
-        if event["event_type"] != "RungFilled":
-            continue
-        clients = {
-            role: event["legs"][role]["client_order_id"]
-            for role in ("spot", "short")
-        }
-        if event["ordinal"] == ordinal \
-                or clients["spot"] == expected_clients["spot"] \
-                or (expected_clients["short"] is not None \
-                    and clients["short"] == expected_clients["short"]):
-            candidates.append((index, event))
-    if not candidates:
-        return "ABSENT"
-    if not isinstance(short, dict) \
-            or not isinstance(expected_clients["short"], str) \
-            or not expected_clients["short"]:
-        return "MISMATCH"
-    if len(candidates) != 1:
-        return "MISMATCH"
-    fill_index, filled = candidates[0]
-    add_intent = None
-    hedge_intent = None
-    for event in reversed(position["ledger"][:fill_index]):
-        if add_intent is None and event["event_type"] == "AddIntent" \
-                and (event["ordinal"] == filled["ordinal"] \
-                     or event["intent"]["newClientOrderId"] \
-                     == filled["legs"]["spot"]["client_order_id"]):
-            add_intent = event
-        if hedge_intent is None and event["event_type"] == "AddHedgeIntent" \
-                and (event["ordinal"] == filled["ordinal"] \
-                     or event["intent"]["newClientOrderId"] \
-                     == filled["legs"]["short"]["client_order_id"]):
-            hedge_intent = event
-        if add_intent is not None and hedge_intent is not None:
-            break
-    if add_intent is None or hedge_intent is None:
-        return "MISMATCH"
-    complete_match = (
-        filled["ordinal"] == ordinal
-        and add_intent["ordinal"] == ordinal
-        and hedge_intent["ordinal"] == ordinal
-        and add_intent["run_id"] == transition.get("run_id")
-        and hedge_intent["run_id"] == transition.get("run_id")
-        and add_intent["proposal_id"] == transition.get("proposal_id")
-        and add_intent["proposal_digest"]
-        == transition.get("proposal_digest")
-        and add_intent["dislocation"] == transition.get("dislocation")
-        and filled["dislocation"] == transition.get("dislocation")
-        and add_intent["intent"]["newClientOrderId"]
-        == expected_clients["spot"]
-        and hedge_intent["intent"]["newClientOrderId"]
-        == expected_clients["short"]
-        and all(
-            filled["legs"][role]["client_order_id"]
-            == expected_clients[role]
-            for role in ("spot", "short"))
-    )
-    return "MATCH" if complete_match else "MISMATCH"
-
-
-def _v2_add_matches_rung(
-        position: Dict[str, Any], transition: Dict[str, Any]) -> bool:
-    return _v2_add_rung_identity_state(position, transition) == "MATCH"
-
-
-def _v2_add_abort_identity_state(
-        position: Dict[str, Any], transition: Dict[str, Any]
-        ) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Find one AddAborted terminal and bind it to its complete ADD identity."""
-    terminals = [
-        event for event in position["ledger"]
-        if event["event_type"] == "AddAborted"
-    ]
-    if not terminals:
-        return "ABSENT", None
-    if len(terminals) != 1:
-        return "MISMATCH", None
-    terminal = terminals[0]
-    add_intents = [
-        event for event in position["ledger"]
-        if event["event_type"] == "AddIntent"
-        and event["ordinal"] == terminal["ordinal"]
-        and event["run_id"] == terminal["run_id"]
-    ]
-    intents = transition.get("intents")
-    spot_intent = intents.get("spot") if isinstance(intents, dict) else None
-    if len(add_intents) != 1 or not isinstance(spot_intent, dict):
-        return "MISMATCH", terminal
-    try:
-        normalized_spot_intent = _normalize_v2_entry_intent(
-            spot_intent, "spot", "ADD receipt Spot intent",
-            require_canonical=False)
-    except PositionError:
-        return "MISMATCH", terminal
-    add_intent = add_intents[0]
-    matches = (
-        terminal["ordinal"] == transition.get("ordinal")
-        and terminal["run_id"] == transition.get("run_id")
-        and add_intent["proposal_id"] == transition.get("proposal_id")
-        and add_intent["proposal_digest"]
-        == transition.get("proposal_digest")
-        and add_intent["dislocation"] == transition.get("dislocation")
-        and add_intent["intent"] == normalized_spot_intent
-    )
-    if terminal["spot_leg"] is not None:
-        matches = matches and terminal["spot_leg"]["client_order_id"] \
-            == spot_intent.get("newClientOrderId")
-    unwind_intent = intents.get("unwind") if isinstance(intents, dict) else None
-    if terminal["unwind_leg"] is not None:
-        matches = matches and isinstance(unwind_intent, dict) \
-            and terminal["unwind_leg"]["client_order_id"] \
-            == unwind_intent.get("newClientOrderId")
-    return ("MATCH" if matches else "MISMATCH"), terminal
-
-
-def _active_v2_add_receipt(
-        receipt_dir: str, position: Dict[str, Any],
-        exclude_path: Optional[str] = None,
-        ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    try:
-        names = sorted(os.listdir(receipt_dir))
-    except FileNotFoundError:
-        return None
-    except OSError:
-        raise PositionError(
-            "version-2 ADD receipt directory is unreadable") from None
-    active = []
-    for name in names:
-        if not name.startswith("basis-position-") \
-                or not name.endswith(".json"):
-            continue
-        path = os.path.join(receipt_dir, name)
-        if exclude_path is not None and path == exclude_path:
-            continue
-        try:
-            with open(path, encoding="utf-8") as handle:
-                receipt = json.load(handle)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            raise PositionError(
-                "a basis-position command receipt is unreadable; "
-                "reconcile it before ADD") from None
-        if not isinstance(receipt, dict) \
-                or receipt.get("kind") != "position-add":
-            continue
-        transition = receipt.get("add_transition")
-        if not isinstance(transition, dict):
-            if "verdict" not in receipt:
-                raise PositionError(
-                    "an unfinished ADD receipt lacks its transition")
-            continue
-        status = transition.get("status")
-        committed = _v2_add_matches_rung(position, transition)
-        abort_identity, _terminal = _v2_add_abort_identity_state(
-            position, transition)
-        if status == "ABORTED" and abort_identity == "MATCH" \
-                and "verdict" in receipt:
-            continue
-        if status == "COMMITTED" and committed \
-                and "verdict" in receipt:
-            continue
-        active.append((path, receipt))
-    if len(active) > 1:
-        raise PositionError(
-            "more than one unfinished version-2 ADD receipt stands")
-    return active[0] if active else None
-
-
-def _v2_add_identity_used(
-        receipt_dir: str, position: Dict[str, Any],
-        proposal_digest: str, run_id: str) -> Optional[str]:
-    event_id = "add:" + proposal_digest[:32]
-    for event in position["ledger"]:
-        if event["event_type"] in ("AddIntent", "RungFilled") \
-                and event["dislocation"]["event_id"] == event_id:
-            return "proposal digest already records a version-2 ADD event"
-    try:
-        names = sorted(os.listdir(receipt_dir))
-    except OSError:
-        return "ADD receipt directory is unreadable"
-    for name in names:
-        if not name.startswith("basis-position-") \
-                or not name.endswith(".json"):
-            continue
-        path = os.path.join(receipt_dir, name)
-        try:
-            with open(path, encoding="utf-8") as handle:
-                receipt = json.load(handle)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return "a basis-position command receipt is unreadable"
-        if not isinstance(receipt, dict):
-            continue
-        if receipt.get("run_id") == run_id:
-            return "ADD run id already has a command receipt"
-        if receipt.get("kind") == "position-add" \
-                and receipt.get("proposal_digest") == proposal_digest:
-            return "proposal digest already has an ADD command receipt"
-    return None
-
-
-def _save_other_receipt(
-        state: RunState, path: str, receipt: Dict[str, Any]) -> None:
-    current_path, current_receipt = state.receipt_path, state.receipt
-    try:
-        state.receipt_path = path
-        state.receipt = receipt
-        save(state)
-    finally:
-        state.receipt_path = current_path
-        state.receipt = current_receipt
-
-
-def _v2_add_order_observation(
-        transition: Dict[str, Any], role: str,
-        order: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(order, dict):
-        return None
-    intent = transition.get("intents", {}).get(role)
-    if not isinstance(intent, dict):
-        return None
-    venue = VENUES.get(intent.get("market"))
-    if venue is None or order.get("symbol") != transition["plan"]["symbol"] \
-            or order.get("clientOrderId") != intent.get("newClientOrderId"):
-        return None
-    try:
-        executed = d(order.get("executedQty", "0"))
-        quote = d(order.get(venue.quote_field, "0"))
-    except (ArithmeticError, TypeError, ValueError):
-        return None
+        raise PositionError("terminal entry quantities are unreadable") \
+            from None
     if not executed.is_finite() or executed < 0 \
             or not quote.is_finite() or quote < 0:
-        return None
-    observed = {
-        "symbol": transition["plan"]["symbol"],
-        "clientOrderId": intent["newClientOrderId"],
-        "status": str(order.get("status", "")),
-        "executedQty": fmt(executed),
-        venue.quote_field: fmt(quote),
-    }
-    order_id = order.get("orderId")
-    if order_id is not None and str(order_id):
-        observed["orderId"] = str(order_id)
-    return observed
-
-
-def _v2_add_prior_order_observation(
-        receipt: Dict[str, Any], role: str) -> Optional[Dict[str, Any]]:
+        raise PositionError("terminal entry quantities are unreadable")
     stage = {
         "spot": ENTER_SPOT,
         "short": ENTER_SHORT,
         "unwind": UNWIND_SPOT,
     }[role]
-    rows = [
-        row for row in receipt.get("legs", [])
-        if isinstance(row, dict) and row.get("stage") == stage
-    ]
-    if len(rows) != 1:
-        return None
-    observed = rows[0].get("strongest_order_observation")
-    return dict(observed) if isinstance(observed, dict) else None
-
-
-def _v2_add_pre_post_seal_row(
-        state: RunState, stage: str) -> Dict[str, Any]:
-    """Persist the seal decision immediately before an ADD-owned POST."""
-    present = [
-        seal for seal in (STOP_FILE, STOP_JOBS_FILE)
-        if os.path.exists(os.path.join(state.cfg.receipt_dir, seal))
-    ]
-    exposure_exit = stage in (ENTER_SHORT, UNWIND_SPOT)
-    if present and stage == ENTER_SPOT:
-        action = "REFUSE_UNPOSTED_SPOT"
-    elif present and exposure_exit:
-        action = "ALLOW_EXPOSURE_EXIT"
-    elif stage == ENTER_SPOT:
-        action = "ALLOW_ENTRY"
-    else:
-        action = "ALLOW_EXPOSURE_EXIT"
-    row = {
-        "row_type": "ADD_PRE_POST_SEAL",
-        "rule": V2_ADD_SEAL_RULE,
-        "stage": stage,
-        "present": present,
-        "action": action,
-        "checked_utc": utc(),
-    }
-    transition = state.receipt["add_transition"]
-    transition.setdefault("seal_spec_rows", []).append(row)
-    transition["updated_utc"] = utc()
-    save(state)
-    return row
-
-
-def _settle_v2_add_leg(
-        state: RunState, stage: str, plan: CyclePlan,
-        quantity: Optional[Decimal] = None):
-    """Settle one ADD-owned order with submit/query identity binding."""
-    transition = state.receipt["add_transition"]
-    role = {
-        ENTER_SPOT: "spot",
-        ENTER_SHORT: "short",
-        UNWIND_SPOT: "unwind",
-    }.get(stage)
-    if role is None:
-        raise PositionError("version-2 ADD order stage is invalid")
-    intended = leg_intent(stage, plan, state.run_id, quantity)
-    client = intended["newClientOrderId"]
-    original_request = state.request
-    observed: Dict[str, Optional[str]] = {
-        "submit_order_id": None,
-        "returned_symbol": None,
-        "returned_order_id": None,
-    }
-    refusal: List[str] = []
-
-    def freeze_identity(reason: str) -> None:
-        if reason not in refusal:
-            refusal.append(reason)
-        transition["status"] = "FROZEN"
-        transition["stage"] = "RESPONSE_IDENTITY_MISMATCH"
-        transition["identity_refusal"] = {
-            "reason": "ORDER_RESPONSE_IDENTITY_MISMATCH",
-            "role": role,
-            "facts": sorted(set(refusal)),
-        }
-        transition["updated_utc"] = utc()
-        save(state)
-
-    def bound_request(method, base_url, path, params=None, signed=False):
-        if method == "POST" and path.endswith("/order"):
-            seal_row = _v2_add_pre_post_seal_row(state, stage)
-            if seal_row["action"] == "REFUSE_UNPOSTED_SPOT":
-                rows = [
-                    row for row in state.receipt.get("legs", [])
-                    if isinstance(row, dict) and row.get("stage") == stage
-                ]
-                if rows:
-                    rows[-1].update({
-                        "status": "NOT_SUBMITTED",
-                        "seal_refusal": list(seal_row["present"]),
-                        "terminal_utc": utc(),
-                    })
-                    save(state)
-                raise _V2AddEntrySeal(seal_row["present"])
-        kind, payload = original_request(
-            method, base_url, path, params, signed)
-        if not path.endswith("/order") or not isinstance(payload, dict) \
-                or kind != "ok":
-            return kind, payload
-        if method == "POST":
-            returned_symbol = payload.get("symbol")
-            if returned_symbol is not None and returned_symbol != plan.symbol:
-                freeze_identity("SUBMIT_SYMBOL_MISMATCH")
-            order_id = payload.get("orderId")
-            if order_id is not None and str(order_id):
-                observed["submit_order_id"] = str(order_id)
-                transition.setdefault("submit_order_ids", {})[role] = str(
-                    order_id)
-                transition["updated_utc"] = utc()
-                save(state)
-        elif method == "GET":
-            observed["returned_symbol"] = None if payload.get("symbol") \
-                is None else str(payload.get("symbol"))
-            observed["returned_order_id"] = None if payload.get("orderId") \
-                is None else str(payload.get("orderId"))
-            if payload.get("symbol") != plan.symbol:
-                freeze_identity("QUERY_SYMBOL_MISMATCH")
-            if payload.get("clientOrderId") != client:
-                freeze_identity("QUERY_CLIENT_ID_MISMATCH")
-            submit_order_id = observed["submit_order_id"] \
-                or transition.get("submit_order_ids", {}).get(role)
-            if submit_order_id is not None \
-                    and str(payload.get("orderId", "")) \
-                    != str(submit_order_id):
-                freeze_identity("SUBMIT_QUERY_ORDER_ID_MISMATCH")
-        return kind, payload
-
-    state.request = bound_request
-    try:
-        try:
-            result = settle_leg(
-                state, stage, plan, quantity,
-                query_order=query_client_order_strongest)
-        except _V2AddEntrySeal as seal:
-            result = ("entry_sealed", {"seals": seal.seals}, [])
-    finally:
-        state.request = original_request
-    rows = [
+    receipt_rows = [
         row for row in state.receipt.get("legs", [])
         if isinstance(row, dict) and row.get("stage") == stage
     ]
-    if rows:
-        row = rows[-1]
-        if observed["submit_order_id"] is not None:
-            row["submit_order_id"] = observed["submit_order_id"]
-        if observed["returned_symbol"] is not None:
-            row["confirmed_symbol"] = observed["returned_symbol"]
-        strongest = _v2_add_order_observation(
-            transition, role, result[1])
-        if not refusal and result[0] == "unknown" \
-                and strongest is not None:
-            row["strongest_order_observation"] = strongest
-        if refusal:
-            row["identity_refusal"] = "ORDER_RESPONSE_IDENTITY_MISMATCH"
-            row["identity_reasons"] = sorted(set(refusal))
-        transition["updated_utc"] = utc()
-        save(state)
-    if refusal:
-        return "identity_mismatch", result[1], []
-    return result
-
-
-def _v2_add_receipt_leg(
-        receipt: Dict[str, Any], role: str) -> Dict[str, Any]:
-    transition = receipt["add_transition"]
-    stage = ENTER_SPOT if role == "spot" else ENTER_SHORT
-    intent = transition["intents"].get(role)
-    if not isinstance(intent, dict):
-        raise PositionError(
-            "version-2 ADD %s intent is not persisted" % role)
-    rows = [
-        row for row in receipt.get("legs", [])
-        if isinstance(row, dict) and row.get("stage") == stage
-    ]
-    if len(rows) != 1:
-        raise PositionError(
-            "version-2 ADD %s leg receipt is not singular" % role)
-    row = rows[0]
-    if row.get("identity_refusal") is not None:
-        raise PositionError(
-            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD %s response "
-            "identity was refused" % role)
-    if row.get("client_id") != intent.get("newClientOrderId"):
-        raise PositionError(
-            "version-2 ADD %s client identity drifted" % role)
-    status = row.get("status")
-    if status not in V2_TERMINAL_ORDER_STATUSES:
-        raise PositionError(
-            "version-2 ADD %s own order is not terminal" % role)
-    order_id = row.get("order_id")
-    if not isinstance(order_id, str) or not order_id:
-        raise PositionError(
-            "version-2 ADD %s exchange order identity is unknown" % role)
-    if row.get("confirmed_symbol") != transition["plan"]["symbol"]:
-        raise PositionError(
-            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD %s symbol "
-            "does not bind" % role)
-    submit_order_id = row.get("submit_order_id")
-    if submit_order_id is not None and str(submit_order_id) != order_id:
-        raise PositionError(
-            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD %s order id "
-            "does not bind" % role)
-    try:
-        executed = d(row["executed_qty"])
-        quote = d(row["quote"])
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise PositionError(
-            "version-2 ADD %s terminal quantities are unreadable" % role) \
-            from None
-    if not executed.is_finite() or not quote.is_finite() \
-            or executed <= 0 or quote <= 0:
-        raise PositionError(
-            "version-2 ADD %s terminal quantities are not positive" % role)
-    fee_map = row.get("fee_by_asset")
-    if role == "spot" and not isinstance(fee_map, dict):
-        raise PositionError(
-            "version-2 ADD Spot fee truth is not reconciled")
-    if fee_map is None:
-        fee_map = {}
-    config = transition["venue"]
+    if len(receipt_rows) != 1:
+        raise PositionError("entry leg receipt is not singular")
+    fee_map = receipt_rows[0].get("fee_by_asset", {})
+    if not isinstance(fee_map, dict):
+        raise PositionError("entry fee map is unreadable")
     return {
         "stage": stage,
-        "market": config[role],
-        "client_order_id": row["client_id"],
-        "exchange_order_id": order_id,
-        "terminal_status": status,
+        "market": persistence.market_name(role),
+        "client_order_id": client,
+        "exchange_order_id": str(order_id),
+        "terminal_status": str(order.get("status", "")),
         "executed_quantity": fmt(executed),
         "executed_quote": fmt(quote),
         "fee_by_asset": dict(fee_map),
     }
 
 
-def _v2_add_receipt_unwind_leg(receipt: Dict[str, Any]) -> Dict[str, Any]:
-    transition = receipt["add_transition"]
-    intent = transition["intents"].get("unwind")
-    if not isinstance(intent, dict):
-        raise PositionError(
-            "version-2 ADD unwind intent is not persisted")
-    rows = [
-        row for row in receipt.get("legs", [])
-        if isinstance(row, dict) and row.get("stage") == UNWIND_SPOT
-    ]
-    if len(rows) != 1:
-        raise PositionError(
-            "version-2 ADD unwind leg receipt is not singular")
-    row = rows[0]
-    if row.get("client_id") != intent.get("newClientOrderId"):
-        raise PositionError(
-            "version-2 ADD unwind client identity drifted")
-    if row.get("identity_refusal") is not None \
-            or row.get("confirmed_symbol") != transition["plan"]["symbol"]:
-        raise PositionError(
-            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD unwind "
-            "response identity was refused")
-    order_id = str(row.get("order_id", ""))
-    if not order_id or row.get("status") not in V2_TERMINAL_ORDER_STATUSES:
-        raise PositionError(
-            "version-2 ADD unwind own order is not terminal")
-    submit_order_id = row.get("submit_order_id")
-    if submit_order_id is not None and str(submit_order_id) != order_id:
-        raise PositionError(
-            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD unwind order "
-            "id does not bind")
-    try:
-        executed = d(row["executed_qty"])
-        quote = d(row["quote"])
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise PositionError(
-            "version-2 ADD unwind terminal quantities are unreadable") \
-            from None
-    if not executed.is_finite() or not quote.is_finite() \
-            or executed <= 0 or quote <= 0:
-        raise PositionError(
-            "version-2 ADD unwind terminal quantities are not positive")
-    fee_map = row.get("fee_by_asset")
-    if not isinstance(fee_map, dict):
-        raise PositionError(
-            "version-2 ADD unwind fee truth is not reconciled")
-    return {
-        "stage": UNWIND_SPOT,
-        "market": transition["venue"]["spot"],
-        "client_order_id": row["client_id"],
-        "exchange_order_id": order_id,
-        "terminal_status": row["status"],
-        "executed_quantity": fmt(executed),
-        "executed_quote": fmt(quote),
-        "fee_by_asset": dict(fee_map),
-    }
+def _settle_entry_leg(
+        state: RunState, persistence: _EntryPersistence,
+        stage: str, plan: CyclePlan,
+        quantity: Optional[Decimal] = None):
+    original_request = state.request
 
-
-def _commit_v2_add_receipt(
-        position: Dict[str, Any], receipt_dir: str,
-        receipt: Dict[str, Any], cut_ms: int) -> Dict[str, Any]:
-    transition = receipt["add_transition"]
-    current = load_position(receipt_dir)
-    if current is None or not _is_v2_position(current):
-        raise PositionError(
-            "version-2 ADD ledger is missing before commit")
-    rung_identity = _v2_add_rung_identity_state(current, transition)
-    if rung_identity == "MATCH":
-        return current
-    if rung_identity == "MISMATCH":
-        raise PositionError(
-            "ADD_RUNG_IDENTITY_MISMATCH: committed rung recovery refused")
-    if transition.get("config_event_digest") \
-            != current["ledger"][0]["event_digest"]:
-        raise PositionError(
-            "version-2 ADD config epoch changed before commit")
-    active = derive_v2_state(current)["active_transition"]
-    if active is None or active["stage"] != "SHORT_INTENT_PERSISTED" \
-            or active["run_id"] != transition.get("run_id") \
-            or active["ordinal"] != transition.get("ordinal"):
-        raise PositionError(
-            "version-2 ADD ledger does not hold the persisted short intent")
-    expected_length = len(current["ledger"])
-    expected_digest = current["ledger"][-1]["event_digest"]
-    legs = {
-        role: _v2_add_receipt_leg(receipt, role)
-        for role in ("spot", "short")
-    }
-    event_cut = max(
-        _v2_epoch_ms(cut_ms, "ADD fill reconcile time"),
-        current["ledger"][-1]["cut_ms"] + 1,
-    )
-    payload = new_v2_rung_filled_event(
-        transition["ordinal"], legs, transition["dislocation"],
-        event_cut)
-    return append_v2_event(
-        receipt_dir, payload, expected_length,
-        expected_last_digest=expected_digest)
-
-
-def _finish_v2_add_receipt(
-        state: RunState, position: Dict[str, Any], cut_ms: int
-        ) -> Tuple[Dict[str, Any], List[str]]:
-    transition = state.receipt["add_transition"]
-    transition["status"] = "FILLS_RECONCILED"
-    transition["stage"] = "BOTH_OWN_ORDERS_TERMINAL"
-    transition["updated_utc"] = utc()
-    save(state)
-    persisted = _commit_v2_add_receipt(
-        position, state.cfg.receipt_dir, state.receipt, cut_ms)
-    transition["status"] = "COMMITTED"
-    transition["stage"] = "RUNG_FILLED_APPENDED"
-    transition["after_event_count"] = len(persisted["ledger"])
-    transition["after_last_digest"] = persisted["ledger"][-1][
-        "event_digest"]
-    transition["updated_utc"] = utc()
-    save(state)
-    derived = derive_v2_state(persisted)
-    rung = derived["rungs"][transition["ordinal"] - 1]
-    permanent = [
-        reason for reason in rung["freeze_reasons"]
-        if not reason.startswith("RECONCILE_")
-    ]
-    return persisted, permanent
-
-
-def _commit_v2_add_abort(
-        receipt_dir: str, receipt: Dict[str, Any], reason: str,
-        spot_status: str, short_status: str,
-        spot_net_quantity: Decimal, unwind_requested_quantity: Decimal,
-        unwind_filled_quantity: Decimal, dust_quantity: Decimal,
-        spot_leg: Optional[Dict[str, Any]],
-        unwind_leg: Optional[Dict[str, Any]],
-        unwind_base_fee_quantity: Decimal = Decimal(0)) -> Dict[str, Any]:
-    transition = receipt["add_transition"]
-    current = load_position(receipt_dir)
-    if current is None or not _is_v2_position(current):
-        raise PositionError(
-            "version-2 ADD ledger is missing before abort")
-    active = derive_v2_state(current)["active_transition"]
-    if active is None or active["run_id"] != transition["run_id"] \
-            or active["ordinal"] != transition["ordinal"]:
-        raise PositionError(
-            "version-2 ADD abort does not bind the active transition")
-    payload = new_v2_add_aborted_event(
-        transition["ordinal"], transition["run_id"], reason,
-        spot_status, short_status, spot_net_quantity,
-        unwind_requested_quantity, unwind_filled_quantity, dust_quantity,
-        spot_leg, unwind_leg, unwind_base_fee_quantity)
-    persisted = append_v2_event(
-        receipt_dir, payload, len(current["ledger"]),
-        expected_last_digest=current["ledger"][-1]["event_digest"])
-    transition.update({
-        "status": "ABORTED",
-        "stage": ST_ADD_ABORTED,
-        "abort_reason": reason,
-        "spot_status": spot_status,
-        "short_status": short_status,
-        "spot_net_quantity": fmt(spot_net_quantity),
-        "unwind_requested_quantity": fmt(unwind_requested_quantity),
-        "unwind_filled_quantity": fmt(unwind_filled_quantity),
-        "unwind_base_fee_quantity": fmt(unwind_base_fee_quantity),
-        "dust_quantity": fmt(dust_quantity),
-        "after_event_count": len(persisted["ledger"]),
-        "after_last_digest": persisted["ledger"][-1]["event_digest"],
-        "updated_utc": utc(),
-    })
-    return persisted
-
-
-def _v2_add_spot_sellable_quantity(
-        quantity: Decimal, market: Dict[str, Any]) -> Optional[Decimal]:
-    """Return the Spot-valid floor after its own quantity and notional gates."""
-    if not isinstance(quantity, Decimal) or not quantity.is_finite() \
-            or quantity < 0:
-        raise PositionError(
-            "version-2 ADD Spot unwind quantity is unreadable")
-    try:
-        spot_step = market["spot_step"]
-        spot_min_qty = market["spot_min_qty"]
-        spot_min_notional = market["spot_min_notional"]
-        spot_bid = market["spot_bid"]
-    except KeyError:
-        raise PositionError(
-            "version-2 ADD Spot unwind market truth is incomplete") from None
-    values = (spot_step, spot_min_qty, spot_min_notional, spot_bid)
-    if any(not isinstance(value, Decimal) or not value.is_finite()
-           for value in values) \
-            or spot_step <= 0 or spot_min_qty < 0 \
-            or spot_min_notional < 0 or spot_bid <= 0:
-        raise PositionError(
-            "version-2 ADD Spot unwind market truth is unreadable")
-    sellable = quantize_down(quantity, spot_step)
-    if sellable <= 0 or sellable < spot_min_qty \
-            or sellable * spot_bid < spot_min_notional:
-        return None
-    return sellable
-
-
-def _v2_add_hedge_quantity(
-        net_base: Decimal, market: Dict[str, Any],
-        effective_cap: Decimal) -> Tuple[Optional[Decimal], Optional[str]]:
-    """Authorize a full measured hedge only inside filters and quote cap."""
-    values = (
-        net_base, effective_cap, market.get("shared_step"),
-        market.get("futures_min_qty"), market.get("futures_min_notional"),
-        market.get("futures_bid"),
-    )
-    if any(not isinstance(value, Decimal) or not value.is_finite()
-           for value in values) \
-            or net_base <= 0 or effective_cap <= 0 \
-            or market["shared_step"] <= 0 \
-            or market["futures_min_qty"] < 0 \
-            or market["futures_min_notional"] < 0 \
-            or market["futures_bid"] <= 0:
-        raise PositionError(
-            "version-2 ADD Futures hedge authority is unreadable")
-    hedge = quantize_down(net_base, market["shared_step"])
-    if hedge <= 0 or hedge < market["futures_min_qty"]:
-        return None, "FUTURES_QUANTITY_BELOW_MINIMUM"
-    hedge_notional = hedge * market["futures_bid"]
-    if hedge_notional < market["futures_min_notional"]:
-        return None, "FUTURES_NOTIONAL_BELOW_MINIMUM"
-    if hedge_notional > effective_cap:
-        return None, "FUTURES_QUOTE_CAP_EXCEEDED"
-    return hedge, None
-
-
-def _persist_v2_add_unwind_intent(
-        state: RunState, plan: CyclePlan, market: Dict[str, Any],
-        net_base: Decimal, short_status: str
-        ) -> Tuple[Optional[Decimal], Decimal]:
-    transition = state.receipt["add_transition"]
-    sellable = _v2_add_spot_sellable_quantity(net_base, market)
-    if sellable is None:
-        return None, net_base
-    dust = _v2_decimal_subtract(net_base, sellable)
-    intent = leg_intent(UNWIND_SPOT, plan, state.run_id, sellable)
-    prior = transition.setdefault("intents", {}).get("unwind")
-    if prior is not None and prior != intent:
-        raise PositionError(
-            "version-2 ADD unwind intent identity changed")
-    transition["intents"]["unwind"] = dict(intent)
-    transition["status"] = "UNWIND_REQUIRED"
-    transition["stage"] = "UNWIND_INTENT_PERSISTING"
-    transition["unwind_basis"] = {
-        "short_status": short_status,
-        "net_spot_quantity": fmt(net_base),
-        "sellable_quantity": fmt(sellable),
-        "initial_dust_quantity": fmt(dust),
-        "spot_step": fmt(market["spot_step"]),
-        "spot_minimum_quantity": fmt(market["spot_min_qty"]),
-        "spot_minimum_notional": fmt(market["spot_min_notional"]),
-        "measured_spot_bid": fmt(market["spot_bid"]),
-    }
-    transition["updated_utc"] = utc()
-    state.receipt.setdefault("client_ids", {})[
-        intent["newClientOrderId"]] = {
-            "stage": UNWIND_SPOT, "market": "spot",
-            "run_id": state.run_id,
-        }
-    save(state)
-    current = load_position(state.cfg.receipt_dir)
-    if current is None or not _is_v2_position(current):
-        raise PositionError(
-            "version-2 ADD ledger disappeared before unwind intent")
-    active = derive_v2_state(current)["active_transition"]
-    if active is None or active["run_id"] != transition["run_id"]:
-        raise PositionError(
-            "version-2 ADD unwind intent lost its active transition")
-    payload = new_v2_add_unwind_intent_event(
-        transition["ordinal"], transition["run_id"],
-        _v2_add_receipt_leg(state.receipt, "spot"), short_status,
-        net_base, sellable, dust, intent)
-    persisted = append_v2_event(
-        state.cfg.receipt_dir, payload, len(current["ledger"]),
-        expected_last_digest=current["ledger"][-1]["event_digest"])
-    transition["stage"] = "UNWIND_INTENT_PERSISTED"
-    transition["unwind_intent_event_count"] = len(persisted["ledger"])
-    transition["unwind_intent_event_digest"] = persisted["ledger"][-1][
-        "event_digest"]
-    transition["updated_utc"] = utc()
-    save(state)
-    return sellable, dust
-
-
-def _execute_v2_add_unwind(
-        state: RunState, plan: CyclePlan, market: Dict[str, Any],
-        net_base: Decimal, short_status: str
-        ) -> Tuple[str, str, str]:
-    transition = state.receipt["add_transition"]
-    spot_leg = _v2_add_receipt_leg(state.receipt, "spot")
-    try:
-        sellable, _initial_dust = _persist_v2_add_unwind_intent(
-            state, plan, market, net_base, short_status)
-    except (ArithmeticError, PositionError, TypeError, ValueError) as error:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_INTENT_REFUSED"
-        transition["unwind_error"] = clean(error, 220)
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "UNKNOWN",
-            "ADD Spot %s %s remains after the hedge did not fill"
-            % (fmt(net_base), market["base"]),
-            "measured unwind intent was refused: %s" % clean(error, 220),
-        )
-    if sellable is None:
-        persisted = _commit_v2_add_abort(
-            state.cfg.receipt_dir, state.receipt,
-            "SPOT_DUST_BELOW_SELLABLE_MINIMUM", "FILLED", short_status,
-            net_base, Decimal(0), Decimal(0), net_base, spot_leg, None)
-        transition["after_event_count"] = len(persisted["ledger"])
-        save(state)
-        return (
-            ST_ADD_ABORTED,
-            "Spot dust %s %s is below the sellable minimum"
-            % (fmt(net_base), market["base"]),
-            "ADD_ABORTED records the measured dust; no amount was lost",
-        )
-
-    res, order, fills = _settle_v2_add_leg(
-        state, UNWIND_SPOT, plan, sellable)
-    if res == "identity_mismatch":
-        return (
-            "UNKNOWN",
-            "ADD Spot %s %s remains after an unwind identity refusal"
-            % (fmt(net_base), market["base"]),
-            "ORDER_RESPONSE_IDENTITY_MISMATCH; unfinished ADD is frozen",
-        )
-    if res == "unknown":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_OUTCOME_UNKNOWN"
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "UNKNOWN",
-            "ADD Spot unwind outcome is unconfirmed for %s"
-            % transition["intents"]["unwind"]["newClientOrderId"],
-            "the sealed unwind identity must be queried before any resend",
-        )
-    sold = d(order.get("executedQty", "0")) \
-        if res == "terminal" else Decimal(0)
-    if sold <= 0:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_ZERO_OR_REJECTED"
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "ONE_LEG_EXPOSED",
-            "ADD holds Spot %s %s; measured unwind has no fill"
-            % (fmt(net_base), market["base"]),
-            "exposure remains recorded; no additional order was inferred",
-        )
-    if sold > sellable:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_OVERFILL_REFUSED"
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "UNKNOWN", "ADD Spot unwind fill exceeds its sealed quantity",
-            "unfinished ADD is frozen; terminal facts were not committed",
-        )
-    trades, covered = spot_trades(
-        state, state.receipt["legs"][-1].get("order_id", ""), sold, fills)
-    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
-    if covered < sold:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_FEE_TRUTH_UNKNOWN"
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "UNKNOWN", "ADD Spot unwind fee truth is incomplete",
-            "unfinished ADD is frozen; terminal facts were not committed",
-        )
-    try:
-        unwind_base_fee = d(
-            state.receipt["legs"][-1]["fee_by_asset"].get(
-                market["base"], "0"))
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        unwind_base_fee = None
-    if unwind_base_fee is None or not unwind_base_fee.is_finite() \
-            or unwind_base_fee < 0 \
-            or sold + unwind_base_fee > net_base:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_BASE_FEE_REFUSED"
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "UNKNOWN", "ADD Spot unwind base-fee truth exceeds its lot",
-            "terminal facts were refused; no additional order was submitted",
-        )
-    residual = _v2_decimal_subtract(
-        _v2_decimal_subtract(net_base, sold), unwind_base_fee)
-    residual_sellable = None if residual < 0 else \
-        _v2_add_spot_sellable_quantity(residual, market)
-    if residual < 0 or residual_sellable is not None:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "UNWIND_SELLABLE_RESIDUAL"
-        transition["updated_utc"] = utc()
-        save(state)
-        return (
-            "ONE_LEG_EXPOSED",
-            "ADD Spot unwind left sellable residual %s %s"
-            % (fmt(residual), market["base"]),
-            "residual remains recorded; no additional order was inferred",
-        )
-    unwind_leg = _v2_add_receipt_unwind_leg(state.receipt)
-    persisted = _commit_v2_add_abort(
-        state.cfg.receipt_dir, state.receipt,
-        "HEDGE_NOT_FILLED_SPOT_UNWOUND", "FILLED", short_status,
-        net_base, sellable, sold, residual, spot_leg, unwind_leg,
-        unwind_base_fee)
-    transition["after_event_count"] = len(persisted["ledger"])
-    save(state)
-    return (
-        ST_ADD_ABORTED, "none",
-        "ADD_ABORTED records measured Spot unwind %s and dust %s %s"
-        % (fmt(sold), fmt(residual), market["base"]),
-    )
-
-
-def _resume_v2_add_unwind(
-        state: RunState, plan: CyclePlan, market: Dict[str, Any],
-        net_base: Decimal, short_status: str,
-        query_state: str, order: Any) -> Tuple[str, str, str]:
-    """Finish or safely resend one sealed risk-reducing unwind identity."""
-    transition = state.receipt["add_transition"]
-    basis = transition.get("unwind_basis")
-    if not isinstance(basis, dict):
-        return (
-            "UNKNOWN", "ADD Spot exposure remains",
-            "sealed unwind basis is unreadable; no order was submitted",
-        )
-    try:
-        sellable = d(basis["sellable_quantity"])
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        return (
-            "UNKNOWN", "ADD Spot exposure remains",
-            "sealed unwind quantity is unreadable; no order was submitted",
-        )
-    measured_sellable = _v2_add_spot_sellable_quantity(net_base, market)
-    if measured_sellable is None or sellable != measured_sellable:
-        return (
-            "UNKNOWN", "ADD Spot exposure remains",
-            "sealed unwind quantity does not match Spot sellability; "
-            "no order was submitted",
-        )
-    fills: List[Dict[str, Any]] = []
-    already_filled = Decimal(0)
-    if query_state == "not_found":
-        rows = [
-            row for row in state.receipt.get("legs", [])
-            if isinstance(row, dict) and row.get("stage") == UNWIND_SPOT
-        ]
-        if len(rows) > 1:
-            return (
-                "UNKNOWN", "ADD Spot exposure remains",
-                "unwind receipt is not singular; no order was submitted",
-            )
-        observed_attempts = list(
-            transition.get("prior_unwind_attempts", []))
-        observed_attempts.extend(rows)
-        for attempt in observed_attempts:
-            if not isinstance(attempt, dict):
-                continue
-            observation = attempt.get("strongest_order_observation")
-            if not isinstance(observation, dict):
-                continue
-            try:
-                observed_fill = d(observation.get("executedQty", "0"))
-            except (ArithmeticError, TypeError, ValueError):
-                return (
-                    "UNKNOWN", "ADD Spot exposure remains",
-                    "observed unwind fill is unreadable; no order was submitted",
-                )
-            if not observed_fill.is_finite() or observed_fill < 0:
-                return (
-                    "UNKNOWN", "ADD Spot exposure remains",
-                    "observed unwind fill is unreadable; no order was submitted",
-                )
-            already_filled += observed_fill
-        if already_filled > 0:
-            return (
-                "UNKNOWN", "ADD Spot exposure remains",
-                "a partial unwind fill was observed; later absence cannot "
-                "authorize a resend",
-            )
-        remaining = _v2_decimal_subtract(net_base, already_filled)
-        resend_quantity = _v2_add_spot_sellable_quantity(remaining, market)
-        if resend_quantity is None:
-            return (
-                "UNKNOWN", "ADD Spot exposure remains",
-                "remaining measured Spot is below the sellable minimum; "
-                "no order was submitted",
-            )
-        if rows:
-            if transition.get("unwind_resend_count", 0) >= 1:
-                return (
-                    "UNKNOWN", "ADD Spot exposure remains",
-                    "sealed unwind was already resent once; no further order "
-                    "was submitted",
-                )
-            transition.setdefault("prior_unwind_attempts", []).append(
-                dict(rows[0]))
-            state.receipt["legs"].remove(rows[0])
-            transition["unwind_resend_count"] = 1
-            transition["unwind_resend_basis"] = "EXACT_NOT_FOUND"
-        else:
-            transition["unwind_first_submit_basis"] = "EXACT_NOT_FOUND"
-        transition["updated_utc"] = utc()
-        save(state)
-        res, order, fills = _settle_v2_add_leg(
-            state, UNWIND_SPOT, plan, resend_quantity)
-        if res == "identity_mismatch":
-            return (
-                "UNKNOWN", "ADD Spot exposure remains",
-                "ORDER_RESPONSE_IDENTITY_MISMATCH; unwind is frozen",
-            )
-        if res == "unknown":
-            return (
-                "UNKNOWN", "ADD Spot unwind remains unconfirmed",
-                "the sealed identity was queried before resend; no blind "
-                "retry is allowed",
-            )
-        if res == "rejected":
-            return (
-                "ONE_LEG_EXPOSED", "ADD Spot exposure remains",
-                "measured unwind was rejected after exact-absence proof",
-            )
-    elif query_state != "terminal" or not isinstance(order, dict):
-        return (
-            "UNKNOWN", "ADD Spot unwind remains unconfirmed",
-            "resume queried the sealed unwind identity and submitted nothing",
-        )
-    sold = d(order.get("executedQty", "0"))
-    total_sold = already_filled + sold
-    if sold <= 0:
-        return (
-            "ONE_LEG_EXPOSED", "ADD Spot exposure remains",
-            "measured unwind has no fill; no additional order was inferred",
-        )
-    if sold > sellable or total_sold > net_base:
-        return (
-            "UNKNOWN", "ADD Spot unwind fill exceeds its sealed quantity",
-            "terminal facts were refused; no additional order was submitted",
-        )
-    rows = [
-        (index, row) for index, row in enumerate(state.receipt.get("legs", []))
-        if isinstance(row, dict) and row.get("stage") == UNWIND_SPOT
-    ]
-    if len(rows) != 1:
-        return (
-            "UNKNOWN", "ADD Spot exposure remains",
-            "unwind receipt is not singular; no additional order was submitted",
-        )
-    leg_index, row = rows[0]
-    if not isinstance(row.get("fee_by_asset"), dict):
-        trades, covered = spot_trades(
-            state, row.get("order_id", ""), sold, fills)
-        if covered < sold:
-            return (
-                "UNKNOWN", "ADD Spot unwind fee truth is incomplete",
-                "terminal facts remain frozen; no additional order was submitted",
-            )
-        attach_fees(state, leg_index, trades)
-    try:
-        unwind_base_fee = d(row["fee_by_asset"].get(market["base"], "0"))
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        unwind_base_fee = None
-    if unwind_base_fee is None or not unwind_base_fee.is_finite() \
-            or unwind_base_fee < 0 \
-            or total_sold + unwind_base_fee > net_base:
-        return (
-            "UNKNOWN", "ADD Spot unwind base-fee truth exceeds its lot",
-            "terminal facts were refused; no additional order was submitted",
-        )
-    residual = _v2_decimal_subtract(
-        _v2_decimal_subtract(net_base, total_sold), unwind_base_fee)
-    residual_sellable = None if residual < 0 else \
-        _v2_add_spot_sellable_quantity(residual, market)
-    if residual < 0 or residual_sellable is not None:
-        return (
-            "ONE_LEG_EXPOSED",
-            "ADD Spot unwind left sellable residual %s %s"
-            % (fmt(residual), market["base"]),
-            "residual remains recorded; no additional order was inferred",
-        )
-    spot_leg = _v2_add_receipt_leg(state.receipt, "spot")
-    unwind_leg = _v2_add_receipt_unwind_leg(state.receipt)
-    _commit_v2_add_abort(
-        state.cfg.receipt_dir, state.receipt,
-        "HEDGE_NOT_FILLED_SPOT_UNWOUND", "FILLED", short_status,
-        net_base, sellable, total_sold, residual, spot_leg, unwind_leg,
-        unwind_base_fee)
-    save(state)
-    return (
-        ST_ADD_ABORTED, "none",
-        "ADD_ABORTED records measured Spot unwind %s and dust %s %s"
-        % (fmt(total_sold), fmt(residual), market["base"]),
-    )
-
-
-def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
-            now_ms: Callable[[], int] = default_now_ms,
-            proposal_id: Optional[str] = None) -> int:
-    """Add one v2 rung through the canonical two-leg entry machinery."""
-    for seal_file in (STOP_FILE, STOP_JOBS_FILE):
-        if os.path.exists(os.path.join(cfg.receipt_dir, seal_file)):
-            print("ADD | %s | BLOCKED | %s file present; entry is disabled"
-                  % (cfg.symbol, seal_file))
-            return EXIT_CODE["BLOCKED"]
-    command_now = now_ms()
-    try:
-        accepted = load_entry_proposal(
-            cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha,
-            command_now)
-    except PositionError as error:
-        print("ADD | %s | REFUSED | %s" % (
-            cfg.symbol, clean(error, 300)))
-        return EXIT_CODE["REFUSED"]
-    start_guard = _take_position_write_guard(cfg.receipt_dir)
-    if not start_guard:
-        print("ADD | %s | BLOCKED | ADD_START_CONCURRENT: %s"
-              % (cfg.symbol, start_guard.refusal))
-        return EXIT_CODE["BLOCKED"]
-    if start_guard.recovery_row is not None:
-        row = start_guard.recovery_row
-        print("ADD | %s | %s | reason=%s prior_owner_pid=%s"
-              % (cfg.symbol, row["row_type"], row["reason"],
-                 row["prior_owner_pid"]))
-    try:
-        try:
-            position = load_position(cfg.receipt_dir)
-            if position is None or not _is_v2_position(position):
-                raise PositionError(
-                    "cmd_add requires a version-2 ledger; version-1 is unchanged")
-            config, reconcile, ordinal, schedule_gap, effective_cap = \
-                _v2_add_authority(position, command_now)
-            if config["symbol"] != cfg.symbol:
-                raise PositionError(
-                    "version-2 ledger symbol does not match the ADD command")
-            if _active_v2_add_receipt(cfg.receipt_dir, position) is not None:
-                raise PositionError(
-                    "an unfinished version-2 ADD stands; run --resume first")
-            if cfg.run_id:
-                _v2_id(cfg.run_id, "ADD run_id")
-            identity_blocker = _v2_add_identity_used(
-                cfg.receipt_dir, position, accepted.digest, cfg.run_id)
-            if identity_blocker:
-                raise PositionError(identity_blocker)
-            proposal_gap = _proposal_decimal(
-                accepted.payload, "entry_gap_pct", (("entry_gap_pct",),))
-            if proposal_gap < schedule_gap:
-                raise PositionError(
-                    "proposal entry gap %s%% is below frozen schedule row %s%%"
-                    % (fmt(proposal_gap), fmt(schedule_gap)))
-            state = make_state(cfg, request, sleep, "add")
-            # Commit proposal ownership while the same guard still covers
-            # the unfinished-receipt check.  A concurrent caller therefore
-            # cannot pass the check without seeing this reservation.
-            state.receipt.update({
-                "proposal_id": accepted.proposal_id,
-                "proposal_digest": accepted.digest,
+    def sealed_request(method, base_url, path, params=None, signed=False):
+        if method == "POST" and stage == ENTER_SPOT \
+                and path.endswith("/order"):
+            seals = _entry_seals(state.cfg.receipt_dir)
+            state.receipt.setdefault("entry_seal_rows", []).append({
+                "row_type": "ENTRY_PRE_SPOT_POST_SEAL",
+                "stage": stage,
+                "present": list(seals),
+                "action": "REFUSE" if seals else "ALLOW",
+                "checked_utc": utc(),
             })
             save(state)
-        finally:
-            _release_position_write_guard(
-                cfg.receipt_dir, start_guard.token)
-    except PositionError as error:
-        print("ADD | %s | BLOCKED | %s" % (
-            cfg.symbol, clean(error, 300)))
-        return EXIT_CODE["BLOCKED"]
+            if seals:
+                raise _EntrySealBeforeSpot(seals)
+        return original_request(method, base_url, path, params, signed)
 
-    lane_lock_preexisting = os.path.exists(state.lock_path)
-    if not lane_lock_preexisting and not take_lock(state):
+    state.request = sealed_request
+    try:
+        return settle_leg(
+            state, stage, plan, quantity,
+            query_order=query_client_order_strongest,
+            observation_sink=persistence.observation_sink(state))
+    finally:
+        state.request = original_request
+
+
+def _entry_hedge_quantity(
+        accepted: AcceptedProposal, authority: EntryAuthority,
+        plan: CyclePlan, market: Dict[str, Any],
+        net_base: Decimal) -> Tuple[Optional[Decimal], str]:
+    ceiling = market.get("futures_execution_price_ceiling")
+    step = market.get("futures_step")
+    minimum = market.get("futures_min_qty")
+    minimum_notional = market.get("futures_min_notional")
+    values = (ceiling, step, minimum, minimum_notional)
+    if any(not isinstance(value, Decimal) or not value.is_finite()
+           for value in values) \
+            or ceiling <= 0 or step <= 0 \
+            or minimum < 0 or minimum_notional < 0:
+        return None, "FUTURES_EXECUTION_CEILING_UNKNOWN"
+    effective = plan.short_notional if authority.effective_cap_quote is None \
+        else min(plan.short_notional, authority.effective_cap_quote)
+    bounded = min(
+        net_base,
+        accepted.quantity,
+        plan.short_notional / ceiling,
+        effective / ceiling)
+    hedge = quantize_down(bounded, step)
+    if hedge <= 0 or hedge < minimum:
+        return None, "FUTURES_QUANTITY_BELOW_MINIMUM"
+    if hedge * ceiling < minimum_notional:
+        return None, "FUTURES_NOTIONAL_BELOW_MINIMUM"
+    return hedge, ""
+
+
+def _fresh_spot_sellable(
+        state: RunState, market: Dict[str, Any], quantity: Decimal
+        ) -> Tuple[str, Optional[Decimal], Optional[Decimal]]:
+    kind, payload = state.request(
+        "GET", SPOT.base_url, SPOT_BOOK_PATH,
+        {"symbol": state.cfg.symbol}, False)
+    state.receipt["unwind_fresh_spot_book"] = _book_snapshot(kind, payload)
+    save(state)
+    if kind != "ok":
+        return "UNKNOWN", None, None
+    try:
+        bid, _ask = _validated_book(payload, state.cfg.symbol, "Spot")
+        step = market["spot_step"]
+        minimum = market["spot_min_qty"]
+        minimum_notional = market["spot_min_notional"]
+    except (KeyError, PositionError):
+        return "UNKNOWN", None, None
+    sellable = quantize_down(quantity, step)
+    if sellable <= 0 or sellable < minimum \
+            or sellable * bid < minimum_notional:
+        return "DUST", None, bid
+    return "SELLABLE", sellable, bid
+
+
+def _entry_freeze(
+        state: RunState, persistence: _EntryPersistence,
+        exposure: str, note: str, *, one_leg: bool = False) -> int:
+    persistence.freeze(state, note, one_leg=one_leg)
+    return conclude(
+        state, "UNKNOWN", exposure, note)
+
+
+def _execute_entry_unwind(
+        cfg: PositionConfig, state: RunState,
+        persistence: _EntryPersistence, plan: CyclePlan,
+        market: Dict[str, Any], spot_leg: Dict[str, Any],
+        net_base: Decimal, short_status: str, reason: str) -> int:
+    sellability, sellable, bid = _fresh_spot_sellable(
+        state, market, net_base)
+    if sellability == "UNKNOWN":
+        return _entry_freeze(
+            state, persistence,
+            "Spot %s %s remains" % (fmt(net_base), market["base"]),
+            "fresh Spot sellability is UNKNOWN; no unwind was submitted",
+            one_leg=True)
+    if sellable is None:
+        measured = {
+            "spot_status": "FILLED",
+            "short_status": short_status,
+            "spot_net_quantity": net_base,
+            "unwind_requested_quantity": Decimal(0),
+            "unwind_filled_quantity": Decimal(0),
+            "unwind_base_fee_quantity": Decimal(0),
+            "dust_quantity": net_base,
+            "spot_leg": spot_leg,
+            "unwind_leg": None,
+            "unwind_completed": False,
+        }
+        persistence.commit_aborted(
+            state, "SPOT_DUST_BELOW_SELLABLE_MINIMUM", measured)
+        if persistence.authority.command == "ADD":
+            return conclude(
+                state, ST_ADD_ABORTED,
+                "Spot dust %s %s" % (fmt(net_base), market["base"]),
+                "AddAborted records fresh Spot filters and measured dust")
         return conclude(
-            state, "BLOCKED", "none",
-            "lane lock appeared while ADD was starting; no intent persisted")
+            state, "ONE_LEG_EXPOSED",
+            "Spot dust %s %s" % (fmt(net_base), market["base"]),
+            "fresh Spot bid %s proves the amount is below sellability"
+            % fmt(bid))
+    try:
+        client = persistence.persist_unwind_intent(
+            state, plan, spot_leg, short_status, sellable)
+    except PositionError as error:
+        return _entry_freeze(
+            state, persistence,
+            "Spot %s %s remains" % (fmt(net_base), market["base"]),
+            "durable unwind intent was refused: %s" % clean(error, 180),
+            one_leg=True)
+    res, order, fills = _settle_entry_leg(
+        state, persistence, UNWIND_SPOT, plan, sellable)
+    persistence.record_leg(
+        state, UNWIND_SPOT, client, res, order)
+    if res == "unknown":
+        return _entry_freeze(
+            state, persistence,
+            "Spot unwind outcome is unconfirmed",
+            "persisted unwind identity must be queried before any action",
+            one_leg=True)
+    sold = d(order.get("executedQty", "0")) \
+        if res == "terminal" and isinstance(order, dict) else Decimal(0)
+    if res == "rejected" or sold <= 0:
+        return _entry_freeze(
+            state, persistence,
+            "Spot %s %s remains" % (fmt(net_base), market["base"]),
+            "measured Spot unwind had no positive terminal fill",
+            one_leg=True)
+    try:
+        residual = sold_leg_result(
+            state, UNWIND_SPOT, order, fills,
+            net_base, sellable, market)
+    except ExecutorExit as exit_signal:
+        persistence.freeze(
+            state, "shared sold-leg terminal gate refused the unwind",
+            one_leg=True)
+        return exit_signal.code
+    unwind_leg = _entry_order_leg(
+        state, persistence, "unwind", client, order)
+    base_fee = Decimal(
+        unwind_leg["fee_by_asset"].get(market["base"], "0"))
+    measured = {
+        "spot_status": "FILLED",
+        "short_status": short_status,
+        "spot_net_quantity": net_base,
+        "unwind_requested_quantity": sellable,
+        "unwind_filled_quantity": sold,
+        "unwind_base_fee_quantity": base_fee,
+        "dust_quantity": residual,
+        "spot_leg": spot_leg,
+        "unwind_leg": unwind_leg,
+        "unwind_completed": True,
+    }
+    persistence.commit_aborted(state, reason, measured)
+    verdict = ST_ADD_ABORTED \
+        if persistence.authority.command == "ADD" \
+        else "REJECTED_BEFORE_ENTRY"
+    return conclude(
+        state, verdict, "none",
+        "measured Spot unwind is terminal; residual %s %s"
+        % (fmt(residual), market["base"]))
+
+
+def _execute_entry(
+        cfg, request, sleep, now_ms, *, accepted, authority,
+        persistence) -> int:
+    """Execute ordinal N through the sole persistent two-leg entry core."""
+    state = _entry_state(cfg, request, sleep, accepted, authority)
+    acquired_lock = False
+    if authority.command == "OPEN":
+        if not take_lock(state):
+            return conclude(
+                state, "BLOCKED", "none",
+                "lane lock exists; another run owns the lane")
+        acquired_lock = True
+    elif not os.path.exists(state.lock_path):
+        if not take_lock(state):
+            return conclude(
+                state, "BLOCKED", "none",
+                "lane lock appeared while ADD was starting")
+        acquired_lock = True
     try:
         market = market_context(state)
-    except Refusal as refusal:
-        return conclude(
-            state, "REJECTED_BEFORE_ENTRY", "none", str(refusal))
-    if market["base"] != config["venue"]["base_asset"]:
-        return conclude(
-            state, "REJECTED_BEFORE_ENTRY", "none",
-            "venue base asset no longer matches the frozen config")
-    try:
         plan = _proposal_plan(
-            accepted, market, effective_cap=effective_cap)
-    except PositionError as error:
+            accepted, market,
+            effective_cap=authority.effective_cap_quote,
+            enforce_first_trade_cap=authority.command == "ADD")
+    except (PositionError, Refusal) as error:
+        if acquired_lock:
+            release_lock(state)
         return conclude(
             state, "REJECTED_BEFORE_ENTRY", "none", str(error))
     try:
-        _read_only_add_preflight(
-            state, plan, market, derive_v2_state(position), reconcile)
-    except PreflightRefusal as refusal:
-        return conclude(
-            state, "PREFLIGHT_REFUSED", "none", str(refusal))
-    revalidation_failure = _revalidate_entry(
-        state, accepted, schedule_gap_pct=schedule_gap)
-    if revalidation_failure is not None:
+        persistence.preflight(state, plan, market)
+    except PreflightRefusal as error:
+        if acquired_lock:
+            release_lock(state)
+        return conclude(state, "PREFLIGHT_REFUSED", "none", str(error))
+    failure = _revalidate_entry(
+        state, accepted,
+        schedule_gap_pct=authority.schedule_entry_gap_pct)
+    if failure is not None:
+        if acquired_lock:
+            release_lock(state)
         return conclude(
             state, "REJECTED_BEFORE_ENTRY", "none",
-            "%s: %s" % (
-                ENTRY_REVALIDATION_FAILED, revalidation_failure))
+            "%s: %s" % (ENTRY_REVALIDATION_FAILED, failure))
     try:
-        market["spot_bid"] = _v2_add_revalidated_spot_bid(state.receipt)
-        market["futures_bid"] = _v2_add_revalidated_futures_bid(
-            state.receipt)
-        # market_context exposes the cross-venue maxima. Using those maxima
-        # for the Futures leg is conservative and can never admit a quantity
-        # below either venue's published minimum.
-        market["futures_min_qty"] = market["min_qty"]
-        market["futures_min_notional"] = market["min_notional"]
-    except PositionError as error:
-        return conclude(
-            state, "REJECTED_BEFORE_ENTRY", "none", str(error))
+        persistence.prepare(state, plan, market, now_ms())
+    except (PositionError, PreflightRefusal) as error:
+        if acquired_lock:
+            release_lock(state)
+        return conclude(state, "PREFLIGHT_REFUSED", "none", str(error))
     try:
-        _require_fresh_v2_add_reconcile(reconcile, now_ms())
+        spot_client = persistence.persist_spot_intent(state, plan)
     except PositionError as error:
-        return conclude(
-            state, "REJECTED_BEFORE_ENTRY", "none", str(error))
-
-    intent_guard = _take_position_write_guard(cfg.receipt_dir)
-    if not intent_guard:
+        if acquired_lock:
+            release_lock(state)
         return conclude(
             state, "BLOCKED", "none",
-            "ADD_START_CONCURRENT: %s" % intent_guard.refusal)
-    if intent_guard.recovery_row is not None:
-        row = intent_guard.recovery_row
-        state.receipt.setdefault("position_write_guard_rows", []).append(row)
-        save(state)
-        print("ADD | %s | %s | reason=%s prior_owner_pid=%s"
-              % (cfg.symbol, row["row_type"], row["reason"],
-                 row["prior_owner_pid"]))
+            "entry intent was not committed: %s" % clean(error, 220))
     try:
-        try:
-            for seal_file in (STOP_FILE, STOP_JOBS_FILE):
-                if os.path.exists(os.path.join(cfg.receipt_dir, seal_file)):
-                    raise PositionError(
-                        "%s file appeared before ADD intent" % seal_file)
-            current = load_position(cfg.receipt_dir)
-            if current is None or not _is_v2_position(current):
-                raise PositionError(
-                    "version-2 ADD ledger disappeared before intent")
-            if _active_v2_add_receipt(
-                    cfg.receipt_dir, current,
-                    exclude_path=state.receipt_path) is not None:
-                raise PositionError(
-                    "ADD_START_CONCURRENT: another unfinished ADD owns "
-                    "the position")
-            fresh = _v2_add_authority(current, now_ms())
-            fresh_config, fresh_reconcile, fresh_ordinal, fresh_gap, fresh_cap = \
-                fresh
-            if fresh_config["event_digest"] != config["event_digest"] \
-                    or fresh_reconcile["read_digest"] \
-                    != reconcile["read_digest"] \
-                    or fresh_ordinal != ordinal or fresh_gap != schedule_gap \
-                    or fresh_cap != effective_cap:
-                raise PositionError(
-                    "ADD_AUTHORITY_CHANGED: frozen authority changed before "
-                    "intent")
-            position = current
-            config = fresh_config
-            reconcile = fresh_reconcile
-            dislocation = _v2_add_dislocation(accepted)
-            state.receipt.update({
-                "proposal_id": accepted.proposal_id,
-                "proposal_digest": accepted.digest,
-                "ordinal": ordinal,
-                "effective_cap_quote": fmt(effective_cap),
-                "reconcile_id": reconcile["reconcile_id"],
-                "add_transition": {
-                    "kind": "ADD",
-                    "status": "PREPARED",
-                    "stage": "PREPARED",
-                    "run_id": state.run_id,
-                    "ordinal": ordinal,
-                    "proposal_id": accepted.proposal_id,
-                    "proposal_digest": accepted.digest,
-                    "proposal_config_digest": accepted.payload[
-                        "config_digest"],
-                    "config_event_digest": config["event_digest"],
-                    "before_event_count": len(position["ledger"]),
-                    "before_last_digest": position["ledger"][-1][
-                        "event_digest"],
-                    "last_reconcile_id": reconcile["reconcile_id"],
-                    "reconcile_read_digest": reconcile["read_digest"],
-                    "schedule_entry_gap_pct": fmt(schedule_gap),
-                    "effective_cap_quote": fmt(effective_cap),
-                    "plan": _v2_add_plan_receipt(plan, market),
-                    "venue": {
-                        "spot": config["venue"]["spot"],
-                        "short": config["venue"]["futures"],
-                    },
-                    "dislocation": dislocation,
-                    "intents": {},
-                    "created_utc": utc(),
-                    "updated_utc": utc(),
-                },
-            })
-            save(state)
-        finally:
-            _release_position_write_guard(
-                cfg.receipt_dir, intent_guard.token)
-    except PositionError as error:
-        return conclude(state, "BLOCKED", "none", str(error))
-
-    try:
-        client = persist_intent(
-            cfg.receipt_dir, position, ENTER_SPOT, plan, state.run_id,
-            state=state)
-    except PositionError as error:
-        current = load_position(cfg.receipt_dir)
-        active = None if current is None else \
-            derive_v2_state(current).get("active_transition")
-        transition = state.receipt["add_transition"]
-        transition["updated_utc"] = utc()
-        if active is None or active.get("run_id") != state.run_id:
-            transition["status"] = "ABORTED"
-            transition["stage"] = "INTENT_NOT_COMMITTED"
-            return conclude(
-                state, ST_ADD_ABORTED, "none",
-                "ADD intent was not committed; no order was submitted: %s"
-                % clean(error, 220))
-        transition["status"] = "FROZEN"
-        transition["stage"] = "INTENT_RECEIPT_INCOMPLETE"
-        save(state)
+        res, order, fills = _settle_entry_leg(
+            state, persistence, ENTER_SPOT, plan)
+    except _EntrySealBeforeSpot as seal:
+        persistence.commit_aborted(state, "ENTRY_SEAL_BEFORE_SPOT_POST", {
+            "spot_status": "NOT_SUBMITTED",
+            "short_status": "NOT_SEALED",
+            "spot_net_quantity": Decimal(0),
+            "unwind_requested_quantity": Decimal(0),
+            "unwind_filled_quantity": Decimal(0),
+            "dust_quantity": Decimal(0),
+            "spot_leg": None,
+            "unwind_leg": None,
+        })
+        if acquired_lock:
+            release_lock(state)
+        verdict = ST_ADD_ABORTED if authority.command == "ADD" \
+            else "REJECTED_BEFORE_ENTRY"
         return conclude(
-            state, "UNKNOWN", "ADD intent is durable but receipt is incomplete",
-            "no order was submitted: %s" % clean(error, 220))
-    res, order, fills = _settle_v2_add_leg(state, ENTER_SPOT, plan)
-    transition = state.receipt["add_transition"]
-    if res == "entry_sealed":
-        seals = order.get("seals", []) if isinstance(order, dict) else []
-        try:
-            _commit_v2_add_abort(
-                cfg.receipt_dir, state.receipt,
-                "ENTRY_SEAL_BEFORE_SPOT_POST", "NOT_SUBMITTED",
-                "NOT_SEALED", Decimal(0), Decimal(0), Decimal(0),
-                Decimal(0), None, None)
-        except (ArithmeticError, PositionError, TypeError, ValueError) as error:
-            transition["status"] = "FROZEN"
-            transition["stage"] = "SEAL_ABORT_COMMIT_REFUSED"
-            transition["resume_error"] = clean(error, 220)
-            transition["updated_utc"] = utc()
-            save(state)
-            return conclude(
-                state, "UNKNOWN", "ADD Spot was not submitted",
-                "entry seal abort could not be committed: %s"
-                % clean(error, 220))
-        save(state)
+            state, verdict, "none",
+            "%s appeared before the Spot POST; no entry order was submitted"
+            % (",".join(seal.seals) or "entry seal"))
+    persistence.record_leg(
+        state, ENTER_SPOT, spot_client, res, order)
+    if res == "rejected":
+        persistence.commit_aborted(state, "SPOT_INTENT_EXACTLY_NOT_FOUND", {
+            "spot_status": "NOT_FOUND",
+            "short_status": "NOT_SEALED",
+            "spot_net_quantity": Decimal(0),
+            "unwind_requested_quantity": Decimal(0),
+            "unwind_filled_quantity": Decimal(0),
+            "dust_quantity": Decimal(0),
+            "spot_leg": None,
+            "unwind_leg": None,
+        })
+        if acquired_lock:
+            release_lock(state)
+        verdict = ST_ADD_ABORTED if authority.command == "ADD" \
+            else "REJECTED_BEFORE_ENTRY"
         return conclude(
-            state, ST_ADD_ABORTED, "none",
-            "ADD_ABORTED records that %s appeared before the Spot POST; "
-            "zero ADD orders were submitted" % (",".join(seals) or "a seal"))
-    if res == "identity_mismatch":
-        return conclude(
-            state, "UNKNOWN", "ADD Spot response identity was refused",
-            "ORDER_RESPONSE_IDENTITY_MISMATCH; unfinished ADD is frozen")
-    if res == "rejected" or (res == "terminal" and d(
-            order.get("executedQty", "0")) <= 0):
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SPOT_ZERO_OR_REJECTED"
-        transition["updated_utc"] = utc()
-        save(state)
-        return conclude(
-            state, "UNKNOWN", "ADD Spot entry is terminal without a fill",
-            "the persisted ADD intent remains frozen until aggregate "
-            "agreement records no exposure")
+            state, verdict, "none",
+            "Spot entry was exactly absent after a refused submit")
     if res == "unknown":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SPOT_OUTCOME_UNKNOWN"
-        transition["updated_utc"] = utc()
-        save(state)
-        return conclude(
-            state, "UNKNOWN",
-            "ADD Spot BUY unconfirmed within quote cap %s; query %s"
-            % (fmt(plan.spot_quote_cap), client),
-            "unfinished ADD is frozen; nothing is resent")
-
+        return _entry_freeze(
+            state, persistence,
+            "Spot BUY outcome is unconfirmed for %s" % spot_client,
+            "persisted Spot identity must be queried; nothing is resent")
     executed = d(order.get("executedQty", "0"))
+    if executed <= 0:
+        return _entry_freeze(
+            state, persistence,
+            "Spot terminal quantity is zero",
+            "aggregate agreement is required before closing the intent")
     trades, covered = spot_trades(
         state, state.receipt["legs"][-1].get("order_id", ""),
         executed, fills)
     attach_fees(state, len(state.receipt["legs"]) - 1, trades)
+    persistence.attach_spot_fees(state)
     if covered < executed:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SPOT_FEE_TRUTH_UNKNOWN"
-        transition["updated_utc"] = utc()
-        save(state)
-        return conclude(
-            state, "ONE_LEG_EXPOSED",
-            "ADD holds up to %s %s from Spot; fee truth is incomplete"
+        return _entry_freeze(
+            state, persistence,
+            "holding up to %s %s from Spot"
             % (fmt(executed), market["base"]),
-            "unfinished ADD is frozen; an assumed fee cannot size a hedge")
-    buy_base_fee = base_fee_of(trades, market["base"])
-    net_base = executed - buy_base_fee
-    try:
-        hedge, hedge_refusal = _v2_add_hedge_quantity(
-            net_base, market, effective_cap)
-    except PositionError as error:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "HEDGE_AUTHORITY_REFUSED"
-        transition["hedge_refusal"] = clean(error, 220)
-        transition["updated_utc"] = utc()
-        save(state)
-        return conclude(
-            state, "UNKNOWN", "ADD Spot fill stands without a proven hedge",
-            "Futures hedge authority is unreadable; no hedge was submitted")
-    transition["spot_terminal"] = {
-        "executed_quantity": fmt(executed),
-        "base_fee": fmt(buy_base_fee),
-        "net_base_quantity": fmt(net_base),
+            "Spot fee truth is incomplete; no hedge was sized",
+            one_leg=True)
+    spot_leg = _entry_order_leg(
+        state, persistence, "spot", spot_client, order)
+    base_fee = Decimal(
+        spot_leg["fee_by_asset"].get(market["base"], "0"))
+    if base_fee > executed:
+        return _entry_freeze(
+            state, persistence, "Spot fee exceeds its fill",
+            "entry fee truth is inconsistent", one_leg=True)
+    net_base = _v2_decimal_subtract(executed, base_fee)
+    spot_quote = Decimal(spot_leg["executed_quote"])
+    spot_gate = None
+    if executed < market["spot_min_qty"]:
+        spot_gate = "SPOT_ACTUAL_QUANTITY_BELOW_MINIMUM"
+    elif spot_quote < market["spot_min_notional"]:
+        spot_gate = "SPOT_ACTUAL_NOTIONAL_BELOW_MINIMUM"
+    elif spot_quote > plan.spot_quote_cap:
+        spot_gate = "SPOT_FILL_EXCEEDS_PERSISTED_INTENT"
+    hedge, hedge_refusal = _entry_hedge_quantity(
+        accepted, authority, plan, market, net_base)
+    state.receipt["entry_result"] = {
+        "spot_executed_quantity": fmt(executed),
+        "spot_executed_quote": fmt(spot_quote),
+        "spot_base_fee": fmt(base_fee),
+        "spot_net_quantity": fmt(net_base),
         "hedge_quantity": "0" if hedge is None else fmt(hedge),
-        "hedge_refusal": hedge_refusal,
+        "hedge_refusal": hedge_refusal or spot_gate,
     }
-    transition["status"] = "SPOT_TERMINAL"
-    transition["stage"] = "SPOT_OWN_ORDER_TERMINAL"
-    transition["updated_utc"] = utc()
     save(state)
-    if hedge is None:
-        verdict, exposure, note = _execute_v2_add_unwind(
-            state, plan, market, net_base, "NOT_SEALED")
-        return conclude(state, verdict, exposure, note)
-
-    client = persist_intent(
-        cfg.receipt_dir, position, ENTER_SHORT, plan, state.run_id,
-        hedge, state=state)
-    res, order, _fills = _settle_v2_add_leg(
-        state, ENTER_SHORT, plan, hedge)
-    if res == "identity_mismatch":
-        return conclude(
-            state, "UNKNOWN", "ADD short response identity was refused",
-            "ORDER_RESPONSE_IDENTITY_MISMATCH; unfinished ADD is frozen")
-    if res == "unknown":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SHORT_OUTCOME_UNKNOWN"
-        transition["updated_utc"] = utc()
-        save(state)
-        return conclude(
-            state, "UNKNOWN",
-            "ADD holds Spot %s %s; short SELL outcome is unconfirmed for %s"
-            % (fmt(net_base), market["base"], client),
-            "unfinished ADD is frozen; nothing is resent")
-    short_filled = d(order.get("executedQty", "0")) \
-        if res == "terminal" else Decimal(0)
-    if short_filled <= 0:
-        short_status = "REJECTED" if res == "rejected" else "ZERO_FILLED"
-        verdict, exposure, note = _execute_v2_add_unwind(
-            state, plan, market, net_base, short_status)
-        return conclude(state, verdict, exposure, note)
-
+    persistence.stage_spot_result(state, spot_leg, hedge)
+    if spot_gate is not None or hedge is None:
+        return _execute_entry_unwind(
+            cfg, state, persistence, plan, market, spot_leg, net_base,
+            "NOT_SEALED", spot_gate or hedge_refusal)
     try:
-        persisted, permanent = _finish_v2_add_receipt(
-            state, position, now_ms())
-    except (ArithmeticError, PositionError, TypeError, ValueError) as error:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "RUNG_COMMIT_REFUSED"
-        transition["commit_error"] = clean(error, 220)
-        transition["updated_utc"] = utc()
-        save(state)
-        return conclude(
-            state, "UNKNOWN",
-            "both ADD own orders are terminal but ledger commit is unproved",
-            "unfinished ADD is frozen: %s" % clean(error, 220))
-    if permanent:
-        return conclude(
-            state, "UNKNOWN",
-            "ADD rung %s is recorded with freeze reason(s) %s"
-            % (ordinal, ",".join(permanent)),
-            "RungFilled is durable; aggregate reconcile is still required")
+        short_client = persistence.persist_short_intent(
+            state, plan, spot_leg, hedge)
+    except PositionError as error:
+        return _execute_entry_unwind(
+            cfg, state, persistence, plan, market, spot_leg, net_base,
+            "NOT_SEALED", "SHORT_INTENT_NOT_COMMITTED")
+    res, order, _ = _settle_entry_leg(
+        state, persistence, ENTER_SHORT, plan, hedge)
+    persistence.record_leg(
+        state, ENTER_SHORT, short_client, res, order)
+    if res == "unknown":
+        return _entry_freeze(
+            state, persistence,
+            "Spot %s %s stands; state is either unhedged spot or the full pair"
+            % (fmt(net_base), market["base"]),
+            "persisted short identity must be queried; nothing is resent")
+    short_filled = d(order.get("executedQty", "0")) \
+        if res == "terminal" and isinstance(order, dict) else Decimal(0)
+    if res == "rejected" or short_filled <= 0:
+        status = "REJECTED" if res == "rejected" else "ZERO_FILLED"
+        return _execute_entry_unwind(
+            cfg, state, persistence, plan, market, spot_leg, net_base,
+            status, "HEDGE_NOT_FILLED_SPOT_UNWOUND")
+    short_leg = _entry_order_leg(
+        state, persistence, "short", short_client, order)
+    short_quote = Decimal(short_leg["executed_quote"])
+    short_cap = plan.short_notional \
+        if authority.effective_cap_quote is None else min(
+            plan.short_notional, authority.effective_cap_quote)
+    terminal_refusal = None
+    if short_filled < market["futures_min_qty"]:
+        terminal_refusal = "SHORT_ACTUAL_QUANTITY_BELOW_MINIMUM"
+    elif short_quote < market["futures_min_notional"]:
+        terminal_refusal = "SHORT_ACTUAL_NOTIONAL_BELOW_MINIMUM"
+    elif short_filled > hedge:
+        terminal_refusal = "SHORT_FILL_EXCEEDS_PERSISTED_INTENT"
+    elif short_quote > short_cap:
+        terminal_refusal = "SHORT_FILL_EXCEEDS_QUOTE_CAP"
+    if terminal_refusal is not None:
+        return _entry_freeze(
+            state, persistence,
+            "positive short fill remains outside terminal entry gates",
+            terminal_refusal, one_leg=True)
+    try:
+        persistence.commit_filled(
+            state, spot_leg, short_leg, now_ms())
+    except PositionError as error:
+        return _entry_freeze(
+            state, persistence,
+            "both own orders are terminal but entry commit is unproved",
+            clean(error, 220), one_leg=True)
     return conclude(
         state, "OPEN",
-        "ADD rung %s records Spot net %s %s and short %s"
-        % (ordinal, fmt(net_base), market["base"], fmt(short_filled)),
-        "terminal own-order fills are durable; fresh aggregate reconcile "
-        "is required before another ADD")
+        "entry ordinal %s records Spot net %s %s and short %s"
+        % (authority.ordinal, fmt(net_base), market["base"],
+           fmt(short_filled)),
+        "terminal own-order fills were committed before the audit verdict")
 
 
-def _unwind_spot(cfg: PositionConfig, state: RunState,
-                 position: Dict[str, Any], plan: CyclePlan,
-                 market: Dict[str, Any], net_base: Decimal,
-                 now_ms) -> int:
-    """Ordered unwind of a spot leg that never got its hedge: sell the
-    SPOT-step floor of the acquired net base (the maximal honest sale),
-    exactly the reconcile discipline."""
-    sellable = quantize_down(net_base, market["spot_step"])
-    if sellable <= 0:
-        position["state"] = ST_ONE_LEG
-        position["one_leg_since_ms"] = now_ms()
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "ONE_LEG_EXPOSED",
-                        "holding %s %s dust below the spot step; cannot "
-                        "hedge or sell it back"
-                        % (fmt(net_base), market["base"]),
-                        "short leg refused; no repair trade")
-    client = persist_intent(cfg.receipt_dir, position, UNWIND_SPOT, plan,
-                            state.run_id, sellable)
-    res, order, fills = settle_leg(state, UNWIND_SPOT, plan, sellable)
-    record_leg(cfg.receipt_dir, position, UNWIND_SPOT, client, "spot", res,
-               order)
-    if res == "unknown":
-        position["state"] = ST_UNKNOWN
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "UNKNOWN",
-                        "spot unwind unconfirmed: holding either spot %s %s "
-                        "or nothing; query %s"
-                        % (fmt(net_base), market["base"], client),
-                        "lane frozen; nothing resent")
-    sold = d(order.get("executedQty", "0")) if res == "terminal" \
-        else Decimal(0)
-    if sold <= 0:
-        position["state"] = ST_ONE_LEG
-        position["one_leg_since_ms"] = now_ms()
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "ONE_LEG_EXPOSED",
-                        "holding spot %s %s, no hedge; unwind rejected"
-                        % (fmt(net_base), market["base"]),
-                        "exposure stands; report to owner; no repair trade")
-    trades, _covered = spot_trades(
-        state, state.receipt["legs"][-1].get("order_id", ""), sold, fills)
-    attach_fees(state, len(state.receipt["legs"]) - 1, trades)
-    attach_position_fees(cfg.receipt_dir, position, state)
-    residual = net_base - sold - base_fee_of(trades, market["base"])
-    if residual >= market["spot_step"]:
-        position["state"] = ST_ONE_LEG
-        position["one_leg_since_ms"] = now_ms()
-        save_position(cfg.receipt_dir, position)
-        return conclude(state, "ONE_LEG_EXPOSED",
-                        "unwind sold %s; residual %s %s at or above the "
-                        "spot step is sellable"
-                        % (fmt(sold), fmt(residual), market["base"]),
-                        "no repair trade; reconcile before any new entry")
-    position["state"] = ST_NONE
-    position["unwound"] = {"sold_qty": fmt(sold),
-                           "residual_base": fmt(residual)}
-    save_position(cfg.receipt_dir, position)
-    release_lock(state)
-    return conclude(state, "REJECTED_BEFORE_ENTRY", "none",
-                    "short refused; spot unwound through the ordered path; "
-                    "residual %s below the spot step" % fmt(residual))
+def cmd_open(cfg: PositionConfig, request, sleep=time.sleep,
+             now_ms: Callable[[], int] = default_now_ms,
+             proposal_id: Optional[str] = None, *,
+             runner_cap: Optional[Decimal] = None) -> int:
+    seals = _entry_seals(cfg.receipt_dir)
+    if seals:
+        print("OPEN | %s | BLOCKED | %s file present; entry is disabled"
+              % (cfg.symbol, seals[0]))
+        return EXIT_CODE["BLOCKED"]
+    try:
+        accepted = load_entry_proposal(
+            cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha, now_ms())
+        authority, persistence = _prepare_open_entry(
+            cfg, accepted, runner_cap)
+    except _EntryBlocked as error:
+        print("OPEN | %s | BLOCKED | %s" % (
+            cfg.symbol, clean(error, 300)))
+        return EXIT_CODE["BLOCKED"]
+    except PositionError as error:
+        print("OPEN | %s | REFUSED | %s" % (
+            cfg.symbol, clean(error, 300)))
+        return EXIT_CODE["REFUSED"]
+    return _execute_entry(
+        cfg, request, sleep, now_ms, accepted=accepted,
+        authority=authority, persistence=persistence)
 
 
-# --------------------------------------------------------------------------
-# --check: one hold-loop tick — public reads, recomputed entry gap, the
-# spec's exit triggers, a factual decision. Never places an order.
-# --------------------------------------------------------------------------
-
+def cmd_add(cfg: PositionConfig, request, sleep=time.sleep,
+            now_ms: Callable[[], int] = default_now_ms,
+            proposal_id: Optional[str] = None, *,
+            runner_cap: Optional[Decimal] = None) -> int:
+    seals = _entry_seals(cfg.receipt_dir)
+    if seals:
+        print("ADD | %s | BLOCKED | %s file present; entry is disabled"
+              % (cfg.symbol, seals[0]))
+        return EXIT_CODE["BLOCKED"]
+    command_now = now_ms()
+    try:
+        accepted = load_entry_proposal(
+            cfg.receipt_dir, proposal_id, cfg.symbol, cfg.sha, command_now)
+        authority, persistence = _prepare_add_entry(
+            cfg, accepted, command_now, runner_cap)
+    except PositionError as error:
+        print("ADD | %s | BLOCKED | %s" % (
+            cfg.symbol, clean(error, 300)))
+        return EXIT_CODE["BLOCKED"]
+    return _execute_entry(
+        cfg, request, sleep, now_ms, accepted=accepted,
+        authority=authority, persistence=persistence)
 def hold_decision(position: Dict[str, Any], current_gap_pct: Decimal,
                   fees_pct: Decimal, emergency_present: bool,
                   now_ms: int) -> Dict[str, Any]:
@@ -7575,557 +6823,583 @@ def derive_resume(position: Dict[str, Any],
     }
 
 
-def _merge_v2_add_query_truth(
-        receipt: Dict[str, Any], role: str,
-        query_state: str, order: Any) -> Optional[str]:
-    transition = receipt["add_transition"]
-    intent = transition["intents"].get(role)
-    if not isinstance(intent, dict):
-        return "INTENT_MISSING"
-    stage = {
-        "spot": ENTER_SPOT,
-        "short": ENTER_SHORT,
-        "unwind": UNWIND_SPOT,
-    }.get(role)
-    if stage is None:
-        raise PositionError("version-2 ADD resume role is invalid")
-    rows = [
-        row for row in receipt.get("legs", [])
-        if isinstance(row, dict) and row.get("stage") == stage
-    ]
-    if len(rows) > 1:
+def _entry_audit_receipts(
+        receipt_dir: str) -> List[Tuple[str, Dict[str, Any]]]:
+    try:
+        names = sorted(os.listdir(receipt_dir))
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise PositionError("entry audit directory is unreadable") from None
+    receipts = []
+    for name in names:
+        if not name.startswith("basis-position-") \
+                or not name.endswith(".json"):
+            continue
+        path = os.path.join(receipt_dir, name)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise PositionError(
+                "an entry audit receipt is unreadable") from None
+        if isinstance(receipt, dict) \
+                and receipt.get("kind") == "position-add":
+            receipts.append((path, receipt))
+    return receipts
+
+
+def _entry_receipt_rung_id(receipt: Dict[str, Any]) -> Optional[str]:
+    direct = receipt.get("rung_id")
+    authority = receipt.get("entry_authority")
+    nested = authority.get("rung_id") \
+        if isinstance(authority, dict) else None
+    if direct is not None and nested is not None and direct != nested:
+        raise PositionError("entry audit rung identity disagrees")
+    value = direct if direct is not None else nested
+    return value if isinstance(value, str) and value else None
+
+
+def _entry_receipt_for_rung(
+        receipts: List[Tuple[str, Dict[str, Any]]], rung_id: str
+        ) -> Optional[Tuple[str, Dict[str, Any]]]:
+    matches = [row for row in receipts
+               if _entry_receipt_rung_id(row[1]) == rung_id]
+    if len(matches) > 1:
         raise PositionError(
-            "version-2 ADD resume found duplicate leg receipts")
+            "more than one audit receipt binds the same rung")
+    return matches[0] if matches else None
+
+
+def _projection_authority(
+        position: Dict[str, Any], projection: Dict[str, Any]
+        ) -> EntryAuthority:
+    ordinal = projection["ordinal"]
+    config = position["ledger"][0]
+    row = config["schedule"][ordinal - 1]
+    return EntryAuthority(
+        command="ADD",
+        ordinal=ordinal,
+        rung_id=projection["rung_id"],
+        schedule_entry_gap_pct=Decimal(
+            projection.get("schedule_entry_gap_pct",
+                           row["entry_gap_pct"])),
+        schedule_quote_cap=Decimal(row["quote_cap"]),
+        effective_cap_quote=Decimal(
+            projection["effective_cap_quote"]),
+        config_event_digest=projection["config_event_digest"],
+        reconcile_id=projection.get("reconcile_id"),
+        dislocation=_copy_v2_record(
+            projection["dislocation"], "recovery dislocation"),
+    )
+
+
+def _audit_matches_projection(
+        receipt: Dict[str, Any], authority: EntryAuthority,
+        projection: Dict[str, Any]) -> bool:
+    row = receipt.get("entry_authority")
+    if not isinstance(row, dict):
+        return False
+    expected = _authority_row(authority, projection["rung_id"])
+    if row != expected \
+            or receipt.get("run_id") != projection.get("run_id") \
+            or receipt.get("proposal_id") \
+            != projection.get("proposal_id") \
+            or receipt.get("proposal_digest") \
+            != projection.get("proposal_digest"):
+        return False
+    intents = receipt.get("entry_intents", {})
+    for role in ("spot", "short", "unwind"):
+        projected = projection.get(role + "_intent")
+        if projected is not None and intents.get(role) != projected:
+            return False
+    return True
+
+
+def _reconstruct_entry_audit(
+        cfg: PositionConfig, position: Dict[str, Any],
+        projection: Dict[str, Any], authority: EntryAuthority
+        ) -> Tuple[str, Dict[str, Any]]:
+    run_id = projection.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise PositionError(
+            "legacy directly seeded rung has no resumable ADD audit")
+    path = os.path.join(
+        cfg.receipt_dir, "basis-position-%s.json" % run_id)
+    if os.path.exists(path):
+        raise PositionError(
+            "rung audit path exists but does not bind its ledger identity")
+    intents = {
+        role: projection[role + "_intent"]
+        for role in ("spot", "short", "unwind")
+        if projection.get(role + "_intent") is not None
+    }
+    receipt = {
+        "kind": "position-add",
+        "run_id": run_id,
+        "sha": cfg.sha,
+        "symbol": cfg.symbol,
+        "started_utc": utc(),
+        "legs": [],
+        "proposal_id": projection.get("proposal_id"),
+        "proposal_digest": projection.get("proposal_digest"),
+        "ordinal": projection["ordinal"],
+        "rung_id": projection["rung_id"],
+        "entry_authority": _authority_row(
+            authority, projection["rung_id"]),
+        "entry_intents": _copy_v2_record(
+            intents, "reconstructed entry intents"),
+        "entry_transition": {
+            "status": "RECOVERING",
+            "stage": projection.get("stage", "LEDGER_TERMINAL"),
+            "rung_id": projection["rung_id"],
+            "updated_utc": utc(),
+        },
+        "client_ids": {
+            intent["newClientOrderId"]: {
+                "stage": {"spot": ENTER_SPOT,
+                          "short": ENTER_SHORT,
+                          "unwind": UNWIND_SPOT}[role],
+                "market": intent["market"],
+                "run_id": run_id,
+            }
+            for role, intent in intents.items()
+        },
+    }
+    state = make_state(
+        cfg, lambda *args, **kwargs: ("unclear", {}),
+        lambda seconds: None, "resume", receipted=False,
+        run_id_override=run_id)
+    state.receipt_path = path
+    state.receipt = receipt
+    save(state)
+    return path, receipt
+
+
+def _recovery_state(
+        cfg: PositionConfig, request, sleep,
+        path: str, receipt: Dict[str, Any], run_id: str) -> RunState:
+    state = make_state(
+        cfg, request, sleep, "resume", receipted=False,
+        run_id_override=run_id)
+    state.receipt_path = path
+    state.receipt = receipt
+    state.events.append(base_event(state, "run_start"))
+    return state
+
+
+def _prior_entry_observation(
+        receipt: Dict[str, Any], role: str) -> Optional[Dict[str, Any]]:
+    observations = receipt.get("entry_observations", {})
+    if isinstance(observations, dict):
+        for key in (role, {
+                "spot": ENTER_SPOT,
+                "short": ENTER_SHORT,
+                "unwind": UNWIND_SPOT,
+                }[role]):
+            row = observations.get(key)
+            if isinstance(row, dict):
+                return dict(row)
+    return None
+
+
+def _merge_entry_query_truth(
+        state: RunState, role: str, intent: Dict[str, Any],
+        query_state: str, order: Any) -> None:
     if query_state == "identity_mismatch":
         raise PositionError(
-            "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD resume "
-            "refused a polled identity")
-    returned_order = query_state in ("pending", "terminal") \
-        and isinstance(order, dict)
-    if returned_order:
-        client = intent.get("newClientOrderId")
-        if order.get("clientOrderId") != client:
-            raise PositionError(
-                "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD resume "
-                "client identity does not match")
-        if order.get("symbol") != transition["plan"]["symbol"]:
-            raise PositionError(
-                "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD resume "
-                "symbol does not match")
-        submit_order_id = transition.get("submit_order_ids", {}).get(role)
-        if submit_order_id is not None \
-                and str(order.get("orderId", "")) \
-                != str(submit_order_id):
-            raise PositionError(
-                "ORDER_RESPONSE_IDENTITY_MISMATCH: version-2 ADD resume "
-                "submit and query order ids do not match")
-        strongest = _v2_add_order_observation(transition, role, order)
-        if strongest is None:
-            raise PositionError(
-                "version-2 ADD resume order observation is unreadable")
-        if not rows:
-            row = {
-                "stage": stage,
-                "client_id": client,
-                "market": VENUES[intent["market"]].name,
-                "status": "UNKNOWN",
-                "utc": utc(),
-            }
-            receipt.setdefault("legs", []).append(row)
-            rows = [row]
-        if query_state == "pending":
-            rows[0]["strongest_order_observation"] = strongest
+            "ORDER_RESPONSE_IDENTITY_MISMATCH: recovery identity refused")
+    stage = {"spot": ENTER_SPOT,
+             "short": ENTER_SHORT,
+             "unwind": UNWIND_SPOT}[role]
+    rows = [row for row in state.receipt.get("legs", [])
+            if isinstance(row, dict) and row.get("stage") == stage]
+    if len(rows) > 1:
+        raise PositionError("recovery found duplicate entry leg receipts")
     if query_state != "terminal":
-        exact_rejected_absence = bool(
-            rows and query_state == "not_found"
-            and rows[0].get("status") == "REJECTED"
-            and not rows[0].get("order_id"))
-        if rows and rows[0].get("status") in V2_TERMINAL_ORDER_STATUSES \
-                and not exact_rejected_absence:
-            raise PositionError(
-                "version-2 ADD persisted terminal truth became absent or "
-                "unconfirmed")
-        return query_state.upper()
-    if not returned_order:
+        return
+    if not isinstance(order, dict) \
+            or order.get("symbol") != state.cfg.symbol \
+            or order.get("clientOrderId") \
+            != intent["newClientOrderId"]:
         raise PositionError(
-            "version-2 ADD resume terminal response is unreadable")
-    client = intent.get("newClientOrderId")
-    order_id = str(order.get("orderId", ""))
+            "ORDER_RESPONSE_IDENTITY_MISMATCH: recovery order does not bind")
     venue = VENUES[intent["market"]]
-    status = order.get("status")
-    if status not in V2_TERMINAL_ORDER_STATUSES:
-        raise PositionError(
-            "version-2 ADD resume order is not terminal")
     try:
         executed = d(order["executedQty"])
         quote = d(order[venue.quote_field])
     except (ArithmeticError, KeyError, TypeError, ValueError):
         raise PositionError(
-            "version-2 ADD resume terminal quantities are unreadable") \
-            from None
-    if not executed.is_finite() or not quote.is_finite() \
-            or not order_id:
-        raise PositionError(
-            "version-2 ADD resume terminal truth is incomplete")
+            "recovery terminal quantities are unreadable") from None
+    order_id = order.get("orderId")
+    if not executed.is_finite() or executed < 0 \
+            or not quote.is_finite() or quote < 0 \
+            or order_id is None or not str(order_id):
+        raise PositionError("recovery terminal order truth is incomplete")
     if rows:
         row = rows[0]
-        if row.get("client_id") != client:
+        prior_id = row.get("order_id")
+        if prior_id is not None and str(prior_id) != str(order_id):
             raise PositionError(
-                "version-2 ADD resume persisted client identity drifted")
-        if row.get("status") in V2_TERMINAL_ORDER_STATUSES:
-            try:
-                prior_executed = d(row["executed_qty"])
-                prior_quote = d(row["quote"])
-            except (ArithmeticError, KeyError, TypeError, ValueError):
-                raise PositionError(
-                    "version-2 ADD persisted terminal truth is unreadable") \
-                    from None
-            if row["status"] != status or prior_executed != executed \
-                    or prior_quote != quote \
-                    or str(row.get("order_id", "")) != order_id:
-                raise PositionError(
-                    "version-2 ADD terminal own-order truth drifted")
+                "ORDER_RESPONSE_IDENTITY_MISMATCH: order id changed")
     else:
-        row = {
-            "stage": stage,
-            "client_id": client,
-            "market": venue.name,
-            "utc": utc(),
-        }
-        receipt.setdefault("legs", []).append(row)
+        row = {"stage": stage, "market": venue.name,
+               "client_id": intent["newClientOrderId"]}
+        state.receipt.setdefault("legs", []).append(row)
     row.update({
-        "status": str(status),
-        "order_id": order_id,
-        "confirmed_symbol": transition["plan"]["symbol"],
+        "status": str(order.get("status", "")),
+        "order_id": str(order_id),
         "executed_qty": fmt(executed),
         "quote": fmt(quote),
         "terminal_utc": utc(),
-        "resume_query": "terminal",
-    })
-    return None
-
-
-def _resume_v2_add(
-        cfg: PositionConfig, request, sleep,
-        now_ms: Callable[[], int], position: Dict[str, Any],
-        active_path: str, active_receipt: Dict[str, Any]) -> int:
-    transition = active_receipt.get("add_transition")
-    if not isinstance(transition, dict):
-        print("RESUME | %s | BLOCKED | unfinished ADD transition unreadable"
-              % cfg.symbol)
-        return EXIT_CODE["BLOCKED"]
-    original_run = transition.get("run_id")
-    resume_run = cfg.run_id
-    if resume_run and resume_run == original_run:
-        resume_run = resume_run + "-resume"
-    state = make_state(
-        cfg, request, sleep, "resume",
-        run_id_override=resume_run or None)
-    state.receipt.update({
-        "recovered_add_run_id": original_run,
-        "recovered_add_ordinal": transition.get("ordinal"),
     })
     save(state)
-    operation_state = make_state(
-        cfg, request, sleep, "resume", receipted=False,
-        run_id_override=original_run)
-    operation_state.receipt_path = active_path
-    operation_state.receipt = active_receipt
-    operation_state.events_path = state.events_path
 
-    if transition.get("identity_refusal") is not None:
-        return conclude(
-            state, "UNKNOWN", "unfinished ADD response identity was refused",
-            "ORDER_RESPONSE_IDENTITY_MISMATCH remains frozen; no order was "
-            "submitted")
 
-    def finish_recovered(
-            verdict: str, exposure: str, note: str) -> int:
-        if transition.get("status") == "ABORTED":
-            active_receipt.update({
-                "verdict": ST_ADD_ABORTED,
-                "exposure": clean(exposure, 300),
-                "verdict_note": clean(note, 300),
-                "finished_utc": utc(),
-            })
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(state, verdict, exposure, note)
+def _query_recovery_role(
+        state: RunState, persistence: _V2RungPersistence,
+        role: str, intent: Dict[str, Any]) -> Tuple[str, Any]:
+    prior = _prior_entry_observation(state.receipt, role)
+    expected_order_id = None
+    if prior is not None and prior.get("orderId") is not None:
+        expected_order_id = str(prior["orderId"])
 
-    if transition.get("config_event_digest") \
-            != position["ledger"][0]["event_digest"]:
-        return conclude(
-            state, "UNKNOWN", "version-2 ADD config epoch mismatch",
-            "unfinished ADD remains frozen; no order was submitted")
-    abort_identity, abort_terminal = _v2_add_abort_identity_state(
-        position, transition)
-    if abort_identity == "MISMATCH":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "ABORT_IDENTITY_MISMATCH"
-        transition["identity_refusal"] = {
-            "reason": "ADD_ABORT_IDENTITY_MISMATCH",
-            "fields": [
-                "ordinal", "client_ids", "run_id", "proposal_id",
-                "proposal_digest", "dislocation",
-            ],
-        }
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "UNKNOWN", "recorded ADD abort identity disagrees",
-            "ADD_ABORT_IDENTITY_MISMATCH; resume submitted nothing")
-    if abort_identity == "MATCH" and abort_terminal is not None:
-        transition.update({
-            "status": "ABORTED",
-            "stage": ST_ADD_ABORTED,
-            "abort_reason": abort_terminal["reason"],
-            "spot_status": abort_terminal["spot_status"],
-            "short_status": abort_terminal["short_status"],
-            "spot_net_quantity": abort_terminal["spot_net_quantity"],
-            "unwind_requested_quantity": abort_terminal[
-                "unwind_requested_quantity"],
-            "unwind_filled_quantity": abort_terminal[
-                "unwind_filled_quantity"],
-            "unwind_base_fee_quantity": abort_terminal[
-                "unwind_base_fee_quantity"],
-            "dust_quantity": abort_terminal["dust_quantity"],
-            "after_event_count": len(position["ledger"]),
-            "after_last_digest": position["ledger"][-1]["event_digest"],
-            "updated_utc": utc(),
-        })
-        dust = d(abort_terminal["dust_quantity"])
-        exposure = "none" if dust == 0 else \
-            "Spot residual %s" % fmt(dust)
-        return finish_recovered(
-            ST_ADD_ABORTED, exposure,
-            "resume repaired the durable AddAborted receipt; no order was "
-            "submitted")
-    rung_identity = _v2_add_rung_identity_state(position, transition)
-    if rung_identity == "MISMATCH":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "RUNG_IDENTITY_MISMATCH"
-        transition["identity_refusal"] = {
-            "reason": "ADD_RUNG_IDENTITY_MISMATCH",
-            "fields": [
-                "ordinal", "client_ids", "run_id", "proposal_id",
-                "proposal_digest", "dislocation",
-            ],
-        }
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "UNKNOWN", "recorded ADD rung identity disagrees",
-            "ADD_RUNG_IDENTITY_MISMATCH; resume submitted nothing")
-    if rung_identity == "MATCH":
-        transition["status"] = "COMMITTED"
-        transition["stage"] = "RUNG_FILLED_APPENDED"
-        transition["after_event_count"] = len(position["ledger"])
-        transition["after_last_digest"] = position["ledger"][-1][
-            "event_digest"]
-        transition["updated_utc"] = utc()
-        active_receipt.update({
-            "verdict": "OPEN",
-            "exposure": "rung already recorded",
-            "verdict_note": "resume repaired the command receipt only",
-            "finished_utc": utc(),
-        })
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "OPEN", "ADD rung already recorded",
-            "command receipt repaired; no order was submitted")
+    def observation_sink(_observed_role: str,
+                         order: Dict[str, Any]) -> None:
+        state.receipt.setdefault("entry_observations", {})[role] = \
+            dict(order)
+        save(state)
 
-    intents = transition.get("intents")
-    ledger_active = derive_v2_state(position)["active_transition"]
-    if ledger_active is None \
-            or ledger_active["run_id"] != original_run \
-            or ledger_active["ordinal"] != transition.get("ordinal") \
-            or ledger_active["proposal_id"] \
-            != transition.get("proposal_id") \
-            or ledger_active["proposal_digest"] \
-            != transition.get("proposal_digest") \
-            or ledger_active["dislocation"] \
-            != transition.get("dislocation"):
-        return conclude(
-            state, "UNKNOWN", "unfinished ADD does not bind ledger intent",
-            "resume submitted nothing")
-    if not isinstance(intents, dict):
-        intents = {}
-        transition["intents"] = intents
-    receipt_spot_intent = intents.get("spot")
-    if receipt_spot_intent is not None:
-        try:
-            normalized_spot_intent = _normalize_v2_entry_intent(
-                receipt_spot_intent, "spot", "ADD receipt Spot intent",
-                require_canonical=False)
-        except PositionError:
-            normalized_spot_intent = None
-        if normalized_spot_intent != ledger_active["spot_intent"]:
-            return conclude(
-                state, "UNKNOWN", "unfinished ADD Spot intent disagrees",
-                "resume submitted nothing")
-    intents["spot"] = ledger_active["spot_intent"]
-    if ledger_active.get("short_intent") is not None:
-        receipt_short_intent = intents.get("short")
-        if receipt_short_intent is not None:
-            try:
-                normalized_short_intent = _normalize_v2_entry_intent(
-                    receipt_short_intent, "short",
-                    "ADD receipt short intent",
-                    require_canonical=False)
-            except PositionError:
-                normalized_short_intent = None
-            if normalized_short_intent != ledger_active["short_intent"]:
-                return conclude(
-                    state, "UNKNOWN", "unfinished ADD short intent disagrees",
-                    "resume submitted nothing")
-        intents["short"] = ledger_active["short_intent"]
-    if ledger_active["stage"] == "UNWIND_INTENT_PERSISTED":
-        receipt_unwind_intent = intents.get("unwind")
-        if receipt_unwind_intent is not None:
-            try:
-                normalized_unwind_intent = _normalize_v2_unwind_intent(
-                    receipt_unwind_intent, "ADD receipt unwind intent",
-                    require_canonical=False)
-            except PositionError:
-                normalized_unwind_intent = None
-            if normalized_unwind_intent != ledger_active["unwind_intent"]:
-                return conclude(
-                    state, "UNKNOWN", "unfinished ADD unwind intent disagrees",
-                    "resume submitted nothing")
-        intents["unwind"] = ledger_active["unwind_intent"]
-    if not isinstance(intents.get("spot"), dict):
-        return conclude(
-            state, "UNKNOWN", "unfinished ADD has no persisted Spot intent",
-            "resume cannot query an absent identity; no order was submitted")
+    query_state, order = query_client_order_strongest(
+        state, VENUES[intent["market"]], intent["newClientOrderId"],
+        expected_order_id=expected_order_id,
+        prior_order=prior,
+        observation_sink=observation_sink)
+    _merge_entry_query_truth(
+        state, role, intent, query_state, order)
+    return query_state, order
+
+
+def _recovery_plan(
+        active: Dict[str, Any], quantity: Decimal) -> CyclePlan:
+    spot_cap = Decimal(active["spot_intent"]["quoteOrderQty"])
+    effective = Decimal(active["effective_cap_quote"])
+    return CyclePlan(
+        symbol=active["spot_intent"]["symbol"],
+        entry_gap_bps=Decimal(
+            active["dislocation"]["entry_gap_pct"]) * Decimal(100),
+        exit_gap_bps=Decimal(
+            active["dislocation"]["exit_gap_pct"]) * Decimal(100),
+        funding_rate=Decimal(active["dislocation"]["funding_rate"]),
+        spot_quantity=quantity,
+        short_quantity=quantity,
+        spot_quote_cap=spot_cap,
+        short_notional=effective,
+        leverage=1,
+        reason="ledger-first entry recovery",
+    )
+
+
+def _recovery_persistence(
+        cfg: PositionConfig, position: Dict[str, Any],
+        active: Dict[str, Any], authority: EntryAuthority
+        ) -> _V2RungPersistence:
+    accepted = AcceptedProposal(
+        proposal_id=active["proposal_id"],
+        digest=active["proposal_digest"],
+        payload={}, quantity=Decimal("1"), net_edge_pct=Decimal("0"))
+    reconcile = _latest_v2_reconcile_event(position)
+    persistence = _V2RungPersistence(
+        cfg, accepted, authority, position, reconcile)
+    persistence.rung_id = active["rung_id"]
+    return persistence
+
+
+def _finish_recovered_unwind(
+        state: RunState, persistence: _V2RungPersistence,
+        active: Dict[str, Any], plan: CyclePlan,
+        market: Dict[str, Any], spot_leg: Dict[str, Any],
+        net_base: Decimal, order: Dict[str, Any]) -> int:
+    intent = active["unwind_intent"]
+    sellable = Decimal(intent["quantity"])
+    sold = d(order.get("executedQty", "0"))
+    if sold <= 0:
+        return _entry_freeze(
+            state, persistence, "Spot exposure remains",
+            "persisted unwind has no positive terminal fill", one_leg=True)
     try:
-        plan, market = _v2_add_plan_from_receipt(transition)
-        if plan.symbol != cfg.symbol:
-            raise PositionError(
-                "version-2 ADD plan symbol does not match resume command")
-    except (ArithmeticError, PositionError, TypeError, ValueError) as error:
-        return conclude(
-            state, "UNKNOWN", "unfinished ADD plan is unreadable",
-            "resume submitted nothing: %s" % clean(error, 220))
-    roles = ["spot"]
-    if ledger_active.get("short_intent") is not None:
-        roles.append("short")
-    if ledger_active["stage"] == "UNWIND_INTENT_PERSISTED":
-        roles.append("unwind")
-    query_results = {}
-    orders = {}
-    state.client_ids = tuple(
-        intents[role]["newClientOrderId"] for role in roles)
-    try:
-        for role in roles:
-            intent = intents[role]
-            client = intent["newClientOrderId"]
-            query_state, order = query_client_order_strongest(
-                state, VENUES[intent["market"]], client,
-                prior_order=_v2_add_prior_order_observation(
-                    active_receipt, role))
-            query_results[role] = query_state
-            orders[role] = order
-            _merge_v2_add_query_truth(
-                active_receipt, role, query_state, order)
-    except (ArithmeticError, KeyError, PositionError, TypeError, ValueError) \
-            as error:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "RESUME_TRUTH_REFUSED"
-        transition["resume_error"] = clean(error, 220)
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "UNKNOWN", "unfinished ADD own-order truth disagrees",
-            "resume froze without a submission: %s" % clean(error, 220))
-    transition["resume_queries"] = dict(query_results)
-    transition["updated_utc"] = utc()
-    _save_other_receipt(state, active_path, active_receipt)
+        residual = sold_leg_result(
+            state, UNWIND_SPOT, order, [], net_base, sellable, market)
+    except ExecutorExit as exit_signal:
+        persistence.freeze(
+            state, "shared sold-leg terminal gate refused recovery",
+            one_leg=True)
+        return exit_signal.code
+    unwind_leg = _entry_order_leg(
+        state, persistence, "unwind",
+        intent["newClientOrderId"], order)
+    base_fee = Decimal(
+        unwind_leg["fee_by_asset"].get(market["base"], "0"))
+    persistence.commit_aborted(state, "HEDGE_NOT_FILLED_SPOT_UNWOUND", {
+        "spot_status": "FILLED",
+        "short_status": active["short_status"],
+        "spot_net_quantity": net_base,
+        "unwind_requested_quantity": sellable,
+        "unwind_filled_quantity": sold,
+        "unwind_base_fee_quantity": base_fee,
+        "dust_quantity": residual,
+        "spot_leg": spot_leg,
+        "unwind_leg": unwind_leg,
+        "unwind_completed": True,
+    })
+    return conclude(
+        state, ST_ADD_ABORTED, "none",
+        "ledger-first recovery committed measured Spot unwind")
 
-    if query_results.get("spot") == "not_found" \
-            and ledger_active["stage"] == "SPOT_INTENT_PERSISTED":
-        try:
-            _commit_v2_add_abort(
-                cfg.receipt_dir, active_receipt,
-                "SPOT_INTENT_EXACTLY_NOT_FOUND", "NOT_FOUND", "NOT_SEALED",
-                Decimal(0), Decimal(0), Decimal(0), Decimal(0), None, None)
-        except (ArithmeticError, PositionError, TypeError, ValueError) as error:
-            transition["status"] = "FROZEN"
-            transition["stage"] = "ABORT_COMMIT_REFUSED"
-            transition["resume_error"] = clean(error, 220)
-            transition["updated_utc"] = utc()
-            _save_other_receipt(state, active_path, active_receipt)
-            return conclude(
-                state, "UNKNOWN", "ADD exact absence could not be committed",
-                "resume submitted nothing: %s" % clean(error, 220))
-        return finish_recovered(
-            ST_ADD_ABORTED, "none",
-            "ADD_ABORTED records exact Spot intent absence; no order was "
-            "submitted")
 
-    if query_results.get("spot") != "terminal":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SPOT_OUTCOME_UNKNOWN"
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "UNKNOWN", "ADD Spot own order remains unconfirmed",
-            "resume queried the persisted identity and submitted nothing")
-
-    spot_rows = [
-        row for row in active_receipt.get("legs", [])
-        if isinstance(row, dict) and row.get("stage") == ENTER_SPOT
-    ]
-    if len(spot_rows) != 1:
-        return conclude(
-            state, "UNKNOWN", "ADD Spot receipt is not singular",
-            "resume submitted nothing")
-    spot_row = spot_rows[0]
-    spot_executed = d(spot_row["executed_qty"])
-    if spot_executed <= 0:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SPOT_ZERO_REQUIRES_AGREEMENT"
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "UNKNOWN", "ADD Spot terminal quantity is zero",
-            "aggregate agreement is required before the intent can close")
-    if not isinstance(spot_row.get("fee_by_asset"), dict):
-        trades, covered = spot_trades(
-            state, spot_row["order_id"], spot_executed, [])
-        if covered < spot_executed:
-            transition["status"] = "FROZEN"
-            transition["stage"] = "SPOT_FEE_TRUTH_UNKNOWN"
-            transition["updated_utc"] = utc()
-            _save_other_receipt(state, active_path, active_receipt)
-            return conclude(
-                state, "ONE_LEG_EXPOSED",
-                "ADD Spot fill stands but fee truth is incomplete",
-                "resume submitted nothing; hedge size remains unknown")
-        spot_row["fee_by_asset"] = fees_by_asset(trades)
-        _save_other_receipt(state, active_path, active_receipt)
-    base_asset = transition["plan"]["base_asset"]
-    fee_map = spot_row["fee_by_asset"]
-    try:
-        base_fee = d(fee_map.get(base_asset, "0"))
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        return conclude(
-            state, "UNKNOWN", "ADD fee or step truth is unreadable",
-            "resume submitted nothing")
-    net_base = spot_executed - base_fee
-    if not net_base.is_finite() or net_base <= 0:
-        return conclude(
-            state, "UNKNOWN", "ADD measured Spot net is not positive",
-            "resume submitted nothing")
-    try:
-        effective_cap = d(transition["effective_cap_quote"])
-        hedge, hedge_refusal = _v2_add_hedge_quantity(
-            net_base, market, effective_cap)
-    except (ArithmeticError, KeyError, PositionError, TypeError, ValueError):
-        return conclude(
-            state, "UNKNOWN", "ADD Futures hedge authority is unreadable",
-            "resume submitted nothing")
-    if ledger_active["stage"] == "UNWIND_INTENT_PERSISTED":
-        verdict, exposure, note = _resume_v2_add_unwind(
-            operation_state, plan, market, net_base,
-            ledger_active["short_status"], query_results["unwind"],
-            orders["unwind"])
-        return finish_recovered(verdict, exposure, note)
-    if "short" not in roles:
-        verdict, exposure, note = _execute_v2_add_unwind(
-            operation_state, plan, market, net_base, "NOT_SEALED")
-        return finish_recovered(verdict, exposure, note)
-    if hedge is None:
-        return conclude(
-            state, "UNKNOWN", "ADD short intent exceeds current authority",
-            "%s; resume submitted nothing"
-            % (hedge_refusal or "HEDGE_AUTHORITY_REFUSED"))
-    try:
-        intended_hedge = d(intents["short"]["quantity"])
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        return conclude(
-            state, "UNKNOWN", "ADD short intent quantity is unreadable",
-            "resume submitted nothing")
-    if intended_hedge != hedge:
-        return conclude(
-            state, "UNKNOWN", "ADD short intent no longer matches Spot fees",
-            "resume submitted nothing")
-    if query_results.get("short") == "not_found":
-        verdict, exposure, note = _execute_v2_add_unwind(
-            operation_state, plan, market, net_base, "NOT_FOUND")
-        return finish_recovered(verdict, exposure, note)
-    if query_results.get("short") != "terminal":
-        transition["status"] = "FROZEN"
-        transition["stage"] = "SHORT_OUTCOME_UNKNOWN"
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "ONE_LEG_EXPOSED",
-            "ADD Spot net %s %s stands; short own order is unconfirmed"
-            % (fmt(net_base), base_asset),
-            "resume queried both persisted identities and submitted nothing")
-
-    short_rows = [
-        row for row in active_receipt.get("legs", [])
-        if isinstance(row, dict) and row.get("stage") == ENTER_SHORT
-    ]
-    if len(short_rows) != 1:
-        return conclude(
-            state, "UNKNOWN", "ADD short receipt is not singular",
-            "resume submitted nothing")
-    short_filled = d(short_rows[0]["executed_qty"])
-    if short_filled <= 0:
-        short_status = "REJECTED" \
-            if short_rows[0]["status"] == "REJECTED" else "ZERO_FILLED"
-        verdict, exposure, note = _execute_v2_add_unwind(
-            operation_state, plan, market, net_base, short_status)
-        return finish_recovered(verdict, exposure, note)
-
-    transition["status"] = "FILLS_RECONCILED"
-    transition["stage"] = "BOTH_OWN_ORDERS_TERMINAL"
-    transition["updated_utc"] = utc()
-    _save_other_receipt(state, active_path, active_receipt)
-    try:
-        persisted = _commit_v2_add_receipt(
-            position, cfg.receipt_dir, active_receipt, now_ms())
-        derived = derive_v2_state(persisted)
-    except (ArithmeticError, PositionError, TypeError, ValueError) as error:
-        transition["status"] = "FROZEN"
-        transition["stage"] = "RUNG_COMMIT_REFUSED"
-        transition["commit_error"] = clean(error, 220)
-        transition["updated_utc"] = utc()
-        _save_other_receipt(state, active_path, active_receipt)
-        return conclude(
-            state, "UNKNOWN",
-            "both ADD own orders are terminal but ledger commit is unproved",
-            "resume submitted nothing: %s" % clean(error, 220))
-    transition["status"] = "COMMITTED"
-    transition["stage"] = "RUNG_FILLED_APPENDED"
-    transition["after_event_count"] = len(persisted["ledger"])
-    transition["after_last_digest"] = persisted["ledger"][-1][
-        "event_digest"]
-    transition["updated_utc"] = utc()
-    rung = derived["rungs"][transition["ordinal"] - 1]
-    permanent = [
-        reason for reason in rung["freeze_reasons"]
-        if not reason.startswith("RECONCILE_")
-    ]
-    active_receipt.update({
-        "verdict": "UNKNOWN" if permanent else "OPEN",
-        "exposure": "ADD rung recorded",
-        "verdict_note": "resume queried persisted identities; no submission",
+def _finalize_orphan_entry_receipt(
+        cfg: PositionConfig, request, sleep,
+        receipts: List[Tuple[str, Dict[str, Any]]],
+        known_rung_ids: set) -> Optional[int]:
+    orphans = []
+    for path, receipt in receipts:
+        rung_id = _entry_receipt_rung_id(receipt)
+        if rung_id not in known_rung_ids and "verdict" not in receipt:
+            orphans.append((path, receipt))
+    if len(orphans) > 1:
+        raise PositionError("more than one receipt lacks ledger authority")
+    if not orphans:
+        return None
+    path, receipt = orphans[0]
+    receipt.update({
+        "verdict": "NOT_STARTED",
+        "exposure": "none",
+        "verdict_note": "no initiating AddIntent exists; zero transport",
         "finished_utc": utc(),
     })
-    _save_other_receipt(state, active_path, active_receipt)
-    if permanent:
+    state = _recovery_state(
+        cfg, request, sleep, path, receipt,
+        str(receipt.get("run_id") or cfg.run_id or "not-started"))
+    save(state)
+    print("RESUME | %s | NOT_STARTED | no AddIntent; zero transport"
+          % cfg.symbol)
+    return EXIT_CODE["REFUSED"]
+
+
+def _resume_v2_entry(
+        cfg: PositionConfig, request, sleep,
+        now_ms: Callable[[], int], position: Dict[str, Any]) -> int:
+    derived = derive_v2_state(position)
+    if derived["symbol"] != cfg.symbol:
+        raise PositionError(
+            "version-2 ledger symbol does not match resume command")
+    receipts = _entry_audit_receipts(cfg.receipt_dir)
+    known_rung_ids = {
+        rung["rung_id"] for rung in derived["rungs"]
+    }
+    if derived["active_transition"] is not None:
+        known_rung_ids.add(derived["active_transition"]["rung_id"])
+    if derived["add_terminal"] is not None:
+        known_rung_ids.add(derived["add_terminal"]["rung_id"])
+
+    active = derived["active_transition"]
+    if active is None:
+        terminal = derived["add_terminal"]
+        if terminal is not None:
+            authority = _projection_authority(position, terminal)
+            found = _entry_receipt_for_rung(
+                receipts, terminal["rung_id"])
+            if found is None:
+                found = _reconstruct_entry_audit(
+                    cfg, position, terminal, authority)
+            path, receipt = found
+            if not _audit_matches_projection(
+                    receipt, authority, terminal):
+                raise PositionError(
+                    "terminal audit identity does not bind its rung")
+            if receipt.get("verdict") == ST_ADD_ABORTED:
+                print("RESUME | %s | state %s | nothing to progress"
+                      % (cfg.symbol, ST_ADD_ABORTED))
+                return EXIT_CODE[ST_ADD_ABORTED]
+            state = _recovery_state(
+                cfg, request, sleep, path, receipt, terminal["run_id"])
+            receipt["entry_transition"].update({
+                "status": "ABORTED", "stage": ST_ADD_ABORTED,
+                "reason": terminal["reason"], "updated_utc": utc(),
+            })
+            save(state)
+            return conclude(
+                state, ST_ADD_ABORTED,
+                "none" if Decimal(terminal["dust_quantity"]) == 0 else
+                "Spot residual %s" % terminal["dust_quantity"],
+                "terminal ledger repaired its missing audit; zero transport")
+        for rung in reversed(derived["rungs"]):
+            if rung["run_id"] is None:
+                continue
+            found = _entry_receipt_for_rung(receipts, rung["rung_id"])
+            if found is None:
+                authority = _projection_authority(position, rung)
+                path, receipt = _reconstruct_entry_audit(
+                    cfg, position, rung, authority)
+                state = _recovery_state(
+                    cfg, request, sleep, path, receipt, rung["run_id"])
+                receipt["entry_transition"].update({
+                    "status": "COMMITTED",
+                    "stage": "RUNG_FILLED_COMMITTED",
+                    "updated_utc": utc(),
+                })
+                save(state)
+                return conclude(
+                    state, "OPEN", "rung already recorded",
+                    "terminal ledger repaired its missing audit; "
+                    "zero transport")
+        orphan = _finalize_orphan_entry_receipt(
+            cfg, request, sleep, receipts, known_rung_ids)
+        if orphan is not None:
+            return orphan
+        print("RESUME | %s | BLOCKED | no active v2 entry; state %s"
+              % (cfg.symbol, derived["top_state"]))
+        return EXIT_CODE["BLOCKED"]
+
+    authority = _projection_authority(position, active)
+    found = _entry_receipt_for_rung(receipts, active["rung_id"])
+    if found is None:
+        found = _reconstruct_entry_audit(
+            cfg, position, active, authority)
+    path, receipt = found
+    if not _audit_matches_projection(receipt, authority, active):
+        raise PositionError(
+            "active audit identity does not bind rung, proposal, and "
+            "dislocation")
+    state = _recovery_state(
+        cfg, request, sleep, path, receipt, active["run_id"])
+    persistence = _recovery_persistence(
+        cfg, position, active, authority)
+    state.client_ids = tuple(
+        intent["newClientOrderId"] for intent in (
+            active.get("spot_intent"), active.get("short_intent"),
+            active.get("unwind_intent")) if intent is not None)
+    try:
+        spot_state, spot_order = _query_recovery_role(
+            state, persistence, "spot", active["spot_intent"])
+        if active.get("short_intent") is not None:
+            short_state, short_order = _query_recovery_role(
+                state, persistence, "short", active["short_intent"])
+        else:
+            short_state, short_order = None, None
+        if active.get("unwind_intent") is not None:
+            unwind_state, unwind_order = _query_recovery_role(
+                state, persistence, "unwind", active["unwind_intent"])
+        else:
+            unwind_state, unwind_order = None, None
+    except PositionError as error:
+        return _entry_freeze(
+            state, persistence, "unfinished ADD truth disagrees",
+            clean(error, 220), one_leg=True)
+    if spot_state == "not_found" \
+            and active["stage"] == "SPOT_INTENT_PERSISTED":
+        persistence.commit_aborted(
+            state, "SPOT_INTENT_EXACTLY_NOT_FOUND", {
+                "spot_status": "NOT_FOUND",
+                "short_status": "NOT_SEALED",
+                "spot_net_quantity": Decimal(0),
+                "unwind_requested_quantity": Decimal(0),
+                "unwind_filled_quantity": Decimal(0),
+                "dust_quantity": Decimal(0),
+                "spot_leg": None, "unwind_leg": None,
+            })
         return conclude(
-            state, "UNKNOWN",
-            "ADD rung %s is recorded with freeze reason(s) %s"
-            % (transition["ordinal"], ",".join(permanent)),
-            "resume submitted nothing; aggregate reconcile remains required")
+            state, ST_ADD_ABORTED, "none",
+            "ledger-first recovery proved exact Spot intent absence")
+    if spot_state != "terminal":
+        return _entry_freeze(
+            state, persistence, "ADD Spot order remains unconfirmed",
+            "ledger-first recovery queried the persisted identity only")
+    spot_executed = d(spot_order.get("executedQty", "0"))
+    if spot_executed <= 0:
+        return _entry_freeze(
+            state, persistence, "ADD Spot terminal quantity is zero",
+            "aggregate agreement is required", one_leg=True)
+    spot_rows = [row for row in state.receipt.get("legs", [])
+                 if row.get("stage") == ENTER_SPOT]
+    if not isinstance(spot_rows[0].get("fee_by_asset"), dict):
+        trades, covered = spot_trades(
+            state, spot_rows[0]["order_id"], spot_executed, [])
+        if covered < spot_executed:
+            return _entry_freeze(
+                state, persistence, "ADD Spot fee truth is incomplete",
+                "no hedge or unwind was inferred", one_leg=True)
+        attach_fees(
+            state, state.receipt["legs"].index(spot_rows[0]), trades)
+    spot_leg = _entry_order_leg(
+        state, persistence, "spot",
+        active["spot_intent"]["newClientOrderId"], spot_order)
+    base_asset = position["ledger"][0]["venue"]["base_asset"]
+    base_fee = Decimal(spot_leg["fee_by_asset"].get(base_asset, "0"))
+    if base_fee > spot_executed:
+        return _entry_freeze(
+            state, persistence, "ADD Spot fee exceeds its fill",
+            "fee truth is inconsistent", one_leg=True)
+    net_base = _v2_decimal_subtract(spot_executed, base_fee)
+    try:
+        market = market_context(state)
+    except Refusal as error:
+        return _entry_freeze(
+            state, persistence, "ADD Spot exposure remains",
+            str(error), one_leg=True)
+    plan = _recovery_plan(active, net_base)
+    persistence.plan = plan
+    persistence.market = market
+    if active["stage"] == "UNWIND_INTENT_PERSISTED":
+        if unwind_state != "terminal":
+            return _entry_freeze(
+                state, persistence, "ADD Spot unwind remains unconfirmed",
+                "later absence cannot authorize a resend", one_leg=True)
+        return _finish_recovered_unwind(
+            state, persistence, active, plan, market,
+            spot_leg, net_base, unwind_order)
+    if active.get("short_intent") is None:
+        return _execute_entry_unwind(
+            cfg, state, persistence, plan, market, spot_leg, net_base,
+            "NOT_SEALED", "CUT_BEFORE_HEDGE_INTENT")
+    if short_state == "not_found":
+        return _execute_entry_unwind(
+            cfg, state, persistence, plan, market, spot_leg, net_base,
+            "NOT_FOUND", "HEDGE_NOT_FILLED_SPOT_UNWOUND")
+    if short_state != "terminal":
+        return _entry_freeze(
+            state, persistence,
+            "ADD Spot stands; short order remains unconfirmed",
+            "ledger-first recovery submitted nothing", one_leg=True)
+    short_filled = d(short_order.get("executedQty", "0"))
+    if short_filled <= 0:
+        return _execute_entry_unwind(
+            cfg, state, persistence, plan, market, spot_leg, net_base,
+            "ZERO_FILLED", "HEDGE_NOT_FILLED_SPOT_UNWOUND")
+    short_leg = _entry_order_leg(
+        state, persistence, "short",
+        active["short_intent"]["newClientOrderId"], short_order)
+    short_quote = Decimal(short_leg["executed_quote"])
+    intended = Decimal(active["short_intent"]["quantity"])
+    if short_filled < market["futures_min_qty"] \
+            or short_quote < market["futures_min_notional"] \
+            or short_filled > intended \
+            or short_quote > Decimal(active["effective_cap_quote"]):
+        return _entry_freeze(
+            state, persistence,
+            "positive short fill remains outside terminal entry gates",
+            "RungFilled was not committed", one_leg=True)
+    try:
+        persistence.commit_filled(
+            state, spot_leg, short_leg, now_ms())
+    except PositionError as error:
+        return _entry_freeze(
+            state, persistence,
+            "terminal orders could not commit RungFilled",
+            clean(error, 220), one_leg=True)
     return conclude(
-        state, "OPEN",
-        "ADD rung %s was reconstructed from terminal own orders"
-        % transition["ordinal"],
-        "resume submitted nothing; aggregate reconcile remains required")
+        state, "OPEN", "ADD rung reconstructed from terminal own orders",
+        "ledger-first recovery submitted no duplicate entry order")
 
 
 def cmd_resume(cfg: PositionConfig, request, sleep=time.sleep,
@@ -8145,22 +7419,12 @@ def cmd_resume(cfg: PositionConfig, request, sleep=time.sleep,
         return EXIT_CODE["NOTHING_STANDING"]
     if _is_v2_position(position):
         try:
-            derived = derive_v2_state(position)
-            if derived["symbol"] != cfg.symbol:
-                raise PositionError(
-                    "version-2 ledger symbol does not match resume command")
-            active = _active_v2_add_receipt(cfg.receipt_dir, position)
+            return _resume_v2_entry(
+                cfg, request, sleep, now_ms, position)
         except PositionError as error:
             print("RESUME | %s | BLOCKED | %s" % (
                 cfg.symbol, clean(error, 300)))
             return EXIT_CODE["BLOCKED"]
-        if active is None:
-            print("RESUME | %s | BLOCKED | no unfinished ADD; a typed fresh "
-                  "ReconcileObserved read is required for v2 ledger state %s"
-                  % (cfg.symbol, derived["top_state"]))
-            return EXIT_CODE["BLOCKED"]
-        return _resume_v2_add(
-            cfg, request, sleep, now_ms, position, active[0], active[1])
     if position.get("symbol") != cfg.symbol:
         print("RESUME | position holds %s, command names %s | refusing "
               "mismatch" % (position.get("symbol"), cfg.symbol))

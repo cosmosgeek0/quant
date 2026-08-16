@@ -171,7 +171,7 @@ class LedgerTransport:
             raise AssertionError("unexpected order stage %s" % stage)
 
         order = {
-            "clientOrderId": client,
+            "symbol": SYMBOL, "clientOrderId": client,
             "status": "FILLED",
             "executedQty": self._number(executed),
             quote_field: self._number(quote),
@@ -182,7 +182,7 @@ class LedgerTransport:
         response_fills = [] if self.crash == "after_spot_fill" \
             and stage == "enter_spot" else fills
         self._kill("after_post:%s" % stage)
-        return "ok", {"fills": response_fills}
+        return "ok", dict(order, fills=response_fills)
 
     def __call__(self, method, base_url, path, params=None, signed=False):
         params = dict(params or {})

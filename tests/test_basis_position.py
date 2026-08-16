@@ -19,6 +19,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
@@ -667,6 +668,8 @@ def happy_spec():
             "quoteAsset": "USDT", "marginAsset": "USDT",
             "orderTypes": ["LIMIT", "MARKET"],
             "filters": [
+                {"filterType": "PRICE_FILTER", "minPrice": "0.01",
+                 "maxPrice": "100.2", "tickSize": "0.01"},
                 {"filterType": "LOT_SIZE", "stepSize": "0.001",
                  "minQty": "0.001"},
                 {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001",
@@ -731,6 +734,9 @@ def one_unit_spec():
                          "askPrice": "9.9"}
     spec["usdm_book"] = {"symbol": SYMBOL, "bidPrice": "10.0",
                          "askPrice": "10.01", "time": 1755000000000}
+    for row in spec["usdm_info"]["symbols"][0]["filters"]:
+        if row["filterType"] == "PRICE_FILTER":
+            row["maxPrice"] = "10.0"
     spec["spot_account"]["balances"][1]["free"] = "1.0"
     spec["legs"]["enter_spot"] = {
         "submit": ("ok", {"fills": [
@@ -1755,8 +1761,9 @@ class VersionTwoPersistenceTests(unittest.TestCase):
         self.assertEqual(self.head_path.read_bytes(), before_head)
         self.assertFalse(Path(str(self.state_path) + ".tmp").exists())
 
-    def test_v2_head_write_interruption_leaves_detectable_state(self):
+    def test_v2_entry_prepared_tail_recovers_to_committed_head(self):
         self.ready()
+        committed = self.current()
         before_head = self.head_path.read_bytes()
         payload = bp.new_v2_receipt_observed_event(
             "head-interruption", "REDUCTION", self.MODULE_TIME_MS + 1,
@@ -1777,8 +1784,10 @@ class VersionTwoPersistenceTests(unittest.TestCase):
                 self.append(payload)
         self.assertEqual(self.head_path.read_bytes(), before_head)
         self.assertFalse(Path(str(self.head_path) + ".tmp").exists())
-        with self.assertRaisesRegex(bp.PositionError, "committed head"):
-            bp.load_position(self.receipt_dir)
+        recovered = bp.load_position(self.receipt_dir)
+        self.assertEqual(recovered, committed)
+        self.assertEqual(len(recovered["ledger"]),
+                         json.loads(before_head)["event_count"])
 
     def test_br4_event_time_regression_and_future_cut_refuse(self):
         self.ready()
@@ -2666,7 +2675,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
                     orphan_dir, self.CONFIG_SNAPSHOT)
 
 
-class PositionAddCommandTests(MachineCase):
+class EntryCoreRegressionTests(MachineCase):
     BASE_MS = 1755000100000
     ADD_CONFIG = {
         "symbol": SYMBOL,
@@ -2690,6 +2699,7 @@ class PositionAddCommandTests(MachineCase):
 
     def setUp(self):
         super().setUp()
+        self.ADD_CONFIG = json.loads(json.dumps(type(self).ADD_CONFIG))
         self.write_add_proposal()
 
     def add_proposal_payload(self, proposal_id=PROPOSAL_ID):
@@ -2890,1138 +2900,589 @@ class PositionAddCommandTests(MachineCase):
             bp.new_v2_flat_proved_event("add-flat-final"),
             now=observed + 1)
 
-    def test_build04_open_add_add_reduce_flat_offline_walk(self):
-        opened = self.initialize_open()
-        self.assertEqual(opened["top_state"], bp.ST_OPEN)
-        self.assertEqual([row["ordinal"] for row in opened["rungs"]], [1])
-
-        unreconciled = ScriptedTransport(self.add_spec(1))
-        code, unreconciled, output = self.run_add(
-            PROPOSAL_ID, "add-unreconciled", unreconciled)
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn("confirmed ReconcileObserved", output)
-        self.assertEqual(unreconciled.calls, [])
-
-        before_two = self.reconcile("add-reconcile-before-two")
-        self.assertEqual(before_two["top_state"], bp.ST_OPEN)
-        self.assertIn(
-            {"event_type": "AddIntent", "ordinal": 2},
-            before_two["legal_next_transitions"])
-
-        code, second, output = self.run_add(
-            PROPOSAL_ID, "add02", self.add_spec(2))
-        self.assertEqual(code, 0, output)
-        self.assertEqual(post_stages(second),
-                         ["enter_spot", "enter_short"])
-        pending_two = bp.derive_v2_state(self.current())
-        self.assertEqual([row["ordinal"] for row in pending_two["rungs"]],
-                         [1, 2])
-        self.assertEqual(pending_two["top_state"], "FROZEN")
-        self.assertIn("RECONCILIATION_REQUIRED",
-                      pending_two["freeze_reasons"])
-        self.assertEqual(
-            self.reconcile("add-reconcile-after-two")["top_state"],
-            bp.ST_OPEN)
-
-        third_id = "abc124"
-        self.write_add_proposal(third_id)
-        code, third, output = self.run_add(
-            third_id, "add03", self.add_spec(3))
-        self.assertEqual(code, 0, output)
-        self.assertEqual(post_stages(third),
-                         ["enter_spot", "enter_short"])
-        pending_three = bp.derive_v2_state(self.current())
-        self.assertEqual(
-            [row["ordinal"] for row in pending_three["rungs"]],
-            [1, 2, 3])
-        self.assertEqual(pending_three["top_state"], "FROZEN")
-        open_three = self.reconcile("add-reconcile-after-three")
-        self.assertEqual(open_three["top_state"], bp.ST_OPEN)
-
-        reduced_three = bp.derive_v2_state(
-            self.reduce_top("add-reduce-three", 3, "0.078"))
-        self.assertEqual(reduced_three["top_state"], "FROZEN")
-        self.assertEqual(reduced_three["remaining_spot_quantity"], "0.128")
-        self.assertEqual(reduced_three["rungs"][2]["status"], bp.ST_CLOSED)
-        reduced_two = bp.derive_v2_state(
-            self.reduce_top("add-reduce-two", 2, "0.078"))
-        self.assertEqual(reduced_two["top_state"], "FROZEN")
-        self.assertEqual(reduced_two["remaining_spot_quantity"], "0.05")
-        self.assertEqual(reduced_two["rungs"][1]["status"], bp.ST_CLOSED)
-        reduced = self.reduce_top("add-reduce-one", 1, "0.05")
-        reduced_one = bp.derive_v2_state(reduced)
-        self.assertEqual(reduced_one["top_state"], "FROZEN")
-        self.assertEqual(reduced_one["remaining_spot_quantity"], "0")
-        self.assertEqual(reduced_one["remaining_short_quantity"], "0")
-        closed = bp.derive_v2_state(self.prove_final_flat())
-        self.assertEqual(closed["top_state"], bp.ST_CLOSED)
-        self.assertEqual(
-            [row["status"] for row in closed["rungs"]],
-            [bp.ST_CLOSED, bp.ST_CLOSED, bp.ST_CLOSED])
-        self.assertEqual(closed["remaining_spot_quantity"], "0")
-        self.assertEqual(closed["remaining_short_quantity"], "0")
-
-    def test_build04_stop_refuses_add_before_proposal_or_transport(self):
-        for seal_file, run_id in (
-                (bp.STOP_FILE, "addstop"),
-                (bp.STOP_JOBS_FILE, "addstopjobs")):
-            with self.subTest(seal_file=seal_file):
-                seal_path = Path(self.dir, seal_file)
-                seal_path.write_text("owner stop\n", encoding="utf-8")
-                transport = ScriptedTransport(happy_spec())
-                code, transport, output = self.run_add(
-                    PROPOSAL_ID, run_id, transport)
-                self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-                self.assertIn("%s file present" % seal_file, output)
-                self.assertEqual(transport.calls, [])
-                seal_path.unlink()
-
-    def test_build04_dust_standing_refuses_add_without_transport(self):
-        quantity = (
-            "0.0000000000000000000000000001999999999999999999999999999")
-        self.initialize_open(seed_quantity=quantity)
-        self.reduce_top("add-dust-reduce", 1, "1e-28")
-        derived = bp.derive_v2_state(self.current())
-        self.assertIn(bp.V2_DUST_STANDING, derived["freeze_reasons"])
-        transport = ScriptedTransport(happy_spec())
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "adddust", transport)
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn(bp.V2_DUST_STANDING, output)
-        self.assertEqual(transport.calls, [])
-
-    def test_build04_stale_reconcile_refuses_before_any_intent(self):
+    def ready_add(self, reconcile_id="entry-reconcile"):
         self.initialize_open()
-        self.reconcile("add-reconcile-stale")
-        reconcile = self.current()["ledger"][-1]
-        stale_now = reconcile["observed_at_ms"] \
-            + bp.V2_RECONCILE_READ_MAX_AGE_MS + 1
-        transport = ScriptedTransport(happy_spec())
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "addstale", transport, now=stale_now)
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn("STALE_RECONCILE_READ", output)
-        self.assertEqual(transport.calls, [])
-        self.assertIsNone(bp._active_v2_add_receipt(
-            self.dir, self.current()))
+        return self.reconcile(reconcile_id)
 
-    def test_build04_reconcile_that_ages_during_reads_refuses_before_intent(
-            self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-ages-during-reads")
-        reconcile = self.current()["ledger"][-1]
-        command_now = reconcile["observed_at_ms"] + 1
-        intent_now = reconcile["observed_at_ms"] \
-            + bp.V2_RECONCILE_READ_MAX_AGE_MS + 1
-        times = iter((command_now, intent_now))
-        transport = ScriptedTransport(self.add_spec(11))
-        cfg = dataclasses.replace(self.cfg, run_id="addage")
-        output = io.StringIO()
-        with redirect_stdout(output):
-            code = bp.cmd_add(
-                cfg, transport, sleep=lambda seconds: None,
-                now_ms=lambda: next(times), proposal_id=PROPOSAL_ID)
-        self.assertEqual(code, bp.EXIT_CODE["REJECTED_BEFORE_ENTRY"])
-        self.assertIn("STALE_RECONCILE_READ", output.getvalue())
-        self.assertEqual(transport.posts, [])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"],
-            "ReconcileObserved")
+    def audit_path(self, run_id):
+        return Path(self.dir, "basis-position-%s.json" % run_id)
 
-    def test_build04_cap_comes_from_frozen_schedule_not_proposal(self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-cap")
-        payload = self.add_proposal_payload()
-        payload["spot_quote_cap"] = "8"
-        payload["short_notional"] = "8"
-        self.write_add_proposal(payload=payload)
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "addcap", self.add_spec(4))
-        self.assertEqual(code, 0, output)
-        spot_post = transport.posts[0][1]
-        self.assertEqual(Decimal(spot_post["quoteOrderQty"]), Decimal("8"))
-        self.assertLessEqual(
-            Decimal(spot_post["quoteOrderQty"]),
-            bp.FIRST_TRADE_CAP_USDT)
-        receipt = self.receipt("addcap")
-        self.assertEqual(
-            Decimal(receipt["add_transition"]["effective_cap_quote"]),
-            Decimal("8"))
-        self.assertEqual(
-            bp.derive_v2_state(self.current())["rungs"][1][
-                "effective_cap_quote"], "8")
+    def test_entry_poll_keeps_seen_order_when_later_reads_are_missing(self):
+        responses = [term_spot("NEW", "0", "0", 701)] + [MISSING] * 50
 
-    def test_br8_f1_frozen_cap_nine_refuses_before_intent(self):
-        self.ADD_CONFIG = json.loads(json.dumps(self.ADD_CONFIG))
-        self.ADD_CONFIG["schedule"][1]["quote_cap"] = "9"
-        self.ADD_CONFIG["caps"]["entry_quote"] = "9"
-        self.write_proposal(proposal_payload(), proposal_id=PROPOSAL_ID)
-        self.initialize_open()
-        self.reconcile("br8-cap-nine")
+        def request(method, base_url, path, params=None, signed=False):
+            response = responses.pop(0) if responses else MISSING
+            return response(params or {}) if callable(response) else response
 
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8cap9", self.add_spec(101))
+        state = bp.make_state(
+            self.cfg, request, lambda seconds: None,
+            "poll", receipted=False)
+        seen = []
+        status, order = bp.query_client_order_strongest(
+            state, bp.SPOT, "poll-client",
+            observation_sink=lambda role, row: seen.append((role, row)))
+        self.assertEqual(status, "pending")
+        self.assertEqual(order["status"], "NEW")
+        self.assertEqual(seen[-1][1]["orderId"], 701)
 
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn("ADD_HARD_CAP", output)
-        self.assertEqual(transport.posts, [])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"],
-            "ReconcileObserved")
-        self.assertIsNone(bp._active_v2_add_receipt(
-            self.dir, self.current()))
+    def test_entry_poll_requires_submit_and_query_order_id_agreement(self):
+        def request(method, base_url, path, params=None, signed=False):
+            return term_spot("FILLED", "0.01", "1", 702)(params or {})
 
-    def test_br8_f1_entry_cap_above_eight_refuses_before_intent(self):
-        self.ADD_CONFIG = json.loads(json.dumps(self.ADD_CONFIG))
-        self.ADD_CONFIG["caps"]["entry_quote"] = "8.5"
-        self.initialize_open()
-        self.reconcile("br8-entry-cap")
+        state = bp.make_state(
+            self.cfg, request, lambda seconds: None,
+            "identity", receipted=False)
+        status, _order = bp.query_client_order_strongest(
+            state, bp.SPOT, "identity-client", expected_order_id="701")
+        self.assertEqual(status, "identity_mismatch")
 
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8entrycap", self.add_spec(102))
+    def test_entry_abort_recovery_requires_full_rung_identity(self):
+        self.ready_add("abort-identity-reconcile")
 
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn("ADD_HARD_CAP", output)
-        self.assertEqual(transport.calls, [])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"],
-            "ReconcileObserved")
-
-    def test_br8_f1_proposal_cap_eight_point_five_refuses_before_intent(self):
-        self.initialize_open()
-        self.reconcile("br8-proposal-cap")
-        payload = self.add_proposal_payload()
-        payload["spot_quote_cap"] = "8.5"
-        payload["short_notional"] = "8.5"
-        self.write_add_proposal(payload=payload)
-
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8proposalcap", self.add_spec(103))
-
-        self.assertEqual(code, bp.EXIT_CODE["REJECTED_BEFORE_ENTRY"])
-        self.assertIn("ADD_HARD_CAP", output)
-        self.assertEqual(transport.posts, [])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"],
-            "ReconcileObserved")
-        self.assertIsNone(bp._active_v2_add_receipt(
-            self.dir, self.current()))
-
-    def test_br8_f2_exactly_missing_spot_intent_aborts_without_post(self):
-        self.initialize_open()
-        self.reconcile("br8-missing-spot")
-        spec = self.add_spec(104)
-
-        def cut_before_spot_post(_params):
-            raise RuntimeError("simulated process cut")
-
-        interrupted = ScriptedTransport(spec, on_post=cut_before_spot_post)
-        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
-            self.run_add(PROPOSAL_ID, "br8missingspot", interrupted)
-        resume_spec = self.add_spec(105)
-        resume_spec["legs"]["enter_spot"]["query"] = [MISSING, MISSING]
-
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br8missingresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(resumed.posts, [])
-        terminal = self.current()["ledger"][-1]
-        self.assertEqual(terminal["event_type"], "AddAborted")
-        self.assertEqual(terminal["reason"],
-                         "SPOT_INTENT_EXACTLY_NOT_FOUND")
-        self.assertEqual(
-            bp.derive_v2_state(self.current())["top_state"],
-            bp.ST_ADD_ABORTED)
-
-    def test_br10_f1_new_observation_survives_later_missing_replies(self):
-        self.initialize_open()
-        self.reconcile("br10-new-before-missing")
-        spec = self.add_spec(121)
-
-        def cut_before_spot_post(_params):
-            raise RuntimeError("simulated process cut")
+        def cut_at_spot(params):
+            if params["newClientOrderId"].endswith("enter_spot"):
+                raise RuntimeError("simulated process cut")
 
         with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
             self.run_add(
-                PROPOSAL_ID, "br10newseen", ScriptedTransport(
-                    spec, on_post=cut_before_spot_post))
-        resume_spec = self.add_spec(122)
-        resume_spec["legs"]["enter_spot"]["query"] = [
-            term_spot("NEW", "0", "0", 700121),
-        ] + [MISSING] * 8
-
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br10newresume",
+                PROPOSAL_ID, "abortidentity",
+                ScriptedTransport(self.add_spec(201), on_post=cut_at_spot))
+        path = self.audit_path("abortidentity")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["proposal_id"] = "different-proposal"
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        transport = ScriptedTransport(self.add_spec(202))
+        code, transport, output = self.run_cmd(
+            bp.cmd_resume, transport, run_id="abortidentity-resume",
             now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
-        self.assertEqual(resumed.posts, [])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddIntent")
-        receipt = self.receipt("br10newseen")
-        row = receipt["legs"][0]["strongest_order_observation"]
-        self.assertEqual(row["status"], "NEW")
-        self.assertEqual(row["executedQty"], "0")
-
-    def test_br10_f1_wrong_client_is_refused_on_its_first_poll(self):
-        self.initialize_open()
-        self.reconcile("br10-wrong-client")
-        spec = self.add_spec(123)
-
-        def cut_before_spot_post(_params):
-            raise RuntimeError("simulated process cut")
-
-        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
-            self.run_add(
-                PROPOSAL_ID, "br10wrongclient", ScriptedTransport(
-                    spec, on_post=cut_before_spot_post))
-
-        def wrong_client(_params):
-            return ("ok", {
-                "symbol": SYMBOL,
-                "clientOrderId": "another-client",
-                "status": "NEW", "executedQty": "0",
-                "cummulativeQuoteQty": "0", "orderId": 700123,
-            })
-
-        resume_spec = self.add_spec(124)
-        resume_spec["legs"]["enter_spot"]["query"] = [
-            wrong_client,
-        ] + [MISSING] * 8
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br10wrongresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
-        self.assertIn("ORDER_RESPONSE_IDENTITY_MISMATCH", output)
-        self.assertEqual(resumed.posts, [])
-        client = self.receipt("br10wrongclient")["add_transition"][
-            "intents"]["spot"]["newClientOrderId"]
-        self.assertEqual(resumed.query_counts[client], 1)
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddIntent")
-
-    def test_br10_f2_add_aborted_is_a_terminal_sink(self):
-        self.initialize_open()
-        self.reconcile("br10-terminal-sink")
-        spec = self.add_spec(118)
-
-        def cut_before_spot_post(_params):
-            raise RuntimeError("simulated process cut")
-
-        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
-            self.run_add(
-                PROPOSAL_ID, "br10sink", ScriptedTransport(
-                    spec, on_post=cut_before_spot_post))
-        resume_spec = self.add_spec(119)
-        resume_spec["legs"]["enter_spot"]["query"] = [MISSING]
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br10sinkresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(resumed.posts, [])
-        before = len(self.current()["ledger"])
-        with self.assertRaisesRegex(bp.PositionError, "ADD_TERMINAL_SINK"):
-            self.reconcile("br10-sink-reentry")
-        self.assertEqual(len(self.current()["ledger"]), before)
-
-        next_id = "abc126"
-        self.write_add_proposal(next_id)
-        retry = ScriptedTransport(self.add_spec(120))
-        code, retry, output = self.run_add(
-            next_id, "br10sinknext", retry,
-            now=self.current()["ledger"][-1]["cut_ms"] + 1)
         self.assertEqual(code, bp.EXIT_CODE["BLOCKED"], output)
-        self.assertIn(bp.ST_ADD_ABORTED, output)
-        self.assertEqual(retry.calls, [])
+        self.assertEqual(transport.calls, [])
 
-    def test_br8_f2_spot_fill_without_hedge_intent_resumes_unwind(self):
-        self.initialize_open()
-        self.reconcile("br8-cut-before-hedge")
-        spec = self.add_spec(106)
-        original = bp.persist_intent
+    def test_entry_hedge_respects_proposal_short_notional(self):
+        self.ready_add("proposal-short-cap")
+        payload = self.add_proposal_payload()
+        payload["spot_quote_cap"] = "7.9"
+        payload["short_notional"] = "6"
+        self.write_add_proposal(payload=payload)
+        spec = self.add_spec(
+            203, short_quantity="0.059", short_quote="5.9118")
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "proposalshort", spec)
+        self.assertEqual(code, 0, output)
+        short_post = transport.posts[1][1]
+        self.assertEqual(Decimal(short_post["quantity"]), Decimal("0.059"))
 
-        def cut_before_hedge_intent(*args, **kwargs):
-            if args[2] == bp.ENTER_SHORT:
-                raise RuntimeError("simulated process cut")
-            return original(*args, **kwargs)
-
-        interrupted = ScriptedTransport(spec)
-        with mock.patch.object(
-                bp, "persist_intent", side_effect=cut_before_hedge_intent):
-            with self.assertRaisesRegex(
-                    RuntimeError, "simulated process cut"):
-                self.run_add(
-                    PROPOSAL_ID, "br8cuthedge", interrupted)
-        self.assertEqual(post_stages(interrupted), ["enter_spot"])
-
-        resume_spec = self.add_spec(107)
-        resume_spec["legs"]["enter_spot"]["query"] = [
-            term_spot("FILLED", "0.079", "7.9", 700106)]
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br8cuthedgeresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(post_stages(resumed), ["unwind_spot"])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddAborted")
-        self.assertEqual(
-            bp.derive_v2_state(self.current())["top_state"],
-            bp.ST_ADD_ABORTED)
-
-    def test_br8_f3_rejected_hedge_unwinds_measured_spot(self):
-        self.initialize_open()
-        self.reconcile("br8-hedge-rejected")
-        spec = self.add_spec(108)
+    def test_entry_unwind_fee_cannot_draw_from_older_rung(self):
+        self.ready_add("unwind-fee-reconcile")
+        spec = self.add_spec(204)
         spec["legs"]["enter_short"] = {
             "submit": ("api_error", {"code": -2010, "msg": "refused"}),
-            "query": [MISSING, MISSING],
-        }
-
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8hedgereject", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(
-            post_stages(transport),
-            ["enter_spot", "enter_short", "unwind_spot"])
-        unwind_posts = [
-            params for _base, params in transport.posts
-            if params["newClientOrderId"].endswith("unwind_spot")]
-        self.assertEqual(len(unwind_posts), 1)
-        self.assertEqual(Decimal(unwind_posts[0]["quantity"]), Decimal("0.078"))
-        terminal = self.current()["ledger"][-1]
-        self.assertEqual(terminal["event_type"], "AddAborted")
-        self.assertEqual(terminal["spot_net_quantity"], "0.078")
-        self.assertEqual(terminal["unwind_requested_quantity"], "0.078")
-        self.assertEqual(terminal["unwind_filled_quantity"], "0.078")
-        self.assertEqual(terminal["dust_quantity"], "0")
-        self.assertEqual(
-            terminal["unwind_leg"]["executed_quantity"], "0.078")
-        self.assertEqual(
-            bp.derive_v2_state(self.current())["top_state"],
-            bp.ST_ADD_ABORTED)
-
-    def test_br8_f3_resume_queries_sealed_unwind_before_one_resend(self):
-        self.initialize_open()
-        self.reconcile("br8-unwind-resume")
-        interrupted_spec = self.add_spec(115)
-        interrupted_spec["legs"]["enter_short"] = {
-            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
-            "query": [MISSING, MISSING],
-        }
-
-        def cut_at_unwind(params):
-            if params["newClientOrderId"].endswith("unwind_spot"):
-                raise RuntimeError("simulated process cut")
-
-        interrupted = ScriptedTransport(
-            interrupted_spec, on_post=cut_at_unwind)
-        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
-            self.run_add(PROPOSAL_ID, "br8unwindcut", interrupted)
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"],
-            "AddUnwindIntent")
-
-        resume_spec = self.add_spec(116)
-        resume_spec["legs"]["enter_spot"]["query"] = [
-            term_spot("FILLED", "0.079", "7.9", 700115)]
-        resume_spec["legs"]["enter_short"]["query"] = [MISSING, MISSING]
-        resume_spec["legs"]["unwind_spot"]["query"] = (
-            [MISSING] * be.QUERY_TRIES + [
-                term_spot("FILLED", "0.078", "7.7922", 900116)])
-
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br8unwindresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(post_stages(resumed), ["unwind_spot"])
-        unwind_client = resumed.posts[0][1]["newClientOrderId"]
-        query_index = next(
-            index for index, call in enumerate(resumed.calls)
-            if call[0] == "GET"
-            and call[3].get("origClientOrderId") == unwind_client)
-        post_index = next(
-            index for index, call in enumerate(resumed.calls)
-            if call[0] == "POST"
-            and call[3].get("newClientOrderId") == unwind_client)
-        self.assertLess(query_index, post_index)
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddAborted")
-
-    def test_br10_f3_partial_unwind_then_missing_freezes_without_resend(self):
-        self.initialize_open()
-        self.reconcile("br10-partial-unwind")
-        interrupted_spec = self.add_spec(125)
-        interrupted_spec["legs"]["enter_short"] = {
-            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
-            "query": [MISSING],
-        }
-
-        def cut_at_unwind(params):
-            if params["newClientOrderId"].endswith("unwind_spot"):
-                raise RuntimeError("simulated process cut")
-
-        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
-            self.run_add(
-                PROPOSAL_ID, "br10partialcut", ScriptedTransport(
-                    interrupted_spec, on_post=cut_at_unwind))
-        resume_spec = self.add_spec(126)
-        resume_spec["legs"]["enter_spot"]["query"] = [
-            term_spot("FILLED", "0.079", "7.9", 700125)]
-        resume_spec["legs"]["enter_short"]["query"] = [MISSING]
-        resume_spec["legs"]["unwind_spot"]["query"] = [
-            term_spot("PARTIALLY_FILLED", "0.03", "2.997", 900125),
-        ] + [MISSING] * (be.QUERY_TRIES - 1)
-
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resume_spec, run_id="br10partialresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
-        self.assertEqual(resumed.posts, [])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddUnwindIntent")
-        receipt = self.receipt("br10partialcut")
-        unwind_rows = [
-            row for row in receipt["legs"]
-            if row["stage"] == bp.UNWIND_SPOT
-        ]
-        self.assertEqual(len(unwind_rows), 1)
-        observation = unwind_rows[0]["strongest_order_observation"]
-        self.assertEqual(observation["status"], "PARTIALLY_FILLED")
-        self.assertEqual(observation["executedQty"], "0.03")
-
-    def test_br10b_add_aborted_ledger_repairs_interrupted_receipt(self):
-        self.initialize_open()
-        self.reconcile("br10b-abort-repair")
-        spec = self.add_spec(136)
-        spec["legs"]["enter_short"] = {
-            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
-            "query": [MISSING],
-        }
-        original_append = bp.append_v2_event
-
-        def append_then_cut(receipt_dir, payload, expected_length,
-                            expected_last_digest=None):
-            persisted = original_append(
-                receipt_dir, payload, expected_length,
-                expected_last_digest=expected_last_digest)
-            if payload["event_type"] == "AddAborted":
-                raise RuntimeError("simulated process cut after AddAborted")
-            return persisted
-
-        with mock.patch.object(
-                bp, "append_v2_event", side_effect=append_then_cut):
-            with self.assertRaisesRegex(
-                    RuntimeError, "simulated process cut after AddAborted"):
-                self.run_add(PROPOSAL_ID, "br10babortcut", spec)
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddAborted")
-        stale = self.receipt("br10babortcut")
-        self.assertNotEqual(stale["add_transition"]["status"], "ABORTED")
-
-        resumed = ScriptedTransport(self.add_spec(137))
-        code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resumed, run_id="br10babortresume",
-            now=self.current()["ledger"][-1]["cut_ms"] + 2)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(resumed.calls, [])
-        repaired = self.receipt("br10babortcut")
-        self.assertEqual(repaired["add_transition"]["status"], "ABORTED")
-        self.assertEqual(repaired["verdict"], bp.ST_ADD_ABORTED)
-        self.assertIn("repaired the durable AddAborted receipt", output)
-
-    def test_br10_f4_unwind_uses_spot_step_for_sellable_quantity(self):
-        self.initialize_open()
-        self.reconcile("br8-unwind-dust")
-        spec = self.add_spec(
-            117, spot_quantity="0.0015", base_fee="0.001",
-            spot_quote="0.15")
-        for row in spec["spot_info"]["symbols"][0]["filters"]:
-            if row["filterType"] == "NOTIONAL":
-                row["minNotional"] = "0.01"
-        spec["legs"]["unwind_spot"] = {
-            "submit": ("ok", {"fills": [{
-                "qty": "0.0005", "commission": "0.00005",
-                "commissionAsset": "USDT",
-            }]}),
-            "query": [term_spot(
-                "FILLED", "0.0005", "0.04995", 900117)],
-        }
-
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8unwinddust", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(post_stages(transport),
-                         ["enter_spot", "unwind_spot"])
-        unwind_post = transport.posts[-1][1]
-        self.assertEqual(Decimal(unwind_post["quantity"]),
-                         Decimal("0.0005"))
-        terminal = self.current()["ledger"][-1]
-        self.assertEqual(terminal["spot_net_quantity"], "0.0005")
-        self.assertEqual(terminal["unwind_requested_quantity"], "0.0005")
-        self.assertEqual(terminal["unwind_filled_quantity"], "0.0005")
-        self.assertEqual(terminal["dust_quantity"], "0")
-
-    def test_br10c_f2_actual_hedge_below_notional_routes_to_spot_dust(self):
-        self.initialize_open()
-        self.reconcile("br10c-hedge-minimum")
-        spec = self.add_spec(
-            133, spot_quantity="0.01", base_fee="0.001",
-            spot_quote="1")
-
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br10chedgemin", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(post_stages(transport), ["enter_spot"])
-        receipt = self.receipt("br10chedgemin")
-        terminal = receipt["add_transition"]["spot_terminal"]
-        self.assertEqual(terminal["hedge_quantity"], "0")
-        self.assertEqual(terminal["hedge_refusal"],
-                         "FUTURES_NOTIONAL_BELOW_MINIMUM")
-        aborted = self.current()["ledger"][-1]
-        self.assertEqual(aborted["event_type"], "AddAborted")
-        self.assertEqual(aborted["dust_quantity"], "0.009")
-
-    def test_br10c_f4_hedge_quote_above_cap_unwinds_without_short_post(self):
-        self.initialize_open()
-        self.reconcile("br10c-hedge-cap")
-        spec = self.add_spec(
-            134, spot_quantity="0.08", base_fee="0",
-            spot_quote="8")
-        spec["legs"]["unwind_spot"] = {
-            "submit": ("ok", {"fills": [{
-                "qty": "0.08", "commission": "0.007992",
-                "commissionAsset": "USDT",
-            }]}),
-            "query": [term_spot("FILLED", "0.08", "7.992", 900134)],
-        }
-
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br10chedgecap", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(post_stages(transport),
-                         ["enter_spot", "unwind_spot"])
-        receipt = self.receipt("br10chedgecap")
-        self.assertEqual(
-            receipt["add_transition"]["spot_terminal"]["hedge_refusal"],
-            "FUTURES_QUOTE_CAP_EXCEEDED")
-        self.assertEqual(self.current()["ledger"][-1]["dust_quantity"], "0")
-
-    def test_br10c_f3_unwind_base_fee_cannot_use_existing_spot(self):
-        self.initialize_open()
-        self.reconcile("br10c-unwind-base-fee")
-        spec = self.add_spec(135)
-        spec["legs"]["enter_short"] = {
-            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
-            "query": [MISSING],
+            "query": [MISSING] * 8,
         }
         spec["legs"]["unwind_spot"] = {
             "submit": ("ok", {"fills": [{
                 "qty": "0.078", "commission": "0.0001",
                 "commissionAsset": "BTC",
             }]}),
-            "query": [term_spot("FILLED", "0.078", "7.7922", 900135)],
+            "query": [term_spot("FILLED", "0.078", "7.79", 90204)],
         }
-
         code, transport, output = self.run_add(
-            PROPOSAL_ID, "br10cbasefee", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
+            PROPOSAL_ID, "unwindfee", spec)
+        self.assertEqual(code, bp.EXIT_CODE["OPEN_EXPOSURE"], output)
         self.assertEqual(post_stages(transport),
                          ["enter_spot", "enter_short", "unwind_spot"])
-        self.assertIn("base-fee truth exceeds", output)
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddUnwindIntent")
-        transition = self.receipt("br10cbasefee")["add_transition"]
-        self.assertEqual(transition["stage"], "UNWIND_BASE_FEE_REFUSED")
+        self.assertEqual(self.current()["ledger"][-1]["event_type"],
+                         "AddUnwindIntent")
 
-    def test_br8_f4_spot_response_symbol_mismatch_freezes(self):
-        self.initialize_open()
-        self.reconcile("br8-spot-symbol")
-        spec = self.add_spec(109)
-        spec["legs"]["enter_spot"]["submit"] = (
-            "ok", {"symbol": SYMBOL, "orderId": 10102,
-                   "fills": spec["legs"]["enter_spot"]["submit"][1]["fills"]})
+    def test_entry_receipt_without_ledger_intent_finishes_without_transport(
+            self):
+        self.ready_add("orphan-receipt-reconcile")
+        path = self.audit_path("orphan-audit")
+        path.write_text(json.dumps({
+            "kind": "position-add", "run_id": "orphan-audit",
+            "sha": SHA, "symbol": SYMBOL, "legs": [],
+        }), encoding="utf-8")
+        transport = ScriptedTransport(self.add_spec(205))
+        code, transport, output = self.run_cmd(
+            bp.cmd_resume, transport, run_id="orphan-resume")
+        self.assertEqual(code, bp.EXIT_CODE["REFUSED"], output)
+        self.assertEqual(transport.calls, [])
+        repaired = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["verdict"], "NOT_STARTED")
 
-        def wrong_symbol(params):
-            return ("ok", {
-                "symbol": "ETHUSDT",
-                "clientOrderId": params["origClientOrderId"],
-                "status": "FILLED", "executedQty": "0.079",
-                "cummulativeQuoteQty": "7.9", "orderId": 10102,
-            })
+    def test_entry_poll_observation_is_durable_before_next_read(self):
+        durable = []
+        calls = 0
 
-        spec["legs"]["enter_spot"]["query"] = [wrong_symbol]
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8spotsymbol", spec)
+        def request(method, base_url, path, params=None, signed=False):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return term_spot("NEW", "0", "0", 706)(params or {})
+            self.assertTrue(durable)
+            return MISSING
 
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"])
-        self.assertIn("ORDER_RESPONSE_IDENTITY_MISMATCH", output)
-        self.assertEqual(post_stages(transport), ["enter_spot"])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddIntent")
+        state = bp.make_state(
+            self.cfg, request, lambda seconds: None,
+            "durable-poll", receipted=False)
+        status, _order = bp.query_client_order_strongest(
+            state, bp.SPOT, "durable-client",
+            observation_sink=lambda role, row: durable.append(dict(row)))
+        self.assertEqual(status, "pending")
+        self.assertEqual(durable[0]["orderId"], 706)
 
-    def test_br8_f4_spot_submit_query_order_id_mismatch_freezes(self):
-        self.initialize_open()
-        self.reconcile("br8-spot-order-id")
-        spec = self.add_spec(110)
-        fills = spec["legs"]["enter_spot"]["submit"][1]["fills"]
-        spec["legs"]["enter_spot"]["submit"] = (
-            "ok", {"symbol": SYMBOL, "orderId": 10102, "fills": fills})
-        spec["legs"]["enter_spot"]["query"] = [
-            term_spot("FILLED", "0.079", "7.9", 20202)]
+    def _write_guard(self, pid, marker, heartbeat_ms):
+        now = time.time_ns() // 1_000_000
+        path = Path(self.dir, bp.STATE_WRITE_GUARD_FILE)
+        path.write_text(json.dumps({
+            "owner_pid": pid,
+            "owner_start_marker": marker,
+            "created_epoch_ms": min(now, heartbeat_ms),
+            "heartbeat_epoch_ms": heartbeat_ms,
+            "heartbeat_monotonic_ns": 1,
+            "token": "guard-token",
+        }), encoding="ascii")
+        return path
 
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8spotorder", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"])
-        self.assertIn("ORDER_RESPONSE_IDENTITY_MISMATCH", output)
-        self.assertEqual(post_stages(transport), ["enter_spot"])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddIntent")
-
-    def test_br8_f4_short_submit_query_order_id_mismatch_freezes(self):
-        self.initialize_open()
-        self.reconcile("br8-short-order-id")
-        spec = self.add_spec(111)
-        spot_fills = spec["legs"]["enter_spot"]["submit"][1]["fills"]
-        spec["legs"]["enter_spot"]["submit"] = (
-            "ok", {"symbol": SYMBOL, "orderId": 10102,
-                   "fills": spot_fills})
-        spec["legs"]["enter_spot"]["query"] = [
-            term_spot("FILLED", "0.079", "7.9", 10102)]
-        spec["legs"]["enter_short"]["submit"] = (
-            "ok", {"symbol": SYMBOL, "orderId": 10103})
-        spec["legs"]["enter_short"]["query"] = [
-            term_usdm("FILLED", "0.078", "7.8156", 30302)]
-
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br8shortorder", spec)
-
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"])
-        self.assertIn("ORDER_RESPONSE_IDENTITY_MISMATCH", output)
-        self.assertEqual(
-            post_stages(transport), ["enter_spot", "enter_short"])
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddHedgeIntent")
-
-    def test_br8_f5_simultaneous_starts_have_one_receipt_owner(self):
-        self.initialize_open()
-        self.reconcile("br8-concurrent-start")
-        first_inside = threading.Event()
-        release_first = threading.Event()
-        original = bp._active_v2_add_receipt
-        first_thread = {"ident": None}
-
-        def hold_first_check(*args, **kwargs):
-            if threading.get_ident() == first_thread["ident"]:
-                first_inside.set()
-                if not release_first.wait(5):
-                    raise AssertionError("concurrent-start coordination timed out")
-            return original(*args, **kwargs)
-
-        first_transport = ScriptedTransport(self.add_spec(112))
-        second_transport = ScriptedTransport(self.add_spec(113))
-        results = {}
-
-        def first_start():
-            first_thread["ident"] = threading.get_ident()
-            results["first"] = bp.cmd_add(
-                dataclasses.replace(self.cfg, run_id="br8racefirst"),
-                first_transport, sleep=lambda _seconds: None,
-                now_ms=lambda: self.current()["ledger"][-1]["cut_ms"] + 1,
-                proposal_id=PROPOSAL_ID)
-
-        with mock.patch.object(
-                bp, "_active_v2_add_receipt", side_effect=hold_first_check), \
-                mock.patch("builtins.print"):
-            thread = threading.Thread(target=first_start)
-            thread.start()
-            self.assertTrue(first_inside.wait(5))
-            results["second"] = bp.cmd_add(
-                dataclasses.replace(self.cfg, run_id="br8racesecond"),
-                second_transport, sleep=lambda _seconds: None,
-                now_ms=lambda: self.current()["ledger"][-1]["cut_ms"] + 1,
-                proposal_id=PROPOSAL_ID)
-            release_first.set()
-            thread.join(10)
-        self.assertFalse(thread.is_alive())
-
-        self.assertEqual(results["first"], 0)
-        self.assertEqual(results["second"], bp.EXIT_CODE["BLOCKED"])
-        self.assertEqual(post_stages(first_transport),
-                         ["enter_spot", "enter_short"])
-        self.assertEqual(second_transport.posts, [])
-        self.assertFalse(Path(
-            self.dir, "basis-position-br8racesecond.json").exists())
-        self.assertIsNone(bp._active_v2_add_receipt(
-            self.dir, self.current()))
-
-    def test_br10_f5_guard_payload_carries_owner_start_and_heartbeat(self):
+    def test_live_guard_owner_is_never_reclaimed_by_age(self):
+        old = (time.time_ns() // 1_000_000
+               - bp.POSITION_WRITE_GUARD_STALE_MS - 1000)
+        marker = bp._position_guard_process_start(os.getpid())
+        self._write_guard(os.getpid(), marker, old)
         attempt = bp._take_position_write_guard(self.dir)
-        self.assertTrue(attempt, attempt.refusal)
-        guard_path = Path(self.dir, bp.STATE_WRITE_GUARD_FILE)
-        owner = json.loads(guard_path.read_text(encoding="ascii"))
-        self.assertEqual(owner["owner_pid"], os.getpid())
-        self.assertTrue(owner["owner_start_marker"])
-        self.assertGreater(owner["heartbeat_epoch_ms"], 0)
-        self.assertGreater(owner["heartbeat_monotonic_ns"], 0)
-        bp._release_position_write_guard(self.dir, attempt.token)
-        self.assertFalse(guard_path.exists())
+        self.assertFalse(attempt)
+        self.assertEqual(attempt.refusal, "POSITION_WRITE_GUARD_ACTIVE")
 
-    def test_br10b_receipt_and_ledger_replacements_fsync_their_directory(self):
-        with mock.patch.object(
-                bp, "_fsync_file_and_parent",
-                wraps=bp._fsync_file_and_parent) as durable:
-            state = bp.make_state(
-                dataclasses.replace(self.cfg, run_id="br10bfsync"),
-                ScriptedTransport(happy_spec()), lambda _seconds: None,
-                "durability")
-            bp.initialize_v2_position(self.dir, self.ADD_CONFIG)
+    def test_entry_receipt_writer_stays_single_durable_route(self):
+        state = bp.make_state(
+            self.cfg, lambda *args: ("unclear", {}),
+            lambda seconds: None, "writer", receipted=False)
+        with mock.patch.object(bp, "executor_save") as writer, \
+                mock.patch.object(bp, "_fsync_file_and_parent") as duplicate:
+            bp.save(state)
+        writer.assert_called_once_with(state)
+        duplicate.assert_not_called()
 
-        paths = [call.args[0] for call in durable.call_args_list]
-        self.assertIn(state.receipt_path, paths)
-        self.assertIn(str(Path(self.dir, bp.STATE_FILE)), paths)
-        self.assertIn(str(Path(self.dir, bp.STATE_FILE)) + ".head", paths)
+    def test_entry_hedge_quantity_obeys_effective_cap_before_post(self):
+        accepted = bp.AcceptedProposal(
+            PROPOSAL_ID, "a" * 64, {}, Decimal("1"), Decimal("1"))
+        authority = bp.EntryAuthority(
+            "ADD", 2, None, Decimal("0.1"), Decimal("8"),
+            Decimal("6"), "b" * 64, "reconcile", {})
+        plan = bp.CyclePlan(
+            SYMBOL, Decimal("20"), Decimal("10"), Decimal("0.0001"),
+            Decimal("1"), Decimal("1"), Decimal("8"), Decimal("8"),
+            1, "cap test")
+        hedge, reason = bp._entry_hedge_quantity(
+            accepted, authority, plan, {
+                "futures_execution_price_ceiling": Decimal("100.2"),
+                "futures_step": Decimal("0.001"),
+                "futures_min_qty": Decimal("0.001"),
+                "futures_min_notional": Decimal("5"),
+            }, Decimal("1"))
+        self.assertEqual(reason, "")
+        self.assertEqual(hedge, Decimal("0.059"))
 
-    def test_br10_f5_stale_legacy_guard_reclaims_once_with_typed_row(self):
-        self.initialize_open()
-        self.reconcile("br10-stale-guard")
-        guard_path = Path(self.dir, bp.STATE_WRITE_GUARD_FILE)
-        guard_path.write_bytes(b"")
-        os.utime(guard_path, (1, 1))
-
+    def test_entry_actual_leg_minima_block_rung_commit(self):
+        self.ready_add("actual-minimum-reconcile")
+        spec = self.add_spec(207, short_quote="4.99999999")
         code, transport, output = self.run_add(
-            PROPOSAL_ID, "br10staleguard", self.add_spec(127))
-
-        self.assertEqual(code, 0, output)
+            PROPOSAL_ID, "actualminimum", spec)
+        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
         self.assertEqual(post_stages(transport),
                          ["enter_spot", "enter_short"])
-        self.assertEqual(output.count("POSITION_WRITE_GUARD_RECLAIMED"), 1)
-        self.assertIn("LEGACY_HEARTBEAT_STALE", output)
-        self.assertFalse(guard_path.exists())
+        self.assertEqual(self.current()["ledger"][-1]["event_type"],
+                         "AddHedgeIntent")
 
-    def test_br10_f5_non_eexist_guard_error_is_a_typed_refusal(self):
+    def test_entry_spot_fill_above_persisted_intent_refuses_commit(self):
+        self.ready_add("spot-intent-bound")
+        payload = self.add_proposal_payload()
+        payload["spot_quote_cap"] = "7.9"
+        payload["short_notional"] = "7.9"
+        self.write_add_proposal(payload=payload)
+        spec = self.add_spec(208, spot_quote="7.90000001")
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "spotintentbound", spec)
+        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "unwind_spot"])
+        self.assertEqual(self.current()["ledger"][-1]["event_type"],
+                         "AddAborted")
+
+    def test_entry_dust_uses_fresh_spot_bid_and_spot_filters(self):
+        self.ready_add("fresh-dust-reconcile")
+        spec = self.add_spec(209)
+        spec["spot_book"] = {
+            "symbol": SYMBOL, "bidPrice": "10", "askPrice": "100"}
+        spec["legs"]["enter_short"] = {
+            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
+            "query": [MISSING] * 8,
+        }
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "freshdust", spec)
+        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+        self.assertEqual(self.current()["ledger"][-1]["reason"],
+                         "SPOT_DUST_BELOW_SELLABLE_MINIMUM")
+
+    def test_entry_frozen_schedule_and_each_cap_never_exceed_eight(self):
+        self.ADD_CONFIG["schedule"][1]["quote_cap"] = "8.1"
         self.initialize_open()
-        self.reconcile("br10-guard-error")
-        transport = ScriptedTransport(self.add_spec(128))
-
-        with mock.patch.object(
-                bp, "_create_position_write_guard",
-                side_effect=PermissionError("simulated local refusal")):
-            code, transport, output = self.run_add(
-                PROPOSAL_ID, "br10guarderror", transport)
-
+        self.reconcile("schedule-cap-reconcile")
+        transport = ScriptedTransport(self.add_spec(210))
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "schedulecap", transport)
         self.assertEqual(code, bp.EXIT_CODE["BLOCKED"], output)
-        self.assertIn("POSITION_WRITE_GUARD_ACQUIRE_REFUSED", output)
+        self.assertIn("ADD_HARD_CAP", output)
+        self.assertEqual(transport.posts, [])
+
+    def test_entry_add_without_reconcile_never_posts(self):
+        self.initialize_open()
+        transport = ScriptedTransport(self.add_spec(211))
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "noreconcile", transport)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"], output)
         self.assertEqual(transport.calls, [])
 
-    def test_br8_f5_freeze_between_check_and_post_has_no_active_receipt(self):
-        self.initialize_open()
-        self.reconcile("br8-before-freeze")
-        original = bp._read_only_add_preflight
-        injected = {"done": False}
+    def test_entry_missing_spot_or_cut_before_hedge_resumes_without_duplicate(
+            self):
+        self.ready_add("cut-before-hedge-reconcile")
+        original = bp._V2RungPersistence.persist_short_intent
 
-        def freeze_then_preflight(state, plan, market, derived, reconcile):
-            if not injected["done"]:
-                injected["done"] = True
-                position = self.current()
-                current = bp.derive_v2_state(position)
-                own_orders = []
-                for event in position["ledger"]:
-                    if event["event_type"] != "RungFilled":
-                        continue
-                    for role in ("spot", "short"):
-                        leg = event["legs"][role]
-                        own_orders.append({
-                            "client_order_id": leg["client_order_id"],
-                            "market": leg["market"],
-                            "status": leg["terminal_status"],
-                            "executed_quantity": leg["executed_quantity"],
-                        })
-                observed = position["ledger"][-1]["cut_ms"] + 1
-                event = bp.new_v2_reconcile_observed_event(
-                    "br8-freeze-arrival", observed, "private-add-read",
-                    baseline={
-                        "spot_base_quantity": "0",
-                        "futures_position_quantity": "0",
-                    },
-                    positions={
-                        "spot_base_quantity": "0.25",
-                        "futures_position_quantity": "-" + current[
-                            "remaining_short_quantity"],
-                    },
-                    open_orders={
-                        "spot_standard_client_order_ids": [],
-                        "spot_algorithmic_client_order_ids": [],
-                        "futures_standard_client_order_ids": [],
-                        "futures_algorithmic_client_order_ids": [],
-                    },
-                    own_orders=own_orders,
-                    balances={
-                        "spot_base_free_quantity": "0.25",
-                        "spot_base_locked_quantity": "0",
-                        "spot_quote_free_quantity": "1000",
-                        "futures_wallet_balance": "1000",
-                    })
-                with mock.patch.object(
-                        bp, "default_now_ms", return_value=observed):
-                    bp.derive_resume(position, event, receipt_dir=self.dir)
-            return original(state, plan, market, derived, reconcile)
+        def cut_before_short(*args, **kwargs):
+            raise RuntimeError("simulated process cut")
 
-        transport = ScriptedTransport(self.add_spec(114))
+        interrupted = ScriptedTransport(self.add_spec(212))
         with mock.patch.object(
-                bp, "_read_only_add_preflight",
-                side_effect=freeze_then_preflight):
-            code, transport, output = self.run_add(
-                PROPOSAL_ID, "br8freezestart", transport,
-                now=self.current()["ledger"][-1]["cut_ms"] + 1)
-
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"], output)
-        self.assertEqual(transport.posts, [])
-        self.assertEqual(
-            bp.derive_v2_state(self.current())["top_state"], "FROZEN")
-        self.assertIsNone(bp._active_v2_add_receipt(
-            self.dir, self.current()))
-        receipt = self.receipt("br8freezestart")
-        self.assertIn("verdict", receipt)
-        self.assertNotIn("add_transition", receipt)
-
-    def test_build04_each_intent_is_in_ledger_before_its_post(self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-intent-order")
-        observed = []
-
-        def inspect_ledger_before_post(params):
-            position = self.current()
-            derived = bp.derive_v2_state(position)
-            active = derived["active_transition"]
-            observed.append({
-                "posted": params["newClientOrderId"],
-                "tail": position["ledger"][-1]["event_type"],
-                "top_state": derived["top_state"],
-                "spot_client": active["spot_intent"][
-                    "newClientOrderId"],
-                "short_client": None if active["short_intent"] is None
-                else active["short_intent"]["newClientOrderId"],
-            })
-
-        transport = ScriptedTransport(
-            self.add_spec(8), on_post=inspect_ledger_before_post)
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "addintent", transport)
-        self.assertEqual(code, 0, output)
-        self.assertEqual([row["tail"] for row in observed],
-                         ["AddIntent", "AddHedgeIntent"])
-        self.assertEqual([row["top_state"] for row in observed],
-                         [bp.ST_ADDING, bp.ST_ADDING])
-        self.assertEqual(observed[0]["posted"],
-                         observed[0]["spot_client"])
-        self.assertIsNone(observed[0]["short_client"])
-        self.assertEqual(observed[1]["posted"],
-                         observed[1]["short_client"])
-
-    def test_br10_f6_seal_after_spot_intent_aborts_before_any_post(self):
-        self.initialize_open()
-        self.reconcile("br10-seal-before-spot")
-        original = bp.persist_intent
-
-        def persist_then_seal(*args, **kwargs):
-            client = original(*args, **kwargs)
-            if args[2] == bp.ENTER_SPOT:
-                Path(self.dir, bp.STOP_FILE).write_text(
-                    "owner stop\n", encoding="utf-8")
-            return client
-
-        with mock.patch.object(
-                bp, "persist_intent", side_effect=persist_then_seal):
-            code, transport, output = self.run_add(
-                PROPOSAL_ID, "br10spotseal", self.add_spec(129))
-
-        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
-        self.assertEqual(transport.posts, [])
-        terminal = self.current()["ledger"][-1]
-        self.assertEqual(terminal["event_type"], "AddAborted")
-        self.assertEqual(terminal["reason"], "ENTRY_SEAL_BEFORE_SPOT_POST")
-        self.assertEqual(terminal["spot_status"], "NOT_SUBMITTED")
-        receipt = self.receipt("br10spotseal")
-        seal_rows = receipt["add_transition"]["seal_spec_rows"]
-        self.assertEqual(seal_rows[-1]["rule"], bp.V2_ADD_SEAL_RULE)
-        self.assertEqual(seal_rows[-1]["action"], "REFUSE_UNPOSTED_SPOT")
-
-    def test_br10_f6_seal_after_spot_fill_allows_exposure_hedge(self):
-        self.initialize_open()
-        self.reconcile("br10-seal-before-hedge")
-        original = bp.persist_intent
-
-        def persist_then_seal(*args, **kwargs):
-            client = original(*args, **kwargs)
-            if args[2] == bp.ENTER_SHORT:
-                Path(self.dir, bp.STOP_JOBS_FILE).write_text(
-                    "owner stop\n", encoding="utf-8")
-            return client
-
-        with mock.patch.object(
-                bp, "persist_intent", side_effect=persist_then_seal):
-            code, transport, output = self.run_add(
-                PROPOSAL_ID, "br10hedgeseal", self.add_spec(130))
-
-        self.assertEqual(code, 0, output)
-        self.assertEqual(post_stages(transport),
-                         ["enter_spot", "enter_short"])
-        receipt = self.receipt("br10hedgeseal")
-        seal_rows = receipt["add_transition"]["seal_spec_rows"]
-        self.assertEqual([row["action"] for row in seal_rows],
-                         ["ALLOW_ENTRY", "ALLOW_EXPOSURE_EXIT"])
-        self.assertEqual(seal_rows[-1]["present"], [bp.STOP_JOBS_FILE])
-        self.assertEqual(seal_rows[-1]["rule"], bp.V2_ADD_SEAL_RULE)
-
-    def test_build04_terminal_fill_cannot_exceed_persisted_intent(self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-overfill")
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "addover", self.add_spec(
-                12, spot_quote="8.0001"))
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"])
-        self.assertIn("ledger commit is unproved", output)
-        self.assertEqual(post_stages(transport),
-                         ["enter_spot", "enter_short"])
-        position = self.current()
-        self.assertEqual(position["ledger"][-1]["event_type"],
-                         "AddHedgeIntent")
-        self.assertEqual(bp.derive_v2_state(position)["top_state"],
-                         bp.ST_ADDING)
-
-    def test_build04_exact_add_retry_never_executes_twice(self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-idempotent")
-        code, first, output = self.run_add(
-            PROPOSAL_ID, "addonce", self.add_spec(6))
-        self.assertEqual(code, 0, output)
-        self.assertEqual(post_stages(first),
-                         ["enter_spot", "enter_short"])
-        self.reconcile("add-reconcile-idempotent-after")
-
-        retry = ScriptedTransport(self.add_spec(7))
-        code, retry, output = self.run_add(
-            PROPOSAL_ID, "addonce", retry)
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn("already", output)
-        self.assertEqual(retry.calls, [])
-        self.assertEqual(
-            [row["ordinal"] for row in
-             bp.derive_v2_state(self.current())["rungs"]],
-            [1, 2])
-
-    def test_br10_f7_recovery_requires_the_full_rung_identity(self):
-        self.initialize_open()
-        self.reconcile("br10-full-rung-identity")
-        code, transport, output = self.run_add(
-            PROPOSAL_ID, "br10identity", self.add_spec(131))
-        self.assertEqual(code, 0, output)
-        self.assertEqual(post_stages(transport),
-                         ["enter_spot", "enter_short"])
-
-        receipt_path = Path(
-            self.dir, "basis-position-br10identity.json")
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        transition = receipt["add_transition"]
-        transition["run_id"] = "changedrun"
-        transition["proposal_id"] = "changedproposal"
-        transition["proposal_digest"] = "f" * 64
-        transition["dislocation"] = dict(transition["dislocation"])
-        transition["dislocation"]["event_id"] = "add:changedidentity"
-        receipt_path.write_text(
-            json.dumps(receipt, sort_keys=True), encoding="utf-8")
-
-        resumed = ScriptedTransport(self.add_spec(132))
+                bp._V2RungPersistence, "persist_short_intent",
+                side_effect=cut_before_short):
+            with self.assertRaisesRegex(
+                    RuntimeError, "simulated process cut"):
+                self.run_add(PROPOSAL_ID, "cutbeforehedge", interrupted)
+        self.assertEqual(post_stages(interrupted), ["enter_spot"])
+        resume_spec = self.add_spec(213)
         code, resumed, output = self.run_cmd(
-            bp.cmd_resume, resumed, run_id="br10identityresume",
+            bp.cmd_resume, resume_spec, run_id="cutbeforehedge-resume",
             now=self.current()["ledger"][-1]["cut_ms"] + 2)
+        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
+        self.assertEqual(post_stages(resumed), ["unwind_spot"])
+        self.assertEqual(self.current()["ledger"][-1]["event_type"],
+                         "AddAborted")
+        self.assertIsNotNone(original)
 
-        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
-        self.assertIn("ADD_RUNG_IDENTITY_MISMATCH", output)
-        self.assertEqual(resumed.calls, [])
-        repaired = self.receipt("br10identity")
-        self.assertEqual(repaired["add_transition"]["status"], "FROZEN")
-        self.assertEqual(
-            repaired["add_transition"]["identity_refusal"]["reason"],
-            "ADD_RUNG_IDENTITY_MISMATCH")
+    def test_entry_rejected_hedge_uses_measured_spot_unwind(self):
+        self.ready_add("rejected-hedge-reconcile")
+        spec = self.add_spec(214)
+        spec["legs"]["enter_short"] = {
+            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
+            "query": [MISSING] * 8,
+        }
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "rejectedhedge", spec)
+        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short", "unwind_spot"])
+        self.assertEqual(self.current()["ledger"][-1]["event_type"],
+                         "AddAborted")
 
-    def test_build04_crash_between_legs_resume_queries_without_post(self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-before-crash")
-        spec = self.add_spec(5)
+    def test_entry_each_leg_binds_symbol_client_and_order_id(self):
+        self.ready_add("leg-identity-reconcile")
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "legidentity", self.add_spec(215))
+        self.assertEqual(code, 0, output)
+        rung = self.current()["ledger"][-1]
+        for role in ("spot", "short"):
+            leg = rung["legs"][role]
+            self.assertTrue(leg["client_order_id"].endswith(
+                "enter_spot" if role == "spot" else "enter_short"))
+            self.assertTrue(leg["exchange_order_id"])
+        self.assertEqual(len(transport.posts), 2)
 
-        def stop_after_short_reaches_transport(params):
-            if params["newClientOrderId"].endswith("enter_short"):
+    def test_entry_concurrent_starts_have_one_ledger_owner(self):
+        self.ready_add("concurrent-owner-reconcile")
+        now = self.current()["ledger"][-1]["cut_ms"] + 1
+        accepted = bp.load_entry_proposal(
+            self.dir, PROPOSAL_ID, SYMBOL, SHA, now)
+        cfg_one = dataclasses.replace(self.cfg, run_id="owner-one")
+        cfg_two = dataclasses.replace(self.cfg, run_id="owner-two")
+        authority_one, first = bp._prepare_add_entry(
+            cfg_one, accepted, now)
+        authority_two, second = bp._prepare_add_entry(
+            cfg_two, accepted, now)
+        transport = ScriptedTransport(self.add_spec(216))
+        state_one = bp._entry_state(
+            cfg_one, transport, lambda seconds: None,
+            accepted, authority_one)
+        state_two = bp._entry_state(
+            cfg_two, transport, lambda seconds: None,
+            accepted, authority_two)
+        market = bp.market_context(state_one)
+        plan = bp._proposal_plan(
+            accepted, market,
+            effective_cap=authority_one.effective_cap_quote,
+            enforce_first_trade_cap=True)
+        first.persist_spot_intent(state_one, plan)
+        with self.assertRaisesRegex(bp.PositionError, "ledger changed"):
+            second.persist_spot_intent(state_two, plan)
+        active = bp.derive_v2_state(self.current())["active_transition"]
+        self.assertEqual(active["run_id"], "owner-one")
+
+    def test_entry_live_or_foreign_observation_cannot_become_absent(self):
+        state = bp.make_state(
+            self.cfg, lambda *args: MISSING, lambda seconds: None,
+            "prior-observation", receipted=False)
+        prior = term_spot("NEW", "0", "0", 717)({
+            "origClientOrderId": "prior-client"})[1]
+        status, order = bp.query_client_order_strongest(
+            state, bp.SPOT, "prior-client", prior_order=prior)
+        self.assertEqual((status, order["orderId"]), ("pending", 717))
+        foreign = dict(prior, clientOrderId="foreign-client")
+        status, _order = bp.query_client_order_strongest(
+            state, bp.SPOT, "prior-client", prior_order=foreign)
+        self.assertEqual(status, "identity_mismatch")
+
+    def test_entry_aborted_rung_is_terminal(self):
+        self.ready_add("terminal-abort-reconcile")
+
+        def cut_at_spot(params):
+            raise RuntimeError("simulated process cut")
+
+        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
+            self.run_add(
+                PROPOSAL_ID, "terminalabort",
+                ScriptedTransport(self.add_spec(218), on_post=cut_at_spot))
+        spec = self.add_spec(219)
+        spec["legs"]["enter_spot"]["query"] = [MISSING] * 8
+        code, resumed, output = self.run_cmd(
+            bp.cmd_resume, spec, run_id="terminalabort-resume",
+            now=self.current()["ledger"][-1]["cut_ms"] + 2)
+        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
+        self.assertEqual(resumed.posts, [])
+        with self.assertRaisesRegex(bp.PositionError, "ADD_TERMINAL_SINK"):
+            self.reconcile("terminal-abort-later")
+
+    def test_entry_partial_unwind_then_missing_never_resends(self):
+        self.ready_add("partial-unwind-reconcile")
+        spec = self.add_spec(220)
+        spec["legs"]["enter_short"] = {
+            "submit": ("api_error", {"code": -2010, "msg": "refused"}),
+            "query": [MISSING] * 8,
+        }
+
+        def cut_at_unwind(params):
+            if params["newClientOrderId"].endswith("unwind_spot"):
                 raise RuntimeError("simulated process cut")
 
-        interrupted = ScriptedTransport(
-            spec, on_post=stop_after_short_reaches_transport)
         with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
-            self.run_add(PROPOSAL_ID, "addcrash", interrupted)
-        self.assertEqual(post_stages(interrupted), ["enter_spot"])
-        active = bp._active_v2_add_receipt(self.dir, self.current())
-        self.assertIsNotNone(active)
-        self.assertIn("short", active[1]["add_transition"]["intents"])
+            self.run_add(
+                PROPOSAL_ID, "partialunwind",
+                ScriptedTransport(spec, on_post=cut_at_unwind))
+        resume_spec = self.add_spec(221)
+        resume_spec["legs"]["enter_short"]["query"] = [MISSING] * 8
+        resume_spec["legs"]["unwind_spot"]["query"] = [
+            term_spot("PARTIALLY_FILLED", "0.02", "2", 90220),
+        ] + [MISSING] * 50
+        code, resumed, output = self.run_cmd(
+            bp.cmd_resume, resume_spec, run_id="partialunwind-resume",
+            now=self.current()["ledger"][-1]["cut_ms"] + 2)
+        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"], output)
+        self.assertEqual(resumed.posts, [])
 
-        resume_transport = ScriptedTransport(spec)
-        code, resume_transport, output = self.run_cmd(
-            bp.cmd_resume, resume_transport, run_id="add-recover",
+    def test_entry_dust_uses_spot_step(self):
+        self.ready_add("spot-step-reconcile")
+        spec = self.add_spec(
+            222, spot_quantity="0.0015", base_fee="0.001",
+            short_quantity="0", spot_quote="0.15", short_quote="0")
+        for row in spec["spot_info"]["symbols"][0]["filters"]:
+            if row["filterType"] == "NOTIONAL":
+                row["minNotional"] = "0.01"
+        spec["usdm_info"]["symbols"][0]["filters"][-1]["notional"] = \
+            "0.01"
+        spec["legs"]["unwind_spot"] = {
+            "submit": ("ok", {"fills": [{
+                "qty": "0.0005", "commission": "0.00001",
+                "commissionAsset": "USDT",
+            }]}),
+            "query": [term_spot("FILLED", "0.0005", "0.049", 90222)],
+        }
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "spotstep", spec)
+        self.assertEqual(code, bp.EXIT_CODE[bp.ST_ADD_ABORTED], output)
+        self.assertEqual(Decimal(transport.posts[-1][1]["quantity"]),
+                         Decimal("0.0005"))
+
+    def test_entry_dead_owner_reclaims_but_live_owner_never_does(self):
+        now = time.time_ns() // 1_000_000
+        path = self._write_guard(
+            99_999_999, "missing-process", now - 1)
+        dead = bp._take_position_write_guard(self.dir)
+        self.assertTrue(dead)
+        self.assertEqual(dead.recovery_row["reason"], "OWNER_NOT_RUNNING")
+        bp._release_position_write_guard(self.dir, dead.token)
+        marker = bp._position_guard_process_start(os.getpid())
+        self._write_guard(
+            os.getpid(), marker,
+            now - bp.POSITION_WRITE_GUARD_STALE_MS - 1)
+        live = bp._take_position_write_guard(self.dir)
+        self.assertFalse(live)
+        self.assertEqual(live.refusal, "POSITION_WRITE_GUARD_ACTIVE")
+        self.assertTrue(path.exists())
+
+    def test_entry_each_seal_before_spot_blocks_and_after_spot_allows_hedge(
+            self):
+        self.ready_add("seal-reconcile")
+        Path(self.dir, bp.STOP_FILE).write_text("owner stop\n",
+                                                encoding="utf-8")
+        transport = ScriptedTransport(self.add_spec(223))
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "sealedbefore", transport)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"], output)
+        self.assertEqual(transport.calls, [])
+        Path(self.dir, bp.STOP_FILE).unlink()
+        original = bp._V2RungPersistence.persist_short_intent
+
+        def seal_after_spot(adapter, *args, **kwargs):
+            Path(self.dir, bp.STOP_JOBS_FILE).write_text(
+                "owner stop\n", encoding="utf-8")
+            return original(adapter, *args, **kwargs)
+
+        with mock.patch.object(
+                bp._V2RungPersistence, "persist_short_intent",
+                new=seal_after_spot):
+            code, transport, output = self.run_add(
+                PROPOSAL_ID, "sealafter", self.add_spec(224))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+
+    def test_entry_recovery_requires_rung_id_proposal_and_dislocation(self):
+        self.ready_add("recovery-bundle-reconcile")
+
+        def cut_at_spot(params):
+            raise RuntimeError("simulated process cut")
+
+        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
+            self.run_add(
+                PROPOSAL_ID, "recoverybundle",
+                ScriptedTransport(self.add_spec(225), on_post=cut_at_spot))
+        path = self.audit_path("recoverybundle")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["entry_authority"]["dislocation"]["event_id"] = \
+            "add:different"
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        transport = ScriptedTransport(self.add_spec(226))
+        code, transport, output = self.run_cmd(
+            bp.cmd_resume, transport, run_id="recoverybundle-resume")
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"], output)
+        self.assertEqual(transport.calls, [])
+
+    def test_entry_each_receipt_and_commit_marker_is_durable(self):
+        self.ready_add("durable-marker-reconcile")
+        with mock.patch.object(bp.os, "fsync", wraps=os.fsync) as fsync:
+            code, _transport, output = self.run_add(
+                PROPOSAL_ID, "durablemarker", self.add_spec(227))
+        self.assertEqual(code, 0, output)
+        self.assertGreater(fsync.call_count, 0)
+        receipt = self.receipt("durablemarker")
+        position = self.current()
+        head = json.loads(Path(
+            self.dir, bp.STATE_FILE + ".head").read_text(encoding="utf-8"))
+        add_intent = next(
+            event for event in position["ledger"]
+            if event["event_type"] == "AddIntent")
+        self.assertEqual(receipt["verdict"], "OPEN")
+        self.assertEqual(receipt["rung_id"],
+                         add_intent["event_digest"])
+        self.assertEqual(head["event_count"], len(position["ledger"]))
+
+    def test_entry_terminal_ledger_repairs_missing_audit_receipt(self):
+        self.ready_add("terminal-audit-reconcile")
+        code, _transport, output = self.run_add(
+            PROPOSAL_ID, "missingaudit", self.add_spec(228))
+        self.assertEqual(code, 0, output)
+        self.audit_path("missingaudit").unlink()
+        transport = ScriptedTransport(self.add_spec(229))
+        code, transport, output = self.run_cmd(
+            bp.cmd_resume, transport, run_id="missingaudit-resume",
             now=self.current()["ledger"][-1]["cut_ms"] + 2)
         self.assertEqual(code, 0, output)
-        self.assertEqual(resume_transport.posts, [])
-        pending = bp.derive_v2_state(self.current())
-        self.assertEqual([row["ordinal"] for row in pending["rungs"]],
-                         [1, 2])
-        self.assertEqual(pending["top_state"], "FROZEN")
-        reconciled = self.reconcile("add-reconcile-after-recovery")
-        self.assertEqual(reconciled["top_state"], bp.ST_OPEN)
-        repaired = self.receipt("addcrash")
-        self.assertEqual(repaired["add_transition"]["status"],
-                         "COMMITTED")
-        self.assertEqual(repaired["verdict"], "OPEN")
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self.receipt("missingaudit")["verdict"], "OPEN")
 
-    def test_build04_ledger_intent_blocks_retry_if_receipt_is_missing(self):
-        self.initialize_open()
-        self.reconcile("add-reconcile-ledger-guard")
-        spec = self.add_spec(9)
+    def test_entry_spot_sellability_uses_only_spot_filters(self):
+        state = bp.make_state(
+            self.cfg,
+            lambda *args: ("ok", {
+                "symbol": SYMBOL, "bidPrice": "100", "askPrice": "101"}),
+            lambda seconds: None, "sellability", receipted=False)
+        status, quantity, _bid = bp._fresh_spot_sellable(state, {
+            "shared_step": Decimal("0.01"),
+            "spot_step": Decimal("0.001"),
+            "spot_min_qty": Decimal("0.001"),
+            "spot_min_notional": Decimal("0"),
+        }, Decimal("0.005"))
+        self.assertEqual((status, quantity),
+                         ("SELLABLE", Decimal("0.005")))
 
-        def stop_at_spot_transport(_params):
-            raise RuntimeError("simulated early process cut")
+    def test_entry_actual_fills_use_unrounded_venue_values(self):
+        authority = bp.EntryAuthority(
+            "OPEN", 1, None, None, None, None,
+            "a" * 64, None, {})
+        accepted = bp.AcceptedProposal(
+            PROPOSAL_ID, "b" * 64, {}, Decimal("1"), Decimal("1"))
+        persistence = bp._EntryPersistence(self.cfg, accepted, authority)
+        state = bp.make_state(
+            self.cfg, lambda *args: ("unclear", {}),
+            lambda seconds: None, "unrounded", receipted=False)
+        state.receipt["legs"] = [{
+            "stage": bp.ENTER_SHORT, "fee_by_asset": {}}]
+        order = {
+            "symbol": SYMBOL, "clientOrderId": "unrounded-client",
+            "orderId": 230, "status": "FILLED",
+            "executedQty": "0.0780000001", "cumQuote": "5.000000001",
+        }
+        leg = bp._entry_order_leg(
+            state, persistence, "short", "unrounded-client", order)
+        self.assertEqual(leg["executed_quantity"], "0.0780000001")
+        self.assertEqual(leg["executed_quote"], "5.000000001")
 
-        interrupted = ScriptedTransport(
-            spec, on_post=stop_at_spot_transport)
-        with self.assertRaisesRegex(
-                RuntimeError, "simulated early process cut"):
-            self.run_add(PROPOSAL_ID, "addlost", interrupted)
-        derived = bp.derive_v2_state(self.current())
-        self.assertEqual(derived["top_state"], bp.ST_ADDING)
-        self.assertEqual(
-            self.current()["ledger"][-1]["event_type"], "AddIntent")
-        Path(self.dir, "basis-position-addlost.json").unlink()
+    def test_entry_fee_assets_preserve_base_quote_and_third_asset_units(self):
+        self.ready_add("fee-assets-reconcile")
+        spec = self.add_spec(
+            231, base_fee="0", short_quantity="0.079",
+            short_quote="7.9158")
+        spec["legs"]["enter_spot"]["submit"] = ("ok", {"fills": [
+            {"qty": "0.04", "commission": "0.004",
+             "commissionAsset": "USDT"},
+            {"qty": "0.039", "commission": "0.0002",
+             "commissionAsset": "BNB"},
+        ]})
+        code, _transport, output = self.run_add(
+            PROPOSAL_ID, "feeassets", spec)
+        self.assertEqual(code, 0, output)
+        fees = self.current()["ledger"][-1]["legs"]["spot"][
+            "fee_by_asset"]
+        self.assertEqual(fees, {"USDT": "0.004", "BNB": "0.0002"})
 
-        next_id = "abc125"
-        self.write_add_proposal(next_id)
-        retry = ScriptedTransport(spec)
-        code, retry, output = self.run_add(
-            next_id, "addnext", retry,
-            now=self.current()["ledger"][-1]["cut_ms"] + 1)
-        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
-        self.assertIn("current state is ADDING", output)
-        self.assertEqual(retry.calls, [])
-
+    def test_entry_cap_to_base_floor_precedes_short_post(self):
+        accepted = bp.AcceptedProposal(
+            PROPOSAL_ID, "c" * 64, {}, Decimal("0.2"), Decimal("1"))
+        authority = bp.EntryAuthority(
+            "ADD", 2, None, Decimal("0.1"), Decimal("8"),
+            Decimal("6"), "d" * 64, "reconcile", {})
+        plan = bp.CyclePlan(
+            SYMBOL, Decimal("20"), Decimal("10"), Decimal("0.0001"),
+            Decimal("0.2"), Decimal("0.2"), Decimal("8"), Decimal("8"),
+            1, "floor test")
+        hedge, _reason = bp._entry_hedge_quantity(
+            accepted, authority, plan, {
+                "futures_execution_price_ceiling": Decimal("100.2"),
+                "futures_step": Decimal("0.001"),
+                "futures_min_qty": Decimal("0.001"),
+                "futures_min_notional": Decimal("5"),
+            }, Decimal("0.2"))
+        self.assertEqual(hedge, Decimal("0.059"))
 
 class RatesTests(MachineCase):
     def test_rates_written_atomically_with_rate_values(self):
@@ -4712,6 +4173,15 @@ class CloseTests(MachineCase):
         self.assertIn("no proven short quantity", out)
 
     def test_close_after_partial_resume_uses_remaining_short(self):
+        payload = proposal_payload()
+        payload.update({
+            "quantity": "1.001",
+            "spot_ask": "9.9",
+            "perp_bid": "10.0",
+            "spot_quote_cap": "10",
+            "short_notional": "10",
+        })
+        self.write_proposal(payload)
         self.open_position(one_unit_spec())
         self.assertEqual(
             Decimal(self.position()["entry"]["short"]["filled_qty"]),

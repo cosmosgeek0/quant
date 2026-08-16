@@ -381,7 +381,7 @@ def one_symbol(payload: Any, symbol: str, label: str) -> Dict[str, Any]:
 
 
 def market_context(state: RunState) -> Dict[str, Any]:
-    """Read both venues' filters; derive the shared step and minimums."""
+    """Read both venues' filters; derive shared and per-venue constraints."""
     symbol = state.cfg.symbol
     spot_info = one_symbol(
         public_read(state, SPOT.base_url, SPOT.exchange_info_path,
@@ -413,35 +413,43 @@ def market_context(state: RunState) -> Dict[str, Any]:
                         for row in spot_info.get("filters", [])}
         usdm_filters = {row["filterType"]: row
                         for row in usdm_info.get("filters", [])}
-        steps = [d(spot_filters["LOT_SIZE"]["stepSize"]),
-                 d(usdm_filters["LOT_SIZE"]["stepSize"])]
-        min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"]),
-                    d(usdm_filters["LOT_SIZE"]["minQty"])]
-        for filters in (spot_filters, usdm_filters):
+        spot_steps = [d(spot_filters["LOT_SIZE"]["stepSize"])]
+        futures_steps = [d(usdm_filters["LOT_SIZE"]["stepSize"])]
+        spot_min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"])]
+        futures_min_qtys = [d(usdm_filters["LOT_SIZE"]["minQty"])]
+        for filters, venue_steps, venue_min_qtys in (
+                (spot_filters, spot_steps, spot_min_qtys),
+                (usdm_filters, futures_steps, futures_min_qtys)):
             market_lot = filters.get("MARKET_LOT_SIZE", {})
-            market_step = d(market_lot.get("stepSize", "0"))
-            if market_step > 0:
-                steps.append(market_step)
-            min_qtys.append(d(market_lot.get("minQty", "0")))
+            if market_lot:
+                market_step = d(market_lot["stepSize"])
+                market_min_qty = d(market_lot["minQty"])
+                if market_step > 0:
+                    venue_steps.append(market_step)
+                venue_min_qtys.append(market_min_qty)
         spot_notional = spot_filters.get("NOTIONAL") or \
             spot_filters.get("MIN_NOTIONAL") or {}
         usdm_notional = usdm_filters.get("MIN_NOTIONAL", {})
-        min_notional = max(d(spot_notional.get("minNotional", "0")),
-                           d(usdm_notional.get("notional", "0")))
-        shared_step = steps[0]
-        for step in steps[1:]:
-            shared_step = common_step(shared_step, step)
-        # The SPOT venue's own sellability step: a spot-sale residual at or
-        # above this is a sellable remainder, whatever the shared (LCM) step.
-        spot_step = d(spot_filters["LOT_SIZE"]["stepSize"])
-        spot_market_step = d(spot_filters.get("MARKET_LOT_SIZE",
-                                              {}).get("stepSize", "0"))
-        if spot_market_step > 0:
-            spot_step = common_step(spot_step, spot_market_step)
+        spot_min_notional = d(spot_notional["minNotional"])
+        futures_min_notional = d(usdm_notional["notional"])
+        spot_step = spot_steps[0]
+        for step in spot_steps[1:]:
+            spot_step = common_step(spot_step, step)
+        futures_step = futures_steps[0]
+        for step in futures_steps[1:]:
+            futures_step = common_step(futures_step, step)
+        shared_step = common_step(spot_step, futures_step)
     except (KeyError, TypeError, ValueError, ArithmeticError):
         raise Refusal("symbol filters are unusable on one venue") from None
-    if shared_step <= 0 or spot_step <= 0:
-        raise Refusal("shared quantity step is not positive")
+    filter_values = (
+        spot_step, futures_step, spot_min_notional,
+        futures_min_notional, *spot_min_qtys, *futures_min_qtys,
+    )
+    if any(not value.is_finite() for value in filter_values) \
+            or shared_step <= 0 or spot_step <= 0 or futures_step <= 0 \
+            or spot_min_notional < 0 or futures_min_notional < 0 \
+            or min(spot_min_qtys) < 0 or min(futures_min_qtys) < 0:
+        raise Refusal("symbol filters contain an invalid venue constraint")
     # Worst-case futures price band for a market order: the exchange reserves
     # margin at roughly notional x the up-multiplier. Missing band data falls
     # back to a conservative 1.5; the notional itself comes from the shared
@@ -454,24 +462,36 @@ def market_context(state: RunState) -> Dict[str, Any]:
                         (band_by_side, "bidMultiplierUp")):
         try:
             value = d(source.get(key, "0"))
-        except ArithmeticError:
+        except (ArithmeticError, TypeError, ValueError):
             continue
-        if value > 1:
+        if value.is_finite() and value > 1:
             ups.append(value)
     band_up = max(ups) if ups else Decimal("1.5")
-    spot_min_notional = d((spot_notional or {}).get("minNotional", "0"))
-    spot_min_qtys = [d(spot_filters["LOT_SIZE"]["minQty"]),
-                     d(spot_filters.get("MARKET_LOT_SIZE",
-                                        {}).get("minQty", "0"))]
+    futures_execution_price_ceiling = None
+    try:
+        raw_ceiling = usdm_filters.get("PRICE_FILTER", {}).get("maxPrice")
+        if raw_ceiling not in (None, ""):
+            parsed_ceiling = d(raw_ceiling)
+            if parsed_ceiling.is_finite() and parsed_ceiling > 0:
+                futures_execution_price_ceiling = parsed_ceiling
+    except (ArithmeticError, TypeError, ValueError):
+        futures_execution_price_ceiling = None
+    min_notional = max(spot_min_notional, futures_min_notional)
+    min_qty = max(*spot_min_qtys, *futures_min_qtys)
     return {
         "base": spot_info.get("baseAsset", ""),
         "shared_step": shared_step,
         "spot_step": spot_step,
+        "futures_step": futures_step,
         "min_notional": min_notional,
-        "min_qty": max(min_qtys),
+        "min_qty": min_qty,
         "band_up": band_up,
         "spot_min_notional": spot_min_notional,
         "spot_min_qty": max(spot_min_qtys),
+        "futures_min_notional": futures_min_notional,
+        "futures_min_qty": max(futures_min_qtys),
+        "futures_execution_price_ceiling":
+            futures_execution_price_ceiling,
     }
 
 
@@ -534,11 +554,15 @@ def query_client_order(state: RunState, venue: Venue,
 def _query_order_observation_strength(
         venue: Venue, order: Dict[str, Any]) -> Tuple[int, Decimal, Decimal]:
     """Order nonterminal observations without weakening Decimal truth."""
-    status_rank = {
-        "NEW": 1,
-        "PARTIALLY_FILLED": 2,
-        "FILLED": 3,
-    }.get(str(order.get("status", "")), 0)
+    status = str(order.get("status", ""))
+    if status == "NEW":
+        status_rank = 1
+    elif status == "PARTIALLY_FILLED":
+        status_rank = 2
+    elif status in TERMINAL:
+        status_rank = 4 if status == "FILLED" else 3
+    else:
+        status_rank = 0
     try:
         executed = d(order.get("executedQty", "0"))
         quote = d(order.get(venue.quote_field, "0"))
@@ -551,24 +575,60 @@ def _query_order_observation_strength(
     return status_rank, executed, quote
 
 
+def _order_id(value: Any) -> Optional[str]:
+    """Normalize one exchange order id without inventing a missing identity."""
+    if value is None or isinstance(value, bool):
+        return None
+    normalized = str(value)
+    return normalized if normalized else None
+
+
+def _order_identity(
+        state: RunState, order: Any, order_client_id: str,
+        expected_order_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (order_id, error) for one complete query observation."""
+    if not isinstance(order, dict):
+        return None, "returned order was not an object"
+    if order.get("symbol") != state.cfg.symbol:
+        return None, "returned order symbol did not match"
+    if order.get("clientOrderId") != order_client_id:
+        return None, "returned order client id did not match"
+    observed_order_id = _order_id(order.get("orderId"))
+    if observed_order_id is None:
+        return None, "returned order id was missing"
+    if expected_order_id is not None \
+            and observed_order_id != expected_order_id:
+        return observed_order_id, "returned order id did not match"
+    return observed_order_id, None
+
+
 def query_client_order_strongest(
-        state: RunState, venue: Venue, order_client_id: str,
-        *, prior_order: Optional[Dict[str, Any]] = None) -> Tuple[str, Any]:
+        state: RunState, venue: Venue, client_id: str,
+        *, expected_order_id=None, prior_order=None,
+        observation_sink=None) -> Tuple[str, Any]:
     """Poll an exact identity without letting later absence erase a sighting.
 
-    This stricter helper is opt-in so every existing executor caller keeps the
-    legacy polling contract. Exact absence requires -2013 on the complete
-    retry envelope and no order observation in this or an earlier invocation.
-    Every returned row is identity-checked before its state can be retained.
+    Exact absence requires -2013 on the complete retry envelope and no order
+    observation in this or an earlier invocation. Symbol, client id, and the
+    submit or first-seen order id are checked on every returned row. Each
+    stronger observation reaches the supplied durable sink before another GET.
     """
+    bound_order_id = _order_id(expected_order_id)
+    if expected_order_id is not None and bound_order_id is None:
+        first_fail(state, "query_order", "expected order id was unreadable")
+        return "identity_mismatch", prior_order
     strongest = None
+    if prior_order is not None and not isinstance(prior_order, dict):
+        first_fail(state, "query_order", "prior order was not an object")
+        return "identity_mismatch", prior_order
     if isinstance(prior_order, dict):
-        if prior_order.get("symbol") != state.cfg.symbol \
-                or prior_order.get("clientOrderId") != order_client_id:
-            first_fail(
-                state, "query_order",
-                "returned order identity did not match")
+        observed_order_id, identity_error = _order_identity(
+            state, prior_order, client_id, bound_order_id)
+        if identity_error is not None:
+            first_fail(state, "query_order", identity_error)
             return "identity_mismatch", prior_order
+        if bound_order_id is None:
+            bound_order_id = observed_order_id
         strongest = dict(prior_order)
         if strongest.get("status") in TERMINAL:
             return "terminal", strongest
@@ -577,19 +637,22 @@ def query_client_order_strongest(
         kind, order = state.request(
             "GET", venue.base_url, venue.order_path,
             {"symbol": state.cfg.symbol,
-             "origClientOrderId": order_client_id}, True)
+             "origClientOrderId": client_id}, True)
         if kind == "ok" and isinstance(order, dict):
             all_missing = False
-            if order.get("symbol") != state.cfg.symbol \
-                    or order.get("clientOrderId") != order_client_id:
-                first_fail(
-                    state, "query_order",
-                    "returned order identity did not match")
+            observed_order_id, identity_error = _order_identity(
+                state, order, client_id, bound_order_id)
+            if identity_error is not None:
+                first_fail(state, "query_order", identity_error)
                 return "identity_mismatch", order
+            if bound_order_id is None:
+                bound_order_id = observed_order_id
             if strongest is None or _query_order_observation_strength(
                     venue, order) > _query_order_observation_strength(
                         venue, strongest):
                 strongest = dict(order)
+                if observation_sink is not None:
+                    observation_sink(venue.name, dict(strongest))
             if order.get("status") in TERMINAL:
                 return "terminal", order
         elif kind == "api_error" and isinstance(order, dict) \
@@ -611,7 +674,8 @@ def query_client_order_strongest(
 
 def settle_leg(state: RunState, stage: str, plan: CyclePlan,
                quantity: Optional[Decimal] = None, *,
-               query_order: Optional[Callable[..., Tuple[str, Any]]] = None):
+               query_order=query_client_order_strongest,
+               observation_sink=None):
     """Submit ONE order for a stage, then establish its truth by client id.
 
     Returns ("terminal", order, response_fills) | ("rejected", payload, []) |
@@ -639,18 +703,84 @@ def settle_leg(state: RunState, stage: str, plan: CyclePlan,
 
     kind, response = state.request("POST", venue.base_url, venue.order_path,
                                    dict(wire), True)
-    poll_order = query_client_order if query_order is None else query_order
-    query_state, order = poll_order(state, venue, order_client_id)
+    submit_order_id = None
+    submit_identity_error = None
+    if kind == "ok" and isinstance(response, dict):
+        returned_symbol = response.get("symbol")
+        returned_client_id = response.get("clientOrderId")
+        if returned_symbol is not None and returned_symbol != state.cfg.symbol:
+            submit_identity_error = "submit response symbol did not match"
+        elif returned_client_id is not None \
+                and returned_client_id != order_client_id:
+            submit_identity_error = "submit response client id did not match"
+        raw_submit_order_id = response.get("orderId")
+        if raw_submit_order_id is not None:
+            submit_order_id = _order_id(raw_submit_order_id)
+            if submit_order_id is None:
+                submit_identity_error = "submit response order id was unreadable"
+            else:
+                leg["submit_order_id"] = submit_order_id
+                save(state)
+    if submit_identity_error is not None:
+        first_fail(state, "submit_order", submit_identity_error)
+
+    role = {
+        ENTER_SPOT: "spot",
+        ENTER_SHORT: "short",
+        UNWIND_SPOT: "unwind",
+        EXIT_SHORT: "short_close",
+        EXIT_SPOT: "spot_close",
+    }.get(stage, stage.lower())
+
+    def persist_observation(_venue_role, observed):
+        leg["strongest_order_observation"] = dict(observed)
+        leg["confirmed_symbol"] = observed.get("symbol")
+        leg["observed_order_id"] = _order_id(observed.get("orderId"))
+        save(state)
+        if observation_sink is not None:
+            observation_sink(role, dict(observed))
+
+    poll_order = query_client_order_strongest if query_order is None \
+        else query_order
+    if poll_order is query_client_order:
+        query_state, order = poll_order(state, venue, order_client_id)
+    else:
+        query_state, order = poll_order(
+            state, venue, order_client_id,
+            expected_order_id=submit_order_id, prior_order=None,
+            observation_sink=persist_observation)
 
     if query_state == "terminal":
-        if order.get("clientOrderId") != order_client_id:
-            first_fail(state, "query_order", "returned client id did not match")
-            leg.update({"status": "UNKNOWN", "detail": "order identity mismatch"})
+        if poll_order is query_client_order:
+            returned_order_id = _order_id(order.get("orderId")) \
+                if isinstance(order, dict) else None
+            identity_error = None if isinstance(order, dict) \
+                and order.get("clientOrderId") == order_client_id \
+                else "returned order client id did not match"
+        else:
+            returned_order_id, identity_error = _order_identity(
+                state, order, order_client_id, submit_order_id)
+        if submit_identity_error is not None or identity_error is not None:
+            if identity_error is not None:
+                first_fail(state, "query_order", identity_error)
+            leg.update({"status": "UNKNOWN",
+                        "detail": "order identity did not match"})
             save(state)
             return "unknown", order, []
-        executed = d(order.get("executedQty", "0"))
-        quote = d(order.get(venue.quote_field, "0"))
-        order_id = str(order.get("orderId", ""))
+        try:
+            executed = d(order.get("executedQty"))
+            quote = d(order.get(venue.quote_field))
+        except (ArithmeticError, TypeError, ValueError):
+            executed, quote = Decimal("NaN"), Decimal("NaN")
+        if not executed.is_finite() or not quote.is_finite() \
+                or executed < 0 or quote < 0:
+            first_fail(state, "query_order",
+                       "returned terminal quantities were unreadable")
+            leg.update({"status": "UNKNOWN",
+                        "detail": "terminal quantities were unreadable"})
+            save(state)
+            return "unknown", order, []
+        order_id = returned_order_id or ""
         leg.update({"status": str(order.get("status")), "order_id": order_id,
                     "executed_qty": fmt(executed), "quote": fmt(quote),
                     "terminal_utc": utc()})
@@ -1388,7 +1518,9 @@ def reconcile_once(cfg: ExecutorConfig, request,
         short_quantity=sell_qty, spot_quote_cap=Decimal(0),
         short_notional=Decimal(0), leverage=1,
         reason="reconcile: ordered sale of recorded exposure")
-    outcome, order, _fills = settle_leg(state, EXIT_SPOT, plan_stub, sell_qty)
+    outcome, order, _fills = settle_leg(
+        state, EXIT_SPOT, plan_stub, sell_qty,
+        query_order=query_client_order)
     if outcome == "terminal":
         executed = d(order.get("executedQty", "0"))
         residual = net_base - executed

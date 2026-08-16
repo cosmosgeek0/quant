@@ -75,7 +75,8 @@ def tearDownModule():
 
 def term_spot(status, executed, quote, order_id):
     def responder(params):
-        return ("ok", {"clientOrderId": params["origClientOrderId"],
+        return ("ok", {"symbol": SYMBOL,
+                       "clientOrderId": params["origClientOrderId"],
                        "status": status, "executedQty": executed,
                        "cummulativeQuoteQty": quote, "orderId": order_id})
     return responder
@@ -83,13 +84,34 @@ def term_spot(status, executed, quote, order_id):
 
 def term_usdm(status, executed, quote, order_id):
     def responder(params):
-        return ("ok", {"clientOrderId": params["origClientOrderId"],
+        return ("ok", {"symbol": SYMBOL,
+                       "clientOrderId": params["origClientOrderId"],
                        "status": status, "executedQty": executed,
                        "cumQuote": quote, "orderId": order_id})
     return responder
 
 
-NEW_ORDER = ("ok", {"status": "NEW"})
+def new_order(params):
+    stage = params["origClientOrderId"].split("-", 2)[2]
+    order_id = {
+        "enter_spot": 111222,
+        "enter_short": 444555,
+        "exit_short": 444556,
+        "exit_spot": 111223,
+        "unwind_spot": 111224,
+    }[stage]
+    quote_field = "cummulativeQuoteQty" if "spot" in stage else "cumQuote"
+    return ("ok", {
+        "symbol": SYMBOL,
+        "clientOrderId": params["origClientOrderId"],
+        "status": "NEW",
+        "executedQty": "0",
+        quote_field: "0",
+        "orderId": order_id,
+    })
+
+
+NEW_ORDER = new_order
 MISSING = ("api_error", {"code": -2013, "msg": "Order does not exist."})
 
 
@@ -247,6 +269,17 @@ def post_stages(transport):
             for _, params in transport.posts]
 
 
+def cycle_plan():
+    return basis_cycle.CyclePlan(
+        symbol=SYMBOL, entry_gap_bps=Decimal("20"),
+        exit_gap_bps=Decimal("10"), funding_rate=Decimal("0.0001"),
+        spot_quantity=HAPPY_PLAN_QTY,
+        short_quantity=HAPPY_PLAN_QTY,
+        spot_quote_cap=HAPPY_SPOT_QUOTE_CAP,
+        short_notional=HAPPY_SHORT_NOTIONAL, leverage=1,
+        reason="offline executor interface test")
+
+
 class ExecutorCase(unittest.TestCase):
     def setUp(self):
         holder = tempfile.TemporaryDirectory()
@@ -330,14 +363,7 @@ class ReceiptDurabilityTests(ExecutorCase):
         ]
 
     def plan(self):
-        return basis_cycle.CyclePlan(
-            symbol=SYMBOL, entry_gap_bps=Decimal("20"),
-            exit_gap_bps=Decimal("10"), funding_rate=Decimal("0.0001"),
-            spot_quantity=HAPPY_PLAN_QTY,
-            short_quantity=HAPPY_PLAN_QTY,
-            spot_quote_cap=HAPPY_SPOT_QUOTE_CAP,
-            short_notional=HAPPY_SHORT_NOTIONAL, leverage=1,
-            reason="offline durability test")
+        return cycle_plan()
 
     def test_save_orders_file_sync_replace_and_parent_sync(self):
         state = self.state()
@@ -351,9 +377,10 @@ class ReceiptDurabilityTests(ExecutorCase):
             self.assertEqual(method, "POST")
             return "ok", {"fills": []}
 
-        def query_order(_state, _venue, order_client_id):
+        def query_order(_state, _venue, order_client_id, **_kwargs):
             return "terminal", {
-                "clientOrderId": order_client_id, "status": "FILLED",
+                "symbol": SYMBOL, "clientOrderId": order_client_id,
+                "status": "FILLED",
                 "executedQty": "0.1", "cummulativeQuoteQty": "10",
                 "orderId": 123,
             }
@@ -444,6 +471,312 @@ class ReceiptDurabilityTests(ExecutorCase):
         self.assertEqual(len(parent_descriptors), 1)
         with self.assertRaises(OSError):
             os.fstat(parent_descriptors[0])
+
+
+class EntryPollingInterfaceTests(ExecutorCase):
+    def state(self, request):
+        state = basis_executor.make_state(
+            self.cfg, request, sleep=lambda _seconds: None)
+        state.receipt = {"legs": []}
+        return state
+
+    def order(self, client, order_id, status="NEW", executed="0",
+              quote="0", venue=basis_executor.SPOT):
+        return {
+            "symbol": SYMBOL,
+            "clientOrderId": client,
+            "orderId": order_id,
+            "status": status,
+            "executedQty": executed,
+            venue.quote_field: quote,
+        }
+
+    def test_entry_poll_keeps_seen_order_when_later_reads_are_missing(self):
+        client = "bc-%s-enter_spot" % RID
+        replies = [
+            ("ok", self.order(client, 710, executed="0.01", quote="1")),
+            MISSING,
+            MISSING,
+        ]
+        observations = []
+
+        def request(*_args, **_kwargs):
+            return replies.pop(0)
+
+        state = self.state(request)
+        with mock.patch.object(basis_executor, "QUERY_TRIES", 3):
+            query_state, order = basis_executor.query_client_order_strongest(
+                state, basis_executor.SPOT, client,
+                observation_sink=lambda role, row: observations.append(
+                    (role, row)))
+        self.assertEqual(query_state, "pending")
+        self.assertEqual(order["orderId"], 710)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0][0], "spot")
+
+    def test_entry_poll_observation_is_durable_before_next_read(self):
+        reads = 0
+        state_holder = {}
+        external = []
+
+        def request(method, _base_url, _path, params, _signed):
+            nonlocal reads
+            if method == "POST":
+                return "ok", {}
+            reads += 1
+            client = params["origClientOrderId"]
+            if reads == 1:
+                return "ok", self.order(
+                    client, 720, status="PARTIALLY_FILLED",
+                    executed="0.01", quote="1", venue=basis_executor.USDM)
+            with open(state_holder["state"].receipt_path,
+                      encoding="utf-8") as handle:
+                durable = json.load(handle)
+            saved = durable["legs"][-1]["strongest_order_observation"]
+            self.assertEqual(saved["orderId"], 720)
+            self.assertEqual(saved["status"], "PARTIALLY_FILLED")
+            return MISSING
+
+        state = self.state(request)
+        state_holder["state"] = state
+        with mock.patch.object(basis_executor, "QUERY_TRIES", 2):
+            result, order, _fills = basis_executor.settle_leg(
+                state, basis_cycle.ENTER_SHORT, cycle_plan(),
+                Decimal("0.02"),
+                observation_sink=lambda role, row: external.append(
+                    (role, row["orderId"])))
+        self.assertEqual(result, "unknown")
+        self.assertEqual(order["orderId"], 720)
+        self.assertEqual(external, [("short", 720)])
+
+    def test_entry_poll_sink_only_persists_stronger_truth(self):
+        client = "bc-%s-enter_spot" % RID
+        replies = [
+            ("ok", self.order(client, 725)),
+            ("ok", self.order(client, 725)),
+            ("ok", self.order(
+                client, 725, status="PARTIALLY_FILLED",
+                executed="0.01", quote="1")),
+            MISSING,
+        ]
+        saved = []
+        state = self.state(lambda *_args, **_kwargs: replies.pop(0))
+        with mock.patch.object(basis_executor, "QUERY_TRIES", 4):
+            query_state, order = basis_executor.query_client_order_strongest(
+                state, basis_executor.SPOT, client,
+                observation_sink=lambda _role, row: saved.append(row))
+        self.assertEqual(query_state, "pending")
+        self.assertEqual(order["status"], "PARTIALLY_FILLED")
+        self.assertEqual([row["status"] for row in saved],
+                         ["NEW", "PARTIALLY_FILLED"])
+
+    def test_entry_poll_requires_submit_and_query_order_id_agreement(self):
+        state_holder = {}
+
+        def request(method, _base_url, _path, params, _signed):
+            client = params.get("newClientOrderId") \
+                or params["origClientOrderId"]
+            if method == "POST":
+                return "ok", {
+                    "symbol": SYMBOL, "clientOrderId": client,
+                    "orderId": 730,
+                }
+            with open(state_holder["state"].receipt_path,
+                      encoding="utf-8") as handle:
+                durable = json.load(handle)
+            self.assertEqual(durable["legs"][-1]["submit_order_id"], "730")
+            return "ok", self.order(
+                client, 731, status="FILLED", executed="0.01", quote="1")
+
+        state = self.state(request)
+        state_holder["state"] = state
+        result, order, _fills = basis_executor.settle_leg(
+            state, basis_cycle.ENTER_SPOT, cycle_plan())
+        self.assertEqual(result, "unknown")
+        self.assertEqual(order["orderId"], 731)
+        self.assertEqual(state.receipt["first_failure"]["where"],
+                         "query_order")
+        self.assertIn("order id", state.receipt["first_failure"]["detail"])
+
+        client = "bc-%s-enter_spot" % RID
+        replies = [
+            ("ok", self.order(client, 732)),
+            ("ok", self.order(
+                client, 733, status="FILLED", executed="0.01", quote="1")),
+        ]
+        state = self.state(lambda *_args, **_kwargs: replies.pop(0))
+        with mock.patch.object(basis_executor, "QUERY_TRIES", 2):
+            query_state, order = basis_executor.query_client_order_strongest(
+                state, basis_executor.SPOT, client)
+        self.assertEqual(query_state, "identity_mismatch")
+        self.assertEqual(order["orderId"], 733)
+
+    def test_entry_each_leg_binds_symbol_client_and_order_id(self):
+        client = "bc-%s-enter_spot" % RID
+        rows = [
+            {**self.order(client, 740), "symbol": "ETHUSDT"},
+            {**self.order(client, 740), "clientOrderId": "bc-other"},
+            self.order(client, 741),
+        ]
+        for row in rows:
+            with self.subTest(row=row):
+                calls = []
+
+                def request(*_args, **_kwargs):
+                    calls.append(1)
+                    return "ok", row
+
+                state = self.state(request)
+                with mock.patch.object(basis_executor, "QUERY_TRIES", 2):
+                    query_state, _order = \
+                        basis_executor.query_client_order_strongest(
+                            state, basis_executor.SPOT, client,
+                            expected_order_id="740")
+                self.assertEqual(query_state, "identity_mismatch")
+                self.assertEqual(len(calls), 1)
+
+    def test_entry_live_or_foreign_observation_cannot_become_absent(self):
+        client = "bc-%s-enter_spot" % RID
+        replies = [
+            ("ok", {**self.order(client, 750),
+                    "clientOrderId": "bc-other"}),
+            MISSING,
+        ]
+        calls = []
+
+        def request(*_args, **_kwargs):
+            calls.append(1)
+            return replies.pop(0)
+
+        state = self.state(request)
+        with mock.patch.object(basis_executor, "QUERY_TRIES", 2):
+            query_state, order = basis_executor.query_client_order_strongest(
+                state, basis_executor.SPOT, client)
+        self.assertEqual(query_state, "identity_mismatch")
+        self.assertEqual(order["orderId"], 750)
+        self.assertEqual(len(calls), 1)
+
+    def test_entry_partial_unwind_then_missing_never_resends(self):
+        posts = 0
+        reads = 0
+
+        def request(method, _base_url, _path, params, _signed):
+            nonlocal posts, reads
+            if method == "POST":
+                posts += 1
+                return "ok", {}
+            reads += 1
+            if reads == 1:
+                return "ok", self.order(
+                    params["origClientOrderId"], 760,
+                    status="PARTIALLY_FILLED", executed="0.01",
+                    quote="1")
+            return MISSING
+
+        state = self.state(request)
+        with mock.patch.object(basis_executor, "QUERY_TRIES", 2):
+            result, order, _fills = basis_executor.settle_leg(
+                state, basis_cycle.UNWIND_SPOT, cycle_plan(), Decimal("0.02"))
+        self.assertEqual(result, "unknown")
+        self.assertEqual(order["status"], "PARTIALLY_FILLED")
+        self.assertEqual(posts, 1)
+
+    def test_entry_spot_fill_above_persisted_intent_refuses_commit(self):
+        def request(method, _base_url, _path, params, _signed):
+            if method == "POST":
+                return "ok", {}
+            return "ok", self.order(
+                params["origClientOrderId"], 770, status="FILLED",
+                executed="0.01",
+                quote=str(cycle_plan().spot_quote_cap + Decimal("0.01")))
+
+        state = self.state(request)
+        result, _order, _fills = basis_executor.settle_leg(
+            state, basis_cycle.ENTER_SPOT, cycle_plan())
+        self.assertEqual(result, "terminal")
+        actual_quote = Decimal(state.receipt["legs"][-1]["quote"])
+        self.assertGreater(actual_quote, cycle_plan().spot_quote_cap)
+        self.assertNotIn("first_failure", state.receipt)
+
+    def test_entry_actual_fills_use_unrounded_venue_values(self):
+        def request(method, _base_url, _path, params, _signed):
+            if method == "POST":
+                return "ok", {}
+            return "ok", self.order(
+                params["origClientOrderId"], 780, status="EXPIRED",
+                executed="0.0011", quote="0.11011",
+                venue=basis_executor.USDM)
+
+        state = self.state(request)
+        result, _order, _fills = basis_executor.settle_leg(
+            state, basis_cycle.ENTER_SHORT, cycle_plan(), Decimal("0.002"))
+        self.assertEqual(result, "terminal")
+        self.assertEqual(state.receipt["legs"][-1]["executed_qty"], "0.0011")
+        self.assertEqual(state.receipt["legs"][-1]["quote"], "0.11011")
+
+
+class EntryMarketContextTests(ExecutorCase):
+    def context(self, spec):
+        transport = ScriptedTransport(spec)
+        state = basis_executor.make_state(
+            self.cfg, transport, sleep=lambda _seconds: None,
+            receipted=False)
+        return basis_executor.market_context(state)
+
+    def test_entry_actual_leg_minima_block_rung_commit(self):
+        spec = happy_spec()
+        spot_filters = spec["spot_info"]["symbols"][0]["filters"]
+        futures_filters = spec["usdm_info"]["symbols"][0]["filters"]
+        spot_filters[0].update(stepSize="0.0002", minQty="0.0003")
+        spot_filters[1].update(stepSize="0.0004", minQty="0.0005")
+        spot_filters[2]["minNotional"] = "3"
+        futures_filters[0].update(stepSize="0.002", minQty="0.003")
+        futures_filters[1].update(stepSize="0.004", minQty="0.005")
+        futures_filters[2]["notional"] = "7"
+        market = self.context(spec)
+        self.assertEqual(market["spot_step"], Decimal("0.0004"))
+        self.assertEqual(market["spot_min_qty"], Decimal("0.0005"))
+        self.assertEqual(market["spot_min_notional"], Decimal("3"))
+        self.assertEqual(market["futures_step"], Decimal("0.004"))
+        self.assertEqual(market["futures_min_qty"], Decimal("0.005"))
+        self.assertEqual(market["futures_min_notional"], Decimal("7"))
+
+    def test_entry_hedge_quantity_obeys_effective_cap_before_post(self):
+        spec = happy_spec()
+        spec["usdm_info"]["symbols"][0]["filters"].append({
+            "filterType": "PRICE_FILTER", "maxPrice": "101.25",
+        })
+        market = self.context(spec)
+        self.assertEqual(market["futures_execution_price_ceiling"],
+                         Decimal("101.25"))
+        cap_quantity = basis_cycle.quantize_down(
+            Decimal("7") / market["futures_execution_price_ceiling"],
+            market["futures_step"])
+        self.assertEqual(cap_quantity, Decimal("0.069"))
+
+    def test_entry_cap_to_base_floor_precedes_short_post(self):
+        spec = happy_spec()
+        market = self.context(spec)
+        self.assertIsNone(market["futures_execution_price_ceiling"])
+        spec["usdm_info"]["symbols"][0]["filters"].append({
+            "filterType": "PRICE_FILTER", "maxPrice": "100.3",
+        })
+        market = self.context(spec)
+        self.assertEqual(market["futures_execution_price_ceiling"],
+                         Decimal("100.3"))
+
+    def test_entry_spot_sellability_uses_only_spot_filters(self):
+        spec = happy_spec()
+        futures_filters = spec["usdm_info"]["symbols"][0]["filters"]
+        futures_filters[0].update(stepSize="1", minQty="2")
+        futures_filters[1].update(stepSize="1", minQty="3")
+        futures_filters[2]["notional"] = "50"
+        market = self.context(spec)
+        self.assertEqual(market["spot_step"], Decimal("0.0001"))
+        self.assertEqual(market["spot_min_qty"], Decimal("0.0001"))
+        self.assertEqual(market["spot_min_notional"], Decimal("5.00000000"))
+        self.assertEqual(market["futures_step"], Decimal("1"))
+        self.assertEqual(market["futures_min_qty"], Decimal("3"))
 
 
 class PlanRefusalTests(ExecutorCase):
@@ -804,6 +1137,93 @@ class SpotStepResidualTests(ExecutorCase):
             Decimal(receipt["result"]["residual_base_from_this_run"]),
             Decimal("0.005"))
         self.assertFalse(self.lock_exists())
+
+    def test_entry_dust_uses_spot_step(self):
+        spec = coarse_step_spec()
+        spec["legs"]["enter_spot"] = {
+            "submit": ("ok", {"fills": [
+                {"qty": "1.005", "commission": "0.005",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("FILLED", "1.005", "5.00", 211222)],
+        }
+        spec["legs"]["exit_spot"] = {
+            "submit": ("ok", {"fills": [
+                {"qty": "1.00", "commission": "0.005",
+                 "commissionAsset": "USDT"}]}),
+            "query": [term_spot("FILLED", "1.00", "5.00", 211223)],
+        }
+        code, _transport, _ = self.run_once(spec)
+        self.assertEqual(code, 0)
+        residual = Decimal(
+            self.receipt()["result"]["residual_base_from_this_run"])
+        self.assertEqual(residual, Decimal("0.005"))
+        self.assertLess(residual, Decimal("0.01"))
+
+
+class SharedSoldLegTests(ExecutorCase):
+    def rejected_short_spec(self):
+        spec = happy_spec()
+        spec["legs"]["enter_short"] = {
+            "submit": ("api_error", {"code": -2019,
+                                     "msg": "Margin is insufficient."}),
+            "query": [MISSING],
+        }
+        return spec
+
+    def test_entry_unwind_fee_cannot_draw_from_older_rung(self):
+        spec = self.rejected_short_spec()
+        spec["legs"]["unwind_spot"] = {
+            "submit": ("ok", {"fills": [{
+                "qty": wire(HAPPY_HEDGE_QTY),
+                "commission": "0.00100000",
+                "commissionAsset": "BTC",
+            }]}),
+            "query": [term_spot(
+                "FILLED", wire(HAPPY_HEDGE_QTY),
+                wire(HAPPY_SELL_QUOTE), 111224)],
+        }
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 3)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short", "unwind_spot"])
+        receipt = self.receipt()
+        self.assertEqual(receipt["verdict"], "OPEN_EXPOSURE")
+        self.assertLess(
+            Decimal(receipt["result"]["residual_base_from_this_run"]), 0)
+        self.assertIn("pre-existing balance", receipt["exposure"])
+
+    def test_entry_rejected_hedge_uses_measured_spot_unwind(self):
+        spec = self.rejected_short_spec()
+        code, transport, _ = self.run_once(spec)
+        self.assertEqual(code, 2)
+        unwind = transport.posts[-1][1]
+        self.assertEqual(unwind["newClientOrderId"],
+                         "bc-%s-unwind_spot" % RID)
+        self.assertEqual(Decimal(unwind["quantity"]), HAPPY_HEDGE_QTY)
+        self.assertNotEqual(Decimal(unwind["quantity"]), HAPPY_PLAN_QTY)
+
+    def test_entry_fee_assets_preserve_base_quote_and_third_asset_units(self):
+        spec = self.rejected_short_spec()
+        spec["legs"]["unwind_spot"] = {
+            "submit": ("ok", {"fills": [
+                {"qty": wire(HAPPY_HEDGE_QTY), "commission": "0.01",
+                 "commissionAsset": "USDT"},
+                {"qty": wire(HAPPY_HEDGE_QTY), "commission": "0.0002",
+                 "commissionAsset": "BNB"},
+            ]}),
+            "query": [term_spot(
+                "FILLED", wire(HAPPY_HEDGE_QTY),
+                wire(HAPPY_SELL_QUOTE), 111224)],
+        }
+        code, _transport, _ = self.run_once(spec)
+        self.assertEqual(code, 2)
+        leg = self.receipt()["legs"][-1]
+        self.assertEqual(Decimal(leg["fee_by_asset"]["USDT"]),
+                         Decimal("0.01"))
+        self.assertEqual(Decimal(leg["fee_by_asset"]["BNB"]),
+                         Decimal("0.0002"))
+        self.assertEqual(Decimal(
+            self.receipt()["result"]["sell_base_fee"]), Decimal("0"))
 
 
 class ShortRejectionTests(ExecutorCase):
