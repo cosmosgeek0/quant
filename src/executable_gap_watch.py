@@ -7,8 +7,9 @@ fall back to conservative composite ``freshness_ms``.  No per-venue times are
 present, so accepted rows state that paired-venue skew was not checked.
 
 Startup replay reads at most the final 64 MiB of ``executable_gaps.jsonl``.
-It accepts only OK rows from the last 24 hours, after which BF2 retains at most
-481 per symbol.  This covers spec rows 089, 092, 094, and BUILD-01 row 109.
+It restores only OK rows from the last 24 hours into the ring and retains one
+last refusal UTC per symbol for dedupe.  BF2 retains at most 481 accepted cuts
+per symbol.  This covers spec rows 089, 092, 094, and BUILD-01 row 109.
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ class RecordTiming:
     utc_ms: Optional[int]
     observed_ms: Optional[int]
     age_source: Literal["book_age_ms", "freshness_ms"]
+    utc_ahead_ms: Optional[int] = None
     refusal_reason: Optional[Literal["RECORD_UTC_IN_FUTURE"]] = None
 
 
@@ -118,14 +120,20 @@ def _record_timing(record: Mapping[str, Any], now_ms: int) -> RecordTiming:
         and record.get("book_age_ms") is not None
     age_source = "book_age_ms" if uses_book_age else "freshness_ms"
     age_ms = _nonnegative_ms(record.get(age_source))
-    if written_ms is not None \
-            and written_ms - now_ms > RECORD_UTC_FUTURE_TOLERANCE_MS:
+    utc_ahead_ms = max(0, written_ms - now_ms) \
+        if written_ms is not None else None
+    if utc_ahead_ms is not None \
+            and utc_ahead_ms > RECORD_UTC_FUTURE_TOLERANCE_MS:
         return RecordTiming(
-            written_ms, None, age_source, "RECORD_UTC_IN_FUTURE")
-    observed_ms = written_ms - age_ms \
+            written_ms, None, age_source, utc_ahead_ms,
+            "RECORD_UTC_IN_FUTURE")
+    raw_observed_ms = written_ms - age_ms \
         if written_ms is not None and age_ms is not None and age_ms <= written_ms \
         else None
-    return RecordTiming(written_ms, observed_ms, age_source)
+    observed_ms = min(raw_observed_ms, now_ms) \
+        if raw_observed_ms is not None else None
+    return RecordTiming(
+        written_ms, observed_ms, age_source, utc_ahead_ms)
 
 
 def _book_text(record: Mapping[str, Any]) -> Mapping[str, Optional[str]]:
@@ -156,7 +164,12 @@ def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
 
 
-def _row(utc: str, result: Any, age_source: str) -> Dict[str, Any]:
+def _row(
+    utc: str,
+    result: Any,
+    age_source: str,
+    utc_ahead_ms: Optional[int] = None,
+) -> Dict[str, Any]:
     accepted = isinstance(result, ExecutableGapReading)
     return {
         "utc": utc, "symbol": result.symbol,
@@ -165,6 +178,7 @@ def _row(utc: str, result: Any, age_source: str) -> Dict[str, Any]:
         "spot_age_ms": result.spot_age_ms,
         "perp_age_ms": result.perp_age_ms,
         "age_source": age_source,
+        "utc_ahead_ms": utc_ahead_ms,
         "skew_checked": result.skew_checked,
         "result": "OK" if accepted else result.reason,
     }
@@ -190,7 +204,8 @@ def build_rows(state: Mapping[str, Mapping[str, Any]], now_ms: int) -> Tuple[
         else:
             result = read_executable_gap_shared_observation(
                 symbol, _book_text(record), timing.observed_ms, now_ms)
-        rows.append(_row(row_utc, result, timing.age_source))
+        rows.append(_row(
+            row_utc, result, timing.age_source, timing.utc_ahead_ms))
         if isinstance(result, ExecutableGapReading):
             accepted.append(result)
         else:
@@ -226,11 +241,14 @@ def _tail_lines(path: Path):
             from None
 
 
-def _replay_reading(raw: bytes, cutoff_ms: int, now_ms: int):
+def _decode_replay_row(raw: bytes) -> Any:
     try:
-        row = json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
         raise ExecutableGapWatchError("gap receipt ledger has an invalid row") from None
+
+
+def _reading_from_replay_row(row: Any, cutoff_ms: int, now_ms: int):
     if not isinstance(row, dict) or row.get("result") != "OK":
         return None
     row_ms = _utc_ms(row.get("utc"))
@@ -256,15 +274,41 @@ def _replay_reading(raw: bytes, cutoff_ms: int, now_ms: int):
     )
 
 
-def replay_history(path: Path, now_ms: int) -> GapHistoryRing:
-    """Restore accepted last-24h rows within the documented tail byte bound."""
+def _replay_reading(raw: bytes, cutoff_ms: int, now_ms: int):
+    return _reading_from_replay_row(
+        _decode_replay_row(raw), cutoff_ms, now_ms)
+
+
+def _replay_refusal_key(row: Any) -> Optional[Tuple[str, int]]:
+    if not isinstance(row, dict) or type(row.get("result")) is not str \
+            or row.get("result") == "OK":
+        return None
+    symbol = row.get("symbol")
+    row_ms = _utc_ms(row.get("utc"))
+    if type(symbol) is not str or row_ms is None:
+        return None
+    return symbol, row_ms
+
+
+def replay_history(
+    path: Path,
+    now_ms: int,
+    *,
+    last_refusal_utc: Optional[Dict[str, int]] = None,
+) -> GapHistoryRing:
+    """Restore accepted history and optionally collect last refusal UTCs."""
     if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
         raise ExecutableGapWatchError("current time must be nonnegative epoch-ms")
     history = GapHistoryRing()
     cutoff_ms = max(0, now_ms - REPLAY_WINDOW_MS)
     for raw in _tail_lines(Path(path)):
-        reading = _replay_reading(raw, cutoff_ms, now_ms)
+        row = _decode_replay_row(raw)
+        reading = _reading_from_replay_row(row, cutoff_ms, now_ms)
         if reading is None:
+            refusal_key = _replay_refusal_key(row)
+            if refusal_key is not None and last_refusal_utc is not None:
+                symbol, row_ms = refusal_key
+                last_refusal_utc[symbol] = row_ms
             continue
         try:
             history.series_for(reading.symbol)
@@ -321,22 +365,30 @@ def format_summary(summary: WatchSummary) -> str:
 def run_once(paths: RuntimePaths = PATHS, *, now_ms: Optional[int] = None) -> WatchPass:
     current_ms = time.time_ns() // 1_000_000 if now_ms is None else now_ms
     output_path = paths.receipt_dir / OUTPUT_FILENAME
-    history = replay_history(output_path, current_ms)
+    last_refusal_utc: Dict[str, int] = {}
+    history = replay_history(
+        output_path, current_ms, last_refusal_utc=last_refusal_utc)
     state = load_stream_state(paths.stream_state)
     rows, accepted, summary = build_rows(state, current_ms)
     accepted_by_symbol = {reading.symbol: reading for reading in accepted}
     append_rows = []
     append_readings = []
     for row in rows:
+        cut_ms = _utc_ms(row["utc"])
+        if cut_ms is None:
+            raise ExecutableGapWatchError("stream cut time is invalid")
         try:
             latest = history.series_for(row["symbol"])
         except HistoryQueryError:
             latest = ()
-        if latest and latest[-1].utc_text == row["utc"]:
+        if latest and latest[-1].utc_text == row["utc"] \
+                or last_refusal_utc.get(row["symbol"]) == cut_ms:
             continue
         reading = accepted_by_symbol.get(row["symbol"])
         if reading is not None:
             append_readings.append((row, reading))
+        else:
+            last_refusal_utc[row["symbol"]] = cut_ms
         append_rows.append(row)
     try:
         for row, reading in append_readings:

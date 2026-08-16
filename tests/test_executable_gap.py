@@ -109,6 +109,52 @@ class ExecutableGapLawTests(unittest.TestCase):
         self.assertFalse(result.skew_checked)
         self.assertEqual((result.spot_age_ms, result.perp_age_ms), (100, 100))
 
+    def test_equal_caller_times_do_not_claim_per_venue_skew_proof(self):
+        spot, perp = gap.quotes_from_stream_record(
+            stream_record(),
+            spot_observed_ms=NOW_MS - 100,
+            perp_observed_ms=NOW_MS - 100,
+        )
+
+        result = gap.read_executable_gap(SYMBOL, spot, perp, NOW_MS)
+
+        self.assertIsInstance(result, gap.ExecutableGapReading)
+        self.assertFalse(result.skew_checked)
+        self.assertIs(spot.source, perp.source)
+
+    def test_typed_venue_quotes_use_source_object_provenance(self):
+        shared_source = object()
+        spot = gap.VenueQuote(
+            "spot", "100", "101", NOW_MS - 100, shared_source)
+        shared_perp = gap.VenueQuote(
+            "perp", "111.1", "112", NOW_MS - 100, shared_source)
+        independent_perp = gap.VenueQuote(
+            "perp", "111.1", "112", NOW_MS - 100, object())
+
+        shared = gap.read_executable_gap(
+            SYMBOL, spot, shared_perp, NOW_MS)
+        independent = gap.read_executable_gap(
+            SYMBOL, spot, independent_perp, NOW_MS)
+
+        self.assertIsInstance(shared, gap.ExecutableGapReading)
+        self.assertIsInstance(independent, gap.ExecutableGapReading)
+        self.assertFalse(shared.skew_checked)
+        self.assertTrue(independent.skew_checked)
+
+    def test_reverse_dislocation_with_excess_skew_refuses(self):
+        result = read(
+            stream_record(
+                spot_bid="110", spot_ask="111",
+                perp_bid="99", perp_ask="100",
+            ),
+            spot_age=0,
+            perp_age=gap.DEFAULT_MAX_QUOTE_SKEW_MS + 1,
+        )
+
+        self.assertIsInstance(result, gap.GapRefusal)
+        self.assertEqual(result.reason, "QUOTE_SKEW_EXCEEDED")
+        self.assertTrue(result.skew_checked)
+
     def test_reverse_dislocation_stays_normal_signed(self):
         """src/reverse_rung_intent.py recomputes the reverse capture."""
         result = read(stream_record(
@@ -186,6 +232,19 @@ class GapHistoryRingTests(unittest.TestCase):
                                            Decimal("2"), 0, 0)
         with self.assertRaisesRegex(ValueError, "finite Decimal"):
             history.record(invalid)
+
+    def test_history_cut_preserves_skew_honesty(self):
+        history = gap.GapHistoryRing()
+        source = gap.ExecutableGapReading(
+            SYMBOL, NOW_MS, Decimal("1"), Decimal("2"), 0, 0,
+            skew_checked=False,
+        )
+
+        recorded = history.record(source)
+        restored = history.series_for(SYMBOL)[0]
+
+        self.assertFalse(recorded.skew_checked)
+        self.assertFalse(restored.skew_checked)
 
 
 if __name__ == "__main__":
