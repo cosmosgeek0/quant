@@ -158,13 +158,19 @@
       if (on) { rows[i].setAttribute("aria-current", "page"); }
       else { rows[i].removeAttribute("aria-current"); }
     }
+    if (window.NetV1 && window.NetV1.destroy) { window.NetV1.destroy(); }
     pageEl.textContent = "";
     stopNewsPoll();
     stopNetHealthPoll();
     stopNetTelemetry();
     if (netChart) { netChart.destroy(); netChart = null; }
     if (h === "network") {
-      if (window.NetV5 && window.NetV5.build) {
+      if (window.NetV1 && window.NetV1.build) {
+        /* Network V1: the module owns its data layer and timers and
+           stops itself when the container leaves the document */
+        sigPage = null;
+        window.NetV1.build(pageEl);
+      } else if (window.NetV5 && window.NetV5.build) {
         /* V5 proposal branch: the module owns its own fetches and
            timers; the shell only hands over the container */
         sigPage = null;
