@@ -52,7 +52,7 @@ class ReverseProofJobTests(unittest.TestCase):
         self.assertEqual(job["requested_by"], "lead")
         self.assertEqual(job["operator_token"], "lead")
         self.assertEqual(composer.validate_job(job, NOW), job)
-        accepted = runner._validate_reverse_job(job, job["job_id"], NOW)
+        accepted = runner._validate_job(job, job["job_id"], NOW)
         self.assertEqual(accepted.job_id, job["job_id"])
 
     def test_expiry_window_accepts_fifteen_minutes_and_refuses_more(self):

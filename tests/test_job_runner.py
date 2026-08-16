@@ -233,6 +233,9 @@ class ReverseTransport:
         self.close_fails = False
         self.margin_post_unclear = False
         self.margin_query_omits_fills = False
+        self.preflight_fault = ""
+        self.final_open_venue = ""
+        self.stop_on_history_get = False
         self.price = Decimal("100")
         self.free = Decimal("0.5")
         self.borrowed = Decimal("0")
@@ -253,8 +256,11 @@ class ReverseTransport:
         return {"symbols": [{
             "symbol": "TSTUSDT", "status": "TRADING",
             "baseAsset": "TST", "quoteAsset": "USDT",
+            "isSpotTradingAllowed": True,
             "isMarginTradingAllowed": True,
             "orderTypes": ["MARKET"],
+            "quoteOrderQtyMarketAllowed": True,
+            "baseAssetPrecision": 8, "quoteAssetPrecision": 8,
             "filters": [
                 {"filterType": "LOT_SIZE", "stepSize": "0.001",
                  "minQty": "0.001", "maxQty": "1000"},
@@ -365,13 +371,15 @@ class ReverseTransport:
             "status": status, "orderId": self.next_order,
             "executedQty": self.text(executed),
             "cumQuote": self.text(executed * self.price),
+            "avgPrice": self.text(self.price) if executed else "0",
             "reduceOnly": is_close,
         }
         self.futures_orders[client_id] = payload
         self.futures_trades[self.next_order] = [] if executed == 0 else [{
             "orderId": self.next_order, "price": self.text(self.price),
             "qty": self.text(executed), "commission": "0.001",
-            "commissionAsset": "USDT",
+            "commissionAsset": "USDT", "realizedPnl": "0",
+            "id": self.next_order,
         }]
         self.maybe_stop(leg)
         return "ok", payload
@@ -379,13 +387,24 @@ class ReverseTransport:
     def __call__(self, method, base_url, path, params=None, signed=False):
         params = dict(params or {})
         self.calls.append((method, base_url, path, params, signed))
+        if method == "GET" and path == "/fapi/v1/time":
+            return "ok", {"serverTime": 1786708800000}
         if method == "GET" and path == jr.basis_executor.SPOT.exchange_info_path:
             return "ok", self.spot_exchange()
         if method == "GET" and path == jr.basis_executor.SPOT_BOOK_PATH:
             return "ok", {
+                "symbol": "TSTUSDT",
                 "bidPrice": self.text(self.price),
                 "askPrice": self.text(self.price),
             }
+        if method == "GET" and path == jr.basis_executor.SPOT_ACCOUNT_PATH:
+            return "ok", {"canTrade": True, "balances": [
+                {"asset": "TST", "free": self.text(self.free)},
+                {"asset": "USDT", "free": "100"},
+            ]}
+        if method == "GET" and path == jr.basis_executor.SPOT_OPEN_ORDERS_PATH:
+            final = self.final_open_venue == "spot" and self.history["REPAY"]
+            return "ok", ([{"symbol": "TSTUSDT"}] if final else [])
         if method == "GET" and path == jr.basis_executor.USDM.exchange_info_path:
             return "ok", self.futures_exchange()
         if method == "GET" and path == jr.basis_executor.USDM_BOOK_PATH:
@@ -395,6 +414,29 @@ class ReverseTransport:
             }
         if method == "GET" and path == jr.basis_executor.USDM_PREMIUM_PATH:
             return "ok", {"markPrice": self.text(self.price)}
+        if method == "GET" and path == "/fapi/v1/accountConfig":
+            return "ok", {"canTrade": self.preflight_fault != "can_trade"}
+        if method == "GET" and path == "/fapi/v3/account":
+            amount = Decimal("0.001") \
+                if self.preflight_fault == "independent_position" \
+                else self.position
+            return "ok", {
+                "availableBalance": "1" if self.preflight_fault == "balance"
+                else "100",
+                "positions": [{"symbol": "TSTUSDT", "positionSide": "BOTH",
+                               "positionAmt": self.text(amount)}],
+            }
+        if method == "GET" and path == "/fapi/v1/positionSide/dual":
+            return "ok", {"dualSidePosition":
+                           self.preflight_fault == "one_way"}
+        if method == "GET" and path == "/fapi/v1/openOrders":
+            preflight = self.preflight_fault == "open_orders"
+            final = self.final_open_venue == "futures" \
+                and self.history["REPAY"]
+            return "ok", ([{"symbol": "TSTUSDT"}]
+                          if preflight or final else [])
+        if method == "GET" and path == "/fapi/v1/symbolConfig":
+            return "ok", [{"symbol": "TSTUSDT", "leverage": "1"}]
         if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
             return "ok", self.account()
         if method == "GET" and path == jr.basis_executor.USDM_POSITION_PATH:
@@ -403,6 +445,9 @@ class ReverseTransport:
                 "positionAmt": self.text(self.position),
             }]
         if method == "GET" and path == jr.MARGIN_ENDPOINT_PATH:
+            if self.stop_on_history_get and self.stop_path:
+                Path(self.stop_path).touch()
+                self.stop_on_history_get = False
             return "ok", {"rows": list(self.history[params["type"]])}
         if method == "POST" and path == jr.MARGIN_ENDPOINT_PATH:
             return self.margin_mutation(params)
@@ -736,6 +781,7 @@ class JobRunnerTests(unittest.TestCase):
     def reverse_tick(self, transport, directory=None):
         root = directory or self.receipt_dir
         with mock.patch.object(jr, "_utc_now", return_value=NOW), \
+                mock.patch.object(jr.futures_hand, "POLL_SECONDS", 0.01), \
                 mock.patch.object(jr.time, "sleep", return_value=None):
             return jr.tick(
                 receipt_dir=root, now=NOW, margin_request=transport
@@ -5579,8 +5625,12 @@ class JobRunnerTests(unittest.TestCase):
         )
         self.assertEqual(source["final_truth"], {
             "liability": "0", "futures_position": "0",
-            "base_balance_delta": "-0.0005", "dust": "0.001",
+            "base_balance_delta": "-0.0005", "spot_open_orders": 0,
+            "futures_open_orders": 0, "dust": "0.001",
         })
+        self.assertEqual((source["plan"]["intent_id"],
+                          source["plan"]["client_tag"]),
+                         (source["intent_id"], source["client_tag"]))
         self.assertLessEqual(
             Decimal(source["plan"]["quote_notional"]), Decimal("8")
         )
@@ -5593,6 +5643,84 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(source["legs"][0]["submission"]["transaction_id"])
         self.assertTrue(source["legs"][-1]["submission"]["transaction_id"])
         self.assertEqual(source["governor_release"], "RELEASED")
+
+    def test_reverse_proven_futures_preflight_is_complete(self):
+        cases = (("can_trade", 4), ("one_way", 2), ("open_orders", 2),
+                 ("independent_position", 2), ("balance", 2))
+        for fault, expected in cases:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-preflight-" + fault, root)
+                transport = ReverseTransport()
+                transport.preflight_fault = fault
+
+                self.assertEqual(self.reverse_tick(transport, root), expected)
+                self.assertFalse(any(call[0] == "POST"
+                                     for call in transport.calls))
+
+    def test_reverse_closed_truth_requires_both_venues_without_open_orders(self):
+        for venue in ("spot", "futures"):
+            with self.subTest(venue=venue), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-final-" + venue, root)
+                transport = ReverseTransport(os.path.join(root, "STOP-JOBS"))
+                transport.final_open_venue = venue
+
+                self.assertEqual(self.reverse_tick(transport, root), 3)
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                self.assertEqual(result["verdict"], "OPEN_EXPOSURE")
+                self.assertIn(venue.upper() + "_OPEN_ORDERS",
+                              self.reverse_source(result, root)["reason"])
+
+    def test_reverse_stop_on_history_read_refuses_borrow_post(self):
+        self.reverse_job("reverse-history-stop")
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"))
+        transport.stop_on_history_get = True
+
+        self.assertEqual(self.reverse_tick(transport), 2)
+
+        self.assertFalse(any(
+            call[0] == "POST" and call[2] == jr.MARGIN_ENDPOINT_PATH
+            for call in transport.calls))
+        source = self.reverse_source(self.results()[0])
+        self.assertEqual(source["legs"][0]["reason"], "STOP_JOBS_SEALED")
+        self.assertEqual(source["legs"][0]["mutation_attempts"], 0)
+
+    def test_reverse_distinct_intents_do_not_share_ids_or_reborrow(self):
+        first_intent = "reverse-intent-first"
+        self.reverse_job("reverse-intent-first", intent_id=first_intent)
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"))
+        transport.unknown_leg = jr.reverse_mechanics.MARGIN_SELL
+        self.assertEqual(self.reverse_tick(transport), 4)
+        first = self.reverse_source(self.results()[0])
+        borrow_posts = sum(
+            call[0] == "POST" and call[2] == jr.MARGIN_ENDPOINT_PATH
+            and call[3].get("type") == "BORROW" for call in transport.calls)
+
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "jobs"))
+            self.write_reverse_controls(root)
+            self.reverse_job("reverse-intent-second", root,
+                             intent_id="reverse-intent-second")
+            transport.stop_path = os.path.join(root, "STOP-JOBS")
+            transport.unknown_leg = ""
+            self.assertEqual(self.reverse_tick(transport, root), 2)
+            result = json.loads(Path(
+                root, "jobs", "results.jsonl").read_text().splitlines()[0])
+            second = self.reverse_source(result, root)
+
+        first_ids = {row["client_id"] for row in first["plan"]["legs"]}
+        second_ids = {row["client_id"] for row in second["plan"]["legs"]}
+        self.assertTrue(first_ids.isdisjoint(second_ids))
+        self.assertEqual(sum(
+            call[0] == "POST" and call[2] == jr.MARGIN_ENDPOINT_PATH
+            and call[3].get("type") == "BORROW"
+            for call in transport.calls), borrow_posts)
 
     def test_reverse_sell_not_filled_repays_without_market_unwind(self):
         self.reverse_job("reverse-sell-empty")

@@ -30,6 +30,8 @@ def build(**changes):
         "borrow_asset": "TEST",
         "borrowable": D("0.1"),
         "interest_rate_hourly": D("0.000001"),
+        "intent_id": "reverse-intent-a",
+        "client_tag": "reverse-client-a",
     }
     values.update(changes)
     return mechanics.plan_reverse_mechanics(**values)
@@ -126,10 +128,20 @@ class PlanTests(unittest.TestCase):
 
     def test_intent_and_leg_seeds_are_deterministic_and_bound_to_names(self):
         first, second = build(), build()
-        changed = build(interest_rate_hourly=D("0.000002"))
+        market_changed = build(interest_rate_hourly=D("0.000002"))
+        changed_intent = build(intent_id="reverse-intent-b")
 
         self.assertEqual(first, second)
-        self.assertNotEqual(first.intent_id, changed.intent_id)
+        self.assertEqual((first.intent_id, first.client_tag),
+                         ("reverse-intent-a", "reverse-client-a"))
+        self.assertEqual(
+            [leg.client_id_seed for leg in first.legs],
+            [leg.client_id_seed for leg in market_changed.legs],
+        )
+        self.assertNotEqual(
+            [leg.client_id_seed for leg in first.legs],
+            [leg.client_id_seed for leg in changed_intent.legs],
+        )
         self.assertEqual(len({leg.client_id_seed for leg in first.legs}), 6)
         for leg in first.legs:
             expected = "rmo-" + hashlib.sha256(
