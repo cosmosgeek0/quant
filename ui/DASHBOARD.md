@@ -47,12 +47,14 @@ the layout again.
   News (first fetch within ~2 minutes) start from that moment.
 
 ## 3. The Mac side (legacy viewer — still running on 2026-08-16, not the truth)
-- The newest UI is the lane `lane/ui-network-v5` (worktree
-  `Desktop/worktrees/net-v5`) — Network V5: schedule heatmap, control path,
-  worst-first table, state changes, per-loop grace via `/api/grace`. It is
-  what the site serves. `Desktop/quant/ui/` (local `main`, GitHub branch
-  `lane/ui-4`) is UI 4.0, one step older. The operational Lead's lanes come
-  from `origin/main` and contain neither.
+- The newest UI is Network V5 on the lane `lane/ui-network-v5` (worktree
+  `Desktop/worktrees/net-v5`): schedule heatmap, control path, worst-first
+  table, state changes, per-loop grace via `/api/grace`. It is what the site
+  serves. Since 2026-08-16 ~14:00Z the canonical checkout `Desktop/quant`
+  (local `main`, GitHub branch `lane/ui-4`) is fast-forwarded to the SAME
+  commits — there is one UI source now, not two. The operational Lead's lanes
+  come from `origin/main` and contain none of the UI 3.0+ work; the next
+  Network build follows `ui/NETWORK-TAB-BRIEF.md`.
 - Two local servers: `serve.py` on 8899 (the Mac recorder samples it) and on
   8901 (the owner's local view). Both read `Desktop/quant/ui/live/`.
 - `scripts/ui_pull.sh` pulls the box's receipt files over SSM into the Mac's
