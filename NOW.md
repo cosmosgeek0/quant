@@ -7,7 +7,8 @@
 - Other owner words remain open for donor permit numbers, the BNB fee float, and re-arm. Re-arm still requires a replay configuration to clear fees plus slippage before the smallest same-hour cap. | MEASURED record state
 
 ## Measured truth — 2026-08-16
-- LIVE: host RELEASE f4fa89fa (runner only, atomic tool OK, gate lifted); the machine is SEALED with STOP-JOBS present and FLAT; no locks. | MEASURED
+- LIVE: host RELEASE f0578561 (release 2: stream book_age_ms + momentum identity fix + feed restart tolerance, executable-gap watch, reverse shadow, depth walk, funding ruler, tick OBSERVE stage); machine SEALED with STOP-JOBS present and FLAT; no locks. | MEASURED
+- FEED FINDING (money-critical even sealed): the websocket feed has never delivered book tickers — every record's bid/ask None since 08-14; all quotes to date were REST-pass aged (~8-9 s, every 2-3 min); the lock-in shadows therefore refuse everything as stale until FD1 (futures !bookTicker + spot ticker connection truth) lands and deploys. | MEASURED
 - MARGIN: the first act is CLOSED end to end — borrowed=0, interest=0, liability=0, and the repay receipt itself now reads CLOSED (reconcile-margin at 09:39:13Z on release f4fa89fa: REPAY_CONFIRMED, amount 2.5000387 = principal 2.5 + interest 0.0000387). The runner repair MJ17-19 passed round-four review MERGE-SAFE, is on main, and is the deployed release. | MEASURED
 - LANDINGS: main carries the reviewed runner repair (f4fa89fa) and records; every other landing on lane/lead2-v2fix is LANE ONLY pending its review round. | MEASURED
 - POSITION ADD: BUILD-04 landed at 63284ec6 and its first repair at 0f342188. BR8 round 1 returned FINDINGS-BLOCK with five confirmed findings; BR10 round 2 returned FINDINGS-BLOCK with seven, so the 5-to-7 review count is not converging. | MEASURED verdicts; INFERRED convergence label from counts

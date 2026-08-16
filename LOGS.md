@@ -7,6 +7,13 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+RELEASE 2 LIVE + FEED FINDING 2026-08-16 ~11:00Z | observation + shadows deployed (release f0578561, 10 files, atomic tool OK first attempt) | machine SEALED + FLAT
+observe | the tick now runs executable_gap_watch and reverse_lockin_shadow every 2 min under seals (health rows exit 0, ~0.3-0.4 s each) | first real output: 357 both-venue symbols, ALL refused SPOT_QUOTE_STALE on book_age_ms 7,708-9,172 ms vs the 5 s actionable bound | MEASURED
+finding | the websocket feed has NEVER delivered book tickers: alive since 08-14 06:10, 656 symbols, ticker fields None on every record ("with any ticker: 0"); the stream reports feed_used=yes yet sources every quote from the REST pass (~8-9 s old, every 2-3 min) | cause: futures best bid/ask live on !bookTicker, not the 24h ticker the feed subscribes; the spot ticker connection is not reported in connections at all | every basis gap and executable read to date was REST-aged | MEASURED code + host reads
+repair | FD1 (feed book tickers, connection truth) dispatched; until it lands the lock-in shadows are honestly blind and say so | MEASURED
+runner | REVERSE_MECHANICS_ROUNDTRIP op landed on lane (MO2b + MO3; +1,310 lines) — MRV15 FINDINGS-BLOCK: seal-to-POST authority race, missing proven futures preflight, ids unbound to intent; MO4 repairs by consolidating onto the proven paths (target -600) | live proof waits on MO4 + MRV16 | MEASURED
+size | SZ1 audit: job_runner 36.5% execute / 63.5% validate+receipt+recover+legacy (2,271 recovery lines, ~700 deletable named); basis_position 39.5% / 60.5% | ADD re-cut parked on lane/add-recut; owner SIZE law in AGENTS.md | MEASURED
+
 VOLUME DIAGNOSTIC WOUND DOWN 2026-08-16 ~11:00Z | owner order: stop the tape scans, they return nothing and hammer the SSD | MEASURED
 result | V6 --limit 200 real-data run killed after 1h40m with ZERO output rows (the limit bounds events, not the 35 GB tape-prices read; the earlier full run refused after 3h+ the same way) | the commander's V2 out-of-sample expectancy stays UNMEASURED and is not pursued further without the owner's word | MEASURED
 kept | V6 code + tests (7c0fe85): the refusal row names its cost components; synthetic machine-scale policy shows a 1e-50 operation-order remainder between the two totals (INFERRED as the full-tape cause; never measured on the banked events) | MEASURED landing
