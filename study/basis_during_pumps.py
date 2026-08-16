@@ -183,7 +183,10 @@ def _summarize(rows: Sequence[Mapping[str, Any]], both_count: int, census_count:
     for label in ("HELD", "COLLAPSED"):
         selected = [row for row in rows if row["class"] == label]
         distribution[label] = _stats([row["max_abs_gap_during_rise_pct"] for row in selected if row["max_abs_gap_during_rise_pct"] is not None], totals[label])
-        durations[label] = _stats([Decimal(row["minutes_abs_gap_above_2pct_during_rise"]) for row in selected if row["minutes_abs_gap_above_2pct_during_rise"] is not None], totals[label])
+        positive = [Decimal(row["minutes_abs_gap_above_2pct_during_rise"]) for row in selected if row["minutes_abs_gap_above_2pct_during_rise"] is not None and row["minutes_abs_gap_above_2pct_during_rise"] > 0]
+        durations[label] = _stats(positive, len(positive))
+    positive_all = [Decimal(row["minutes_abs_gap_above_2pct_during_rise"]) for row in rows if row["minutes_abs_gap_above_2pct_during_rise"] is not None and row["minutes_abs_gap_above_2pct_during_rise"] > 0]
+    durations["ALL"] = _stats(positive_all, len(positive_all))
     for threshold in THRESHOLDS:
         key = absorption.decimal_text(threshold); fractions[key] = {"ALL": _fraction(rows, threshold)}
         for label in ("HELD", "COLLAPSED"): fractions[key][label] = _fraction([row for row in rows if row["class"] == label], threshold)
@@ -192,18 +195,18 @@ def _summarize(rows: Sequence[Mapping[str, Any]], both_count: int, census_count:
         key = absorption.decimal_text(threshold); values = fractions[key]
         cells = [f"{name}={item['exceeded']}/{item['measured']}({_short(None if item['fraction'] is None else item['fraction'] * Decimal('100'))}%)" for name, item in values.items()]
         lines.append(f"MAX_ABS_GAP_EXCEEDED_{key}PCT | {' | '.join(cells)} | MEASURED")
-    lines.append(f"MINUTES_ABS_GAP_ABOVE_2PCT | HELD {_plain_stats(durations['HELD'])} | COLLAPSED {_plain_stats(durations['COLLAPSED'])} | MEASURED")
+    lines.append(f"MINUTES_ABS_GAP_ABOVE_2PCT_WHEN_EXCEEDED | ALL {_plain_stats(durations['ALL'])} | HELD {_plain_stats(durations['HELD'])} | COLLAPSED {_plain_stats(durations['COLLAPSED'])} | MEASURED")
     complete_rise = sum(row["evidence"]["rise_complete"] for row in rows)
     lines.append(f"COVERAGE | census={census_count} | both_symbols={both_count} | eligible={len(rows)} | complete_window={statuses['COMPLETE']} | partial={statuses['PARTIAL']} | absent={statuses['ABSENT']} | complete_rise={complete_rise} | MEASURED")
     summary = {"schema": "basis-during-pumps-summary-v1", "census_episodes": census_count,
                "both_venue_symbols": both_count, "eligible_episodes": len(rows), "class_counts": dict(totals),
                "evidence_status": dict(statuses), "complete_rise": complete_rise,
                "max_abs_gap_during_rise_pct": distribution, "threshold_fractions": fractions,
-               "minutes_abs_gap_above_2pct_during_rise": durations,
+               "minutes_abs_gap_above_2pct_during_rise_when_exceeded": durations,
                "definitions": {"gap_pct": "(perpetual close - spot close) / spot close * 100",
                                "pre_base": "120 exact paired minutes before base; signed median",
                                "rise": "base through peak inclusive; every paired minute required",
-                               "duration": "count of rise minutes with absolute gap strictly above 2 percent",
+                               "duration": "per-episode count of rise minutes strictly above 2 percent; summary conditions on a positive count",
                                "window_coverage": "both closes present each minute from base minus 2h through peak plus 2h"}}
     return summary, lines
 
@@ -247,9 +250,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if ordinal % 50 == 0 or ordinal == len(futures):
                     print(f"AB18 | symbols={ordinal}/{len(futures)} | episodes={len(profiles)}", flush=True)
         profiles.sort(key=lambda row: row["episode_id"]); summary, report = _summarize(profiles, len(both), len(census))
+        summary["eligible_symbols"] = len(grouped)
+        history_spot = {path.name for path in (args.history_dir / "spot/monthly/klines").iterdir() if path.is_dir()}
+        history_futures = {path.name for path in (args.history_dir / "futures/um/monthly/klines").iterdir() if path.is_dir()}
         summary["source"] = {"reader": "study.absorption._kline_rows", "class_reader": "study.stage_a.discover_market_tapes",
                              "history": str(args.history_dir), "recent": str(args.recent_data_dir),
-                             "archives_read": archives, "bars_parsed": parsed}
+                             "archives_read": archives, "bars_parsed": parsed,
+                             "history_layout": {"spot_symbols": len(history_spot), "futures_symbols": len(history_futures),
+                                                "same_symbol_overlap": len(history_spot & history_futures)}}
         _write(args.output_dir / "basis-during-pumps.jsonl", profiles, lines=True)
         _write(args.output_dir / "basis-summary.json", summary)
         for path in (args.output_dir / "basis-comparison.txt", args.report):
