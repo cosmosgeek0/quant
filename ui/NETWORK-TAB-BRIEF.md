@@ -1,9 +1,11 @@
-# NETWORK TAB — brief for the next builder (owner review, 2026-08-16, rev 3)
+# NETWORK TAB — brief for the next builder (owner review, 2026-08-16, rev 4)
 
 Plain words. Decisions first, reasons after. Rev 2 folded in the Codex review of
 rev 1 (ten points); rev 3 folds in Codex's FULL research report (connections
 table, status vocabulary, /api/network contract, control classes, exact file
-names). Everything from Codex is marked [codex]. Web sweep sources at the end. ui/DESIGN.md still governs look and
+names). Rev 4 folds in Codex's second-pass critique (production-first topology,
+animation contract, events[] in the contract, one selection everywhere,
+acceptance sentence). Everything from Codex is marked [codex]. Web sweep sources at the end. ui/DESIGN.md still governs look and
 voice; this file says WHAT belongs on the Network tab, what leaves, what is
 missing, which controls are real, and where to build.
 
@@ -44,10 +46,10 @@ paths connecting those systems are functioning. Nothing else lives here.
 ## 3. The wires — with plane and TODAY's evidence [codex]
 | # | connection | plane | what belongs on the wire | evidence today |
 |---|---|---|---|---|
-| 1 | browser → local serve.py (Mac viewer, legacy) | local | HTTP health, API answer, p50/p95, last success | measured locally |
+| 1 | browser → local serve.py (Mac viewer, LEGACY — collapsed management line, never a primary wire) | local | HTTP health, API answer, p50/p95, last success | measured locally |
 | 2 | remote browser → Cloudflare edge / Access | ingress | DNS, TLS, Access result, edge time-to-first-byte, status family | unknown until collected |
 | 3 | Cloudflare edge → tunnel connector → box origin | ingress | connector count, tunnel protocol, origin reachability, 521–526 errors | not surfaced |
-| 4 | Mac mirror ↔ AWS SSM ↔ box receipts (legacy) | management | session result, pull duration, bytes, checksum, freshness | path exists; transport evidence incomplete |
+| 4 | owner ↔ AWS SSM ↔ box (management; the Mac mirror is LEGACY — collapsed line, never a primary wire) | management | session result, duration, bytes, checksum, freshness | path exists; transport evidence incomplete |
 | 5 | box runtime → AWS Secrets Manager | management (collapsed line) | last successful credential fetch + safe error class — never values | code-confirmed, not normalised |
 | 6 | box ↔ Binance Spot public (api/stream) | market data | REST timing + weight; WSS shards, last event, ping/pong, reconnects, gaps, subscription count | evidence exists in the feed state, not mirrored |
 | 7 | box ↔ Binance USD-M public (fapi/fstream) | market data | separate REST/WSS state, reconnects, continuity, rate budget | evidence exists, not mirrored |
@@ -57,6 +59,15 @@ paths connecting those systems are functioning. Nothing else lives here.
 Rule [codex]: do not invent VPCs, subnets, gateways, geographic hops or other
 cloud objects because enterprise consoles show them; render a node only after
 the project can prove it exists and collect its state.
+Production first [codex]: the primary picture is the box. Fixed trust-zone
+columns: Operator browser ⇄ Cloudflare Access/edge ⇄ Tunnel connector ⇄ AWS
+execution box; from the box: ⇄ Binance Spot REST/WSS, ⇄ Binance USD-M
+REST/WSS (always two separate wires), → Binance signed account/execution
+HTTPS (locked), ← public news sources, → AWS Secrets Manager (status only).
+Owner ⇄ SSM ⇄ box sits in a collapsed Management layer. The legacy Mac mirror
+and local file copies are never shown as primary connections. Internal
+consumers (runner, basis, momentum, volume) appear only as small handoff
+badges that link to Machine / Basis / Reverse / Volume — never as wires.
 
 ## 4. Truth model — every wire, three states + provenance [codex]
 - States: CONFIGURED (it is set up) → TRANSPORT (DNS/TCP/TLS or socket
@@ -120,6 +131,21 @@ the project can prove it exists and collect its state.
 Machine heartbeats move intact to Machine; News source detail opens News.
 Green requires fresh evidence. Every chart and control labelled and keyboard
 reachable.
+One selection everywhere [codex]: clicking a topology link, a story-graph
+moment, or a table row selects the SAME wire and timestamp in the topology,
+the graph, the table, the drawer and the ledger. Historical playback: the
+time cursor can be dragged back through the held window and the topology
+replays the states of that moment; the ledger is the causal trail (what
+changed, in order, with reasons).
+Animation contract for the topology [codex] — counter-driven only: line
+colour = health only; line width = measured bytes/sec; moving-particle
+density = messages/sec; arrowheads = direction; a brief pulse = reconnect,
+gap or error; dashed = configured but unobserved; grey and motionless =
+Unknown or Off. Never animate without a real counter behind it. Label what
+flows in plain words: UI requests, ticker stream, account reads, execution
+requests, news articles, SSM receipts. Provide pause, playback and
+reduced-motion. Muted stable colours; no rainbow vendor nodes, no decorative
+motion.
 
 ## 7. Backend prerequisites (the tab cannot be honest without these) [codex]
 - Mirror the feed-state file: `market_feed.py` writes per-venue/shard
@@ -133,11 +159,18 @@ reachable.
 - Mac mirror wire (legacy, while it lives): normalise SSM session result,
   pull duration, bytes, checksum result into one row shape [codex].
 - ONE read-only contract for the page [codex]: `/api/network` returning
-  `nodes[]` and `edges[]` (Grafana node-graph shape). Each edge: source,
-  target, plane, direction, transport, the three truth states, reason,
-  evidence time and source, freshness, latency, reconnect/gap/rate data,
-  authority, allowed controls. Missing values are null with state Unknown.
-  The page renders from this one contract; no page-side guessing.
+  `nodes[]`, `edges[]` and `events[]` (Grafana node-graph shape plus a
+  transition ledger). Each edge: source, target, plane, direction, transport,
+  payload (what flows), purpose, the three truth states, status_reason,
+  observation time, freshness/cadence, p50/p95 latency, messages/sec,
+  bytes/sec, reconnects, continuity gaps, last-message age, rate-limit
+  usage/headroom, evidence source, authority, allowed controls. Missing values
+  are null with state Unknown — never zero. The page renders from this one
+  contract; no page-side guessing.
+- More collectors, all sanitised, all under `ui/live/` [codex]: signed-request
+  OUTCOMES (from receipts/runner rows — outcome and timing only, never
+  payloads or identifiers), SSM/Secrets status rows (last success + safe error
+  class), one normalised error-event shape feeding `events[]`.
 - Key mismatch: the pull manifest writer emits `errors` (a list) while
   `serve.py` reads `error` (a string) — the manifest error is silently
   invisible. Fix on the serve side (read both), one test.
@@ -165,6 +198,13 @@ Rename today's misleading switches [codex]: "Network live" → "Live view" (it
 pauses only the page's polling), the per-wire "cadence" select → "Monitor
 every" (it sets the recorder's sampling, not any host loop), chart toggles →
 "Show".
+Measured facts about today's controls [codex]: the only genuine page
+mutation is recorder sampling via `/api/poll_config` with allowed intervals
+1/2/5/10/15/30/60/120 s; "Live view" only pauses browser polling; the feed
+reconnects by itself (a "reconnect/resync" control forces a fresh handshake
+and resubscribe, it does not repair a broken auto-reconnect); the news
+fetcher's minimum interval is 60 s (news_fetcher.py); feed stopping and news
+interval have no Network endpoint yet.
 PAUSE MONITORING (dashboard-side, safe, exists or trivial): Live view (page
 polling), range, wire visibility, monitor interval per wire
 (`/api/poll_config`), grace per wire (`/api/grace`), probe on/off.
@@ -177,6 +217,16 @@ risk), websocket reconnect second, feed interval on the owner's word.
 NEVER HERE: "shut all networks" (that is the machine's STOP on Machine; pausing
 the market feed blinds the machine — a Machine decision; Network shows STOP
 read-only with a link), orders, transfers, leverage.
+
+## 8b. Acceptance — what "done" means [codex, adopted verbatim in spirit]
+The owner can answer within seconds: what is connected, what data is flowing,
+what failed, where, since when, why, and what action is genuinely allowed.
+Every animation counter-driven, every control receipt-backed, every unknown
+explicit, and the page stays responsive without touching the trading runtime.
+Build order: (1) reconcile the source — build only from the V5 lane; (2)
+publish read-only `/api/network`; (3) plumb collectors; (4) build topology →
+story graph → table → drawer → ledger; (5) only then authenticated lifecycle
+endpoints. No live metric is promised before its collector exists.
 
 ## 9. STRIP from Network (move, do not delete)
 | item | goes to | why |
