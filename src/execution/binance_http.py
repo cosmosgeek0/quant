@@ -1,7 +1,4 @@
-"""Shared Binance types, exact-money context, and one-attempt HTTP transport.
-
-Contract rows 016-036 and 127: study/design/EXECUTION-HAND-INTERFACE.txt.
-"""
+"""Shared Binance types, exact-money context, and one-attempt HTTP transport."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -28,8 +25,7 @@ Params = Tuple[Tuple[str, str], ...]
 T = TypeVar("T")
 
 
-class AdapterRefusal(ValueError):
-    """The sole caller/schema exception of every adapter (row 012)."""
+class AdapterRefusal(ValueError): pass
 
 
 _EXACT_TRAPS = (Inexact, Rounded, InvalidOperation, DivisionByZero, Overflow)
@@ -146,12 +142,15 @@ class FillCoverage:  # row 024
     complete: bool
     fees: Tuple[Fee, ...]
 
-import hashlib, hmac, json, time
-import urllib.error, urllib.parse, urllib.request
+import hashlib, hmac, json, time, urllib.error, urllib.parse, urllib.request
 
 _MAX_TIMEOUT_SECONDS, _MAX_RECV_WINDOW_MS = 60, 60000
 _RESERVED_PARAMS = frozenset({"signature", "timestamp", "recvWindow"})
-_PRIVATE_MSG_PARTS = ("http://", "https://", "www.", "x-mbx-apikey", "signature", "authorization", "credential", "api key", "api-key", "api_key", "header")
+_PRIVATE_MSG_PARTS = ("www.", "x-mbx-apikey", "signature", "authorization", "credential", "api-key", "api_key", "header")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args): return None
 
 
 def system_now_ms() -> int: return int(time.time() * 1000)
@@ -163,23 +162,27 @@ def _unclear(msg: str, code: int | None = None) -> HttpResult: return HttpResult
 def _reject_constant(_value: str) -> None: raise ValueError("non-finite JSON number")
 
 
+def _unique_object(pairs):
+    if len(pairs) != len(dict(pairs)): raise ValueError("duplicate JSON key")
+    return dict(pairs)
+
+
 def _clean_api_msg(value: object, secrets: Tuple[str, str]) -> str | None:
     if type(value) is not str: return None
-    cleaned = " ".join("".join(char if char.isprintable() else " " for char in value).split())
-    if not cleaned: return None
-    lowered = cleaned.lower()
-    if (any(part in lowered for part in _PRIVATE_MSG_PARTS)
-            or any(secret.lower() in lowered for secret in secrets)):
-        return "binance_api_error"
-    return cleaned[:160]
+    words = "".join(char if char.isprintable() else " " for char in value).split()
+    private = _PRIVATE_MSG_PARTS + tuple(secret.lower() for secret in secrets)
+    cleaned = " ".join(word for word in words if "/" not in word and not any(part in word.lower() for part in private))
+    return cleaned[:160] or None
 
 
 def _classify(status: object, body: object, secrets: Tuple[str, str]) -> HttpResult:
     if type(status) is not int: return _unclear("invalid_http_status")
+    if 300 <= status < 400: return _unclear("http_%d" % status, status)
     if status in (408, 409) or status >= 500: return _unclear("http_%d" % status)
     try:
         with exact_context():
-            payload = json.loads(body, parse_float=Decimal, parse_int=int, parse_constant=_reject_constant)
+            payload = json.loads(body, parse_float=Decimal, parse_int=int,
+                                 parse_constant=_reject_constant, object_pairs_hook=_unique_object)
     except (DecimalException, TypeError, ValueError, UnicodeError): return _unclear("invalid_json")
     code = payload.get("code") if isinstance(payload, dict) else None
     if type(code) is not int: code = None
@@ -215,7 +218,7 @@ class BinanceHttp:
         if not callable(now_ms): raise AdapterRefusal("now_ms must be callable")
         self._api_key, self._api_secret = api_key, api_secret
         self._timeout, self._recv_window = timeout_seconds, recv_window_ms
-        self._now_ms, self._offsets = now_ms, {}
+        self._now_ms, self._offsets, self._open = now_ms, {}, urllib.request.build_opener(_NoRedirect()).open
 
     def _clock(self) -> int | None:
         try:
@@ -237,7 +240,7 @@ class BinanceHttp:
                  params: Params | None = None, signed: bool = False) -> HttpResult:
         if (type(method) is not str or not method or type(base_url) is not str
                 or not base_url or type(path) is not str or not path.startswith("/")
-                or type(signed) is not bool):
+                or "?" in path or "#" in path or type(signed) is not bool):
             raise AdapterRefusal("method, base_url, and path must be valid strings")
         values = list(_canonical_params(params))
         if signed:
@@ -256,7 +259,7 @@ class BinanceHttp:
             url = base_url + path + ("?" + query if query else "")
             request = urllib.request.Request(url, method=method)
             if signed: request.add_header("X-MBX-APIKEY", self._api_key)
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with self._open(request, timeout=self._timeout) as response:
                 status = getattr(response, "status", None)
                 status = response.getcode() if status is None else status
                 return _classify(status, response.read(), (self._api_key, self._api_secret))

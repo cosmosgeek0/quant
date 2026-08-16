@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import sys
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -85,6 +86,10 @@ class FuturesAdapterTest(unittest.TestCase):
         routes = preflight_routes(); routes["/fapi/v3/balance"] = ok([{"asset": "USDT", "availableBalance": "119.99"}])
         self.assertEqual(futures.read_preflight(Spy(routes), BASE, market(), D("100"),
                                                require_flat=True, sleep=lambda _: None).kind, "unclear")
+        guarded = Spy({})
+        with self.assertRaises(http.AdapterRefusal):
+            futures.read_preflight(guarded, BASE, market(), D("9" * 60), require_flat=True, sleep=lambda _: None)
+        self.assertEqual(guarded.calls, [])
 
     def test_preflight_refuses_permission_mode_orders_and_nonflat_state(self):
         cases = []
@@ -154,20 +159,32 @@ class FuturesAdapterTest(unittest.TestCase):
                       ("GET", "/fapi/v1/order"): rejected()})
         result = futures.submit_order_once(absent, BASE, plan, lambda _: None, sleep=lambda _: None)
         self.assertEqual(result.tag, "error"); self.assertEqual(len(absent.posts()), 1)
-        delays = []; pending = Spy({("GET", "/fapi/v1/order"): unclear()})
-        result = futures.query_order(pending, BASE, SYMBOL, "fut-open-3", sleep=delays.append)
-        self.assertEqual(result.tag, "pending")
-        self.assertEqual(len(pending.calls), http.ORDER_QUERY_ATTEMPTS)
+        delays = []; pending = Spy({("POST", "/fapi/v1/order"): unclear(), ("GET", "/fapi/v1/order"): unclear()})
+        result = futures.submit_order_once(pending, BASE, plan, lambda _: None, sleep=delays.append)
+        queries = [call for call in pending.calls if call[0] == "GET"]
+        self.assertEqual((result.tag, len(pending.posts()), len(queries)), ("pending", 1, http.ORDER_QUERY_ATTEMPTS))
         self.assertEqual(delays, [http.ORDER_QUERY_DELAY_SECONDS] * (http.ORDER_QUERY_ATTEMPTS - 1))
 
-    def test_close_submit_requires_returned_reduce_only_truth(self):
+    def test_close_submit_requires_query_reduce_only_truth(self):
         plan = futures.build_reduce_only_close(market(), "SELL", "fut-close-3", SHA, D("1.234"))
-        payload = order_payload("fut-close-3", "SELL", True)
-        transport = Spy({("POST", "/fapi/v1/order"): ok({"clientOrderId": "fut-close-3", "reduceOnly": False}),
+        payload = order_payload("fut-close-3", "SELL", False)
+        transport = Spy({("POST", "/fapi/v1/order"): ok({"clientOrderId": "fut-close-3", "reduceOnly": True}),
                          ("GET", "/fapi/v1/order"): ok(payload)})
         result = futures.submit_order_once(transport, BASE, plan, lambda _: None, sleep=lambda _: None)
         self.assertEqual((result.tag, result.returned_client_id), ("pending", "fut-close-3"))
         self.assertEqual(len(transport.posts()), 1)
+
+    def test_plan_faults_refuse_before_intent_or_wire(self):
+        built = futures.build_open_order(market(), "BUY", "fut-open-5", SHA, D("1.234"), profile="MARKET")
+        params = built.intent.params; nan = tuple((key, "NaN") if key == "quantity" else pair for pair in params for key in (pair[0],))
+        cases = (replace(built, intent=replace(built.intent, git_sha="short")), replace(built, intent=replace(built.intent, git_sha="z" * 40)),
+                 replace(built, quantity=1.234), replace(built, intent=replace(built.intent, params=((['symbol'], SYMBOL),) + params[1:])),
+                 replace(built, intent=replace(built.intent, params=nan)))
+        for index, crafted in enumerate(cases):
+            with self.subTest(case=index):
+                transport, writes = Spy({}), []
+                with self.assertRaises(http.AdapterRefusal): futures.submit_order_once(transport, BASE, crafted, writes.append)
+                self.assertEqual((writes, transport.calls), ([], []))
 
     def test_fill_fee_and_income_ledgers_preserve_decimal_truth(self):
         trades = [{"symbol": SYMBOL, "id": 1, "orderId": 77, "price": "100", "qty": "1",
@@ -184,6 +201,14 @@ class FuturesAdapterTest(unittest.TestCase):
         wrong = copy.deepcopy(trades); wrong[0]["orderId"] = 78
         self.assertEqual(futures.read_fills(Spy({"/fapi/v1/userTrades": ok(wrong)}), BASE,
                                              order, sleep=lambda _: None).kind, "unclear")
+        valid = http.Fill(3, 77, D("100"), D("1.234"), D("123.4"), http.Fee("USDT", D("0")))
+        invalid = (replace(valid, order_id=78), replace(valid, price=D("0")), replace(valid, quantity=D("0")),
+                   replace(valid, quantity="1.234"), replace(valid, fee=http.Fee("USDT", D("-0.1"))),
+                   replace(valid, fee=http.Fee("", D("0"))))
+        for supplied in invalid:
+            with self.subTest(fill=supplied):
+                feed = Spy({}); result = futures.read_fills(feed, BASE, order, (supplied,), sleep=lambda _: None)
+                self.assertEqual((result.kind, feed.calls), ("unclear", []))
         income = [{"tranId": index, "symbol": SYMBOL, "incomeType": kind, "income": amount,
                    "asset": "USDT", "time": 1000 + index, "tradeId": ""}
                   for index, kind, amount in ((1, "COMMISSION", "-0.04"),
