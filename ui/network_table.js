@@ -28,6 +28,16 @@
   EDGES.forEach(function (item, index) {
     EDGE_INFO[item[0]] = { label: item[1], detail: item[2], order: index };
   });
+  var CONTROL_GROUPS = {
+    rest: { label: "REST", key: "rest_probe_s", values: [15, 30, 60],
+      edges: ["spot_rest", "usdm_rest"] },
+    wss: { label: "WSS", key: "wss_read_s", values: [5, 10, 15],
+      edges: ["spot_wss", "usdm_wss", "feed_machine"] },
+    cf: { label: "Cloudflare", key: "cf_monitor_s", values: [15, 30, 60],
+      edges: ["cf_connector", "connector_origin"] },
+    news: { label: "News", key: "news_monitor_s", values: [120, 300, 600],
+      edges: ["news_fetch"] }
+  };
 
   function element(tag, className, text) {
     var node = root.document.createElement(tag);
@@ -201,6 +211,20 @@
     return String(date.getUTCHours()).padStart(2, "0") + ":" + String(date.getUTCMinutes()).padStart(2, "0");
   }
 
+  function controlTitle(groupName) {
+    var group = CONTROL_GROUPS[groupName];
+    if (!group) { return ""; }
+    return "applies to " + group.label + ": " + group.edges.map(function (edgeId) {
+      return EDGE_INFO[edgeId] ? EDGE_INFO[edgeId].label : edgeId;
+    }).join(", ");
+  }
+
+  function collectorConfig(model) {
+    var current = model && model.current, collector = current && current.collector;
+    return collector && collector.config && typeof collector.config === "object"
+      ? collector.config : null;
+  }
+
   function render(host, model, opts) {
     if (!host || typeof host.appendChild !== "function")
       { throw new TypeError("NetV1Table.render requires a host element"); }
@@ -212,8 +236,9 @@
     var axis = element("div", "n1-axis"), axisLabels = [], rows = new Map();
     var tip = element("div", "n1-tip"), activeModel = model, destroyed = false;
     var onSelect = typeof opts.onSelect === "function" ? opts.onSelect : null;
+    var onControl = typeof opts.onControl === "function" ? opts.onControl : null;
 
-    ["Connection", "Status", "Reading", "Fresh", "Headroom", "Last change", "History"]
+    ["Connection", "Status", "Reading", "Fresh", "Headroom", "Last change", "History", "CONTROL"]
       .forEach(function (label, index) {
         var th = element("th", index === 1 ? "c-status" : "", label);
         th.scope = "col"; headRow.appendChild(th);
@@ -281,21 +306,26 @@
       var word = element("span", "v5-word off"), reading = element("td");
       var wordText = root.document.createTextNode(DASH);
       var fresh = element("td"), room = element("td"), change = element("td", "n1-detail");
-      var history = element("td"), canvas = element("canvas", "n1-cells"), record;
+      var history = element("td"), canvas = element("canvas", "n1-cells");
+      var control = element("td"), controlDash = element("span", "", DASH), record;
       row.tabIndex = 0; row.setAttribute("data-edge", edge.id); dot.setAttribute("aria-hidden", "true");
       nameCell.appendChild(name); nameCell.appendChild(detail);
       word.appendChild(dot); word.appendChild(wordText); status.appendChild(word); history.appendChild(canvas);
-      [nameCell, status, reading, fresh, room, change, history]
+      control.appendChild(controlDash);
+      [nameCell, status, reading, fresh, room, change, history, control]
         .forEach(function (cell) { row.appendChild(cell); });
       record = { id: edge.id, row: row, name: name, detail: detail, dot: dot,
         word: word, wordText: wordText, reading: reading, fresh: fresh, room: room, change: change,
         canvas: canvas, historyValue: null, bucketRef: null, drawWidth: -1,
-        drawRange: null, drawRatio: null, drawing: null, observer: null, visible: false };
+        drawRange: null, drawRatio: null, drawing: null, observer: null, visible: false,
+        control: control, controlDash: controlDash, every: null,
+        pauseLabel: null, pause: null, monitorOn: null, probe: null };
       canvas.setAttribute("aria-label", (EDGE_INFO[edge.id] || {}).label + " history");
       canvas.addEventListener("mousemove", function (event) { showTip(record, event); });
       canvas.addEventListener("mouseleave", hideTip);
       row.addEventListener("click", function () { if (!destroyed && onSelect) { onSelect(record.id); } });
       row.addEventListener("keydown", function (event) {
+        if (event.target !== row) { return; }
         if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") { return; }
         event.preventDefault(); if (!destroyed && onSelect) { onSelect(record.id); }
       });
@@ -304,6 +334,108 @@
           if (record.visible && !destroyed) { drawHistory(record, false); } });
       }
       return record;
+    }
+
+    function setControlReady(control, enabled) {
+      if (!control) { return; }
+      control.disabled = !enabled;
+      control.setAttribute("aria-busy", "false");
+    }
+
+    function sendControl(record, control, detail) {
+      if (destroyed || !onControl || !control || control.disabled) { return; }
+      control.disabled = true; control.setAttribute("aria-busy", "true");
+      try { onControl(detail); } catch (ignored) {}
+    }
+
+    function ensureEvery(record, edge) {
+      var group = CONTROL_GROUPS[edge.group], select, option;
+      if (record.every || !group) { return; }
+      select = element("select", "st-select n1-ctl-every");
+      select.setAttribute("aria-label", "Monitor interval");
+      option = element("option", "", DASH); option.value = ""; select.appendChild(option);
+      group.values.forEach(function (value) {
+        option = element("option", "", value + " s");
+        option.value = String(value); select.appendChild(option);
+      });
+      record.every = select;
+      select.addEventListener("click", function (event) { event.stopPropagation(); });
+      select.addEventListener("change", function () {
+        var currentGroup = CONTROL_GROUPS[record.edge && record.edge.group];
+        var value = Number(select.value);
+        if (!currentGroup || currentGroup.values.indexOf(value) === -1) { return; }
+        sendControl(record, select, { type: "every", edgeId: record.id,
+          group: record.edge.group, value: value });
+      });
+      record.control.appendChild(select);
+    }
+
+    function ensurePause(record) {
+      var button;
+      if (record.pause) { return; }
+      record.pauseLabel = element("span", "st-t-meta", "Monitor");
+      button = element("button", "switch n1-switch");
+      button.type = "button"; button.setAttribute("role", "switch");
+      button.setAttribute("aria-label", "Monitor"); button.setAttribute("aria-checked", "false");
+      button.appendChild(element("span", "knob")); record.pause = button;
+      button.addEventListener("click", function (event) {
+        event.stopPropagation();
+        if (record.monitorOn === null) { return; }
+        sendControl(record, button, { type: "pause", edgeId: record.id,
+          group: record.edge.group, value: !record.monitorOn });
+      });
+      record.control.appendChild(record.pauseLabel); record.control.appendChild(button);
+    }
+
+    function ensureProbe(record) {
+      var button;
+      if (record.probe) { return; }
+      button = element("button", "st-ctl-btn n1-ctl-probe", "Probe now");
+      button.type = "button"; record.probe = button;
+      button.addEventListener("click", function (event) {
+        event.stopPropagation();
+        sendControl(record, button, { type: "probe", edgeId: record.id,
+          group: record.edge.group, value: null });
+      });
+      record.control.appendChild(button);
+    }
+
+    function patchControls(record, edge) {
+      var declared = Array.isArray(edge.controls) ? edge.controls : [];
+      var group = CONTROL_GROUPS[edge.group], config = collectorConfig(activeModel);
+      var showEvery = !!onControl && !!group && declared.indexOf("monitor_every") !== -1;
+      var showPause = !!onControl && !!group && declared.indexOf("pause_monitor") !== -1;
+      var showProbe = !!onControl && declared.indexOf("probe_now") !== -1;
+      var title = controlTitle(edge.group), current, paused, monitorOn;
+      if (showEvery) { ensureEvery(record, edge); }
+      if (showPause) { ensurePause(record); }
+      if (showProbe) { ensureProbe(record); }
+      record.controlDash.hidden = showEvery || showPause || showProbe;
+      if (record.every) {
+        record.every.hidden = !showEvery;
+        current = showEvery && config ? config[group.key] : null;
+        current = showEvery && group.values.indexOf(current) !== -1 ? String(current) : "";
+        if (record.every.value !== current) { record.every.value = current; }
+        record.every.title = title;
+        record.every.setAttribute("aria-label", "Monitor interval, " + title);
+        setControlReady(record.every, showEvery);
+      }
+      if (record.pause) {
+        paused = showPause && config && config.paused ? config.paused[edge.group] : null;
+        monitorOn = paused === false ? true : (paused === true ? false : null);
+        record.monitorOn = monitorOn; record.pause.hidden = !showPause;
+        record.pauseLabel.hidden = !showPause; record.pause.title = title;
+        record.pause.setAttribute("aria-label", "Monitor, " + title);
+        record.pause.setAttribute("aria-checked", monitorOn === true ? "true" : "false");
+        record.pause.classList.toggle("on", monitorOn === true);
+        setControlReady(record.pause, showPause && monitorOn !== null);
+      }
+      if (record.probe) {
+        record.probe.hidden = !showProbe;
+        record.probe.title = "Probe now: " + ((EDGE_INFO[edge.id] || {}).label || edge.id);
+        record.probe.setAttribute("aria-label", record.probe.title);
+        setControlReady(record.probe, showProbe);
+      }
     }
 
     function patchRow(record, edge, event, selected) {
@@ -323,6 +455,7 @@
       record.row.classList.toggle("on", selected);
       record.row.setAttribute("aria-selected", selected ? "true" : "false");
       record.canvas.setAttribute("aria-label", info.label + " history");
+      patchControls(record, edge);
     }
 
     function wantedEdge(edge, filter) {
@@ -380,9 +513,9 @@
         if (record.observer) { record.observer.observe(record.canvas); } drawHistory(record, false);
       });
       updateAxis(visible);
-      if (focusedId && wanted.has(focusedId) && root.document.activeElement !== rows.get(focusedId).row) {
-        try { rows.get(focusedId).row.focus({ preventScroll: true }); }
-        catch (ignored) { rows.get(focusedId).row.focus(); }
+      if (focusedId && wanted.has(focusedId) && root.document.activeElement !== focused) {
+        try { focused.focus({ preventScroll: true }); }
+        catch (ignored) { focused.focus(); }
       }
     }
 

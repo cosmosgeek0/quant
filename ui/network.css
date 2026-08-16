@@ -108,14 +108,26 @@
   margin-top: 3px; overflow-x: auto;
   border-top: 1px solid var(--hair, var(--line, var(--st-line, #e5e7eb)));
 }
-.n1-grid { width: 100%; min-width: 980px; table-layout: auto; }
+.n1-grid { width: 100%; min-width: 1220px; table-layout: auto; }
 .n1-grid th, .n1-grid td {
   border-color: var(--hair, var(--line, var(--st-line, #e5e7eb)));
 }
 .n1-grid td, .n1-grid tbody tr { height: 40px; }
-.n1-grid th:last-child, .n1-grid td:last-child {
+.n1-grid th:nth-last-child(2), .n1-grid td:nth-last-child(2) {
   width: 100%; min-width: 320px;
 }
+.n1-grid th:last-child, .n1-grid td:last-child {
+  width: 250px; min-width: 250px; text-align: left;
+}
+.n1-grid td:last-child {
+  vertical-align: middle; font-family: InterVariable, Inter, sans-serif;
+}
+.n1-grid td:last-child > * + * { margin-left: 6px; }
+.n1-grid td:last-child .st-t-meta {
+  color: var(--muted, var(--st-mid, #787882));
+  font: 400 11px/16px InterVariable, Inter, sans-serif;
+}
+.n1-grid [hidden] { display: none !important; }
 .n1-grid tbody tr {
   outline: 0 solid transparent; outline-offset: -1px; transition: none;
 }
@@ -136,11 +148,51 @@
 .n1-cells { display: block; width: 100%; min-width: 320px; height: 14px; }
 .n1-axis {
   display: flex; justify-content: space-between;
-  width: max(320px, calc(100% - 660px)); min-width: 320px;
-  margin: 6px 10px 1px auto;
+  width: max(320px, calc(100% - 920px)); min-width: 320px;
+  margin: 6px 260px 1px auto;
   color: var(--faint, var(--st-faint, #95959d));
   font: 400 11px/16px InterVariable, Inter, sans-serif;
 }
+
+.n1-ctl-every, .n1-ctl-probe {
+  font: 500 12.5px/16px InterVariable, Inter, sans-serif;
+  transition: none; animation: none;
+}
+.n1-ctl-every {
+  width: 62px; height: 26px; padding: 0 5px;
+  border-color: var(--hair, var(--line, var(--st-line, #e5e7eb)));
+  background: var(--panel, var(--st-card, #fff));
+  color: var(--muted, var(--st-mid, #787882));
+}
+.n1-ctl-every:hover, .n1-ctl-probe:hover {
+  color: var(--ink, var(--st-ink, #161618));
+}
+.n1-ctl-every:focus-visible, .n1-ctl-probe:focus-visible,
+.n1-grid .n1-switch:focus-visible {
+  outline: 2px solid var(--focus, #2557d6); outline-offset: 1px;
+}
+.n1-grid .n1-switch {
+  display: inline-flex; width: 30px; height: 17px; padding: 2px;
+  vertical-align: middle; transform: none; background: var(--hair, var(--line, #e5e7eb));
+}
+.n1-grid .n1-switch .knob { width: 13px; height: 13px; }
+.n1-grid .n1-switch[aria-checked="true"] { background: var(--focus, #2557d6); }
+.n1-grid .n1-switch[aria-checked="true"] .knob { transform: translateX(13px); }
+.n1-ctl-probe {
+  min-height: 26px; padding: 4px 8px;
+  border-color: var(--hair, var(--line, var(--st-line, #e5e7eb)));
+  background: transparent; color: var(--muted, var(--st-mid, #787882));
+}
+.n1-ctl-every:disabled, .n1-ctl-probe:disabled,
+.n1-grid .n1-switch:disabled { cursor: default; opacity: 0.55; }
+
+.n1-receipt {
+  min-height: 16px; margin: 6px 2px 0;
+  color: var(--muted, var(--st-mid, #787882));
+  font: 400 11px/16px InterVariable, Inter, sans-serif;
+  transition: none; animation: none;
+}
+.n1-receipt.warn { color: #d4a406; }
 
 .n1-drawer {
   padding: 12px 14px 14px;

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 _COUNTER_FIELDS = ("successful_handshakes", "handshake_failures", "reconnects")
+_CONNECTIONS_HEAD = re.compile(r'^\s*\{\s*"connections"\s*:\s*')
+_WRITTEN_TAIL = re.compile(
+    r'"written_ms"\s*:\s*(?:"(?P<quoted>-?\d+)"|(?P<number>-?\d+))\s*\}\s*$'
+)
 
 
 def _read_object(path: str):
@@ -138,19 +144,73 @@ def _venue_metrics(venue, now_ms):
     return result
 
 
-def read_feed_connections(path: str, now_ms: int) -> dict | None:
-    payload = _read_object(path)
-    if payload is None or not isinstance(payload.get("connections"), dict):
-        return None
-    written_ms = _integer(payload.get("written_ms"))
+def _feed_connections_result(connections, written_ms, now_ms):
     result = {
         "written_ms": written_ms,
         "snapshot_age_ms": _age_ms(now_ms, written_ms),
     }
     for venue_name in ("spot", "perp"):
-        venue = payload["connections"].get(venue_name)
+        venue = connections.get(venue_name)
         if isinstance(venue, dict):
             result[venue_name] = _venue_metrics(venue, now_ms)
+    return result
+
+
+def read_feed_connections(path: str, now_ms: int) -> dict | None:
+    payload = _read_object(path)
+    if payload is None or not isinstance(payload.get("connections"), dict):
+        return None
+    written_ms = _integer(payload.get("written_ms"))
+    return _feed_connections_result(payload["connections"], written_ms, now_ms)
+
+
+def read_feed_source(
+    path: str, now_ms: int, head_bytes: int = 65536, tail_bytes: int = 512
+) -> dict | None:
+    """Read feed connection evidence without parsing the large symbols object."""
+    source_path = Path(path)
+    try:
+        with source_path.open("rb") as source:
+            stat = os.fstat(source.fileno())
+            try:
+                head = source.read(head_bytes).decode("utf-8")
+                source.seek(max(0, stat.st_size - tail_bytes))
+                tail = source.read(tail_bytes).decode("utf-8")
+                head_match = _CONNECTIONS_HEAD.match(head)
+                tail_match = _WRITTEN_TAIL.search(tail)
+                if head_match is None or tail_match is None:
+                    raise ValueError("feed key order changed")
+                connections, _end = json.JSONDecoder().raw_decode(
+                    head, head_match.end()
+                )
+                if not isinstance(connections, dict):
+                    raise ValueError("feed connections are not an object")
+                raw_written = tail_match.group("quoted") or tail_match.group("number")
+                written_ms = _integer(raw_written)
+                if written_ms is None:
+                    raise ValueError("feed written time is unavailable")
+                full_parse = False
+            except (OSError, UnicodeError, ValueError):
+                try:
+                    source.seek(0)
+                    payload = json.load(source)
+                except (OSError, UnicodeError, ValueError):
+                    return None
+                if not isinstance(payload, dict) or not isinstance(
+                    payload.get("connections"), dict
+                ):
+                    return None
+                connections = payload["connections"]
+                written_ms = _integer(payload.get("written_ms"))
+                full_parse = True
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    result = _feed_connections_result(connections, written_ms, now_ms)
+    result.update({
+        "source_bytes": stat.st_size,
+        "source_mtime_ms": stat.st_mtime_ns // 1_000_000,
+        "full_parse": full_parse,
+    })
     return result
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Offline tests for the host's local mirror."""
 
-import hashlib
 import json
 import os
 import re
@@ -17,6 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MIRROR_SCRIPT = ROOT / "ui" / "host" / "local_mirror.sh"
 STAGE_SCRIPT = ROOT / "ui" / "host" / "stage_server.sh"
 VERIFY_SCRIPT = ROOT / "ui" / "host" / "verify_network.sh"
+MEASURE_WRITES_SCRIPT = ROOT / "ui" / "host" / "measure_writes.sh"
+NETWORK_SERVICE = ROOT / "ui" / "host" / "quant-ui-network.service"
 NETWORK_DATA_SCRIPT = ROOT / "ui" / "network_data.js"
 FEED_FIXTURE = ROOT / "tests" / "fixtures" / "network" / "feed_state_sample.json"
 BASH = shutil.which("bash")
@@ -80,96 +81,82 @@ class TestNetworkMirror(unittest.TestCase):
     def read_json(self, name):
         return json.loads((self.live / name).read_text(encoding="utf-8"))
 
-    def test_complete_feed_is_copied_with_meta_and_manifest(self):
+    def test_feed_source_is_not_copied(self):
         self.write_feed()
 
         self.run_mirror()
 
-        mirrored = (self.live / "feed_state.json").read_bytes()
-        digest = hashlib.sha256(mirrored).hexdigest()
-        meta = self.read_json("feed_state.meta.json")
         manifest = self.read_json("pull_manifest.json")
-        self.assertEqual(mirrored, self.feed_bytes)
-        self.assertEqual(meta["source"], "watch/feed_state.json")
-        self.assertEqual(meta["source_bytes"], len(mirrored))
-        self.assertEqual(meta["sha256"], digest)
-        self.assertIsNone(meta["error"])
+        self.assertFalse((self.live / "feed_state.json").exists())
+        self.assertFalse((self.live / "feed_state.meta.json").exists())
         self.assertEqual(manifest["errors"], [])
         self.assertTrue(manifest["ok"])
-        self.assertEqual(manifest["files"], 1)
-
-    def test_missing_feed_keeps_previous_copy_and_records_error(self):
-        previous = b'{"previous":"good"}'
-        (self.live / "feed_state.json").write_bytes(previous)
-
-        self.run_mirror()
-
-        meta = self.read_json("feed_state.meta.json")
-        manifest = self.read_json("pull_manifest.json")
-        self.assertEqual((self.live / "feed_state.json").read_bytes(), previous)
-        self.assertIn("missing", meta["error"])
-        self.assertEqual(manifest["errors"], [meta["error"]])
-        self.assertFalse(manifest["ok"])
         self.assertEqual(manifest["files"], 0)
 
-    def test_incomplete_feed_keeps_previous_copy_and_records_error(self):
-        previous = b'{"previous":"good"}'
-        truncated = self.feed_bytes[:len(self.feed_bytes) // 2]
-        self.assertNotEqual(truncated[-1:], b"}")
-        (self.live / "feed_state.json").write_bytes(previous)
-        self.write_feed(truncated)
-
-        self.run_mirror()
-
-        meta = self.read_json("feed_state.meta.json")
-        manifest = self.read_json("pull_manifest.json")
-        self.assertEqual((self.live / "feed_state.json").read_bytes(), previous)
-        self.assertIn("incomplete", meta["error"])
-        self.assertEqual(manifest["errors"], [meta["error"]])
-        self.assertFalse(manifest["ok"])
-
-    def test_r4_braced_invalid_feed_keeps_previous_copy(self):
-        previous = b'{"previous":"good"}'
-        (self.live / "feed_state.json").write_bytes(previous)
-        self.write_feed(b"{not-json}")
-
-        self.run_mirror()
-
-        meta = self.read_json("feed_state.meta.json")
-        manifest = self.read_json("pull_manifest.json")
-        self.assertEqual((self.live / "feed_state.json").read_bytes(), previous)
-        self.assertIn("incomplete", meta["error"])
-        self.assertEqual(manifest["errors"], [meta["error"]])
-        self.assertFalse(manifest["ok"])
-
-    def test_r4_race_truncated_copy_keeps_previous_feed(self):
-        previous = b'{"previous":"good"}'
-        (self.live / "feed_state.json").write_bytes(previous)
+    def test_existing_feed_artifacts_are_not_rewritten(self):
+        feed_target = self.live / "feed_state.json"
+        meta_target = self.live / "feed_state.meta.json"
+        feed_target.write_bytes(b'{"previous":"copy"}')
+        meta_target.write_bytes(b'{"previous":"meta"}')
+        fixed_ns = 1_600_000_000_000_000_000
+        os.utime(feed_target, ns=(fixed_ns, fixed_ns))
+        os.utime(meta_target, ns=(fixed_ns, fixed_ns))
         self.write_feed()
-        fake_bin = self.root / "bin"
-        fake_bin.mkdir()
-        fake_cp = fake_bin / "cp"
-        fake_cp.write_text(
-            "#!/bin/bash\n"
-            "/bin/cp \"$@\"\n"
-            "copy_rc=$?\n"
-            "if [ \"$copy_rc\" -eq 0 ] && "
-            "[ \"${3-}\" = \"$QUANT_MIRROR_L/.tmp.feed_state.json\" ]; then\n"
-            "  printf '{\"written_ms\":' > \"$3\"\n"
-            "fi\n"
-            "exit \"$copy_rc\"\n",
-            encoding="utf-8",
-        )
-        fake_cp.chmod(0o755)
 
-        self.run_mirror({"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]})
+        self.run_mirror()
 
-        meta = self.read_json("feed_state.meta.json")
         manifest = self.read_json("pull_manifest.json")
-        self.assertEqual((self.live / "feed_state.json").read_bytes(), previous)
-        self.assertIn("incomplete", meta["error"])
-        self.assertEqual(manifest["errors"], [meta["error"]])
-        self.assertFalse(manifest["ok"])
+        self.assertEqual(feed_target.read_bytes(), b'{"previous":"copy"}')
+        self.assertEqual(meta_target.read_bytes(), b'{"previous":"meta"}')
+        self.assertEqual(feed_target.stat().st_mtime_ns, fixed_ns)
+        self.assertEqual(meta_target.stat().st_mtime_ns, fixed_ns)
+        self.assertEqual(manifest["errors"], [])
+        self.assertTrue(manifest["ok"])
+        self.assertEqual(manifest["files"], 0)
+
+    def test_unchanged_source_is_not_rewritten(self):
+        source = self.receipts / "health.jsonl"
+        target = self.live / "health.jsonl"
+        source.write_bytes(b"same-size\n")
+        self.run_mirror()
+        first_ns = target.stat().st_mtime_ns
+        source_ns = first_ns - 200_000_000_000
+        target_ns = first_ns - 100_000_000_000
+        os.utime(source, ns=(source_ns, source_ns))
+        os.utime(target, ns=(target_ns, target_ns))
+
+        self.run_mirror()
+
+        manifest = self.read_json("pull_manifest.json")
+        self.assertEqual(target.stat().st_mtime_ns, target_ns)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(manifest["files"], 0)
+
+    def test_changed_source_is_copied(self):
+        source = self.receipts / "decisions.jsonl"
+        target = self.live / "decisions.jsonl"
+        source.write_bytes(b"row\n")
+        self.run_mirror()
+        source.write_bytes(source.read_bytes() + b"x")
+
+        self.run_mirror()
+
+        manifest = self.read_json("pull_manifest.json")
+        self.assertEqual(target.read_bytes(), b"row\nx")
+        self.assertEqual(target.stat().st_mtime_ns, source.stat().st_mtime_ns)
+        self.assertEqual(manifest["files"], 1)
+
+    def test_flag_present_twice_keeps_target_mtime(self):
+        source = self.receipts / "STOP"
+        target = self.live / "STOP"
+        source.touch()
+        self.run_mirror()
+        fixed_ns = 1_600_000_000_000_000_000
+        os.utime(target, ns=(fixed_ns, fixed_ns))
+
+        self.run_mirror()
+
+        self.assertEqual(target.stat().st_mtime_ns, fixed_ns)
 
     def test_existing_files_and_stop_flags_keep_their_behavior(self):
         expected = {}
@@ -202,15 +189,10 @@ class TestNetworkMirror(unittest.TestCase):
 
 class TestNetworkHostScripts(unittest.TestCase):
 
-    def test_r8_mirror_round_2_documents_sentinel_design(self):
+    def test_mirror_has_no_feed_copy_block(self):
         script = MIRROR_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "# V1 uses head/tail sentinels for truncated writes; full parsing "
-            "every 5 s costs about 2% of one core, and malformed copies are "
-            "Unknown.",
-            script,
-        )
+        self.assertNotIn("feed_state", script)
 
     def test_r4_mirror_uses_set_u_and_short_metadata_rows(self):
         rows = MIRROR_SCRIPT.read_text(encoding="utf-8").splitlines()
@@ -227,6 +209,31 @@ class TestNetworkHostScripts(unittest.TestCase):
 
         self.assertIn('SERVER=${1:-ui/serve.py.new}', script)
         self.assertIn('python3 "$SERVER" --port 8081', script)
+
+    def test_network_service_reads_feed_at_source(self):
+        service = NETWORK_SERVICE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "--feed-source "
+            "/home/ssm-user/quant_receipts/watch/feed_state.json",
+            service,
+        )
+
+    def test_measure_writes_uses_disk_and_cgroup_counters(self):
+        script = MEASURE_WRITES_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("df --output=source /home/ssm-user", script)
+        self.assertIn("/proc/diskstats", script)
+        self.assertIn("quant-ui-mirror.service/io.stat", script)
+        self.assertIn("quant-ui-network.service/io.stat", script)
+        self.assertIn("wbytes=", script)
+        self.assertIn("sectors_delta * 512", script)
+        self.assertNotIn("<<", script)
+        self.assertEqual(
+            [(index, len(row)) for index, row in enumerate(
+                script.splitlines(), 1) if len(row) >= 200],
+            [],
+        )
 
     def test_r8_stage_round_2_validates_json_and_probe_route(self):
         script = STAGE_SCRIPT.read_text(encoding="utf-8")

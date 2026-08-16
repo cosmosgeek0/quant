@@ -10,6 +10,7 @@ from pathlib import Path
 from ui import network_health as health
 from ui.network_evidence import (
     read_feed_connections,
+    read_feed_source,
     read_last_job,
     read_manifest,
     read_news,
@@ -26,6 +27,20 @@ def epoch_ms(value):
 
 
 class FeedConnectionTests(unittest.TestCase):
+    def large_feed(self):
+        sample = json.loads(
+            (FIXTURES / "feed_state_sample.json").read_text(encoding="utf-8")
+        )
+        return {
+            "connections": sample["connections"],
+            "symbols": {"SYNTHETIC": "x" * (1024 * 1024)},
+            "version": 1,
+            "window": 60,
+            "window_newest_ms": "1786897849490",
+            "window_oldest_ms": "1786897789490",
+            "written_ms": sample["written_ms"],
+        }
+
     def test_sample_reports_each_connection_once(self):
         now_ms = 1786897850490
 
@@ -95,6 +110,61 @@ class FeedConnectionTests(unittest.TestCase):
 
             self.assertIsNone(read_feed_connections(root / "missing", 1))
             self.assertIsNone(read_feed_connections(malformed, 1))
+
+    def test_source_fast_path_matches_full_parse_on_one_megabyte_file(self):
+        now_ms = 1786897850490
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "feed.json"
+            path.write_text(
+                json.dumps(self.large_feed(), sort_keys=True), encoding="utf-8"
+            )
+
+            full = read_feed_connections(path, now_ms)
+            result = read_feed_source(path, now_ms)
+            stat = path.stat()
+
+        self.assertGreater(stat.st_size, 1024 * 1024)
+        self.assertEqual(
+            {key: result[key] for key in full},
+            full,
+        )
+        self.assertFalse(result["full_parse"])
+        self.assertEqual(result["source_bytes"], stat.st_size)
+        self.assertEqual(
+            result["source_mtime_ms"], stat.st_mtime_ns // 1_000_000
+        )
+
+    def test_source_changed_key_order_uses_one_full_parse(self):
+        now_ms = 1786897850490
+        payload = self.large_feed()
+        changed_order = {
+            "symbols": payload["symbols"],
+            "connections": payload["connections"],
+            "version": payload["version"],
+            "window": payload["window"],
+            "window_newest_ms": payload["window_newest_ms"],
+            "window_oldest_ms": payload["window_oldest_ms"],
+            "written_ms": payload["written_ms"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "feed.json"
+            path.write_text(json.dumps(changed_order), encoding="utf-8")
+
+            full = read_feed_connections(path, now_ms)
+            result = read_feed_source(path, now_ms)
+
+        self.assertEqual({key: result[key] for key in full}, full)
+        self.assertTrue(result["full_parse"])
+
+    def test_source_truncated_write_and_missing_file_return_none(self):
+        payload = json.dumps(self.large_feed(), sort_keys=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "feed.json"
+            path.write_text(payload[:-20], encoding="utf-8")
+
+            self.assertIsNone(read_feed_source(path, 1))
+            self.assertIsNone(read_feed_source(root / "missing.json", 1))
 
     def test_r2_connected_missing_remains_unknown_unless_feed_is_broken(self):
         with tempfile.TemporaryDirectory() as temporary:

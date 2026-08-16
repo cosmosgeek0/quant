@@ -14,6 +14,12 @@
     usdm_wss: "last_message_age_ms", feed_machine: "book_age_p50_ms",
     news_fetch: "sources_live"
   };
+  var CONTROL_CONFIG = {
+    rest: { key: "rest_probe_s", values: [15, 30, 60] },
+    wss: { key: "wss_read_s", values: [5, 10, 15] },
+    cf: { key: "cf_monitor_s", values: [15, 30, 60] },
+    news: { key: "news_monitor_s", values: [120, 300, 600] }
+  };
 
   function finiteNumber(value) { return typeof value === "number" && isFinite(value); }
 
@@ -90,6 +96,21 @@
     ? "—" : String(value); }
   function shortRelease(value) { return value === null || value === undefined || value === ""
     ? "—" : String(value).slice(0, 7); }
+
+  function configValue(current, key, group) {
+    var collector = current && current.collector;
+    var config = collector && collector.config;
+    if (!config || typeof config !== "object") { return null; }
+    if (key === "paused") {
+      return config.paused && typeof config.paused === "object"
+        ? config.paused[group] : null;
+    }
+    return Object.prototype.hasOwnProperty.call(config, key) ? config[key] : null;
+  }
+
+  function isCooldownLine(message) {
+    return /^cooldown(?:\s|$)/.test(message) || message === "probe already requested";
+  }
 
   function visibleEdges(view) {
     return edges(view).filter(function (edge) {
@@ -265,6 +286,100 @@
   function updateComponents(view) {
     updateStrip(view); updateTable(view); updateDrawer(view); updateLedger(view); }
 
+  function setReceipt(view, token, text, warn) {
+    if (!active(view) || token !== view.controlToken) { return; }
+    view.receipt.className = "n1-receipt" + (warn ? " warn" : "");
+    view.receipt.textContent = text; view.receipt.hidden = false;
+  }
+
+  function controlReceipt(view, control, key, answer) {
+    var message, saved, savedKey;
+    if (!answer || answer.ok !== true) {
+      message = answer && typeof answer.error === "string" && answer.error
+        ? answer.error : "Control request did not return an answer";
+      return { text: message, warn: !isCooldownLine(message), config: false,
+        success: false, key: key, group: control.group };
+    }
+    saved = answer.saved;
+    if (!saved || typeof saved !== "object") {
+      return { text: "Receipt unavailable", warn: true, config: false,
+        success: false, key: key, group: control.group };
+    }
+    if (control.type === "probe") {
+      return { text: "probe requested · " + edgeLabel(view, saved.edge_id || control.edgeId) +
+        " · request " + shown(saved.request_id), warn: false, config: false,
+        success: true, key: null, group: control.group };
+    }
+    savedKey = saved.key || key;
+    if (saved.unchanged === true) {
+      return { text: "unchanged · " + shown(savedKey) + " " + shown(saved.new),
+        warn: false, config: true, success: true, key: savedKey,
+        group: saved.group || control.group };
+    }
+    return { text: "saved · " + shown(savedKey) + " " + shown(saved.old) +
+      " → " + shown(saved.new) + " · receipt #" + shown(saved.receipt_id) +
+      " · reread " + shown(saved.reread), warn: false, config: true,
+      success: true, key: savedKey, group: saved.group || control.group };
+  }
+
+  function onControl(view, control) {
+    if (!active(view)) { return Promise.resolve(null); }
+    var data = root.NetworkData, group = control && CONTROL_CONFIG[control.group];
+    var key = null, request = null, token = view.controlToken + 1;
+    view.controlToken = token;
+    if (!control || typeof control.type !== "string") {
+      request = Promise.resolve({ ok: false, error: "Control request is incomplete" });
+    } else if (control.type === "every") {
+      key = group && group.key;
+      if (!group || group.values.indexOf(control.value) === -1) {
+        request = Promise.resolve({ ok: false, error: "Monitor interval is unavailable" });
+      } else if (!data || typeof data.postConfig !== "function") {
+        request = Promise.resolve({ ok: false, error: "Control endpoint unavailable" });
+      } else { request = data.postConfig(key, control.value, control.group); }
+    } else if (control.type === "pause") {
+      key = "paused";
+      if (!group || typeof control.value !== "boolean") {
+        request = Promise.resolve({ ok: false, error: "Monitor state is unavailable" });
+      } else if (!data || typeof data.postConfig !== "function") {
+        request = Promise.resolve({ ok: false, error: "Control endpoint unavailable" });
+      } else { request = data.postConfig("paused", !control.value, control.group); }
+    } else if (control.type === "probe") {
+      if (!data || typeof data.postProbe !== "function") {
+        request = Promise.resolve({ ok: false, error: "Probe endpoint unavailable" });
+      } else { request = data.postProbe(control.edgeId); }
+    } else {
+      request = Promise.resolve({ ok: false, error: "Control type is unavailable" });
+    }
+    return Promise.resolve(request).catch(function (error) {
+      return { ok: false, error: error && error.message
+        ? error.message : "Control request did not return an answer" };
+    }).then(function (answer) {
+      if (!active(view)) { return null; }
+      var receipt = controlReceipt(view, control || {}, key, answer);
+      setReceipt(view, token, receipt.text, receipt.warn);
+      if (!data || typeof data.fetchCurrent !== "function") {
+        updateTable(view);
+        if (receipt.config && receipt.success) {
+          setReceipt(view, token, receipt.text + " · server now —", receipt.warn);
+        }
+        return answer;
+      }
+      return data.fetchCurrent().then(function (current) {
+        if (!active(view)) { return current; }
+        if (current && typeof current === "object") {
+          view.current = current; view.lastAnswerAt = Date.now(); view.hasError = false;
+          patchError(view);
+        }
+        updateTable(view);
+        if (receipt.config && receipt.success) {
+          setReceipt(view, token, receipt.text + " · server now " +
+            shown(configValue(current, receipt.key, receipt.group)), receipt.warn);
+        }
+        return current;
+      });
+    });
+  }
+
   function missing(host, className) {
     host.className = className; host.textContent = "";
     host.appendChild(el("div", "v5-note", "component not loaded")); return null;
@@ -282,7 +397,9 @@
         function (id) { selectFor(view, id); }], "st-card n1-strip");
     view.components.table = mount(view.hosts.table, root.NetV1Table,
       [view.hosts.table, tableModel(view),
-        { onSelect: function (id) { selectFor(view, id); } }], "st-card n1-table");
+        { onSelect: function (id) { selectFor(view, id); },
+          onControl: function (control) { return onControl(view, control); } }],
+      "st-card n1-table");
     view.components.drawer = mount(view.hosts.drawer, root.NetV1Drawer,
       [view.hosts.drawer, null, [], drawerOpts(view)], "st-card n1-drawer");
     view.components.ledger = mount(view.hosts.ledger, root.NetV1Ledger,
@@ -393,7 +510,7 @@
       selectedId: null, metric: null, live: true, didDefaultSelect: false,
       historyByEdge: Object.create(null), drawerBuckets: [],
       sessionFetchMs: null, sessionMeasuredAt: null, lastAnswerAt: null, hasError: false,
-      components: {}, hosts: {}, unsubscribers: [], timers: []
+      controlToken: 0, components: {}, hosts: {}, unsubscribers: [], timers: []
     };
     state = view; view.page = el("div", "st-page");
     var head = el("div", "st-head");
@@ -439,7 +556,10 @@
     view.hosts.table = el("div", "st-card n1-table");
     view.hosts.drawer = el("div"); view.hosts.drawer.hidden = true;
     view.hosts.ledger = el("div", "st-card n1-ledger");
-    view.page.appendChild(view.hosts.table); view.page.appendChild(view.hosts.drawer);
+    view.receipt = el("div", "n1-receipt"); view.receipt.hidden = true;
+    view.receipt.setAttribute("role", "status"); view.receipt.setAttribute("aria-live", "polite");
+    view.page.appendChild(view.hosts.table); view.page.appendChild(view.receipt);
+    view.page.appendChild(view.hosts.drawer);
     view.page.appendChild(view.hosts.ledger);
     view.foot = el("div", "n1-foot", "recorder — · ui — · collector — · — UTC");
     view.page.appendChild(view.foot); container.appendChild(view.page);

@@ -109,6 +109,7 @@ class FakeWorld:
             "origin": [], "feed": [], "stream": [], "news": [], "job": [],
         }
         self.rest_results = {}
+        self.feed_results = {}
         self.previous_seen = []
         self.probe_derived = set()
 
@@ -121,7 +122,7 @@ class FakeWorld:
             "read_ready": self.read_ready,
             "probe_origin": self.probe_origin,
             "cf_metrics_from_raw": self.cf_metrics_from_raw,
-            "read_feed_connections": self.read_feed_connections,
+            "read_feed_source": self.read_feed_source,
             "read_stream_state": self.read_stream_state,
             "read_news": self.read_news,
             "read_last_job": self.read_last_job,
@@ -176,8 +177,7 @@ class FakeWorld:
         origin = {"request_errors_delta": 0, "response_5xx_delta": 0}
         return {"cf_connector": connector, "connector_origin_delta": origin}
 
-    def read_feed_connections(self, path, now_ms):
-        self.calls["feed"].append((path, now_ms))
+    def feed_observation(self, now_ms):
         venue = {
             "feed_status": "healthy",
             "expected_connections": 2,
@@ -189,7 +189,15 @@ class FakeWorld:
             "perp": deepcopy(venue),
             "written_ms": now_ms - 10,
             "snapshot_age_ms": 10,
+            "source_bytes": 4096,
+            "source_mtime_ms": now_ms - 1000,
+            "full_parse": False,
         }
+
+    def read_feed_source(self, path, now_ms):
+        self.calls["feed"].append((path, now_ms))
+        result = self.feed_results.get(path, self.feed_observation(now_ms))
+        return deepcopy(result)
 
     def read_stream_state(self, path, now_ms):
         self.calls["stream"].append((path, now_ms))
@@ -299,6 +307,7 @@ class NetworkRecorderTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.live = self.root / "live"
         self.data = self.root / "data"
+        self.feed_source = self.root / "watch" / "feed_state.json"
         self.live.mkdir()
         MemoryStore.databases.clear()
         self.world = FakeWorld()
@@ -307,6 +316,7 @@ class NetworkRecorderTests(unittest.TestCase):
         return [
             "--live-dir", str(self.live),
             "--data-dir", str(self.data),
+            "--feed-source", str(self.feed_source),
             "--once", "-q",
         ]
 
@@ -358,6 +368,80 @@ class NetworkRecorderTests(unittest.TestCase):
         samples = self.database()["samples"]
         self.assertEqual(len(samples), 8)
         self.assertEqual({row["edge_id"] for row in samples}, REQUIRED_IDS)
+
+    def test_wss_reads_source_and_writes_compact_connections_atomically(self):
+        self.run_once()
+
+        compact_path = self.live / "feed_connections.json"
+        compact = json.loads(compact_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.world.calls["feed"],
+            [(str(self.feed_source), self.world.now)],
+        )
+        self.assertEqual(compact["source"], "watch/feed_state.json")
+        self.assertEqual(compact["read_at"], recorder._iso(self.world.now))
+        self.assertEqual(
+            compact["source_mtime"], recorder._iso(self.world.now - 1000)
+        )
+        self.assertEqual(compact["source_bytes"], 4096)
+        self.assertEqual(compact["written_ms"], str(self.world.now - 10))
+        self.assertEqual(compact["snapshot_age_ms"], 10)
+        self.assertEqual(set(compact["connections"]), {"spot", "perp"})
+        self.assertFalse(compact["full_parse"])
+        self.assertIsNone(compact["error"])
+        self.assertFalse(Path(str(compact_path) + ".tmp").exists())
+
+    def test_unreadable_source_is_unknown_with_exact_reason(self):
+        self.world.feed_results[str(self.feed_source)] = None
+
+        current = self.run_once()
+
+        by_id = {edge["id"]: edge for edge in current["edges"]}
+        for edge_id in ("spot_wss", "usdm_wss"):
+            self.assertEqual(by_id[edge_id]["health"], "Unknown")
+            self.assertEqual(
+                by_id[edge_id]["health_reason"], "Feed evidence unreadable"
+            )
+        compact = json.loads(
+            (self.live / "feed_connections.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(compact["connections"], {})
+        self.assertEqual(compact["error"], "Feed evidence unreadable")
+        self.assertIsNone(compact["source_bytes"])
+
+    def test_unreadable_source_uses_existing_mirror_and_logs_once(self):
+        self.world.feed_results[str(self.feed_source)] = None
+        mirror = self.live / "feed_state.json"
+        mirror.write_text("{}", encoding="utf-8")
+        self.world.feed_results[str(mirror)] = self.world.feed_observation(
+            self.world.now
+        )
+        runner = recorder.Recorder(
+            self.live, self.data, quiet=True, deps=self.world.deps(),
+            feed_source=self.feed_source,
+        )
+        runner.start(self.world.now)
+        runner.cycle(self.world.now)
+        self.world.now += 15_000
+        runner.cycle(self.world.now)
+
+        fallback_events = [
+            row for row in self.database()["events"]
+            if row["reason"] == "feed source unreadable, using mirrored copy"
+        ]
+        compact = json.loads(
+            (self.live / "feed_connections.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(fallback_events), 1)
+        self.assertEqual(compact["source"], "feed_state.json")
+        self.assertEqual(
+            compact["error"], "feed source unreadable, using mirrored copy"
+        )
+        self.assertEqual(
+            [path for path, _now in self.world.calls["feed"]],
+            [str(self.feed_source), str(mirror)] * 2,
+        )
+        runner.close()
 
     def test_paused_group_is_off_without_collection_or_samples(self):
         self.write_config(paused={"wss": True})

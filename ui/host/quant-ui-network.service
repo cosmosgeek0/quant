@@ -7,7 +7,7 @@ Type=simple
 User=ssm-user
 WorkingDirectory=/home/ssm-user/quant-ui
 Environment=QUANT_UI_DATA_DIR=/home/ssm-user/quant-ui/data
-ExecStart=/usr/bin/python3 ui/network_recorder.py --tick 5 -q
+ExecStart=/usr/bin/python3 ui/network_recorder.py --tick 5 -q --feed-source /home/ssm-user/quant_receipts/watch/feed_state.json
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

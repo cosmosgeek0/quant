@@ -20,6 +20,9 @@ UI_DIR = Path(__file__).resolve().parent
 REPO_ROOT = UI_DIR.parent
 DEFAULT_LIVE_DIR = UI_DIR / "live"
 DEFAULT_DATA_DIR = REPO_ROOT / "data"
+DEFAULT_FEED_SOURCE = "/home/ssm-user/quant_receipts/watch/feed_state.json"
+FEED_FALLBACK_EVENT = "feed source unreadable, using mirrored copy"
+FEED_UNREADABLE_REASON = "Feed evidence unreadable"
 GROUP_EDGES = {
     "rest": ("spot_rest", "usdm_rest"), "wss": ("spot_wss", "usdm_wss", "feed_machine"),
     "cf": ("cf_connector", "connector_origin"), "news": ("news_fetch",),
@@ -36,7 +39,7 @@ DEPENDENCIES = {
         "discover_metrics_url", "scrape_metrics", "read_ready",
         "probe_origin", "cf_metrics_from_raw")},
     **{name: ("network_evidence", name) for name in (
-        "read_feed_connections", "read_stream_state", "read_news", "read_last_job")},
+        "read_feed_source", "read_stream_state", "read_news", "read_last_job")},
     **{name: ("network_health", name) for name in (
         "derive_edge", "transitions", "summarize")},
     "NetworkStore": ("network_store", "NetworkStore"),
@@ -118,12 +121,36 @@ def _safe_release(value):
     return value if all(char.isalnum() or char in "._-" for char in value) else None
 
 
+def _feed_source_label(path):
+    source = Path(path)
+    if source.name == "feed_state.json" and source.parent.name == "watch":
+        return "watch/feed_state.json"
+    return source.name or "feed_state.json"
+
+
+def _write_json_atomic(path, payload):
+    temporary = Path(str(path) + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(payload, output, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
+            output.write("\n")
+        os.replace(str(temporary), str(path))
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="record Network V1 evidence")
     parser.add_argument("--live-dir", default=str(DEFAULT_LIVE_DIR))
     parser.add_argument("--data-dir", default=os.environ.get("QUANT_UI_DATA_DIR", str(DEFAULT_DATA_DIR)))
     parser.add_argument("--tick", type=_tick, default=5.0)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--feed-source", default=DEFAULT_FEED_SOURCE)
     parser.add_argument("--metrics-url")
     parser.add_argument("--origin-url", default="http://127.0.0.1:8080/")
     parser.add_argument("-q", "--quiet", action="store_true")
@@ -181,14 +208,17 @@ class Recorder:
     """One process-local scheduler with injectable collection callables."""
 
     def __init__(self, live_dir, data_dir, tick_s=5.0, metrics_url=None,
-                 origin_url="http://127.0.0.1:8080/", quiet=False, deps=None):
+                 origin_url="http://127.0.0.1:8080/", quiet=False, deps=None,
+                 feed_source=DEFAULT_FEED_SOURCE):
         self.live_dir, self.data_dir = Path(live_dir), Path(data_dir)
+        self.feed_source = Path(feed_source)
         self.tick_s, self.metrics_url = float(tick_s), metrics_url
         self.origin_url, self.quiet = origin_url, quiet
         self.overrides, self.resolved = dict(deps or {}), {}
         self.current_path, self.config_path, self.probe_path = (
             self.live_dir / "network_current.json", self.live_dir / "network_config.json",
             self.live_dir / "network_probe_request.json")
+        self.feed_connections_path = self.live_dir / "feed_connections.json"
         self.store = None
         self.started = self.closed = self.stop_requested = False
         self.status, self.started_at, self.last_cycle_at = "unknown", None, None
@@ -199,6 +229,7 @@ class Recorder:
         self.next_due = {group: 0 for group in GROUP_EDGES}
         self.next_allowed, self.probe_now, self.last_probe = {}, {}, {}
         self.last_prune, self.metrics_found, self.previous_cf_raw = None, None, None
+        self.feed_fallback_active = False
 
     def dep(self, name):
         if name in self.resolved:
@@ -344,10 +375,13 @@ class Recorder:
                     self.next_due[group] = min(self.next_due[group], now_ms)
         return True
 
-    def derive(self, edge_id, evidence, now_ms, collected=False):
+    def derive(self, edge_id, evidence, now_ms, collected=False,
+               unknown_reason=None):
         seeded = edge_id in self.seed_previous
         previous = self.seed_previous.pop(edge_id, self.edges.get(edge_id))
         current = self.dep("derive_edge")(edge_id, evidence, previous, self.config, now_ms)
+        if unknown_reason and current.get("health") == "Unknown":
+            current["health_reason"] = unknown_reason
         if not collected and evidence is None:
             self._keep_uncollected_continuity(current, previous)
         if isinstance(previous, dict) and isinstance(previous.get("last_transition"), dict):
@@ -435,23 +469,66 @@ class Recorder:
                 evidence["probe_now"] = True
             self.derive(edge_id, evidence, now_ms, collected=True)
 
+    def write_feed_connections(self, feed, source_path, now_ms, error=None):
+        row = feed if isinstance(feed, dict) else {}
+        connections = {
+            venue: dict(row[venue]) for venue in ("spot", "perp")
+            if isinstance(row.get(venue), dict)
+        }
+        written_ms = row.get("written_ms")
+        if isinstance(written_ms, int) and not isinstance(written_ms, bool):
+            written_ms = str(written_ms)
+        elif not isinstance(written_ms, str):
+            written_ms = None
+        source_mtime_ms = row.get("source_mtime_ms")
+        payload = {
+            "source": _feed_source_label(source_path),
+            "read_at": _iso(now_ms),
+            "source_mtime": _iso(source_mtime_ms) if _plain_nonnegative_int(source_mtime_ms) else None,
+            "source_bytes": row.get("source_bytes") if _plain_nonnegative_int(row.get("source_bytes")) else None,
+            "written_ms": written_ms,
+            "snapshot_age_ms": row.get("snapshot_age_ms") if isinstance(row.get("snapshot_age_ms"), int) and not isinstance(row.get("snapshot_age_ms"), bool) else None,
+            "connections": connections,
+            "full_parse": row.get("full_parse") is True,
+            "error": error if isinstance(error, str) else None,
+        }
+        _write_json_atomic(self.feed_connections_path, payload)
+
     def collect_wss(self, now_ms):
-        feed_path = str(self.live_dir / "feed_state.json")
+        feed_path = self.feed_source
+        mirror_path = self.live_dir / "feed_state.json"
         stream_path = str(self.live_dir / "stream_state.json")
-        feed = self.dep("read_feed_connections")(feed_path, now_ms)
+        feed = self.dep("read_feed_source")(str(feed_path), now_ms)
+        used_path, warning = feed_path, None
+        if not isinstance(feed, dict) and mirror_path.exists():
+            mirrored = self.dep("read_feed_source")(str(mirror_path), now_ms)
+            if isinstance(mirrored, dict):
+                feed, used_path, warning = mirrored, mirror_path, FEED_FALLBACK_EVENT
+                if not self.feed_fallback_active:
+                    self.event(now_ms, None, "feed fallback", "medium",
+                               FEED_FALLBACK_EVENT, {})
+                self.feed_fallback_active = True
+        elif isinstance(feed, dict):
+            self.feed_fallback_active = False
+        if not isinstance(feed, dict):
+            warning = FEED_UNREADABLE_REASON
+        self.write_feed_connections(feed, used_path, now_ms, warning)
         stream = self.dep("read_stream_state")(stream_path, now_ms)
+        unknown_reason = FEED_UNREADABLE_REASON if not isinstance(feed, dict) else None
         for edge_id, venue in (("spot_wss", "spot"), ("usdm_wss", "perp")):
             row = feed.get(venue) if isinstance(feed, dict) else None
             evidence = dict(row) if isinstance(row, dict) else None
             if evidence is not None:
                 evidence.update(written_ms=feed.get("written_ms"),
                                 snapshot_age_ms=feed.get("snapshot_age_ms"))
-            self.derive(edge_id, evidence, now_ms, collected=True)
+            self.derive(edge_id, evidence, now_ms, collected=True,
+                        unknown_reason=unknown_reason)
         machine = dict(stream) if isinstance(stream, dict) else None
         if machine is not None:
             value = feed.get("snapshot_age_ms") if isinstance(feed, dict) else None
             machine["feed_snapshot_age_ms"] = value
-        self.derive("feed_machine", machine, now_ms, collected=True)
+        self.derive("feed_machine", machine, now_ms, collected=True,
+                    unknown_reason=unknown_reason)
 
     def collect_cf(self, edge_ids, now_ms, forced):
         edge_ids, shared, connector = set(edge_ids), None, None
@@ -570,20 +647,7 @@ class Recorder:
         }
 
     def write_current(self, now_ms):
-        temporary = Path(str(self.current_path) + ".tmp")
-        try:
-            with open(temporary, "w", encoding="utf-8") as output:
-                json.dump(self.payload(now_ms), output, ensure_ascii=False,
-                          separators=(",", ":"), allow_nan=False)
-                output.write("\n")
-                output.flush()
-            os.replace(str(temporary), str(self.current_path))
-        except BaseException:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-            raise
+        _write_json_atomic(self.current_path, self.payload(now_ms))
 
     def wait_seconds(self, now_ms):
         waits = [self.tick_s]
@@ -632,8 +696,11 @@ def main(argv=None, deps=None):
         print("origin URL must use http://127.0.0.1 or http://localhost",
               file=sys.stderr)
         return 2
-    recorder = Recorder(args.live_dir, args.data_dir, args.tick,
-                        args.metrics_url, args.origin_url, args.quiet, deps)
+    recorder = Recorder(
+        args.live_dir, args.data_dir, tick_s=args.tick,
+        metrics_url=args.metrics_url, origin_url=args.origin_url,
+        quiet=args.quiet, deps=deps, feed_source=args.feed_source,
+    )
     previous = {}
 
     def request_stop(_signum, _frame):
