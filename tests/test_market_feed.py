@@ -130,7 +130,7 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(
             mf.FAPI_WS_URL,
             "wss://fstream.binance.com/market/stream"
-            "?streams=!ticker@arr/!miniTicker@arr",
+            "?streams=!bookTicker",
         )
 
     def test_tls_upgrade_is_verified_with_injected_socket(self):
@@ -171,7 +171,7 @@ class HandshakeTests(unittest.TestCase):
         )
         request = transport.sent[0].decode("ascii")
         self.assertIn(
-            "GET /stream?streams=!ticker@arr/!miniTicker@arr HTTP/1.1", request
+            "GET /stream?streams=!ticker@arr HTTP/1.1", request
         )
         self.assertEqual(client.recv_text(), "ready")
 
@@ -327,67 +327,72 @@ class RecordMergeTests(unittest.TestCase):
         self.state = mf.merge_metadata({}, spot, perp, FIXED_UTC)
         self.seen = {}
 
-    def test_spot_and_perp_tickers_merge_without_rotation_and_compute_basis(self):
+    def test_documented_spot_array_and_futures_book_event_merge(self):
         spot_rows = [
-            {"s": "AAAUSDT", "b": "10", "a": "11", "E": FIXED_MS - 5},
-            {"s": "SPOTUSDT", "b": "20", "a": "21", "E": FIXED_MS - 7},
-            {"s": "UNKNOWNUSDT", "b": "1", "a": "2", "E": FIXED_MS},
+            {"e": "24hrTicker", "E": FIXED_MS - 5, "s": "AAAUSDT",
+             "b": "10", "B": "3", "a": "11", "A": "4"},
         ]
+        spot_stream, spot_rows = mf.parse_combined_message(json.dumps(
+            {"stream": "!ticker@arr", "data": spot_rows}
+        ))
         changed = mf.merge_ticker_rows(
             self.state,
             "spot",
-            "!ticker@arr",
+            spot_stream,
             spot_rows,
             FIXED_UTC,
             FIXED_MS,
             self.seen,
         )
-        self.assertEqual(changed, {"AAAUSDT", "SPOTUSDT"})
+        self.assertEqual(changed, {"AAAUSDT"})
+        book = {"e": "bookTicker", "u": 400900217, "E": FIXED_MS - 8,
+                "T": FIXED_MS - 9, "s": "AAAUSDT", "b": "12", "B": "5",
+                "a": "13", "A": "7"}
+        perp_stream, perp_rows = mf.parse_combined_message(json.dumps(
+            {"stream": "!bookTicker", "data": book}
+        ))
         changed = mf.merge_ticker_rows(
             self.state,
             "perp",
-            "!ticker@arr",
-            [{"s": "AAAUSDT", "b": "12", "a": "13", "E": FIXED_MS - 9}],
+            perp_stream,
+            perp_rows,
             FIXED_UTC,
             FIXED_MS,
             self.seen,
         )
         self.assertEqual(changed, {"AAAUSDT"})
         record = self.state["AAAUSDT"]
-        self.assertEqual((record["spot_bid"], record["perp_ask"]), ("10", "13"))
+        self.assertEqual(
+            (record["spot_bid"], record["spot_ask"],
+             record["perp_bid"], record["perp_ask"]),
+            ("10", "11", "12", "13"),
+        )
+        self.assertEqual(self.seen["AAAUSDT"],
+                         {"spot": FIXED_MS - 5, "perp": FIXED_MS - 9})
         self.assertEqual(
             record["basis_gap_pct"],
             "9.0909090909090909090909090909090909090909090909091",
         )
         self.assertEqual(record["freshness_ms"], "9")
 
-    def test_mini_ticker_is_not_mislabeled_as_book_or_one_minute_volume(self):
-        before = json.loads(json.dumps(self.state))
-        changed = mf.merge_ticker_rows(
-            self.state,
-            "spot",
-            "!miniTicker@arr",
-            [{"s": "AAAUSDT", "c": "10", "q": "999", "E": FIXED_MS}],
-            FIXED_UTC,
-            FIXED_MS,
-            self.seen,
-        )
-        self.assertEqual(changed, set())
-        self.assertEqual(self.state, before)
-
-    def test_crossed_or_nonpositive_book_fails_closed(self):
+    def test_incomplete_or_crossed_book_fails_closed(self):
         changed = mf.merge_ticker_rows(
             self.state,
             "spot",
             "!ticker@arr",
-            [{"s": "AAAUSDT", "b": "3", "a": "2", "E": FIXED_MS}],
+            [{"s": "AAAUSDT", "b": "3", "B": "1", "E": FIXED_MS},
+             {"s": "SPOTUSDT", "b": "3", "B": "1", "a": "2", "A": "1",
+              "E": FIXED_MS}],
             FIXED_UTC,
             FIXED_MS,
             self.seen,
         )
-        self.assertEqual(changed, {"AAAUSDT"})
-        self.assertIsNone(self.state["AAAUSDT"]["spot_bid"])
-        self.assertIsNone(self.state["AAAUSDT"]["spot_ask"])
+        self.assertEqual(changed, {"AAAUSDT", "SPOTUSDT"})
+        for symbol in changed:
+            self.assertEqual(
+                (self.state[symbol]["spot_bid"], self.state[symbol]["spot_ask"]),
+                (None, None),
+            )
 
 
 class SubscriptionTests(unittest.TestCase):
@@ -398,9 +403,13 @@ class SubscriptionTests(unittest.TestCase):
         }
         urls = mf.websocket_urls(state)
         self.assertEqual(len(urls["spot"]), 1)
-        self.assertEqual(len(urls["perp"]), 3)
+        self.assertEqual(len(urls["perp"]), 4)
+        self.assertEqual(urls["spot"][0], mf.SPOT_WS_URL)
+        self.assertEqual(urls["perp"][0], mf.FAPI_WS_URL)
+        self.assertNotIn("!ticker@arr", "".join(urls["perp"]))
+        self.assertNotIn("!miniTicker@arr", "".join(urls["perp"]))
         subscribed_klines = []
-        for url in urls["perp"]:
+        for url in urls["perp"][1:]:
             streams = url.split("?streams=", 1)[1].split("/")
             self.assertLessEqual(len(streams), mf.MAX_STREAMS_PER_CONNECTION)
             subscribed_klines.extend(
@@ -521,9 +530,9 @@ class RollingWindowTests(unittest.TestCase):
                 windows["AAAUSDT"]["closed_1m"],
             )
         urls = mf.websocket_urls(self.state)
-        self.assertTrue(any("/aaausdt@kline_1m" in url for url in urls["perp"]))
-        self.assertFalse(any("/aaausdt@kline_1m" in url for url in urls["spot"]))
-        self.assertTrue(any("/spotusdt@kline_1m" in url for url in urls["spot"]))
+        self.assertTrue(any("aaausdt@kline_1m" in url for url in urls["perp"]))
+        self.assertFalse(any("aaausdt@kline_1m" in url for url in urls["spot"]))
+        self.assertTrue(any("spotusdt@kline_1m" in url for url in urls["spot"]))
         self.assertTrue(mf.argument_parser().parse_args(["--serve"]).serve)
 
     def test_restart_filters_stale_windows_and_snapshot_reports_window_age(self):
@@ -691,52 +700,37 @@ class ReconnectTests(unittest.TestCase):
         self.assertTrue(closing.closed)
         self.assertTrue(final.closed)
 
-    def test_never_connected_shard_counts_failures_and_stays_broken(self):
+    def test_connection_truth_reports_ticker_silence_and_shard_failures(self):
         with tempfile.TemporaryDirectory() as raw:
-            feed = mf.MarketFeed(
-                Path(raw) / "feed.json",
-                Path(raw) / "STOP",
-                serve=True,
-                window=3,
-                ms_fn=lambda: FIXED_MS,
+            feed = mf.MarketFeed(Path(raw) / "feed.json", Path(raw) / "STOP",
+                serve=True, window=3, ms_fn=lambda: FIXED_MS,
             )
-            urls = {"spot": [mf.SPOT_WS_URL], "perp": [mf.FAPI_WS_URL]}
+            urls = mf.websocket_urls({"AAAUSDT": mf.empty_record(FIXED_UTC, "both")})
             feed._reset_connections(urls)
-
-            stopped = {"value": False}
-
-            def on_attempt():
+            self.assertEqual(set(feed.connections), {"spot", "perp"})
+            for venue in feed.connections:
+                ticker = feed.connections[venue]["ticker"]
+                self.assertEqual((ticker["status"], ticker["attempts"],
+                                  ticker["successful_handshakes"],
+                                  ticker["last_message_ms"]), ("broken", 0, 0, None))
+                feed._record_connection_event("attempt", venue, -1)
+                feed._record_connection_event("connected", venue, -1)
+            old_ms = FIXED_MS - mf.TICKER_STALE_MS - 1
+            feed._record_connection_event("message", "spot", -1, old_ms)
+            for unused in range(3):
                 feed._record_connection_event("attempt", "perp", 0)
-
-            def on_failure():
                 feed._record_connection_event("handshake_failed", "perp", 0)
-                if feed.connections["perp"]["handshake_failures"] == 3:
-                    stopped["value"] = True
-
-            def fail_connect(url):
-                self.assertEqual(url, mf.FAPI_WS_URL)
-                raise OSError("injected handshake failure")
-
-            mf.run_reconnect_loop(
-                mf.FAPI_WS_URL,
-                lambda text: None,
-                connector=fail_connect,
-                stop_requested=lambda: stopped["value"],
-                wait_fn=lambda delay: False,
-                on_attempt=on_attempt,
-                on_connect_failure=on_failure,
-            )
-            payload = mf.feed_snapshot_payload(
-                {}, {}, 3, FIXED_MS, feed.connections
-            )
-        venue = payload["connections"]["perp"]
-        shard = venue["shards"][0]
-        self.assertEqual(venue["status"], "broken")
-        self.assertEqual(venue["successful_handshakes"], 0)
-        self.assertEqual(venue["handshake_failures"], 3)
-        self.assertEqual(venue["reconnects"], 2)
-        self.assertEqual(shard["handshake_failures"], 3)
-        self.assertEqual(shard["reconnects"], 2)
+            payload = mf.feed_snapshot_payload({}, {}, 3, FIXED_MS, feed.connections)
+        for venue in payload["connections"].values():
+            self.assertEqual((venue["ticker"]["status"], venue["ticker"]["attempts"],
+                venue["ticker"]["successful_handshakes"], venue["status"]),
+                ("stale", 1, 1, "degraded"))
+        self.assertEqual(payload["connections"]["spot"]["ticker"]["last_message_ms"],
+                         str(old_ms))
+        perp = payload["connections"]["perp"]
+        self.assertEqual((perp["handshake_failures"], perp["reconnects"]), (3, 2))
+        self.assertEqual((perp["shards"][0]["handshake_failures"],
+                          perp["shards"][0]["reconnects"]), (3, 2))
 
     def test_socket_timeout_checks_stop_without_reconnect(self):
         stopped = {"value": False}
