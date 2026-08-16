@@ -872,7 +872,7 @@ class MachineCase(unittest.TestCase):
         buffer = io.StringIO()
         kwargs = {"sleep": lambda seconds: None,
                   "now_ms": lambda: now}
-        if handler is bp.cmd_open:
+        if handler in (bp.cmd_open, bp.cmd_add):
             kwargs["proposal_id"] = PROPOSAL_ID \
                 if proposal_id is _AUTO_PROPOSAL else proposal_id
         with redirect_stdout(buffer):
@@ -2661,6 +2661,488 @@ class VersionTwoPersistenceTests(unittest.TestCase):
                     orphan_dir, self.CONFIG_SNAPSHOT)
 
 
+class PositionAddCommandTests(MachineCase):
+    BASE_MS = 1755000100000
+    ADD_CONFIG = {
+        "symbol": SYMBOL,
+        "direction": bp.V2_DIRECTION,
+        "schedule": [
+            {"ordinal": 1, "entry_gap_pct": "0.1",
+             "quote_cap": "6"},
+            {"ordinal": 2, "entry_gap_pct": "0.15",
+             "quote_cap": "8"},
+            {"ordinal": 3, "entry_gap_pct": "0.18",
+             "quote_cap": "8"},
+        ],
+        "caps": {"stack_quote": "30", "entry_quote": "8"},
+        "venue": {
+            "spot": "BINANCE_SPOT",
+            "futures": "BINANCE_USDM",
+            "base_asset": "BTC",
+            "quote_asset": "USDT",
+        },
+    }
+
+    def current(self):
+        return bp.load_position(self.dir)
+
+    def append(self, payload, now=None):
+        position = self.current()
+        length = 0 if position is None else len(position["ledger"])
+        if now is None:
+            return bp.append_v2_event(self.dir, payload, length)
+        with mock.patch.object(bp, "default_now_ms", return_value=now):
+            return bp.append_v2_event(self.dir, payload, length)
+
+    def flat_facts(self):
+        return {
+            "futures_position_quantity": "0",
+            "spot_sellable_base_quantity": "0",
+            "standard_open_order_count": 0,
+            "algorithmic_open_order_count": 0,
+            "own_orders_terminal": True,
+            "positions_digest": "1" * 64,
+            "open_orders_digest": "2" * 64,
+            "own_orders_digest": "3" * 64,
+        }
+
+    def seed_event(self, quantity="0.05", quote="5"):
+        dislocation = bp.new_v2_dislocation_event(
+            "seed:1", self.BASE_MS - 10,
+            "0.2", "0.1", "0.0001", 28800000)
+        return bp.new_v2_rung_filled_event(1, {
+            "spot": {
+                "stage": bp.ENTER_SPOT,
+                "market": "BINANCE_SPOT",
+                "client_order_id": "seed-spot",
+                "exchange_order_id": "seed-exchange-spot",
+                "terminal_status": "FILLED",
+                "executed_quantity": quantity,
+                "executed_quote": quote,
+                "fee_by_asset": {},
+            },
+            "short": {
+                "stage": bp.ENTER_SHORT,
+                "market": "BINANCE_USDM",
+                "client_order_id": "seed-short",
+                "exchange_order_id": "seed-exchange-short",
+                "terminal_status": "FILLED",
+                "executed_quantity": quantity,
+                "executed_quote": quote,
+                "fee_by_asset": {},
+            },
+        }, dislocation, self.BASE_MS)
+
+    def initialize_open(self, seed_quantity="0.05"):
+        bp.initialize_v2_position(self.dir, self.ADD_CONFIG)
+        self.append(bp.new_v2_receipt_observed_event(
+            "add-flat-initial", "FLAT", self.BASE_MS - 3,
+            "private-read-bundle", self.flat_facts()))
+        self.append(
+            bp.new_v2_flat_proved_event("add-flat-initial"),
+            now=self.BASE_MS - 2)
+        self.append(self.seed_event(quantity=seed_quantity))
+        return bp.derive_v2_state(self.current())
+
+    def reconcile(self, reconcile_id):
+        position = self.current()
+        derived = bp.derive_v2_state(position)
+        own_orders = []
+        for event in position["ledger"]:
+            if event["event_type"] != "RungFilled":
+                continue
+            for role in ("spot", "short"):
+                leg = event["legs"][role]
+                own_orders.append({
+                    "client_order_id": leg["client_order_id"],
+                    "market": leg["market"],
+                    "status": leg["terminal_status"],
+                    "executed_quantity": leg["executed_quantity"],
+                })
+        spot = derived["remaining_spot_quantity"]
+        short = derived["remaining_short_quantity"]
+        observed = position["ledger"][-1]["cut_ms"] + 1
+        observation = bp.new_v2_reconcile_observed_event(
+            reconcile_id, observed, "private-add-read",
+            baseline={
+                "spot_base_quantity": "0",
+                "futures_position_quantity": "0",
+            },
+            positions={
+                "spot_base_quantity": spot,
+                "futures_position_quantity": "-" + short
+                if short != "0" else "0",
+            },
+            open_orders={
+                "spot_standard_client_order_ids": [],
+                "spot_algorithmic_client_order_ids": [],
+                "futures_standard_client_order_ids": [],
+                "futures_algorithmic_client_order_ids": [],
+            },
+            own_orders=own_orders,
+            balances={
+                "spot_base_free_quantity": spot,
+                "spot_base_locked_quantity": "0",
+                "spot_quote_free_quantity": "1000",
+                "futures_wallet_balance": "1000",
+            })
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=observed):
+            return bp.derive_resume(
+                position, observation, receipt_dir=self.dir)
+
+    def add_spec(self, order_offset, spot_quantity="0.079",
+                 base_fee="0.001", short_quantity="0.078",
+                 spot_quote="7.9", short_quote="7.8156"):
+        spec = happy_spec()
+        derived = bp.derive_v2_state(self.current())
+        spec["spot_account"]["balances"][1]["free"] = derived[
+            "remaining_spot_quantity"]
+        remaining_short = derived["remaining_short_quantity"]
+        spec["position"] = [{
+            "symbol": SYMBOL,
+            "positionAmt": "-" + remaining_short
+            if remaining_short != "0" else "0",
+        }]
+        spec["legs"]["enter_spot"] = {
+            "submit": ("ok", {"fills": [{
+                "qty": spot_quantity,
+                "commission": base_fee,
+                "commissionAsset": "BTC",
+            }]}),
+            "query": [term_spot(
+                "FILLED", spot_quantity, spot_quote,
+                700000 + order_offset)],
+        }
+        spec["legs"]["enter_short"] = {
+            "submit": ("ok", {}),
+            "query": [term_usdm(
+                "FILLED", short_quantity, short_quote,
+                800000 + order_offset)],
+        }
+        return spec
+
+    def run_add(self, proposal_id, run_id, spec, now=None):
+        if now is None:
+            position = self.current()
+            now = self.BASE_MS if position is None else \
+                position["ledger"][-1]["cut_ms"] + 1
+        transport = spec if callable(spec) else ScriptedTransport(spec)
+        cfg = dataclasses.replace(self.cfg, run_id=run_id)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = bp.cmd_add(
+                cfg, transport, sleep=lambda seconds: None,
+                now_ms=lambda: now, proposal_id=proposal_id)
+        return code, transport, output.getvalue()
+
+    def reduce_top(self, receipt_id, ordinal, quantity):
+        observed = self.current()["ledger"][-1]["cut_ms"] + 1
+        self.append(bp.new_v2_receipt_observed_event(
+            receipt_id, "REDUCTION", observed,
+            "own-reduce-receipt", {
+                "ordinal": ordinal,
+                "spot_quantity": quantity,
+                "short_quantity": quantity,
+            }))
+        return self.append(bp.new_v2_rung_reduced_event(
+            ordinal, [receipt_id], {
+                "spot_quantity": quantity,
+                "short_quantity": quantity,
+            }))
+
+    def prove_final_flat(self):
+        self.reconcile("add-reconcile-final-flat")
+        observed = self.current()["ledger"][-1]["cut_ms"] + 1
+        self.append(bp.new_v2_receipt_observed_event(
+            "add-flat-final", "FLAT", observed,
+            "private-read-bundle", self.flat_facts()))
+        return self.append(
+            bp.new_v2_flat_proved_event("add-flat-final"),
+            now=observed + 1)
+
+    def test_build04_open_add_add_reduce_flat_offline_walk(self):
+        opened = self.initialize_open()
+        self.assertEqual(opened["top_state"], bp.ST_OPEN)
+        self.assertEqual([row["ordinal"] for row in opened["rungs"]], [1])
+        before_two = self.reconcile("add-reconcile-before-two")
+        self.assertEqual(before_two["top_state"], bp.ST_OPEN)
+        self.assertIn(
+            {"event_type": "AddIntent", "ordinal": 2},
+            before_two["legal_next_transitions"])
+
+        code, second, output = self.run_add(
+            PROPOSAL_ID, "add02", self.add_spec(2))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(post_stages(second),
+                         ["enter_spot", "enter_short"])
+        pending_two = bp.derive_v2_state(self.current())
+        self.assertEqual([row["ordinal"] for row in pending_two["rungs"]],
+                         [1, 2])
+        self.assertEqual(pending_two["top_state"], "FROZEN")
+        self.assertIn("RECONCILIATION_REQUIRED",
+                      pending_two["freeze_reasons"])
+        self.assertEqual(
+            self.reconcile("add-reconcile-after-two")["top_state"],
+            bp.ST_OPEN)
+
+        third_id = "abc124"
+        self.write_proposal(
+            proposal_payload(third_id), proposal_id=third_id)
+        code, third, output = self.run_add(
+            third_id, "add03", self.add_spec(3))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(post_stages(third),
+                         ["enter_spot", "enter_short"])
+        pending_three = bp.derive_v2_state(self.current())
+        self.assertEqual(
+            [row["ordinal"] for row in pending_three["rungs"]],
+            [1, 2, 3])
+        self.assertEqual(pending_three["top_state"], "FROZEN")
+        open_three = self.reconcile("add-reconcile-after-three")
+        self.assertEqual(open_three["top_state"], bp.ST_OPEN)
+
+        reduced_three = bp.derive_v2_state(
+            self.reduce_top("add-reduce-three", 3, "0.078"))
+        self.assertEqual(reduced_three["top_state"], "FROZEN")
+        self.assertEqual(reduced_three["remaining_spot_quantity"], "0.128")
+        self.assertEqual(reduced_three["rungs"][2]["status"], bp.ST_CLOSED)
+        reduced_two = bp.derive_v2_state(
+            self.reduce_top("add-reduce-two", 2, "0.078"))
+        self.assertEqual(reduced_two["top_state"], "FROZEN")
+        self.assertEqual(reduced_two["remaining_spot_quantity"], "0.05")
+        self.assertEqual(reduced_two["rungs"][1]["status"], bp.ST_CLOSED)
+        reduced = self.reduce_top("add-reduce-one", 1, "0.05")
+        reduced_one = bp.derive_v2_state(reduced)
+        self.assertEqual(reduced_one["top_state"], "FROZEN")
+        self.assertEqual(reduced_one["remaining_spot_quantity"], "0")
+        self.assertEqual(reduced_one["remaining_short_quantity"], "0")
+        closed = bp.derive_v2_state(self.prove_final_flat())
+        self.assertEqual(closed["top_state"], bp.ST_CLOSED)
+        self.assertEqual(
+            [row["status"] for row in closed["rungs"]],
+            [bp.ST_CLOSED, bp.ST_CLOSED, bp.ST_CLOSED])
+        self.assertEqual(closed["remaining_spot_quantity"], "0")
+        self.assertEqual(closed["remaining_short_quantity"], "0")
+
+    def test_build04_stop_refuses_add_before_proposal_or_transport(self):
+        Path(self.dir, bp.STOP_FILE).write_text(
+            "owner stop\n", encoding="utf-8")
+        transport = ScriptedTransport(happy_spec())
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "addstop", transport)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
+        self.assertIn("STOP file present", output)
+        self.assertEqual(transport.calls, [])
+
+    def test_build04_dust_standing_refuses_add_without_transport(self):
+        quantity = (
+            "0.0000000000000000000000000001999999999999999999999999999")
+        self.initialize_open(seed_quantity=quantity)
+        self.reduce_top("add-dust-reduce", 1, "1e-28")
+        derived = bp.derive_v2_state(self.current())
+        self.assertIn(bp.V2_DUST_STANDING, derived["freeze_reasons"])
+        transport = ScriptedTransport(happy_spec())
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "adddust", transport)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
+        self.assertIn(bp.V2_DUST_STANDING, output)
+        self.assertEqual(transport.calls, [])
+
+    def test_build04_stale_reconcile_refuses_before_any_intent(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-stale")
+        reconcile = self.current()["ledger"][-1]
+        stale_now = reconcile["observed_at_ms"] \
+            + bp.V2_RECONCILE_READ_MAX_AGE_MS + 1
+        transport = ScriptedTransport(happy_spec())
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "addstale", transport, now=stale_now)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
+        self.assertIn("STALE_RECONCILE_READ", output)
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(bp._active_v2_add_receipt(
+            self.dir, self.current()))
+
+    def test_build04_reconcile_that_ages_during_reads_refuses_before_intent(
+            self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-ages-during-reads")
+        reconcile = self.current()["ledger"][-1]
+        command_now = reconcile["observed_at_ms"] + 1
+        intent_now = reconcile["observed_at_ms"] \
+            + bp.V2_RECONCILE_READ_MAX_AGE_MS + 1
+        times = iter((command_now, intent_now))
+        transport = ScriptedTransport(self.add_spec(11))
+        cfg = dataclasses.replace(self.cfg, run_id="addage")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = bp.cmd_add(
+                cfg, transport, sleep=lambda seconds: None,
+                now_ms=lambda: next(times), proposal_id=PROPOSAL_ID)
+        self.assertEqual(code, bp.EXIT_CODE["REJECTED_BEFORE_ENTRY"])
+        self.assertIn("STALE_RECONCILE_READ", output.getvalue())
+        self.assertEqual(transport.posts, [])
+        self.assertEqual(
+            self.current()["ledger"][-1]["event_type"],
+            "ReconcileObserved")
+
+    def test_build04_cap_comes_from_frozen_schedule_not_proposal(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-cap")
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "addcap", self.add_spec(4))
+        self.assertEqual(code, 0, output)
+        spot_post = transport.posts[0][1]
+        self.assertEqual(Decimal(spot_post["quoteOrderQty"]), Decimal("8"))
+        self.assertNotEqual(
+            Decimal(spot_post["quoteOrderQty"]),
+            Decimal("9.9198"))
+        receipt = self.receipt("addcap")
+        self.assertEqual(
+            Decimal(receipt["add_transition"]["effective_cap_quote"]),
+            Decimal("8"))
+        self.assertEqual(
+            bp.derive_v2_state(self.current())["rungs"][1][
+                "effective_cap_quote"], "8")
+
+    def test_build04_each_intent_is_in_ledger_before_its_post(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-intent-order")
+        observed = []
+
+        def inspect_ledger_before_post(params):
+            position = self.current()
+            derived = bp.derive_v2_state(position)
+            active = derived["active_transition"]
+            observed.append({
+                "posted": params["newClientOrderId"],
+                "tail": position["ledger"][-1]["event_type"],
+                "top_state": derived["top_state"],
+                "spot_client": active["spot_intent"][
+                    "newClientOrderId"],
+                "short_client": None if active["short_intent"] is None
+                else active["short_intent"]["newClientOrderId"],
+            })
+
+        transport = ScriptedTransport(
+            self.add_spec(8), on_post=inspect_ledger_before_post)
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "addintent", transport)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([row["tail"] for row in observed],
+                         ["AddIntent", "AddHedgeIntent"])
+        self.assertEqual([row["top_state"] for row in observed],
+                         [bp.ST_ADDING, bp.ST_ADDING])
+        self.assertEqual(observed[0]["posted"],
+                         observed[0]["spot_client"])
+        self.assertIsNone(observed[0]["short_client"])
+        self.assertEqual(observed[1]["posted"],
+                         observed[1]["short_client"])
+
+    def test_build04_terminal_fill_cannot_exceed_persisted_intent(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-overfill")
+        code, transport, output = self.run_add(
+            PROPOSAL_ID, "addover", self.add_spec(
+                12, short_quantity="0.079"))
+        self.assertEqual(code, bp.EXIT_CODE["UNKNOWN"])
+        self.assertIn("ledger commit is unproved", output)
+        self.assertEqual(post_stages(transport),
+                         ["enter_spot", "enter_short"])
+        position = self.current()
+        self.assertEqual(position["ledger"][-1]["event_type"],
+                         "AddHedgeIntent")
+        self.assertEqual(bp.derive_v2_state(position)["top_state"],
+                         bp.ST_ADDING)
+
+    def test_build04_exact_add_retry_never_executes_twice(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-idempotent")
+        code, first, output = self.run_add(
+            PROPOSAL_ID, "addonce", self.add_spec(6))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(post_stages(first),
+                         ["enter_spot", "enter_short"])
+        self.reconcile("add-reconcile-idempotent-after")
+
+        retry = ScriptedTransport(self.add_spec(7))
+        code, retry, output = self.run_add(
+            PROPOSAL_ID, "addonce", retry)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
+        self.assertIn("already", output)
+        self.assertEqual(retry.calls, [])
+        self.assertEqual(
+            [row["ordinal"] for row in
+             bp.derive_v2_state(self.current())["rungs"]],
+            [1, 2])
+
+    def test_build04_crash_between_legs_resume_queries_without_post(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-before-crash")
+        spec = self.add_spec(5)
+
+        def stop_after_short_reaches_transport(params):
+            if params["newClientOrderId"].endswith("enter_short"):
+                raise RuntimeError("simulated process cut")
+
+        interrupted = ScriptedTransport(
+            spec, on_post=stop_after_short_reaches_transport)
+        with self.assertRaisesRegex(RuntimeError, "simulated process cut"):
+            self.run_add(PROPOSAL_ID, "addcrash", interrupted)
+        self.assertEqual(post_stages(interrupted), ["enter_spot"])
+        active = bp._active_v2_add_receipt(self.dir, self.current())
+        self.assertIsNotNone(active)
+        self.assertIn("short", active[1]["add_transition"]["intents"])
+
+        resume_transport = ScriptedTransport(spec)
+        code, resume_transport, output = self.run_cmd(
+            bp.cmd_resume, resume_transport, run_id="add-recover",
+            now=self.current()["ledger"][-1]["cut_ms"] + 2)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(resume_transport.posts, [])
+        pending = bp.derive_v2_state(self.current())
+        self.assertEqual([row["ordinal"] for row in pending["rungs"]],
+                         [1, 2])
+        self.assertEqual(pending["top_state"], "FROZEN")
+        reconciled = self.reconcile("add-reconcile-after-recovery")
+        self.assertEqual(reconciled["top_state"], bp.ST_OPEN)
+        repaired = self.receipt("addcrash")
+        self.assertEqual(repaired["add_transition"]["status"],
+                         "COMMITTED")
+        self.assertEqual(repaired["verdict"], "OPEN")
+
+    def test_build04_ledger_intent_blocks_retry_if_receipt_is_missing(self):
+        self.initialize_open()
+        self.reconcile("add-reconcile-ledger-guard")
+        spec = self.add_spec(9)
+
+        def stop_at_spot_transport(_params):
+            raise RuntimeError("simulated early process cut")
+
+        interrupted = ScriptedTransport(
+            spec, on_post=stop_at_spot_transport)
+        with self.assertRaisesRegex(
+                RuntimeError, "simulated early process cut"):
+            self.run_add(PROPOSAL_ID, "addlost", interrupted)
+        derived = bp.derive_v2_state(self.current())
+        self.assertEqual(derived["top_state"], bp.ST_ADDING)
+        self.assertEqual(
+            self.current()["ledger"][-1]["event_type"], "AddIntent")
+        Path(self.dir, "basis-position-addlost.json").unlink()
+
+        next_id = "abc125"
+        self.write_proposal(
+            proposal_payload(next_id), proposal_id=next_id)
+        retry = ScriptedTransport(spec)
+        code, retry, output = self.run_add(
+            next_id, "addnext", retry,
+            now=self.current()["ledger"][-1]["cut_ms"] + 1)
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
+        self.assertIn("current state is ADDING", output)
+        self.assertEqual(retry.calls, [])
+
+
 class RatesTests(MachineCase):
     def test_rates_written_atomically_with_rate_values(self):
         code, transport, out = self.run_cmd(bp.cmd_rates, happy_spec())
@@ -2693,6 +3175,18 @@ class RatesTests(MachineCase):
 
 
 class OpenTests(MachineCase):
+    def test_build04_cmd_add_refuses_v1_without_changing_position(self):
+        self.open_position()
+        state_path = Path(self.dir, bp.STATE_FILE)
+        before = state_path.read_bytes()
+        transport = ScriptedTransport(happy_spec())
+        code, transport, output = self.run_cmd(
+            bp.cmd_add, transport, run_id="add-v1")
+        self.assertEqual(code, bp.EXIT_CODE["BLOCKED"])
+        self.assertIn("version-1 is unchanged", output)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(state_path.read_bytes(), before)
+
     def test_open_without_proposal_refuses_before_any_transport(self):
         transport = ScriptedTransport(happy_spec())
         code, transport, out = self.run_cmd(
