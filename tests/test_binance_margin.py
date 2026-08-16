@@ -72,6 +72,18 @@ class MarginAdapterTests(unittest.TestCase):
         with self.assertRaises(http.AdapterRefusal):
             margin.build_borrow("BTC", Decimal("1"), "intent-4", SHA)
 
+    def test_submit_refuses_direct_over_cap_before_effects(self):
+        amount = margin_ops.PRINCIPAL_CEILING + Decimal("0.1")
+        operation = margin.build_borrow(
+            "USDT", margin_ops.PRINCIPAL_CEILING, "intent-cap", SHA)
+        params = (("asset", "USDT"), ("amount", str(amount)), ("type", "BORROW"))
+        operation = replace(operation, amount=amount, principal=amount,
+                            intent=replace(operation.intent, params=params))
+        feed, writes = Feed(ok({"tranId": 7})), []
+        with self.assertRaises(http.AdapterRefusal):
+            margin.submit_once(feed, BASE, operation, writes.append)
+        self.assertEqual((writes, feed.calls), ([], []))
+
     def test_history_direction_comes_from_the_request(self):
         for direction in ("BORROW", "REPAY"):
             with self.subTest(direction=direction):
@@ -132,6 +144,12 @@ class MarginAdapterTests(unittest.TestCase):
         self.assertEqual(margin.read_liability(Feed(ok(duplicate)), BASE, "USDT").kind,
                          "unclear")
 
+    def test_liability_extreme_exponent_is_unclear(self):
+        payload = {"userAssets": [
+            {"asset": "USDT", "borrowed": "1e1000000", "interest": "0"}]}
+        result = margin.read_liability(Feed(ok(payload)), BASE, "USDT")
+        self.assertEqual((result.kind, result.value), ("unclear", None))
+
     def test_submit_writes_first_and_posts_once_with_integer_identity(self):
         operation = margin.build_borrow("USDT", Decimal("2.5"), "intent-5", SHA)
         events = []
@@ -152,8 +170,7 @@ class MarginAdapterTests(unittest.TestCase):
     def test_submit_keeps_unclear_identity_and_writer_failure_safe(self):
         operation = margin.build_borrow("USDT", Decimal("1"), "intent-6", SHA)
         for payload in ({"tranId": "7"}, {"txId": True},
-                        {"tranId": 7, "txId": 7},
-                        {"tranId": 7, "detail": {"txId": 8}}):
+                        {"tranId": 7, "txId": 7}):
             with self.subTest(payload=payload):
                 feed = Feed(ok(payload))
                 result = margin.submit_once(feed, BASE, operation, lambda _intent: None)
@@ -165,6 +182,13 @@ class MarginAdapterTests(unittest.TestCase):
                 feed, BASE, operation,
                 lambda _intent: (_ for _ in ()).throw(RuntimeError("write unavailable")))
         self.assertEqual(feed.calls, [])
+
+    def test_submit_keeps_nested_only_identity_unclear(self):
+        operation = margin.build_borrow("USDT", Decimal("1"), "intent-nested", SHA)
+        response = ok({"detail": {"txId": 7}})
+        result = margin.submit_once(Feed(response), BASE, operation, lambda _intent: None)
+        self.assertEqual((result.kind, result.tx_id), ("unclear", None))
+        self.assertIs(result.error, response)
 
     def test_confirmation_binds_history_split_and_liability_movement(self):
         zero = margin.Liability("USDT", Decimal("0"), Decimal("0"), Decimal("0"))

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass as _dataclass
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation
 import re as _re
 import time as _time
 from typing import Callable as _Callable, Literal as _Literal
@@ -69,7 +69,8 @@ def _money(value: object, *, positive: bool = False, input_only: bool = False) -
         amount = Decimal(value)
     except (InvalidOperation, ValueError):
         raise _http.AdapterRefusal("money value is unreadable") from None
-    if not amount.is_finite() or amount < _ZERO or positive and amount <= _ZERO: raise _http.AdapterRefusal("money value is outside its bounds")
+    with _http.exact_guard():
+        if not amount.is_finite() or amount < _ZERO or positive and amount <= _ZERO: raise _http.AdapterRefusal("money value is outside its bounds")
     return amount
 
 
@@ -79,8 +80,7 @@ def _wire(value: Decimal) -> str:
 
 
 def _sum(left: Decimal, right: Decimal) -> Decimal:
-    with localcontext() as context:
-        context.prec = max(1, max(left.adjusted(), right.adjusted()) - min(left.as_tuple().exponent, right.as_tuple().exponent) + 2); return left + right
+    with _http.exact_guard(): return left + right
 
 
 def _error(note: str) -> _http.HttpResult: return _http.HttpResult("unclear", None, None, note)
@@ -92,54 +92,47 @@ def _schema(note: str) -> _http.ReadResult: return _http.ReadResult("unclear", N
 def _read_error(result: _http.HttpResult) -> _http.ReadResult: return _http.ReadResult(result.kind, None, result)
 
 
-def _tx_ids(value: object) -> list[object]:
-    found = []
-    if isinstance(value, dict):
-        for name, item in value.items():
-            if name in ("txId", "tranId"): found.append(item)
-            if isinstance(item, (dict, list, tuple)): found.extend(_tx_ids(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value: found.extend(_tx_ids(item))
-    return found
-
-
-def _identity(identity: str, git_sha: str) -> None:
-    if _IDENTITY.fullmatch(identity or "") is None or _SHA.fullmatch(git_sha or "") is None: raise _http.AdapterRefusal("mutation identity is invalid")
+def _identity(identity: object, git_sha: object) -> None:
+    if not isinstance(identity, str) or not isinstance(git_sha, str) or _IDENTITY.fullmatch(identity) is None or _SHA.fullmatch(git_sha) is None: raise _http.AdapterRefusal("mutation identity is invalid")
 
 
 def _valid_liability(value: object) -> Liability:
     if not isinstance(value, Liability): raise _http.AdapterRefusal("liability is required")
     _asset(value.asset); principal = _money(value.principal, input_only=True)
     interest = _money(value.interest, input_only=True); total = _money(value.total, input_only=True)
-    if _sum(principal, interest) != total: raise _http.AdapterRefusal("liability total is not exact")
+    with _http.exact_guard():
+        if principal + interest != total: raise _http.AdapterRefusal("liability total is not exact")
     return value
 
 
+def _validated_operation(direction: str, asset: object, amount: object, principal: object,
+                         interest: object, identity: object, git_sha: object) -> MarginOperation:
+    if not isinstance(direction, str) or direction not in _DIRECTIONS: raise _http.AdapterRefusal("margin operation is invalid")
+    asset = _asset(asset, allowed=True); _identity(identity, git_sha)
+    with _http.exact_guard():
+        amount = _money(amount, positive=True, input_only=True); principal = _money(principal, positive=direction == "BORROW", input_only=True); interest = _money(interest, input_only=True)
+        if direction == "BORROW" and principal > _PRINCIPAL_CEILING: raise _http.AdapterRefusal("principal exceeds its owned ceiling")
+        split_ok = amount == principal and interest == _ZERO if direction == "BORROW" else amount == principal + interest
+    if not split_ok: raise _http.AdapterRefusal("margin operation facts do not agree")
+    params = (("asset", asset), ("amount", _wire(amount)), ("type", direction))
+    intent = _http.MutationIntent("BINANCE_MARGIN", direction, identity, git_sha, params)
+    return MarginOperation(intent, direction, asset, amount, principal, interest)
+
+
 def _operation(value: object) -> MarginOperation:
-    if not isinstance(value, MarginOperation) or value.direction not in _DIRECTIONS or not isinstance(value.intent, _http.MutationIntent): raise _http.AdapterRefusal("margin operation is invalid")
-    _asset(value.asset, allowed=True); _identity(value.intent.identity, value.intent.git_sha)
-    amount = _money(value.amount, positive=True, input_only=True); principal = _money(value.principal, positive=True, input_only=True); interest = _money(value.interest, input_only=True)
-    split_ok = amount == principal and interest == _ZERO if value.direction == "BORROW" else amount == _sum(principal, interest)
-    params = (("asset", value.asset), ("amount", _wire(amount)), ("type", value.direction))
-    if not split_ok or value.intent != _http.MutationIntent("BINANCE_MARGIN", value.direction, value.intent.identity, value.intent.git_sha, params): raise _http.AdapterRefusal("margin operation facts do not agree")
+    if not isinstance(value, MarginOperation) or not isinstance(value.intent, _http.MutationIntent): raise _http.AdapterRefusal("margin operation is invalid")
+    expected = _validated_operation(value.direction, value.asset, value.amount, value.principal, value.interest, value.intent.identity, value.intent.git_sha)
+    if value != expected: raise _http.AdapterRefusal("margin operation facts do not agree")
     return value
 
 
 def build_borrow(asset: str, principal: Decimal, intent_id: str, git_sha: str) -> MarginOperation:
-    asset = _asset(asset, allowed=True); principal = _money(principal, positive=True, input_only=True); _identity(intent_id, git_sha)
-    if principal > _PRINCIPAL_CEILING: raise _http.AdapterRefusal("principal exceeds its owned ceiling")
-    params = (("asset", asset), ("amount", _wire(principal)), ("type", "BORROW"))
-    intent = _http.MutationIntent("BINANCE_MARGIN", "BORROW", intent_id, git_sha, params)
-    return MarginOperation(intent, "BORROW", asset, principal, principal, _ZERO)
+    return _validated_operation("BORROW", asset, principal, principal, _ZERO, intent_id, git_sha)
 
 
 def build_repay(liability: Liability, intent_id: str, git_sha: str) -> MarginOperation:
-    liability = _valid_liability(liability); _asset(liability.asset, allowed=True)
-    _identity(intent_id, git_sha); amount = _sum(liability.principal, liability.interest)
-    if amount <= _ZERO: raise _http.AdapterRefusal("repay liability is not positive")
-    params = (("asset", liability.asset), ("amount", _wire(amount)), ("type", "REPAY"))
-    intent = _http.MutationIntent("BINANCE_MARGIN", "REPAY", intent_id, git_sha, params)
-    return MarginOperation(intent, "REPAY", liability.asset, amount, liability.principal, liability.interest)
+    liability = _valid_liability(liability)
+    return _validated_operation("REPAY", liability.asset, liability.total, liability.principal, liability.interest, intent_id, git_sha)
 
 
 def _history_row(value: object, asset: str, direction: str) -> MarginHistoryRow:
@@ -223,9 +216,9 @@ def submit_once(transport: _http.Transport, base_url: str, operation: MarginOper
     except Exception: raise _http.IntentNotDurable("intent was not durably written") from None
     result = transport("POST", base_url, _PATH, operation.intent.params, True)
     if result.kind != "ok": return MarginSubmit(result.kind, None, result)
-    aliases = _tx_ids(result.payload)
+    aliases = [result.payload[name] for name in ("txId", "tranId") if isinstance(result.payload, dict) and name in result.payload]
     if len(aliases) != 1 or type(aliases[0]) is not int or aliases[0] <= 0:
-        error = _error("margin_submit_schema"); return MarginSubmit("unclear", None, error)
+        return MarginSubmit("unclear", None, result)
     return MarginSubmit("accepted", aliases[0], None)
 
 
@@ -238,19 +231,20 @@ def confirm(operation: MarginOperation, tx_id: int, history: MarginHistoryRow,
             return answer("unknown", "MARGIN_CONFIRMATION_MISMATCH")
         for value in (history.amount, history.principal, history.interest):
             _money(value, input_only=True)
-        facts = history.direction == operation.direction and history.tx_id == tx_id \
-            and history.asset == operation.asset == before.asset == after.asset \
-            and history.status == "CONFIRMED" and history.origin_type in _ORIGINS \
-            and history.amount == operation.amount and history.principal == operation.principal \
-            and history.interest == operation.interest
-        if operation.direction == "REPAY":
-            facts = facts and history.amount == _sum(history.principal, history.interest) \
-                and before.principal == operation.principal \
-                and before.interest == operation.interest and before.total == operation.amount
-            movement = after.principal == after.interest == after.total == _ZERO
-        else:
-            movement = after.principal == _sum(before.principal, operation.amount) \
-                and after.interest >= before.interest
+        with _http.exact_guard():
+            facts = history.direction == operation.direction and history.tx_id == tx_id \
+                and history.asset == operation.asset == before.asset == after.asset \
+                and history.status == "CONFIRMED" and history.origin_type in _ORIGINS \
+                and history.amount == operation.amount and history.principal == operation.principal \
+                and history.interest == operation.interest
+            if operation.direction == "REPAY":
+                facts = facts and history.amount == _sum(history.principal, history.interest) \
+                    and before.principal == operation.principal \
+                    and before.interest == operation.interest and before.total == operation.amount
+                movement = after.principal == after.interest == after.total == _ZERO
+            else:
+                movement = after.principal == _sum(before.principal, operation.amount) \
+                    and after.interest >= before.interest
         if not facts: return answer("unknown", "MARGIN_CONFIRMATION_MISMATCH")
         if not movement: return answer("unknown", "MARGIN_LIABILITY_MISMATCH")
         return answer("confirmed", operation.direction + "_CONFIRMED")
