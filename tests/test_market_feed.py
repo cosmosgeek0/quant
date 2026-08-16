@@ -7,8 +7,10 @@ import json
 import socket
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -646,6 +648,47 @@ class RestartTests(unittest.TestCase):
 
 
 class ReconnectTests(unittest.TestCase):
+    def test_bounded_queue_keeps_latest_book_and_reports_drops(self):
+        def reader(base, unused_path, unused_params):
+            symbol = (spot_info("AAAUSDT") if base == mf.SPOT_BASE_URL
+                      else perp_info("AAAUSDT"))
+            return {"symbols": [symbol]}
+
+        def flood(unused_url, on_text, **callbacks):
+            callbacks["on_attempt"]()
+            callbacks["on_connect"]()
+            for value in range(mf.EVENT_QUEUE_MAX + 2):
+                on_text(json.dumps({"stream": "!bookTicker", "data": {
+                    "s": "AAAUSDT", "b": str(value + 1), "a": str(value + 2),
+                    "T": FIXED_MS + value,
+                }}))
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            feed = mf.MarketFeed(root / "feed.json", root / "STOP", serve=True,
+                window=3, reader=reader, utc_fn=lambda: FIXED_UTC,
+                ms_fn=lambda: FIXED_MS + mf.EVENT_QUEUE_MAX + 2)
+            with mock.patch.object(mf, "run_reconnect_loop", side_effect=flood):
+                worker = threading.Thread(target=feed._worker,
+                    args=("perp", -1, mf.FAPI_WS_URL, 1, threading.Event()),
+                    daemon=True)
+                worker.start()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual((feed.events.qsize(), feed.events.maxsize),
+                             (mf.EVENT_QUEUE_MAX, mf.EVENT_QUEUE_MAX))
+            feed._start_workers = lambda *unused: []
+            stats = feed.run(0.1)
+            payload = json.loads((root / "feed.json").read_text(encoding="utf-8"))
+        perp = payload["connections"]["perp"]
+        self.assertEqual((perp["dropped_frames"], perp["ticker"]["attempts"],
+                          perp["ticker"]["successful_handshakes"]), (2, 1, 1))
+        self.assertEqual(stats.websocket_messages, mf.EVENT_QUEUE_MAX)
+        self.assertEqual((payload["symbols"]["AAAUSDT"]["perp_bid"],
+                          payload["symbols"]["AAAUSDT"]["perp_ask"]),
+                         (str(mf.EVENT_QUEUE_MAX + 2),
+                          str(mf.EVENT_QUEUE_MAX + 3)))
+
     def test_exponential_reconnect_with_injected_clients(self):
         stopped = {"value": False}
         waits = []
