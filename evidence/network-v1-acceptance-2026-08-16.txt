@@ -1,0 +1,76 @@
+NETWORK V1 — NET-07 ACCEPTANCE TRANSCRIPT (sanitized rows) — 2026-08-16 22:33Z–23:03Z — box i-…63a9, integrator
+run 1 (ui/host/acceptance_network.sh 600, release ui 0cb4a73 / recorder bb222cc):
+== record ui_release=0cb4a7359c8ab314dddd97540529b39732d512a5
+== record recorder_release=bb222cc3694cce5675776693e3ab1fff028864b0 deployed_ui_release=0cb4a7359c8ab314dddd97540529b39732d512a5
+== record sha256 file=ui/network_api.py first16=db48b3754b13c376
+== record sha256 file=ui/network_evidence.py first16=6db787248885a3d3
+== record sha256 file=ui/network_health.py first16=9fe68422a42fad6f
+== record sha256 file=ui/network_probe_binance.py first16=9b99c2cfc7e68f2f
+== record sha256 file=ui/network_probe_cf.py first16=0d128d720fe65a9a
+== record sha256 file=ui/network_recorder.py first16=5391ff9394715d58
+== record sha256 file=ui/network_store.py first16=97564a20311f6298
+== record sha256 file=ui/serve.py first16=53eb9a9821e61ee8
+== baseline edge id=cf_connector health=Operational observed_at=2026-08-16T22:33:50.103Z
+== baseline edge id=connector_origin health=Operational observed_at=2026-08-16T22:33:50.103Z
+== baseline edge id=spot_rest health=Operational observed_at=2026-08-16T22:33:40.308Z
+== baseline edge id=spot_wss health=Operational observed_at=2026-08-16T22:33:50.103Z
+== baseline edge id=usdm_rest health=Operational observed_at=2026-08-16T22:33:40.308Z
+== baseline edge id=usdm_wss health=Operational observed_at=2026-08-16T22:33:50.103Z
+== baseline edge id=feed_machine health=Degraded observed_at=2026-08-16T22:33:50.103Z
+== baseline edge id=news_fetch health=Degraded observed_at=2026-08-16T22:32:18.956Z
+== baseline database bytes=2342912 samples=8257 events=116
+== baseline recorder utc=2026-08-16T22:33:51Z collector=running rss_kib=29468 cpu_usage_nsec=3783946000
+== stop result=PASS service=quant-ui-network utc=2026-08-16T22:33:51Z
+== stale result=FAIL timeout_s=90
+== start result=PASS service=quant-ui-network utc=2026-08-16T22:35:23Z rest_probes_total_start=2320
+== recovery poll elapsed_s=5 spot_rest=Operational usdm_rest=Operational probes_delta=2 scope=spot_plus_usdm
+== recovery result=PASS seconds=5 probes_delta=2 scope=spot_plus_usdm
+== recovery event id=121 edge=usdm_rest transition=Unknown → Operational reason=USD-M REST probe returned HTTP 200
+== recovery event id=122 edge=spot_wss transition=Unknown → Operational reason=Spot WSS feed is connected and current
+== recovery event id=123 edge=usdm_wss transition=Unknown → Operational reason=USD-M WSS feed is connected and current
+== recovery event id=124 edge=feed_machine transition=Unknown → Degraded reason=Machine median book age is above 5 seconds while t
+== recovery event id=125 edge=connector_origin transition=Unknown → Operational reason=Origin returned HTTP 200
+== recovery event id=126 edge=news_fetch transition=Unknown → Degraded reason=News reports 6 source errors
+== recovery transition=PASS
+== measure start utc=2026-08-16T22:35:29Z window_s=600 cpu_usage_nsec=276436000 db_bytes=2371584 samples=8265 events=126
+== measure cpu result=PASS elapsed_s=600 delta_nsec=2104978000 average_one_core_pct=0.350830 limit_pct=1
+== measure rss result=PASS end_kib=30252 limit_kib=61440 
+== measure database result=PASS end_bytes=2371584 delta_bytes=0 growth_bytes_per_hour=0.000 limit_bytes=104857600
+== measure rows samples_start=8265 samples_end=8550 samples_delta=285 events_start=126 events_end=127 events_delta=1
+== measure requests_api_network=SKIP reason=not_measurable_here
+== endpoint network result=PASS runs=10/10 max_bytes=19751 max_time_total_s=0.015422 p95_proxy_s=0.015422 proxy=max_of_10
+== endpoint history result=PASS runs=10/10 max_bytes=2598 max_time_total_s=0.090896 p95_proxy_s=0.090896 proxy=max_of_10
+== endpoint events result=PASS runs=10/10 max_bytes=30008 max_time_total_s=0.058590 p95_proxy_s=0.058590 proxy=max_of_10
+== identifiers term=connectorId count=0 bodies=3/3 result=PASS
+== identifiers term=receipt_path count=0 bodies=3/3 result=PASS
+== identifiers term=job_id count=0 bodies=3/3 result=PASS
+== identifiers term=signature count=0 bodies=3/3 result=PASS
+== identifiers term=secret count=7 bodies=3/3 result=MARKED note=aws_secrets_labels_may_match
+== ACCEPTANCE FAIL stale_timeout
+== final utc=2026-08-16T22:45:36Z
+
+run 2 (stop → Stale → start → recovery with the full freshness window, release e64ef38, after the quorum change):
+== before 22:57:16 running cf_connector=Operational origin=Operational spot_rest=Operational spot_wss=Operational usdm_rest=Operational usdm_wss=Operational feed_machine=Degraded news_fetch=Degraded | all_stale=False | spot_q=2
+== stopped 22:57:16
+== stale 16s stopped cf_connector=Operational origin=Operational spot_rest=Operational spot_wss=Operational usdm_rest=Operational usdm_wss=Operational feed_machine=Degraded news_fetch=Degraded | all_stale=False | spot_q=2
+== stale 46s stopped cf_connector=Stale origin=Stale spot_rest=Stale spot_wss=Stale usdm_rest=Stale usdm_wss=Stale feed_machine=Stale news_fetch=Degraded | all_stale=False | spot_q=2
+== stale 304s stopped cf_connector=Stale origin=Stale spot_rest=Stale spot_wss=Stale usdm_rest=Stale usdm_wss=Stale feed_machine=Stale news_fetch=Degraded | all_stale=False | spot_q=2
+== stale 319s stopped cf_connector=Stale origin=Stale spot_rest=Stale spot_wss=Stale usdm_rest=Stale usdm_wss=Stale feed_machine=Stale news_fetch=Stale | all_stale=True | spot_q=2
+== stale_result yes elapsed=319s
+== started 23:02:35
+== recover 5s running cf_connector=Unknown origin=Operational spot_rest=Degraded spot_wss=Operational usdm_rest=Degraded usdm_wss=Operational feed_machine=Degraded news_fetch=Degraded | all_stale=False | spot_q=1
+== recover 20s running cf_connector=Operational origin=Operational spot_rest=Operational spot_wss=Operational usdm_rest=Operational usdm_wss=Operational feed_machine=Degraded news_fetch=Degraded | all_stale=False | spot_q=2
+== recovery_elapsed 20s
+== event 141 None collector stopped | collector stopped
+== event 142 None collector started | collector started
+== event 143 spot_rest Unknown → Degraded | Spot REST is recovering 1/2
+== event 144 usdm_rest Unknown → Degraded | USD-M REST is recovering 1/2
+== event 145 spot_wss Unknown → Operational | Spot WSS feed is connected and current
+== event 146 usdm_wss Unknown → Operational | USD-M WSS feed is connected and current
+== event 147 feed_machine Unknown → Degraded | Machine median book age is above 5 seconds while the feed is
+== event 148 connector_origin Unknown → Operational | Origin returned HTTP 200
+== event 149 news_fetch Unknown → Degraded | News reports 6 source errors
+== event 150 spot_rest Degraded → Operational | Spot REST probe returned HTTP 200
+== event 151 usdm_rest Degraded → Operational | USD-M REST probe returned HTTP 200
+== event 152 cf_connector Unknown → Operational | cloudflared connector is ready
+== done 23:02:56

@@ -1,0 +1,17 @@
+NETWORK V1 — NET-07 LIVE ACCEPTANCE — 2026-08-16 22:33Z–23:03Z — integrator (transcript rows: evidence/network-v1-acceptance-2026-08-16.txt)
+1 releases | run 1: ui 0cb4a73 / recorder bb222cc; run 2: ui + recorder e64ef38 (branch head); module sha256 first-16 recorded in the transcript | MEASURED
+2 feed counts vs source | recorder now reads watch/feed_state.json at its source; feed_connections.json carries source_bytes/mtime/written_ms per read (5,472,164 B, snapshot age 2.4 s at 22:18Z); WSS metrics on the page = the same connections block | MEASURED
+3 four Binance wires | Spot REST 147 ms · USD-M REST 153 ms (weight 3/6000, 3/2400) · Spot WSS 4/4 sockets · USD-M WSS 4/4, all Operational at baseline | MEASURED
+4 connector vs origin distinct | cf_connector (metrics 127.0.0.1:20241: ha 4, ready 4, QUIC RTT 1–3 ms) and connector_origin (loopback GET 2–7 ms) are separate edges with separate evidence | MEASURED
+5 feed → machine | Degraded throughout: machine median book age 8–10 s while the feed snapshot is 1.5–3 s old; symbols under 5 s between 0 and 53 of 656 | MEASURED
+6–7 stop → Stale | run 1: collector "stopped" at 11 s; REST Stale at 42 s, WSS/cf/origin/feed at 52 s (their 45-s windows), news still Degraded at 90 s (its window is 3 × 120 s) → the script's fixed 90-s gate said FAIL; run 2 with the full window: all seven at 46 s, news at 319 s → all eight Stale, never Outage, never green | MEASURED
+8 restart → two successes | run 2: 5 s after start REST reads "recovering 1/2" (Degraded), 20 s → Operational after the second success; cf Unknown for one sample (delta not yet available) then Operational; quorum is no longer carried across restarts (e64ef38) | MEASURED
+9 recovery in history | events 141–152: collector stopped/started, Unknown → Degraded (recovering 1/2) → Operational for both REST wires, WSS/origin/cf Operational, feed_machine/news Degraded | MEASURED
+10 ten-minute measure | recorder 0.35 % of one core (limit 1 %), RSS 30,252 KB (limit 60 MB), DB main file 2,371,584 B with 0 growth in the window (WAL absorbs), samples +285 / events +1 in 10 min; requests to /api/network not measurable on the box (said so) | MEASURED
+11 /api/network | 19,751 B max, 0.0154 s max of 10 (p95 proxy) — limits 100 KB / 0.050 s | PASS MEASURED
+12 24H history | 2,598 B max, 0.091 s max of 10 — limits 1 MB / 0.250 s (only 1.5 h of history existed) | PASS MEASURED
+13 identifiers | connectorId 0 · receipt_path 0 · job_id 0 · signature 0 · "secret" 7 = the AWS Secrets Manager labels only | PASS MEASURED
+14 real URL | page and /api/network verified through arbitrage.cosmosgeek.org in the owner's browser at 22:55Z (release e64ef38): strip, worst-first rows, 22-px cells, drawer chart per wire, compact ledger, controls | MEASURED
+15 transcript | this file + the sanitized rows file, committed | MEASURED
+targets | recorder CPU 0.35 % < 1 % · RSS 30 MB < 60 MB · DB 2.4 MB (48 h projection ≈ 12–20 MB) < 100 MB · Binance probes 8/min at 15 s · browser refresh 5 s · zero duplicate websockets (recorder opens none) | MEASURED / projection INFERRED
+open | history cells show "no data" (not Stale) for a stopped-recorder window — honest, the ledger says why; feed→machine "source" stays Unknown (runtime does not record it); dead V5 page files still on disk (not loaded) — cleanup card if the owner wants; quant-ui-telemetry service still runs for the future Machine tab | UNVERIFIED as labeled
