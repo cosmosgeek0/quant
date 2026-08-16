@@ -390,6 +390,22 @@ class FeedMachineHealthTests(unittest.TestCase):
                 self.assertEqual(edge["health"], expected)
                 self.assertIsNone(edge["metrics"]["source"])
 
+    def test_p9_three_mirror_intervals_keep_feed_machine_assessment_stable(self):
+        cases = (
+            (5399, 8209, "Degraded"),
+            (20000, 8209, "Unknown"),
+            (4000, 3000, "Operational"),
+        )
+        for snapshot_age, book_age, expected in cases:
+            with self.subTest(snapshot_age=snapshot_age, book_age=book_age):
+                edge = health.derive_edge(
+                    "feed_machine",
+                    machine(feed_snapshot_age_ms=snapshot_age,
+                            book_age_p50_ms=book_age),
+                    None, CONFIG, NOW,
+                )
+                self.assertEqual(edge["health"], expected)
+
     def test_old_machine_row_is_stale(self):
         edge = health.derive_edge(
             "feed_machine", machine(stream_row_age_ms=600001),
@@ -402,7 +418,7 @@ class FeedMachineHealthTests(unittest.TestCase):
             (None, "Feed or machine evidence is not mirrored"),
             (machine(feed_snapshot_age_ms=None), "Feed evidence is not mirrored"),
             (machine(book_age_p50_ms=None), "Machine stream evidence is not mirrored"),
-            (machine(feed_snapshot_age_ms=6000, book_age_p50_ms=6000),
+            (machine(feed_snapshot_age_ms=15001, book_age_p50_ms=6000),
              "Feed snapshot is too old to assess machine lag"),
         )
         for evidence, reason in cases:
@@ -623,6 +639,22 @@ class PassiveAndTransitionTests(unittest.TestCase):
         first = health.derive_edge("spot_wss", wss(), None, CONFIG, NOW)
         second = health.derive_edge("spot_wss", wss(), first, CONFIG, NOW + 1000)
         self.assertEqual(health.transitions(first, second), [])
+
+    def test_p9_reason_only_unknown_change_has_no_health_event(self):
+        previous = {
+            "id": "binance_exec",
+            "health_reason": "On-demand path; no execution evidence is mirrored",
+            "metrics": {},
+            "counters": {},
+        }
+        current = health.derive_edge(
+            "binance_exec",
+            {"last_used_at": "2027-01-15T08:00:00Z", "last_op": "validate",
+             "last_outcome": "accepted"},
+            previous, CONFIG, NOW,
+        )
+
+        self.assertEqual(health.transitions(previous, current), [])
 
 
 class SummaryAndReadTimeTests(unittest.TestCase):

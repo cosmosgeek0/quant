@@ -313,7 +313,7 @@ def _derive_feed_machine(edge, evidence, _prev, _now_ms):
     book_age = edge["metrics"]["book_age_p50_ms"]
     _truth(edge, "Pass", "Not-applicable", "Pass" if _is_number(book_age) and book_age <= 5000 else ("Fail" if _is_number(book_age) else "Unknown"))
     stream_known = _is_number(row_age) and _is_number(book_age)
-    feed_fresh = _is_number(feed_age) and feed_age <= 5000
+    feed_fresh = _is_number(feed_age) and feed_age <= 15000
     _apply_rules(edge, (
         (_is_number(symbols_total) and symbols_total == 0, "Unknown", "Machine stream has no rows"),
         (not _is_number(feed_age), "Unknown", "Feed evidence is not mirrored"),
@@ -458,9 +458,10 @@ def transitions(prev_edge, new_edge):
     """Return only health changes and the marker events named by V1."""
     events, label = [], new_edge.get("label", new_edge.get("id", "Connection"))
     append = events.append
-    if isinstance(prev_edge, dict) and prev_edge.get("health") != new_edge.get("health"):
+    if isinstance(prev_edge, dict):
         old, new = prev_edge.get("health", "Unknown"), new_edge.get("health", "Unknown")
-        append(_event("%s → %s" % (old, new), SEVERITY.get(new, "medium"), new_edge.get("health_reason", "Health changed"), {"old_health": old, "new_health": new}))
+        if old != new:
+            append(_event("%s → %s" % (old, new), SEVERITY.get(new, "medium"), new_edge.get("health_reason", "Health changed"), {"old_health": old, "new_health": new}))
     previous_metrics, metrics = (prev_edge.get("metrics", {}) if isinstance(prev_edge, dict) else {}), new_edge.get("metrics", {})
     old_reconnects, new_reconnects = previous_metrics.get("reconnects"), metrics.get("reconnects")
     if _is_number(old_reconnects) and _is_number(new_reconnects) and new_reconnects > old_reconnects:

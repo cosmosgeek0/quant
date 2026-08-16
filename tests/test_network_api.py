@@ -315,6 +315,26 @@ class NetworkApiTest(unittest.TestCase):
         self.assertIsNone(repeated)
         self.assertEqual(repeated_error, "cooldown 2 s")
 
+    def test_p9_unchanged_config_has_no_write_or_receipt(self):
+        original = b'{\n  "rest_probe_s": 15,\n  "paused": {"rest": false}\n}\n'
+        self.sources["network_config"].write_bytes(original)
+        store = self.open_store()
+        store.close()
+
+        with mock.patch.object(network_api, "_now_ms", return_value=NOW_MS):
+            saved, error = network_api.write_network_config(
+                self.sources, {"key": "rest_probe_s", "value": 15})
+
+        self.assertIsNone(error)
+        self.assertEqual(saved, {
+            "key": "rest_probe_s", "group": "rest", "old": 15, "new": 15,
+            "receipt_id": None, "reread": True, "unchanged": True,
+        })
+        self.assertEqual(self.sources["network_config"].read_bytes(), original)
+        store = self.open_store()
+        self.assertEqual(store.events_after(0, 10)["events"], [])
+        store.close()
+
     def test_r3_config_receipt_failure_restores_previous_bytes(self):
         original = b'{\n  "rest_probe_s": 15,\n  "paused": {"rest": false}\n}\n'
         self.sources["network_config"].write_bytes(original)

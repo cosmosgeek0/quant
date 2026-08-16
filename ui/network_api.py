@@ -656,10 +656,6 @@ def write_network_config(sources, body, headers=None):
     key, group, new = request
     with _CONFIG_WRITE_LOCK:
         now_ms = _now_ms()
-        last_ms = _CONFIG_COOLDOWNS.get((key, group))
-        if last_ms is not None and now_ms - last_ms < 2_000:
-            remaining = max(1, (2_000 - (now_ms - last_ms) + 999) // 1000)
-            return None, "cooldown %d s" % remaining
         config_path = Path(sources["network_config"])
         try:
             previous_bytes, previous_exists = config_path.read_bytes(), True
@@ -667,6 +663,15 @@ def write_network_config(sources, body, headers=None):
             previous_bytes, previous_exists = b"", False
         current = _resolved_config(_read_dict(config_path))
         old = current["paused"][group] if key == "paused" else current[key]
+        if old == new:
+            return {
+                "key": key, "group": group, "old": old, "new": new,
+                "receipt_id": None, "reread": True, "unchanged": True,
+            }, None
+        last_ms = _CONFIG_COOLDOWNS.get((key, group))
+        if last_ms is not None and now_ms - last_ms < 2_000:
+            remaining = max(1, (2_000 - (now_ms - last_ms) + 999) // 1000)
+            return None, "cooldown %d s" % remaining
         receipt_id = _receipt_id(now_ms)
         if key == "paused":
             current["paused"][group] = new
