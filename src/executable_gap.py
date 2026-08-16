@@ -198,20 +198,16 @@ def _valid_quote_for_venue(quote: Any, venue: str) -> bool:
 
 
 def _pair_skew_checked(spot: Any, perp: Any) -> bool:
-    if not _valid_ms(getattr(spot, "observed_ms", None)) \
-            or not _valid_ms(getattr(perp, "observed_ms", None)):
+    if not isinstance(spot, VenueQuote) \
+            or not isinstance(perp, VenueQuote):
         return False
-    if isinstance(spot, VenueQuote) and isinstance(perp, VenueQuote):
-        same_source = spot.source is perp.source \
-            or type(spot.source) is str and type(perp.source) is str \
-            and spot.source == perp.source
-        return not (
-            same_source
-            and spot.observed_ms == perp.observed_ms
-        )
-    if isinstance(spot, TimedQuote) and isinstance(perp, TimedQuote):
-        return spot.observed_ms != perp.observed_ms
-    return False
+    if not _valid_ms(spot.observed_ms) or not _valid_ms(perp.observed_ms) \
+            or spot.source is None or perp.source is None:
+        return False
+    same_source = spot.source is perp.source \
+        or type(spot.source) is str and type(perp.source) is str \
+        and spot.source == perp.source
+    return not same_source
 
 
 def _refused(

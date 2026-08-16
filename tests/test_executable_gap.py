@@ -128,18 +128,60 @@ class ExecutableGapLawTests(unittest.TestCase):
             "spot", "100", "101", NOW_MS - 100, shared_source)
         shared_perp = gap.VenueQuote(
             "perp", "111.1", "112", NOW_MS - 100, shared_source)
+        shared_perp_later = gap.VenueQuote(
+            "perp", "111.1", "112", NOW_MS - 200, shared_source)
         independent_perp = gap.VenueQuote(
             "perp", "111.1", "112", NOW_MS - 100, object())
+        spot_tag = "venue-feed"
+        perp_tag = "".join(("venue", "-feed"))
+        tagged_spot = gap.VenueQuote(
+            "spot", "100", "101", NOW_MS - 100, spot_tag)
+        tagged_perp = gap.VenueQuote(
+            "perp", "111.1", "112", NOW_MS - 200, perp_tag)
 
         shared = gap.read_executable_gap(
             SYMBOL, spot, shared_perp, NOW_MS)
+        shared_later = gap.read_executable_gap(
+            SYMBOL, spot, shared_perp_later, NOW_MS)
         independent = gap.read_executable_gap(
             SYMBOL, spot, independent_perp, NOW_MS)
+        tagged = gap.read_executable_gap(
+            SYMBOL, tagged_spot, tagged_perp, NOW_MS)
 
         self.assertIsInstance(shared, gap.ExecutableGapReading)
+        self.assertIsInstance(shared_later, gap.ExecutableGapReading)
         self.assertIsInstance(independent, gap.ExecutableGapReading)
+        self.assertIsInstance(tagged, gap.ExecutableGapReading)
         self.assertFalse(shared.skew_checked)
+        self.assertFalse(shared_later.skew_checked)
         self.assertTrue(independent.skew_checked)
+        self.assertEqual(spot_tag, perp_tag)
+        self.assertIsNot(spot_tag, perp_tag)
+        self.assertFalse(tagged.skew_checked)
+
+    def test_legacy_quote_pair_never_claims_a_skew_check(self):
+        spot = gap.TimedQuote("100", "101", NOW_MS - 100)
+        perp = gap.TimedQuote("111.1", "112", NOW_MS - 200)
+
+        result = gap.read_executable_gap(SYMBOL, spot, perp, NOW_MS)
+
+        self.assertIsInstance(result, gap.ExecutableGapReading)
+        self.assertFalse(result.skew_checked)
+
+    def test_distinct_venue_sources_enforce_the_skew_bound(self):
+        spot = gap.VenueQuote(
+            "spot", "100", "101", NOW_MS, object())
+        perp = gap.VenueQuote(
+            "perp", "111.1", "112",
+            NOW_MS - gap.DEFAULT_MAX_QUOTE_SKEW_MS - 1,
+            object(),
+        )
+
+        result = gap.read_executable_gap(SYMBOL, spot, perp, NOW_MS)
+
+        self.assertIsInstance(result, gap.GapRefusal)
+        self.assertEqual(result.reason, "QUOTE_SKEW_EXCEEDED")
+        self.assertTrue(result.skew_checked)
 
     def test_reverse_dislocation_with_excess_skew_refuses(self):
         result = read(

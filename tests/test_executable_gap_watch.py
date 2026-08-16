@@ -255,6 +255,7 @@ class ExecutableGapWatchTests(unittest.TestCase):
         })
 
         completed = watch.run_once(self.paths, now_ms=NOW_MS)
+        repeated = watch.run_once(self.paths, now_ms=NOW_MS)
 
         self.assertEqual(completed.summary.computed, 2)
         rows = {row["symbol"]: row for row in self.read_rows()}
@@ -275,6 +276,8 @@ class ExecutableGapWatchTests(unittest.TestCase):
             watch.RECORD_UTC_FUTURE_TOLERANCE_MS + 1,
         )
         self.assertEqual(rows["PASTUSDT"]["utc_ahead_ms"], 0)
+        self.assertEqual(repeated.rows, ())
+        self.assertEqual(len(self.read_rows()), 3)
 
     def test_same_record_cut_is_appended_and_recorded_once(self):
         self.write_state({"ONCEUSDT": stream_record()})
