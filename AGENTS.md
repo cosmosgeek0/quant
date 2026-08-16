@@ -32,3 +32,11 @@ Clean words, soft tone, everywhere — reports, code comments, test names,
 row text. No profanity, no aggressive or shock wording, nothing that could
 trip a content flag on ordinary engineering work. A report that arrives
 worded badly goes back to you for cleaning before it is read.
+
+## Size (owner law 2026-08-16 — the first money file was 479 lines and moved money)
+- Every build card carries a line budget; your report states +/- non-blank lines
+  per file. Repairs are net-negative or flat: fix by removing the wrong path,
+  not by adding a guard beside it. Duplicate guards, receipt fields nobody
+  reads, and recovery branches no live event ever took are defects.
+- No offline test earns a line the live path does not need. One regression per
+  live lesson; a test that only exercises another test's fixture is deleted.
