@@ -1,4 +1,5 @@
 """Offline contract tests for the shared Binance Margin adapter."""
+import ast
 from dataclasses import replace
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -42,6 +43,14 @@ class Feed:
 
 
 class MarginAdapterTests(unittest.TestCase):
+    def test_source_keeps_one_statement_per_line_within_readable_cap(self):
+        source = (SRC / "execution" / "binance_margin.py").read_text(encoding="utf-8")
+        statement_lines = [
+            node.lineno for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.stmt)]
+        self.assertEqual(len(statement_lines), len(set(statement_lines)))
+        self.assertLessEqual(sum(bool(line.strip()) for line in source.splitlines()), 191)
+
     def test_liability_and_repay_keep_the_exact_interest_split(self):
         with localcontext() as context:
             context.prec = 3
@@ -94,6 +103,15 @@ class MarginAdapterTests(unittest.TestCase):
                 self.assertEqual(result.value[0].direction, direction)
                 self.assertEqual(result.value[0].origin_type, "MANUAL")
                 self.assertEqual(dict(feed.calls[0][3])["type"], direction)
+                self.assertIs(feed.calls[0][4], True)
+
+    def test_history_non_text_origin_is_unclear_after_one_signed_read(self):
+        feed = Feed(ok({"total": 1, "rows": [history(type=[])]}))
+        result = margin.read_history_by_direction(
+            feed, BASE, "USDT", "REPAY", sleep=lambda _delay: None)
+        self.assertEqual((result.kind, result.value, len(feed.calls)),
+                         ("unclear", None, 1))
+        self.assertIs(feed.calls[0][4], True)
 
     def test_exact_id_absence_is_ok_while_conflicts_are_unclear(self):
         empty = margin.read_history_by_tx_id(
@@ -106,6 +124,13 @@ class MarginAdapterTests(unittest.TestCase):
                     Feed(ok({"total": len(rows), "rows": rows})),
                     BASE, "USDT", "BORROW", 17)
                 self.assertEqual(result.kind, "unclear")
+
+    def test_exact_id_requires_total_to_match_returned_rows(self):
+        feed = Feed(ok({"total": 1, "rows": []}))
+        result = margin.read_history_by_tx_id(
+            feed, BASE, "USDT", "BORROW", 17, sleep=lambda _delay: None)
+        self.assertEqual((result.kind, result.value, len(feed.calls)),
+                         ("unclear", None, 1))
 
     def test_await_retries_only_valid_absence(self):
         visible = Feed(ok({"total": 0, "rows": []}),
@@ -199,6 +224,19 @@ class MarginAdapterTests(unittest.TestCase):
             Decimal("0"), "CONFIRMED", "MANUAL", 1700000000000)
         self.assertEqual(margin.confirm(borrow, 17, borrow_row, zero, borrowed).kind,
                          "confirmed")
+        for field, value in (
+                ("direction", "REPAY"),
+                ("tx_id", 18),
+                ("asset", "BTC"),
+                ("status", "PENDING"),
+                ("origin_type", "SYSTEM"),
+                ("principal", Decimal("2.4")),
+                ("interest", Decimal("0.1"))):
+            with self.subTest(field=field):
+                changed = replace(borrow_row, **{field: value})
+                self.assertEqual(
+                    margin.confirm(borrow, 17, changed, zero, borrowed).kind,
+                    "unknown")
 
         before = margin.Liability(
             "USDT", Decimal("2.5"), Decimal("0.0000387"), Decimal("2.5000387"))
@@ -212,6 +250,17 @@ class MarginAdapterTests(unittest.TestCase):
             repay, 18, replace(repay_row, amount=Decimal("2.5000386")),
             before, zero).kind, "unknown")
         self.assertEqual(margin.confirm(repay, 18, repay_row, before, borrowed).kind,
+                         "unknown")
+
+    def test_confirmation_requires_plain_integer_history_identity(self):
+        zero = margin.Liability("USDT", Decimal("0"), Decimal("0"), Decimal("0"))
+        borrowed = margin.Liability(
+            "USDT", Decimal("2.5"), Decimal("0"), Decimal("2.5"))
+        operation = margin.build_borrow("USDT", Decimal("2.5"), "intent-9", SHA)
+        row = margin.MarginHistoryRow(
+            "BORROW", Decimal("17"), "USDT", Decimal("2.5"), Decimal("2.5"),
+            Decimal("0"), "CONFIRMED", "MANUAL", 1700000000000)
+        self.assertEqual(margin.confirm(operation, 17, row, zero, borrowed).kind,
                          "unknown")
 
 
