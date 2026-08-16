@@ -9,9 +9,10 @@ Reverse capture uses the long Perp entry denominator, while ``DirectionalGap``
 keeps the caller's intended direction explicit.  Optional depth and funding
 inputs replace the stamped top-of-book and kernel-default economics sources.
 
-The fixed gate order is borrow, fresh executable gap, reverse direction,
-ladder headroom, quote cap, borrow clamp, step/minimum feasibility, depth, then
-net edge.  Depth therefore cannot hide an earlier sizing refusal.
+The fixed ten-gate order is borrow, fresh executable gap, verified skew,
+reverse direction, ladder headroom, quote cap, borrow-principal clamp,
+step/minimum feasibility, depth, then net edge.  Depth therefore cannot hide
+an earlier sizing refusal.
 """
 
 from __future__ import annotations
@@ -19,19 +20,21 @@ from __future__ import annotations
 import hashlib, json, re
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, localcontext
+from math import gcd
 from typing import Any, Literal, Mapping, Optional, Union
 
 import basis_kernel, basis_ladder, depth_walk, executable_gap, funding_ruler
 import limits, margin_ops
 
 
-(BORROW_POWER_REQUIRED, GAP_NOT_EXECUTABLE_OR_STALE,
+(BORROW_POWER_REQUIRED, GAP_NOT_EXECUTABLE_OR_STALE, SKEW_NOT_VERIFIED,
  GAP_DIRECTION_NOT_REVERSE, LADDER_HEADROOM_UNAVAILABLE,
  QUOTE_NOTIONAL_CAP_EXCEEDED, BORROW_CLAMP_EXCEEDED,
  STEP_OR_MIN_NOTIONAL_INFEASIBLE, DEPTH_INSUFFICIENT_OR_INVALID,
  NET_EDGE_NOT_POSITIVE) = GATE_ORDER = (
     "BORROW_POWER_REQUIRED",
     "GAP_NOT_EXECUTABLE_OR_STALE",
+    "SKEW_NOT_VERIFIED",
     "GAP_DIRECTION_NOT_REVERSE",
     "LADDER_HEADROOM_UNAVAILABLE",
     "QUOTE_NOTIONAL_CAP_EXCEEDED",
@@ -47,6 +50,10 @@ ASSET_RE = re.compile(r"^[A-Z0-9]{1,20}$")
 TOP_OF_BOOK = "top_of_book"; DEPTH_WALK = "depth_walk"
 KERNEL_DEFAULT_HOLD = "kernel_default_hold"
 FUNDING_RULER_WORST_CASE = "funding_ruler_worst_case"
+_IDENTITY_SCHEMA = "reverse-rung-intent-v4"
+SKEW_VERIFIED_ASSUMED = "skew_verified_assumed"
+NamedAssumption = Literal["skew_verified_assumed"]
+_NAMED_ASSUMPTIONS = frozenset({SKEW_VERIFIED_ASSUMED})
 
 
 @dataclass(frozen=True)
@@ -108,9 +115,14 @@ class ReverseRungIntent:
     funding_and_interest_drag_pct: Decimal
     intent_id: str
     sealed_inputs_digest: str
+    assumptions: tuple[NamedAssumption, ...] = ()
     capture_source: str = TOP_OF_BOOK
     drag_source: str = KERNEL_DEFAULT_HOLD
     settlements_crossed: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not self.borrow_qty == self.spot_short_qty == self.perp_long_qty:
+            raise ValueError("reverse intent base quantities must match")
 
 
 @dataclass(frozen=True)
@@ -157,6 +169,18 @@ def _floor(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def _common_step(first: Decimal, second: Decimal) -> Decimal:
+    """Return the smallest Decimal quantity valid on both venue grids."""
+    first_parts, second_parts = first.as_tuple(), second.as_tuple()
+    exponent = min(first_parts.exponent, second_parts.exponent)
+    first_units = int("".join(map(str, first_parts.digits))) \
+        * 10 ** (first_parts.exponent - exponent)
+    second_units = int("".join(map(str, second_parts.digits))) \
+        * 10 ** (second_parts.exponent - exponent)
+    common_units = first_units // gcd(first_units, second_units) * second_units
+    return Decimal(common_units).scaleb(exponent)
+
+
 def _sealed_material(
     gap: DirectionalGap,
     ladder: LadderSnapshot,
@@ -170,16 +194,19 @@ def _sealed_material(
     settlements_crossed: int,
     depth: Optional[ReverseDepthInput],
     funding: Optional[ReverseFundingInput],
+    assumptions: frozenset[NamedAssumption],
 ) -> str:
     reading = gap.result
     state, config = ladder.state, ladder.config
     material = {
-        "schema": "reverse-rung-intent-v2",
+        "schema": _IDENTITY_SCHEMA,
+        "assumptions": sorted(assumptions),
         "gap": {
             "direction": gap.direction, "symbol": reading.symbol,
             "now_ms": reading.now_ms, "verdict": reading.verdict,
             "entry_gap_pct": _text(reading.entry_gap_pct), "exit_gap_pct": _text(reading.exit_gap_pct),
             "spot_age_ms": reading.spot_age_ms, "perp_age_ms": reading.perp_age_ms,
+            "skew_checked": reading.skew_checked,
         },
         "ladder": {
             "direction": state.direction,
@@ -242,11 +269,15 @@ def build_reverse_rung_intent(
     caps: ReverseRungCaps,
     depth: Optional[ReverseDepthInput] = None,
     funding: Optional[ReverseFundingInput] = None,
+    assumptions: frozenset[NamedAssumption] = frozenset(),
 ) -> ReverseRungResult:
     """Return one immutable shadow intent or the first ordered refusal.
 
     ``borrow_power`` defaults CLOSED.  Only the owner's explicit word may set
     that capability in configuration; market data or this code never opens it.
+    That capability flag remains separate from the typed ``assumptions`` set.
+    The sole named assumption can stand in for verified venue skew in a shadow
+    evaluation, and any resulting intent records and seals that assumption.
     All quantities, prices, rates, percentages, and caps must be finite
     ``Decimal`` values.  ``None`` is unknown and reaches its ordered refusal.
     Supplying ``depth`` or ``funding`` selects the corresponding stamped source;
@@ -293,6 +324,15 @@ def build_reverse_rung_intent(
         return refuse(GAP_NOT_EXECUTABLE_OR_STALE,
                       "reverse capture is unavailable from the sealed pair")
 
+    if type(assumptions) is not frozenset \
+            or not assumptions.issubset(_NAMED_ASSUMPTIONS):
+        return refuse(SKEW_NOT_VERIFIED,
+                      "assumptions are not a named frozen set")
+    if reading.skew_checked is not True \
+            and SKEW_VERIFIED_ASSUMED not in assumptions:
+        return refuse(SKEW_NOT_VERIFIED,
+                      "paired venue skew was not verified")
+
     if gap.direction != basis_ladder.REVERSE:
         return refuse(GAP_DIRECTION_NOT_REVERSE,
                       "the selected executable gap is not reverse")
@@ -330,12 +370,11 @@ def build_reverse_rung_intent(
         return refuse(QUOTE_NOTIONAL_CAP_EXCEEDED,
                       "the rung exceeds the effective limits cap")
 
-    if quote_notional > margin_ops.PRINCIPAL_CEILING \
-            or type(borrow.asset) is not str \
+    if type(borrow.asset) is not str \
             or ASSET_RE.fullmatch(borrow.asset) is None \
             or not _finite_decimal(borrow.borrowable_amount, positive=True):
         return refuse(BORROW_CLAMP_EXCEEDED,
-                      "the borrow facts do not fit the 3 USDT clamp")
+                      "the borrow principal facts are unavailable or invalid")
 
     if not all((
         _finite_decimal(market.spot_step, positive=True),
@@ -347,18 +386,25 @@ def build_reverse_rung_intent(
                       "one venue sizing field is unknown or invalid")
     with localcontext() as context:
         context.prec = basis_kernel.PRECISION
-        spot_qty = _floor(quote_notional / market.spot_bid, market.spot_step)
-        perp_qty = _floor(quote_notional / market.perp_ask, market.perp_step)
-        spot_notional = spot_qty * market.spot_bid
-        perp_notional = perp_qty * market.perp_ask
-    if borrow.borrowable_amount < spot_qty:
+        spot_floor = _floor(
+            quote_notional / market.spot_bid, market.spot_step)
+        perp_floor = _floor(
+            quote_notional / market.perp_ask, market.perp_step)
+        common_qty = _floor(
+            min(spot_floor, perp_floor),
+            _common_step(market.spot_step, market.perp_step),
+        )
+        spot_notional = common_qty * market.spot_bid
+        perp_notional = common_qty * market.perp_ask
+    if common_qty > margin_ops.PRINCIPAL_CEILING \
+            or borrow.borrowable_amount < common_qty:
         return refuse(BORROW_CLAMP_EXCEEDED,
-                      "borrowable amount is below the floored Spot short")
-    if spot_qty <= ZERO or perp_qty <= ZERO \
+                      "the common borrow principal exceeds its available clamp")
+    if common_qty <= ZERO \
             or spot_notional < market.spot_min_notional \
             or perp_notional < market.perp_min_notional:
         return refuse(STEP_OR_MIN_NOTIONAL_INFEASIBLE,
-                      "floored quantity misses a venue minimum")
+                      "no common floored quantity meets both venue minimums")
 
     expected_capture = top_capture
     if depth is not None:
@@ -447,20 +493,22 @@ def build_reverse_rung_intent(
                       "funding settlement count is unavailable")
     digest = _sealed_material(
         gap, ladder, borrow, market, caps, hold_ms, expected_capture,
-        capture_source, drag_source, settlements_crossed, depth, funding)
+        capture_source, drag_source, settlements_crossed, depth, funding,
+        assumptions)
     drag = funding_drag_pct + interest_pct
     return ReverseRungIntent(
         symbol=reading.symbol,
         ordinal=ordinal,
         borrow_asset=borrow.asset,
-        borrow_qty=spot_qty,
-        spot_short_qty=spot_qty,
-        perp_long_qty=perp_qty,
+        borrow_qty=common_qty,
+        spot_short_qty=common_qty,
+        perp_long_qty=common_qty,
         quote_notional=quote_notional,
         expected_capture_pct=expected_capture,
         funding_and_interest_drag_pct=drag,
         intent_id="rri-" + digest[:24],
         sealed_inputs_digest=digest,
+        assumptions=tuple(sorted(assumptions)),
         capture_source=capture_source,
         drag_source=drag_source,
         settlements_crossed=settlements_crossed,
@@ -472,7 +520,9 @@ __all__ = [
     "ReverseDepthInput", "ReverseFundingInput",
     "ReverseMarketMetadata", "ReverseRungCaps", "ReverseRungIntent",
     "ReverseRungRefusal", "ReverseRungResult", "GATE_ORDER",
-    "DEPTH_INSUFFICIENT_OR_INVALID", "TOP_OF_BOOK", "DEPTH_WALK",
+    "SKEW_NOT_VERIFIED", "DEPTH_INSUFFICIENT_OR_INVALID",
+    "SKEW_VERIFIED_ASSUMED", "NamedAssumption",
+    "TOP_OF_BOOK", "DEPTH_WALK",
     "KERNEL_DEFAULT_HOLD", "FUNDING_RULER_WORST_CASE",
     "build_reverse_rung_intent",
 ]

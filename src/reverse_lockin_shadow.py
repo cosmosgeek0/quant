@@ -3,8 +3,8 @@
 
 For BASIS-LOCKIN-SPEC row 120 only.  A gap is not a ``DislocationEvent``:
 ``basis_events.py:18-21`` requires a fresh volume/price impulse and gap growth.
-Rows measure reverse economics without authority; unknowns reach the fixed
-refusal order in :mod:`reverse_rung_intent`.
+Rows measure reverse economics without execution authority; their typed shadow
+assumptions are explicit, and unknowns reach the fixed refusal order.
 
 Optional books use ``RECEIPT_DIR/reverse_depth.json`` keyed by symbol;
 ``RECEIPT_DIR/funding_info.json`` accepts keyed or raw fundingInfo rows.  Missing symbol rows retain stamped fallback sources.
@@ -24,7 +24,7 @@ from runtime_paths import PATHS, RuntimePaths
 GAP_FILENAME = "executable_gaps.jsonl"; OUTPUT_FILENAME = "reverse_shadow.jsonl"
 METADATA_FILENAME = "stream_metadata.json"; DEPTH_FILENAME = "reverse_depth.json"
 FUNDING_INFO_FILENAME = "funding_info.json"; TAIL_MAX_BYTES = 4 * 1024 * 1024
-ZERO = Decimal("0")
+ZERO = Decimal("0"); SHADOW_INTENT_ASSUMPTIONS = frozenset({reverse.SKEW_VERIFIED_ASSUMED})
 DEFAULT_HOLD_MINUTES = Decimal(basis_kernel.DEFAULT_CONFIG.default_hold_ms) / Decimal("60000")
 SHADOW_NOTIONAL = min(limits.FIRST_TRADE_CAP_USDT, margin_ops.PRINCIPAL_CEILING)
 DEFAULT_LADDER_CONFIG = basis_ladder.LadderConfig(
@@ -46,7 +46,7 @@ class ShadowBorrowInput:
 
 @dataclass(frozen=True)
 class ShadowSummary:
-    symbols_evaluated: int; reverse_direction: int; would_intent: int; top_5: Tuple[Tuple[str, Decimal], ...]; gate_histogram: Tuple[Tuple[str, int], ...]
+    symbols_evaluated: int; reverse_direction: int; would_intent: int; top_5: Tuple[Tuple[str, Decimal], ...]; gate_histogram: Tuple[Tuple[str, int], ...]; shadow_assumptions: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -205,7 +205,7 @@ def _intent_inputs(candidate: GapCandidate, record: Mapping[str, Any],
                             shadow.borrow_power),
         market, reverse.ReverseRungCaps(
             limits.PER_LEG_CAP_USDT, limits.FIRST_TRADE_CAP_USDT, limits.MEASURED_ROUNDTRIP_FEE_PCT),
-        depth_input, funding_input)
+        depth_input, funding_input, SHADOW_INTENT_ASSUMPTIONS)
 
 
 def evaluate_candidate(candidate: GapCandidate, record: Mapping[str, Any], assume_borrow_power: bool,
@@ -218,7 +218,7 @@ def evaluate_candidate(candidate: GapCandidate, record: Mapping[str, Any], assum
         "utc": candidate.utc, "symbol": candidate.reading.symbol,
         "entry_gap_pct": _text(candidate.reading.entry_gap_pct),
         "would_intent": isinstance(result, reverse.ReverseRungIntent),
-        "shadow_assumption": "borrow_power_assumed" if assume_borrow_power else None,
+        "shadow_assumptions": list((("borrow_power_assumed",) if assume_borrow_power else ()) + tuple(sorted(SHADOW_INTENT_ASSUMPTIONS))), "execution_authorized": False,
         "capture_source": result.capture_source, "drag_source": result.drag_source,
         "settlements_crossed": result.settlements_crossed,
         "funding_info_source": FUNDING_INFO_FILENAME if funding_input is not None else "absent"}
@@ -275,18 +275,18 @@ def run_once(paths: RuntimePaths = PATHS, *, assume_borrow_power: bool = False,
         (gate, sum(row.get("first_failing_gate") == gate for row in rows))
         for gate in reverse.GATE_ORDER
         if any(row.get("first_failing_gate") == gate for row in rows))
-    summary = ShadowSummary(len(candidates), len(selected), len(intents), tuple(ranked[:5]), histogram)
+    summary = ShadowSummary(len(candidates), len(selected), len(intents), tuple(ranked[:5]), histogram, (("borrow_power_assumed",) if assume_borrow_power else ()) + tuple(sorted(SHADOW_INTENT_ASSUMPTIONS)))
     _append_rows(paths.receipt_dir / OUTPUT_FILENAME, rows)
     return ShadowPass(rows, summary)
 
 
 def format_summary(summary: ShadowSummary) -> str:
     top = ",".join(f"{symbol}:{_text(value)}" for symbol, value in summary.top_5) or "-"
-    gates = ",".join(f"{gate}:{count}" for gate, count in summary.gate_histogram) or "-"
+    gates = ",".join(f"{gate}:{count}" for gate, count in summary.gate_histogram) or "-"; assumptions = json.dumps(list(summary.shadow_assumptions), separators=(",", ":"))
     return (
         "REVERSE-LOCKIN-SHADOW | symbols_evaluated=%d reverse_direction=%d "
-        "would_intent=%d top_5_expected_capture_pct=%s gate_histogram=%s"
-        % (summary.symbols_evaluated, summary.reverse_direction, summary.would_intent, top, gates))
+        "would_intent=%d top_5_expected_capture_pct=%s gate_histogram=%s shadow_assumptions=%s execution_authorized=false"
+        % (summary.symbols_evaluated, summary.reverse_direction, summary.would_intent, top, gates, assumptions))
 
 
 def main(argv: Optional[Sequence[str]] = None, *, paths: RuntimePaths = PATHS) -> int:
