@@ -11,7 +11,7 @@ There is no I/O or execution.
 
 from __future__ import annotations
 
-import hashlib, json, re
+import hashlib, re
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, DecimalException, ROUND_DOWN, localcontext
 from math import gcd
@@ -24,6 +24,7 @@ from reverse_rung_intent import (ASSET_RE, BORROW_CLAMP_EXCEEDED, GATE_ORDER,
 
 ZERO = Decimal("0"); MAX_QUOTE_CAP = Decimal("8")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,30}$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 BORROW = "BORROW"; MARGIN_SELL = "MARGIN_SELL"
 FUTURES_LONG_OPEN = "FUTURES_LONG_OPEN"; FUTURES_CLOSE = "FUTURES_CLOSE"
 MARGIN_BUY = "MARGIN_BUY"; REPAY = "REPAY"
@@ -54,7 +55,8 @@ class ReverseLeg:
 
 @dataclass(frozen=True)
 class ReversePlan:
-    symbol: str; intent_id: str; base_qty: Decimal; borrow_asset: str
+    symbol: str; intent_id: str; client_tag: str; base_qty: Decimal
+    borrow_asset: str
     borrow_principal: Decimal; borrowable: Decimal
     interest_rate_hourly: Decimal; quote_cap: Decimal; quote_notional: Decimal
     spot_notional: Decimal; perp_notional: Decimal; common_step: Decimal
@@ -159,7 +161,7 @@ def _common_step(first: Decimal, second: Decimal) -> Decimal:
 
 def plan_reverse_mechanics(
     symbol, quote_cap, spot_meta, perp_meta, borrow_asset, borrowable,
-    interest_rate_hourly, caps=limits,
+    interest_rate_hourly, intent_id, client_tag, caps=limits,
 ) -> ReversePlanResult:
     """Return one immutable six-leg plan or the first ordered refusal."""
     per_leg = _value(caps, "per_leg_cap_usdt", "PER_LEG_CAP_USDT")
@@ -174,9 +176,11 @@ def plan_reverse_mechanics(
 
     if type(borrow_asset) is not str or ASSET_RE.fullmatch(borrow_asset) is None \
             or not _valid_decimal(borrowable, positive=True) \
-            or not _valid_decimal(interest_rate_hourly):
+            or not _valid_decimal(interest_rate_hourly) \
+            or type(intent_id) is not str or ID_RE.fullmatch(intent_id) is None \
+            or type(client_tag) is not str or ID_RE.fullmatch(client_tag) is None:
         return _refusal(symbol, BORROW_CLAMP_EXCEEDED,
-                        "borrow asset, availability, or hourly rate is unavailable")
+                        "borrow or claimed-intent facts are unavailable")
 
     spot_step, spot_min, spot_price = (_value(spot_meta, "step"),
         _value(spot_meta, "min_notional"), _value(spot_meta, "price"))
@@ -210,26 +214,14 @@ def plan_reverse_mechanics(
                         "no common floored quantity meets both venue minimums")
 
     quote_notional = max(spot_notional, perp_notional)
-    material = {
-        "schema": "reverse-mechanics-plan-v1", "symbol": symbol,
-        "quote_cap": _text(quote_cap), "spot_step": _text(spot_step),
-        "spot_min": _text(spot_min), "spot_price": _text(spot_price),
-        "perp_step": _text(perp_step), "perp_min": _text(perp_min),
-        "perp_price": _text(perp_price), "borrow_asset": borrow_asset,
-        "borrowable": _text(borrowable),
-        "interest_rate_hourly": _text(interest_rate_hourly),
-    }
-    digest = hashlib.sha256(json.dumps(
-        material, sort_keys=True, separators=(",", ":")).encode("ascii")
-    ).hexdigest()
-    intent_id = "rmp-" + digest[:24]
     legs = tuple(ReverseLeg(
         name,
         "rmo-" + hashlib.sha256(
-            (intent_id + ":" + name).encode("ascii")).hexdigest()[:24],
+            (intent_id + ":" + name).encode("utf-8")).hexdigest()[:24],
         base_qty, name == FUTURES_CLOSE, LIFECYCLE_BY_LEG[name],
     ) for name in LEG_ORDER)
-    return ReversePlan(symbol, intent_id, base_qty, borrow_asset, base_qty,
+    return ReversePlan(symbol, intent_id, client_tag, base_qty,
+        borrow_asset, base_qty,
         borrowable, interest_rate_hourly, quote_cap, quote_notional,
         spot_notional, perp_notional, common_step, legs, spot_step=spot_step)
 

@@ -194,11 +194,6 @@ REVERSE_ENTRY_LEGS = frozenset((
     reverse_mechanics.MARGIN_SELL,
     reverse_mechanics.FUTURES_LONG_OPEN,
 ))
-REVERSE_EXIT_LEGS = frozenset((
-    reverse_mechanics.FUTURES_CLOSE,
-    reverse_mechanics.MARGIN_BUY,
-    reverse_mechanics.REPAY,
-))
 # Identity evidence is ambiguous once a response walk exceeds this node budget.
 MARGIN_IDENTITY_MAX_NODES = 4096
 # Bound the encoded response material examined by one identity walk to 1 MiB.
@@ -600,83 +595,74 @@ def _validate_margin_job(raw: Dict[str, Any], filename_id: str,
     )
 
 
-def _validate_reverse_job(raw: Dict[str, Any], filename_id: str,
-                          now: datetime) -> Job:
-    unknown = set(raw) - REVERSE_JOB_FIELDS
-    if unknown:
-        forbidden = TRADING_JOB_FIELDS | MARGIN_JOB_FIELDS | set(
-            margin_ops.FORBIDDEN_JOB_FIELDS
-        )
-        raise JobRefusal(
-            "FORBIDDEN_FIELD" if unknown & forbidden else "UNKNOWN_FIELD"
-        )
-    if REVERSE_JOB_REQUIRED_FIELDS - set(raw):
-        raise JobRefusal("MISSING_FIELD")
-
-    string_fields = (
-        "job_id", "op", "symbol", "borrow_asset", "quote_cap",
-        "created_utc", "expires_utc", "requested_by", "intent_id",
-        "client_tag", "operator_token",
-    )
-    if any(type(raw[name]) is not str for name in string_fields):
-        raise JobRefusal("BAD_TYPE")
-    if not JOB_ID_RE.fullmatch(raw["job_id"]) \
-            or raw["job_id"] != filename_id:
-        raise JobRefusal("BAD_JOB_ID")
-    if raw["op"] != REVERSE_OP:
-        raise JobRefusal("BAD_OP")
-    if SYMBOL_RE.fullmatch(raw["symbol"]) is None:
-        raise JobRefusal("BAD_SYMBOL")
-    if margin_ops.ASSET_RE.fullmatch(raw["borrow_asset"]) is None \
-            or raw["symbol"] != raw["borrow_asset"] + "USDT":
-        raise JobRefusal("BAD_BORROW_ASSET")
-    if not raw["requested_by"].strip() \
-            or len(raw["requested_by"]) > 128:
-        raise JobRefusal("BAD_REQUESTER")
-    if not raw["operator_token"].strip() \
-            or len(raw["operator_token"]) \
-            > margin_ops.MAX_OPERATOR_TOKEN_LENGTH:
-        raise JobRefusal("BAD_OPERATOR_TOKEN")
-    if REVERSE_ID_RE.fullmatch(raw["intent_id"]) is None:
-        raise JobRefusal("BAD_INTENT_ID")
-    if REVERSE_ID_RE.fullmatch(raw["client_tag"]) is None:
-        raise JobRefusal("BAD_CLIENT_TAG")
-    if len(raw["quote_cap"]) > MARGIN_DECIMAL_TEXT_MAX \
-            or REVERSE_DECIMAL_RE.fullmatch(raw["quote_cap"]) is None:
-        raise JobRefusal("BAD_QUOTE_CAP")
-    try:
-        quote_cap = Decimal(raw["quote_cap"])
-    except (ArithmeticError, ValueError):
-        raise JobRefusal("BAD_QUOTE_CAP") from None
-    if not quote_cap.is_finite() or quote_cap <= Decimal("0"):
-        raise JobRefusal("BAD_QUOTE_CAP")
-    if quote_cap > REVERSE_QUOTE_CAP \
-            or quote_cap > limits.FIRST_TRADE_CAP_USDT \
-            or quote_cap > limits.PER_LEG_CAP_USDT:
-        raise JobRefusal(reverse_mechanics.QUOTE_NOTIONAL_CAP_EXCEEDED)
-
-    created = _timestamp(raw["created_utc"])
-    expires = _timestamp(raw["expires_utc"])
-    if expires <= created or expires - created > MAX_JOB_AGE:
-        raise JobRefusal("BAD_EXPIRY_WINDOW")
-    if now >= expires:
-        raise JobRefusal("EXPIRED")
-    return Job(
-        job_id=raw["job_id"], op=REVERSE_OP, symbol=raw["symbol"],
-        requested_max_notional=quote_cap, effective_notional=quote_cap,
-        created_utc=created, expires_utc=expires,
-        requested_by=raw["requested_by"],
-        operator_token=raw["operator_token"], intent_id=raw["intent_id"],
-        client_tag=raw["client_tag"], borrow_asset=raw["borrow_asset"],
-    )
-
-
 def _validate_job(raw: Dict[str, Any], filename_id: str,
                   now: datetime, receipt_dir: str = "") -> Job:
     if type(raw.get("op")) is str and raw["op"] in MARGIN_OPS:
         return _validate_margin_job(raw, filename_id, now)
     if raw.get("op") == REVERSE_OP:
-        return _validate_reverse_job(raw, filename_id, now)
+        unknown = set(raw) - REVERSE_JOB_FIELDS
+        if unknown:
+            forbidden = TRADING_JOB_FIELDS | MARGIN_JOB_FIELDS | set(
+                margin_ops.FORBIDDEN_JOB_FIELDS
+            )
+            raise JobRefusal(
+                "FORBIDDEN_FIELD" if unknown & forbidden else "UNKNOWN_FIELD"
+            )
+        if REVERSE_JOB_REQUIRED_FIELDS - set(raw):
+            raise JobRefusal("MISSING_FIELD")
+        string_fields = (
+            "job_id", "op", "symbol", "borrow_asset", "quote_cap",
+            "created_utc", "expires_utc", "requested_by", "intent_id",
+            "client_tag", "operator_token",
+        )
+        if any(type(raw[name]) is not str for name in string_fields):
+            raise JobRefusal("BAD_TYPE")
+        if not JOB_ID_RE.fullmatch(raw["job_id"]) \
+                or raw["job_id"] != filename_id:
+            raise JobRefusal("BAD_JOB_ID")
+        if SYMBOL_RE.fullmatch(raw["symbol"]) is None:
+            raise JobRefusal("BAD_SYMBOL")
+        if margin_ops.ASSET_RE.fullmatch(raw["borrow_asset"]) is None \
+                or raw["symbol"] != raw["borrow_asset"] + "USDT":
+            raise JobRefusal("BAD_BORROW_ASSET")
+        if not raw["requested_by"].strip() \
+                or len(raw["requested_by"]) > 128:
+            raise JobRefusal("BAD_REQUESTER")
+        if not raw["operator_token"].strip() \
+                or len(raw["operator_token"]) \
+                > margin_ops.MAX_OPERATOR_TOKEN_LENGTH:
+            raise JobRefusal("BAD_OPERATOR_TOKEN")
+        if REVERSE_ID_RE.fullmatch(raw["intent_id"]) is None:
+            raise JobRefusal("BAD_INTENT_ID")
+        if REVERSE_ID_RE.fullmatch(raw["client_tag"]) is None:
+            raise JobRefusal("BAD_CLIENT_TAG")
+        if len(raw["quote_cap"]) > MARGIN_DECIMAL_TEXT_MAX \
+                or REVERSE_DECIMAL_RE.fullmatch(raw["quote_cap"]) is None:
+            raise JobRefusal("BAD_QUOTE_CAP")
+        try:
+            quote_cap = Decimal(raw["quote_cap"])
+        except (ArithmeticError, ValueError):
+            raise JobRefusal("BAD_QUOTE_CAP") from None
+        if not quote_cap.is_finite() or quote_cap <= Decimal("0"):
+            raise JobRefusal("BAD_QUOTE_CAP")
+        if quote_cap > min(
+                REVERSE_QUOTE_CAP, limits.FIRST_TRADE_CAP_USDT,
+                limits.PER_LEG_CAP_USDT):
+            raise JobRefusal(reverse_mechanics.QUOTE_NOTIONAL_CAP_EXCEEDED)
+        created = _timestamp(raw["created_utc"])
+        expires = _timestamp(raw["expires_utc"])
+        if expires <= created or expires - created > MAX_JOB_AGE:
+            raise JobRefusal("BAD_EXPIRY_WINDOW")
+        if now >= expires:
+            raise JobRefusal("EXPIRED")
+        return Job(
+            job_id=raw["job_id"], op=REVERSE_OP, symbol=raw["symbol"],
+            requested_max_notional=quote_cap, effective_notional=quote_cap,
+            created_utc=created, expires_utc=expires,
+            requested_by=raw["requested_by"],
+            operator_token=raw["operator_token"], intent_id=raw["intent_id"],
+            client_tag=raw["client_tag"], borrow_asset=raw["borrow_asset"],
+        )
 
     unknown = set(raw) - JOB_FIELDS
     if unknown:
@@ -1626,53 +1612,18 @@ def _margin_intent_claim_path(paths: Dict[str, str], intent_id: str) -> str:
 
 def _margin_intent_is_claimed(paths: Dict[str, str], intent_id: str) -> bool:
     return type(intent_id) is str \
-        and margin_ops.INTENT_ID_RE.fullmatch(intent_id) is not None \
+        and (margin_ops.INTENT_ID_RE.fullmatch(intent_id) is not None
+             or REVERSE_ID_RE.fullmatch(intent_id) is not None) \
         and os.path.isfile(_margin_intent_claim_path(paths, intent_id))
 
 
 def _claim_margin_intent(paths: Dict[str, str], intent_id: str,
                          job_id: str, now: datetime) -> bool:
     if type(intent_id) is not str \
-            or margin_ops.INTENT_ID_RE.fullmatch(intent_id) is None:
+            or (margin_ops.INTENT_ID_RE.fullmatch(intent_id) is None
+                and REVERSE_ID_RE.fullmatch(intent_id) is None):
         return False
     path = _margin_intent_claim_path(paths, intent_id)
-    try:
-        descriptor = os.open(
-            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-    except FileExistsError:
-        return False
-    body = json.dumps({
-        "intent_id": intent_id,
-        "job_id": job_id,
-        "claimed_utc": _utc_text(now),
-    }, separators=(",", ":")) + "\n"
-    try:
-        os.write(descriptor, body.encode("utf-8"))
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    _fsync_parent_directory(path)
-    return True
-
-
-def _reverse_intent_claim_path(paths: Dict[str, str], intent_id: str) -> str:
-    digest = hashlib.sha256(intent_id.encode("utf-8")).hexdigest()
-    return os.path.join(paths["claims"], "reverse-intent-%s.claim" % digest)
-
-
-def _reverse_intent_is_claimed(paths: Dict[str, str], intent_id: str) -> bool:
-    return type(intent_id) is str \
-        and REVERSE_ID_RE.fullmatch(intent_id) is not None \
-        and os.path.isfile(_reverse_intent_claim_path(paths, intent_id))
-
-
-def _claim_reverse_intent(paths: Dict[str, str], intent_id: str,
-                          job_id: str, now: datetime) -> bool:
-    if type(intent_id) is not str \
-            or REVERSE_ID_RE.fullmatch(intent_id) is None:
-        return False
-    path = _reverse_intent_claim_path(paths, intent_id)
     try:
         descriptor = os.open(
             path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
@@ -2319,30 +2270,33 @@ def _spot_state(symbol: str, sha: str, receipt_dir: str, run_id: str,
 
 
 def _spot_balances(account: Any, *assets: str) -> Dict[str, Decimal]:
-    if not isinstance(account, dict) \
-            or not isinstance(account.get("balances"), list) \
-            or any(not isinstance(row, dict)
-                   for row in account.get("balances", [])):
+    if not isinstance(account, dict):
         raise MomentumStateError("Spot account balances are unreadable")
-    rows = account["balances"]
+    rows = account.get("balances")
+    if not isinstance(rows, list):
+        rows = account.get("userAssets")
+    if not isinstance(rows, list) \
+            or any(not isinstance(row, dict) for row in rows):
+        raise MomentumStateError("Spot account balances are unreadable")
+    balances: Dict[str, Decimal] = {}
     for asset in assets:
         matches = [row for row in rows if row.get("asset") == asset]
         if len(matches) != 1 or matches[0].get("free") is None:
             raise MomentumStateError(
                 "Spot account has no unique free balance for %s" % asset
             )
-    try:
-        balances = spot_roundtrip.balances_of(account, *assets)
-    except (ArithmeticError, KeyError, TypeError, ValueError):
-        raise MomentumStateError("Spot account balances are unreadable") \
-            from None
+        balances[asset] = _momentum_decimal(
+            matches[0]["free"], "Spot %s free balance" % asset,
+            allow_zero=True,
+        )
     if any(not value.is_finite() or value < 0 for value in balances.values()):
         raise MomentumStateError("Spot account balance is outside its range")
     return balances
 
 
 def _spot_market_context(state: basis_executor.RunState,
-                         effective: Decimal) -> Dict[str, Any]:
+                         effective: Decimal,
+                         margin_required: bool = False) -> Dict[str, Any]:
     """Proven spot-hand preflight, limited to a quote-bounded BUY."""
     try:
         raw_info = basis_executor.public_read(
@@ -2356,6 +2310,10 @@ def _spot_market_context(state: basis_executor.RunState,
                 or info.get("isSpotTradingAllowed") is not True:
             raise basis_executor.Refusal(
                 "symbol is not live for Spot trading"
+            )
+        if margin_required and info.get("isMarginTradingAllowed") is not True:
+            raise basis_executor.Refusal(
+                "symbol is not live for Margin trading"
             )
         if "MARKET" not in info.get("orderTypes", []) \
                 or info.get("quoteOrderQtyMarketAllowed") is not True:
@@ -4975,142 +4933,145 @@ def _json_authority_digest(value: Any) -> Optional[str]:
 
 def _margin_post_authority(
         job: Job, paths: Dict[str, str], operation: Dict[str, Any],
-        post_params: Dict[str, Any], validated_job_digest: str) \
+        post_params: Dict[str, Any], validated_job_digest: str,
+        authority_job: Optional[Job] = None,
+        reverse_entry: bool = False) \
         -> Tuple[str, datetime, Dict[str, str], bool]:
-    ready_params_digest = _json_authority_digest(post_params)
-    if ready_params_digest is None:
-        ready_params_digest = _authority_digest(None)
+    governing_job = authority_job or job
+    params_digest = _json_authority_digest(post_params)
     digests: Dict[str, str] = {
-        "ready_params": ready_params_digest,
+        "ready_params": params_digest or _authority_digest(None),
         "job_file": validated_job_digest
         if type(validated_job_digest) is str
         and re.fullmatch(r"[0-9a-f]{64}", validated_job_digest)
         else _authority_digest(None),
     }
-    job_encoded = None
-    accept_encoded = None
-    operator_encoded = None
-    stop_encoded = None
+    job_encoded = accept_encoded = operator_encoded = stop_encoded = None
     read_reason = ""
-    job_path = os.path.join(paths["jobs"], "job-%s.json" % job.job_id)
     try:
-        job_encoded = _read_file_bytes(job_path)
+        job_encoded = _read_file_bytes(os.path.join(
+            paths["jobs"], "job-%s.json" % governing_job.job_id))
     except OSError:
         read_reason = "MARGIN_VALIDATION_UNKNOWN"
-    if job_encoded is not None and _authority_digest(job_encoded) \
-            != validated_job_digest:
+    if job_encoded is not None \
+            and _authority_digest(job_encoded) != validated_job_digest:
         read_reason = "MARGIN_VALIDATION_UNKNOWN"
-    try:
-        accept_encoded = _read_file_bytes(paths["accept_one"])
-    except FileNotFoundError:
-        pass
-    except OSError:
-        read_reason = read_reason or "ACCEPT_ONE_INVALID"
-    try:
-        operator_encoded = _read_file_bytes(paths["operator"])
-    except FileNotFoundError:
-        pass
-    except OSError:
-        read_reason = read_reason or "OPERATOR_MISMATCH"
-    try:
-        stop_encoded = _read_file_bytes(paths["stop"])
-    except FileNotFoundError:
-        pass
-    except OSError:
-        read_reason = read_reason or "MARGIN_VALIDATION_UNKNOWN"
-
+    for name, missing_reason in (
+            ("accept_one", "ACCEPT_ONE_INVALID"),
+            ("operator", "OPERATOR_MISMATCH"),
+            ("stop", "MARGIN_VALIDATION_UNKNOWN")):
+        try:
+            encoded = _read_file_bytes(paths[name])
+        except FileNotFoundError:
+            encoded = None
+        except OSError:
+            encoded = None
+            read_reason = read_reason or missing_reason
+        if name == "accept_one":
+            accept_encoded = encoded
+        elif name == "operator":
+            operator_encoded = encoded
+        else:
+            stop_encoded = encoded
     verified_now = _utc_now()
     digests.update({
         "accept_one": _authority_digest(accept_encoded),
         "operator": _authority_digest(operator_encoded),
         "stop_jobs": _authority_digest(stop_encoded),
     })
-    stop_present = stop_encoded is not None
+    stopped = stop_encoded is not None
     if read_reason:
-        return read_reason, verified_now, digests, stop_present
-
+        return read_reason, verified_now, digests, stopped
     try:
         fresh_raw = _decode_strict_object(job_encoded or b"")
-        token = fresh_raw.get("operator_token")
-        expiry = fresh_raw.get("expires_utc")
-        if type(token) is str:
-            digests["operator_token"] = _authority_digest(
-                token.encode("utf-8")
-            )
-        if type(expiry) is str:
-            digests["job_expiry"] = _authority_digest(
-                expiry.encode("utf-8")
-            )
-        final_operation = margin_ops.build_margin_operation(
-            _margin_job_projection(fresh_raw), MARGIN_ASSET_WHITELIST,
-            verified_now,
-        )
-    except (JobRefusal, KeyError, TypeError, ValueError):
-        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
+        for field, digest_name in (
+                ("operator_token", "operator_token"),
+                ("expires_utc", "job_expiry")):
+            value = fresh_raw.get(field)
+            if type(value) is str:
+                digests[digest_name] = _authority_digest(
+                    value.encode("utf-8"))
     except Exception:
-        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
-    if not isinstance(final_operation, dict):
-        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
-    if final_operation.get("verdict") == "REFUSED":
-        reason = final_operation.get("reason")
-        if type(reason) is not str or not reason:
-            reason = "MARGIN_VALIDATION_UNKNOWN"
-        return reason, verified_now, digests, stop_present
-    try:
-        fresh_job = _validate_margin_job(
-            fresh_raw, job.job_id, verified_now, final_operation
-        )
-    except JobRefusal as error:
-        return error.reason, verified_now, digests, stop_present
-    except ValueError:
-        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
-    if fresh_job.operator_token != job.operator_token:
-        return "OPERATOR_MISMATCH", verified_now, digests, stop_present
-    if fresh_job != job or fresh_job.margin_operation != operation \
-            or not isinstance(fresh_job.margin_operation, dict) \
-            or fresh_job.margin_operation.get("params") != post_params:
-        return (
-            "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stop_present
-        )
-    if job.op == margin_ops.MARGIN_BORROW and stop_present:
-        return "STOP_JOBS_SEALED", verified_now, digests, stop_present
-    if job.op != margin_ops.MARGIN_BORROW:
-        return "", verified_now, digests, stop_present
+        return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+
+    if governing_job.op == REVERSE_OP:
+        try:
+            fresh_job = _validate_job(
+                fresh_raw, governing_job.job_id, verified_now)
+        except JobRefusal as error:
+            return error.reason, verified_now, digests, stopped
+        except Exception:
+            return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+        if fresh_job != governing_job \
+                or fresh_job.operator_token != governing_job.operator_token \
+                or not isinstance(operation, dict) \
+                or operation.get("params") != post_params:
+            return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+        stop_blocks = reverse_entry
+    else:
+        try:
+            final_operation = margin_ops.build_margin_operation(
+                _margin_job_projection(fresh_raw), MARGIN_ASSET_WHITELIST,
+                verified_now)
+        except Exception:
+            return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+        if not isinstance(final_operation, dict):
+            return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+        if final_operation.get("verdict") == "REFUSED":
+            reason = final_operation.get("reason")
+            return (reason if type(reason) is str and reason
+                    else "MARGIN_VALIDATION_UNKNOWN"), verified_now, digests, stopped
+        try:
+            fresh_job = _validate_margin_job(
+                fresh_raw, job.job_id, verified_now, final_operation)
+        except JobRefusal as error:
+            return error.reason, verified_now, digests, stopped
+        except ValueError:
+            return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+        if fresh_job.operator_token != job.operator_token:
+            return "OPERATOR_MISMATCH", verified_now, digests, stopped
+        if fresh_job != job or fresh_job.margin_operation != operation \
+                or not isinstance(fresh_job.margin_operation, dict) \
+                or fresh_job.margin_operation.get("params") != post_params:
+            return "MARGIN_VALIDATION_UNKNOWN", verified_now, digests, stopped
+        if job.op != margin_ops.MARGIN_BORROW:
+            return "", verified_now, digests, stopped
+        stop_blocks = True
+
+    if stop_blocks and stopped:
+        return "STOP_JOBS_SEALED", verified_now, digests, stopped
     if accept_encoded is None:
-        return (
-            "ENTRY_BLOCKED_NOT_ACCEPTED", verified_now, digests, stop_present
-        )
+        return "ENTRY_BLOCKED_NOT_ACCEPTED", verified_now, digests, stopped
     try:
         acceptance = _validate_accept_one_object(
-            _decode_strict_object(accept_encoded), verified_now
-        )
+            _decode_strict_object(accept_encoded), verified_now)
     except (JobRefusal, ValueError):
-        return "ACCEPT_ONE_INVALID", verified_now, digests, stop_present
+        return "ACCEPT_ONE_INVALID", verified_now, digests, stopped
     if operator_encoded is None:
-        return "OPERATOR_MISMATCH", verified_now, digests, stop_present
+        return "OPERATOR_MISMATCH", verified_now, digests, stopped
     try:
         operator = _validate_operator_object(
-            _decode_strict_object(operator_encoded)
-        )
+            _decode_strict_object(operator_encoded))
     except (JobRefusal, ValueError):
         operator = None
     if operator is None or fresh_job.requested_by != operator \
             or acceptance.operator != operator \
             or fresh_job.operator_token != operator:
-        return "OPERATOR_MISMATCH", verified_now, digests, stop_present
+        return "OPERATOR_MISMATCH", verified_now, digests, stopped
     if fresh_job.requested_max_notional > acceptance.max_notional:
-        return (
-            "ACCEPT_ONE_NOTIONAL_EXCEEDED", verified_now, digests,
-            stop_present,
-        )
-    return "", verified_now, digests, stop_present
+        return "ACCEPT_ONE_NOTIONAL_EXCEEDED", verified_now, digests, stopped
+    return "", verified_now, digests, stopped
 
 
 def _run_margin_operation(
         job: Job, paths: Dict[str, str],
         request: Optional[Callable[..., Tuple[str, Any]]] = None,
         governor_token: str = "", sha: str = "",
-        validated_job_digest: str = "") -> Outcome:
+        validated_job_digest: str = "",
+        authority_job: Optional[Job] = None,
+        reverse_entry: bool = False,
+        asset_whitelist: Optional[frozenset] = None,
+        source_suffix: str = "", claim_intent: bool = True) -> Outcome:
     fresh_now = _utc_now()
     principal = _canonical_decimal_text(job.requested_max_notional)
     projection = {
@@ -5127,7 +5088,7 @@ def _run_margin_operation(
     }
     try:
         operation = margin_ops.build_margin_operation(
-            projection, MARGIN_ASSET_WHITELIST, fresh_now
+            projection, asset_whitelist or MARGIN_ASSET_WHITELIST, fresh_now
         )
     except Exception:
         return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
@@ -5143,8 +5104,9 @@ def _run_margin_operation(
         return Outcome("REFUSED", 2, "", "MARGIN_VALIDATION_UNKNOWN")
     ready_operation = operation
 
+    suffix = "-" + source_suffix if source_suffix else ""
     source_path = os.path.join(
-        paths["receipts"], "margin-%s.json" % job.job_id
+        paths["receipts"], "margin-%s%s.json" % (job.job_id, suffix)
     )
     receipt = {
         "kind": "margin_operation",
@@ -5183,7 +5145,8 @@ def _run_margin_operation(
     post_params = dict(operation["params"])
     authority_refusal, authority_now, authority_digests, stop_present = \
         _margin_post_authority(
-            job, paths, operation, post_params, validated_job_digest
+            job, paths, operation, post_params, validated_job_digest,
+            authority_job, reverse_entry,
         )
     receipt["authority_checked_utc"] = _utc_text(authority_now)
     receipt["authority_digests"] = authority_digests
@@ -5259,7 +5222,8 @@ def _run_margin_operation(
 
     authority_refusal, authority_now, authority_digests, stop_present = \
         _margin_post_authority(
-            job, paths, operation, post_params, validated_job_digest
+            job, paths, operation, post_params, validated_job_digest,
+            authority_job, reverse_entry,
         )
     receipt["authority_checked_utc"] = _utc_text(authority_now)
     receipt["authority_digests"] = authority_digests
@@ -5274,21 +5238,21 @@ def _run_margin_operation(
         ready_operation["expected_ledger_confirmation"] = repay_expected
         receipt["ready"] = ready_operation
 
-    intent_id = operation["intent_id"]
-    try:
-        intent_claimed = _claim_margin_intent(
-            paths, intent_id, job.job_id, authority_now
-        )
-    except Exception:
-        return _finish_margin_before_post(
-            receipt, source_path, "UNKNOWN", 4,
-            "MARGIN_INTENT_CLAIM_PERSISTENCE_FAILED", authority_now,
-        )
-    if not intent_claimed:
-        return _finish_margin_before_post(
-            receipt, source_path, "REFUSED", 2,
-            "INTENT_ALREADY_CLAIMED", authority_now,
-        )
+    if claim_intent:
+        try:
+            intent_claimed = _claim_margin_intent(
+                paths, operation["intent_id"], job.job_id, authority_now
+            )
+        except Exception:
+            return _finish_margin_before_post(
+                receipt, source_path, "UNKNOWN", 4,
+                "MARGIN_INTENT_CLAIM_PERSISTENCE_FAILED", authority_now,
+            )
+        if not intent_claimed:
+            return _finish_margin_before_post(
+                receipt, source_path, "REFUSED", 2,
+                "INTENT_ALREADY_CLAIMED", authority_now,
+            )
     sealed_repay = job.op == margin_ops.MARGIN_REPAY and stop_present
     if sealed_repay:
         receipt["execution_mode"] = "STOP_JOBS_REPAY"
@@ -5408,22 +5372,6 @@ class ReverseReadUnknown(Exception):
     """One required reverse-mechanics exchange fact is unreadable."""
 
 
-def _reverse_decimal(value: Any, field: str,
-                     positive: bool = False) -> Decimal:
-    if type(value) is not str or not value \
-            or len(value) > MARGIN_DECIMAL_TEXT_MAX \
-            or REVERSE_DECIMAL_RE.fullmatch(value) is None:
-        raise ReverseReadUnknown(field + "_UNREADABLE")
-    try:
-        parsed = Decimal(value)
-    except (ArithmeticError, ValueError):
-        raise ReverseReadUnknown(field + "_UNREADABLE") from None
-    if not parsed.is_finite() \
-            or (parsed <= Decimal("0") if positive else parsed < Decimal("0")):
-        raise ReverseReadUnknown(field + "_UNREADABLE")
-    return parsed
-
-
 def _reverse_read(transport: Callable[..., Tuple[str, Any]],
                   base_url: str, path: str,
                   params: Optional[Dict[str, str]], signed: bool,
@@ -5438,322 +5386,43 @@ def _reverse_read(transport: Callable[..., Tuple[str, Any]],
     return result[1]
 
 
-def _reverse_one_symbol(payload: Any, symbol: str,
-                        label: str) -> Dict[str, Any]:
-    if type(payload) is not dict or type(payload.get("symbols")) is not list:
-        raise ReverseReadUnknown(label + "_UNREADABLE")
-    matches = [
-        row for row in payload["symbols"]
-        if type(row) is dict and row.get("symbol") == symbol
-    ]
-    if len(matches) != 1:
-        raise ReverseReadUnknown(label + "_UNREADABLE")
-    return matches[0]
-
-
-def _reverse_spot_context(symbol_info: Dict[str, Any], book: Any,
-                          borrow_asset: str) -> Dict[str, Any]:
-    try:
-        if symbol_info.get("status") != "TRADING" \
-                or symbol_info.get("baseAsset") != borrow_asset \
-                or symbol_info.get("quoteAsset") != "USDT" \
-                or "MARKET" not in symbol_info.get("orderTypes", []):
-            raise JobRefusal("REVERSE_SPOT_NOT_TRADABLE")
-        margin_allowed = symbol_info.get("isMarginTradingAllowed")
-        if margin_allowed is not True \
-                and str(margin_allowed).lower() != "true":
-            raise JobRefusal("REVERSE_MARGIN_NOT_ALLOWED")
-        if type(book) is not dict:
-            raise ReverseReadUnknown("REVERSE_SPOT_PRICE_UNREADABLE")
-        bid = _reverse_decimal(book.get("bidPrice"), "REVERSE_SPOT_BID", True)
-        ask = _reverse_decimal(book.get("askPrice"), "REVERSE_SPOT_ASK", True)
-        filters = {
-            row["filterType"]: row for row in symbol_info.get("filters", [])
-            if type(row) is dict and type(row.get("filterType")) is str
-        }
-        lot = filters["LOT_SIZE"]
-        step = _reverse_decimal(
-            lot.get("stepSize"), "REVERSE_SPOT_STEP", True
-        )
-        market_step_text = filters.get("MARKET_LOT_SIZE", {}).get(
-            "stepSize", "0"
-        )
-        market_step = _reverse_decimal(
-            market_step_text, "REVERSE_SPOT_MARKET_STEP"
-        )
-        if market_step > Decimal("0"):
-            step = futures_hand.common_step(step, market_step)
-        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL")
-        if type(notional) is not dict:
-            raise ReverseReadUnknown("REVERSE_SPOT_MIN_NOTIONAL_UNREADABLE")
-        minimum = _reverse_decimal(
-            notional.get("minNotional"),
-            "REVERSE_SPOT_MIN_NOTIONAL", True,
-        )
-    except KeyError:
-        raise ReverseReadUnknown("REVERSE_SPOT_METADATA_UNREADABLE") from None
-    except (ArithmeticError, TypeError, ValueError):
-        raise ReverseReadUnknown("REVERSE_SPOT_METADATA_UNREADABLE") from None
-    return {
-        "meta": {"step": step, "min_notional": minimum, "price": ask},
-        "bid": bid, "ask": ask, "step": step,
-        "min_notional": minimum,
-    }
-
-
-def _reverse_asset_row(payload: Any, asset: str) -> Dict[str, Any]:
-    if type(payload) is not dict or type(payload.get("userAssets")) is not list:
-        raise ReverseReadUnknown("REVERSE_MARGIN_ACCOUNT_UNREADABLE")
-    rows = [
-        row for row in payload["userAssets"]
-        if type(row) is dict and row.get("asset") == asset
-    ]
-    if len(rows) != 1:
-        raise ReverseReadUnknown("REVERSE_MARGIN_ASSET_UNREADABLE")
-    return rows[0]
-
-
-def _reverse_asset_truth(payload: Any, asset: str) -> Dict[str, Decimal]:
-    row = _reverse_asset_row(payload, asset)
-    free = _reverse_decimal(row.get("free"), "REVERSE_BASE_FREE")
-    borrowed = _reverse_decimal(
-        row.get("borrowed"), "REVERSE_BASE_BORROWED"
-    )
-    interest = _reverse_decimal(
-        row.get("interest"), "REVERSE_BASE_INTEREST"
-    )
-    with localcontext() as context:
-        context.prec = (MARGIN_DECIMAL_TEXT_MAX * 2) + 2
-        liability = borrowed + interest
-    return {
-        "free": free, "borrowed": borrowed,
-        "interest": interest, "liability": liability,
-    }
-
-
-def _reverse_borrow_facts(payload: Any, asset: str) \
-        -> Tuple[Decimal, Decimal]:
-    row = _reverse_asset_row(payload, asset)
-    borrowable_fields = (
-        "maxBorrowable", "borrowable", "maxBorrowableAmount",
-    )
-    interest_fields = (
-        "interestRateHourly", "hourlyInterestRate", "interestRate",
-    )
-    borrowable_values = [
-        _reverse_decimal(row[name], "REVERSE_BORROWABLE", True)
-        for name in borrowable_fields if name in row
-    ]
-    interest_values = [
-        _reverse_decimal(row[name], "REVERSE_INTEREST_RATE")
-        for name in interest_fields if name in row
-    ]
-    if not borrowable_values or len(set(borrowable_values)) != 1:
-        raise ReverseReadUnknown("REVERSE_BORROWABLE_UNREADABLE")
-    if not interest_values or len(set(interest_values)) != 1:
-        raise ReverseReadUnknown("REVERSE_INTEREST_RATE_UNREADABLE")
-    return borrowable_values[0], interest_values[0]
-
-
 def _reverse_plan_row(plan: reverse_mechanics.ReversePlan) -> Dict[str, Any]:
     return {
         "symbol": plan.symbol,
         "intent_id": plan.intent_id,
+        "client_tag": plan.client_tag,
         "base_qty": _decimal_text(plan.base_qty),
         "borrow_asset": plan.borrow_asset,
-        "borrow_principal": _decimal_text(plan.borrow_principal),
-        "borrowable": _decimal_text(plan.borrowable),
-        "interest_rate_hourly": _decimal_text(plan.interest_rate_hourly),
-        "quote_cap": _decimal_text(plan.quote_cap),
         "quote_notional": _decimal_text(plan.quote_notional),
-        "spot_notional": _decimal_text(plan.spot_notional),
-        "perp_notional": _decimal_text(plan.perp_notional),
-        "common_step": _decimal_text(plan.common_step),
-        "spot_step": _decimal_text(
-            getattr(plan, "spot_step", None) or plan.common_step
-        ),
         "dust": _decimal_text(plan.dust),
         "legs": [{
             "name": leg.name,
             "client_id": leg.client_id_seed,
             "base_qty": _decimal_text(leg.base_qty),
             "reduce_only": leg.reduce_only,
-            "lifecycle_states": list(leg.lifecycle_states),
         } for leg in plan.legs],
-    }
-
-
-def _reverse_preflight(
-        job: Job, transport: Callable[..., Tuple[str, Any]]) \
-        -> Tuple[reverse_mechanics.ReversePlan, Dict[str, Any],
-                 Dict[str, Any]]:
-    spot_exchange = _reverse_read(
-        transport, basis_executor.SPOT.base_url,
-        basis_executor.SPOT.exchange_info_path,
-        {"symbol": job.symbol}, False, "REVERSE_SPOT_METADATA",
-    )
-    spot_book = _reverse_read(
-        transport, basis_executor.SPOT.base_url,
-        basis_executor.SPOT_BOOK_PATH,
-        {"symbol": job.symbol}, False, "REVERSE_SPOT_PRICE",
-    )
-    perp_exchange = _reverse_read(
-        transport, basis_executor.USDM.base_url,
-        basis_executor.USDM.exchange_info_path,
-        {"symbol": job.symbol}, False, "REVERSE_PERP_METADATA",
-    )
-    perp_book = _reverse_read(
-        transport, basis_executor.USDM.base_url,
-        basis_executor.USDM_BOOK_PATH,
-        {"symbol": job.symbol}, False, "REVERSE_PERP_PRICE",
-    )
-    mark = _reverse_read(
-        transport, basis_executor.USDM.base_url,
-        basis_executor.USDM_PREMIUM_PATH,
-        {"symbol": job.symbol}, False, "REVERSE_PERP_MARK",
-    )
-    account = _reverse_read(
-        transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH,
-        {}, True, "REVERSE_MARGIN_ACCOUNT",
-    )
-    risks = _reverse_read(
-        transport, basis_executor.USDM.base_url,
-        basis_executor.USDM_POSITION_PATH,
-        {"symbol": job.symbol}, True, "REVERSE_FUTURES_POSITION",
-    )
-    spot_info = _reverse_one_symbol(
-        spot_exchange, job.symbol, "REVERSE_SPOT_METADATA"
-    )
-    perp_info = _reverse_one_symbol(
-        perp_exchange, job.symbol, "REVERSE_PERP_METADATA"
-    )
-    spot = _reverse_spot_context(spot_info, spot_book, job.borrow_asset)
-    try:
-        hand_plan = futures_hand.plan_open(
-            perp_info, perp_book, mark, job.effective_notional,
-            Decimal(os.environ.get("MAX_SLIPPAGE_BPS", "10")), "BUY",
-        )
-    except (ArithmeticError, futures_hand.PreflightError, TypeError,
-            ValueError):
-        raise JobRefusal("REVERSE_FUTURES_PLAN_REFUSED") from None
-    borrowable, interest_rate = _reverse_borrow_facts(
-        account, job.borrow_asset
-    )
-    plan_result = plan_reverse_mechanics(
-        job.symbol, job.effective_notional, spot["meta"], {
-            "step": hand_plan["step"],
-            "min_notional": hand_plan["min_notional"],
-            "price": hand_plan["limit_price"],
-        }, job.borrow_asset, borrowable, interest_rate, limits,
-    )
-    if not isinstance(plan_result, reverse_mechanics.ReversePlan):
-        reason = getattr(plan_result, "reason", "REVERSE_PLAN_REFUSED")
-        raise JobRefusal(reason if type(reason) is str else "REVERSE_PLAN_REFUSED")
-    if plan_result.base_qty > hand_plan["quantity"]:
-        raise JobRefusal("REVERSE_FUTURES_QUANTITY_REFUSED")
-    initial_asset = _reverse_asset_truth(account, job.borrow_asset)
-    initial_position = basis_executor.futures_position(risks, job.symbol)
-    if initial_position is None:
-        raise ReverseReadUnknown("REVERSE_FUTURES_POSITION_UNREADABLE")
-    if initial_asset["liability"] != Decimal("0"):
-        raise JobRefusal("EXISTING_MARGIN_LIABILITY")
-    if initial_position != Decimal("0"):
-        raise JobRefusal("EXISTING_FUTURES_POSITION")
-    hand_plan = dict(hand_plan)
-    hand_plan["quantity"] = plan_result.base_qty
-    hand_plan["max_fill_notional"] = (
-        plan_result.base_qty * hand_plan["limit_price"]
-    )
-    return plan_result, {
-        "spot": spot,
-        "futures_open_plan": hand_plan,
-        "initial_base_free": initial_asset["free"],
-    }, account
-
-
-def _reverse_exchange_truth(
-        job: Job, context: Dict[str, Any],
-        transport: Callable[..., Tuple[str, Any]]) \
-        -> Tuple[reverse_mechanics.ExchangeTruth, Dict[str, Any]]:
-    account = _reverse_read(
-        transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH,
-        {}, True, "REVERSE_MARGIN_ACCOUNT",
-    )
-    risks = _reverse_read(
-        transport, basis_executor.USDM.base_url,
-        basis_executor.USDM_POSITION_PATH,
-        {"symbol": job.symbol}, True, "REVERSE_FUTURES_POSITION",
-    )
-    asset = _reverse_asset_truth(account, job.borrow_asset)
-    position = basis_executor.futures_position(risks, job.symbol)
-    if position is None or position < Decimal("0"):
-        raise ReverseReadUnknown("REVERSE_FUTURES_POSITION_UNREADABLE")
-    base_delta = asset["free"] - context["initial_base_free"]
-    return reverse_mechanics.ExchangeTruth(
-        asset["liability"], base_delta, position
-    ), {"account": account, "asset": asset, "position": position}
-
-
-def _reverse_entry_authority(
-        job: Job, paths: Dict[str, str], validated_job_digest: str) \
-        -> Tuple[str, datetime, Dict[str, str], bool]:
-    checked = _utc_now()
-    digests: Dict[str, str] = {}
-    job_path = os.path.join(paths["jobs"], "job-%s.json" % job.job_id)
-    try:
-        encoded = _read_file_bytes(job_path)
-    except OSError:
-        return "REVERSE_VALIDATION_UNKNOWN", checked, digests, False
-    measured_digest = _authority_digest(encoded)
-    digests["job_file"] = measured_digest
-    if measured_digest != validated_job_digest:
-        return "REVERSE_VALIDATION_UNKNOWN", checked, digests, False
-    try:
-        fresh_raw = _decode_strict_object(encoded)
-        fresh_job = _validate_reverse_job(fresh_raw, job.job_id, checked)
-    except JobRefusal as error:
-        return error.reason, checked, digests, False
-    except Exception:
-        return "REVERSE_VALIDATION_UNKNOWN", checked, digests, False
-    if fresh_job != job:
-        return "REVERSE_VALIDATION_UNKNOWN", checked, digests, False
-    for name in ("accept_one", "operator", "stop"):
-        try:
-            marker = _read_file_bytes(paths[name])
-        except FileNotFoundError:
-            marker = None
-        except OSError:
-            return "REVERSE_VALIDATION_UNKNOWN", checked, digests, False
-        digests[name] = _authority_digest(marker)
-    stop_present = os.path.isfile(paths["stop"])
-    if stop_present:
-        return "STOP_JOBS_SEALED", checked, digests, True
-    refusal = _entry_ticket_refusal(fresh_job, paths, checked)
-    return refusal, checked, digests, stop_present
-
-
-def _reverse_fees(fills: List[Dict[str, str]]) -> Dict[str, str]:
-    totals: Dict[str, Decimal] = {}
-    for fill in fills:
-        asset = fill["commission_asset"]
-        totals[asset] = totals.get(asset, Decimal("0")) + Decimal(
-            fill["commission"]
-        )
-    return {
-        asset: _decimal_text(amount)
-        for asset, amount in sorted(totals.items())
     }
 
 
 def _reverse_margin_fill_row(fill: margin_orders.MarginFill) \
         -> Tuple[List[Dict[str, str]], Dict[str, str]]:
-    rows = [{
-        "price": _decimal_text(price),
-        "quantity": _decimal_text(quantity),
-        "commission": _decimal_text(commission),
-        "commission_asset": asset,
-    } for price, quantity, commission, asset in fill.fills]
-    return rows, _reverse_fees(rows)
+    rows = []
+    totals: Dict[str, Decimal] = {}
+    for index, (price, quantity, commission, asset) in enumerate(fill.fills or ()):
+        rows.append({
+            "trade_id": "margin-%s-%s" % (fill.order_id, index + 1),
+            "order_id": str(fill.order_id),
+            "price": _decimal_text(price),
+            "qty": _decimal_text(quantity),
+            "realized_pnl": "0",
+            "commission": _decimal_text(commission),
+            "commission_asset": asset,
+        })
+        totals[asset] = totals.get(asset, Decimal("0")) + commission
+    return rows, {
+        asset: _decimal_text(amount)
+        for asset, amount in sorted(totals.items())
+    }
 
 
 def _reverse_start_leg(receipt: Dict[str, Any], path: str, leg: str,
@@ -5785,462 +5454,8 @@ def _reverse_finish_leg(receipt: Dict[str, Any], path: str,
     _persist_json_receipt(path, receipt)
 
 
-def _reverse_margin_order_leg(
-        job: Job, plan: reverse_mechanics.ReversePlan,
-        leg: reverse_mechanics.ReverseLeg, side: str, quantity: Decimal,
-        transport: Callable[..., Tuple[str, Any]], receipt: Dict[str, Any],
-        path: str, ref_price: Decimal, step: Decimal,
-        min_notional: Decimal) \
-        -> Tuple[str, Tuple[Decimal, ...], str]:
-    ready = margin_orders.build_margin_order(
-        job.symbol, side, quantity, leg.client_id_seed,
-        step, min_notional,
-        ref_price,
-    )
-    if not isinstance(ready, margin_orders.MarginOrderReady):
-        row = _reverse_start_leg(
-            receipt, path, leg.name, leg.client_id_seed
-        )
-        reason = getattr(ready, "reason", "MARGIN_ORDER_REFUSED")
-        _reverse_finish_leg(receipt, path, row, "FAILED", str(reason))
-        return reverse_mechanics.FAILED, (), str(reason)
-    row = _reverse_start_leg(
-        receipt, path, leg.name, leg.client_id_seed, ready.params
-    )
-    row["mutation_attempts"] = 1
-    row["submitted_utc"] = _utc_text(_utc_now())
-    _persist_json_receipt(path, receipt)
-    try:
-        post_result = transport(
-            "POST", basis_executor.SPOT.base_url,
-            margin_orders.MARGIN_ORDER_PATH, dict(ready.params), True,
-        )
-    except Exception:
-        post_result = ("unclear", {})
-    parsed: Any = None
-    post_kind = post_result[0] if type(post_result) is tuple \
-        and len(post_result) == 2 else "unreadable"
-    if post_kind == "ok" and type(post_result[1]) is dict:
-        parsed = margin_orders.parse_margin_order_response(
-            post_result[1], ready
-        )
-    if not isinstance(parsed, margin_orders.MarginFill):
-        parsed = margin_orders.query_margin_order(
-            transport, job.symbol, leg.client_id_seed
-        )
-        row["resolved_by_client_id_query"] = True
-    if not isinstance(parsed, margin_orders.MarginFill):
-        if isinstance(parsed, margin_orders.MarginOrderNotFound) \
-                and post_kind == "api_error":
-            _reverse_finish_leg(
-                receipt, path, row, "FAILED", "MARGIN_ORDER_REJECTED"
-            )
-            return reverse_mechanics.FAILED, (), "MARGIN_ORDER_REJECTED"
-        reason = getattr(parsed, "reason", "MARGIN_ORDER_UNKNOWN")
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", str(reason))
-        return reverse_mechanics.UNKNOWN, (), str(reason)
-    row.update({
-        "order_id": parsed.order_id,
-        "exchange_status": parsed.status,
-        "executed_qty": _decimal_text(parsed.executed_qty),
-        "cum_quote": _decimal_text(parsed.cum_quote),
-    })
-    amounts = (parsed.executed_qty,) if parsed.executed_qty > 0 else ()
-    if parsed.fills is None:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "MARGIN_ORDER_FILL_DATA_UNKNOWN"
-        )
-        return reverse_mechanics.UNKNOWN, amounts, \
-            "MARGIN_ORDER_FILL_DATA_UNKNOWN"
-    fills, fees = _reverse_margin_fill_row(parsed)
-    try:
-        net = margin_orders.net_base_after_fees(parsed, job.borrow_asset)
-    except ValueError:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "MARGIN_ORDER_NET_UNKNOWN",
-            fills, fees,
-        )
-        return reverse_mechanics.UNKNOWN, amounts, "MARGIN_ORDER_NET_UNKNOWN"
-    if not isinstance(net, Decimal):
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "MARGIN_ORDER_NET_UNKNOWN",
-            fills, fees,
-        )
-        return reverse_mechanics.UNKNOWN, amounts, "MARGIN_ORDER_NET_UNKNOWN"
-    row["net_base_after_fees"] = _decimal_text(net)
-    if parsed.status != "FILLED" or parsed.executed_qty != ready.quantity:
-        _reverse_finish_leg(
-            receipt, path, row, "FAILED", "MARGIN_ORDER_NOT_FULL",
-            fills, fees,
-        )
-        return reverse_mechanics.FAILED, amounts, "MARGIN_ORDER_NOT_FULL"
-    if parsed.cum_quote > plan.quote_cap:
-        if side == "BUY":
-            row["quote_cap_breach"] = True
-            _reverse_finish_leg(
-                receipt, path, row, "DONE",
-                "EXIT_QUOTE_CAP_BREACH_CONTAINED", fills, fees,
-            )
-            return reverse_mechanics.DONE_STATUS, amounts, \
-                "EXIT_QUOTE_CAP_BREACH_CONTAINED"
-        _reverse_finish_leg(
-            receipt, path, row, "FAILED", "QUOTE_CAP_EXCEEDED",
-            fills, fees,
-        )
-        return reverse_mechanics.FAILED, amounts, "QUOTE_CAP_EXCEEDED"
-    _reverse_finish_leg(receipt, path, row, "DONE", "FILLED", fills, fees)
-    return reverse_mechanics.DONE_STATUS, amounts, "FILLED"
-
-
-def _reverse_futures_trades(
-        transport: Callable[..., Tuple[str, Any]], symbol: str,
-        order_id: Any, executed: Decimal) \
-        -> Tuple[List[Dict[str, str]], Dict[str, str]]:
-    payload = _reverse_read(
-        transport, basis_executor.USDM.base_url, "/fapi/v1/userTrades",
-        {"symbol": symbol, "orderId": str(order_id)}, True,
-        "REVERSE_FUTURES_FILLS",
-    )
-    if type(payload) is not list:
-        raise ReverseReadUnknown("REVERSE_FUTURES_FILLS_UNREADABLE")
-    fills = []
-    covered = Decimal("0")
-    for trade in payload:
-        if type(trade) is not dict or str(trade.get("orderId")) != str(order_id):
-            raise ReverseReadUnknown("REVERSE_FUTURES_FILLS_UNREADABLE")
-        price = _reverse_decimal(
-            trade.get("price"), "REVERSE_FUTURES_FILL_PRICE", True
-        )
-        quantity = _reverse_decimal(
-            trade.get("qty"), "REVERSE_FUTURES_FILL_QUANTITY", True
-        )
-        commission = _reverse_decimal(
-            trade.get("commission"), "REVERSE_FUTURES_COMMISSION"
-        )
-        asset = trade.get("commissionAsset")
-        if type(asset) is not str \
-                or margin_ops.ASSET_RE.fullmatch(asset) is None:
-            raise ReverseReadUnknown("REVERSE_FUTURES_FILLS_UNREADABLE")
-        covered += quantity
-        fills.append({
-            "price": _decimal_text(price),
-            "quantity": _decimal_text(quantity),
-            "commission": _decimal_text(commission),
-            "commission_asset": asset,
-        })
-    if executed > Decimal("0") and covered < executed:
-        raise ReverseReadUnknown("REVERSE_FUTURES_FILLS_INCOMPLETE")
-    return fills, _reverse_fees(fills)
-
-
-def _reverse_futures_order_leg(
-        job: Job, plan: reverse_mechanics.ReversePlan,
-        context: Dict[str, Any], leg: reverse_mechanics.ReverseLeg,
-        quantity: Decimal, transport: Callable[..., Tuple[str, Any]],
-        receipt: Dict[str, Any], path: str) \
-        -> Tuple[str, Tuple[Decimal, ...], str]:
-    previous_symbol = futures_hand.SYMBOL
-    futures_hand.SYMBOL = job.symbol
-    try:
-        if leg.name == reverse_mechanics.FUTURES_LONG_OPEN:
-            hand_plan = dict(context["futures_open_plan"])
-            if quantity > hand_plan["quantity"] \
-                    or quantity * hand_plan["limit_price"] \
-                    < hand_plan["min_notional"] \
-                    or quantity * hand_plan["limit_price"] > plan.quote_cap:
-                raise futures_hand.PreflightError(
-                    "reverse long quantity is outside its measured bounds"
-                )
-            hand_plan["quantity"] = quantity
-            params = futures_hand.open_intent(
-                "BUY", hand_plan, leg.client_id_seed
-            )
-        else:
-            params = futures_hand.close_intent(
-                "SELL", quantity, leg.client_id_seed
-            )
-    except (ArithmeticError, futures_hand.PreflightError, TypeError,
-            ValueError):
-        row = _reverse_start_leg(
-            receipt, path, leg.name, leg.client_id_seed
-        )
-        _reverse_finish_leg(
-            receipt, path, row, "FAILED", "FUTURES_ORDER_REFUSED"
-        )
-        return reverse_mechanics.FAILED, (), "FUTURES_ORDER_REFUSED"
-    finally:
-        futures_hand.SYMBOL = previous_symbol
-    row = _reverse_start_leg(
-        receipt, path, leg.name, leg.client_id_seed, params
-    )
-    row["mutation_attempts"] = 1
-    row["submitted_utc"] = _utc_text(_utc_now())
-    _persist_json_receipt(path, receipt)
-    try:
-        post_result = transport(
-            "POST", basis_executor.USDM.base_url,
-            basis_executor.USDM.order_path, dict(params), True,
-        )
-    except Exception:
-        post_result = ("unclear", {})
-    post_kind = post_result[0] if type(post_result) is tuple \
-        and len(post_result) == 2 else "unreadable"
-    try:
-        query_result = transport(
-            "GET", basis_executor.USDM.base_url,
-            basis_executor.USDM.order_path, {
-                "symbol": job.symbol,
-                "origClientOrderId": leg.client_id_seed,
-            }, True,
-        )
-    except Exception:
-        query_result = ("unclear", {})
-    if type(query_result) is tuple and len(query_result) == 2 \
-            and query_result[0] == "api_error" \
-            and type(query_result[1]) is dict \
-            and query_result[1].get("code") == -2013 \
-            and post_kind == "api_error":
-        _reverse_finish_leg(
-            receipt, path, row, "FAILED", "FUTURES_ORDER_REJECTED"
-        )
-        return reverse_mechanics.FAILED, (), "FUTURES_ORDER_REJECTED"
-    if type(query_result) is not tuple or len(query_result) != 2 \
-            or query_result[0] != "ok" or type(query_result[1]) is not dict:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "FUTURES_ORDER_UNKNOWN"
-        )
-        return reverse_mechanics.UNKNOWN, (), "FUTURES_ORDER_UNKNOWN"
-    order = query_result[1]
-    if order.get("symbol") != job.symbol \
-            or order.get("clientOrderId") != leg.client_id_seed:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "FUTURES_ORDER_IDENTITY_MISMATCH"
-        )
-        return reverse_mechanics.UNKNOWN, (), \
-            "FUTURES_ORDER_IDENTITY_MISMATCH"
-    status = order.get("status")
-    if status not in futures_hand.TERMINAL:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "FUTURES_ORDER_NON_TERMINAL"
-        )
-        return reverse_mechanics.UNKNOWN, (), "FUTURES_ORDER_NON_TERMINAL"
-    try:
-        executed = _reverse_decimal(
-            order.get("executedQty"), "REVERSE_FUTURES_EXECUTED"
-        )
-        cum_quote = _reverse_decimal(
-            order.get("cumQuote"), "REVERSE_FUTURES_QUOTE"
-        )
-        order_id = order.get("orderId")
-        if isinstance(order_id, bool) or type(order_id) not in (int, str) \
-                or not str(order_id).isdigit():
-            raise ReverseReadUnknown("REVERSE_FUTURES_ORDER_ID_UNREADABLE")
-    except ReverseReadUnknown as error:
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", str(error))
-        return reverse_mechanics.UNKNOWN, (), str(error)
-    fills: List[Dict[str, str]] = []
-    fees: Dict[str, str] = {}
-    if executed > Decimal("0"):
-        try:
-            fills, fees = _reverse_futures_trades(
-                transport, job.symbol, order_id, executed
-            )
-        except ReverseReadUnknown as error:
-            _reverse_finish_leg(receipt, path, row, "UNKNOWN", str(error))
-            return reverse_mechanics.UNKNOWN, (executed,), str(error)
-    row.update({
-        "order_id": str(order_id), "exchange_status": status,
-        "executed_qty": _decimal_text(executed),
-        "cum_quote": _decimal_text(cum_quote),
-    })
-    amounts = (executed,) if executed > Decimal("0") else ()
-    if leg.name == reverse_mechanics.FUTURES_CLOSE:
-        reduce_only = order.get("reduceOnly") is True \
-            or str(order.get("reduceOnly", "")).lower() == "true"
-        row["reduce_only"] = reduce_only
-        if not reduce_only:
-            _reverse_finish_leg(
-                receipt, path, row, "UNKNOWN",
-                "FUTURES_REDUCE_ONLY_UNPROVEN", fills, fees,
-            )
-            return reverse_mechanics.UNKNOWN, amounts, \
-                "FUTURES_REDUCE_ONLY_UNPROVEN"
-    if status != "FILLED" or executed != quantity:
-        _reverse_finish_leg(
-            receipt, path, row, "FAILED", "FUTURES_ORDER_NOT_FULL",
-            fills, fees,
-        )
-        return reverse_mechanics.FAILED, amounts, "FUTURES_ORDER_NOT_FULL"
-    if cum_quote > plan.quote_cap:
-        if leg.name == reverse_mechanics.FUTURES_CLOSE:
-            row["quote_cap_breach"] = True
-            _reverse_finish_leg(
-                receipt, path, row, "DONE",
-                "EXIT_QUOTE_CAP_BREACH_CONTAINED", fills, fees,
-            )
-            return reverse_mechanics.DONE_STATUS, amounts, \
-                "EXIT_QUOTE_CAP_BREACH_CONTAINED"
-        _reverse_finish_leg(
-            receipt, path, row, "FAILED", "QUOTE_CAP_EXCEEDED",
-            fills, fees,
-        )
-        return reverse_mechanics.FAILED, amounts, "QUOTE_CAP_EXCEEDED"
-    _reverse_finish_leg(receipt, path, row, "DONE", "FILLED", fills, fees)
-    return reverse_mechanics.DONE_STATUS, amounts, "FILLED"
-
-
-def _reverse_margin_mutation_leg(
-        job: Job, leg: reverse_mechanics.ReverseLeg, request_type: str,
-        amount: Decimal, transport: Callable[..., Tuple[str, Any]],
-        receipt: Dict[str, Any], path: str) \
-        -> Tuple[str, Tuple[Decimal, ...], str]:
-    amount_text = _canonical_decimal_text(amount)
-    params = {
-        "asset": job.borrow_asset,
-        "amount": amount_text,
-        "type": request_type,
-    }
-    row = _reverse_start_leg(
-        receipt, path, leg.name, leg.client_id_seed, params
-    )
-    history_reason, _history_before, history_ids_before = \
-        _margin_history_snapshot(
-            transport, basis_executor.SPOT.base_url,
-            MARGIN_ENDPOINT_PATH, job.borrow_asset,
-        )
-    if history_reason:
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", history_reason)
-        return reverse_mechanics.UNKNOWN, (), history_reason
-    history_watermark = max(history_ids_before, default=0)
-    try:
-        before_result = transport(
-            "GET", basis_executor.SPOT.base_url,
-            MARGIN_ACCOUNT_PATH, {}, True,
-        )
-    except Exception:
-        before_result = ("unclear", {})
-    if type(before_result) is not tuple or len(before_result) != 2 \
-            or before_result[0] != "ok":
-        reason = "MARGIN_CONFIRMATION_UNREADABLE"
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", reason)
-        return reverse_mechanics.UNKNOWN, (), reason
-    liability_before = _margin_account_liability(
-        before_result[1], job.borrow_asset
-    )
-    if liability_before is None:
-        reason = "MARGIN_CONFIRMATION_MISMATCH"
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", reason)
-        return reverse_mechanics.UNKNOWN, (), reason
-    if request_type == "REPAY" \
-            and Decimal(liability_before["total_liability"]) != amount:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "REPAY_LIABILITY_CHANGED"
-        )
-        return reverse_mechanics.UNKNOWN, (), "REPAY_LIABILITY_CHANGED"
-    expected: Optional[Dict[str, str]]
-    if request_type == "BORROW":
-        expected = {
-            "asset": job.borrow_asset, "principal": amount_text,
-            "interest": "0", "status": "BORROW_CONFIRMED",
-        }
-    else:
-        expected = _margin_repay_expected_ledger_confirmation(
-            params, liability_before
-        )
-    if expected is None:
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", "MARGIN_CONFIRMATION_MISMATCH"
-        )
-        return reverse_mechanics.UNKNOWN, (), \
-            "MARGIN_CONFIRMATION_MISMATCH"
-    row.update({
-        "history_watermark": history_watermark,
-        "account_liability_before": liability_before,
-        "expected_ledger_confirmation": expected,
-        "mutation_attempts": 1,
-        "submitted_utc": _utc_text(_utc_now()),
-    })
-    _persist_json_receipt(path, receipt)
-    try:
-        post_result = transport(
-            "POST", basis_executor.SPOT.base_url,
-            MARGIN_ENDPOINT_PATH, dict(params), True,
-        )
-    except Exception:
-        post_result = ("unclear", {})
-    if type(post_result) is not tuple or len(post_result) != 2:
-        post_result = ("unreadable", {})
-    transaction_id = _margin_transaction_id(post_result[1]) \
-        if post_result[0] == "ok" else ""
-    row["submission"] = {
-        "kind": post_result[0] if type(post_result[0]) is str
-        else "unreadable",
-        "transaction_id": transaction_id,
-    }
-    _persist_json_receipt(path, receipt)
-    if not transaction_id:
-        reason = "MARGIN_TRANSACTION_MISSING"
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", reason)
-        return reverse_mechanics.UNKNOWN, (), reason
-    try:
-        after_result = transport(
-            "GET", basis_executor.SPOT.base_url,
-            MARGIN_ACCOUNT_PATH, {}, True,
-        )
-    except Exception:
-        after_result = ("unclear", {})
-    if type(after_result) is not tuple or len(after_result) != 2 \
-            or after_result[0] != "ok":
-        reason = "MARGIN_CONFIRMATION_UNREADABLE"
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", reason)
-        return reverse_mechanics.UNKNOWN, (), reason
-    history_reason, history_after, history_ids_after = \
-        _margin_post_history_snapshot(
-            transport, basis_executor.SPOT.base_url,
-            MARGIN_ENDPOINT_PATH, job.borrow_asset, request_type,
-            transaction_id, history_watermark, job.job_id,
-        )
-    if history_reason:
-        _reverse_finish_leg(receipt, path, row, "UNKNOWN", history_reason)
-        return reverse_mechanics.UNKNOWN, (), history_reason
-    confirmation = _evaluate_margin_confirmation(
-        history_after.get(request_type), history_ids_after,
-        transaction_id, history_watermark, expected, request_type,
-        liability_before, before_result[1], after_result[1],
-    )
-    row["ledger_confirmation"] = confirmation.ledger_confirmation
-    row["account_liability"] = confirmation.account_liability
-    row["snapshot_time_note"] = confirmation.snapshot_time_note
-    fills = [{"quantity": amount_text}]
-    amounts = (amount,)
-    if request_type == "BORROW" and confirmation.verdict == "OPEN":
-        _reverse_finish_leg(
-            receipt, path, row, "DONE", confirmation.reason, fills, {}
-        )
-        return reverse_mechanics.DONE_STATUS, amounts, confirmation.reason
-    if request_type == "REPAY" and confirmation.verdict == "CLOSED" \
-            and isinstance(confirmation.account_liability, dict) \
-            and Decimal(confirmation.account_liability["total_liability"]) \
-            == Decimal("0"):
-        _reverse_finish_leg(
-            receipt, path, row, "DONE", confirmation.reason, fills, {}
-        )
-        return reverse_mechanics.DONE_STATUS, amounts, confirmation.reason
-    if confirmation.verdict == "UNKNOWN":
-        _reverse_finish_leg(
-            receipt, path, row, "UNKNOWN", confirmation.reason, fills, {}
-        )
-        return reverse_mechanics.UNKNOWN, amounts, confirmation.reason
-    _reverse_finish_leg(
-        receipt, path, row, "FAILED", "MARGIN_LIABILITY_REMAINS",
-        fills, {},
-    )
-    return reverse_mechanics.FAILED, amounts, "MARGIN_LIABILITY_REMAINS"
-
-
 def _reverse_action_row(action: Any, now: datetime) -> Dict[str, Any]:
-    row = {"kind": getattr(action, "kind", "UNKNOWN"),
-           "utc": _utc_text(now)}
+    row = {"kind": getattr(action, "kind", "UNKNOWN"), "utc": _utc_text(now)}
     if isinstance(action, reverse_mechanics.NextLeg):
         row["leg"] = action.leg.name
         row["quantity"] = _decimal_text(action.leg.base_qty)
@@ -6256,7 +5471,8 @@ def _reverse_action_row(action: Any, now: datetime) -> Dict[str, Any]:
 
 def _reverse_exposure_reason(
         truth: reverse_mechanics.ExchangeTruth,
-        plan: reverse_mechanics.ReversePlan) -> str:
+        plan: reverse_mechanics.ReversePlan,
+        spot_open_orders: int = 0, futures_open_orders: int = 0) -> str:
     standing = []
     if truth.futures_position and truth.futures_position > Decimal("0"):
         standing.append(reverse_mechanics.FUTURES_CLOSE)
@@ -6265,328 +5481,507 @@ def _reverse_exposure_reason(
         standing.append("BASE_BALANCE_DELTA")
     if truth.liability and truth.liability > Decimal("0"):
         standing.append(reverse_mechanics.REPAY)
+    if spot_open_orders:
+        standing.append("SPOT_OPEN_ORDERS")
+    if futures_open_orders:
+        standing.append("FUTURES_OPEN_ORDERS")
     return "OPEN_EXPOSURE:" + (",".join(standing) if standing else "KNOWN")
-
-
-def _reverse_ledger(receipt: Dict[str, Any]) -> Dict[str, Any]:
-    fills = []
-    fees = []
-    for leg in receipt.get("legs", []):
-        if not isinstance(leg, dict):
-            continue
-        for fill in leg.get("fills", []):
-            if isinstance(fill, dict):
-                fills.append({"leg": leg.get("leg", ""), **fill})
-        for asset, amount in leg.get("fees_by_asset", {}).items():
-            fees.append({
-                "leg": leg.get("leg", ""),
-                "commission_asset": asset, "commission": amount,
-            })
-    return {
-        "fills": fills, "fees": fees,
-        "realized": {"gross_usdt": "UNKNOWN", "net_usdt": "UNKNOWN"},
-    }
-
-
-def _finish_reverse_source(receipt: Dict[str, Any], path: str,
-                           verdict: str, code: int, reason: str) -> Outcome:
-    receipt.update({
-        "verdict": verdict, "reason": reason,
-        "finished_utc": _utc_text(_utc_now()),
-    })
-    try:
-        _persist_json_receipt(path, receipt)
-    except Exception:
-        return Outcome(
-            "UNKNOWN", 4, path if os.path.isfile(path) else "",
-            "REVERSE_RECEIPT_PERSISTENCE_FAILED",
-        )
-    return Outcome(verdict, code, path, reason, _reverse_ledger(receipt))
 
 
 def _run_reverse_mechanics(
         job: Job, paths: Dict[str, str],
         request: Optional[Callable[..., Tuple[str, Any]]],
         governor_token: str, sha: str, validated_job_digest: str) -> Outcome:
-    source_path = os.path.join(
-        paths["receipts"], "reverse-%s.json" % job.job_id
-    )
+    source_path = os.path.join(paths["receipts"], "reverse-%s.json" % job.job_id)
     receipt: Dict[str, Any] = {
         "kind": "reverse_mechanics_roundtrip", "job_id": job.job_id,
-        "op": REVERSE_OP, "symbol": job.symbol,
-        "borrow_asset": job.borrow_asset,
+        "op": REVERSE_OP, "symbol": job.symbol, "borrow_asset": job.borrow_asset,
         "quote_cap": _decimal_text(job.effective_notional),
-        "intent_id": job.intent_id, "client_tag": job.client_tag,
-        "sha": sha, "started_utc": _utc_text(_utc_now()),
-        "verdict": "PREFLIGHT", "reason": "", "plan": None,
-        "market": {}, "ladder_actions": [], "legs": [],
-        "authority_digests": {},
+        "intent_id": job.intent_id, "client_tag": job.client_tag, "sha": sha,
+        "started_utc": _utc_text(_utc_now()), "mutation_attempts": 0,
+        "verdict": "PREFLIGHT", "reason": "", "plan": None, "market": {},
+        "ladder_actions": [], "legs": [],
     }
     if governor_token:
-        receipt["governor_token"] = governor_token
-        receipt["governor_release"] = "PENDING"
+        receipt.update({"governor_token": governor_token,
+                        "governor_release": "PENDING"})
     try:
-        _persist_json_receipt(source_path, receipt, create=True)
+        _persist_margin_source(source_path, receipt, create=True)
     except Exception:
+        return Outcome("UNKNOWN", 4, source_path if os.path.isfile(source_path)
+                       else "", "REVERSE_READY_PERSISTENCE_FAILED")
+    trade_fills: List[Dict[str, str]] = []
+
+    def finish(verdict: str, code: int, reason: str) -> Outcome:
+        result = _finish_margin_source(
+            receipt, source_path, verdict, code, reason, _utc_now())
         return Outcome(
-            "UNKNOWN", 4,
-            source_path if os.path.isfile(source_path) else "",
-            "REVERSE_READY_PERSISTENCE_FAILED",
-        )
+            result.verdict, result.exit_code, result.receipt_path, result.reason,
+            _momentum_ledger(trade_fills, closed=result.verdict == "CLOSED"))
+
     try:
         transport = request or basis_executor.live_request_factory(
             os.environ.get("BINANCE_API_KEY", ""),
-            os.environ.get("BINANCE_API_SECRET", ""),
-        )
+            os.environ.get("BINANCE_API_SECRET", ""))
     except Exception:
-        return _finish_reverse_source(
-            receipt, source_path, "UNKNOWN", 4,
-            "REVERSE_TRANSPORT_UNREADABLE",
-        )
+        return finish("UNKNOWN", 4, "REVERSE_TRANSPORT_UNREADABLE")
+
+    previous_http = futures_hand.http
+
+    def reverse_http(method, path, params=None, signed=False):
+        return transport(method, basis_executor.USDM.base_url, path,
+                         params or {}, signed)
+
+    futures_hand.http = reverse_http
     try:
-        plan, context, _account = _reverse_preflight(job, transport)
-    except JobRefusal as error:
-        return _finish_reverse_source(
-            receipt, source_path, "REFUSED", 2, error.reason
-        )
-    except ReverseReadUnknown as error:
-        return _finish_reverse_source(
-            receipt, source_path, "UNKNOWN", 4, str(error)
-        )
-    receipt["plan"] = _reverse_plan_row(plan)
-    receipt["market"] = {
-        "spot_bid": _decimal_text(context["spot"]["bid"]),
-        "spot_ask": _decimal_text(context["spot"]["ask"]),
-        "spot_step": _decimal_text(context["spot"]["step"]),
-        "spot_min_notional": _decimal_text(
-            context["spot"]["min_notional"]
-        ),
-        "futures_limit_price": _decimal_text(
-            context["futures_open_plan"]["limit_price"]
-        ),
-    }
-    try:
-        _persist_json_receipt(source_path, receipt)
-    except Exception:
-        return Outcome(
-            "UNKNOWN", 4, source_path,
-            "REVERSE_RECEIPT_PERSISTENCE_FAILED",
-        )
-    ledger: Dict[str, Any] = {}
-    attempts: Dict[str, int] = {}
-    entry_failure = ""
-    entry_completed = False
-    intent_claimed = False
-    for _step in range(18):
         try:
-            truth, truth_detail = _reverse_exchange_truth(
-                job, context, transport
-            )
-        except ReverseReadUnknown as error:
-            action = reverse_mechanics.FREEZE(str(error))
-            receipt["ladder_actions"].append(
-                _reverse_action_row(action, _utc_now())
-            )
-            return _finish_reverse_source(
-                receipt, source_path, "UNKNOWN", 4, str(error)
-            )
-        action = next_action(plan, ledger, truth)
-        receipt["ladder_actions"].append(
-            _reverse_action_row(action, _utc_now())
-        )
-        try:
-            _persist_json_receipt(source_path, receipt)
+            spot = _spot_market_context(_spot_state(
+                job.symbol, sha, paths["receipts"], "reverse-" + job.job_id,
+                transport), job.effective_notional, margin_required=True)
+            account = _reverse_read(
+                transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH,
+                {}, True, "REVERSE_MARGIN_ACCOUNT")
+            liability = _margin_account_liability(account, job.borrow_asset)
+            balances = _spot_balances(account, job.borrow_asset)
+            rows = account.get("userAssets") if isinstance(account, dict) else ()
+            matches = [row for row in rows if isinstance(row, dict)
+                       and row.get("asset") == job.borrow_asset]
+            if liability is None or len(matches) != 1:
+                raise ReverseReadUnknown("REVERSE_MARGIN_ACCOUNT_UNREADABLE")
+            asset_row = matches[0]
+            borrowable = [_momentum_decimal(asset_row[name], "reverse borrowable")
+                          for name in ("maxBorrowable", "borrowable",
+                                      "maxBorrowableAmount")
+                          if name in asset_row]
+            interest = [_momentum_decimal(
+                asset_row[name], "reverse hourly interest", allow_zero=True)
+                for name in ("interestRateHourly", "hourlyInterestRate",
+                             "interestRate") if name in asset_row]
+            if not borrowable or len(set(borrowable)) != 1 \
+                    or not interest or len(set(interest)) != 1:
+                raise ReverseReadUnknown("REVERSE_BORROW_FACTS_UNREADABLE")
+            _configure_futures_hand(paths["receipts"])
+            try:
+                hand_plan = futures_hand.preflight(
+                    job.effective_notional,
+                    Decimal(os.environ.get("MAX_SLIPPAGE_BPS", "10")), "BUY")
+            except futures_hand.CapabilityBlocked as error:
+                raise ReverseReadUnknown(
+                    "REVERSE_FUTURES_PREFLIGHT_UNREADABLE") from error
+            except futures_hand.PreflightError as error:
+                raise JobRefusal("REVERSE_FUTURES_PREFLIGHT: %s" % error) \
+                    from None
+            if hand_plan.get("current_leverage") != futures_hand.TARGET_LEVERAGE:
+                raise JobRefusal("REVERSE_FUTURES_LEVERAGE_REFUSED")
+            plan_result = plan_reverse_mechanics(
+                job.symbol, job.effective_notional,
+                {"step": spot["step"], "min_notional": spot["min_notional"],
+                 "price": spot["ask"]},
+                {"step": hand_plan["step"],
+                 "min_notional": hand_plan["min_notional"],
+                 "price": hand_plan["limit_price"]},
+                job.borrow_asset, borrowable[0], interest[0], job.intent_id,
+                job.client_tag, limits)
+            if not isinstance(plan_result, reverse_mechanics.ReversePlan):
+                reason = getattr(plan_result, "reason", "REVERSE_PLAN_REFUSED")
+                raise JobRefusal(reason if type(reason) is str
+                                 else "REVERSE_PLAN_REFUSED")
+            plan = plan_result
+            if plan.base_qty > hand_plan["quantity"]:
+                raise JobRefusal("REVERSE_FUTURES_QUANTITY_REFUSED")
+            receipt["plan"] = _reverse_plan_row(plan)
+            if Decimal(liability["total_liability"]) != 0:
+                raise JobRefusal("EXISTING_MARGIN_LIABILITY")
+        except JobRefusal as error:
+            return finish("REFUSED", 2, error.reason)
+        except (MomentumStateError, ReverseReadUnknown) as error:
+            return finish("UNKNOWN", 4, str(error))
         except Exception:
-            return Outcome(
-                "UNKNOWN", 4, source_path,
-                "REVERSE_RECEIPT_PERSISTENCE_FAILED",
-            )
-        if isinstance(action, reverse_mechanics.Freeze):
-            if action.reason in {
-                    "TERMINAL_TRUTH_NOT_FLAT", "RECOVERY_TRUTH_NOT_FLAT"}:
-                return _finish_reverse_source(
-                    receipt, source_path, "OPEN_EXPOSURE", 3,
-                    _reverse_exposure_reason(truth, plan),
+            return finish("UNKNOWN", 4, "REVERSE_PREFLIGHT_UNREADABLE")
+
+        initial_base_free = balances[job.borrow_asset]
+        hand_plan = dict(hand_plan)
+        hand_plan.update({
+            "quantity": plan.base_qty,
+            "max_fill_notional": plan.base_qty * hand_plan["limit_price"],
+        })
+        receipt["market"] = {
+            "spot_bid": _decimal_text(spot["bid"]),
+            "spot_ask": _decimal_text(spot["ask"]),
+            "spot_step": _decimal_text(spot["step"]),
+            "spot_min_notional": _decimal_text(spot["min_notional"]),
+            "futures_limit_price": _decimal_text(hand_plan["limit_price"]),
+        }
+        try:
+            _persist_margin_source(source_path, receipt)
+        except Exception:
+            return Outcome("UNKNOWN", 4, source_path,
+                           "REVERSE_RECEIPT_PERSISTENCE_FAILED")
+
+        def exchange_truth():
+            current = _reverse_read(
+                transport, basis_executor.SPOT.base_url, MARGIN_ACCOUNT_PATH,
+                {}, True, "REVERSE_MARGIN_ACCOUNT")
+            current_liability = _margin_account_liability(
+                current, job.borrow_asset)
+            if current_liability is None:
+                raise ReverseReadUnknown("REVERSE_MARGIN_ACCOUNT_UNREADABLE")
+            current_free = _spot_balances(
+                current, job.borrow_asset)[job.borrow_asset]
+            try:
+                futures = _momentum_measure(job.symbol)
+            except MomentumStateError as error:
+                raise ReverseReadUnknown(
+                    "REVERSE_FUTURES_POSITION_UNREADABLE") from error
+            spot_orders = _reverse_read(
+                transport, basis_executor.SPOT.base_url,
+                basis_executor.SPOT_OPEN_ORDERS_PATH, {"symbol": job.symbol},
+                True, "REVERSE_SPOT_OPEN_ORDERS")
+            if not isinstance(spot_orders, list):
+                raise ReverseReadUnknown(
+                    "REVERSE_SPOT_OPEN_ORDERS_UNREADABLE")
+            return reverse_mechanics.ExchangeTruth(
+                Decimal(current_liability["total_liability"]),
+                current_free - initial_base_free, futures["qty"]), {
+                "spot_open_orders": len(spot_orders),
+                "futures_open_orders": futures["open_orders"],
+            }
+
+        def final_authority(row, leg, params):
+            reason, checked, digests, stopped = _margin_post_authority(
+                job, paths, {"params": dict(params)}, dict(params),
+                validated_job_digest,
+                reverse_entry=leg.name in REVERSE_ENTRY_LEGS)
+            authority = {
+                "authority_checked_utc": _utc_text(checked),
+                "authority_digests": digests,
+                "authority_stop_jobs_present": stopped,
+            }
+            row.update(authority)
+            receipt.update(authority)
+            return reason
+
+        def close_leg(row, status, reason, amounts=(), fills=None, fees=None,
+                      net=None):
+            if isinstance(net, Decimal):
+                row["net_base_after_fees"] = _decimal_text(net)
+            authority_names = ("authority_checked_utc", "authority_digests",
+                               "authority_stop_jobs_present")
+            if "authority_checked_utc" in row:
+                receipt.update({name: row[name] for name in authority_names})
+            _reverse_finish_leg(
+                receipt, source_path, row, status, reason, fills, fees)
+            return status, tuple(amounts), reason
+
+        def margin_mutation(leg):
+            request_type = "BORROW" if leg.name == reverse_mechanics.BORROW \
+                else "REPAY"
+            op = "MARGIN_" + request_type
+            amount = _canonical_decimal_text(leg.base_qty)
+            intent = "mrgintent-" + hashlib.sha256(
+                (job.intent_id + ":" + leg.name).encode("utf-8")
+            ).hexdigest()[:24]
+            try:
+                tag = margin_ops.deterministic_client_tag(
+                    op, job.borrow_asset, amount, _utc_text(job.expires_utc))
+                operation = margin_ops.build_margin_operation({
+                    "op": op, "asset": job.borrow_asset, "principal": amount,
+                    "client_tag": tag, "intent_id": intent,
+                    "expires_utc": _utc_text(job.expires_utc),
+                    "operator_token": job.operator_token,
+                }, frozenset((job.borrow_asset,)), _utc_now())
+                if not isinstance(operation, dict) \
+                        or operation.get("verdict") != "READY":
+                    raise ValueError
+                margin_job = Job(
+                    job.job_id, op, job.borrow_asset, leg.base_qty,
+                    leg.base_qty, job.created_utc, job.expires_utc,
+                    job.requested_by, operator_token=job.operator_token,
+                    intent_id=intent, client_tag=tag,
+                    margin_operation=operation)
+            except Exception:
+                row = _reverse_start_leg(
+                    receipt, source_path, leg.name, leg.client_id_seed)
+                return close_leg(row, reverse_mechanics.FAILED,
+                                 "MARGIN_VALIDATION_UNKNOWN")
+            row = _reverse_start_leg(
+                receipt, source_path, leg.name, leg.client_id_seed,
+                dict(operation["params"]))
+            outcome = _run_margin_operation(
+                margin_job, paths, transport, sha=sha,
+                validated_job_digest=validated_job_digest, authority_job=job,
+                reverse_entry=leg.name in REVERSE_ENTRY_LEGS,
+                asset_whitelist=frozenset((job.borrow_asset,)),
+                source_suffix=leg.name.lower(), claim_intent=False)
+            source = _load_plain_receipt(outcome.receipt_path)
+            if isinstance(source, dict):
+                names = (
+                    "mutation_attempts", "mutation_started_utc",
+                    "history_watermark", "account_liability_before",
+                    "submission", "ledger_confirmation", "account_liability",
+                    "snapshot_time_note", "authority_checked_utc",
+                    "authority_digests", "authority_stop_jobs_present",
                 )
-            return _finish_reverse_source(
-                receipt, source_path, "UNKNOWN", 4, action.reason
-            )
-        if isinstance(action, reverse_mechanics.DoneAction):
-            if truth.liability == Decimal("0") \
-                    and truth.futures_position == Decimal("0") \
-                    and abs(truth.base_balance_delta) < plan.dust:
+                row.update({name: source[name] for name in names if name in source})
+            status = reverse_mechanics.DONE_STATUS if outcome.exit_code == 0 \
+                else (reverse_mechanics.UNKNOWN
+                      if outcome.verdict in FREEZE_VERDICTS
+                      else reverse_mechanics.FAILED)
+            amounts = (leg.base_qty,) \
+                if status == reverse_mechanics.DONE_STATUS else ()
+            fills = [{"quantity": amount}] if amounts else []
+            return close_leg(row, status, outcome.reason, amounts, fills, {})
+
+        def margin_order(leg):
+            side = "SELL" if leg.name == reverse_mechanics.MARGIN_SELL else "BUY"
+            price = spot["bid"] if side == "SELL" else spot["ask"]
+            ready = margin_orders.build_margin_order(
+                job.symbol, side, leg.base_qty, leg.client_id_seed,
+                spot["step"], spot["min_notional"], price)
+            row = _reverse_start_leg(
+                receipt, source_path, leg.name, leg.client_id_seed,
+                ready.params if isinstance(
+                    ready, margin_orders.MarginOrderReady) else None)
+            if not isinstance(ready, margin_orders.MarginOrderReady):
+                return close_leg(row, reverse_mechanics.FAILED, str(
+                    getattr(ready, "reason", "MARGIN_ORDER_REFUSED")))
+            if side == "BUY" and ready.quantity * price > plan.quote_cap:
+                return close_leg(row, reverse_mechanics.FAILED,
+                                 "BUY_BACK_QUOTE_CAP_EXCEEDED")
+            refusal = final_authority(row, leg, ready.params)
+            if refusal:
+                return close_leg(row, reverse_mechanics.FAILED, refusal)
+            row.update({"mutation_attempts": 1,
+                        "submitted_utc": _utc_text(_utc_now())})
+            _persist_margin_source(source_path, receipt)
+            try:
+                post = transport(
+                    "POST", basis_executor.SPOT.base_url,
+                    margin_orders.MARGIN_ORDER_PATH, dict(ready.params), True)
+            except Exception:
+                post = ("unclear", {})
+            post_kind = post[0] if isinstance(post, tuple) and len(post) == 2 \
+                else "unreadable"
+            parsed: Any = margin_orders.parse_margin_order_response(
+                post[1], ready) if post_kind == "ok" \
+                and isinstance(post[1], dict) else None
+            if not isinstance(parsed, margin_orders.MarginFill):
+                parsed = margin_orders.query_margin_order(
+                    transport, job.symbol, leg.client_id_seed)
+                row["resolved_by_client_id_query"] = True
+            if not isinstance(parsed, margin_orders.MarginFill):
+                rejected = isinstance(
+                    parsed, margin_orders.MarginOrderNotFound
+                ) and post_kind == "api_error"
+                return close_leg(
+                    row, reverse_mechanics.FAILED if rejected
+                    else reverse_mechanics.UNKNOWN,
+                    "MARGIN_ORDER_REJECTED" if rejected else str(
+                        getattr(parsed, "reason", "MARGIN_ORDER_UNKNOWN")))
+            amounts = (parsed.executed_qty,) if parsed.executed_qty > 0 else ()
+            if parsed.fills is None:
+                return close_leg(row, reverse_mechanics.UNKNOWN,
+                                 "MARGIN_ORDER_FILL_DATA_UNKNOWN", amounts)
+            fills, fees = _reverse_margin_fill_row(parsed)
+            trade_fills.extend(fills)
+            net = margin_orders.net_base_after_fees(parsed, job.borrow_asset)
+            row.update({
+                "order_id": parsed.order_id, "exchange_status": parsed.status,
+                "executed_qty": _decimal_text(parsed.executed_qty),
+                "cum_quote": _decimal_text(parsed.cum_quote),
+            })
+            if not isinstance(net, Decimal):
+                status, reason = (reverse_mechanics.UNKNOWN,
+                                  "MARGIN_ORDER_NET_UNKNOWN")
+            elif parsed.status != "FILLED" \
+                    or parsed.executed_qty != ready.quantity:
+                status, reason = (reverse_mechanics.FAILED,
+                                  "MARGIN_ORDER_NOT_FULL")
+            elif parsed.cum_quote > plan.quote_cap:
+                status = reverse_mechanics.DONE_STATUS if side == "BUY" \
+                    else reverse_mechanics.FAILED
+                reason = "EXIT_QUOTE_CAP_BREACH_CONTAINED" if side == "BUY" \
+                    else "QUOTE_CAP_EXCEEDED"
+            else:
+                status, reason = reverse_mechanics.DONE_STATUS, "FILLED"
+            return close_leg(row, status, reason, amounts, fills, fees, net)
+
+        def futures_order(leg):
+            try:
+                if leg.name == reverse_mechanics.FUTURES_LONG_OPEN:
+                    order_plan = dict(hand_plan)
+                    notional = leg.base_qty * order_plan["limit_price"]
+                    if leg.base_qty > order_plan["quantity"] \
+                            or notional < order_plan["min_notional"] \
+                            or notional > plan.quote_cap:
+                        raise futures_hand.PreflightError(
+                            "reverse long quantity is outside its bounds")
+                    order_plan["quantity"] = leg.base_qty
+                    intent = futures_hand.open_intent(
+                        "BUY", order_plan, leg.client_id_seed)
+                else:
+                    intent = futures_hand.close_intent(
+                        "SELL", leg.base_qty, leg.client_id_seed)
+            except (ArithmeticError, futures_hand.PreflightError,
+                    TypeError, ValueError):
+                row = _reverse_start_leg(
+                    receipt, source_path, leg.name, leg.client_id_seed)
+                return close_leg(row, reverse_mechanics.FAILED,
+                                 "FUTURES_ORDER_REFUSED")
+            row = _reverse_start_leg(
+                receipt, source_path, leg.name, leg.client_id_seed, intent)
+            refusal = final_authority(row, leg, intent)
+            if refusal:
+                return close_leg(row, reverse_mechanics.FAILED, refusal)
+            row.update({"mutation_attempts": 1,
+                        "submitted_utc": _utc_text(_utc_now())})
+            _persist_margin_source(source_path, receipt)
+            query, order, response_fills, post_kind = _momentum_submit(intent)
+            if query != "terminal":
+                rejected = query == "not_found" and post_kind == "api_error"
+                return close_leg(
+                    row, reverse_mechanics.FAILED if rejected
+                    else reverse_mechanics.UNKNOWN,
+                    "FUTURES_ORDER_REJECTED" if rejected
+                    else "FUTURES_ORDER_UNKNOWN")
+            reduce_only = leg.name == reverse_mechanics.FUTURES_CLOSE
+            try:
+                facts = _momentum_order_facts(
+                    order, leg.client_id_seed, reduce_only)
+            except MomentumStateError as error:
+                return close_leg(
+                    row, reverse_mechanics.UNKNOWN, str(error))
+            amounts = (facts["qty"],) if facts["qty"] > 0 else ()
+            try:
+                fills = _momentum_fills(
+                    order, response_fills) if amounts else []
+            except MomentumStateError as error:
+                return close_leg(
+                    row, reverse_mechanics.UNKNOWN, str(error), amounts)
+            trade_fills.extend(fills)
+            fees = _momentum_ledger(
+                fills)["realized"]["commission_by_asset"]
+            row.update({
+                "order_id": facts["order_id"],
+                "exchange_status": facts["status"],
+                "executed_qty": _decimal_text(facts["qty"]),
+                "cum_quote": _decimal_text(facts["quote"]),
+                "reduce_only": facts["reduce_only"],
+            })
+            if facts["status"] != "FILLED" or facts["qty"] != leg.base_qty:
+                status, reason = (reverse_mechanics.FAILED,
+                                  "FUTURES_ORDER_NOT_FULL")
+            elif facts["quote"] > plan.quote_cap:
+                status = reverse_mechanics.DONE_STATUS if reduce_only \
+                    else reverse_mechanics.FAILED
+                reason = "EXIT_QUOTE_CAP_BREACH_CONTAINED" if reduce_only \
+                    else "QUOTE_CAP_EXCEEDED"
+            else:
+                status, reason = reverse_mechanics.DONE_STATUS, "FILLED"
+            return close_leg(row, status, reason, amounts, fills, fees)
+
+        ledger: Dict[str, Any] = {}
+        attempts: Dict[str, int] = {}
+        entry_failure = ""
+        entry_completed = intent_claimed = False
+        for _step in range(18):
+            try:
+                truth, detail = exchange_truth()
+            except (MomentumStateError, ReverseReadUnknown) as error:
+                action = reverse_mechanics.FREEZE(str(error))
+                receipt["ladder_actions"].append(
+                    _reverse_action_row(action, _utc_now()))
+                return finish("UNKNOWN", 4, str(error))
+            action = next_action(plan, ledger, truth)
+            receipt["ladder_actions"].append(
+                _reverse_action_row(action, _utc_now()))
+            try:
+                _persist_margin_source(source_path, receipt)
+            except Exception:
+                return Outcome("UNKNOWN", 4, source_path,
+                               "REVERSE_RECEIPT_PERSISTENCE_FAILED")
+            open_counts = (detail["spot_open_orders"],
+                           detail["futures_open_orders"])
+            if isinstance(action, reverse_mechanics.Freeze):
+                if action.reason in {"TERMINAL_TRUTH_NOT_FLAT",
+                                     "RECOVERY_TRUTH_NOT_FLAT"}:
+                    return finish("OPEN_EXPOSURE", 3,
+                                  _reverse_exposure_reason(
+                                      truth, plan, *open_counts))
+                return finish("UNKNOWN", 4, action.reason)
+            if isinstance(action, reverse_mechanics.DoneAction):
+                flat = truth.liability == truth.futures_position == 0 \
+                    and abs(truth.base_balance_delta) < plan.dust \
+                    and sum(open_counts) == 0
+                if not flat:
+                    return finish("OPEN_EXPOSURE", 3,
+                                  _reverse_exposure_reason(
+                                      truth, plan, *open_counts))
                 receipt["final_truth"] = {
                     "liability": _canonical_decimal_text(truth.liability),
                     "futures_position": _canonical_decimal_text(
-                        truth.futures_position
-                    ),
+                        truth.futures_position),
                     "base_balance_delta": _canonical_decimal_text(
-                        truth.base_balance_delta
-                    ),
+                        truth.base_balance_delta),
+                    "spot_open_orders": 0, "futures_open_orders": 0,
                     "dust": _canonical_decimal_text(plan.dust),
                 }
                 if entry_failure and not entry_completed:
-                    return _finish_reverse_source(
-                        receipt, source_path, "REFUSED", 2, entry_failure
-                    )
-                reason = "REVERSE_MECHANICS_CLOSED" \
-                    if not entry_failure else \
-                    "REVERSE_MECHANICS_RECOVERED:" + entry_failure
-                return _finish_reverse_source(
-                    receipt, source_path, "CLOSED", 0, reason
-                )
-            return _finish_reverse_source(
-                receipt, source_path, "OPEN_EXPOSURE", 3,
-                _reverse_exposure_reason(truth, plan),
-            )
-        leg = action.leg if isinstance(action, reverse_mechanics.NextLeg) \
-            else action.leg_sequence[0]
-        if attempts.get(leg.name, 0):
-            standing = action.sequence \
-                if isinstance(action, reverse_mechanics.Unwind) \
-                else (leg.name,)
-            return _finish_reverse_source(
-                receipt, source_path, "OPEN_EXPOSURE", 3,
-                "OPEN_EXPOSURE:" + ",".join(standing),
-            )
-        attempts[leg.name] = 1
-        if leg.name in REVERSE_ENTRY_LEGS:
-            authority_reason, authority_now, digests, stop_present = \
-                _reverse_entry_authority(
-                    job, paths, validated_job_digest
-                )
-            receipt["authority_checked_utc"] = _utc_text(authority_now)
-            receipt["authority_digests"] = digests
-            receipt["authority_stop_jobs_present"] = stop_present
-            if authority_reason:
-                row = _reverse_start_leg(
-                    receipt, source_path, leg.name, leg.client_id_seed
-                )
-                _reverse_finish_leg(
-                    receipt, source_path, row, "FAILED", authority_reason
-                )
-                ledger[leg.name] = {
-                    "status": reverse_mechanics.FAILED, "fills": (),
-                    "executed_qty": Decimal("0"),
-                }
-                entry_failure = authority_reason
-                continue
+                    return finish("REFUSED", 2, entry_failure)
+                reason = "REVERSE_MECHANICS_CLOSED" if not entry_failure \
+                    else "REVERSE_MECHANICS_RECOVERED:" + entry_failure
+                return finish("CLOSED", 0, reason)
+            leg = action.leg if isinstance(
+                action, reverse_mechanics.NextLeg) else action.leg_sequence[0]
+            if attempts.get(leg.name):
+                standing = action.sequence if isinstance(
+                    action, reverse_mechanics.Unwind) else (leg.name,)
+                return finish("OPEN_EXPOSURE", 3,
+                              "OPEN_EXPOSURE:" + ",".join(standing))
+            attempts[leg.name] = 1
             if not intent_claimed:
                 try:
-                    intent_claimed = _claim_reverse_intent(
-                        paths, job.intent_id, job.job_id, _utc_now()
-                    )
+                    intent_claimed = _claim_margin_intent(
+                        paths, job.intent_id, job.job_id, _utc_now())
                 except Exception:
-                    return _finish_reverse_source(
-                        receipt, source_path, "UNKNOWN", 4,
-                        "REVERSE_INTENT_CLAIM_PERSISTENCE_FAILED",
-                    )
+                    return finish(
+                        "UNKNOWN", 4,
+                        "REVERSE_INTENT_CLAIM_PERSISTENCE_FAILED")
                 if not intent_claimed:
-                    return _finish_reverse_source(
-                        receipt, source_path, "REFUSED", 2,
-                        "INTENT_ALREADY_CLAIMED",
-                    )
-
-        if leg.name == reverse_mechanics.BORROW:
-            status, fills, reason = _reverse_margin_mutation_leg(
-                job, leg, "BORROW", leg.base_qty,
-                transport, receipt, source_path,
-            )
-        elif leg.name == reverse_mechanics.MARGIN_SELL:
-            status, fills, reason = _reverse_margin_order_leg(
-                job, plan, leg, "SELL", leg.base_qty,
-                transport, receipt, source_path,
-                context["spot"]["bid"],
-                context["spot"]["step"],
-                context["spot"]["min_notional"],
-            )
-        elif leg.name == reverse_mechanics.FUTURES_LONG_OPEN:
-            status, fills, reason = _reverse_futures_order_leg(
-                job, plan, context, leg, leg.base_qty,
-                transport, receipt, source_path,
-            )
-        elif leg.name == reverse_mechanics.FUTURES_CLOSE:
-            status, fills, reason = _reverse_futures_order_leg(
-                job, plan, context, leg, leg.base_qty,
-                transport, receipt, source_path,
-            )
-        elif leg.name == reverse_mechanics.MARGIN_BUY:
-            if leg.base_qty * context["spot"]["ask"] > plan.quote_cap:
-                row = _reverse_start_leg(
-                    receipt, source_path, leg.name, leg.client_id_seed
-                )
-                _reverse_finish_leg(
-                    receipt, source_path, row, "FAILED",
-                    "BUY_BACK_QUOTE_CAP_EXCEEDED",
-                )
-                status, fills, reason = (
-                    reverse_mechanics.FAILED, (),
-                    "BUY_BACK_QUOTE_CAP_EXCEEDED",
-                )
+                    return finish("REFUSED", 2, "INTENT_ALREADY_CLAIMED")
+            if leg.name in {reverse_mechanics.BORROW,
+                            reverse_mechanics.REPAY}:
+                status, amounts, reason = margin_mutation(leg)
+            elif leg.name in {reverse_mechanics.MARGIN_SELL,
+                              reverse_mechanics.MARGIN_BUY}:
+                status, amounts, reason = margin_order(leg)
             else:
-                status, fills, reason = _reverse_margin_order_leg(
-                    job, plan, leg, "BUY", leg.base_qty,
-                    transport, receipt, source_path,
-                    context["spot"]["ask"],
-                    context["spot"]["step"],
-                    context["spot"]["min_notional"],
-                )
-        else:
-            liability = truth_detail["asset"]["liability"]
-            if liability <= Decimal("0"):
-                row = _reverse_start_leg(
-                    receipt, source_path, leg.name, leg.client_id_seed
-                )
-                _reverse_finish_leg(
-                    receipt, source_path, row, "UNKNOWN",
-                    "REPAY_LIABILITY_CHANGED",
-                )
-                status, fills, reason = (
-                    reverse_mechanics.UNKNOWN, (),
-                    "REPAY_LIABILITY_CHANGED",
-                )
-            elif truth_detail["asset"]["free"] < leg.base_qty:
-                row = _reverse_start_leg(
-                    receipt, source_path, leg.name, leg.client_id_seed
-                )
-                _reverse_finish_leg(
-                    receipt, source_path, row, "FAILED",
-                    "INSUFFICIENT_BASE_FOR_REPAY",
-                )
-                status, fills, reason = (
-                    reverse_mechanics.FAILED, (),
-                    "INSUFFICIENT_BASE_FOR_REPAY",
-                )
-            else:
-                status, fills, reason = _reverse_margin_mutation_leg(
-                    job, leg, "REPAY", leg.base_qty,
-                    transport, receipt, source_path,
-                )
-        executed = sum(fills, Decimal("0"))
-        ledger_row: Dict[str, Any] = {
-            "status": status, "fills": fills, "executed_qty": executed,
-        }
-        if leg.name in {
-                reverse_mechanics.MARGIN_SELL,
-                reverse_mechanics.MARGIN_BUY}:
-            net_text = receipt["legs"][-1].get("net_base_after_fees") \
-                if receipt["legs"] else None
-            if type(net_text) is str:
-                try:
-                    ledger_row["net_base_after_fees"] = Decimal(net_text)
-                except ArithmeticError:
-                    pass
-        ledger[leg.name] = ledger_row
-        if leg.name in REVERSE_ENTRY_LEGS \
-                and (status == reverse_mechanics.DONE_STATUS or fills):
-            entry_completed = True
-        if status == reverse_mechanics.FAILED \
-                and leg.name in REVERSE_ENTRY_LEGS:
-            entry_failure = reason
-    return _finish_reverse_source(
-        receipt, source_path, "UNKNOWN", 4,
-        "REVERSE_LADDER_LIMIT_REACHED",
-    )
+                status, amounts, reason = futures_order(leg)
+            receipt["mutation_attempts"] = sum(
+                int(row.get("mutation_attempts", 0)) for row in receipt["legs"]
+                if isinstance(row, dict))
+            ledger_row: Dict[str, Any] = {
+                "status": status, "fills": amounts,
+                "executed_qty": sum(amounts, Decimal("0")),
+            }
+            if leg.name in {reverse_mechanics.MARGIN_SELL,
+                            reverse_mechanics.MARGIN_BUY}:
+                net = receipt["legs"][-1].get("net_base_after_fees")
+                if type(net) is str:
+                    try:
+                        ledger_row["net_base_after_fees"] = Decimal(net)
+                    except ArithmeticError:
+                        pass
+            ledger[leg.name] = ledger_row
+            if leg.name in REVERSE_ENTRY_LEGS \
+                    and (status == reverse_mechanics.DONE_STATUS or amounts):
+                entry_completed = True
+            if status == reverse_mechanics.FAILED \
+                    and leg.name in REVERSE_ENTRY_LEGS:
+                entry_failure = reason
+        return finish("UNKNOWN", 4, "REVERSE_LADDER_LIMIT_REACHED")
+    finally:
+        futures_hand.http = previous_http
 
 
 def _execute(job: Job, receipt_dir: str, paths: Dict[str, str],
@@ -6698,42 +6093,11 @@ def _release_final_outcome_governor(
         except JobRefusal:
             return False
     released = _release_governor(release, governor_token, receipt_dir)
-    if released and op == margin_ops.MARGIN_BORROW:
+    if released and op in {margin_ops.MARGIN_BORROW, REVERSE_OP}:
         released = _mark_margin_governor_released(
             paths, job_id, source_path, governor_token, now, "RELEASED"
         )
-    elif released and op == REVERSE_OP:
-        released = _mark_reverse_governor_released(
-            paths, job_id, source_path, governor_token, now
-        )
     return released
-
-
-def _mark_reverse_governor_released(
-        paths: Dict[str, str], job_id: str, source_path: str,
-        governor_token: str, now: datetime) -> bool:
-    expected_source = os.path.join(
-        paths["receipts"], "reverse-%s.json" % job_id
-    )
-    if os.path.abspath(source_path) != os.path.abspath(expected_source):
-        return False
-    targets = (
-        expected_source,
-        os.path.join(paths["receipts"], "job-%s.json" % job_id),
-    )
-    for path in targets:
-        payload = _load_plain_receipt(path)
-        if not isinstance(payload, dict) \
-                or payload.get("job_id") != job_id \
-                or payload.get("governor_token") != governor_token:
-            return False
-        payload["governor_release"] = "RELEASED"
-        payload["governor_released_utc"] = _utc_text(now)
-        try:
-            _persist_json_receipt(path, payload)
-        except Exception:
-            return False
-    return True
 
 
 def _load_plain_receipt(path: str) -> Optional[Dict[str, Any]]:
@@ -7038,12 +6402,19 @@ def _mark_margin_governor_released(
         paths: Dict[str, str], job_id: str, source_path: str,
         governor_token: str, now: datetime, state: str) -> bool:
     runner_path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
-    expected_source = os.path.join(
+    margin_source = os.path.join(
         paths["receipts"], "margin-%s.json" % job_id
     )
-    if source_path and os.path.abspath(source_path) != os.path.abspath(
-            expected_source):
+    reverse_source = os.path.join(
+        paths["receipts"], "reverse-%s.json" % job_id
+    )
+    allowed_sources = {os.path.abspath(margin_source)}
+    if source_path and os.path.abspath(source_path) == os.path.abspath(
+            reverse_source):
+        allowed_sources.add(os.path.abspath(reverse_source))
+    if source_path and os.path.abspath(source_path) not in allowed_sources:
         return False
+    expected_source = source_path or margin_source
     targets = [
         ("SOURCE_RECEIPT", expected_source),
         ("RUNNER_RECEIPT", runner_path),
@@ -8670,26 +8041,16 @@ def tick(receipt_dir: Optional[str] = None, now: Optional[datetime] = None,
                     paths, receipt_dir, filename_id, op, symbol, outcome, now,
                     validated_job_digest=validated_job_digest,
                 )
-            if job.op in MARGIN_OPS \
-                    and _margin_intent_is_claimed(paths, job.intent_id):
-                outcome = Outcome(
-                    "REFUSED", 2, "", "INTENT_ALREADY_CLAIMED"
-                )
-                return _finish_claimed(
-                    paths, receipt_dir, job.job_id, job.op,
-                    job.symbol, outcome, now,
-                    validated_job_digest=validated_job_digest,
-                )
-            if job.op == REVERSE_OP \
-                    and _reverse_intent_is_claimed(paths, job.intent_id):
-                outcome = Outcome(
-                    "REFUSED", 2, "", "INTENT_ALREADY_CLAIMED"
-                )
-                return _finish_claimed(
-                    paths, receipt_dir, job.job_id, job.op,
-                    job.symbol, outcome, now,
-                    validated_job_digest=validated_job_digest,
-                )
+            if job.op in MARGIN_OPS or job.op == REVERSE_OP:
+                if _margin_intent_is_claimed(paths, job.intent_id):
+                    outcome = Outcome(
+                        "REFUSED", 2, "", "INTENT_ALREADY_CLAIMED"
+                    )
+                    return _finish_claimed(
+                        paths, receipt_dir, job.job_id, job.op,
+                        job.symbol, outcome, now,
+                        validated_job_digest=validated_job_digest,
+                    )
             if job.op in {margin_ops.MARGIN_BORROW, REVERSE_OP} \
                     and os.path.isfile(paths["stop"]):
                 outcome = Outcome("REFUSED", 2, "", "STOP_JOBS_SEALED")
