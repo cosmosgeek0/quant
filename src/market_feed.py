@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Continuous public Binance Spot + USD-M USDT market feed.
 
-Dedicated sockets consume Spot ``!ticker`` and USD-M ``!bookTicker`` books;
-shards consume closed ``@kline_1m`` candles without rotation.  Unsigned
+Dedicated sockets consume per-symbol Spot and all-market USD-M books; shards consume
+closed ``@kline_1m`` candles without rotation.  Unsigned
 ``exchangeInfo`` reads provide size constraints while the flat state preserves
 :mod:`market_stream`; no signed or account path exists here.
 """
@@ -56,14 +56,9 @@ FAPI_BASE_URL = "https://fapi.binance.com"
 SPOT_EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 FAPI_EXCHANGE_INFO_PATH = "/fapi/v1/exchangeInfo"
 
-SPOT_WS_URL = (
-    "wss://stream.binance.com:9443/stream"
-    "?streams=!ticker@arr"
-)
-FAPI_WS_URL = (
-    "wss://fstream.binance.com/market/stream"
-    "?streams=!bookTicker"
-)
+SPOT_WS_URL = "wss://stream.binance.com:9443/stream"
+FAPI_WS_URL = "wss://fstream.binance.com/stream?streams=!bookTicker"
+FAPI_KLINE_WS_URL = "wss://fstream.binance.com/market/stream"
 
 DEFAULT_STATE_PATH = Path("stream_state.json")
 DEFAULT_STOP_PATH = RUNTIME_PATHS.stop
@@ -103,10 +98,9 @@ UNSUPPORTED_STREAM_FIELDS = (
     "funding_rate",
     "next_funding_ms",
 )
-TICKER_STREAM_NAMES = ("!ticker@arr", "!bookTicker")
-STREAM_NAMES = frozenset(name.lower() for name in TICKER_STREAM_NAMES)
+BOOK_TICKER_STREAM_SUFFIX = "@bookticker"
 KLINE_STREAM_SUFFIX = "@kline_1m"
-MAX_KLINES_PER_CONNECTION = MAX_STREAMS_PER_CONNECTION - len(TICKER_STREAM_NAMES)
+MAX_KLINES_PER_CONNECTION = MAX_STREAMS_PER_CONNECTION - 2
 WINDOW_SNAPSHOT_FIELDS = (
     "window_venue",
     "window_oldest_ms",
@@ -712,6 +706,29 @@ def load_feed_windows(
     return windows
 
 
+def _summarize_connection_state(venue_state: Dict[str, Any], written_ms: Optional[int] = None) -> None:
+    ticker = venue_state["ticker"]
+    rows = ticker.get("shards", [])
+    if written_ms is not None:
+        for row in rows:
+            last_ms = row.get("last_message_ms")
+            if row.get("connected") and (last_ms is None or written_ms - int(last_ms) > TICKER_STALE_MS):
+                row["status"] = "stale"
+    keys = ("attempts", "successful_handshakes", "handshake_failures", "reconnects", "stream_count")
+    ticker.update({key: sum(row[key] for row in rows) for key in keys})
+    ticker["connected"] = bool(rows) and all(row["connected"] for row in rows)
+    times = [int(row["last_message_ms"]) for row in rows if row.get("last_message_ms")]
+    ticker["last_message_ms"] = str(max(times)) if times else None
+    all_healthy = all(row["status"] == "healthy" for row in rows)
+    ticker["status"] = ("broken" if not rows or not ticker["successful_handshakes"] else "healthy"
+                        if all_healthy else "stale" if ticker["connected"] else "disconnected")
+    all_connections = [*rows, *venue_state.get("shards", [])]
+    venue_state.update({key: sum(row[key] for row in all_connections) for key in keys[1:4]})
+    klines_healthy = all(row["status"] == "healthy" for row in venue_state.get("shards", []))
+    venue_state["status"] = ("broken" if not venue_state["successful_handshakes"] else "healthy"
+                             if ticker["status"] == "healthy" and klines_healthy else "degraded")
+
+
 def feed_snapshot_payload(
     state: Mapping[str, Mapping[str, Any]],
     windows: Mapping[str, Mapping[str, Any]],
@@ -751,12 +768,7 @@ def feed_snapshot_payload(
         symbols[symbol] = record
     connection_payload = copy.deepcopy(connections or {})
     for venue_state in connection_payload.values():
-        ticker = venue_state.get("ticker")
-        last_ms = ticker.get("last_message_ms") if ticker else None
-        if ticker and ticker.get("connected") and (
-            last_ms is None or written_ms - int(last_ms) > TICKER_STALE_MS
-        ):
-            ticker["status"], venue_state["status"] = "stale", "degraded"
+        _summarize_connection_state(venue_state, written_ms)
     return {
         "version": FEED_STATE_VERSION,
         "written_ms": str(written_ms),
@@ -777,12 +789,12 @@ def parse_combined_message(text: str) -> Tuple[str, List[Mapping[str, Any]]]:
         raise DataReadError("WebSocket message is not a combined stream object")
     stream_name = payload["stream"].lower()
     rows = payload.get("data")
-    if stream_name in STREAM_NAMES:
-        expected = list if stream_name.endswith("@arr") else dict
-        if not isinstance(rows, expected):
-            raise DataReadError("WebSocket all-market payload shape is invalid")
-        return stream_name, ([rows] if isinstance(rows, dict) else
-                             [row for row in rows if isinstance(row, dict)])
+    book_symbol = (valid_symbol(stream_name[:-len(BOOK_TICKER_STREAM_SUFFIX)].upper())
+                   if stream_name.endswith(BOOK_TICKER_STREAM_SUFFIX) else None)
+    if stream_name == "!bookticker" or book_symbol is not None:
+        if not isinstance(rows, dict):
+            raise DataReadError("WebSocket book payload shape is invalid")
+        return stream_name, [rows]
     if stream_name.endswith(KLINE_STREAM_SUFFIX):
         symbol = valid_symbol(stream_name[: -len(KLINE_STREAM_SUFFIX)].upper())
         if symbol is not None and isinstance(rows, dict):
@@ -790,30 +802,27 @@ def parse_combined_message(text: str) -> Tuple[str, List[Mapping[str, Any]]]:
     raise DataReadError("WebSocket message has an unexpected stream")
 
 
-def merge_ticker_rows(
-    state: Dict[str, Dict[str, Any]],
-    venue: str,
-    stream_name: str,
-    rows: Iterable[Mapping[str, Any]],
-    utc: str,
-    received_ms: int,
-    seen_ms: Dict[str, Dict[str, int]],
-) -> set[str]:
-    """Apply one all-market array and return records with new book truth."""
+def merge_ticker_rows(state: Dict[str, Dict[str, Any]], venue: str, stream_name: str,
+                      rows: Iterable[Mapping[str, Any]], utc: str, received_ms: int,
+                      seen_ms: Dict[str, Dict[str, int]]) -> set[str]:
+    """Apply one book update and return records with new book truth."""
     if venue not in {"spot", "perp"}:
         raise ValueError("venue must be spot or perp")
     normalized_stream = stream_name.lower()
-    expected_stream = "!ticker@arr" if venue == "spot" else "!bookticker"
-    if normalized_stream != expected_stream:
+    stream_symbol = (valid_symbol(normalized_stream[:-len(BOOK_TICKER_STREAM_SUFFIX)].upper())
+        if venue == "spot" and normalized_stream.endswith(BOOK_TICKER_STREAM_SUFFIX)
+        else None)
+    if ((venue == "spot" and stream_symbol is None) or (venue == "perp" and
+            normalized_stream != "!bookticker")):
         raise DataReadError("unexpected Binance stream name")
     updated: set[str] = set()
-    bid_field, ask_field = (
-        ("spot_bid", "spot_ask") if venue == "spot" else ("perp_bid", "perp_ask")
-    )
+    bid_field, ask_field = (("spot_bid", "spot_ask") if venue == "spot"
+                            else ("perp_bid", "perp_ask"))
     for row in rows:
         symbol = valid_symbol(row.get("s"))
         record = state.get(symbol) if symbol is not None else None
-        if record is None or record["venues"] not in {venue, "both"}:
+        if (record is None or record["venues"] not in {venue, "both"} or (stream_symbol
+                is not None and symbol != stream_symbol)):
             continue
         bid = optional_decimal_string(row, "b", f"{venue} {symbol}", positive=True)
         ask = optional_decimal_string(row, "a", f"{venue} {symbol}", positive=True)
@@ -822,7 +831,8 @@ def merge_ticker_rows(
             bid, ask = None, None
         record[bid_field] = bid
         record[ask_field] = ask
-        event_ms = row.get("T", row.get("E")) if venue == "perp" else row.get("E")
+        # Spot bookTicker has no event time, so its book time is received_ms.
+        event_ms = row.get("T", row.get("E")) if venue == "perp" else received_ms
         try:
             source_ms = int(str(event_ms))
         except (TypeError, ValueError):
@@ -896,30 +906,32 @@ def merge_kline_rows(
 
 
 def websocket_urls(state: Mapping[str, Mapping[str, Any]]) -> Dict[str, List[str]]:
-    """Build one ticker socket plus kline shards within Binance's cap."""
-    spot_symbols = sorted(
-        symbol for symbol, record in state.items() if record.get("venues") == "spot"
-    )
-    perp_symbols = sorted(
-        symbol
-        for symbol, record in state.items()
-        if record.get("venues") in {"perp", "both"}
-    )
+    """Build dedicated ticker and kline shards within Binance's cap."""
+    spot_ticker_symbols = sorted(symbol for symbol, row in state.items() if row.get("venues") in {"spot", "both"})
+    spot_symbols = sorted(symbol for symbol, row in state.items() if row.get("venues") == "spot")
+    perp_symbols = sorted(symbol for symbol, row in state.items()
+                          if row.get("venues") in {"perp", "both"})
 
-    def with_klines(base: str, symbols: Sequence[str]) -> List[str]:
-        shards: List[str] = []
-        for offset in range(0, len(symbols), MAX_KLINES_PER_CONNECTION):
-            chunk = symbols[offset : offset + MAX_KLINES_PER_CONNECTION]
-            streams = "/".join(
-                f"{symbol.lower()}{KLINE_STREAM_SUFFIX}" for symbol in chunk
-            )
-            shards.append(base.split("?streams=", 1)[0] + "?streams=" + streams)
-        return shards
+    def shards(base: str, symbols: Sequence[str], suffix: str,
+               limit: int) -> List[str]:
+        return [base + "?streams=" + "/".join(
+            f"{symbol.lower()}{suffix}" for symbol in symbols[offset:offset + limit])
+            for offset in range(0, len(symbols), limit)]
 
     return {
-        "spot": [SPOT_WS_URL, *with_klines(SPOT_WS_URL, spot_symbols)],
-        "perp": [FAPI_WS_URL, *with_klines(FAPI_WS_URL, perp_symbols)],
+        "spot": [*shards(SPOT_WS_URL, spot_ticker_symbols, "@bookTicker",
+                         MAX_STREAMS_PER_CONNECTION),
+                 *shards(SPOT_WS_URL, spot_symbols, KLINE_STREAM_SUFFIX,
+                         MAX_KLINES_PER_CONNECTION)],
+        "perp": [FAPI_WS_URL, *shards(
+            FAPI_KLINE_WS_URL, perp_symbols, KLINE_STREAM_SUFFIX,
+            MAX_KLINES_PER_CONNECTION)],
     }
+
+
+def _split_socket_urls(urls: Sequence[str]) -> Tuple[List[str], List[str]]:
+    return ([url for url in urls if KLINE_STREAM_SUFFIX not in url.lower()],
+            [url for url in urls if KLINE_STREAM_SUFFIX in url.lower()])
 
 
 def _set_freshness(
@@ -1113,42 +1125,42 @@ class MarketFeed:
         self.connections = {}
         for venue in ("spot", "perp"):
             venue_urls = list(urls.get(venue, ()))
-            common = {
-                "attempts": 0, "successful_handshakes": 0,
-                "handshake_failures": 0, "reconnects": 0,
-                "connected": False, "status": "broken",
-            }
-            ticker = {**common, "connection": "ticker", "stream_count": 1,
-                      "last_message_ms": None}
-            shards = [
-                {**common, "connection": index,
-                 "stream_count": len(url.split("?streams=", 1)[-1].split("/"))}
-                for index, url in enumerate(venue_urls[1:])
-            ]
+            ticker_urls, kline_urls = _split_socket_urls(venue_urls)
+            common = {"attempts": 0, "successful_handshakes": 0,
+                      "handshake_failures": 0, "reconnects": 0,
+                      "connected": False, "status": "broken"}
+            def connection_rows(group: Sequence[str], ticker: bool = False) -> List[Dict[str, Any]]:
+                return [{**common, "connection": index,
+                         "stream_count": len(url.partition("?streams=")[2].split("/")),
+                         **({"last_message_ms": None} if ticker else {})}
+                        for index, url in enumerate(group)]
+            ticker_shards = connection_rows(ticker_urls, True)
+            shards = connection_rows(kline_urls)
+            ticker = {**common, "connection": "ticker", "stream_count": sum(
+                      row["stream_count"] for row in ticker_shards),
+                      "last_message_ms": None, "shards": ticker_shards}
             self.connections[venue] = {
-                "status": "broken",
-                "expected_connections": len(venue_urls),
-                "successful_handshakes": 0,
-                "handshake_failures": 0, "reconnects": 0,
+                "status": "broken", "expected_connections": len(venue_urls),
+                "successful_handshakes": 0, "handshake_failures": 0, "reconnects": 0,
                 "dropped_frames": prior_connections.get(venue, {}).get(
                     "dropped_frames", 0),
-                "ticker": ticker,
-                "shards": shards,
-            }
+                "ticker": ticker, "shards": shards}
 
     def _record_connection_event(self, kind: str, venue: str, shard: int,
                                  message_ms: Optional[int] = None) -> None:
         venue_state = self.connections.get(venue)
         if venue_state is None:
             return
-        shards = venue_state.get("shards", [])
-        if shard < -1 or shard >= len(shards):
+        rows = (venue_state["ticker"].get("shards", []) if shard < 0
+                else venue_state.get("shards", []))
+        index = -shard - 1 if shard < 0 else shard
+        if index < 0 or index >= len(rows):
             return
-        connection = venue_state["ticker"] if shard == -1 else shards[shard]
+        connection = rows[index]
         if kind == "attempt":
             connection["attempts"] += 1
             connection["reconnects"] = max(0, connection["attempts"] - 1)
-            if shard == -1:
+            if shard < 0:
                 connection["last_message_ms"] = None
         elif kind == "connected":
             connection["successful_handshakes"] += 1
@@ -1158,38 +1170,30 @@ class MarketFeed:
             connection["connected"] = False
         elif kind == "disconnected":
             connection["connected"] = False
-        elif kind == "message" and shard == -1 and message_ms is not None:
+        elif kind == "message" and shard < 0 and message_ms is not None:
             connection["last_message_ms"] = str(message_ms)
         else:
             return
-        if connection["connected"]:
-            has_message = shard >= 0 or connection["last_message_ms"]
-            connection["status"] = "healthy" if has_message else "stale"
-        elif connection["successful_handshakes"] == 0:
-            connection["status"] = "broken"
-        else:
-            connection["status"] = "disconnected"
-        all_connections = [venue_state["ticker"], *shards]
-        for key in ("successful_handshakes", "handshake_failures", "reconnects"):
-            venue_state[key] = sum(row[key] for row in all_connections)
-        if venue_state["successful_handshakes"] == 0:
-            venue_state["status"] = "broken"
-        elif all(row["status"] == "healthy" for row in all_connections):
-            venue_state["status"] = "healthy"
-        else:
-            venue_state["status"] = "degraded"
+        has_message = shard >= 0 or connection.get("last_message_ms") is not None
+        connection["status"] = ("healthy" if connection["connected"] and has_message
+            else "stale" if connection["connected"] else "broken"
+            if not connection["successful_handshakes"] else "disconnected")
+        _summarize_connection_state(venue_state)
 
     def _start_workers(self, urls: Mapping[str, Sequence[str]], generation: int,
                        worker_stop: threading.Event) -> List[threading.Thread]:
-        workers = [
-            threading.Thread(
-                target=self._worker,
-                args=(venue, shard, url, generation, worker_stop),
-                name=f"market-feed-{venue}-{'ticker' if shard < 0 else shard}",
-                daemon=True,
-            )
+        worker_rows = [
+            (venue, -index - 1 if group == 0 else index, url)
             for venue in ("spot", "perp")
-            for shard, url in enumerate(urls.get(venue, ()), -1)
+            for group, group_urls in enumerate(_split_socket_urls(urls.get(venue, ())))
+            for index, url in enumerate(group_urls)
+        ]
+        workers = [
+            threading.Thread(target=self._worker,
+                args=(venue, shard, url, generation, worker_stop), daemon=True,
+                name=f"market-feed-{venue}-{'ticker' + str(-shard) if shard < 0 else shard}",
+            )
+            for venue, shard, url in worker_rows
         ]
         for worker in workers:
             worker.start()
@@ -1256,7 +1260,7 @@ class MarketFeed:
             if kind != "text" or text is None:
                 return
             websocket_messages += 1
-            if shard == -1:
+            if shard < 0:
                 self._record_connection_event("message", venue, shard, self.ms_fn())
                 dirty = True
             try:

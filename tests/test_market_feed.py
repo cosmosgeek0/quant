@@ -128,12 +128,15 @@ class FrameParsingTests(unittest.TestCase):
 
 
 class HandshakeTests(unittest.TestCase):
-    def test_futures_combined_url_uses_market_stream_route(self):
+    def test_futures_ticker_and_kline_use_measured_routes(self):
         self.assertEqual(
             mf.FAPI_WS_URL,
-            "wss://fstream.binance.com/market/stream"
+            "wss://fstream.binance.com/stream"
             "?streams=!bookTicker",
         )
+        urls = mf.websocket_urls({"BTCUSDT": mf.empty_record(FIXED_UTC, "both")})
+        self.assertTrue(urls["perp"][1].startswith(
+            "wss://fstream.binance.com/market/stream?streams="))
 
     def test_tls_upgrade_is_verified_with_injected_socket(self):
         nonce = b"the sample nonce"
@@ -161,8 +164,10 @@ class HandshakeTests(unittest.TestCase):
                 return raw
 
         context = Context()
+        spot_url = mf.websocket_urls(
+            {"BTCUSDT": mf.empty_record(FIXED_UTC, "spot")})["spot"][0]
         client = mf.RFC6455Client.connect(
-            mf.SPOT_WS_URL,
+            spot_url,
             socket_factory=socket_factory,
             ssl_context=context,
             key_bytes=nonce,
@@ -173,7 +178,7 @@ class HandshakeTests(unittest.TestCase):
         )
         request = transport.sent[0].decode("ascii")
         self.assertIn(
-            "GET /stream?streams=!ticker@arr HTTP/1.1", request
+            "GET /stream?streams=btcusdt@bookTicker HTTP/1.1", request
         )
         self.assertEqual(client.recv_text(), "ready")
 
@@ -321,21 +326,22 @@ class MetadataTests(unittest.TestCase):
 class RecordMergeTests(unittest.TestCase):
     def setUp(self):
         spot = mf.parse_exchange_metadata(
-            {"symbols": [spot_info("AAAUSDT"), spot_info("SPOTUSDT")]}, "spot"
+            {"symbols": [spot_info("AAAUSDT"), spot_info("SPOTUSDT"),
+                         spot_info("BTCUSDT")]}, "spot"
         )
         perp = mf.parse_exchange_metadata(
-            {"symbols": [perp_info("AAAUSDT"), perp_info("PERPUSDT")]}, "perp"
+            {"symbols": [perp_info("AAAUSDT"), perp_info("PERPUSDT"),
+                         perp_info("GUAUSDT")]}, "perp"
         )
         self.state = mf.merge_metadata({}, spot, perp, FIXED_UTC)
         self.seen = {}
 
-    def test_documented_spot_array_and_futures_book_event_merge(self):
-        spot_rows = [
-            {"e": "24hrTicker", "E": FIXED_MS - 5, "s": "AAAUSDT",
-             "b": "10", "B": "3", "a": "11", "A": "4"},
-        ]
+    def test_measured_spot_and_futures_book_events_merge(self):
+        received_ms = 1_786_883_000_010
         spot_stream, spot_rows = mf.parse_combined_message(json.dumps(
-            {"stream": "!ticker@arr", "data": spot_rows}
+            {"stream": "btcusdt@bookTicker", "data": {
+                "u": 98573333943, "s": "BTCUSDT", "b": "63025.35000000",
+                "B": "1.96503000", "a": "63025.36000000", "A": "12.97784000"}}
         ))
         changed = mf.merge_ticker_rows(
             self.state,
@@ -343,13 +349,14 @@ class RecordMergeTests(unittest.TestCase):
             spot_stream,
             spot_rows,
             FIXED_UTC,
-            FIXED_MS,
+            received_ms,
             self.seen,
         )
-        self.assertEqual(changed, {"AAAUSDT"})
-        book = {"e": "bookTicker", "u": 400900217, "E": FIXED_MS - 8,
-                "T": FIXED_MS - 9, "s": "AAAUSDT", "b": "12", "B": "5",
-                "a": "13", "A": "7"}
+        self.assertEqual(changed, {"BTCUSDT"})
+        book = {"e": "bookTicker", "u": 400900217, "s": "GUAUSDT",
+                "ps": "GUAUSDT", "b": "0.0424900", "B": "824",
+                "a": "0.0425100", "A": "255", "T": 1_786_883_000_008,
+                "E": 1_786_883_000_009}
         perp_stream, perp_rows = mf.parse_combined_message(json.dumps(
             {"stream": "!bookTicker", "data": book}
         ))
@@ -359,38 +366,29 @@ class RecordMergeTests(unittest.TestCase):
             perp_stream,
             perp_rows,
             FIXED_UTC,
-            FIXED_MS,
+            received_ms,
             self.seen,
         )
-        self.assertEqual(changed, {"AAAUSDT"})
-        record = self.state["AAAUSDT"]
+        self.assertEqual(changed, {"GUAUSDT"})
         self.assertEqual(
-            (record["spot_bid"], record["spot_ask"],
-             record["perp_bid"], record["perp_ask"]),
-            ("10", "11", "12", "13"),
+            (self.state["BTCUSDT"]["spot_bid"],
+             self.state["BTCUSDT"]["spot_ask"],
+             self.state["GUAUSDT"]["perp_bid"],
+             self.state["GUAUSDT"]["perp_ask"]),
+            ("63025.35000000", "63025.36000000", "0.0424900", "0.0425100"),
         )
-        self.assertEqual(self.seen["AAAUSDT"],
-                         {"spot": FIXED_MS - 5, "perp": FIXED_MS - 9})
-        self.assertEqual(
-            record["basis_gap_pct"],
-            "9.0909090909090909090909090909090909090909090909091",
-        )
-        self.assertEqual(record["freshness_ms"], "9")
+        self.assertEqual(self.seen,
+            {"BTCUSDT": {"spot": received_ms},
+             "GUAUSDT": {"perp": 1_786_883_000_008}})
 
     def test_incomplete_or_crossed_book_fails_closed(self):
-        changed = mf.merge_ticker_rows(
-            self.state,
-            "spot",
-            "!ticker@arr",
-            [{"s": "AAAUSDT", "b": "3", "B": "1", "E": FIXED_MS},
-             {"s": "SPOTUSDT", "b": "3", "B": "1", "a": "2", "A": "1",
-              "E": FIXED_MS}],
-            FIXED_UTC,
-            FIXED_MS,
-            self.seen,
-        )
-        self.assertEqual(changed, {"AAAUSDT", "SPOTUSDT"})
-        for symbol in changed:
+        rows = {"AAAUSDT": {"s": "AAAUSDT", "b": "3", "B": "1"},
+                "SPOTUSDT": {"s": "SPOTUSDT", "b": "3", "B": "1",
+                             "a": "2", "A": "1"}}
+        for symbol, row in rows.items():
+            changed = mf.merge_ticker_rows(self.state, "spot",
+                f"{symbol.lower()}@bookTicker", [row], FIXED_UTC, FIXED_MS, self.seen)
+            self.assertEqual(changed, {symbol})
             self.assertEqual(
                 (self.state[symbol]["spot_bid"], self.state[symbol]["spot_ask"]),
                 (None, None),
@@ -398,20 +396,25 @@ class RecordMergeTests(unittest.TestCase):
 
 
 class SubscriptionTests(unittest.TestCase):
-    def test_large_futures_universe_is_sharded_below_stream_cap(self):
+    def test_large_universe_uses_measured_routes_and_stream_caps(self):
         symbols = [f"S{index:04d}USDT" for index in range(500)]
         state = {
             symbol: mf.empty_record(FIXED_UTC, "both") for symbol in symbols
         }
         urls = mf.websocket_urls(state)
-        self.assertEqual(len(urls["spot"]), 1)
+        self.assertEqual(len(urls["spot"]), 3)
         self.assertEqual(len(urls["perp"]), 4)
-        self.assertEqual(urls["spot"][0], mf.SPOT_WS_URL)
         self.assertEqual(urls["perp"][0], mf.FAPI_WS_URL)
-        self.assertNotIn("!ticker@arr", "".join(urls["perp"]))
-        self.assertNotIn("!miniTicker@arr", "".join(urls["perp"]))
+        spot_streams = []
+        for url in urls["spot"]:
+            streams = url.split("?streams=", 1)[1].split("/")
+            self.assertLessEqual(len(streams), mf.MAX_STREAMS_PER_CONNECTION)
+            spot_streams.extend(streams)
+        self.assertEqual(spot_streams,
+            [f"{symbol.lower()}@bookTicker" for symbol in symbols])
         subscribed_klines = []
         for url in urls["perp"][1:]:
+            self.assertTrue(url.startswith(mf.FAPI_KLINE_WS_URL + "?streams="))
             streams = url.split("?streams=", 1)[1].split("/")
             self.assertLessEqual(len(streams), mf.MAX_STREAMS_PER_CONNECTION)
             subscribed_klines.extend(
@@ -764,7 +767,9 @@ class ReconnectTests(unittest.TestCase):
             feed = mf.MarketFeed(Path(raw) / "feed.json", Path(raw) / "STOP",
                 serve=True, window=3, ms_fn=lambda: FIXED_MS,
             )
-            urls = mf.websocket_urls({"AAAUSDT": mf.empty_record(FIXED_UTC, "both")})
+            state = {f"S{index:04d}USDT": mf.empty_record(FIXED_UTC, "both")
+                     for index in range(mf.MAX_STREAMS_PER_CONNECTION + 1)}
+            urls = mf.websocket_urls(state)
             feed._reset_connections(urls)
             feed.connections["spot"]["dropped_frames"] = 7
             feed._reset_connections(urls)
@@ -775,21 +780,28 @@ class ReconnectTests(unittest.TestCase):
                 self.assertEqual((ticker["status"], ticker["attempts"],
                                   ticker["successful_handshakes"],
                                   ticker["last_message_ms"]), ("broken", 0, 0, None))
-                feed._record_connection_event("attempt", venue, -1)
-                feed._record_connection_event("connected", venue, -1)
+                for index in range(len(ticker["shards"])):
+                    feed._record_connection_event("attempt", venue, -index - 1)
+                    feed._record_connection_event("connected", venue, -index - 1)
             old_ms = FIXED_MS - mf.TICKER_STALE_MS - 1
             feed._record_connection_event("message", "spot", -1, old_ms)
+            feed._record_connection_event("message", "spot", -2, FIXED_MS)
+            feed._record_connection_event("message", "perp", -1, old_ms)
             for unused in range(3):
                 feed._record_connection_event("attempt", "perp", 0)
                 feed._record_connection_event("handshake_failed", "perp", 0)
             payload = mf.feed_snapshot_payload({}, {}, 3, FIXED_MS, feed.connections)
-        for venue in payload["connections"].values():
-            self.assertEqual((venue["ticker"]["status"], venue["ticker"]["attempts"],
-                venue["ticker"]["successful_handshakes"], venue["status"]),
-                ("stale", 1, 1, "degraded"))
-        self.assertEqual(payload["connections"]["spot"]["ticker"]["last_message_ms"],
-                         str(old_ms))
+        spot = payload["connections"]["spot"]
+        self.assertEqual((spot["expected_connections"], spot["ticker"]["status"],
+            spot["ticker"]["attempts"], spot["ticker"]["successful_handshakes"],
+            spot["ticker"]["last_message_ms"], spot["status"]),
+            (2, "stale", 2, 2, str(FIXED_MS), "degraded"))
+        self.assertEqual([row["status"] for row in spot["ticker"]["shards"]],
+                         ["stale", "healthy"])
         perp = payload["connections"]["perp"]
+        self.assertEqual((perp["expected_connections"], perp["ticker"]["status"],
+            perp["ticker"]["attempts"], perp["ticker"]["last_message_ms"]),
+            (3, "stale", 1, str(old_ms)))
         self.assertEqual((perp["handshake_failures"], perp["reconnects"]), (3, 2))
         self.assertEqual((perp["shards"][0]["handshake_failures"],
                           perp["shards"][0]["reconnects"]), (3, 2))
