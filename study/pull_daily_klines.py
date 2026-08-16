@@ -9,11 +9,18 @@ from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Seq
 from urllib.error import HTTPError, URLError; from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+try:
+    from study import tape_pull
+except ImportError:
+    import tape_pull  # type: ignore
+
 ROOT = Path(__file__).resolve().parents[1]; BASE = "https://data.binance.vision"
 MANIFEST = ROOT / "study/out/v2/cohort_manifest.json"; SOURCE_DATA = Path("/Users/cosmosgeek/Desktop/quant/study/data")
 DEST = Path(__file__).resolve().parent / "data-daily"; OUTPUT = ROOT / "lane-logs/AB5/long-low-positions.json"
 MONTHS = tuple("2025-%02d" % n for n in range(8, 13)) + tuple("2026-%02d" % n for n in range(1, 8))
 DAYS = tuple("2026-08-%02d" % n for n in range(1, 15)); START, END = date(2025, 8, 15), date(2026, 8, 14)
+# One-day kline members contain at most one row per day, so this deliberately
+# small archive and member ceiling is ample while retaining a useful boundary.
 MAX_BYTES, WORKERS, CHUNK = 8_000_000, 4, 128 * 1024
 
 class PullError(Exception): pass
@@ -79,18 +86,48 @@ def open_get(job: Job) -> Any:
         except (TimeoutError, URLError, OSError) as error: raise PullError("public GET transport failed") from error
     raise PullError("public GET retry limit reached")
 
+class _ChunkStream(io.RawIOBase):
+    """Expose shared verified chunks as a buffered-reader source."""
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__(); self._chunks = iter(chunks); self._pending = memoryview(b"")
+    def readable(self) -> bool: return True
+    def readinto(self, target: Any) -> int:
+        view = memoryview(target)
+        while len(self._pending) == 0:
+            try: self._pending = memoryview(next(self._chunks))
+            except StopIteration: return 0
+        size = min(len(view), len(self._pending)); view[:size] = self._pending[:size]
+        self._pending = self._pending[size:]; return size
+    def close(self) -> None:
+        close_chunks = getattr(self._chunks, "close", None)
+        if callable(close_chunks): close_chunks()
+        super().close()
+
+def _archive_member(job: Job, archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    members = [item for item in archive.infolist() if not item.is_dir()]
+    if len(members) != 1 or members[0].filename != job.member(): raise PullError("archive member differs from expected CSV")
+    if members[0].flag_bits & 1: raise PullError("encrypted archive is not accepted")
+    return members[0]
+
+def _raise_shared_archive_error(error: tape_pull.ArchiveError) -> None:
+    measured, bound = error.measured_value, error.bound
+    if bound == MAX_BYTES and isinstance(measured, int) and measured > MAX_BYTES:
+        raise Refused(measured) from None
+    details = ""
+    if measured is not None: details += f" | measured={measured}"
+    if bound is not None: details += f" | bound={bound}"
+    raise PullError(f"{error}{details}") from None
+
 def verify(job: Job, path: Path) -> int:
     size = path.stat().st_size
     if size > MAX_BYTES: raise Refused(size)
     if size <= 0: raise PullError("archive is empty")
     try:
-        with zipfile.ZipFile(path) as archive:
-            members = [item for item in archive.infolist() if not item.is_dir()]
-            if len(members) != 1 or members[0].filename != job.member(): raise PullError("archive member differs from expected CSV")
-            if members[0].flag_bits & 1: raise PullError("encrypted archive is not accepted")
-            with archive.open(members[0]) as handle:
-                while handle.read(CHUNK): pass
+        with zipfile.ZipFile(path, "r") as archive:
+            member = _archive_member(job, archive)
+            for _chunk in tape_pull.stream_verified_member(archive, member, MAX_BYTES): pass
     except PullError: raise
+    except tape_pull.ArchiveError as error: _raise_shared_archive_error(error)
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error: raise PullError("file is not an intact ZIP") from error
     return size
 
@@ -155,20 +192,27 @@ def jobs_for(items: Mapping[str, str]) -> List[Job]:
             for cadence, periods in (("monthly", MONTHS), ("daily", DAYS)) for period in periods]
 
 def archive_rows(job: Job, path: Path) -> Iterable[Tuple[date, Decimal, Decimal, Decimal]]:
-    with zipfile.ZipFile(path) as archive, archive.open(job.member()) as raw:
-        with io.TextIOWrapper(raw, encoding="utf-8", newline="") as handle:
-            for row in csv.reader(handle):
-                if row and row[0].lower().startswith("open"): continue
-                if len(row) < 5: raise PullError("kline row has fewer than five columns")
-                try:
-                    stamp = int(row[0])
-                    while stamp > 10_000_000_000_000: stamp //= 1_000
-                    day = date(1970, 1, 1) + timedelta(days=stamp // 86_400_000)
-                    high, low, close = Decimal(row[2]), Decimal(row[3]), Decimal(row[4])
-                except (ValueError, InvalidOperation, OverflowError) as error: raise PullError("kline row has invalid price data") from error
-                if not all(value.is_finite() and value > 0 for value in (high, low, close)): raise PullError("kline price is not finite and positive")
-                if low > high or not low <= close <= high: raise PullError("kline price range is inconsistent")
-                if START <= day <= END: yield day, high, low, close
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            member = _archive_member(job, archive)
+            chunks = tape_pull.stream_verified_member(archive, member, MAX_BYTES)
+            raw = io.BufferedReader(_ChunkStream(chunks))
+            with io.TextIOWrapper(raw, encoding="utf-8", newline="") as handle:
+                for row in csv.reader(handle):
+                    if row and row[0].lower().startswith("open"): continue
+                    if len(row) < 5: raise PullError("kline row has fewer than five columns")
+                    try:
+                        stamp = int(row[0])
+                        while stamp > 10_000_000_000_000: stamp //= 1_000
+                        day = date(1970, 1, 1) + timedelta(days=stamp // 86_400_000)
+                        high, low, close = Decimal(row[2]), Decimal(row[3]), Decimal(row[4])
+                    except (ValueError, InvalidOperation, OverflowError) as error: raise PullError("kline row has invalid price data") from error
+                    if not all(value.is_finite() and value > 0 for value in (high, low, close)): raise PullError("kline price is not finite and positive")
+                    if low > high or not low <= close <= high: raise PullError("kline price range is inconsistent")
+                    if START <= day <= END: yield day, high, low, close
+    except PullError: raise
+    except tape_pull.ArchiveError as error: _raise_shared_archive_error(error)
+    except (OSError, UnicodeError, csv.Error, zipfile.BadZipFile, zipfile.LargeZipFile) as error: raise PullError("file is not a readable kline ZIP") from error
 
 def render(value: Decimal) -> str:
     text = format(value, "f"); return text.rstrip("0").rstrip(".") if "." in text else text
