@@ -1,7 +1,7 @@
 """Focused, network-free tests for the shared Binance HTTP transport."""
 from __future__ import annotations
 
-import hashlib, hmac, io, inspect, json, sys, unittest
+import hashlib, hmac, io, inspect, json, sys, tempfile, unittest
 import urllib.error, urllib.parse, urllib.request, urllib.response
 from decimal import Decimal, Inexact
 from pathlib import Path
@@ -129,17 +129,27 @@ class BinanceHttpTests(unittest.TestCase):
         self.assertEqual(clock.call_count, 2)
 
     def test_noncanonical_request_parts_are_refused_before_wire(self):
-        client = bh.BinanceHttp("key", "secret")
+        clock = mock.Mock(return_value=1000)
+        client = bh.BinanceHttp("key", "secret", now_ms=clock)
         cases = ((("signature", "x"),), (("timestamp", "1"),),
                  (("recvWindow", "1"),), (("x", "1"), ("x", "2")),
                  ((1, "x"),), (("x", 1),))
-        with mock.patch.object(client, "_open") as wire:
+        bad_bases = ("https://a.test?pre=1", "https://a.test#part")
+        client._offsets.update((base_url, 0) for base_url in bad_bases)
+        with mock.patch.object(client, "_open") as wire, mock.patch.object(
+                bh.hmac, "new") as signer:
             for params in cases:
                 with self.subTest(params=params), self.assertRaises(bh.AdapterRefusal):
                     client("GET", "https://a.test", "/x", params)
             for path in ("/x?pre=1", "/x#part"):
                 with self.subTest(path=path), self.assertRaises(bh.AdapterRefusal):
                     client("GET", "https://a.test", path, signed=True)
+            for base_url in bad_bases:
+                with self.subTest(base_url=base_url), self.assertRaises(
+                        bh.AdapterRefusal):
+                    client("GET", base_url, "/x", signed=True)
+        clock.assert_not_called()
+        signer.assert_not_called()
         wire.assert_not_called()
 
     def test_read_retries_only_unclear_with_fixed_backoff(self):
@@ -191,28 +201,143 @@ class BinanceHttpTests(unittest.TestCase):
                     return_value=_Response('{"price":%s}' % constant)):
                 self.assertEqual(client("GET", "https://a.test", "/x").kind,
                                  "unclear")
+        outside = '{"price":0.%s}' % ("1234567890" * 7)
+        with mock.patch.object(client, "_open", return_value=_Response(outside)):
+            refused = client("GET", "https://a.test", "/x")
+        self.assertEqual((refused.kind, refused.msg), ("unclear", "invalid_json"))
+        self.assertIsNone(refused.payload)
 
     def test_api_error_has_clean_bounded_code_and_message(self):
-        client = bh.BinanceHttp("visible-key", "visible-secret")
-        unsafe = ("declined //hidden.invalid/private X-MBX-APIKEY visible-key "
-                  "signature=visible-secret")
+        client = bh.BinanceHttp("visible key", "visible secret")
+        unsafe = (r"declined visible key visible secret "
+                  r"https:%2F%2Fhidden.invalid%2Fprivate "
+                  r"https:\hidden.invalid\private X-MBX-APIKEY signature")
         with mock.patch.object(client, "_open",
                                side_effect=_http_error(
                                    400, json.dumps({"code": -2010, "msg": unsafe}))):
             result = client("POST", "https://a.test", "/order")
         self.assertEqual((result.kind, result.code), ("api_error", -2010))
         self.assertIsNone(result.payload)
-        self.assertLessEqual(len(result.msg), 160)
-        self.assertNotIn("//", result.msg)
+        self.assertEqual(result.msg, "declined")
         rendered = repr(result).lower()
-        for private in ("hidden.invalid", "visible-key", "visible-secret",
-                        "x-mbx-apikey", "signature"):
+        for private in ("hidden.invalid", "visible key", "visible secret",
+                        "x-mbx-apikey", "signature", "%2f", "\\"):
             self.assertNotIn(private, rendered)
         with mock.patch.object(client, "_open", side_effect=
                                _http_error(400, '{"code":-2010,"msg":"%s"}' %
                                            ("x" * 200))):
             bounded = client("POST", "https://a.test", "/order")
         self.assertEqual(len(bounded.msg), 160)
+
+    def test_api_error_normalizes_nested_and_plus_encoding(self):
+        client = bh.BinanceHttp("visible key", "visible secret")
+        unsafe_messages = (
+            "declined visible%2520key visible%2520secret "
+            "https%253A%252F%252Fhidden.invalid%252Fprivate",
+            "declined visible+key visible+secret",
+        )
+        for unsafe in unsafe_messages:
+            with self.subTest(unsafe=unsafe), mock.patch.object(
+                    client, "_open", side_effect=_http_error(
+                        400, json.dumps({"code": -2010, "msg": unsafe}))):
+                result = client("POST", "https://a.test", "/order")
+            self.assertEqual((result.kind, result.code, result.msg),
+                             ("api_error", -2010, "declined"))
+            rendered = repr(result).lower()
+            for private in ("visible%20key", "visible+key", "hidden.invalid"):
+                self.assertNotIn(private, rendered)
+
+    def test_api_error_redacts_whitespace_variants_of_credentials(self):
+        cases = (
+            ("visible key", "visible secret",
+             "declined visible\tkey visible\nsecret"),
+            ("visible\tkey", "visible\nsecret",
+             "declined visible key visible secret"),
+        )
+        for api_key, api_secret, unsafe in cases:
+            with self.subTest(unsafe=unsafe):
+                client = bh.BinanceHttp(api_key, api_secret)
+                with mock.patch.object(
+                        client, "_open", side_effect=_http_error(
+                            400, json.dumps({"code": -2010, "msg": unsafe}))):
+                    result = client("POST", "https://a.test", "/order")
+                self.assertEqual((result.kind, result.code, result.msg),
+                                 ("api_error", -2010, "declined"))
+
+    def test_api_error_redacts_nonprintable_credential_separators(self):
+        cases = (
+            ("visible key", "visible secret",
+             "declined visible\u0000key visible\u0000secret"),
+            ("visible\u0000key", "visible\u0000secret",
+             "declined visible key visible secret"),
+        )
+        for api_key, api_secret, unsafe in cases:
+            with self.subTest(unsafe=unsafe):
+                client = bh.BinanceHttp(api_key, api_secret)
+                with mock.patch.object(
+                        client, "_open", side_effect=_http_error(
+                            400, json.dumps({"code": -2010, "msg": unsafe}))):
+                    result = client("POST", "https://a.test", "/order")
+                self.assertEqual((result.kind, result.code, result.msg),
+                                 ("api_error", -2010, "declined"))
+                rendered = repr(result).lower()
+                for private in ("visible key", "visible secret"):
+                    self.assertNotIn(private, rendered)
+
+    def test_sync_refusal_propagates_and_unclear_spot_sync_cleans_up(self):
+        client = bh.BinanceHttp("key", "secret")
+        invalid_parts = (
+            ("https://a.test?pre=1", "/time"),
+            ("https://a.test", "/time#part"),
+        )
+        with mock.patch.object(client, "_open") as wire:
+            for base_url, time_path in invalid_parts:
+                with self.subTest(base_url=base_url, time_path=time_path):
+                    with self.assertRaises(bh.AdapterRefusal):
+                        client.sync_time(base_url, time_path)
+        wire.assert_not_called()
+
+        import spot_roundtrip as spot
+
+        with tempfile.TemporaryDirectory(
+                prefix="ah1c-", dir="/private/tmp") as root:
+            lock_path = str(Path(root) / "run.lock")
+            with mock.patch.multiple(
+                    spot, API_KEY="key", API_SECRET="secret",
+                    BASE_URL="https://a.test", SYMBOL="BTCUSDT",
+                    MAX_QUOTE_RAW="1", QUANT_SHA="a" * 40,
+                    RECEIPT_DIR=root, LOCK_PATH=lock_path, receipt={},
+                    receipt_path="", ctx={}, transport=None), mock.patch.object(
+                        bh.urllib.request, "build_opener") as opener, mock.patch(
+                            "sys.stdout", new_callable=io.StringIO):
+                opener.return_value.open.side_effect = TimeoutError
+                with self.assertRaises(SystemExit) as stopped:
+                    spot.main()
+            self.assertEqual(stopped.exception.code, 2)
+            opener.return_value.open.assert_called_once()
+            self.assertFalse(Path(lock_path).exists())
+            receipts = list(Path(root).glob("roundtrip-*.json"))
+            self.assertEqual(len(receipts), 1)
+            saved = json.loads(receipts[0].read_text(encoding="utf-8"))
+            self.assertEqual(saved["verdict"], "REJECTED_BEFORE_BUY")
+
+    def test_source_has_no_joined_review_statements_or_fields(self):
+        source = inspect.getsource(bh)
+        self.assertNotIn(";", source)
+        lines = source.splitlines()
+        for bound in ("_MAX_TIMEOUT_SECONDS", "_MAX_RECV_WINDOW_MS"):
+            matches = [line for line in lines if line.startswith(bound + " = ")]
+            self.assertEqual(len(matches), 1)
+        exact_source = inspect.getsource(bh.exact_context).splitlines()
+        self.assertNotIn("return", exact_source[0])
+        init_source = inspect.getsource(bh.BinanceHttp.__init__).splitlines()
+        fields = ("_api_key", "_api_secret", "_timeout", "_recv_window",
+                  "_now_ms", "_offsets", "_open")
+        for field in fields:
+            matches = [line for line in init_source
+                       if line.strip().startswith("self.%s =" % field)]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].count("self."), 1)
 
     def test_ambiguous_codes_and_uncertain_http_statuses_are_unclear(self):
         client = bh.BinanceHttp("key", "secret")

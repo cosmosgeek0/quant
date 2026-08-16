@@ -19,7 +19,6 @@ TERMINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED"
 AMBIGUOUS_API_CODES = frozenset({-1006, -1007})
 
 Params = Tuple[Tuple[str, str], ...]
-
 T = TypeVar("T")
 
 
@@ -71,7 +70,6 @@ class MutationIntent:  # row 020
 
 
 Transport = Callable[[str, str, str, Optional[Params], bool], HttpResult]
-
 IntentWriter = Callable[[MutationIntent], None]
 
 
@@ -144,9 +142,10 @@ class FillCoverage:  # row 024
     complete: bool
     fees: Tuple[Fee, ...]
 
-import hashlib, hmac, json, time, urllib.error, urllib.parse, urllib.request
+import hashlib, hmac, json, re as _re, time, urllib.error, urllib.parse, urllib.request
 
-_MAX_TIMEOUT_SECONDS, _MAX_RECV_WINDOW_MS = 60, 60000
+_MAX_TIMEOUT_SECONDS = 60
+_MAX_RECV_WINDOW_MS = 60000
 _RESERVED_PARAMS = frozenset({"signature", "timestamp", "recvWindow"})
 _PRIVATE_MSG_PARTS = ("www.", "x-mbx-apikey", "signature", "authorization", "credential", "api-key", "api_key", "header")
 
@@ -169,12 +168,19 @@ def _unique_object(pairs):
     return dict(pairs)
 
 
+def _normalize_api_text(value: str) -> str:
+    while (decoded := "".join(char if char.isprintable() else " " for char in urllib.parse.unquote_plus(value).replace("\\", "/"))) != value:
+        value = decoded
+    return " ".join(value.split())
+
+
 def _clean_api_msg(value: object, secrets: Tuple[str, str]) -> str | None:
-    if type(value) is not str: return None
-    words = "".join(char if char.isprintable() else " " for char in value).split()
-    private = _PRIVATE_MSG_PARTS + tuple(secret.lower() for secret in secrets)
-    cleaned = " ".join(word for word in words if "/" not in word and not any(part in word.lower() for part in private))
-    return cleaned[:160] or None
+    if type(value) is not str:
+        return None
+    normalized = _normalize_api_text(value)
+    for secret in sorted(secrets, key=len, reverse=True):
+        normalized = _re.sub(_re.escape(_normalize_api_text(secret)), " ", normalized, flags=_re.IGNORECASE)
+    return " ".join(word for word in normalized.split() if "/" not in word and not any(part in word.lower() for part in _PRIVATE_MSG_PARTS))[:160] or None
 
 
 def _classify(status: object, body: object, secrets: Tuple[str, str]) -> HttpResult:
@@ -182,20 +188,18 @@ def _classify(status: object, body: object, secrets: Tuple[str, str]) -> HttpRes
     if 300 <= status < 400: return _unclear("http_%d" % status, status)
     if status in (408, 409) or status >= 500: return _unclear("http_%d" % status)
     try:
-        with exact_context():
-            payload = json.loads(body, parse_float=Decimal, parse_int=int,
+        with exact_context() as context:
+            payload = json.loads(body, parse_float=context.create_decimal, parse_int=int,
                                  parse_constant=_reject_constant, object_pairs_hook=_unique_object)
     except (DecimalException, TypeError, ValueError, UnicodeError): return _unclear("invalid_json")
     code = payload.get("code") if isinstance(payload, dict) else None
     if type(code) is not int: code = None
     msg = _clean_api_msg(payload.get("msg"), secrets) if code is not None else None
     if code in AMBIGUOUS_API_CODES: return _unclear(msg or "ambiguous_api_result", code)
+    if 200 <= status < 500 and code is not None and code < 0:
+        return HttpResult("api_error", None, code, msg) if msg is not None else _unclear("api_error_incomplete", code)
     if 200 <= status < 300:
-        if code is not None and code < 0: return HttpResult("api_error", None, code, msg) if msg is not None else _unclear("api_error_incomplete", code)
         return HttpResult("ok", payload, None, None)
-    if 400 <= status < 500:
-        if code is not None and code < 0: return HttpResult("api_error", None, code, msg) if msg is not None else _unclear("api_error_incomplete", code)
-        return _unclear("http_response_unclear")
     return _unclear("http_response_unclear")
 
 
@@ -217,9 +221,13 @@ class BinanceHttp:
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS: raise AdapterRefusal("timeout_seconds is outside its bound")
         if type(recv_window_ms) is not int or not 1 <= recv_window_ms <= _MAX_RECV_WINDOW_MS: raise AdapterRefusal("recv_window_ms is outside its bound")
         if not callable(now_ms): raise AdapterRefusal("now_ms must be callable")
-        self._api_key, self._api_secret = api_key, api_secret
-        self._timeout, self._recv_window = timeout_seconds, recv_window_ms
-        self._now_ms, self._offsets, self._open = now_ms, {}, urllib.request.build_opener(_NoRedirect()).open
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._timeout = timeout_seconds
+        self._recv_window = recv_window_ms
+        self._now_ms = now_ms
+        self._offsets = {}
+        self._open = urllib.request.build_opener(_NoRedirect()).open
 
     def _clock(self) -> int | None:
         try:
@@ -240,7 +248,7 @@ class BinanceHttp:
     def __call__(self, method: str, base_url: str, path: str,
                  params: Params | None = None, signed: bool = False) -> HttpResult:
         if (type(method) is not str or not method or type(base_url) is not str
-                or not base_url or type(path) is not str or not path.startswith("/")
+                or not base_url or "?" in base_url or "#" in base_url or type(path) is not str or not path.startswith("/")
                 or "?" in path or "#" in path or type(signed) is not bool):
             raise AdapterRefusal("method, base_url, and path must be valid strings")
         values = list(_canonical_params(params))
