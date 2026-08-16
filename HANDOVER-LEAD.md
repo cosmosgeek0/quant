@@ -47,3 +47,6 @@ OVERALL        ███████████████████░  ~95
 ```
 
 Outgoing Lead: frozen after this push. History questions welcome via the record.
+
+## 7. Post-freeze fact (landed after the handover, recorded read-only)
+- The V2 volume chain's POLICY-SIM stage REFUSED after a 3h+ run over the 35 GB tape: `POLICY-SIM | REFUSED | cost decomposition does not reconcile` (lane-logs/v2-final-chain3.log). No trades.jsonl / v2_result.json exist. This is a study/policy_sim.py internal consistency guard firing on its own fee/spread/slippage arithmetic under the machine-scale policy (delay 3, stages 0.4:0 + 0.6:5, alloc 8, stop 2, partial 0.5:10, exit 120, spread/slip 0.002 each). Root cause NOT diagnosed. Because the owner's volume word is PARK vs ONE PROBE and the record forbids new volume studies without it, treat this as: one narrow codex card (V6) to make the refusal row NAME the non-reconciling components with numbers (diagnostic only, no threshold change), run on --limit 200 events not the full tape, THEN decide with the owner whether the full run is worth 3 more hours. The commander's V2 deliverable (out-of-sample expectancy after costs) remains UNMEASURED — say so in NOW.md; do not let a stale "pipeline running" row stand.
