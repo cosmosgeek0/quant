@@ -196,6 +196,7 @@ V2_MAX_RATE = Decimal("1")
 V2_MIN_QUANTITY_FLOOR = Decimal(
     "0.0000000000000000000000000001")
 V2_CLOSED_RESIDUAL = "CLOSED_RESIDUAL"
+V2_DUST_STANDING = "DUST_STANDING"
 V2_EVENT_TYPES = frozenset((
     "ConfigSnapshot", "ReceiptObserved", "RungFilled", "RungReduced",
     "FlatProved",
@@ -1784,6 +1785,9 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             if not initial_flat or final_flat:
                 raise PositionError(
                     "version-2 RungFilled is not a legal next transition")
+            if any(_v2_closed_residual(rung) for rung in rungs):
+                raise PositionError(
+                    "version-2 RungFilled is blocked by DUST_STANDING")
             if rungs and not any(_v2_active(rung) for rung in rungs):
                 raise PositionError(
                     "version-2 RungFilled follows complete reduction")
@@ -1943,6 +1947,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         registry[receipt_id] for receipt_id in pending_receipt_ids
     ]
     pending_active_evidence = bool(active_rungs and pending_receipts)
+    dust_standing = not final_flat and any(
+        _v2_closed_residual(rung) for rung in rungs)
 
     derived_rungs = []
     dust_rows = []
@@ -1953,7 +1959,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             reasons.append("RECEIPT_EVIDENCE_PENDING")
         active = _v2_active(rung)
         closed_residual = _v2_closed_residual(rung)
-        status = V2_CLOSED_RESIDUAL if closed_residual \
+        recorded_not_lost = closed_residual and final_flat
+        status = V2_CLOSED_RESIDUAL if closed_residual and not final_flat \
             else "CLOSED" if not active \
             else "FROZEN" if reasons else ST_OPEN
         if closed_residual:
@@ -1968,6 +1975,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
                     rung["remaining_spot"]),
                 "short_quantity": _v2_canonical_decimal(
                     rung["remaining_short"]),
+                "recorded_not_lost": recorded_not_lost,
             })
         derived_rungs.append({
             "ordinal": rung["ordinal"],
@@ -1994,6 +2002,7 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     any_frozen = any(
         _v2_current_freeze_reasons(rung) for rung in active_rungs)
     any_frozen = any_frozen or pending_active_evidence
+    any_frozen = any_frozen or bool(active_rungs and dust_standing)
     flat_transition_ready = len(pending_receipts) == 1 \
         and _v2_flat_receipt_proves_flat(pending_receipts[0])
     top_active_rung = None if top_active_ordinal is None \
@@ -2032,7 +2041,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
 
     headroom = _v2_headroom(stack_cap, rungs)
     next_ordinal: Optional[int] = None
-    if top_state in ("READY", ST_OPEN) and len(rungs) < len(schedule):
+    if top_state in ("READY", ST_OPEN) and not dust_standing \
+            and len(rungs) < len(schedule):
         next_ordinal = len(rungs) + 1
     legal_next = [] if top_state == ST_CLOSED \
         or ledger_freeze_reasons \
@@ -2050,12 +2060,16 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             "ordinal": top_active_ordinal,
         })
 
+    top_state_flags = list(ledger_freeze_reasons)
+    if dust_standing:
+        top_state_flags.append(V2_DUST_STANDING)
+
     return {
         "symbol": config["symbol"],
         "direction": config["direction"],
         "config_event_digest": config["event_digest"],
         "top_state": top_state,
-        "freeze_reasons": ledger_freeze_reasons,
+        "freeze_reasons": top_state_flags,
         "rungs": derived_rungs,
         "dust_rows": dust_rows,
         "remaining_spot_quantity": _v2_canonical_decimal(

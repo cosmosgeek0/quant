@@ -956,6 +956,21 @@ class VersionOneContractTests(unittest.TestCase):
         self.assertEqual(position["revision"], 18)
         self.assertEqual(position["updated_utc"], V1_CONTRACT_UTC)
 
+    def test_br5_v1_round_trip_has_no_v2_head_sidecar(self):
+        fixture_bytes = V1_CONTRACT_PATH.read_bytes()
+        fixture_head = Path(str(V1_CONTRACT_PATH) + ".head")
+        self.assertFalse(fixture_head.exists())
+        with tempfile.TemporaryDirectory() as receipt_dir:
+            state_path = Path(receipt_dir) / bp.STATE_FILE
+            head_path = Path(str(state_path) + ".head")
+            state_path.write_bytes(fixture_bytes)
+            position = bp.load_position(receipt_dir)
+            with mock.patch.object(bp, "utc", return_value=V1_CONTRACT_UTC):
+                bp.save_position(receipt_dir, position)
+            self.assertFalse(head_path.exists())
+            self.assertEqual(bp.load_position(receipt_dir)["version"], 1)
+        self.assertFalse(fixture_head.exists())
+
     def test_v1_contract_canonical_happy_cycle_field_types_and_presence(self):
         position = self.fixture_position()
         self.assert_typed_fields(position, {
@@ -1259,10 +1274,21 @@ class VersionTwoPersistenceTests(unittest.TestCase):
                 bp, "default_now_ms", return_value=module_time_ms):
             return self.append(bp.new_v2_flat_proved_event(receipt_id))
 
+    def ready_at(self, receipt_dir, config=None, receipt_id="flat-initial"):
+        bp.initialize_v2_position(
+            receipt_dir, config or self.CONFIG_SNAPSHOT)
+        position = bp.append_v2_event(
+            receipt_dir, bp.new_v2_receipt_observed_event(
+                receipt_id, "FLAT", self.MODULE_TIME_MS - 100,
+                "private-read-bundle", self.flat_facts()), 1)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=self.MODULE_TIME_MS):
+            return bp.append_v2_event(
+                receipt_dir, bp.new_v2_flat_proved_event(receipt_id),
+                len(position["ledger"]))
+
     def ready(self, config=None):
-        self.initialize(config)
-        self.observe_flat("flat-initial")
-        return self.prove_flat("flat-initial")
+        return self.ready_at(self.receipt_dir, config)
 
     def leg(self, role, ordinal, quantity, quote, fees=None,
             status="FILLED"):
@@ -1730,6 +1756,7 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             "quantity_floor": "0.0000000000000000000000000001",
             "spot_quantity": residual,
             "short_quantity": residual,
+            "recorded_not_lost": False,
         }])
         self.assertEqual(
             bp.V2_MIN_QUANTITY_FLOOR,
@@ -1787,6 +1814,240 @@ class VersionTwoPersistenceTests(unittest.TestCase):
                 "event_count": len(second["ledger"]),
                 "last_event_digest": second["ledger"][-1]["event_digest"],
             })
+
+    def test_br5_event_time_equal_boundary_and_later_clock_edges(self):
+        self.ready()
+        prior_cut = self.current()["ledger"][-1]["cut_ms"]
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        equal = self.filled(1, cut_ms=prior_cut)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=prior_cut):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "strictly greater"):
+                self.append(equal)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+        boundary = self.filled(
+            1, cut_ms=prior_cut + bp.V2_EVENT_FUTURE_SKEW_MS)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=prior_cut):
+            position = self.append(boundary)
+        boundary_cut = position["ledger"][-1]["cut_ms"]
+        self.assertEqual(
+            boundary_cut, prior_cut + bp.V2_EVENT_FUTURE_SKEW_MS)
+
+        later = self.filled(
+            2, cut_ms=boundary_cut + bp.V2_EVENT_FUTURE_SKEW_MS + 1)
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=boundary_cut):
+            with self.assertRaisesRegex(bp.PositionError, "future skew"):
+                self.append(later)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=boundary_cut + 1):
+            accepted = self.append(later)
+        self.assertEqual(accepted["ledger"][-1]["ordinal"], 2)
+
+    def test_br5_frozen_time_ledger_refuses_later_reappend(self):
+        self.ready()
+        persisted = self.raw_position()
+        high_cut = persisted["ledger"][-1]["cut_ms"]
+        regressed = self.filled(
+            1, source_time_ms=high_cut - 100, cut_ms=high_cut - 1)
+        regressed["previous_digest"] = persisted["ledger"][-1][
+            "event_digest"]
+        regressed["event_digest"] = bp.V2_GENESIS_DIGEST
+        regressed["event_digest"] = bp.v2_event_digest(regressed)
+        persisted["ledger"].append(regressed)
+        self.write_raw_position(persisted)
+        self.write_raw_head(persisted)
+        derived = bp.derive_v2_state(bp.load_position(self.receipt_dir))
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertEqual(derived["legal_next_transitions"], [])
+
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        later = bp.new_v2_receipt_observed_event(
+            "later-receipt", "REDUCTION", high_cut + 100,
+            "later-source", {
+                "ordinal": 1,
+                "spot_quantity": "0.01",
+                "short_quantity": "0.01",
+            })
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=high_cut + 100) as clock:
+            with self.assertRaisesRegex(bp.PositionError, "non-monotonic"):
+                bp.append_v2_event(
+                    self.receipt_dir, later, len(persisted["ledger"]))
+        self.assertEqual(clock.call_count, 0)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_br5_one_leg_dust_is_recorded_only_by_flat_proof(self):
+        self.ready()
+        quantity = (
+            "0.0000000000000000000000000001999999999999999999999999999")
+        floor = "0.0000000000000000000000000001"
+        self.append(self.filled(
+            1, spot_quantity=quantity, short_quantity=floor))
+        position = self.reduce("one-leg-dust", 1, floor, floor)
+        derived = bp.derive_v2_state(position)
+        self.assertEqual(
+            derived["rungs"][0]["status"], bp.V2_CLOSED_RESIDUAL)
+        self.assertEqual(derived["rungs"][0][
+            "remaining_short_quantity"], "0")
+        self.assertEqual(derived["top_state"], "AWAITING_FLAT_PROOF")
+        self.assertIn(bp.V2_DUST_STANDING, derived["freeze_reasons"])
+        self.assertFalse(derived["dust_rows"][0]["recorded_not_lost"])
+        residual = derived["rungs"][0]["remaining_spot_quantity"]
+        with self.assertRaisesRegex(
+                bp.PositionError, "minimum nonzero bound"):
+            bp.new_v2_receipt_observed_event(
+                "one-leg-dust-reduction", "REDUCTION",
+                position["ledger"][-1]["cut_ms"] + 1,
+                "dust-source", {
+                    "ordinal": 1,
+                    "spot_quantity": residual,
+                    "short_quantity": "0",
+                })
+
+        observed_at = position["ledger"][-1]["cut_ms"] + 1
+        position = self.observe_flat("flat-one-leg-dust", observed_at)
+        observed = bp.derive_v2_state(position)
+        self.assertIn(bp.V2_DUST_STANDING, observed["freeze_reasons"])
+        self.assertFalse(observed["dust_rows"][0]["recorded_not_lost"])
+        self.assertIn(
+            {"event_type": "FlatProved"},
+            observed["legal_next_transitions"])
+
+        position = self.prove_flat("flat-one-leg-dust", observed_at + 1)
+        closed = bp.derive_v2_state(position)
+        self.assertEqual(closed["top_state"], bp.ST_CLOSED)
+        self.assertNotIn(bp.V2_DUST_STANDING, closed["freeze_reasons"])
+        self.assertEqual(closed["rungs"][0]["status"], bp.ST_CLOSED)
+        self.assertTrue(closed["dust_rows"][0]["recorded_not_lost"])
+
+    def test_br5_multi_rung_dust_refuses_add_then_reduces_and_proves_flat(self):
+        config = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
+        config["schedule"].append({
+            "ordinal": 3,
+            "entry_gap_pct": "0.65",
+            "quote_cap": "6",
+        })
+        config["caps"] = {"stack_quote": "30", "entry_quote": "10"}
+        self.ready(config)
+        self.append(self.filled(
+            1, spot_quantity="0.1", short_quantity="0.1"))
+        quantity = (
+            "0.0000000000000000000000000001999999999999999999999999999")
+        floor = "0.0000000000000000000000000001"
+        self.append(self.filled(
+            2, spot_quantity=quantity, short_quantity=quantity))
+        position = self.reduce("top-to-dust", 2, floor, floor)
+        derived = bp.derive_v2_state(position)
+        self.assertEqual(
+            [row["status"] for row in derived["rungs"]],
+            [bp.ST_OPEN, bp.V2_CLOSED_RESIDUAL])
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertEqual(derived["freeze_reasons"], [bp.V2_DUST_STANDING])
+        self.assertEqual(derived["next_ordinal"], None)
+        self.assertTrue(derived["reduce_only"])
+        add_three = {"event_type": "RungFilled", "ordinal": 3}
+        self.assertNotIn(add_three, derived["legal_next_transitions"])
+
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        next_cut = position["ledger"][-1]["cut_ms"] + 1
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=next_cut):
+            with self.assertRaisesRegex(bp.PositionError, "DUST_STANDING"):
+                self.append(self.filled(
+                    3, spot_quote="1", short_quote="1",
+                    entry_gap="0.7", cut_ms=next_cut))
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+        position = self.observe_reduction(
+            "reduce-open-rung", 1, "0.1", "0.1")
+        pending_reduction = bp.derive_v2_state(position)
+        self.assertIn(
+            {"event_type": "RungReduced", "ordinal": 1},
+            pending_reduction["legal_next_transitions"])
+        position = self.append(bp.new_v2_rung_reduced_event(
+            1, ["reduce-open-rung"], {
+                "spot_quantity": "0.1",
+                "short_quantity": "0.1",
+            }))
+        reduced = bp.derive_v2_state(position)
+        self.assertEqual(reduced["top_state"], "AWAITING_FLAT_PROOF")
+        self.assertIn(bp.V2_DUST_STANDING, reduced["freeze_reasons"])
+
+        observed_at = position["ledger"][-1]["cut_ms"] + 1
+        position = self.observe_flat("flat-multi-dust", observed_at)
+        pending_flat = bp.derive_v2_state(position)
+        self.assertIn(
+            {"event_type": "FlatProved"},
+            pending_flat["legal_next_transitions"])
+        position = self.prove_flat("flat-multi-dust", observed_at + 1)
+        closed = bp.derive_v2_state(position)
+        self.assertEqual(closed["top_state"], bp.ST_CLOSED)
+        self.assertEqual(closed["freeze_reasons"], [])
+        self.assertEqual(
+            [row["status"] for row in closed["rungs"]],
+            [bp.ST_CLOSED, bp.ST_CLOSED])
+        self.assertTrue(closed["dust_rows"][0]["recorded_not_lost"])
+
+    def test_br5_wrong_path_head_refuses_same_length_ledger(self):
+        self.ready()
+        with tempfile.TemporaryDirectory() as other_dir:
+            config = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
+            config["caps"]["entry_quote"] = "9"
+            self.ready_at(other_dir, config, "flat-other-path")
+            other_state = Path(other_dir) / bp.STATE_FILE
+            other_head = Path(str(other_state) + ".head")
+            self.assertEqual(
+                self.length(),
+                len(bp.load_position(other_dir)["ledger"]))
+            self.head_path.write_bytes(other_head.read_bytes())
+        with self.assertRaisesRegex(bp.PositionError, "disagrees"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br5_matching_count_with_older_tail_head_refuses(self):
+        self.ready()
+        older_tail = self.current()["ledger"][-1]["event_digest"]
+        position = self.append(self.filled(1))
+        self.head_path.write_text(json.dumps({
+            "event_count": len(position["ledger"]),
+            "last_event_digest": older_tail,
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(bp.PositionError, "disagrees"):
+            bp.load_position(self.receipt_dir)
+
+    def test_br5_reset_heads_refuse_prior_and_orphan_state(self):
+        self.ready()
+        prior_head = self.head_path.read_bytes()
+        with tempfile.TemporaryDirectory() as fresh_dir:
+            config = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
+            config["schedule"][0]["quote_cap"] = "9"
+            self.ready_at(fresh_dir, config, "flat-fresh-ledger")
+            fresh_state = Path(fresh_dir) / bp.STATE_FILE
+            self.state_path.write_bytes(fresh_state.read_bytes())
+        with self.assertRaisesRegex(bp.PositionError, "disagrees"):
+            bp.load_position(self.receipt_dir)
+
+        with tempfile.TemporaryDirectory() as orphan_dir:
+            orphan_state = Path(orphan_dir) / bp.STATE_FILE
+            orphan_head = Path(str(orphan_state) + ".head")
+            orphan_head.write_bytes(prior_head)
+            with self.assertRaisesRegex(
+                    bp.PositionError, "exists without its ledger"):
+                bp.initialize_v2_position(
+                    orphan_dir, self.CONFIG_SNAPSHOT)
 
 
 class RatesTests(MachineCase):
