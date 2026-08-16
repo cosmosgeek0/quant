@@ -9,13 +9,14 @@ acceptance sentence). Everything from Codex is marked [codex]. Web sweep sources
 voice; this file says WHAT belongs on the Network tab, what leaves, what is
 missing, which controls are real, and where to build.
 
-## 0. Where to build
-- BUILD FROM the V5 lane: worktree `Desktop/worktrees/net-v5`, branch
-  `lane/ui-network-v5` (has `/api/grace`, net_v5.js, this brief). NOT from
-  `Desktop/quant/ui` — that copy is UI 4.0, one step older, and lacks the V5
-  files [codex].
+## 0. Where to build — SUPERSEDED by ui/NETWORK-V1-BUILD-ORDER.md
+- The build order (commander, 2026-08-16, corrections folded) is the master:
+  start the build branch from origin/main; lane/ui-network-v5 is visual /
+  reference material only — its src/ is stale; import only the UI assets you
+  deliberately keep, never merge it wholesale. This brief is design
+  background and the research record; where the two differ, the order wins.
 - The site (arbitrage.cosmosgeek.org) serves from the box; the Mac's 8899/8901
-  and the SSM pull are legacy viewers on their way out. `ui/DASHBOARD.md` has
+  and the SSM pull are legacy viewers on their way out. ui/DASHBOARD.md has
   the wiring and the verified deploy steps.
 
 ## 1. What the Network tab is for (one sentence)
