@@ -1,7 +1,8 @@
 """Strict USD-M Futures adapter; frozen interface rows 051-067."""
 from __future__ import annotations
 import math as _math, re as _re, time as _time, typing as _t
-from dataclasses import dataclass; from decimal import Decimal
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from execution import binance_http as _h
 
 __all__ = ["FUTURES_USER_TRADES_PATH", "FUTURES_INCOME_PATH", "FUTURES_ORDER_PATH", "FuturesMarket", "FuturesPreflight", "LeverageResult", "Income", "read_market", "read_preflight", "read_leverage", "set_leverage_1x_once", "build_open_order", "build_reduce_only_close", "query_order", "submit_order_once", "read_user_trades", "read_fills", "read_income"]
@@ -194,41 +195,49 @@ def _order(payload, symbol, client_id):
     return _result(tag, symbol, client_id, _int(payload.get("orderId")), client_id, status, side, reduce, _dec(payload.get("executedQty"), True), _dec(payload.get("cumQuote"), True))
 
 def query_order(transport: _h.Transport, base_url: str, symbol: str, client_id: str, *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.OrderResult:
-    _base(base_url); _name(symbol, _SYMBOL, "symbol"); _name(client_id, _CLIENT, "client id")
-    params = (("symbol", symbol), ("origClientOrderId", client_id)); missing = 0; last = None
+    _base(base_url)
+    _name(symbol, _SYMBOL, "symbol")
+    _name(client_id, _CLIENT, "client id")
+    params = (("symbol", symbol), ("origClientOrderId", client_id))
+    missing = 0
+    last = _result("pending", symbol, client_id)
     for attempt in range(_h.ORDER_QUERY_ATTEMPTS):
         response = transport("GET", base_url, FUTURES_ORDER_PATH, params, True)
-        if not isinstance(response, _h.HttpResult): response = _h.HttpResult("unclear", None, None, "order_query_result")
+        if not isinstance(response, _h.HttpResult):
+            response = _h.HttpResult("unclear", None, None, "order_query_result")
+        missing = missing + 1 if response.kind == "api_error" and response.code == -2013 else 0
+        last = replace(last, error=None if response.kind == "ok" else response)
         if response.kind == "ok":
-            missing = 0
-            try: last = _order(response.payload, symbol, client_id)
-            except (_h.AdapterRefusal, TypeError): last = None
-            if last is not None and last.tag == "terminal": return last
+            try:
+                last = _order(response.payload, symbol, client_id)
+            except (_h.AdapterRefusal, TypeError):
+                last = replace(last, error=_h.HttpResult("unclear", None, None, "futures_order_schema"))
+            if last.tag == "terminal":
+                return last
         elif response.kind == "api_error" and response.code == -2013:
-            missing += 1
-            if missing >= _h.ORDER_NOT_FOUND_STREAK: return _result("not_found", symbol, client_id)
+            if missing >= _h.ORDER_NOT_FOUND_STREAK and last.status is None: return _result("not_found", symbol, client_id)
         elif response.kind == "api_error": return _result("error", symbol, client_id, error=response)
-        else: missing = 0
         if attempt + 1 < _h.ORDER_QUERY_ATTEMPTS: sleep(_h.ORDER_QUERY_DELAY_SECONDS)
-    return last or _result("pending", symbol, client_id)
+    return last
 
 def submit_order_once(transport: _h.Transport, base_url: str, plan: _h.OrderPlan, write_intent: _h.IntentWriter, *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.OrderResult:
     _base(base_url); plan = _checked_plan(plan); params = plan.intent.params; _write(write_intent, plan.intent); posted = transport("POST", base_url, FUTURES_ORDER_PATH, params, True); conflict = None; returned = posted.payload.get("clientOrderId") if posted.kind == "ok" and isinstance(posted.payload, dict) else None
     if posted.kind == "ok" and (returned != plan.intent.identity or plan.reduce_only and posted.payload.get("reduceOnly") is not True):
         conflict = _h.HttpResult("unclear", None, None, "order_response_conflict")
     queried = query_order(transport, base_url, plan.symbol, plan.intent.identity, sleep=sleep)
-    if conflict is None and plan.reduce_only and queried.tag == "terminal" and queried.reduce_only is not True: conflict = _h.HttpResult("unclear", None, None, "order_query_conflict")
+    if conflict is None and queried.status is not None and (queried.side != plan.side or queried.reduce_only is not plan.reduce_only):
+        conflict = _h.HttpResult("unclear", None, None, "order_query_conflict")
     if queried.tag == "terminal" and conflict is None: return queried
     if queried.tag == "not_found" and posted.kind == "api_error": return _result("error", plan.symbol, plan.intent.identity, error=posted)
-    error = conflict or queried.error or (posted if posted.kind != "ok" else None); shown = returned if isinstance(returned, str) else queried.returned_client_id if conflict is None else None
-    return _result("pending", plan.symbol, plan.intent.identity, queried.identity.order_id, shown, queried.status, queried.side, queried.reduce_only, queried.executed_quantity, queried.quote_quantity, error)
+    error = conflict or (posted if posted.kind == "api_error" else queried.error or (posted if posted.kind != "ok" else None))
+    return _result("pending", plan.symbol, plan.intent.identity, queried.identity.order_id, returned if isinstance(returned, str) else queried.returned_client_id if conflict is None else None, queried.status, queried.side, queried.reduce_only, queried.executed_quantity, queried.quote_quantity, error)
 
-def _valid_fills(fills, expected=None):
+def _valid_fills(fills, expected=None, side=None):
     seen = set() if type(fills) is tuple else _no("fills must be immutable")
     for fill in fills:
         if not isinstance(fill, _h.Fill) or not isinstance(fill.fee, _h.Fee): _no("fill shape invalid")
         trade, order = _int(fill.trade_id, True), _int(fill.order_id)
-        if trade in seen or expected is not None and order != expected or fill.side not in ("BUY", "SELL") or type(fill.is_maker) is not bool or type(fill.time_ms) is not int or fill.time_ms < 0: _no("fill facts invalid")
+        if trade in seen or expected is not None and order != expected or fill.side not in ("BUY", "SELL") or side is not None and fill.side != side or type(fill.is_maker) is not bool or type(fill.time_ms) is not int or fill.time_ms < 0: _no("fill facts invalid")
         _input(fill.price); _input(fill.quantity); _input(fill.quote_quantity); _name(fill.fee.asset, _ASSET, "commission asset"); _input(fill.fee.amount, True); None if fill.realized_pnl is None else _input(fill.realized_pnl, True, True); seen.add(trade)
     return fills
 
@@ -265,14 +274,14 @@ def _coverage(fills, executed):
         fees = tuple(_h.Fee(asset, totals[asset]) for asset in sorted(totals)); return _h.FillCoverage(tuple(fills), covered, executed, covered == executed, fees)
 
 def read_fills(transport: _h.Transport, base_url: str, order: _h.OrderResult, response_fills: _t.Tuple[_h.Fill, ...] = (), *, sleep: _t.Callable[[float], None] = _time.sleep) -> _h.ReadResult[_h.FillCoverage]:
-    executed = _dec(order.executed_quantity, True) if isinstance(order, _h.OrderResult) and order.terminal and order.identity.order_id is not None and isinstance(order.executed_quantity, Decimal) else _no("order identity unproved")
-    try: local = _valid_fills(_valid_fills(order.response_fills, order.identity.order_id) + _valid_fills(response_fills, order.identity.order_id), order.identity.order_id)
+    executed = _dec(order.executed_quantity, True) if isinstance(order, _h.OrderResult) and order.terminal and order.identity.order_id is not None and order.side in ("BUY", "SELL") and isinstance(order.executed_quantity, Decimal) else _no("order identity unproved")
+    try: local = _valid_fills(_valid_fills(order.response_fills, order.identity.order_id, order.side) + _valid_fills(response_fills, order.identity.order_id, order.side), order.identity.order_id, order.side)
     except (TypeError, _h.AdapterRefusal): return _bad("futures_response_fills_schema")
     result = _coverage(local, executed)
     if result.covered_quantity > executed: return _bad("futures_fill_coverage")
     if result.complete: return _h.ReadResult("ok", result, None)
     trades = read_user_trades(transport, base_url, order.identity.symbol, order_id=order.identity.order_id, sleep=sleep)
-    if trades.kind != "ok": return trades
+    if trades.kind != "ok" or any(fill.side != order.side for fill in trades.value): return trades if trades.kind != "ok" else _bad("futures_fill_coverage")
     result = _coverage(trades.value, executed)
     return _bad("futures_fill_coverage") if result.covered_quantity > executed else _h.ReadResult("ok", result, None)
 

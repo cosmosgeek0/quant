@@ -175,17 +175,84 @@ class FuturesAdapterTest(unittest.TestCase):
                          ("GET", "/fapi/v1/order"): ok(order_payload("fut-open-3"))})
         result = futures.submit_order_once(transport, BASE, plan, lambda _: None, sleep=lambda _: None)
         self.assertEqual(result.tag, "terminal"); self.assertEqual(len(transport.posts()), 1)
+        self.assertTrue(all(call[4] is True for call in transport.calls))
         queries = [call for call in transport.calls if call[0] == "GET"]
         self.assertEqual(dict(queries[0][3])["origClientOrderId"], "fut-open-3")
         absent = Spy({("POST", "/fapi/v1/order"): rejected(-2019),
                       ("GET", "/fapi/v1/order"): rejected()})
         result = futures.submit_order_once(absent, BASE, plan, lambda _: None, sleep=lambda _: None)
         self.assertEqual(result.tag, "error"); self.assertEqual(len(absent.posts()), 1)
+        unknown_absent = Spy({("POST", "/fapi/v1/order"): unclear(),
+                              ("GET", "/fapi/v1/order"): rejected()})
+        result = futures.submit_order_once(unknown_absent, BASE, plan, lambda _: None, sleep=lambda _: None)
+        self.assertEqual((result.tag, result.error.kind, len(unknown_absent.posts())), ("pending", "unclear", 1))
         delays = []; pending = Spy({("POST", "/fapi/v1/order"): unclear(), ("GET", "/fapi/v1/order"): unclear()})
         result = futures.submit_order_once(pending, BASE, plan, lambda _: None, sleep=delays.append)
         queries = [call for call in pending.calls if call[0] == "GET"]
         self.assertEqual((result.tag, len(pending.posts()), len(queries)), ("pending", 1, http.ORDER_QUERY_ATTEMPTS))
         self.assertEqual(delays, [http.ORDER_QUERY_DELAY_SECONDS] * (http.ORDER_QUERY_ATTEMPTS - 1))
+
+    def test_query_keeps_observed_pending_truth_after_absence_replies(self):
+        observed = order_payload("fut-observed-1")
+        observed["status"] = "NEW"
+        replies = [ok(observed), ok({"malformed": "payload"})] + [rejected()] * http.ORDER_NOT_FOUND_STREAK + [unclear()]
+        transport = Spy({("GET", "/fapi/v1/order"): replies})
+        result = futures.query_order(transport, BASE, SYMBOL, "fut-observed-1", sleep=lambda _: None)
+        self.assertEqual((result.tag, result.status, result.returned_client_id),
+                         ("pending", "NEW", "fut-observed-1"))
+        self.assertEqual(len(transport.calls), http.ORDER_QUERY_ATTEMPTS)
+        self.assertIsNotNone(result.error)
+        self.assertEqual((result.error.kind, result.error.msg),
+                         ("unclear", "offline_unclear"))
+
+    def test_query_retains_schema_error_after_schema_only_exhaustion(self):
+        replies = [ok({"malformed": "payload"})] * http.ORDER_QUERY_ATTEMPTS
+        transport = Spy({("GET", "/fapi/v1/order"): replies})
+        result = futures.query_order(transport, BASE, SYMBOL, "fut-schema-1", sleep=lambda _: None)
+        self.assertEqual(len(transport.calls), http.ORDER_QUERY_ATTEMPTS)
+        self.assertIsNotNone(result.error)
+        self.assertEqual((result.tag, result.error.kind, result.error.msg),
+                         ("pending", "unclear", "futures_order_schema"))
+
+    def test_submit_retains_post_api_error_over_query_uncertainty(self):
+        plan = futures.build_open_order(market(), "BUY", "fut-post-error-1", SHA, D("1.234"), profile="MARKET")
+        transport = Spy({("POST", "/fapi/v1/order"): rejected(-2010),
+                         ("GET", "/fapi/v1/order"): unclear()})
+        result = futures.submit_order_once(transport, BASE, plan, lambda _: None, sleep=lambda _: None)
+        queries = [call for call in transport.calls if call[0] == "GET"]
+        self.assertIsNotNone(result.error)
+        self.assertEqual((result.tag, result.error.kind, result.error.code),
+                         ("pending", "api_error", -2010))
+        self.assertEqual((len(transport.posts()), len(queries)),
+                         (1, http.ORDER_QUERY_ATTEMPTS))
+
+    def test_submit_binds_terminal_query_shape_to_plan(self):
+        plan = futures.build_open_order(market(), "BUY", "fut-reused-1", SHA, D("1.234"), profile="MARKET")
+        stale = order_payload("fut-reused-1", "SELL", False)
+        transport = Spy({("POST", "/fapi/v1/order"): rejected(-2010),
+                         ("GET", "/fapi/v1/order"): ok(stale)})
+        result = futures.submit_order_once(transport, BASE, plan, lambda _: None, sleep=lambda _: None)
+        self.assertEqual((result.tag, result.side, result.reduce_only), ("pending", "SELL", False))
+        self.assertIsNotNone(result.error)
+        self.assertEqual((result.error.kind, result.error.msg),
+                         ("unclear", "order_query_conflict"))
+        self.assertEqual(len(transport.posts()), 1)
+
+    def test_submit_binds_new_query_shape_to_plan(self):
+        plan = futures.build_reduce_only_close(market(), "SELL", "fut-close-new-1", SHA, D("1.234"))
+        observed = order_payload("fut-close-new-1", "SELL", False)
+        observed["status"] = "NEW"
+        transport = Spy({("POST", "/fapi/v1/order"): rejected(-2010),
+                         ("GET", "/fapi/v1/order"): ok(observed)})
+        result = futures.submit_order_once(transport, BASE, plan, lambda _: None, sleep=lambda _: None)
+        queries = [call for call in transport.calls if call[0] == "GET"]
+        self.assertEqual((result.tag, result.status, result.side, result.reduce_only),
+                         ("pending", "NEW", "SELL", False))
+        self.assertIsNotNone(result.error)
+        self.assertEqual((result.error.kind, result.error.msg),
+                         ("unclear", "order_query_conflict"))
+        self.assertEqual((len(transport.posts()), len(queries)),
+                         (1, http.ORDER_QUERY_ATTEMPTS))
 
     def test_close_submit_requires_query_reduce_only_truth(self):
         plan = futures.build_reduce_only_close(market(), "SELL", "fut-close-3", SHA, D("1.234"))
@@ -248,6 +315,24 @@ class FuturesAdapterTest(unittest.TestCase):
                                    0, 2000, sleep=lambda _: None).value
         self.assertEqual(tuple(row.income_type for row in rows), ("COMMISSION", "REALIZED_PNL", "FUNDING_FEE"))
         self.assertTrue(all(type(row.amount) is Decimal for row in rows))
+
+    def test_fill_coverage_requires_order_and_fill_side_agreement(self):
+        identity = http.OrderIdentity(SYMBOL, "fut-side-1", 77)
+        order = http.OrderResult("terminal", identity, "fut-side-1", "FILLED", True, "BUY", False,
+                                 D("1"), D("100"), (), None)
+        sell = http.Fill(1, 77, D("100"), D("1"), D("100"), http.Fee("USDT", D("0")),
+                         "SELL", False, 1001, D("0"))
+        local = futures.read_fills(Spy({}), BASE, order, (sell,), sleep=lambda _: None)
+        self.assertEqual(local.kind, "unclear")
+        remote_row = {"symbol": SYMBOL, "id": 1, "orderId": 77, "price": "100", "qty": "1",
+                      "quoteQty": "100", "commission": "0", "commissionAsset": "USDT",
+                      "side": "SELL", "maker": False, "time": 1001, "realizedPnl": "0"}
+        remote = futures.read_fills(Spy({futures.FUTURES_USER_TRADES_PATH: ok([remote_row])}),
+                                    BASE, order, sleep=lambda _: None)
+        self.assertEqual(remote.kind, "unclear")
+        buy = replace(sell, side="BUY")
+        with self.assertRaises(http.AdapterRefusal):
+            futures.read_fills(Spy({}), BASE, replace(order, side=None), (buy,), sleep=lambda _: None)
 
 if __name__ == "__main__":
     unittest.main()
