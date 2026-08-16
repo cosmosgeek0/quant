@@ -199,11 +199,12 @@ V2_CLOSED_RESIDUAL = "CLOSED_RESIDUAL"
 V2_DUST_STANDING = "DUST_STANDING"
 V2_EVENT_TYPES = frozenset((
     "ConfigSnapshot", "ReceiptObserved", "RungFilled", "RungReduced",
-    "FlatProved",
+    "ReconcileObserved", "FlatProved",
 ))
 V2_RECEIPT_KINDS = frozenset(("REDUCTION", "FLAT"))
 V2_TERMINAL_ORDER_STATUSES = frozenset((
-    "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "EXPIRED_IN_MATCH",
+    "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED",
+    "EXPIRED_IN_MATCH",
 ))
 V2_TOP_STATES = frozenset((
     "UNPROVEN", "READY", ST_OPEN, "FROZEN",
@@ -812,6 +813,25 @@ _V2_RUNG_REDUCED_FIELDS = frozenset({
 _V2_REDUCTION_AMOUNT_FIELDS = frozenset({
     "spot_quantity", "short_quantity",
 })
+_V2_RECONCILE_FIELDS = frozenset({
+    "reconcile_id", "observed_at_ms", "source", "baseline",
+    "positions", "open_orders", "own_orders", "balances",
+})
+_V2_RECONCILE_POSITION_FIELDS = frozenset({
+    "spot_base_quantity", "futures_position_quantity",
+})
+_V2_RECONCILE_OPEN_ORDER_FIELDS = frozenset({
+    "spot_standard_client_order_ids", "spot_algorithmic_client_order_ids",
+    "futures_standard_client_order_ids",
+    "futures_algorithmic_client_order_ids",
+})
+_V2_RECONCILE_OWN_ORDER_FIELDS = frozenset({
+    "client_order_id", "market", "status", "executed_quantity",
+})
+_V2_RECONCILE_BALANCE_FIELDS = frozenset({
+    "spot_base_free_quantity", "spot_base_locked_quantity",
+    "spot_quote_free_quantity", "futures_wallet_balance",
+})
 _V2_FLAT_PROVED_FIELDS = frozenset({"receipt_id", "module_time_ms"})
 _V2_FLAT_PROVED_INPUT_FIELDS = frozenset({"event_type", "receipt_id"})
 _V2_EVENT_FIELDS = {
@@ -819,6 +839,7 @@ _V2_EVENT_FIELDS = {
     "ReceiptObserved": _V2_EVENT_COMMON_FIELDS | _V2_RECEIPT_FIELDS,
     "RungFilled": _V2_EVENT_COMMON_FIELDS | _V2_RUNG_FILLED_FIELDS,
     "RungReduced": _V2_EVENT_COMMON_FIELDS | _V2_RUNG_REDUCED_FIELDS,
+    "ReconcileObserved": _V2_EVENT_COMMON_FIELDS | _V2_RECONCILE_FIELDS,
     "FlatProved": _V2_EVENT_COMMON_FIELDS | _V2_FLAT_PROVED_FIELDS,
 }
 _V2_EVENT_PAYLOAD_FIELDS = {
@@ -933,6 +954,17 @@ def _v2_decimal_record_value(value: Any, path: str, minimum: Decimal,
     parsed = _v2_decimal_in_bounds(
         _v2_parse_decimal_input(value, path), path, minimum, maximum)
     return _v2_canonical_decimal(parsed)
+
+
+def _v2_optional_decimal_value(
+        value: Any, path: str, minimum: Decimal, maximum: Decimal,
+        require_canonical: bool) -> Optional[str]:
+    if value is None:
+        return None
+    if require_canonical:
+        parsed = _v2_decimal_text(value, path, minimum, maximum)
+        return _v2_canonical_decimal(parsed)
+    return _v2_decimal_record_value(value, path, minimum, maximum)
 
 
 def _v2_json_value(value: Any, path: str) -> None:
@@ -1226,6 +1258,157 @@ def new_v2_receipt_observed_event(
     receipt["receipt_digest"] = _canonical_json_sha256(
         _v2_receipt_digest_payload(receipt), "receipt")
     return {"event_type": "ReceiptObserved", **receipt}
+
+
+def _normalize_v2_reconcile_positions(
+        value: Any, path: str, require_canonical: bool,
+        require_known: bool) -> Dict[str, Optional[str]]:
+    _v2_exact_fields(value, _V2_RECONCILE_POSITION_FIELDS, path)
+    normalized: Dict[str, Optional[str]] = {}
+    for field in sorted(_V2_RECONCILE_POSITION_FIELDS):
+        field_path = path + "." + field
+        normalized[field] = _v2_optional_decimal_value(
+            value[field], field_path, -V2_MAX_DECIMAL, V2_MAX_DECIMAL,
+            require_canonical)
+        if require_known and normalized[field] is None:
+            raise PositionError(
+                "version-2 reconcile baseline quantity is unknown")
+    return normalized
+
+
+def _normalize_v2_reconcile_open_orders(
+        value: Any, path: str,
+        require_canonical: bool) -> Dict[str, Optional[List[str]]]:
+    _v2_exact_fields(value, _V2_RECONCILE_OPEN_ORDER_FIELDS, path)
+    normalized: Dict[str, Optional[List[str]]] = {}
+    for field in sorted(_V2_RECONCILE_OPEN_ORDER_FIELDS):
+        rows = value[field]
+        if rows is None:
+            normalized[field] = None
+            continue
+        if not isinstance(rows, list) or len(rows) > 10000:
+            raise PositionError(
+                "version-2 %s must be a bounded list or null" %
+                (path + "." + field))
+        ids = [
+            _v2_id(client_id, "%s.%s[%d]" % (path, field, index))
+            for index, client_id in enumerate(rows)
+        ]
+        canonical = sorted(ids)
+        if len(set(canonical)) != len(canonical):
+            raise PositionError(
+                "version-2 reconcile open-order id is duplicated")
+        if require_canonical and ids != canonical:
+            raise PositionError(
+                "version-2 reconcile open-order ids are not canonical")
+        normalized[field] = canonical
+    return normalized
+
+
+def _normalize_v2_reconcile_own_orders(
+        value: Any, path: str,
+        require_canonical: bool) -> List[Dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > 10000:
+        raise PositionError(
+            "version-2 reconcile own_orders must be a bounded list")
+    normalized = []
+    for index, row in enumerate(value):
+        row_path = "%s[%d]" % (path, index)
+        _v2_exact_fields(row, _V2_RECONCILE_OWN_ORDER_FIELDS, row_path)
+        client_id = _v2_id(
+            row["client_order_id"], row_path + ".client_order_id")
+        market = _v2_id(row["market"], row_path + ".market")
+        if market not in ("BINANCE_SPOT", "BINANCE_USDM"):
+            raise PositionError(
+                "version-2 reconcile own-order market is invalid")
+        status = _v2_id(row["status"], row_path + ".status")
+        quantity = _v2_optional_decimal_value(
+            row["executed_quantity"], row_path + ".executed_quantity",
+            Decimal(0), V2_MAX_DECIMAL, require_canonical)
+        if status in V2_TERMINAL_ORDER_STATUSES and quantity is None:
+            raise PositionError(
+                "version-2 terminal own order lacks executed quantity")
+        if status == "NOT_FOUND" and quantity is not None:
+            raise PositionError(
+                "version-2 missing own order has a quantity")
+        if status == "UNKNOWN" and quantity is not None:
+            raise PositionError(
+                "version-2 unknown own order has a quantity")
+        normalized.append({
+            "client_order_id": client_id,
+            "market": market,
+            "status": status,
+            "executed_quantity": quantity,
+        })
+    canonical = sorted(
+        normalized, key=lambda row: (row["client_order_id"], row["market"]))
+    client_ids = [row["client_order_id"] for row in canonical]
+    if len(set(client_ids)) != len(client_ids):
+        raise PositionError(
+            "version-2 reconcile own-order id is duplicated")
+    if require_canonical and normalized != canonical:
+        raise PositionError(
+            "version-2 reconcile own_orders are not canonical")
+    return canonical
+
+
+def _normalize_v2_reconcile_balances(
+        value: Any, path: str,
+        require_canonical: bool) -> Dict[str, Optional[str]]:
+    _v2_exact_fields(value, _V2_RECONCILE_BALANCE_FIELDS, path)
+    return {
+        field: _v2_optional_decimal_value(
+            value[field], path + "." + field,
+            Decimal(0), V2_MAX_DECIMAL, require_canonical)
+        for field in sorted(_V2_RECONCILE_BALANCE_FIELDS)
+    }
+
+
+def _normalize_v2_reconcile_observation(
+        value: Any, require_canonical: bool) -> Dict[str, Any]:
+    path = "ReconcileObserved"
+    _v2_exact_fields(value, _V2_RECONCILE_FIELDS, path)
+    return {
+        "reconcile_id": _v2_id(
+            value["reconcile_id"], path + ".reconcile_id"),
+        "observed_at_ms": _v2_epoch_ms(
+            value["observed_at_ms"], path + ".observed_at_ms"),
+        "source": _v2_id(value["source"], path + ".source"),
+        "baseline": _normalize_v2_reconcile_positions(
+            value["baseline"], path + ".baseline",
+            require_canonical, require_known=True),
+        "positions": _normalize_v2_reconcile_positions(
+            value["positions"], path + ".positions",
+            require_canonical, require_known=False),
+        "open_orders": _normalize_v2_reconcile_open_orders(
+            value["open_orders"], path + ".open_orders",
+            require_canonical),
+        "own_orders": _normalize_v2_reconcile_own_orders(
+            value["own_orders"], path + ".own_orders",
+            require_canonical),
+        "balances": _normalize_v2_reconcile_balances(
+            value["balances"], path + ".balances",
+            require_canonical),
+    }
+
+
+def new_v2_reconcile_observed_event(
+        reconcile_id: str, observed_at_ms: int, source: str,
+        baseline: Dict[str, Any], positions: Dict[str, Any],
+        open_orders: Dict[str, Any], own_orders: List[Dict[str, Any]],
+        balances: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one typed private-read observation for a resume CAS append."""
+    normalized = _normalize_v2_reconcile_observation({
+        "reconcile_id": reconcile_id,
+        "observed_at_ms": observed_at_ms,
+        "source": source,
+        "baseline": baseline,
+        "positions": positions,
+        "open_orders": open_orders,
+        "own_orders": own_orders,
+        "balances": balances,
+    }, require_canonical=False)
+    return {"event_type": "ReconcileObserved", **normalized}
 
 
 def _validate_v2_fee_map(value: Any, path: str) -> Dict[str, Decimal]:
@@ -1563,6 +1746,17 @@ def _validate_v2_event_shape(event: Any, index: int) -> None:
         if normalized_amounts != event["amounts"]:
             raise PositionError(
                 "version-2 RungReduced amounts are not canonical")
+    elif event_type == "ReconcileObserved":
+        normalized_observation = _normalize_v2_reconcile_observation(
+            {key: event[key] for key in _V2_RECONCILE_FIELDS},
+            require_canonical=True)
+        if normalized_observation != {
+                key: event[key] for key in _V2_RECONCILE_FIELDS}:
+            raise PositionError(
+                "version-2 ReconcileObserved facts are not canonical")
+        if cut != event["observed_at_ms"]:
+            raise PositionError(
+                "version-2 ReconcileObserved cut does not match observation")
     else:
         _v2_id(event["receipt_id"], path + ".receipt_id")
         module_time = _v2_epoch_ms(
@@ -1684,6 +1878,231 @@ def _v2_flat_receipt_proves_flat(receipt: Dict[str, Any]) -> bool:
         and facts["own_orders_terminal"] is True
 
 
+def _v2_quantities_agree(left: Decimal, right: Decimal) -> bool:
+    return abs(_v2_decimal_subtract(left, right)) \
+        < V2_MIN_QUANTITY_FLOOR
+
+
+def _v2_add_reconcile_reason(reasons: List[str], reason: str) -> None:
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def _v2_reconcile_observed_state(
+        event: Dict[str, Any], rungs: List[Dict[str, Any]],
+        prior_baseline: Dict[str, str]) -> Dict[str, Any]:
+    rows = []
+    reasons: List[str] = []
+    event_baseline = event["baseline"]
+    baseline = prior_baseline
+    for field in sorted(_V2_RECONCILE_POSITION_FIELDS):
+        expected = Decimal(prior_baseline[field])
+        observed = Decimal(event_baseline[field])
+        if not _v2_quantities_agree(expected, observed):
+            rows.append({
+                "row_type": "BASELINE_MISMATCH",
+                "field": field,
+                "derived_total": _v2_canonical_decimal(expected),
+                "exchange_total": _v2_canonical_decimal(observed),
+                "quantity_floor": _v2_canonical_decimal(
+                    V2_MIN_QUANTITY_FLOOR),
+            })
+            _v2_add_reconcile_reason(reasons, "BASELINE_MISMATCH")
+
+    observed_orders = {
+        row["client_order_id"]: row for row in event["own_orders"]
+    }
+    expected_client_ids = set()
+    rung_statuses = {}
+    for rung in rungs:
+        leg_rows = {}
+        leg_statuses = []
+        for role in ("spot", "short"):
+            expected = rung["orders"][role]
+            client_id = expected["client_order_id"]
+            expected_client_ids.add(client_id)
+            observed = observed_orders.get(client_id)
+            exchange_status = None if observed is None \
+                else observed["status"]
+            exchange_quantity = None if observed is None \
+                else observed["executed_quantity"]
+            if observed is None:
+                status = "UNKNOWN"
+            elif exchange_status == "NOT_FOUND":
+                status = "MISSING"
+            elif observed["market"] != expected["market"]:
+                status = "UNKNOWN"
+            elif exchange_status not in V2_TERMINAL_ORDER_STATUSES \
+                    or exchange_quantity is None:
+                status = "UNKNOWN"
+            elif not _v2_quantities_agree(
+                    Decimal(expected["executed_quantity"]),
+                    Decimal(exchange_quantity)):
+                status = "DRIFTED"
+            else:
+                status = "CONFIRMED"
+            leg_statuses.append(status)
+            leg_rows[role] = {
+                "status": status,
+                "client_order_id": client_id,
+                "market": expected["market"],
+                "derived_terminal_status": expected["terminal_status"],
+                "exchange_terminal_status": exchange_status,
+                "derived_terminal_quantity":
+                    expected["executed_quantity"],
+                "exchange_terminal_quantity": exchange_quantity,
+            }
+        if "UNKNOWN" in leg_statuses:
+            rung_status = "UNKNOWN"
+        elif "MISSING" in leg_statuses:
+            rung_status = "MISSING"
+        elif "DRIFTED" in leg_statuses:
+            rung_status = "DRIFTED"
+        else:
+            rung_status = "CONFIRMED"
+        rung_statuses[rung["ordinal"]] = rung_status
+        rows.append({
+            "row_type": "RUNG_RECONCILE",
+            "ordinal": rung["ordinal"],
+            "status": rung_status,
+            "legs": leg_rows,
+        })
+        if rung_status != "CONFIRMED":
+            _v2_add_reconcile_reason(
+                reasons, "RECONCILE_" + rung_status)
+
+    for client_id in sorted(set(observed_orders) - expected_client_ids):
+        observed = observed_orders[client_id]
+        rows.append({
+            "row_type": "UNEXPECTED_OWN_ORDER",
+            "client_order_id": client_id,
+            "market": observed["market"],
+            "status": observed["status"],
+            "exchange_terminal_quantity": observed["executed_quantity"],
+        })
+        _v2_add_reconcile_reason(reasons, "UNEXPECTED_OWN_ORDER")
+
+    for field in sorted(_V2_RECONCILE_OPEN_ORDER_FIELDS):
+        order_ids = event["open_orders"][field]
+        if order_ids is None:
+            rows.append({
+                "row_type": "READ_UNKNOWN",
+                "scope": "open_orders",
+                "field": field,
+            })
+            _v2_add_reconcile_reason(reasons, "RECONCILE_UNKNOWN")
+            continue
+        for client_id in order_ids:
+            rows.append({
+                "row_type": "OPEN_ORDER_STANDING",
+                "field": field,
+                "client_order_id": client_id,
+            })
+            _v2_add_reconcile_reason(reasons, "OPEN_ORDER_STANDING")
+
+    positions = event["positions"]
+    for field in sorted(_V2_RECONCILE_POSITION_FIELDS):
+        if positions[field] is None:
+            rows.append({
+                "row_type": "READ_UNKNOWN",
+                "scope": "positions",
+                "field": field,
+            })
+            _v2_add_reconcile_reason(reasons, "RECONCILE_UNKNOWN")
+
+    derived_totals = {
+        "spot": _v2_decimal_sum([
+            rung["remaining_spot"] for rung in rungs]),
+        "short": _v2_decimal_sum([
+            rung["remaining_short"] for rung in rungs]),
+    }
+    exchange_totals: Dict[str, Optional[Decimal]] = {
+        "spot": None,
+        "short": None,
+    }
+    if positions["spot_base_quantity"] is not None:
+        exchange_totals["spot"] = _v2_decimal_subtract(
+            Decimal(positions["spot_base_quantity"]),
+            Decimal(baseline["spot_base_quantity"]))
+    if positions["futures_position_quantity"] is not None:
+        exchange_totals["short"] = _v2_decimal_subtract(
+            Decimal(baseline["futures_position_quantity"]),
+            Decimal(positions["futures_position_quantity"]))
+    for leg in ("spot", "short"):
+        exchange_total = exchange_totals[leg]
+        if exchange_total is not None and not _v2_quantities_agree(
+                derived_totals[leg], exchange_total):
+            rows.append({
+                "row_type": "AGGREGATE_MISMATCH",
+                "leg": leg,
+                "derived_total": _v2_canonical_decimal(
+                    derived_totals[leg]),
+                "exchange_total": _v2_canonical_decimal(exchange_total),
+                "quantity_floor": _v2_canonical_decimal(
+                    V2_MIN_QUANTITY_FLOOR),
+            })
+            _v2_add_reconcile_reason(reasons, "AGGREGATE_MISMATCH")
+
+    balances = event["balances"]
+    for field in sorted(_V2_RECONCILE_BALANCE_FIELDS):
+        if balances[field] is None:
+            rows.append({
+                "row_type": "READ_UNKNOWN",
+                "scope": "balances",
+                "field": field,
+            })
+            _v2_add_reconcile_reason(reasons, "RECONCILE_UNKNOWN")
+    if positions["spot_base_quantity"] is not None \
+            and balances["spot_base_free_quantity"] is not None \
+            and balances["spot_base_locked_quantity"] is not None:
+        balance_total = _v2_decimal_sum([
+            Decimal(balances["spot_base_free_quantity"]),
+            Decimal(balances["spot_base_locked_quantity"]),
+        ])
+        position_total = Decimal(positions["spot_base_quantity"])
+        if not _v2_quantities_agree(balance_total, position_total):
+            rows.append({
+                "row_type": "BALANCE_MISMATCH",
+                "leg": "spot",
+                "position_total": _v2_canonical_decimal(position_total),
+                "balance_total": _v2_canonical_decimal(balance_total),
+                "quantity_floor": _v2_canonical_decimal(
+                    V2_MIN_QUANTITY_FLOOR),
+            })
+            _v2_add_reconcile_reason(reasons, "BALANCE_MISMATCH")
+
+    return {
+        "reconcile_id": event["reconcile_id"],
+        "observed_at_ms": event["observed_at_ms"],
+        "status": "FROZEN" if reasons else "CONFIRMED",
+        "blocking": bool(reasons),
+        "freeze_reasons": reasons,
+        "rung_statuses": rung_statuses,
+        "rows": rows,
+        "baseline": baseline,
+    }
+
+
+def _v2_mark_reconcile_required(
+        reconciliation: Optional[Dict[str, Any]],
+        rungs: List[Dict[str, Any]], event_type: str,
+        ordinal: int) -> None:
+    if reconciliation is None:
+        return
+    reconciliation["status"] = "FROZEN"
+    reconciliation["blocking"] = True
+    _v2_add_reconcile_reason(
+        reconciliation["freeze_reasons"], "RECONCILIATION_REQUIRED")
+    reconciliation["rung_statuses"] = {
+        rung["ordinal"]: "UNOBSERVED" for rung in rungs
+    }
+    reconciliation["rows"].append({
+        "row_type": "RECONCILIATION_REQUIRED",
+        "after_event_type": event_type,
+        "ordinal": ordinal,
+    })
+
+
 def derive_v2_state(value: Any) -> Dict[str, Any]:
     """Purely derive all v2 operational state from one validated ledger."""
     ledger = _v2_record_ledger(value)
@@ -1703,7 +2122,16 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     client_ids = set()
     exchange_ids = set()
     dislocation_ids = set()
+    reconcile_ids = set()
     rungs: List[Dict[str, Any]] = []
+    # Version 2 can only begin after its exact flat proof, so the position
+    # baseline is the two-leg zero fixed by that ledger transition.  Each
+    # observation repeats it; a caller cannot move the baseline to hide drift.
+    reconcile_baseline: Dict[str, str] = {
+        "spot_base_quantity": "0",
+        "futures_position_quantity": "0",
+    }
+    reconciliation: Optional[Dict[str, Any]] = None
     initial_flat = False
     final_flat = False
     last_transition_index = 0
@@ -1728,7 +2156,24 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             receipt_digests.add(event["receipt_digest"])
             continue
 
+        if event_type == "ReconcileObserved":
+            if final_flat:
+                raise PositionError(
+                    "version-2 CLOSED ledger cannot reconcile again")
+            reconcile_id = event["reconcile_id"]
+            if reconcile_id in reconcile_ids:
+                raise PositionError(
+                    "version-2 reconcile id is registered more than once")
+            reconcile_ids.add(reconcile_id)
+            reconciliation = _v2_reconcile_observed_state(
+                event, rungs, reconcile_baseline)
+            continue
+
         if event_type == "FlatProved":
+            if reconciliation is not None \
+                    and reconciliation["blocking"]:
+                raise PositionError(
+                    "version-2 reconciliation blocks FlatProved")
             receipt_id = event["receipt_id"]
             if receipt_id not in registry:
                 raise PositionError(
@@ -1785,6 +2230,9 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             if not initial_flat or final_flat:
                 raise PositionError(
                     "version-2 RungFilled is not a legal next transition")
+            if reconciliation is not None and reconciliation["blocking"]:
+                raise PositionError(
+                    "version-2 RungFilled is blocked by reconciliation")
             if any(_v2_closed_residual(rung) for rung in rungs):
                 raise PositionError(
                     "version-2 RungFilled is blocked by DUST_STANDING")
@@ -1859,7 +2307,21 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
                 "remaining_spot": spot_net,
                 "remaining_short": short_quantity,
                 "permanent_freeze_reasons": permanent_reasons,
+                "orders": {
+                    role: {
+                        "client_order_id": event["legs"][role][
+                            "client_order_id"],
+                        "market": event["legs"][role]["market"],
+                        "terminal_status": event["legs"][role][
+                            "terminal_status"],
+                        "executed_quantity": event["legs"][role][
+                            "executed_quantity"],
+                    }
+                    for role in ("spot", "short")
+                },
             })
+            _v2_mark_reconcile_required(
+                reconciliation, rungs, "RungFilled", ordinal)
             last_transition_index = index
             continue
 
@@ -1923,6 +2385,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
                 rung["remaining_spot"], spot_sum)
             rung["remaining_short"] = _v2_decimal_subtract(
                 rung["remaining_short"], short_sum)
+            _v2_mark_reconcile_required(
+                reconciliation, rungs, "RungReduced", event["ordinal"])
             consumed_receipts.update(event["receipt_ids"])
             last_transition_index = index
             last_reduction_index = index
@@ -1949,11 +2413,18 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     pending_active_evidence = bool(active_rungs and pending_receipts)
     dust_standing = not final_flat and any(
         _v2_closed_residual(rung) for rung in rungs)
+    reconcile_blocking = reconciliation is not None \
+        and reconciliation["blocking"]
 
     derived_rungs = []
     dust_rows = []
     for rung in rungs:
         reasons = _v2_current_freeze_reasons(rung)
+        reconcile_status = None if reconciliation is None else \
+            reconciliation["rung_statuses"].get(rung["ordinal"])
+        if reconcile_status not in (None, "CONFIRMED") \
+                and _v2_active(rung):
+            reasons.append("RECONCILE_" + reconcile_status)
         if pending_active_evidence \
                 and rung["ordinal"] == top_active_ordinal:
             reasons.append("RECEIPT_EVIDENCE_PENDING")
@@ -1997,12 +2468,14 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
             "cap_exceeded":
                 "CAP_EXCEEDED" in rung["permanent_freeze_reasons"],
             "freeze_reasons": reasons,
+            "reconcile_status": reconcile_status,
         })
 
     any_frozen = any(
         _v2_current_freeze_reasons(rung) for rung in active_rungs)
     any_frozen = any_frozen or pending_active_evidence
     any_frozen = any_frozen or bool(active_rungs and dust_standing)
+    any_frozen = any_frozen or reconcile_blocking
     flat_transition_ready = len(pending_receipts) == 1 \
         and _v2_flat_receipt_proves_flat(pending_receipts[0])
     top_active_rung = None if top_active_ordinal is None \
@@ -2026,6 +2499,8 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         top_state = "FROZEN"
     elif final_flat:
         top_state = ST_CLOSED
+    elif reconcile_blocking:
+        top_state = "FROZEN"
     elif not initial_flat:
         top_state = "UNPROVEN" if flat_transition_ready \
             or not pending_receipts else "FROZEN"
@@ -2047,8 +2522,10 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     legal_next = [] if top_state == ST_CLOSED \
         or ledger_freeze_reasons \
         else [{"event_type": "ReceiptObserved"}]
+    if legal_next:
+        legal_next.append({"event_type": "ReconcileObserved"})
     if top_state in ("UNPROVEN", "AWAITING_FLAT_PROOF") \
-            and flat_transition_ready:
+            and flat_transition_ready and not reconcile_blocking:
         legal_next.append({"event_type": "FlatProved"})
     if next_ordinal is not None:
         legal_next.append({
@@ -2063,6 +2540,10 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
     top_state_flags = list(ledger_freeze_reasons)
     if dust_standing:
         top_state_flags.append(V2_DUST_STANDING)
+    if reconciliation is not None:
+        for reason in reconciliation["freeze_reasons"]:
+            if reason not in top_state_flags:
+                top_state_flags.append(reason)
 
     return {
         "symbol": config["symbol"],
@@ -2070,6 +2551,15 @@ def derive_v2_state(value: Any) -> Dict[str, Any]:
         "config_event_digest": config["event_digest"],
         "top_state": top_state,
         "freeze_reasons": top_state_flags,
+        "reconciliation_status": "UNOBSERVED" if reconciliation is None
+            else reconciliation["status"],
+        "last_reconcile_id": None if reconciliation is None
+            else reconciliation["reconcile_id"],
+        "reconcile_rows": [] if reconciliation is None
+            else reconciliation["rows"],
+        "reconcile_baseline": reconcile_baseline,
+        "flat_proved_blocked": reconcile_blocking,
+        "ledger_event_count": len(ledger),
         "rungs": derived_rungs,
         "dust_rows": dust_rows,
         "remaining_spot_quantity": _v2_canonical_decimal(
@@ -2316,9 +2806,9 @@ def _seal_v2_event_payload(
             event_type + " payload")
         if event_type == "ConfigSnapshot":
             cut = V2_GENESIS_CUT_MS
-        elif event_type == "ReceiptObserved":
+        elif event_type in ("ReceiptObserved", "ReconcileObserved"):
             cut = _v2_epoch_ms(
-                copied["observed_at_ms"], "ReceiptObserved.cut_ms")
+                copied["observed_at_ms"], event_type + ".cut_ms")
         elif event_type == "RungFilled":
             cut = _v2_epoch_ms(copied["cut_ms"], "RungFilled.cut_ms")
         else:
@@ -2343,10 +2833,14 @@ def _seal_v2_event_payload(
 
 
 def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
-                    expected_length: int) -> Dict[str, Any]:
+                    expected_length: int,
+                    expected_last_digest: Optional[str] = None
+                    ) -> Dict[str, Any]:
     """CAS-append; replace the ledger, then its committed head sidecar."""
     expected_length = _v2_int(
         expected_length, "expected_length", 0, V2_MAX_LEDGER_EVENTS - 1)
+    if expected_last_digest is not None:
+        _v2_digest(expected_last_digest, "expected_last_digest")
     os.makedirs(receipt_dir, mode=0o700, exist_ok=True)
     guard_path = os.path.join(receipt_dir, STATE_WRITE_GUARD_FILE)
     try:
@@ -2369,6 +2863,12 @@ def append_v2_event(receipt_dir: str, event_payload: Dict[str, Any],
         if len(ledger) != expected_length:
             raise PositionError(
                 "version-2 expected_length is stale; ledger unchanged")
+        current_digest = V2_GENESIS_DIGEST if not ledger \
+            else ledger[-1]["event_digest"]
+        if expected_last_digest is not None \
+                and current_digest != expected_last_digest:
+            raise PositionError(
+                "version-2 expected_last_digest is stale; ledger unchanged")
         if len(ledger) >= V2_MAX_LEDGER_EVENTS:
             raise PositionError(
                 "version-2 ledger has reached its event bound")
@@ -3965,13 +4465,69 @@ def cmd_close(cfg: PositionConfig, request, sleep=time.sleep,
 # data-only, automatic:false always; nothing is ever resent.
 # --------------------------------------------------------------------------
 
+
+def _v2_resume_observation_payload(
+        position: Dict[str, Any], observation: Any) -> Dict[str, Any]:
+    if not isinstance(observation, dict):
+        raise PositionError(
+            "version-2 resume observation must be an object")
+    copied = _copy_v2_record(observation, "resume observation")
+    event_type = copied.pop("event_type", "ReconcileObserved")
+    if event_type != "ReconcileObserved":
+        raise PositionError(
+            "version-2 resume requires a ReconcileObserved event")
+    normalized = _normalize_v2_reconcile_observation(
+        copied, require_canonical=False)
+    expected = {}
+    for event in position["ledger"]:
+        if event["event_type"] != "RungFilled":
+            continue
+        for role in ("spot", "short"):
+            leg = event["legs"][role]
+            expected[leg["client_order_id"]] = leg["market"]
+    observed_ids = {
+        row["client_order_id"] for row in normalized["own_orders"]
+    }
+    completed = list(normalized["own_orders"])
+    for client_id in sorted(set(expected) - observed_ids):
+        completed.append({
+            "client_order_id": client_id,
+            "market": expected[client_id],
+            # Omitted caller evidence is unknown.  NOT_FOUND is accepted only
+            # when the caller explicitly supplies that private-read result.
+            "status": "UNKNOWN",
+            "executed_quantity": None,
+        })
+    normalized["own_orders"] = _normalize_v2_reconcile_own_orders(
+        completed, "ReconcileObserved.own_orders",
+        require_canonical=False)
+    return {"event_type": "ReconcileObserved", **normalized}
+
+
 def derive_resume(position: Dict[str, Any],
-                  truths: Dict[str, Tuple[str, Any]],
-                  short_amount: Optional[Decimal],
-                  base_free: Optional[Decimal],
-                  spot_step: Decimal) -> Dict[str, Any]:
-    """Pure judgment over reconciled truth. Returns {state, verdict, note,
-    exposure, recommendations}. Never proposes an automatic action."""
+                  truths: Dict[str, Any],
+                  short_amount: Optional[Decimal] = None,
+                  base_free: Optional[Decimal] = None,
+                  spot_step: Optional[Decimal] = None,
+                  *, receipt_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Derive resume truth; v2 first CAS-appends its typed observation.
+
+    The version-1 return remains the pure legacy judgment with no automatic
+    action.  Version 2 returns the ledger-derived reconciliation view.
+    """
+    if _is_v2_position(position):
+        if receipt_dir is None:
+            raise PositionError(
+                "version-2 resume requires receipt_dir for its CAS append")
+        _validate_v2_position(position)
+        payload = _v2_resume_observation_payload(position, truths)
+        ledger = position["ledger"]
+        persisted = append_v2_event(
+            receipt_dir, payload, len(ledger),
+            expected_last_digest=ledger[-1]["event_digest"])
+        return derive_v2_state(persisted)
+    if spot_step is None:
+        raise PositionError("version-1 resume requires spot_step")
     unresolved = []
     working = []
     fills: Dict[str, Decimal] = {}

@@ -1312,7 +1312,8 @@ class VersionTwoPersistenceTests(unittest.TestCase):
     def filled(self, ordinal, spot_quantity="0.1",
                short_quantity="0.1", spot_quote=None,
                short_quote=None, spot_fees=None, entry_gap=None,
-               source_time_ms=None, cut_ms=None):
+               source_time_ms=None, cut_ms=None,
+               spot_status="FILLED", short_status="FILLED"):
         if spot_quote is None:
             spot_quote = "9" if ordinal == 1 else "7.5"
         if short_quote is None:
@@ -1330,10 +1331,76 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             ordinal, {
                 "spot": self.leg(
                     "spot", ordinal, spot_quantity, spot_quote,
-                    spot_fees),
+                    spot_fees, status=spot_status),
                 "short": self.leg(
-                    "short", ordinal, short_quantity, short_quote),
+                    "short", ordinal, short_quantity, short_quote,
+                    status=short_status),
             }, dislocation, cut_ms)
+
+    def reconcile_observation(self, reconcile_id, own_overrides=None,
+                              spot_position=None, futures_position=None,
+                              open_orders=None):
+        position = self.current()
+        derived = bp.derive_v2_state(position)
+        own_orders = []
+        for event in position["ledger"]:
+            if event["event_type"] != "RungFilled":
+                continue
+            for role in ("spot", "short"):
+                leg = event["legs"][role]
+                own_orders.append({
+                    "client_order_id": leg["client_order_id"],
+                    "market": leg["market"],
+                    "status": leg["terminal_status"],
+                    "executed_quantity": leg["executed_quantity"],
+                })
+        for client_id, replacement in (own_overrides or {}).items():
+            own_orders = [
+                row for row in own_orders
+                if row["client_order_id"] != client_id
+            ]
+            if replacement is not None:
+                own_orders.append(replacement)
+        if spot_position is None:
+            spot_position = derived["remaining_spot_quantity"]
+        if futures_position is None:
+            futures_position = "-" + derived[
+                "remaining_short_quantity"] \
+                if derived["remaining_short_quantity"] != "0" else "0"
+        observed_at_ms = position["ledger"][-1]["cut_ms"] + 1
+        return bp.new_v2_reconcile_observed_event(
+            reconcile_id=reconcile_id,
+            observed_at_ms=observed_at_ms,
+            source="private-resume-read",
+            baseline={
+                "spot_base_quantity": "0",
+                "futures_position_quantity": "0",
+            },
+            positions={
+                "spot_base_quantity": spot_position,
+                "futures_position_quantity": futures_position,
+            },
+            open_orders=open_orders or {
+                "spot_standard_client_order_ids": [],
+                "spot_algorithmic_client_order_ids": [],
+                "futures_standard_client_order_ids": [],
+                "futures_algorithmic_client_order_ids": [],
+            },
+            own_orders=own_orders,
+            balances={
+                "spot_base_free_quantity": spot_position,
+                "spot_base_locked_quantity": "0",
+                "spot_quote_free_quantity": "100",
+                "futures_wallet_balance": "100",
+            })
+
+    def resume_v2(self, observation):
+        with mock.patch.object(
+                bp, "default_now_ms",
+                return_value=observation["observed_at_ms"]):
+            return bp.derive_resume(
+                self.current(), observation,
+                receipt_dir=self.receipt_dir)
 
     def observe_reduction(self, receipt_id, ordinal,
                           spot_quantity, short_quantity):
@@ -2001,6 +2068,275 @@ class VersionTwoPersistenceTests(unittest.TestCase):
             [row["status"] for row in closed["rungs"]],
             [bp.ST_CLOSED, bp.ST_CLOSED])
         self.assertTrue(closed["dust_rows"][0]["recorded_not_lost"])
+
+    def test_build03_confirmed_multi_rung_resume(self):
+        self.ready()
+        self.append(self.filled(1, spot_quantity="0.1",
+                                short_quantity="0.1"))
+        self.append(self.filled(2, spot_quantity="0.2",
+                                short_quantity="0.2"))
+        derived = self.resume_v2(
+            self.reconcile_observation("reconcile-confirmed"))
+        self.assertEqual(derived["top_state"], bp.ST_OPEN)
+        self.assertEqual(derived["reconciliation_status"], "CONFIRMED")
+        self.assertEqual(
+            [rung["reconcile_status"] for rung in derived["rungs"]],
+            ["CONFIRMED", "CONFIRMED"])
+        self.assertFalse(derived["flat_proved_blocked"])
+        self.assertEqual(
+            [row for row in derived["reconcile_rows"]
+             if row["row_type"] == "AGGREGATE_MISMATCH"], [])
+
+    def test_build03_terminal_partial_status_and_quantity_confirm(self):
+        self.ready()
+        self.append(self.filled(
+            1, spot_quantity="0.04", short_quantity="0.04",
+            spot_quote="4", short_quote="3.9",
+            spot_status="CANCELED", short_status="CANCELED"))
+        derived = self.resume_v2(
+            self.reconcile_observation("reconcile-terminal-partial"))
+        self.assertEqual(derived["top_state"], bp.ST_OPEN)
+        row = derived["reconcile_rows"][0]
+        self.assertEqual(row["status"], "CONFIRMED")
+        self.assertEqual(
+            row["legs"]["spot"]["exchange_terminal_status"],
+            "CANCELED")
+        self.assertEqual(
+            row["legs"]["spot"]["exchange_terminal_quantity"], "0.04")
+
+    def test_build03_single_rung_quantity_drift_freezes_reduce_only(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-drift", own_overrides={
+                "own-1-spot": {
+                    "client_order_id": "own-1-spot",
+                    "market": "BINANCE_SPOT",
+                    "status": "FILLED",
+                    "executed_quantity": "0.09",
+                },
+            })
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["reduce_only"])
+        self.assertTrue(derived["flat_proved_blocked"])
+        self.assertEqual(derived["rungs"][0]["reconcile_status"],
+                         "DRIFTED")
+        row = derived["reconcile_rows"][0]
+        self.assertEqual(row["status"], "DRIFTED")
+        self.assertEqual(
+            row["legs"]["spot"]["derived_terminal_quantity"], "0.1")
+        self.assertEqual(
+            row["legs"]["spot"]["exchange_terminal_quantity"], "0.09")
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        next_cut = self.current()["ledger"][-1]["cut_ms"] + 1
+        with mock.patch.object(bp, "default_now_ms", return_value=next_cut):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "blocked by reconciliation"):
+                self.append(self.filled(2, cut_ms=next_cut))
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_build03_missing_own_order_freezes_as_unknown(self):
+        self.ready()
+        self.append(self.filled(1))
+        derived = self.resume_v2(self.reconcile_observation(
+            "reconcile-missing", own_overrides={
+                "own-1-short": {
+                    "client_order_id": "own-1-short",
+                    "market": "BINANCE_USDM",
+                    "status": "NOT_FOUND",
+                    "executed_quantity": None,
+                },
+            }))
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertEqual(derived["rungs"][0]["reconcile_status"],
+                         "MISSING")
+        persisted = self.current()["ledger"][-1]
+        missing = [
+            row for row in persisted["own_orders"]
+            if row["client_order_id"] == "own-1-short"
+        ]
+        self.assertEqual(missing[0]["status"], "NOT_FOUND")
+        self.assertIsNone(missing[0]["executed_quantity"])
+
+    def test_build03_aggregate_mismatch_freezes_with_typed_totals(self):
+        self.ready()
+        self.append(self.filled(1))
+        derived = self.resume_v2(self.reconcile_observation(
+            "reconcile-aggregate", spot_position="0.2"))
+        self.assertEqual(derived["top_state"], "FROZEN")
+        rows = [
+            row for row in derived["reconcile_rows"]
+            if row["row_type"] == "AGGREGATE_MISMATCH"
+            and row["leg"] == "spot"
+        ]
+        self.assertEqual(rows, [{
+            "row_type": "AGGREGATE_MISMATCH",
+            "leg": "spot",
+            "derived_total": "0.1",
+            "exchange_total": "0.2",
+            "quantity_floor":
+                "0.0000000000000000000000000001",
+        }])
+        self.assertTrue(derived["flat_proved_blocked"])
+
+    def test_build03_unknown_own_order_never_becomes_zero(self):
+        self.ready()
+        self.append(self.filled(1))
+        derived = self.resume_v2(self.reconcile_observation(
+            "reconcile-unknown", own_overrides={
+                "own-1-short": {
+                    "client_order_id": "own-1-short",
+                    "market": "BINANCE_USDM",
+                    "status": "UNKNOWN",
+                    "executed_quantity": None,
+                },
+            }))
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertEqual(derived["rungs"][0]["reconcile_status"],
+                         "UNKNOWN")
+        event = self.current()["ledger"][-1]
+        unknown = [
+            row for row in event["own_orders"]
+            if row["client_order_id"] == "own-1-short"
+        ][0]
+        self.assertIsNone(unknown["executed_quantity"])
+        self.assertNotEqual(unknown["executed_quantity"], "0")
+
+    def test_build03_unknown_reads_and_open_orders_freeze(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation("reconcile-read-gaps")
+        observation["positions"]["futures_position_quantity"] = None
+        observation["balances"]["futures_wallet_balance"] = None
+        observation["open_orders"][
+            "spot_algorithmic_client_order_ids"] = ["foreign-spot-order"]
+        derived = self.resume_v2(observation)
+        self.assertEqual(derived["top_state"], "FROZEN")
+        self.assertTrue(derived["flat_proved_blocked"])
+        row_types = [row["row_type"]
+                     for row in derived["reconcile_rows"]]
+        self.assertIn("READ_UNKNOWN", row_types)
+        self.assertIn("OPEN_ORDER_STANDING", row_types)
+        self.assertIn("RECONCILE_UNKNOWN", derived["freeze_reasons"])
+        self.assertIn("OPEN_ORDER_STANDING", derived["freeze_reasons"])
+
+    def test_build03_zero_baseline_cannot_be_moved_to_hide_exposure(self):
+        self.ready()
+        self.append(self.filled(1))
+        observation = self.reconcile_observation(
+            "reconcile-moved-baseline", spot_position="0.2")
+        observation["baseline"]["spot_base_quantity"] = "0.1"
+        frozen = self.resume_v2(observation)
+        self.assertEqual(frozen["top_state"], "FROZEN")
+        self.assertIn("BASELINE_MISMATCH", frozen["freeze_reasons"])
+        baseline_rows = [
+            row for row in frozen["reconcile_rows"]
+            if row["row_type"] == "BASELINE_MISMATCH"
+        ]
+        self.assertEqual(baseline_rows[0]["derived_total"], "0")
+        self.assertEqual(baseline_rows[0]["exchange_total"], "0.1")
+
+        confirmed = self.resume_v2(
+            self.reconcile_observation("reconcile-baseline-restored"))
+        self.assertEqual(confirmed["reconciliation_status"], "CONFIRMED")
+        self.assertEqual(confirmed["reconcile_baseline"], {
+            "spot_base_quantity": "0",
+            "futures_position_quantity": "0",
+        })
+
+    def test_build03_transition_after_confirmed_read_requires_fresh_resume(self):
+        self.ready()
+        initial = self.reconcile_observation("reconcile-before-fill")
+        ready = self.resume_v2(initial)
+        self.assertEqual(ready["reconciliation_status"], "CONFIRMED")
+        fill_cut = initial["observed_at_ms"] + 1
+        with mock.patch.object(bp, "default_now_ms", return_value=fill_cut):
+            position = self.append(self.filled(1, cut_ms=fill_cut))
+        pending = bp.derive_v2_state(position)
+        self.assertEqual(pending["top_state"], "FROZEN")
+        self.assertIn("RECONCILIATION_REQUIRED",
+                      pending["freeze_reasons"])
+        self.assertEqual(pending["rungs"][0]["reconcile_status"],
+                         "UNOBSERVED")
+        self.assertNotIn(
+            {"event_type": "RungFilled", "ordinal": 2},
+            pending["legal_next_transitions"])
+        confirmed = self.resume_v2(
+            self.reconcile_observation("reconcile-after-fill"))
+        self.assertEqual(confirmed["top_state"], bp.ST_OPEN)
+        self.assertEqual(confirmed["rungs"][0]["reconcile_status"],
+                         "CONFIRMED")
+
+    def test_build03_reconcile_observation_is_cas_appended_and_chained(self):
+        self.ready()
+        self.append(self.filled(1))
+        before = self.current()
+        prior_digest = before["ledger"][-1]["event_digest"]
+        observation = self.reconcile_observation("reconcile-chain")
+        derived = self.resume_v2(observation)
+        after = self.current()
+        event = after["ledger"][-1]
+        self.assertEqual(len(after["ledger"]), len(before["ledger"]) + 1)
+        self.assertEqual(event["event_type"], "ReconcileObserved")
+        self.assertEqual(event["previous_digest"], prior_digest)
+        self.assertEqual(event["event_digest"], bp.v2_event_digest(event))
+        self.assertEqual(derived["ledger_event_count"],
+                         len(after["ledger"]))
+
+    def test_build03_resume_cas_binds_the_ledger_tail_digest(self):
+        self.ready()
+        self.append(self.filled(1))
+        before_position = self.state_path.read_bytes()
+        before_head = self.head_path.read_bytes()
+        observation = self.reconcile_observation("reconcile-stale-tail")
+        with tempfile.TemporaryDirectory() as other_dir:
+            config = json.loads(json.dumps(self.CONFIG_SNAPSHOT))
+            config["caps"]["entry_quote"] = "9"
+            other = self.ready_at(
+                other_dir, config, receipt_id="flat-stale-tail")
+            other_fill = self.filled(1)
+            with mock.patch.object(
+                    bp, "default_now_ms",
+                    return_value=other_fill["cut_ms"]):
+                other = bp.append_v2_event(
+                    other_dir, other_fill, len(other["ledger"]))
+            with mock.patch.object(
+                    bp, "default_now_ms",
+                    return_value=observation["observed_at_ms"]):
+                with self.assertRaisesRegex(
+                        bp.PositionError, "expected_last_digest"):
+                    bp.derive_resume(
+                        other, observation, receipt_dir=self.receipt_dir)
+        self.assertEqual(self.state_path.read_bytes(), before_position)
+        self.assertEqual(self.head_path.read_bytes(), before_head)
+
+    def test_build03_reconcile_freeze_blocks_flat_proof_until_confirmed(self):
+        self.ready()
+        self.append(self.filled(1))
+        self.resume_v2(self.reconcile_observation(
+            "reconcile-block", spot_position="0.2"))
+        self.reduce("reduce-after-drift", 1, "0.1", "0.1")
+        observed_at = self.current()["ledger"][-1]["cut_ms"] + 1
+        self.observe_flat("flat-after-drift", observed_at)
+        with mock.patch.object(
+                bp, "default_now_ms", return_value=observed_at + 1):
+            with self.assertRaisesRegex(
+                    bp.PositionError, "reconciliation blocks FlatProved"):
+                self.append(bp.new_v2_flat_proved_event(
+                    "flat-after-drift"))
+        confirmed_observation = self.reconcile_observation(
+            "reconcile-owner-confirmed")
+        confirmed = self.resume_v2(confirmed_observation)
+        self.assertEqual(confirmed["reconciliation_status"], "CONFIRMED")
+        self.assertFalse(confirmed["flat_proved_blocked"])
+        closed = self.prove_flat(
+            "flat-after-drift",
+            confirmed_observation["observed_at_ms"] + 1)
+        self.assertEqual(bp.derive_v2_state(closed)["top_state"],
+                         bp.ST_CLOSED)
 
     def test_br5_wrong_path_head_refuses_same_length_ledger(self):
         self.ready()
