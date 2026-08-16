@@ -2181,7 +2181,9 @@ class ReadOnlyHandler(BaseHTTPRequestHandler):
             else:
                 saved, error = writer(type(self).sources, body)
         except OSError as exc:
-            self._send_json(500, {"ok": False, "error": str(exc)})
+            error = ("write failed" if clean in (
+                "/api/network/config", "/api/network/probe") else str(exc))
+            self._send_json(500, {"ok": False, "error": error})
             return
         if error:
             status = 400

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Bounded Network V1 reads and narrow monitoring-control writes."""
 
 import json
+import math
 import os
 import secrets
 import tempfile
@@ -29,6 +30,24 @@ GROUPS = ("rest", "wss", "cf", "news")
 PROBE_EDGES = ("spot_rest", "usdm_rest", "connector_origin", "cf_connector")
 RANGES = {"1h": (3_600_000, 60_000), "6h": (21_600_000, 300_000),
           "24h": (86_400_000, 900_000)}
+_CURRENT_KEYS = frozenset((
+    "schema_version", "generated_at", "generated_ms", "collector",
+    "deployed_ui_release", "summary", "nodes", "edges", "events",
+))
+_EDGE_KEYS = frozenset((
+    "id", "source", "target", "label", "direction", "mode", "required",
+    "group", "health", "health_reason", "authority", "monitoring", "truth",
+    "observed_at", "observed_ms", "fresh_until_ms", "cadence_ms",
+    "sample_count", "metrics", "counters", "evidence", "controls",
+))
+_EVENT_KEYS = (
+    "event_id", "ts", "edge_id", "transition", "severity", "reason",
+    "evidence",
+)
+_EVENT_EVIDENCE_KEYS = frozenset((
+    "key", "group", "old", "new", "receipt_id", "reread", "http_status",
+    "rtt_ms", "edge_id", "request_id", "delta", "from", "to", "note",
+))
 
 _EDGE_ROWS = (
     ("browser_site", "browser", "quant_ui", "Browser site", "->", "Session", False, "session", "Public", ()),
@@ -66,6 +85,7 @@ _METRICS = {
 
 _CONFIG_COOLDOWNS = {}
 _CONFIG_WRITE_LOCK = threading.Lock()
+_PROBE_WRITE_LOCK = threading.Lock()
 _LAST_RECEIPT_ID = 0
 
 
@@ -92,6 +112,22 @@ def _read_dict(path):
     except (OSError, UnicodeError, ValueError, TypeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _read_current(path):
+    if path is None:
+        return None, "missing"
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, UnicodeError, TypeError):
+        return None, "invalid"
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None, "invalid"
+    return (value, "valid") if isinstance(value, dict) else (None, "invalid")
 
 
 def _read_release(path):
@@ -121,7 +157,7 @@ def _static_graph():
     return [dict(edge) for edge in EDGES], [dict(node) for node in NODES]
 
 
-def _unknown_current(release):
+def _unknown_current(release, note=None):
     static_edges, nodes = _static_graph()
     edges = []
     for spec in static_edges:
@@ -139,7 +175,7 @@ def _unknown_current(release):
             "evidence": {"source": None, "source_age_s": None},
         })
         edges.append(edge)
-    return {
+    current = {
         "schema_version": 1, "generated_at": None, "generated_ms": None,
         "collector": {"status": "unknown", "started_at": None, "last_cycle_at": None,
                       "cycle_ms": None, "tick_s": 5, "recorder_release": None,
@@ -151,24 +187,93 @@ def _unknown_current(release):
                     "oldest_required_evidence_at": None, "last_transition": None},
         "nodes": nodes, "edges": edges, "events": [],
     }
+    if note is not None:
+        current["note"] = note
+    return current
+
+
+def _sanitize_current(current):
+    if not isinstance(current, dict) or not isinstance(current.get("edges"), list):
+        return None
+    known_ids = {edge["id"] for edge in _static_graph()[0]}
+    edges = []
+    for edge in current["edges"]:
+        if not isinstance(edge, dict):
+            return None
+        edge_id = edge.get("id")
+        if not isinstance(edge_id, str) or edge_id not in known_ids:
+            return None
+        edges.append({key: value for key, value in edge.items()
+                      if key in _EDGE_KEYS})
+    for key in ("collector", "summary"):
+        if key in current and not isinstance(current[key], dict):
+            return None
+    for key in ("nodes", "events"):
+        if key in current and not isinstance(current[key], list):
+            return None
+    output = {key: value for key, value in current.items()
+              if key in _CURRENT_KEYS}
+    output["edges"] = edges
+    return output
+
+
+def _project_evidence(value):
+    if not isinstance(value, dict):
+        return {}
+    evidence = {}
+    for key, item in value.items():
+        if key not in _EVENT_EVIDENCE_KEYS:
+            continue
+        if isinstance(item, str):
+            evidence[key] = item[:200]
+        elif (item is None or isinstance(item, (bool, int))
+              or (isinstance(item, float) and math.isfinite(item))):
+            evidence[key] = item
+    return evidence
+
+
+def _project_event(event):
+    if not isinstance(event, dict):
+        return None
+    projected = {key: event.get(key) for key in _EVENT_KEYS}
+    reason = event.get("reason")
+    projected["reason"] = reason[:500] if isinstance(reason, str) else ""
+    projected["evidence"] = _project_evidence(event.get("evidence"))
+    return projected
+
+
+def _project_events(events, limit):
+    projected = []
+    for event in events if isinstance(events, list) else ():
+        row = _project_event(event)
+        if row is not None:
+            projected.append(row)
+        if len(projected) >= limit:
+            break
+    return projected
 
 
 def api_network(sources, now=None):
     """Return current recorder state, with read-time freshness applied."""
     release = _read_release(sources.get("ui_release"))
-    current = _read_dict(sources.get("network_current"))
-    if current is None: return _unknown_current(release)
+    current, state = _read_current(sources.get("network_current"))
+    if state == "missing":
+        return _unknown_current(release)
+    current = _sanitize_current(current)
+    if current is None:
+        return _unknown_current(release, "current file invalid")
     try:
         from ui.network_health import apply_read_time_staleness
     except ModuleNotFoundError as error:
         if error.name != "ui.network_health": raise
     else:
-        applied = apply_read_time_staleness(current, _as_now_ms(now))
+        try:
+            applied = apply_read_time_staleness(current, _as_now_ms(now))
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            return _unknown_current(release, "current file invalid")
         current = applied if isinstance(applied, dict) else current
     current["deployed_ui_release"] = release
-    events = current.get("events")
-    if isinstance(events, list) and len(events) > 20:
-        current["events"] = events[:20]
+    current["events"] = _project_events(current.get("events"), 20)
     return current
 
 
@@ -246,7 +351,7 @@ def api_network_events(sources, query):
         return 200, {"events": [], "next_after": after}
     payload = _store_read(path, "events_after", after, limit)
     events = payload.get("events") if isinstance(payload, dict) else None
-    events = events[:limit] if isinstance(events, list) else []
+    events = _project_events(events, limit)
     next_after = events[-1].get("event_id", after) if events and isinstance(events[-1], dict) else after
     return 200, {"events": events, "next_after": next_after}
 
@@ -310,6 +415,24 @@ def _atomic_json(path, payload):
         raise
 
 
+def _atomic_bytes(path, payload):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".%s-" % target.name, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _receipt_id(now_ms):
     global _LAST_RECEIPT_ID
     _LAST_RECEIPT_ID = max(_LAST_RECEIPT_ID + 1, now_ms)
@@ -344,7 +467,12 @@ def write_network_config(sources, body, headers=None):
         if last_ms is not None and now_ms - last_ms < 2_000:
             remaining = max(1, (2_000 - (now_ms - last_ms) + 999) // 1000)
             return None, "cooldown %d s" % remaining
-        current = _resolved_config(_read_dict(sources["network_config"]))
+        config_path = Path(sources["network_config"])
+        try:
+            previous_bytes, previous_exists = config_path.read_bytes(), True
+        except FileNotFoundError:
+            previous_bytes, previous_exists = b"", False
+        current = _resolved_config(_read_dict(config_path))
         old = current["paused"][group] if key == "paused" else current[key]
         receipt_id = _receipt_id(now_ms)
         if key == "paused":
@@ -367,7 +495,18 @@ def write_network_config(sources, body, headers=None):
                         "receipt_id": receipt_id, "reread": True}
             label = "%s.%s" % (key, group) if key == "paused" else key
             reason = "%s %s → %s" % (label, json.dumps(old), json.dumps(new))
-            store.insert_event(now_ms, None, "config", "info", reason, evidence)
+            try:
+                store.insert_event(
+                    now_ms, None, "config", "info", reason, evidence)
+            except Exception:
+                if previous_exists:
+                    _atomic_bytes(config_path, previous_bytes)
+                else:
+                    try:
+                        config_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                return None, "receipt could not be recorded; change reverted"
         finally:
             store.close()
         _CONFIG_COOLDOWNS[(key, group)] = now_ms
@@ -390,16 +529,29 @@ def write_network_probe(sources, body, headers=None):
     if refused: return None, ("403", refused)
     if not isinstance(body, dict) or set(body) != {"edge_id"} or body.get("edge_id") not in PROBE_EDGES: return None, "unknown probe edge"
     edge_id = body["edge_id"]
-    now_ms = _now_ms()
-    current = _read_dict(sources.get("network_current")) or {}
-    collector = current.get("collector") if isinstance(current.get("collector"), dict) else {}
-    probe_now = collector.get("probe_now") if isinstance(collector.get("probe_now"), dict) else {}
-    previous_ms = _parse_iso_ms(probe_now.get(edge_id))
-    if previous_ms is not None and now_ms - previous_ms < 30_000:
-        remaining = max(1, (30_000 - (now_ms - previous_ms) + 999) // 1000)
-        return None, "cooldown %d s" % remaining
-    request_id = secrets.token_hex(6)
-    _atomic_json(sources["network_probe_request"], {
-        "edge_id": edge_id, "request_id": request_id, "requested_at": _iso(now_ms),
-    })
-    return {"edge_id": edge_id, "request_id": request_id}, None
+    with _PROBE_WRITE_LOCK:
+        now_ms = _now_ms()
+        request_path = Path(sources["network_probe_request"])
+        pending = _read_dict(request_path)
+        pending_ms = _parse_iso_ms(
+            pending.get("requested_at")) if isinstance(pending, dict) else None
+        if pending_ms is None:
+            try:
+                pending_ms = int(request_path.stat().st_mtime * 1000)
+            except OSError:
+                pending_ms = None
+        if pending_ms is not None and now_ms - pending_ms < 30_000:
+            return None, "probe already requested"
+        current = _read_dict(sources.get("network_current")) or {}
+        collector = current.get("collector") if isinstance(current.get("collector"), dict) else {}
+        probe_now = collector.get("probe_now") if isinstance(collector.get("probe_now"), dict) else {}
+        previous_ms = _parse_iso_ms(probe_now.get(edge_id))
+        if previous_ms is not None and now_ms - previous_ms < 30_000:
+            remaining = max(1, (30_000 - (now_ms - previous_ms) + 999) // 1000)
+            return None, "cooldown %d s" % remaining
+        request_id = secrets.token_hex(6)
+        _atomic_json(request_path, {
+            "edge_id": edge_id, "request_id": request_id,
+            "requested_at": _iso(now_ms),
+        })
+        return {"edge_id": edge_id, "request_id": request_id}, None

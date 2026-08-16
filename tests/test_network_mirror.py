@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,8 +15,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MIRROR_SCRIPT = ROOT / "ui" / "host" / "local_mirror.sh"
+STAGE_SCRIPT = ROOT / "ui" / "host" / "stage_server.sh"
+VERIFY_SCRIPT = ROOT / "ui" / "host" / "verify_network.sh"
+NETWORK_DATA_SCRIPT = ROOT / "ui" / "network_data.js"
 FEED_FIXTURE = ROOT / "tests" / "fixtures" / "network" / "feed_state_sample.json"
 BASH = shutil.which("bash")
+NODE = str(Path.home() / ".local" / "node22" / "bin" / "node")
+if not Path(NODE).is_file():
+    NODE = shutil.which("node")
 MIRRORED_FILES = (
     "health.jsonl",
     "decisions.jsonl",
@@ -48,7 +55,7 @@ class TestNetworkMirror(unittest.TestCase):
         (watch / "feed_state.json").write_bytes(
             self.feed_bytes if payload is None else payload)
 
-    def run_mirror(self):
+    def run_mirror(self, extra_environment=None):
         environment = os.environ.copy()
         environment.update({
             "QUANT_MIRROR_R": str(self.receipts),
@@ -56,6 +63,8 @@ class TestNetworkMirror(unittest.TestCase):
             "QUANT_MIRROR_D": str(self.run_dir),
             "QUANT_MIRROR_ONCE": "1",
         })
+        if extra_environment:
+            environment.update(extra_environment)
         result = subprocess.run(
             [BASH, str(MIRROR_SCRIPT)],
             cwd=ROOT,
@@ -119,6 +128,49 @@ class TestNetworkMirror(unittest.TestCase):
         self.assertEqual(manifest["errors"], [meta["error"]])
         self.assertFalse(manifest["ok"])
 
+    def test_r4_braced_invalid_feed_keeps_previous_copy(self):
+        previous = b'{"previous":"good"}'
+        (self.live / "feed_state.json").write_bytes(previous)
+        self.write_feed(b"{not-json}")
+
+        self.run_mirror()
+
+        meta = self.read_json("feed_state.meta.json")
+        manifest = self.read_json("pull_manifest.json")
+        self.assertEqual((self.live / "feed_state.json").read_bytes(), previous)
+        self.assertIn("incomplete", meta["error"])
+        self.assertEqual(manifest["errors"], [meta["error"]])
+        self.assertFalse(manifest["ok"])
+
+    def test_r4_race_truncated_copy_keeps_previous_feed(self):
+        previous = b'{"previous":"good"}'
+        (self.live / "feed_state.json").write_bytes(previous)
+        self.write_feed()
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        fake_cp = fake_bin / "cp"
+        fake_cp.write_text(
+            "#!/bin/bash\n"
+            "/bin/cp \"$@\"\n"
+            "copy_rc=$?\n"
+            "if [ \"$copy_rc\" -eq 0 ] && "
+            "[ \"${3-}\" = \"$QUANT_MIRROR_L/.tmp.feed_state.json\" ]; then\n"
+            "  printf '{\"written_ms\":' > \"$3\"\n"
+            "fi\n"
+            "exit \"$copy_rc\"\n",
+            encoding="utf-8",
+        )
+        fake_cp.chmod(0o755)
+
+        self.run_mirror({"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]})
+
+        meta = self.read_json("feed_state.meta.json")
+        manifest = self.read_json("pull_manifest.json")
+        self.assertEqual((self.live / "feed_state.json").read_bytes(), previous)
+        self.assertIn("incomplete", meta["error"])
+        self.assertEqual(manifest["errors"], [meta["error"]])
+        self.assertFalse(manifest["ok"])
+
     def test_existing_files_and_stop_flags_keep_their_behavior(self):
         expected = {}
         for index, name in enumerate(MIRRORED_FILES):
@@ -146,6 +198,196 @@ class TestNetworkMirror(unittest.TestCase):
         self.assertFalse((self.live / "STOP-JOBS").exists())
         self.assertFalse((self.live / "account-governor.lock").exists())
         self.assertEqual(self.read_json("pull_manifest.json")["files"], 10)
+
+
+class TestNetworkHostScripts(unittest.TestCase):
+
+    def test_r4_mirror_uses_set_u_and_short_metadata_rows(self):
+        rows = MIRROR_SCRIPT.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(rows[1], "set -u")
+        self.assertEqual(
+            [(index, len(row)) for index, row in enumerate(rows, 1)
+             if len(row) >= 200],
+            [],
+        )
+
+    def test_r4_stage_launches_candidate_server(self):
+        script = STAGE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('SERVER=${1:-ui/serve.py.new}', script)
+        self.assertIn('python3 "$SERVER" --port 8081', script)
+
+    def test_r4_stage_checks_every_required_route(self):
+        script = STAGE_SCRIPT.read_text(encoding="utf-8")
+        checked = set(re.findall(r'^get_path "([^"]+)"$', script, re.MULTILINE))
+        required = {
+            "/",
+            "/api/strip",
+            "/api/health",
+            "/api/decisions",
+            "/api/failures",
+            "/api/events",
+            "/api/stream",
+            "/api/candidates",
+            "/api/position",
+            "/api/momentum",
+            "/api/fees",
+            "/api/pnl",
+            "/api/news",
+            "/api/telemetry",
+            "/api/poll_config",
+            "/api/grace",
+            "/api/network",
+            "/api/network/history?edge_id=spot_rest&metric=status&range=1h",
+            "/api/network/events?limit=5",
+        }
+
+        self.assertEqual(checked, required)
+        self.assertIn("post_path=/api/network/config", script)
+
+    def test_r4_verify_enforces_size_and_identifier_rules(self):
+        script = VERIFY_SCRIPT.read_text(encoding="utf-8")
+        sha_block = script.split('if [ "$source_sha"', 1)[1].split(
+            'echo "== feed meta"', 1)[0]
+
+        self.assertNotIn("failed=1", sha_block)
+        self.assertIn(
+            'benchmark /api/network "$network_url" "$tmp_dir/network.json" 100000',
+            script,
+        )
+        self.assertIn(
+            'benchmark /api/network/history-24h "$history_url" '
+            '"$tmp_dir/history.json" 1000000',
+            script,
+        )
+        self.assertIn("/api/network/events?limit=200", script)
+        self.assertRegex(
+            script,
+            r'\[ "\$bytes" -gt "\$max_body_bytes" \][\s\S]{0,200}failed=1',
+        )
+        for word in ("connectorId", "receipt_path", "job_id", '"signature"'):
+            self.assertIn(word, script)
+        self.assertIn('scan_identifiers network "$tmp_dir/network.json"', script)
+        self.assertIn('scan_identifiers events "$tmp_dir/events.json"', script)
+        self.assertIn('echo "== VERIFY FAILED"', script)
+        self.assertIn("exit 20", script)
+
+
+@unittest.skipUnless(NODE, "node is required")
+class TestNetworkData(unittest.TestCase):
+
+    def run_network_data(self, body):
+        harness = r'''
+const assert = require("assert");
+const fs = require("fs");
+const vm = require("vm");
+const sourcePath = process.argv[1];
+const source = fs.readFileSync(sourcePath, "utf8");
+
+function jsonResponse(data) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    text: function () { return Promise.resolve(JSON.stringify(data)); }
+  };
+}
+
+function loadNetworkData(fetchImpl, performanceNow, wallNow) {
+  const root = {
+    AbortController: AbortController,
+    fetch: fetchImpl,
+    setTimeout: setTimeout,
+    clearTimeout: clearTimeout,
+    setInterval: setInterval,
+    clearInterval: clearInterval,
+    performance: { now: performanceNow }
+  };
+  const context = {
+    window: root,
+    Date: { now: wallNow },
+    setTimeout: setTimeout,
+    clearTimeout: clearTimeout,
+    setInterval: setInterval,
+    clearInterval: clearInterval
+  };
+  vm.createContext(context);
+  vm.runInContext(source, context, { filename: sourcePath });
+  return root.NetworkData;
+}
+
+(async function () {
+''' + body + r'''
+}()).catch(function (error) {
+  console.error(error && error.stack ? error.stack : String(error));
+  process.exitCode = 1;
+});
+'''
+        result = subprocess.run(
+            [NODE, "-e", harness, str(NETWORK_DATA_SCRIPT)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_r4_history_cache_uses_monotonic_time(self):
+        self.run_network_data(r'''
+  let fetchCount = 0;
+  const performanceValues = [1000, 0, 1];
+  const wallValues = [100000, 0, 1];
+  const api = loadNetworkData(function () {
+    fetchCount += 1;
+    return Promise.resolve(jsonResponse({ bucket_s: 60, buckets: [] }));
+  }, function () {
+    return performanceValues.shift();
+  }, function () {
+    return wallValues.shift();
+  });
+
+  await api.fetchHistory("spot_rest", "status", "1h");
+  await api.fetchHistory("spot_rest", "status", "1h");
+  assert.strictEqual(fetchCount, 2);
+''')
+
+    def test_r4_current_resets_a_lower_event_cursor(self):
+        self.run_network_data(r'''
+  const paths = [];
+  const replies = [
+    { events: [], next_after: 10 },
+    { events: [{ event_id: 1 }] },
+    { events: [], next_after: 0 }
+  ];
+  const api = loadNetworkData(function (path) {
+    paths.push(path);
+    return Promise.resolve(jsonResponse(replies.shift()));
+  }, function () { return 0; }, function () { return 0; });
+
+  await api.fetchEvents();
+  await api.fetchCurrent();
+  await api.fetchEvents();
+  assert.strictEqual(paths[2], "/api/network/events?after=0&limit=50");
+''')
+
+    def test_r4_post_methods_resolve_with_error_results(self):
+        self.run_network_data(r'''
+  const errors = [];
+  const api = loadNetworkData(function () {
+    return Promise.reject(new Error("offline"));
+  }, function () { return 0; }, function () { return 0; });
+  api.subscribe("error", function (value) { errors.push(value); });
+
+  const config = await api.postConfig("rest_probe_s", 15);
+  const probe = await api.postProbe("spot_rest");
+  assert.strictEqual(config.ok, false);
+  assert.strictEqual(config.error, "offline");
+  assert.strictEqual(probe.ok, false);
+  assert.strictEqual(probe.error, "offline");
+  assert.strictEqual(errors.length, 2);
+''')
 
 
 if __name__ == "__main__":

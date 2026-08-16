@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ui import network_health as health
 from ui.network_evidence import (
     read_feed_connections,
     read_last_job,
@@ -95,6 +96,38 @@ class FeedConnectionTests(unittest.TestCase):
             self.assertIsNone(read_feed_connections(root / "missing", 1))
             self.assertIsNone(read_feed_connections(malformed, 1))
 
+    def test_r2_connected_missing_remains_unknown_unless_feed_is_broken(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "feed.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "written_ms": "1000",
+                        "connections": {
+                            "spot": {
+                                "expected_connections": 1,
+                                "status": "healthy",
+                                "ticker": {"last_message_ms": "900"},
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = read_feed_connections(path, 1000)
+
+        self.assertIsNone(result["spot"]["connected_count"])
+        evidence = dict(
+            result["spot"], snapshot_age_ms=result["snapshot_age_ms"]
+        )
+        config = {"wss_read_s": 15, "paused": {"wss": False}}
+        unknown = health.derive_edge("spot_wss", evidence, None, config, 1000)
+        self.assertEqual(unknown["health"], "Unknown")
+        evidence["feed_status"] = "broken"
+        broken = health.derive_edge("spot_wss", evidence, None, config, 1000)
+        self.assertEqual(broken["health"], "Outage")
+
 
 class StreamStateTests(unittest.TestCase):
     def test_sample_uses_nearest_rank_percentiles(self):
@@ -118,21 +151,22 @@ class StreamStateTests(unittest.TestCase):
             },
         )
 
-    def test_bad_numeric_row_is_skipped(self):
+    def test_r2_partial_stream_rows_aggregate_fields_independently(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "stream.json"
             path.write_text(
                 json.dumps(
                     {
-                        "GOOD": {
+                        "BOOK": {
                             "book_age_ms": "100",
-                            "freshness_ms": "200",
                             "utc": "2026-08-16T16:34:00.250Z",
                         },
-                        "BAD": {
+                        "FRESH": {
                             "book_age_ms": "unknown",
-                            "freshness_ms": "1",
-                            "utc": "2026-08-16T16:35:00.000Z",
+                            "freshness_ms": "200",
+                        },
+                        "PARTIAL": {
+                            "utc": "not-a-time",
                         },
                     }
                 ),
@@ -143,8 +177,9 @@ class StreamStateTests(unittest.TestCase):
                 path, epoch_ms("2026-08-16T16:34:01.250Z")
             )
 
-        self.assertEqual(result["symbols_total"], 1)
+        self.assertEqual(result["symbols_total"], 3)
         self.assertEqual(result["book_age_p95_ms"], 100)
+        self.assertEqual(result["freshness_p50_ms"], 200)
         self.assertEqual(result["stream_row_age_ms"], 1000)
 
     def test_empty_object_is_valid_but_has_unknown_percentiles(self):
@@ -251,6 +286,40 @@ class JobAndManifestTests(unittest.TestCase):
             plural["errors"],
             ["feed_state.json: source missing, previous copy kept"],
         )
+
+    def test_r2_manifest_output_is_allowlisted_and_errors_are_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "utc": "2026-08-16T16:34:00Z",
+                        "ok": False,
+                        "interval_ms": 5000,
+                        "cycle_ms": 40,
+                        "files": ["feed_state.json"],
+                        "connectorId": "hidden",
+                        "receipt_path": "/hidden/path",
+                        "errors": (
+                            [{"job_id": "hidden"}, "x" * 250]
+                            + ["error-%02d" % index for index in range(25)]
+                        ),
+                        "error": "legacy error",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = read_manifest(path)
+
+        self.assertEqual(
+            set(result),
+            {"utc", "ok", "interval_ms", "cycle_ms", "files", "errors"},
+        )
+        self.assertEqual(len(result["errors"]), 20)
+        self.assertTrue(all(isinstance(item, str) for item in result["errors"]))
+        self.assertTrue(all(len(item) <= 200 for item in result["errors"]))
+        self.assertEqual(result["errors"][0], "x" * 200)
 
     def test_missing_job_and_manifest_return_none(self):
         self.assertIsNone(read_last_job("/missing/results.jsonl"))

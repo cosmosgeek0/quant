@@ -159,6 +159,21 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual(set(edge), expected)
         json.dumps(edge, allow_nan=False)
 
+    def test_r2_fresh_until_uses_each_evidence_deadline(self):
+        cases = (
+            ("spot_wss", wss(snapshot_age_ms=59000), NOW + 1000),
+            ("feed_machine", machine(stream_row_age_ms=599000), NOW + 1000),
+            ("news_fetch", news(as_of_age_s=359), NOW + 1000),
+            ("spot_rest", rest(), NOW + 45000),
+            ("usdm_wss", wss(snapshot_age_ms=60001), NOW),
+        )
+        for edge_id, evidence, expected in cases:
+            with self.subTest(edge_id=edge_id):
+                edge = health.derive_edge(
+                    edge_id, evidence, None, CONFIG, NOW
+                )
+                self.assertEqual(edge["fresh_until_ms"], expected)
+
 
 class RestHealthTests(unittest.TestCase):
     def test_pause_is_off_with_receipt_and_does_not_claim_truth(self):
@@ -248,6 +263,45 @@ class RestHealthTests(unittest.TestCase):
         self.assertEqual(edge["health"], "Degraded")
         self.assertIn("did not include server time", edge["health_reason"])
         self.assertEqual(edge["truth"]["application"], "Fail")
+
+    def test_r2_rest_success_requires_strict_proof(self):
+        prior = health.derive_edge("spot_rest", rest(), None, CONFIG, NOW)
+        invalid_changes = (
+            {"ok": 1},
+            {"server_time_ms": "1800000000000"},
+            {"server_time_ms": True},
+            {"server_time_ms": 0},
+            {"server_time_ms": -1},
+        )
+        for changes in invalid_changes:
+            with self.subTest(changes=changes):
+                edge = health.derive_edge(
+                    "spot_rest", rest(**changes), prior, CONFIG, NOW + 1000
+                )
+                self.assertEqual(edge["truth"]["application"], "Fail")
+                self.assertEqual(edge["counters"]["quorum"], 0)
+                self.assertNotEqual(edge["health"], "Operational")
+
+    def test_r2_unproven_rest_sample_resets_recovery_quorum(self):
+        interruptions = (
+            None,
+            {"probe_now": True},
+            rest(503, None, ok=False),
+        )
+        for evidence in interruptions:
+            with self.subTest(evidence=evidence):
+                first = health.derive_edge(
+                    "spot_rest", rest(), None, CONFIG, NOW
+                )
+                interrupted = health.derive_edge(
+                    "spot_rest", evidence, first, CONFIG, NOW + 1000
+                )
+                recovered = health.derive_edge(
+                    "spot_rest", rest(), interrupted, CONFIG, NOW + 2000
+                )
+                self.assertEqual(interrupted["counters"]["quorum"], 0)
+                self.assertEqual(recovered["counters"]["quorum"], 1)
+                self.assertEqual(recovered["health"], "Degraded")
 
 
 class WssHealthTests(unittest.TestCase):
@@ -356,6 +410,24 @@ class FeedMachineHealthTests(unittest.TestCase):
                 edge = health.derive_edge("feed_machine", evidence, None, CONFIG, NOW)
                 self.assertEqual(edge["health"], "Unknown")
                 self.assertEqual(edge["health_reason"], reason)
+
+    def test_r2_empty_machine_stream_is_configured_but_unknown(self):
+        evidence = machine(
+            feed_snapshot_age_ms=None,
+            symbols_total=0,
+            stream_row_age_ms=None,
+            book_age_p50_ms=None,
+            book_age_p95_ms=None,
+            book_age_max_ms=None,
+            freshness_p50_ms=None,
+        )
+        edge = health.derive_edge(
+            "feed_machine", evidence, None, CONFIG, NOW
+        )
+        self.assertEqual(edge["truth"]["configured"], "Pass")
+        self.assertEqual(edge["truth"]["application"], "Unknown")
+        self.assertEqual(edge["health"], "Unknown")
+        self.assertEqual(edge["health_reason"], "Machine stream has no rows")
 
 
 class CloudflareHealthTests(unittest.TestCase):
@@ -586,6 +658,16 @@ class SummaryAndReadTimeTests(unittest.TestCase):
         self.assertEqual(summary["oldest_required_evidence_at"], health._iso(NOW - 8000))
         self.assertEqual(summary["last_transition"]["edge_id"], "spot_rest")
 
+    def test_r2_summary_compares_integer_transition_timestamps_numerically(self):
+        edges = self.make_edges()
+        edges[2]["last_transition"] = {"ts": 999, "transition": "older"}
+        edges[3]["last_transition"] = {"ts": 1000, "transition": "newer"}
+
+        summary = health.summarize(edges, NOW)
+
+        self.assertEqual(summary["last_transition"]["ts"], 1000)
+        self.assertEqual(summary["last_transition"]["edge_id"], "spot_rest")
+
     def test_summary_applies_read_time_staleness_without_mutation(self):
         edges = self.make_edges()
         edges[1]["fresh_until_ms"] = NOW - 1
@@ -627,6 +709,24 @@ class SummaryAndReadTimeTests(unittest.TestCase):
         }
         result = health.apply_read_time_staleness(current, NOW)
         self.assertEqual(result["collector"]["status"], "running")
+
+    def test_r2_collector_timing_requires_valid_fields(self):
+        cases = ((None, 5), (NOW, "5"), (NOW, 0), (float(NOW), 5))
+        for generated_ms, tick_s in cases:
+            with self.subTest(generated_ms=generated_ms, tick_s=tick_s):
+                edge = self.make_edges()[0]
+                edge["fresh_until_ms"] = NOW - 1
+                current = {
+                    "generated_ms": generated_ms,
+                    "collector": {"status": "running", "tick_s": tick_s},
+                    "summary": {},
+                    "edges": [edge],
+                }
+
+                result = health.apply_read_time_staleness(current, NOW)
+
+                self.assertEqual(result["collector"]["status"], "unknown")
+                self.assertEqual(result["edges"][0]["health"], "Stale")
 
 
 if __name__ == "__main__":

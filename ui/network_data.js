@@ -82,6 +82,16 @@
 
   function fetchCurrent() {
     return getJson("/api/network").then(function (data) {
+      var currentEvents = data && Array.isArray(data.events) ? data.events : [];
+      var maxEventId = null;
+      currentEvents.forEach(function (event) {
+        var eventId = event ? Number(event.event_id) : NaN;
+        if (isFinite(eventId) && eventId >= 0
+            && (maxEventId === null || eventId > maxEventId)) {
+          maxEventId = eventId;
+        }
+      });
+      if (maxEventId !== null && maxEventId < eventCursor) { eventCursor = 0; }
       emit("current", data);
       return data;
     }).catch(returnNull);
@@ -91,15 +101,18 @@
     var key = String(edgeId) + "|" + String(metric) + "|" + String(range);
     var cached = historyCache[key];
     if (cached && cached.pending) { return cached.pending; }
-    if (cached && Date.now() - cached.fetchedAt < cached.ttlMs) {
-      emit("history", cached.data);
-      return Promise.resolve(cached.data);
+    if (cached) {
+      var cacheAge = root.performance.now() - cached.fetchedAt;
+      if (cacheAge >= 0 && cacheAge < cached.ttlMs) {
+        emit("history", cached.data);
+        return Promise.resolve(cached.data);
+      }
     }
     var path = "/api/network/history?edge_id=" + encodeURIComponent(edgeId)
       + "&metric=" + encodeURIComponent(metric) + "&range=" + encodeURIComponent(range);
     var pending = getJson(path).then(function (data) {
       var bucketSeconds = data ? Number(data.bucket_s) : null;
-      historyCache[key] = { data: data, fetchedAt: Date.now(),
+      historyCache[key] = { data: data, fetchedAt: root.performance.now(),
         ttlMs: bucketSeconds > 0 ? bucketSeconds * 1000 : 0 };
       emit("history", data);
       return data;
@@ -140,14 +153,19 @@
     });
   }
 
+  function postErrorResult(error) {
+    var message = error && error.message ? error.message : "Network request failed";
+    return { ok: false, error: message };
+  }
+
   function postConfig(key, value, group) {
     var body = { key: key, value: value };
     if (group !== undefined && group !== null) { body.group = group; }
-    return postJson("/api/network/config", body);
+    return postJson("/api/network/config", body).catch(postErrorResult);
   }
 
   function postProbe(edgeId) {
-    return postJson("/api/network/probe", { edge_id: edgeId });
+    return postJson("/api/network/probe", { edge_id: edgeId }).catch(postErrorResult);
   }
 
   function measureFetchMs() {

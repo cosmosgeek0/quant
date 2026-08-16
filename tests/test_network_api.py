@@ -41,7 +41,7 @@ class NetworkApiTest(unittest.TestCase):
     def test_current_file_applies_bound_and_release(self):
         current = {
             "schema_version": 1, "generated_ms": NOW_MS,
-            "collector": {"status": "running"},
+            "collector": {"status": "running", "tick_s": 5},
             "edges": [], "events": [{"event_id": value} for value in range(25)],
         }
         self.write_json("network_current", current)
@@ -96,6 +96,30 @@ class NetworkApiTest(unittest.TestCase):
             result = network_api.api_network(self.sources, now=NOW_MS)
         self.assertEqual(result["collector"]["status"], "running")
         self.assertIsNone(result["deployed_ui_release"])
+
+    def test_r3_current_validation_filters_shape_and_falls_back(self):
+        current = network_api._unknown_current(None)
+        current["generated_ms"] = NOW_MS
+        current["collector"]["status"] = "running"
+        current["private_top_level"] = "not public"
+        current["edges"][0]["connectorId"] = "not public"
+        self.write_json("network_current", current)
+
+        result = network_api.api_network(self.sources, now=NOW_MS)
+
+        self.assertNotIn("private_top_level", result)
+        self.assertNotIn("connectorId", result["edges"][0])
+        for invalid in (
+                {"collector": {}, "summary": {}, "edges": [None]},
+                {"collector": {}, "summary": {},
+                 "edges": [{"id": "outside_contract"}]},
+                ["not", "an", "object"]):
+            with self.subTest(invalid=invalid):
+                self.write_json("network_current", invalid)
+                fallback = network_api.api_network(self.sources, now=NOW_MS)
+                self.assertEqual(fallback["collector"]["status"], "unknown")
+                self.assertEqual(fallback["note"], "current file invalid")
+                self.assertEqual(len(fallback["edges"]), 13)
 
     def test_history_queries_real_store_with_bounded_shape(self):
         store = self.open_store()
@@ -164,6 +188,47 @@ class NetworkApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result, {"events": [], "next_after": 0})
 
+    def test_r3_events_projection_bounds_endpoint_and_current(self):
+        event = {
+            "event_id": 7,
+            "ts": network_api._iso(NOW_MS),
+            "edge_id": "spot_rest",
+            "transition": "health",
+            "severity": "medium",
+            "reason": "r" * 600,
+            "evidence": {
+                "note": "n" * 250,
+                "http_status": 200,
+                "reread": True,
+                "receipt_path": "/private/path",
+                "job_id": "private-job",
+            },
+            "receipt_path": "/private/path",
+        }
+        self.sources["network_db"].touch()
+        with mock.patch.object(network_api, "_store_read", return_value={
+                "events": [event], "next_after": 7}):
+            status, endpoint = network_api.api_network_events(
+                self.sources, {"limit": "1"})
+        self.assertEqual(status, 200)
+        projected = endpoint["events"][0]
+        self.assertEqual(set(projected), {
+            "event_id", "ts", "edge_id", "transition", "severity",
+            "reason", "evidence"})
+        self.assertEqual(len(projected["reason"]), 500)
+        self.assertEqual(len(projected["evidence"]["note"]), 200)
+        self.assertEqual(projected["evidence"]["http_status"], 200)
+        self.assertTrue(projected["evidence"]["reread"])
+        self.assertNotIn("receipt_path", projected["evidence"])
+        self.assertNotIn("job_id", projected["evidence"])
+
+        current = network_api._unknown_current(None)
+        current["generated_ms"] = NOW_MS
+        current["events"] = [event]
+        self.write_json("network_current", current)
+        embedded = network_api.api_network(self.sources, now=NOW_MS)["events"][0]
+        self.assertEqual(embedded, projected)
+
     def test_config_write_records_receipt_reread_and_cooldown(self):
         clock = {"now": NOW_MS}
         with mock.patch.object(network_api, "_now_ms",
@@ -187,6 +252,24 @@ class NetworkApiTest(unittest.TestCase):
                 self.sources, {"key": "rest_probe_s", "value": 60})
         self.assertIsNone(repeated)
         self.assertEqual(repeated_error, "cooldown 2 s")
+
+    def test_r3_config_receipt_failure_restores_previous_bytes(self):
+        original = b'{\n  "rest_probe_s": 15,\n  "paused": {"rest": false}\n}\n'
+        self.sources["network_config"].write_bytes(original)
+        store = mock.Mock()
+        store.insert_event.side_effect = OSError("receipt storage unavailable")
+
+        with mock.patch.object(network_api, "_now_ms", return_value=NOW_MS), \
+                mock.patch.object(network_api, "_make_store",
+                                  return_value=store):
+            saved, error = network_api.write_network_config(
+                self.sources, {"key": "rest_probe_s", "value": 30})
+
+        self.assertIsNone(saved)
+        self.assertEqual(
+            error, "receipt could not be recorded; change reverted")
+        self.assertEqual(self.sources["network_config"].read_bytes(), original)
+        store.close.assert_called_once_with()
 
     def test_config_paused_allowlist_and_origin_checks(self):
         with mock.patch.object(network_api, "_now_ms", return_value=NOW_MS):
@@ -230,6 +313,7 @@ class NetworkApiTest(unittest.TestCase):
         request = json.loads(self.sources["network_probe_request"].read_text(
             encoding="utf-8"))
         self.assertEqual(request["requested_at"], network_api._iso(NOW_MS))
+        self.sources["network_probe_request"].unlink()
         self.write_json("network_current", {"collector": {"probe_now": {
             "spot_rest": network_api._iso(NOW_MS - 3_000)}}})
         with mock.patch.object(network_api, "_now_ms", return_value=NOW_MS):
@@ -237,6 +321,28 @@ class NetworkApiTest(unittest.TestCase):
                 self.sources, {"edge_id": "spot_rest"})
         self.assertIsNone(saved)
         self.assertEqual(error, "cooldown 27 s")
+
+    def test_r3_probe_pending_request_is_not_overwritten(self):
+        self.write_json("network_current", {"collector": {"probe_now": {
+            "spot_rest": network_api._iso(NOW_MS - 60_000)}}})
+        pending = {
+            "edge_id": "spot_rest",
+            "request_id": "pending-request",
+            "requested_at": network_api._iso(NOW_MS - 5_000),
+        }
+        self.write_json("network_probe_request", pending)
+
+        with mock.patch.object(network_api, "_now_ms", return_value=NOW_MS), \
+                mock.patch.object(network_api.secrets, "token_hex",
+                                  return_value="replacement"):
+            saved, error = network_api.write_network_probe(
+                self.sources, {"edge_id": "spot_rest"})
+
+        self.assertIsNone(saved)
+        self.assertEqual(error, "probe already requested")
+        self.assertEqual(json.loads(
+            self.sources["network_probe_request"].read_text(encoding="utf-8")),
+            pending)
 
     def test_probe_rejects_unknown_edge_and_cross_origin(self):
         self.assertIsNotNone(network_api.write_network_probe(

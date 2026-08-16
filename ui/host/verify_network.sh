@@ -21,6 +21,7 @@ fi
 cleanup() {
   rm -f "$tmp_dir/curl.err" "$tmp_dir/network.json" "$tmp_dir/network.json.next"
   rm -f "$tmp_dir/history.json" "$tmp_dir/history.json.next"
+  rm -f "$tmp_dir/events.json" "$tmp_dir/events.json.next"
   rmdir "$tmp_dir" 2>/dev/null
 }
 trap cleanup EXIT
@@ -96,6 +97,7 @@ benchmark() {
   bench_label=$1
   bench_url=$2
   body_path=$3
+  max_body_bytes=$4
   max_bytes=
   max_time=
   ok_runs=0
@@ -128,6 +130,10 @@ benchmark() {
       run=$((run + 1))
       continue
     fi
+    if [ "$max_body_bytes" -gt 0 ] && [ "$bytes" -gt "$max_body_bytes" ]; then
+      echo "== $bench_label run=$run bytes=$bytes limit=$max_body_bytes"
+      failed=1
+    fi
     ok_runs=$((ok_runs + 1))
     if [ -z "$max_bytes" ] || [ "$bytes" -gt "$max_bytes" ]; then
       max_bytes=$bytes
@@ -148,8 +154,10 @@ benchmark() {
 
 network_url=http://127.0.0.1:8080/api/network
 history_url='http://127.0.0.1:8080/api/network/history?edge_id=spot_rest&metric=status&range=24h'
-benchmark /api/network "$network_url" "$tmp_dir/network.json"
-benchmark /api/network/history-24h "$history_url" "$tmp_dir/history.json"
+events_url='http://127.0.0.1:8080/api/network/events?limit=200'
+benchmark /api/network "$network_url" "$tmp_dir/network.json" 100000
+benchmark /api/network/history-24h "$history_url" "$tmp_dir/history.json" 1000000
+benchmark /api/network/events "$events_url" "$tmp_dir/events.json" 0
 
 pid=$(systemctl show quant-ui-network -p MainPID --value 2>/dev/null)
 pid_rc=$?
@@ -176,22 +184,30 @@ else
   failed=1
 fi
 
-if [ -f "$tmp_dir/network.json" ]; then
-  for word in secret key signature connectorId; do
-    count=$(grep -F -c "$word" "$tmp_dir/network.json")
-    echo "== network grep $word $count"
+scan_identifiers() {
+  scan_label=$1
+  scan_body=$2
+  if [ ! -f "$scan_body" ]; then
+    echo "== $scan_label identifier scan Unknown"
+    failed=1
+    return
+  fi
+  for word in connectorId receipt_path job_id '"signature"'; do
+    if grep -F -q "$word" "$scan_body"; then
+      echo "== $scan_label identifier $word present"
+      failed=1
+    else
+      echo "== $scan_label identifier $word absent"
+    fi
   done
-else
-  echo "== network grep secret Unknown"
-  echo "== network grep key Unknown"
-  echo "== network grep signature Unknown"
-  echo "== network grep connectorId Unknown"
-  failed=1
-fi
+}
+
+scan_identifiers network "$tmp_dir/network.json"
+scan_identifiers events "$tmp_dir/events.json"
 
 if [ "$failed" -ne 0 ]; then
-  echo "== network verification incomplete"
-  exit 10
+  echo "== VERIFY FAILED"
+  exit 20
 fi
 echo "== network verification complete"
 exit 0

@@ -135,6 +135,44 @@ class BinanceProbeTests(unittest.TestCase):
         self.assertEqual(result["retry_after_s"], 11)
         self.assertFalse(result["ok"])
 
+    def test_r1_binance_response_body_is_bounded_and_http_error_closes(self):
+        limit = 65_536
+        oversized = self.measured_probe(
+            lambda _url, _timeout: (200, {}, b" " * (limit + 1))
+        )
+        self.assertFalse(oversized["ok"])
+        self.assertEqual(oversized["error"], "response too large")
+
+        class RecordingBody(io.BytesIO):
+            def __init__(self, value):
+                super().__init__(value)
+                self.read_sizes = []
+                self.was_closed = False
+
+            def read(self, size=-1):
+                self.read_sizes.append(size)
+                return super().read(size)
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        stream = RecordingBody(b" " * (limit + 2))
+        error = urllib.error.HTTPError(
+            probe.VENUES["spot_rest"][0],
+            429,
+            "rate limited",
+            {"Retry-After": "11"},
+            stream,
+        )
+        with mock.patch.object(
+                probe.urllib.request, "urlopen", side_effect=error):
+            bounded_error = self.measured_probe(None)
+
+        self.assertEqual(bounded_error["error"], "response too large")
+        self.assertEqual(stream.read_sizes, [limit + 1])
+        self.assertTrue(stream.was_closed)
+
     def test_no_retry_after_allows_the_current_time(self):
         self.assertEqual(
             probe.next_allowed_ms({"retry_after_s": None}, 9_000),

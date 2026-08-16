@@ -14,6 +14,7 @@ VENUES = {
     "usdm_rest": ("https://fapi.binance.com/fapi/v1/time", 2400),
 }
 USER_AGENT = "quant-ui-network/1"
+_MAX_RESPONSE_BYTES = 65_536
 
 
 def _default_opener(url, timeout_s):
@@ -27,11 +28,16 @@ def _default_opener(url, timeout_s):
             return (
                 int(response.getcode()),
                 dict(response.headers.items()),
-                response.read(),
+                response.read(_MAX_RESPONSE_BYTES + 1),
             )
     except urllib.error.HTTPError as error:
-        headers = dict(error.headers.items()) if error.headers else {}
-        return int(error.code), headers, error.read()
+        with error:
+            headers = dict(error.headers.items()) if error.headers else {}
+            return (
+                int(error.code),
+                headers,
+                error.read(_MAX_RESPONSE_BYTES + 1),
+            )
 
 
 def _wall_ms(now_ms):
@@ -89,8 +95,10 @@ def probe_time(edge_id: str, opener=None, timeout_s: float = 5.0,
     try:
         status, headers, body = open_once(url, timeout_s)
     except urllib.error.HTTPError as error:
-        headers = dict(error.headers.items()) if error.headers else {}
-        status, body = int(error.code), error.read()
+        with error:
+            headers = dict(error.headers.items()) if error.headers else {}
+            status = int(error.code)
+            body = error.read(_MAX_RESPONSE_BYTES + 1)
     except (urllib.error.URLError, TimeoutError, socket.timeout,
             OSError) as error:
         result["error"] = _transport_error(error)
@@ -103,6 +111,14 @@ def probe_time(edge_id: str, opener=None, timeout_s: float = 5.0,
         _header(headers, "X-MBX-USED-WEIGHT-1M"))
     result["retry_after_s"] = _nonnegative_int(
         _header(headers, "Retry-After"))
+
+    try:
+        response_too_large = len(body) > _MAX_RESPONSE_BYTES
+    except TypeError:
+        response_too_large = False
+    if response_too_large:
+        result["error"] = "response too large"
+        return result
 
     if result["http_status"] != 200:
         if result["http_status"] is None:

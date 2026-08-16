@@ -1,8 +1,21 @@
 #!/bin/bash
+set -u
+
 R="${QUANT_MIRROR_R:-/home/ssm-user/quant_receipts}"
 L="${QUANT_MIRROR_L:-/home/ssm-user/quant-ui/ui/live}"
 D="${QUANT_MIRROR_D:-/home/ssm-user/quant-run/wave2-validate-h2}"
 mkdir -p "$L/jobs" "$L/proposals"
+
+feed_tail_complete() {
+  feed_tail=$(tail -c 64 "$1" 2>/dev/null) || return 1
+  case "$feed_tail" in
+    *'"written_ms"'*) ;;
+    *) return 1 ;;
+  esac
+  feed_last=$(printf '%s' "$feed_tail" | tr -d '[:space:]' | tail -c 1)
+  [ "$feed_last" = "}" ]
+}
+
 while true; do
   start_ms=$(($(date +%s%N)/1000000))
   n=0
@@ -13,9 +26,13 @@ while true; do
   feed_mtime_json=null; feed_bytes_json=null; feed_sha_json=null; feed_copied_json=null
   if [ ! -f "$feed" ]; then feed_error="feed_state missing"
   elif [ ! -s "$feed" ]; then feed_error="feed_state empty"
-  elif [ "$(head -c 1 "$feed")" != "{" ] || { [ "$(tail -c 1 "$feed")" != "}" ] && { [ -n "$(tail -c 1 "$feed")" ] || [ "$(tail -c 2 "$feed" | head -c 1)" != "}" ]; }; }; then
+  elif [ "$(head -c 1 "$feed" 2>/dev/null)" != "{" ] || ! feed_tail_complete "$feed"; then
     feed_error="feed_state incomplete"
-  elif cp -p "$feed" "$L/.tmp.feed_state.json" && mv "$L/.tmp.feed_state.json" "$L/feed_state.json"; then
+  elif ! cp -p "$feed" "$L/.tmp.feed_state.json"; then
+    feed_error="feed_state copy failed"; rm -f "$L/.tmp.feed_state.json"
+  elif ! feed_tail_complete "$L/.tmp.feed_state.json"; then
+    feed_error="feed_state incomplete"; rm -f "$L/.tmp.feed_state.json"
+  elif mv "$L/.tmp.feed_state.json" "$L/feed_state.json"; then
     feed_epoch=$(stat -c %Y "$L/feed_state.json" 2>/dev/null || stat -f %m "$L/feed_state.json")
     feed_mtime_json="\"$(date -u -d "@$feed_epoch" +%FT%TZ 2>/dev/null || date -u -r "$feed_epoch" +%FT%TZ)\""
     feed_bytes_json=$(stat -c %s "$L/feed_state.json" 2>/dev/null || stat -f %z "$L/feed_state.json")
@@ -28,7 +45,13 @@ while true; do
   feed_error_json=null; errors_json='[]'; ok=true; if [ -n "$feed_error" ]; then
     feed_error_json="\"$feed_error\""; errors_json="[\"$feed_error\"]"; ok=false
   fi
-  printf '{"source":"watch/feed_state.json","source_mtime_utc":%s,"source_bytes":%s,"sha256":%s,"copied_utc":%s,"error":%s}\n' "$feed_mtime_json" "$feed_bytes_json" "$feed_sha_json" "$feed_copied_json" "$feed_error_json" > "$L/.tmp.feed_state.meta.json" && mv "$L/.tmp.feed_state.meta.json" "$L/feed_state.meta.json"
+  feed_meta_format='{"source":"watch/feed_state.json","source_mtime_utc":%s'
+  feed_meta_format="${feed_meta_format}"',"source_bytes":%s,"sha256":%s'
+  feed_meta_format="${feed_meta_format}"',"copied_utc":%s,"error":%s}\n'
+  printf "$feed_meta_format" \
+    "$feed_mtime_json" "$feed_bytes_json" "$feed_sha_json" \
+    "$feed_copied_json" "$feed_error_json" > "$L/.tmp.feed_state.meta.json" \
+    && mv "$L/.tmp.feed_state.meta.json" "$L/feed_state.meta.json"
   [ -f "$R/jobs/results.jsonl" ] && cp -p "$R/jobs/results.jsonl" "$L/jobs/.tmp.r" && mv "$L/jobs/.tmp.r" "$L/jobs/results.jsonl" && n=$((n+1))
   [ -f "$D/jobs.log" ] && tail -n 2000 "$D/jobs.log" > "$L/.tmp.jl" && mv "$L/.tmp.jl" "$L/jobs.log" && n=$((n+1))
   find "$R" -maxdepth 1 -name '*.json' -newer "$L" 2>/dev/null | head -200 | while read -r p; do cp -p "$p" "$L/$(basename "$p")"; done

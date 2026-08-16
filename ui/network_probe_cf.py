@@ -15,19 +15,25 @@ _SAMPLE_RE = re.compile(
     r"^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{([^}]*)\})?\s+([^\s]+)(?:\s+[^\s]+)?$"
 )
 _STATUS_CODE_RE = re.compile(r'(?:^|,)\s*status_code="([0-9]{3})"(?:\s*,|$)')
+_LABEL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_METRICS_BODY_CAP = 1024 * 1024
+_READY_BODY_CAP = 8 * 1024
+_ORIGIN_BODY_CAP = 2 * 1024 * 1024
 
 
-def _default_open(url, timeout):
+def _default_open(url, timeout, body_cap):
     request = urllib.request.Request(url, headers={"User-Agent": "quant-network/1"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.getcode(), dict(response.headers.items()), response.read()
+            return (
+                response.getcode(),
+                dict(response.headers.items()),
+                response.read(body_cap + 1),
+            )
     except urllib.error.HTTPError as error:
-        try:
+        with error:
             headers = dict(error.headers.items()) if error.headers else {}
-            return error.code, headers, error.read()
-        finally:
-            error.close()
+            return error.code, headers, error.read(body_cap + 1)
 
 
 def _body_bytes(body):
@@ -40,6 +46,85 @@ def _body_bytes(body):
     raise TypeError("response body is not bytes or text")
 
 
+def _open_bounded(url, timeout, body_cap, opener):
+    if opener is None:
+        status, headers, body = _default_open(url, timeout, body_cap)
+    else:
+        status, headers, body = opener(url, timeout)
+    body_bytes = _body_bytes(body)
+    return status, headers, body_bytes, len(body_bytes) > body_cap
+
+
+def _canonical_labels(source):
+    pairs = []
+    names = set()
+    index = 0
+    length = len(source)
+    while index < length:
+        while index < length and source[index].isspace():
+            index += 1
+        name_match = _LABEL_NAME_RE.match(source, index)
+        if name_match is None:
+            return None
+        name = name_match.group(0)
+        if name in names:
+            return None
+        names.add(name)
+        index = name_match.end()
+        while index < length and source[index].isspace():
+            index += 1
+        if index >= length or source[index] != "=":
+            return None
+        index += 1
+        while index < length and source[index].isspace():
+            index += 1
+        if index >= length or source[index] != '"':
+            return None
+        index += 1
+
+        value = []
+        closed = False
+        while index < length:
+            character = source[index]
+            index += 1
+            if character == '"':
+                closed = True
+                break
+            if character == "\\":
+                if index >= length:
+                    return None
+                escaped = source[index]
+                index += 1
+                if escaped == "n":
+                    value.append("\n")
+                elif escaped in ('"', "\\"):
+                    value.append(escaped)
+                else:
+                    value.extend(("\\", escaped))
+            else:
+                value.append(character)
+        if not closed:
+            return None
+        pairs.append((name, "".join(value)))
+
+        while index < length and source[index].isspace():
+            index += 1
+        if index == length:
+            break
+        if source[index] != ",":
+            return None
+        index += 1
+        if index == length:
+            return None
+
+    canonical = []
+    for name, value in sorted(pairs):
+        escaped_value = value.replace("\\", "\\\\")
+        escaped_value = escaped_value.replace("\n", "\\n").replace('"', '\\"')
+        canonical.append('%s="%s"' % (name, escaped_value))
+    return ",".join(canonical) if canonical else None
+
+
 def discover_metrics_url(configured, opener=None):
     candidates = []
     if isinstance(configured, str) and configured in _METRICS_URLS:
@@ -47,8 +132,11 @@ def discover_metrics_url(configured, opener=None):
     candidates.extend(url for url in _METRICS_URLS if url not in candidates)
     for url in candidates:
         try:
-            status, _headers, body = (opener or _default_open)(url, 3.0)
-            if int(status) == 200 and b"cloudflared_" in _body_bytes(body):
+            status, _headers, body, too_large = _open_bounded(
+                url, 3.0, _METRICS_BODY_CAP, opener
+            )
+            if (not too_large and int(status) == 200
+                    and b"cloudflared_" in body):
                 return url
         except Exception:
             continue
@@ -72,21 +160,28 @@ def parse_prometheus_text(text):
         if labels is None:
             values[name] = value
         else:
+            canonical_labels = _canonical_labels(labels)
+            if canonical_labels is None:
+                continue
             current = values.get(name)
             if not isinstance(current, dict):
                 current = {}
                 values[name] = current
-            current[labels] = value
+            current[canonical_labels] = value
     return values
 
 
 def scrape_metrics(url, opener=None, timeout_s=3.0):
     try:
-        status, _headers, body = (opener or _default_open)(url, timeout_s)
+        status, _headers, body, too_large = _open_bounded(
+            url, timeout_s, _METRICS_BODY_CAP, opener
+        )
+        if too_large:
+            return {"ok": False, "raw_values": {}, "error": "response too large"}
         status = int(status)
         if status != 200:
             return {"ok": False, "raw_values": {}, "error": "HTTP status {}".format(status)}
-        text = _body_bytes(body).decode("utf-8")
+        text = body.decode("utf-8")
         return {"ok": True, "raw_values": parse_prometheus_text(text), "error": None}
     except Exception as error:
         return {
@@ -104,20 +199,33 @@ def _plain_int(value):
     return None
 
 
+def _nonnegative_plain_int(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 def read_ready(base_url, opener=None):
     result = {"ok": False, "status": None, "ready_connections": None}
     try:
         ready_url = base_url.rstrip("/") + "/ready"
-        http_status, _headers, body = (opener or _default_open)(ready_url, 3.0)
+        http_status, _headers, body, too_large = _open_bounded(
+            ready_url, 3.0, _READY_BODY_CAP, opener
+        )
         http_status = int(http_status)
+        if too_large:
+            result["error"] = "response too large"
+            return result
         if http_status != 200:
             result["status"] = http_status
             return result
-        payload = json.loads(_body_bytes(body).decode("utf-8"))
+        payload = json.loads(body.decode("utf-8"))
         if not isinstance(payload, dict):
             return result
         result["status"] = _plain_int(payload.get("status"))
-        result["ready_connections"] = _plain_int(payload.get("readyConnections"))
+        result["ready_connections"] = _nonnegative_plain_int(
+            payload.get("readyConnections")
+        )
         result["ok"] = result["status"] == 200 and result["ready_connections"] is not None
     except Exception:
         pass
@@ -127,10 +235,15 @@ def read_ready(base_url, opener=None):
 def probe_origin(url="http://127.0.0.1:8080/", opener=None, timeout_s=3.0):
     started = time.monotonic()
     try:
-        status, _headers, body = (opener or _default_open)(url, timeout_s)
+        status, _headers, body, too_large = _open_bounded(
+            url, timeout_s, _ORIGIN_BODY_CAP, opener
+        )
         elapsed_ms = max(0, int(round((time.monotonic() - started) * 1000.0)))
         status = int(status)
-        size = len(_body_bytes(body))
+        if too_large:
+            return {"ok": False, "http_status": status, "rtt_ms": elapsed_ms,
+                    "size_bytes": None, "error": "response too large"}
+        size = len(body)
         error = None if status == 200 else "HTTP status {}".format(status)
         return {"ok": status == 200, "http_status": status, "rtt_ms": elapsed_ms,
                 "size_bytes": size, "error": error}

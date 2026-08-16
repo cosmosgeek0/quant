@@ -86,7 +86,8 @@ class NetworkStoreTests(unittest.TestCase):
     def test_history_uses_each_frozen_range_and_bucket_width(self) -> None:
         for range_key, (range_ms, bucket_ms) in network_store.RANGES.items():
             edge_id = "edge_%s" % range_key
-            start_ms = NOW_MS - range_ms
+            bucket_count = range_ms // bucket_ms
+            start_ms = NOW_MS - (bucket_count - 1) * bucket_ms
             self.store.insert_sample(
                 start_ms + 10, edge_id, "Operational", {"value": 10},
                 commit=False,
@@ -120,7 +121,8 @@ class NetworkStoreTests(unittest.TestCase):
                 result = self.store.history(
                     "edge_%s" % range_key, "value", range_key, NOW_MS
                 )
-                start_ms = NOW_MS - range_ms
+                bucket_count = range_ms // bucket_ms
+                start_ms = NOW_MS - (bucket_count - 1) * bucket_ms
                 self.assertEqual(result["bucket_s"], bucket_ms // 1000)
                 self.assertEqual(result["from_ms"], start_ms)
                 self.assertEqual(result["to_ms"], NOW_MS)
@@ -141,11 +143,44 @@ class NetworkStoreTests(unittest.TestCase):
                     },
                 ])
 
+    def test_r1_store_bucket_alignment_uses_fixed_grid_starts(self) -> None:
+        now_ms = 1_800_000_123
+        bucket_ms = network_store.RANGES["1h"][1]
+        last_bucket_start = (now_ms // bucket_ms) * bucket_ms
+        first_bucket_start = last_bucket_start - 59 * bucket_ms
+        self.store.insert_sample(
+            first_bucket_start + 1,
+            "spot_rest",
+            "Operational",
+            {"rtt_ms": 10},
+            commit=False,
+        )
+        self.store.insert_sample(
+            last_bucket_start + 1,
+            "spot_rest",
+            "Operational",
+            {"rtt_ms": 20},
+            commit=False,
+        )
+        self.store.commit()
+
+        result = self.store.history("spot_rest", "rtt_ms", "1h", now_ms)
+
+        self.assertEqual(result["from_ms"], first_bucket_start)
+        self.assertEqual(result["to_ms"], now_ms)
+        self.assertEqual(
+            [bucket["t"] for bucket in result["buckets"]],
+            [first_bucket_start, last_bucket_start],
+        )
+        self.assertTrue(all(
+            bucket["t"] % bucket_ms == 0 for bucket in result["buckets"]
+        ))
+
     def test_history_uses_the_frozen_worst_status_order(self) -> None:
         statuses = [
             "Operational", "Off", "Unknown", "Degraded", "Stale", "Outage"
         ]
-        start_ms = NOW_MS - HOUR_MS
+        start_ms = NOW_MS - HOUR_MS + 60_000
         for index, status in enumerate(statuses):
             self.store.insert_sample(
                 start_ms + index * 60_000 + 1,
@@ -197,6 +232,27 @@ class NetworkStoreTests(unittest.TestCase):
         self.assertEqual(bucket["avg"], 15.25)
         self.assertEqual(bucket["max"], 20.5)
 
+    def test_r1_store_malformed_persisted_json_is_fail_closed(self) -> None:
+        connection = sqlite3.connect(str(self.path))
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO samples(ts_ms, edge_id, status, metrics) "
+            "VALUES(?, ?, ?, ?)",
+            (NOW_MS - 1, "spot_rest", "Operational", "{"),
+        )
+        connection.commit()
+
+        status = self.store.history(
+            "spot_rest", "status", "1h", NOW_MS
+        )
+        numeric = self.store.history(
+            "spot_rest", "rtt_ms", "1h", NOW_MS
+        )
+
+        self.assertEqual(status["buckets"][0]["status"], "Unknown")
+        self.assertEqual(status["buckets"][0]["n"], 1)
+        self.assertEqual(numeric["buckets"], [])
+
     def test_empty_history_and_unknown_range_are_explicit(self) -> None:
         result = self.store.history(
             "edge_without_samples", "status", "24h", NOW_MS
@@ -207,13 +263,13 @@ class NetworkStoreTests(unittest.TestCase):
 
     def test_history_never_returns_more_than_720_recent_buckets(self) -> None:
         custom_range = (721_000, 1_000)
-        start_ms = NOW_MS - custom_range[0]
+        start_ms = NOW_MS - 720_000
         with mock.patch.dict(
             network_store.RANGES, {"test_cap": custom_range}
         ):
             for index in range(721):
                 self.store.insert_sample(
-                    start_ms + index * 1_000 + 1,
+                    start_ms + index * 1_000,
                     "spot_rest",
                     "Operational",
                     {},
@@ -288,34 +344,47 @@ class NetworkStoreTests(unittest.TestCase):
         self.assertEqual(skipped["events_deleted"], 0)
         self.assertEqual(result["bytes"], self.store.size_bytes())
 
-    def test_tiny_size_cap_shortens_sample_retention_to_24_hours(self) -> None:
-        self.store.close()
-        small_path = self.root / "small.sqlite3"
-        self.path = small_path
-        self.store = NetworkStore(str(small_path), size_cap_bytes=1)
-        self.store.open()
-        self.addCleanup(self.store.close)
-        self.store.insert_sample(
-            NOW_MS - 25 * HOUR_MS,
-            "spot_rest",
-            "Operational",
-            {},
-            commit=False,
-        )
-        self.store.insert_sample(
-            NOW_MS - HOUR_MS,
-            "spot_rest",
-            "Operational",
-            {},
-            commit=False,
-        )
+    def test_r1_size_cap_test_asserts_configured_cap(self) -> None:
+        for index in range(5_000):
+            self.store.insert_sample(
+                NOW_MS - HOUR_MS + index,
+                "spot_rest",
+                "Operational",
+                {"padding": "x" * 256},
+                commit=False,
+            )
         self.store.commit()
+        measured_size = self.store.size_bytes()
+        self.store.size_cap_bytes = measured_size // 2
 
         result = self.store.prune(NOW_MS)
 
-        self.assertEqual(result["samples_deleted"], 1)
-        self.assertEqual(len(self._rows("samples")), 1)
+        self.assertTrue(result["cap_met"])
+        self.assertLessEqual(result["bytes"], self.store.size_cap_bytes)
         self.assertEqual(result["bytes"], self.store.size_bytes())
+
+    def test_r1_store_size_cap_removes_oldest_recent_samples(self) -> None:
+        oldest_ms = NOW_MS - HOUR_MS
+        for index in range(2_500):
+            self.store.insert_sample(
+                oldest_ms + index,
+                "spot_rest",
+                "Operational",
+                {"padding": "x" * 512},
+                commit=False,
+            )
+        self.store.commit()
+        measured_size = self.store.size_bytes()
+        self.store.size_cap_bytes = measured_size * 3 // 4
+
+        result = self.store.prune(NOW_MS)
+        remaining = self._rows("samples")
+
+        self.assertTrue(result["cap_met"])
+        self.assertLessEqual(result["bytes"], self.store.size_cap_bytes)
+        self.assertGreater(result["samples_deleted"], 0)
+        self.assertGreater(len(remaining), 0)
+        self.assertGreaterEqual(min(row[0] for row in remaining), oldest_ms + 1_000)
 
     def test_corrupt_database_is_moved_aside_and_reset_is_noted(self) -> None:
         self.store.close()

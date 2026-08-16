@@ -31,11 +31,18 @@ class PrometheusParserTests(unittest.TestCase):
         self.assertEqual(4, len(self.raw["quic_client_latest_rtt"]))
         self.assertEqual(335.0, sum(self.raw["quic_client_lost_packets"].values()))
 
-    def test_labels_keep_the_text_inside_braces(self):
+    def test_r1_cf_label_test_uses_canonical_pairs(self):
         latest = self.raw["quic_client_latest_rtt"]
         lost = self.raw["quic_client_lost_packets"]
         self.assertEqual(1.0, latest['conn_index="0"'])
         self.assertEqual(5.0, lost['conn_index="0",reason="timeout"'])
+        reordered = parse_prometheus_text(
+            'metric{reason="time,\\"out\\"",conn_index="0"} 5\n'
+        )
+        self.assertEqual(
+            {'conn_index="0",reason="time,\\"out\\""': 5.0},
+            reordered["metric"],
+        )
 
     def test_comments_blank_lines_and_invalid_samples_are_ignored(self):
         parsed = parse_prometheus_text("# note\n\nvalid 2\nnot a sample\nbad nope\n")
@@ -92,6 +99,56 @@ class DiscoveryAndScrapeTests(unittest.TestCase):
             result,
         )
 
+    def test_r1_cf_response_bodies_use_endpoint_caps(self):
+        metrics_limit = 1024 * 1024
+        ready_limit = 8 * 1024
+        origin_limit = 2 * 1024 * 1024
+        configured = "http://127.0.0.1:20244/metrics"
+
+        def discovery_opener(url, _timeout):
+            if url == configured:
+                return 200, {}, b"cloudflared_metric 1\n" + b" " * metrics_limit
+            if url.endswith(":20241/metrics"):
+                return 200, {}, b"cloudflared_metric 1\n"
+            return 404, {}, b""
+
+        self.assertEqual(
+            "http://127.0.0.1:20241/metrics",
+            discover_metrics_url(configured, discovery_opener),
+        )
+
+        with mock.patch("ui.network_probe_cf.parse_prometheus_text") as parser:
+            metrics = scrape_metrics(
+                "http://127.0.0.1:20241/metrics",
+                lambda _url, _timeout: (200, {}, b"m 1\n" + b" " * metrics_limit),
+            )
+        parser.assert_not_called()
+        self.assertEqual(
+            {"ok": False, "raw_values": {}, "error": "response too large"},
+            metrics,
+        )
+
+        with mock.patch("ui.network_probe_cf.json.loads") as loads:
+            ready = read_ready(
+                "http://127.0.0.1:20241",
+                lambda _url, _timeout: (200, {}, b"{" + b" " * ready_limit),
+            )
+        loads.assert_not_called()
+        self.assertFalse(ready["ok"])
+        self.assertEqual(ready["error"], "response too large")
+
+        with mock.patch(
+                "ui.network_probe_cf.time.monotonic",
+                side_effect=[10.0, 10.01]):
+            origin = probe_origin(
+                opener=lambda _url, _timeout: (
+                    200, {}, b" " * (origin_limit + 1)
+                )
+            )
+        self.assertFalse(origin["ok"])
+        self.assertEqual(origin["error"], "response too large")
+        self.assertIsNone(origin["size_bytes"])
+
 
 class ReadyAndOriginTests(unittest.TestCase):
     def test_ready_keeps_only_the_contract_fields(self):
@@ -116,6 +173,20 @@ class ReadyAndOriginTests(unittest.TestCase):
             lambda _url, _timeout: (_ for _ in ()).throw(OSError("not ready")),
         )
         self.assertEqual({"ok": False, "status": None, "ready_connections": None}, result)
+
+    def test_r1_cf_negative_ready_connections_is_unknown(self):
+        payload = json.dumps(
+            {"status": 200, "readyConnections": -1}
+        ).encode("utf-8")
+
+        result = read_ready(
+            "http://127.0.0.1:20241",
+            lambda _url, _timeout: (200, {}, payload),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertIsNone(result["ready_connections"])
 
     def test_origin_probe_records_a_success(self):
         opener = lambda _url, _timeout: (200, {}, b"hello")
@@ -225,6 +296,20 @@ class MetricNormalizationTests(unittest.TestCase):
         self.assertIsNone(connector["lost_packets_delta"])
         self.assertIsNone(connector["connect_streams_errors_delta"])
         self.assertEqual({"request_errors_delta": None, "response_5xx_delta": None}, origin)
+
+    def test_r1_cf_label_order_preserves_counter_delta(self):
+        previous = parse_prometheus_text(
+            'quic_client_lost_packets{conn_index="0",reason="timeout"} 4\n'
+        )
+        current = parse_prometheus_text(
+            'quic_client_lost_packets{reason="timeout",conn_index="0"} 5\n'
+        )
+
+        result = cf_metrics_from_raw(current, previous)
+
+        self.assertEqual(
+            1.0, result["cf_connector"]["lost_packets_delta"]
+        )
 
     def test_backwards_counters_return_unknown_not_negative(self):
         previous = self.previous()

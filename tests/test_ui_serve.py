@@ -1801,6 +1801,23 @@ class TestNetworkRouteRegistration(ServerHarness):
         forwarded = module.write_network_config.call_args.args[2]
         self.assertEqual(forwarded["Origin"], "https://elsewhere.example")
 
+    def test_r3_network_write_oserror_uses_fixed_public_message(self):
+        module = self.network_module()
+        module.write_network_config = mock.Mock(side_effect=PermissionError(
+            "/private/network_config.json is not writable"))
+        body = json.dumps({"key": "rest_probe_s", "value": 30}).encode(
+            "utf-8")
+        handler = self.bound_handler(
+            {}, "/api/network/config", method="POST", body=body)
+
+        with mock.patch.dict(sys.modules, {"ui.network_api": module}):
+            handler.do_POST()
+
+        status, payload = self.response_json(handler)
+        self.assertEqual(status, 500)
+        self.assertEqual(payload, {"ok": False, "error": "write failed"})
+        self.assertNotIn("network_config.json", json.dumps(payload))
+
     def test_manifest_error_shapes_render_the_same_pull_facts(self):
         root = self.tempdir()
         now = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)

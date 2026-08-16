@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 from urllib.parse import urlparse
 
@@ -43,6 +44,19 @@ DEPENDENCIES = {
 }
 PROBE_COOLDOWN_MS = 30_000
 PRUNE_INTERVAL_MS = 3_600_000
+HEALTH_STATES = frozenset((
+    "Operational", "Degraded", "Outage", "Stale", "Unknown", "Off",
+))
+SEED_METRIC_KEYS = frozenset((
+    "dropped_frames_total", "total_requests", "request_errors",
+    "lost_packets", "connect_streams_errors",
+))
+CF_SEED_METRICS = {
+    "total_requests": "cloudflared_tunnel_total_requests",
+    "request_errors": "cloudflared_tunnel_request_errors",
+    "lost_packets": "quic_client_lost_packets",
+    "connect_streams_errors": "cloudflared_proxy_connect_streams_errors",
+}
 
 
 def _iso(timestamp_ms):
@@ -76,6 +90,30 @@ def _tick(value):
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("tick must be a positive number")
     return number
+
+
+def _plain_nonnegative_int(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0)
+
+
+def _allowed_origin_url(value):
+    if not isinstance(value, str) or value != value.strip():
+        return False
+    try:
+        parsed = urlparse(value)
+        parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme.lower() == "http"
+            and parsed.hostname in ("127.0.0.1", "localhost")
+            and parsed.username is None and parsed.password is None)
+
+
+def _safe_release(value):
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    return value if all(char.isalnum() or char in "._-" for char in value) else None
 
 
 def build_parser():
@@ -155,6 +193,7 @@ class Recorder:
         self.last_cycle_ms, self.release, self.previous_release = 0, "dev", None
         self.config, self.config_mtime = default_config(), object()
         self.edge_defs, self.nodes, self.edges = [], [], {}
+        self.seed_previous = {}
         self.next_due = {group: 0 for group in GROUP_EDGES}
         self.next_allowed, self.probe_now, self.last_probe = {}, {}, {}
         self.last_prune, self.metrics_found, self.previous_cf_raw = None, None, None
@@ -203,8 +242,11 @@ class Recorder:
         self.reload_config(now_ms, initial=True)
         for row in self.edge_defs:
             edge_id = row["id"]
-            if edge_id not in self.edges:
-                self.edges[edge_id] = self.dep("derive_edge")(edge_id, None, None, self.config, now_ms)
+            previous = self.seed_previous.get(edge_id)
+            current = self.dep("derive_edge")(
+                edge_id, None, previous, self.config, now_ms)
+            self._keep_uncollected_continuity(current, previous)
+            self.edges[edge_id] = current
         if self.previous_release is not None and self.previous_release != self.release:
             evidence = {"old": self.previous_release, "new": self.release}
             self.event(now_ms, None, "deployed release changed", "info",
@@ -217,34 +259,62 @@ class Recorder:
             return
         if not isinstance(payload, dict):
             return
+        edge_rows = payload.get("edges")
+        if not isinstance(edge_rows, list):
+            return
         allowed = {row["id"] for row in self.edge_defs}
-        for edge in payload.get("edges", []):
-            if isinstance(edge, dict) and edge.get("id") in allowed:
-                self.edges[edge["id"]] = deepcopy(edge)
-                metrics = edge.get("metrics")
-                retry = metrics.get("retry_after_s") if isinstance(metrics, dict) else None
-                observed = edge.get("observed_ms")
-                if (edge["id"] in GROUP_EDGES["rest"] and isinstance(retry, (int, float))
-                        and not isinstance(retry, bool) and retry > 0
-                        and isinstance(observed, (int, float)) and not isinstance(observed, bool)):
-                    self.next_allowed[edge["id"]] = int(observed + retry * 1000)
+        previous_cf_raw = {}
+        for edge in edge_rows:
+            if not isinstance(edge, dict):
+                continue
+            edge_id = edge.get("id")
+            if not isinstance(edge_id, str) or edge_id not in allowed:
+                continue
+            previous = {"id": edge_id}
+            counters = edge.get("counters")
+            if isinstance(counters, dict):
+                safe_counters = {
+                    key: value for key, value in counters.items()
+                    if isinstance(key, str) and _plain_nonnegative_int(value)
+                }
+                if safe_counters:
+                    previous["counters"] = safe_counters
+            metrics = edge.get("metrics")
+            if isinstance(metrics, dict):
+                safe_metrics = {
+                    key: value for key, value in metrics.items()
+                    if key in SEED_METRIC_KEYS and _plain_nonnegative_int(value)
+                }
+                if safe_metrics:
+                    previous["metrics"] = safe_metrics
+                    for key, raw_name in CF_SEED_METRICS.items():
+                        if key in safe_metrics:
+                            previous_cf_raw[raw_name] = safe_metrics[key]
+            health = edge.get("health")
+            if isinstance(health, str) and health in HEALTH_STATES:
+                previous["health"] = health
+            observed_ms = edge.get("observed_ms")
+            if _plain_nonnegative_int(observed_ms):
+                previous["observed_ms"] = observed_ms
+            self.seed_previous[edge_id] = previous
+        if previous_cf_raw:
+            self.previous_cf_raw = previous_cf_raw
         collector = payload.get("collector", {})
         probes = collector.get("probe_now") if isinstance(collector, dict) else None
         for edge_id, value in probes.items() if isinstance(probes, dict) else ():
             parsed = _iso_ms(value)
             if edge_id in PROBE_EDGES and parsed is not None:
                 self.probe_now[edge_id], self.last_probe[edge_id] = value, parsed
-        if isinstance(payload.get("deployed_ui_release"), str):
-            self.previous_release = payload["deployed_ui_release"]
+        previous_release = _safe_release(payload.get("deployed_ui_release"))
+        if previous_release is not None:
+            self.previous_release = previous_release
 
     def read_release(self):
         try:
             value = (UI_DIR / "RELEASE").read_text(encoding="utf-8").splitlines()[0].strip()
         except (IndexError, OSError, UnicodeError):
             return "dev"
-        safe = value and len(value) <= 128
-        safe = safe and all(char.isalnum() or char in "._-" for char in value)
-        return value if safe else "dev"
+        return _safe_release(value) or "dev"
 
     def event(self, now_ms, edge_id, transition, severity, reason, evidence):
         return self.store.insert_event(
@@ -270,8 +340,10 @@ class Recorder:
         return True
 
     def derive(self, edge_id, evidence, now_ms, collected=False):
-        previous = self.edges.get(edge_id)
+        previous = self.seed_previous.pop(edge_id, self.edges.get(edge_id))
         current = self.dep("derive_edge")(edge_id, evidence, previous, self.config, now_ms)
+        if not collected and evidence is None:
+            self._keep_uncollected_continuity(current, previous)
         if isinstance(previous, dict) and isinstance(previous.get("last_transition"), dict):
             current["last_transition"] = deepcopy(previous["last_transition"])
         for row in self.dep("transitions")(previous, current) or ():
@@ -289,19 +361,37 @@ class Recorder:
             status = current.get("health") or "Unknown"
             self.store.insert_sample(int(now_ms), edge_id, status, metrics if isinstance(metrics, dict) else {})
 
+    def _keep_uncollected_continuity(self, current, previous):
+        previous_count = previous.get("sample_count") if isinstance(previous, dict) else None
+        current["sample_count"] = (
+            previous_count if _plain_nonnegative_int(previous_count) else 0)
+        observed_ms = previous.get("observed_ms") if isinstance(previous, dict) else None
+        if _plain_nonnegative_int(observed_ms):
+            current["observed_ms"] = observed_ms
+            current["observed_at"] = _iso(observed_ms)
+            cadence_ms = current.get("cadence_ms")
+            current["fresh_until_ms"] = (
+                observed_ms + 3 * cadence_ms
+                if _plain_nonnegative_int(cadence_ms) else None)
+
     def consume_probe(self, now_ms):
+        claimed_path = Path(str(self.probe_path) + ".claimed-%d" % os.getpid())
         try:
-            payload = json.loads(self.probe_path.read_text(encoding="utf-8"))
+            os.replace(str(self.probe_path), str(claimed_path))
         except FileNotFoundError:
             return set()
+        except OSError:
+            return set()
+        try:
+            payload = json.loads(claimed_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
             payload = None
         try:
-            self.probe_path.unlink()
+            claimed_path.unlink()
         except FileNotFoundError:
             pass
         except OSError:
-            return set()
+            pass
         edge_id = payload.get("edge_id") if isinstance(payload, dict) else None
         if not isinstance(edge_id, str) or edge_id not in PROBE_EDGES:
             self.event(now_ms, None, "probe", "medium", "probe refused (not allowed)", {})
@@ -437,6 +527,7 @@ class Recorder:
             if due:
                 self.next_due[group] = now_ms + self.config[INTERVAL_KEYS[group]] * 1000
         self.refresh_other_edges(now_ms)
+        self.seed_previous.clear()
         if self.last_prune is None or now_ms - self.last_prune >= PRUNE_INTERVAL_MS:
             try:
                 self.store.prune(now_ms)
@@ -528,6 +619,10 @@ def _wait(recorder, seconds):
 
 def main(argv=None, deps=None):
     args = build_parser().parse_args(argv)
+    if not _allowed_origin_url(args.origin_url):
+        print("origin URL must use http://127.0.0.1 or http://localhost",
+              file=sys.stderr)
+        return 2
     recorder = Recorder(args.live_dir, args.data_dir, args.tick,
                         args.metrics_url, args.origin_url, args.quiet, deps)
     previous = {}

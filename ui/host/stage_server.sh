@@ -11,7 +11,13 @@ if ! cd "$ROOT"; then
   exit 2
 fi
 
-nohup python3 ui/serve.py --port 8081 > /tmp/quant-ui-stage.log 2>&1 &
+SERVER=${1:-ui/serve.py.new}
+if [ ! -f "$SERVER" ]; then
+  echo "== stage server file Unknown: $SERVER"
+  exit 4
+fi
+echo "== staging $SERVER on 127.0.0.1:8081"
+nohup python3 "$SERVER" --port 8081 > /tmp/quant-ui-stage.log 2>&1 &
 stage_pid=$!
 if ! echo "$stage_pid" > /tmp/quant-ui-stage.pid; then
   kill "$stage_pid" 2>/dev/null
@@ -55,10 +61,19 @@ get_path() {
 get_path "/"
 get_path "/api/strip"
 get_path "/api/health"
+get_path "/api/decisions"
+get_path "/api/failures"
+get_path "/api/events"
+get_path "/api/stream"
+get_path "/api/candidates"
+get_path "/api/position"
+get_path "/api/momentum"
+get_path "/api/fees"
+get_path "/api/pnl"
+get_path "/api/news"
 get_path "/api/telemetry"
 get_path "/api/poll_config"
 get_path "/api/grace"
-get_path "/api/news"
 get_path "/api/network"
 get_path "/api/network/history?edge_id=spot_rest&metric=status&range=1h"
 get_path "/api/network/events?limit=5"

@@ -27,12 +27,15 @@ _HOUR_MS = 3_600_000
 _SAMPLE_RETENTION_MS = 48 * _HOUR_MS
 _CAP_RETENTION_MS = 24 * _HOUR_MS
 _EVENT_RETENTION_MS = 30 * 24 * _HOUR_MS
+_CAP_DELETE_BATCH = 1_000
+_MAX_CAP_PRUNE_ROUNDS = 200
 _METRIC_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _STATUS_RANK_SQL = (
+    "CASE WHEN json_valid(metrics) = 0 THEN 3 ELSE "
     "CASE status WHEN 'Outage' THEN 6 WHEN 'Stale' THEN 5 "
     "WHEN 'Degraded' THEN 4 WHEN 'Unknown' THEN 3 WHEN 'Off' THEN 2 "
-    "WHEN 'Operational' THEN 1 ELSE 3 END"
+    "WHEN 'Operational' THEN 1 ELSE 3 END END"
 )
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples(
@@ -147,10 +150,12 @@ class NetworkStore:
             raise ValueError("unknown metric")
 
         range_ms, bucket_ms = RANGES[range_key]
-        from_ms = now_ms - range_ms
-        last_bucket = range_ms // bucket_ms - 1
+        bucket_count = range_ms // bucket_ms
+        last_bucket_start = (now_ms // bucket_ms) * bucket_ms
+        from_ms = last_bucket_start - (bucket_count - 1) * bucket_ms
         metric_columns = ", NULL AS metric_avg, NULL AS metric_max"
         metric_parameters = ()
+        valid_metrics_filter = ""
         if metric != "status":
             path = "$.%s" % metric
             numeric = (
@@ -160,18 +165,17 @@ class NetworkStore:
             metric_columns = ", AVG(%s) metric_avg, MAX(%s) metric_max" % (
                 numeric, numeric)
             metric_parameters = (path, path, path, path)
+            valid_metrics_filter = " AND json_valid(metrics) = 1"
 
         query = """
-SELECT CASE WHEN ts_ms >= ? THEN ?
-            ELSE CAST((ts_ms - ?) / ? AS INTEGER) END bucket_index,
-       COUNT(*) sample_count, MAX(%s) worst_rank %s
-FROM samples
-WHERE edge_id = ? AND ts_ms >= ? AND ts_ms <= ?
-GROUP BY bucket_index ORDER BY bucket_index DESC LIMIT ?
-""" % (_STATUS_RANK_SQL, metric_columns)
-        parameters = (
-            now_ms, last_bucket, from_ms, bucket_ms,
-        ) + metric_parameters + (edge_id, from_ms, now_ms, _MAX_BUCKETS)
+	SELECT CAST((ts_ms - ?) / ? AS INTEGER) bucket_index,
+	       COUNT(*) sample_count, MAX(%s) worst_rank %s
+	FROM samples
+	WHERE edge_id = ? AND ts_ms >= ? AND ts_ms <= ?%s
+	GROUP BY bucket_index ORDER BY bucket_index DESC LIMIT ?
+""" % (_STATUS_RANK_SQL, metric_columns, valid_metrics_filter)
+        parameters = (from_ms, bucket_ms) + metric_parameters + (
+            edge_id, from_ms, now_ms, _MAX_BUCKETS)
         rows = reversed(self._db().execute(query, parameters).fetchall())
 
         buckets = []
@@ -231,8 +235,10 @@ GROUP BY bucket_index ORDER BY bucket_index DESC LIMIT ?
         last_prune_ms = int(row["value"]) if row else 0
         elapsed_ms = now_ms - last_prune_ms
         if last_prune_ms > 0 and elapsed_ms < _HOUR_MS:
+            current_bytes = self.size_bytes()
             return {"samples_deleted": 0, "events_deleted": 0,
-                    "bytes": self.size_bytes()}
+                    "bytes": current_bytes,
+                    "cap_met": current_bytes <= self.size_cap_bytes}
 
         sample_cursor = database.execute(
             "DELETE FROM samples WHERE ts_ms < ?",
@@ -250,18 +256,40 @@ GROUP BY bucket_index ORDER BY bucket_index DESC LIMIT ?
         )
         database.commit()
 
-        if self.size_bytes() > self.size_cap_bytes:
+        current_bytes = self.size_bytes()
+        if current_bytes > self.size_cap_bytes:
             cursor = database.execute(
                 "DELETE FROM samples WHERE ts_ms < ?",
                 (now_ms - _CAP_RETENTION_MS,),
             )
             samples_deleted += cursor.rowcount
             database.commit()
-            database.execute("PRAGMA incremental_vacuum")
+            database.execute("PRAGMA incremental_vacuum").fetchall()
             database.commit()
+
+        for _round in range(_MAX_CAP_PRUNE_ROUNDS):
+            current_bytes = self.size_bytes()
+            if current_bytes <= self.size_cap_bytes:
+                break
+            cursor = database.execute(
+                "DELETE FROM samples WHERE rowid IN ("
+                "SELECT rowid FROM samples "
+                "ORDER BY ts_ms ASC, rowid ASC LIMIT ?)",
+                (_CAP_DELETE_BATCH,),
+            )
+            deleted = cursor.rowcount
+            database.commit()
+            if deleted <= 0:
+                break
+            samples_deleted += deleted
+            database.execute("PRAGMA incremental_vacuum").fetchall()
+            database.commit()
+
+        current_bytes = self.size_bytes()
         return {"samples_deleted": samples_deleted,
                 "events_deleted": events_deleted,
-                "bytes": self.size_bytes()}
+                "bytes": current_bytes,
+                "cap_met": current_bytes <= self.size_cap_bytes}
 
     def size_bytes(self) -> int:
         database = self._db()

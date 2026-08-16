@@ -119,8 +119,11 @@ def _venue_metrics(venue, now_ms):
     if stream_count is None:
         stream_count = _sum_rows(rows, "stream_count")
     latest_message_ms = _latest_message_ms(venue)
+    connected_values = [row.get("connected") for row in rows]
     connected_count = (
-        sum(row.get("connected") is True for row in rows) if rows else None
+        sum(value is True for value in connected_values)
+        if connected_values and all(isinstance(value, bool) for value in connected_values)
+        else None
     )
     result = {
         "expected_connections": _integer(venue.get("expected_connections")),
@@ -166,20 +169,22 @@ def read_stream_state(path: str, now_ms: int) -> dict | None:
     book_ages = []
     freshness = []
     row_times = []
+    symbols_total = 0
     for row in payload.values():
         if not isinstance(row, dict):
             continue
+        symbols_total += 1
         book_age = _integer(row.get("book_age_ms"))
         fresh_age = _integer(row.get("freshness_ms"))
-        if book_age is None or fresh_age is None:
-            continue
-        book_ages.append(book_age)
-        freshness.append(fresh_age)
+        if book_age is not None:
+            book_ages.append(book_age)
+        if fresh_age is not None:
+            freshness.append(fresh_age)
         row_time = _iso_ms(row.get("utc"))
         if row_time is not None:
             row_times.append(row_time)
     return {
-        "symbols_total": len(book_ages),
+        "symbols_total": symbols_total,
         "book_age_p50_ms": _nearest_rank(book_ages, 50),
         "book_age_p95_ms": _nearest_rank(book_ages, 95),
         "book_age_max_ms": max(book_ages) if book_ages else None,
@@ -245,13 +250,20 @@ def read_manifest(path: str) -> dict | None:
     payload = _read_object(path)
     if payload is None:
         return None
-    result = dict(payload)
-    plural = result.pop("errors", None)
-    singular = result.pop("error", None)
-    errors = list(plural) if isinstance(plural, list) else []
-    if not errors and isinstance(plural, str) and plural:
-        errors.append(plural)
-    if isinstance(singular, str) and singular and singular not in errors:
-        errors.append(singular)
+    result = {
+        key: payload.get(key)
+        for key in ("utc", "ok", "interval_ms", "cycle_ms", "files")
+    }
+    plural = payload.get("errors")
+    candidates = plural if isinstance(plural, list) else [plural]
+    candidates.append(payload.get("error"))
+    errors = []
+    for value in candidates:
+        if isinstance(value, str) and value:
+            bounded = value[:200]
+            if bounded not in errors:
+                errors.append(bounded)
+        if len(errors) == 20:
+            break
     result["errors"] = errors
     return result

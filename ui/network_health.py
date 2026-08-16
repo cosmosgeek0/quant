@@ -69,11 +69,32 @@ def _is_number(value):
             (isinstance(value, float) and math.isfinite(value)))
 
 
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _iso(ms):
     if not _is_number(ms):
         return None
     stamp = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
     return stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _timestamp_ms(value):
+    if _is_int(value):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        return None
+    return int(stamp.timestamp() * 1000)
 
 
 def _cadence_ms(group, config):
@@ -84,6 +105,29 @@ def _cadence_ms(group, config):
     if not _is_number(value) or value <= 0:
         value = DEFAULT_INTERVAL_S[group]
     return int(value * 1000)
+
+
+def _fresh_until_ms(edge_id, evidence, observed_ms, cadence_ms):
+    if observed_ms is None or cadence_ms is None:
+        return None
+    cadence_deadline = observed_ms + 3 * cadence_ms
+    if not isinstance(evidence, dict):
+        return cadence_deadline
+    limits = {
+        "spot_wss": ("snapshot_age_ms", 60000, 1),
+        "usdm_wss": ("snapshot_age_ms", 60000, 1),
+        "feed_machine": ("stream_row_age_ms", 600000, 1),
+        "news_fetch": ("as_of_age_s", 3 * cadence_ms, 1000),
+    }
+    rule = limits.get(edge_id)
+    if rule is None:
+        return cadence_deadline
+    age = evidence.get(rule[0])
+    if not _is_number(age):
+        return cadence_deadline
+    remaining_ms = max(0, rule[1] - age * rule[2])
+    evidence_deadline = int(observed_ms + remaining_ms)
+    return min(cadence_deadline, evidence_deadline)
 
 
 def _previous_count(prev, key):
@@ -128,7 +172,7 @@ def _base(edge_id, evidence, prev, config, now_ms):
         "health": "Unknown", "health_reason": "Evidence is not available", "monitoring": "Paused" if paused else "Running",
         "truth": {"configured": "Unknown", "transport": "Unknown", "application": "Unknown"},
         "observed_at": _iso(observed_ms), "observed_ms": observed_ms,
-        "fresh_until_ms": observed_ms + 3 * cadence_ms if observed_ms is not None and cadence_ms is not None else None,
+        "fresh_until_ms": _fresh_until_ms(edge_id, evidence, observed_ms, cadence_ms),
         "cadence_ms": cadence_ms, "sample_count": sample_count,
         "metrics": {key: None for key in METRIC_KEYS.get(edge_id, ())},
         "counters": copy.deepcopy(prev.get("counters", {})) if isinstance(prev, dict) else {},
@@ -178,6 +222,7 @@ def _derive_rest(edge, evidence, prev, now_ms):
     counters.update({key: _previous_count(prev, key) for key in counter_names})
     valid = isinstance(evidence, dict) and "ok" in evidence and "http_status" in evidence
     if not valid:
+        counters["quorum"] = 0
         kind = "missing" if not isinstance(evidence, dict) else "malformed"
         edge["health_reason"] = "%s probe evidence is %s" % (label, kind)
         metrics["consecutive_failures"] = counters["consecutive_failures"]
@@ -185,8 +230,9 @@ def _derive_rest(edge, evidence, prev, now_ms):
     _copy_metrics(edge, evidence)
     metrics["weight_limit_1m"] = 6000 if edge["id"] == "spot_rest" else 2400
     status = metrics["http_status"]
-    valid_time = evidence.get("server_time_ms") is not None
-    success = status == 200 and valid_time and evidence.get("ok") is not False
+    server_time_ms = evidence.get("server_time_ms")
+    valid_time = _is_int(server_time_ms) and server_time_ms > 0
+    success = evidence.get("ok") is True and status == 200 and valid_time
     _truth(edge, "Pass", "Pass" if status is not None else "Fail", "Pass" if success else "Fail")
     counters["probes"] += 1
     counters["failures"] += int(not success)
@@ -243,8 +289,9 @@ def _derive_wss(edge, evidence, prev, _now_ms):
     _apply_rules(edge, (
         (not _is_number(snapshot_age), "Unknown", "%s snapshot age is not exposed" % label),
         (_is_number(snapshot_age) and snapshot_age > 60000, "Stale", "%s evidence is older than 60 seconds" % label),
+        (status == "broken", "Outage", "%s has no usable connection" % label),
         (not counts_known, "Unknown", "%s connection count is not exposed" % label),
-        (counts_known and (status == "broken" or connected == 0), "Outage", "%s has no usable connection" % label),
+        (counts_known and connected == 0, "Outage", "%s has no usable connection" % label),
         (status not in ("healthy", "degraded"), "Unknown", "%s feed status is not exposed" % label),
         (status == "degraded", "Degraded", "%s reports degraded feed status" % label),
         (not _is_number(last_age), "Unknown", "%s last-message age is not exposed" % label),
@@ -262,12 +309,13 @@ def _derive_feed_machine(edge, evidence, _prev, _now_ms):
     edge["metrics"]["source"] = None
     feed_age = edge["metrics"]["feed_snapshot_age_ms"]
     row_age = edge["metrics"]["stream_row_age_ms"]
+    symbols_total = edge["metrics"]["symbols_total"]
     book_age = edge["metrics"]["book_age_p50_ms"]
-    stream_present = _is_number(row_age) or _is_number(book_age)
-    _truth(edge, "Pass" if stream_present else "Fail", "Not-applicable", "Pass" if _is_number(book_age) and book_age <= 5000 else ("Fail" if _is_number(book_age) else "Unknown"))
+    _truth(edge, "Pass", "Not-applicable", "Pass" if _is_number(book_age) and book_age <= 5000 else ("Fail" if _is_number(book_age) else "Unknown"))
     stream_known = _is_number(row_age) and _is_number(book_age)
     feed_fresh = _is_number(feed_age) and feed_age <= 5000
     _apply_rules(edge, (
+        (_is_number(symbols_total) and symbols_total == 0, "Unknown", "Machine stream has no rows"),
         (not _is_number(feed_age), "Unknown", "Feed evidence is not mirrored"),
         (not stream_known, "Unknown", "Machine stream evidence is not mirrored"),
         (stream_known and row_age > 600000, "Stale", "Machine stream row is older than 600 seconds"),
@@ -459,12 +507,16 @@ def summarize(edges, now_ms):
     worst_edge = max(effective, key=lambda edge: STATUS_RANK.get(edge.get("health"), 3)) if effective else None
     observed_ms = [edge.get("observed_ms") for edge in required if _is_number(edge.get("observed_ms"))]
     latest = None
+    latest_ms = None
     for edge in effective:
         candidate = edge.get("last_transition")
+        candidate_ms = _timestamp_ms(candidate.get("ts")) if isinstance(candidate, dict) else None
         if (isinstance(candidate, dict) and candidate.get("transition") and
-                (latest is None or str(candidate.get("ts", "")) > str(latest.get("ts", "")))):
+                candidate_ms is not None and
+                (latest_ms is None or candidate_ms > latest_ms)):
             latest = dict(candidate)
             latest.setdefault("edge_id", edge.get("id"))
+            latest_ms = candidate_ms
     return {
         "operational_required": sum(edge.get("health") == "Operational" for edge in required),
         "observed_required": sum(_is_number(edge.get("sample_count")) and edge.get("sample_count") > 0 for edge in required),
@@ -482,6 +534,9 @@ def apply_read_time_staleness(current, now_ms):
     result["summary"]["last_transition"] = previous_last
     collector = result.setdefault("collector", {})
     generated_ms, tick_s = result.get("generated_ms"), collector.get("tick_s")
-    if _is_number(generated_ms) and _is_number(tick_s) and now_ms - generated_ms > 3 * tick_s * 1000:
+    valid_timing = _is_int(generated_ms) and _is_int(tick_s) and tick_s > 0
+    if not valid_timing:
+        collector["status"] = "unknown"
+    elif now_ms - generated_ms > 3 * tick_s * 1000:
         collector["status"] = "stopped"
     return result

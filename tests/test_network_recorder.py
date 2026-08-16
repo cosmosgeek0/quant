@@ -3,12 +3,16 @@ from __future__ import annotations
 """Offline deterministic tests for the Network V1 recorder."""
 
 from copy import deepcopy
+from contextlib import redirect_stderr
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+from ui import network_health
 from ui import network_recorder as recorder
 
 
@@ -370,6 +374,26 @@ class NetworkRecorderTests(unittest.TestCase):
         self.assertTrue(sample_ids.isdisjoint(recorder.GROUP_EDGES["wss"]))
         self.assertEqual(len(sample_ids), 5)
 
+    def test_r3_real_derivation_keeps_paused_edges_unobserved(self):
+        self.write_config(paused={"wss": True})
+        deps = self.world.deps()
+        for name in ("derive_edge", "transitions", "summarize"):
+            deps.pop(name)
+        deps["get_edges"] = lambda: network_health.EDGES
+        deps["get_nodes"] = lambda: network_health.NODES
+
+        self.assertEqual(recorder.main(self.args(), deps=deps), 0)
+
+        current = json.loads((self.live / "network_current.json").read_text(
+            encoding="utf-8"))
+        by_id = {edge["id"]: edge for edge in current["edges"]}
+        for edge_id in recorder.GROUP_EDGES["wss"]:
+            self.assertEqual(by_id[edge_id]["health"], "Off")
+            self.assertEqual(by_id[edge_id]["sample_count"], 0)
+            self.assertIsNone(by_id[edge_id]["observed_ms"])
+        self.assertEqual(current["summary"]["observed_required"], 5)
+        self.assertEqual(len(self.database()["samples"]), 5)
+
     def test_same_evidence_on_second_run_adds_no_health_events(self):
         self.run_once()
         first = [
@@ -408,6 +432,37 @@ class NetworkRecorderTests(unittest.TestCase):
             for row in self.database()["events"]
         ))
 
+    def test_r3_probe_request_claim_preserves_new_replacement(self):
+        request = self.write_probe("spot_rest")
+        replacement = {
+            "edge_id": "usdm_rest",
+            "request_id": "new-request",
+            "requested_at": recorder._iso(self.world.now + 1),
+        }
+        real_read_text = Path.read_text
+        replaced = {"done": False}
+
+        def read_then_replace(path, *args, **kwargs):
+            payload = real_read_text(path, *args, **kwargs)
+            if (not replaced["done"] and
+                    (path == request or path.name.startswith(
+                        request.name + ".claimed-"))):
+                replaced["done"] = True
+                request.write_text(json.dumps(replacement), encoding="utf-8")
+            return payload
+
+        runner = recorder.Recorder(
+            self.live, self.data, quiet=True, deps=self.world.deps())
+        with mock.patch.object(Path, "read_text", read_then_replace):
+            forced = runner.consume_probe(self.world.now)
+
+        self.assertEqual(forced, {"spot_rest"})
+        self.assertTrue(request.is_file())
+        self.assertEqual(json.loads(request.read_text(encoding="utf-8")),
+                         replacement)
+        self.assertEqual(list(self.live.glob(
+            "network_probe_request.json.claimed-*")), [])
+
     def test_config_reloads_only_after_mtime_change(self):
         config_path = self.write_config(wss_read_s=15)
         runner = recorder.Recorder(
@@ -434,14 +489,26 @@ class NetworkRecorderTests(unittest.TestCase):
         self.assertEqual(len(self.world.calls["feed"]), initial_feed_reads + 1)
         runner.close()
 
-    def test_previous_current_edge_seeds_next_derivation(self):
-        previous = self.world.derive_edge(
-            "spot_rest", {"health": "Degraded"}, None,
-            recorder.default_config(), self.world.now - 1_000,
-        )
-        previous["sample_count"] = 7
+    def test_r3_seed_keeps_only_continuity_and_rederives_every_edge(self):
+        previous = {
+            "id": "spot_rest",
+            "health": "Degraded",
+            "observed_ms": self.world.now - 1_000,
+            "counters": {"quorum": 1, "probes": 7, "flag": True,
+                         "text": "not an integer"},
+            "metrics": {"dropped_frames_total": 4, "total_requests": 11,
+                        "request_errors": 2, "lost_packets": 3,
+                        "connect_streams_errors": 1, "http_status": 200},
+            "sample_count": 7,
+            "connectorId": "private-value",
+        }
         (self.live / "network_current.json").write_text(json.dumps({
-            "edges": [previous],
+            "edges": [
+                previous,
+                {"id": "aws_secrets", "health": "Operational",
+                 "connectorId": "private-value"},
+                {"id": "outside_contract", "health": "Operational"},
+            ],
             "collector": {"probe_now": {}},
             "deployed_ui_release": "dev",
         }), encoding="utf-8")
@@ -451,9 +518,51 @@ class NetworkRecorderTests(unittest.TestCase):
 
         seen = [old for edge_id, old in self.world.previous_seen
                 if edge_id == "spot_rest" and isinstance(old, dict)]
-        self.assertEqual(seen[0]["health"], "Degraded")
+        self.assertEqual(seen[0], {
+            "id": "spot_rest",
+            "health": "Degraded",
+            "observed_ms": self.world.now - 1_000,
+            "counters": {"quorum": 1, "probes": 7},
+            "metrics": {"dropped_frames_total": 4, "total_requests": 11,
+                        "request_errors": 2, "lost_packets": 3,
+                        "connect_streams_errors": 1},
+        })
         spot = next(edge for edge in current["edges"] if edge["id"] == "spot_rest")
-        self.assertEqual(spot["sample_count"], 8)
+        self.assertEqual(spot["sample_count"], 1)
+        secrets_edge = next(
+            edge for edge in current["edges"] if edge["id"] == "aws_secrets")
+        self.assertEqual(secrets_edge["health"], "Unknown")
+        self.assertNotIn("connectorId", secrets_edge)
+
+        other_live = self.root / "invalid-live"
+        other_live.mkdir()
+        (other_live / "network_current.json").write_text(json.dumps({
+            "edges": {},
+            "collector": {"probe_now": {
+                "spot_rest": recorder._iso(self.world.now)}},
+            "deployed_ui_release": "old-release",
+        }), encoding="utf-8")
+        other_world = FakeWorld()
+        other_runner = recorder.Recorder(
+            other_live, self.root / "invalid-data", quiet=True,
+            deps=other_world.deps())
+        other_runner.start(other_world.now)
+        self.assertEqual(other_runner.probe_now, {})
+        self.assertIsNone(other_runner.previous_release)
+        other_runner.close()
+
+    def test_r3_origin_url_rejects_non_loopback_before_work(self):
+        message = io.StringIO()
+        args = self.args() + ["--origin-url", "http://192.0.2.1/private"]
+
+        with redirect_stderr(message):
+            result = recorder.main(args, deps=self.world.deps())
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            message.getvalue().strip(),
+            "origin URL must use http://127.0.0.1 or http://localhost")
+        self.assertFalse((self.live / "network_current.json").exists())
 
     def test_shutdown_function_writes_stopped_event_and_closes_store(self):
         runner = recorder.Recorder(
