@@ -7,6 +7,11 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+VOLUME DIAGNOSTIC WOUND DOWN 2026-08-16 ~11:00Z | owner order: stop the tape scans, they return nothing and hammer the SSD | MEASURED
+result | V6 --limit 200 real-data run killed after 1h40m with ZERO output rows (the limit bounds events, not the 35 GB tape-prices read; the earlier full run refused after 3h+ the same way) | the commander's V2 out-of-sample expectancy stays UNMEASURED and is not pursued further without the owner's word | MEASURED
+kept | V6 code + tests (7c0fe85): the refusal row names its cost components; synthetic machine-scale policy shows a 1e-50 operation-order remainder between the two totals (INFERRED as the full-tape cause; never measured on the banked events) | MEASURED landing
+standing | no volume tape job runs on this Mac; the 35 GB tape and census banks stay on disk untouched; the volume word remains PARK vs one probe — the owner's | MEASURED
+
 REPAY RECEIPT CLOSED 2026-08-16T09:39Z | first margin act complete end to end | release f4fa89fa deployed by the atomic tool | machine SEALED + FLAT
 cause | exchange REPAY row = principal 2.5 + interest 0.0000387 (amount 2.5000387); the runner had expected the whole amount as principal | signed GET-only read on host | MEASURED
 repair | MJ17 READY split + exact confirmation; MJ18/MJ19 legacy exception bound to a frozen one-tuple allowlist + results-ledger row + exchange row by txId | MRV12 1+4 hollow -> MRV13 1 -> MRV14 MERGE-SAFE | sha:3f87225f,2b65de05,11c62c45 -> main f4fa89fa | MEASURED

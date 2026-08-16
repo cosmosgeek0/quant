@@ -16,7 +16,7 @@
 - REVERSE BASIS: BF4 landed the pure offline reverse intent at 15004059 with quote cap 8, borrow clamp 3, and borrow power CLOSED by default; BF9 landed the read-only, explicitly assumption-stamped shadow at 27517555. Both remain pending dedicated review. | MEASURED
 - REPAY CODE: MJ17/MJ18/MJ19 (3f87225f, 2b65de05, 11c62c45) — reviews MRV12 (1 + 4 hollow) -> MRV13 (1) -> MRV14 MERGE-SAFE; cherry-picked to main f4fa89fa, deployed, and exercised live: the standing receipt reconciled to CLOSED. Evidence: evidence/margin-proof-attempt1-2026-08-16.txt CLOSE-2. | MEASURED
 - BASIS BENCH: 524 executable lock-ins measured median net +0.51% after fees and slippage with 94% positive; 522/546 observed direction cases were REVERSE. These are study facts, not live execution proof. | MEASURED from HANDOVER-LEAD.md section 3
-- VOLUME BENCH: policy_sim still has no out-of-sample expectancy result. V6 at 7c0fe859 named the cost-reconciliation components and measured a synthetic 1e-50 operation-order remainder without changing any threshold or cost; the full result remains UNMEASURED. | MEASURED landing; UNVERIFIED full result
+- VOLUME BENCH: WOUND DOWN on the owner's word (tape scans hammer the SSD and return nothing) — the V6 200-event diagnostic was killed after 1h40m with zero output; V6's code stays (refusal row names cost components); the out-of-sample expectancy remains UNMEASURED and is not pursued without the owner's word. | MEASURED
 - STUDY RECORD: 3aab191c banked the pump-census, base-rate, and persistence scripts; 09f4f435 conditioned duration statistics on episodes that exceeded 2% and added the ALL class. Both remain lane-only pending review. | MEASURED
 
 ## Known limitations
