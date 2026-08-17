@@ -119,7 +119,13 @@ TRADE SIZE LAW (owner word 2026-08-17, standing, hard-coded): the account
 runs near 1,100 USD; the operating trade size is 30 USDT — everywhere, every
 op. The 8-USDT era is closed; no seat proposes, codes, or stages an 8-USDT
 trade again. Small-size arithmetic fights (venue minimums vs tiny caps) are
-the named waste this law removes. No per-test human press, no pasted
+the named waste this law removes.
+RISK DIALS (owner word 2026-08-17, same breath): the trading float is the
+~100 USD on spot; the account may lose 10 USD in a single day — that is the
+daily loss budget, hard-coded. Entry-count ceilings and every other
+small-era dial that can block a trade are lifted; no seat re-invents a
+protective ceiling the owner did not order. The per-trade adverse stop
+(2 percent) stays — it closes a losing trade, it never blocks one. No per-test human press, no pasted
 commands, no arbitrary shell near money — job files in, receipts out.
 WORD-TIME FLATNESS (review-lane condition, adopted 2026-08-14): the same
 signed GET-only flat read (positions + open orders both venues + balances,
