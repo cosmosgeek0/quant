@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+POSITION CLOSED FLAT — ALL FOUR REVERSE MONEY LEGS EXECUTED LIVE IN ONE DAY 2026-08-17 ~12:2xZ (worker 7.0; owner pressed the plain close script via run.md) | account FLAT, machine SEALED
+close | scripts/close_reverse_position.py (committed 25d588e, first-script style, ~150 lines from proven primitives, hard 12-USDT spend stop): bought ~10.12 ZRO at ~0.787 (~7.98 USDT), repaid the full 10.1004 liability | MEASURED
+flat | cross-margin after: ZRO borrowed 0 interest 0 free 0.01942646 (headroom dust ~1.5 cents, recorded), USDT free 1.9885, marginLevel 999, 0 orders | MEASURED live read
+economics | the whole frozen-position adventure cost ~1-2 cents total: sold at 0.79, bought back at 0.787 — the move nearly paid the fees | MEASURED balances
+day | the reverse lane executed BORROW, MARGIN_SELL (runner, receipt …1229), then MARGIN_BUY, REPAY (plain script) — every money leg live-proven leg-by-leg; one clean single-receipt round trip remains unproven | MEASURED
+open | the frozen receipt …1229 still halts the tick (UNKNOWN + governor lock); R7's recover-reverse command (in build) carries an EXTERNALLY_CLOSED_CONFIRMED_FLAT branch that finalizes exactly this shape on deploy — records-side only, no live risk while it lands | MEASURED state
+owner | the scrap-or-demolish decision is open with the owner: full scrap, or keep the ~2k proven-primitive lines on one thin spine and delete the ceremony (the direction doc's plan); no growth path exists | MEASURED owner word pending
+
 REVERSE ATTEMPT 4 — FIRST REAL MONEY ON THE LANE: BORROW + SELL FILLED, FROZE BEFORE THE HEDGE 2026-08-17 11:48Z (worker 7.0; owner press 11:47:49Z at size 30) | position LIVE at freeze; watcher resealed 11:48Z
 legs | BORROW DONE: 10.1 ZRO, txn 401747901880, ledger-confirmed principal 10.1 | MARGIN_SELL FILLED: 10.1 ZRO at 0.79, proceeds 7.979 USDT, fee 0.007979 (order 1493431639) | then FREEZE LEDGER_TRUTH_MISMATCH before FUTURES_LONG_OPEN; verdict UNKNOWN exit 4; sha_valid c8f436e5 | MEASURED receipt reverse-rproof-1229558b1512.json
 cause | the truth check compares expected base delta (0) to measured free-ZRO delta with the sell already filled but the account read landing before the exchange settled it — a stale-read race; the interest theory was disproven by replay; the freeze row records no operands (records gap) | MEASURED study + replay, race INFERRED
