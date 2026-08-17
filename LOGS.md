@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+REVERSE ATTEMPT 2 — REPAIRED GATE PASSED LIVE, REFUSED ONE GATE DEEPER 2026-08-17 09:45Z (worker 7.0; owner press 09:44:54Z through run.md) | machine resealed by the watcher 09:46Z; FLAT; zero mutations
+press | run.md entry consumed within minutes of staging; launcher chain clean on release 3f655c23: guards ok, flat read FLAT, ACCEPT-ONE (max 8, 15 min), job placed rproof-ee819e0b06b8, ARMED 09:44:55Z | MEASURED fire log
+run | tick claimed 09:45:04Z; ran 3.8 s; the repaired borrow-facts gate PASSED (facts read live: borrowable 10.08 ZRO, hourly rate present) — the 2026-08-16/17 refusal literal is gone from the receipt | MEASURED
+refusal | one gate deeper: BORROW_CLAMP_EXCEEDED — the plan sizes base quantity from the quote cap alone (about 3.2 ZRO at press-time prices) then refuses when it exceeds the owner borrow ceiling margin_ops.PRINCIPAL_CEILING = 3 (base units); the feasible window [venue floor ~2.0, ceiling 3.0] was non-empty and unused | MEASURED receipt + code read reverse_mechanics.py:209-211
+receipt | verdict REFUSED exit 2, mutation_attempts 0, legs [], fills [], fees [], governor RELEASED 09:45:04Z, sha_valid true; watcher resealed on the first terminal row | MEASURED reverse-rproof-ee819e0b06b8.json
+next | R3 card in flight: base quantity derives from the binding constraint set min(quote-cap quantity, principal ceiling, borrowable) floored to step — sizing DOWN inside every existing owner cap (risk-reducing; no cap value touched); one fresh-eyes round, deploy, press 3 into run.md | MEASURED plan
+ladder | six historical presses were launcher/composer refusals; attempts under the repaired release: 1 receipt, one gate deeper per attempt — the receipts are doing their job | MEASURED
+
 REVERSE LANE UNBLOCKED — REPAIR DEPLOYED, RECEIPT RECONCILED, PRESS 7 STAGED 2026-08-17 09:4xZ (worker 7.0, owner's autonomous block) | machine SEALED + FLAT end to end; zero mutations
 cause | the deterministic refusal: the preflight hunted borrowable + hourly-interest fields on the margin-account row, which that endpoint never returns (measured live row: free/locked/borrowed/interest/netAsset only) — every press failed identically | MEASURED code trace + host probes
 repair | job_runner reads the real endpoints through the typed single-attempt path (maxBorrowable {asset} -> amount; next-hourly-interest-rate {assets, isIsolated FALSE} -> one matching row), same fail-closed typing, src net 0 lines; fresh-eyes V1/V3 MERGE-SAFE, V2 finding ruled design intent, V4 two test findings repaired; suites 1499 green | lane 4c3af87 | MEASURED
