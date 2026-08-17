@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+SIZING REPAIR DEPLOYED, PRESS 3 STAGED 2026-08-17 10:1xZ (worker 7.0) | machine SEALED + FLAT + ticks clean; zero mutations this entry
+repair | the plan derives base quantity from the binding set min(quote-cap qty per venue, principal ceiling minus one common step for repay-interest headroom, borrowable), floored to step; venue minimum QUANTITIES join the pre-mutation refusals (meta carries measured min_qty, fail-closed); the reduce-only close floor is recomputed from the resized quantity; owner constants untouched | lane b295bdf | MEASURED
+review | single fresh-eyes V6 per the cadence law found 2 HIGH + 1 MEDIUM resize-consistency holes (repay principal+interest over the ceiling at the last leg; min-qty unchecked; stale close floor) — all repaired same hour; suites 17/194/1516 green, Lead-rerun | MEASURED
+deploy | payload w7fix-b295bdf6 XFER_VERIFIED; HOST-DEPLOY OK files=2; RELEASE b295bdf666efbe268e37d9d2c6a408ac5cbb6576; STOP-JOBS present throughout; ticks exit 0 | MEASURED
+press | attempt 3 staged in run.md PENDING; expected plan at press-time prices ~2.9 ZRO (~7.25 USDT notionals, ceiling 3 with headroom, floors met); watcher re-armed (reseal on first terminal row) | MEASURED staged
+
 REVERSE ATTEMPT 2 — REPAIRED GATE PASSED LIVE, REFUSED ONE GATE DEEPER 2026-08-17 09:45Z (worker 7.0; owner press 09:44:54Z through run.md) | machine resealed by the watcher 09:46Z; FLAT; zero mutations
 press | run.md entry consumed within minutes of staging; launcher chain clean on release 3f655c23: guards ok, flat read FLAT, ACCEPT-ONE (max 8, 15 min), job placed rproof-ee819e0b06b8, ARMED 09:44:55Z | MEASURED fire log
 run | tick claimed 09:45:04Z; ran 3.8 s; the repaired borrow-facts gate PASSED (facts read live: borrowable 10.08 ZRO, hourly rate present) — the 2026-08-16/17 refusal literal is gone from the receipt | MEASURED
