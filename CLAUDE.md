@@ -117,6 +117,15 @@ behavior not yet live-proven. A test that duplicates live-proven behavior
 is dead weight and is deleted in the same commit as the seam that replaced
 it. Test counts are never progress and never close a capability.
 
+## CLOSE FIRST (owner word 2026-08-17, paid for with a frozen position)
+A system may refuse to open; it must NEVER be unable to close. The close/
+flatten path is the dumbest, always-ready code in the program: no ceremony,
+no ticket, no review queue, runnable in one press while everything else is
+frozen — and it is proven live BEFORE any entry logic exists. Today's
+measure: a 154-line plain close script freed in minutes the position the
+9,312-line runner could not exit. Anything built next earns its entry path
+only after its exit path has a live receipt.
+
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.
 - Credentials live on the execution host only, read by running code only;
