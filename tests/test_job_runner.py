@@ -253,6 +253,10 @@ class ReverseTransport:
         self.margin_orders = {}
         self.futures_orders = {}
         self.futures_trades = {}
+        self.spot_open_orders = []
+        self.cross_margin_open_orders = []
+        self.futures_open_orders = []
+        self.read_failures = set()
         self.max_borrowable_kind = "ok"
         self.max_borrowable_payload = {"amount": "10.08461683",
                                        "borrowLimit": "11000"}
@@ -401,6 +405,8 @@ class ReverseTransport:
         self.calls.append((method, base_url, path, params, signed))
         if method == "GET":
             self.get_calls.append((path, dict(params)))
+        if method == "GET" and (base_url, path) in self.read_failures:
+            return "unclear", {}
         if method == "GET" and path == "/fapi/v1/time":
             return "ok", {"serverTime": 1786708800000}
         if method == "GET" and path == jr.basis_executor.SPOT.exchange_info_path:
@@ -417,13 +423,16 @@ class ReverseTransport:
                 {"asset": "USDT", "free": "100"},
             ]}
         if method == "GET" and path == jr.basis_executor.SPOT_OPEN_ORDERS_PATH:
-            return "ok", []
+            return "ok", list(self.spot_open_orders)
         if method == "GET" and path == "/sapi/v1/margin/openOrders":
             final = bool(self.history["REPAY"])
             if final and self.final_open_venue == "api_error":
                 return "api_error", {"code": -1000, "msg": "read unavailable"}
             resting = final and self.final_open_venue == "cross_margin"
-            return "ok", ([{"symbol": "TSTUSDT"}] if resting else [])
+            orders = self.cross_margin_open_orders or (
+                [{"symbol": "TSTUSDT"}] if resting else []
+            )
+            return "ok", list(orders)
         if method == "GET" and path == jr.basis_executor.USDM.exchange_info_path:
             return "ok", self.futures_exchange()
         if method == "GET" and path == jr.basis_executor.USDM_BOOK_PATH:
@@ -452,8 +461,10 @@ class ReverseTransport:
             preflight = self.preflight_fault == "open_orders"
             final = self.final_open_venue == "futures" \
                 and self.history["REPAY"]
-            return "ok", ([{"symbol": "TSTUSDT"}]
-                          if preflight or final else [])
+            orders = self.futures_open_orders or (
+                [{"symbol": "TSTUSDT"}] if preflight or final else []
+            )
+            return "ok", list(orders)
         if method == "GET" and path == "/fapi/v1/symbolConfig":
             self.symbol_config_reads += 1
             if self.stop_on_symbol_config_read == self.symbol_config_reads \
@@ -1039,6 +1050,93 @@ class JobRunnerTests(unittest.TestCase):
             "source_path": source_path,
             "lock_path": lock_path,
         }
+
+    def prepare_unknown_reverse_zero(self, job_id, **job_overrides):
+        self.reverse_job(job_id, **job_overrides)
+        transport = ReverseTransport(os.path.join(
+            self.receipt_dir, "STOP-JOBS"
+        ))
+        transport.max_borrowable_kind = "api_error"
+        self.assertEqual(self.reverse_tick(transport), 4)
+        row = self.results()[0]
+        runner_path = row["receipt_path"]
+        runner = json.loads(Path(runner_path).read_text(encoding="utf-8"))
+        source_path = runner["source_receipt_path"]
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        self.assertEqual(source["mutation_attempts"], 0)
+        self.assertEqual(source["legs"], [])
+        lock_path = os.path.join(
+            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+        Path(lock_path).write_text(json.dumps({
+            "version": 1,
+            "token": runner["governor_token"],
+            "op": jr.REVERSE_OP,
+            "symbol": "TSTUSDT",
+            "utc": utc(NOW),
+        }, separators=(",", ":")) + "\n", encoding="utf-8")
+        return {
+            "row": row,
+            "runner_path": runner_path,
+            "source_path": source_path,
+            "lock_path": lock_path,
+        }
+
+    def prepare_finalized_reverse_zero(self, job_id):
+        artifacts = self.prepare_unknown_reverse_zero(job_id)
+
+        class ReleasePaused(Exception):
+            pass
+
+        with mock.patch.object(
+                jr, "_release_final_outcome_governor",
+                side_effect=ReleasePaused):
+            with self.assertRaises(ReleasePaused):
+                jr.reconcile_margin(
+                    job_id, True, self.receipt_dir, NOW,
+                    ReverseTransport(),
+                )
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        runner = json.loads(Path(
+            artifacts["runner_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            (source["verdict"], runner["verdict"]),
+            ("CLOSED", "CLOSED"),
+        )
+        self.assertEqual(
+            (source["governor_release"], runner["governor_release"]),
+            ("PENDING", "PENDING"),
+        )
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+        self.assertEqual([
+            row.get("kind", "RESULT") for row in self.results()
+        ], ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT"])
+        return artifacts
+
+    @staticmethod
+    def artifact_tree_bytes(root):
+        root_path = Path(root)
+        return {
+            str(path.relative_to(root_path)): path.read_bytes()
+            for path in root_path.rglob("*") if path.is_file()
+        }
+
+    def assert_reverse_reconcile_read_only(self, job_id, request):
+        before = self.artifact_tree_bytes(self.receipt_dir)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, request
+            ), 3)
+        self.assertEqual(
+            self.artifact_tree_bytes(self.receipt_dir), before
+        )
+        self.assertTrue(any(
+            call.args and "RECONCILE_UNCONFIRMED" in str(call.args[0])
+            for call in output.call_args_list
+        ))
 
     def prepare_standing_legacy_repay_reconcile(
             self, bind_legacy_release=True, job_id=None):
@@ -3449,6 +3547,392 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.receipt_dir, "STOP-JOBS"
         )))
+
+    def test_reconcile_reverse_zero_closes_releases_and_clears_tick_halt(self):
+        job_id = "reverse-reconcile-zero"
+        artifacts = self.prepare_unknown_reverse_zero(job_id)
+        source_before = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(self.tick(), 3)
+        truth = ReverseTransport()
+
+        with mock.patch.object(
+                jr, "_release_final_outcome_governor",
+                wraps=jr._release_final_outcome_governor) as final_release:
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, truth
+            ), 0)
+
+        final_release.assert_called_once()
+        self.assertEqual(truth.calls, [
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                jr.basis_executor.SPOT_OPEN_ORDERS_PATH,
+                {"symbol": "TSTUSDT"}, True,
+            ),
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                jr.MARGIN_ACCOUNT_PATH, {}, True,
+            ),
+            (
+                "GET", jr.basis_executor.SPOT.base_url,
+                "/sapi/v1/margin/openOrders",
+                {"symbol": "TSTUSDT", "isIsolated": "FALSE"}, True,
+            ),
+            (
+                "GET", jr.basis_executor.USDM.base_url,
+                "/fapi/v3/positionRisk", {"symbol": "TSTUSDT"}, True,
+            ),
+            (
+                "GET", jr.basis_executor.USDM.base_url,
+                "/fapi/v3/account", {}, True,
+            ),
+            (
+                "GET", jr.basis_executor.USDM.base_url,
+                "/fapi/v1/openOrders", {"symbol": "TSTUSDT"}, True,
+            ),
+        ])
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        runner = json.loads(Path(
+            artifacts["runner_path"]
+        ).read_text(encoding="utf-8"))
+        expected_truth = {
+            "spot_open_orders": 0,
+            "cross_margin_open_orders": 0,
+            "futures_position": "0",
+            "futures_open_orders": 0,
+            "margin_liability": {
+                "asset": "TST", "borrowed": "0", "interest": "0",
+                "total_liability": "0",
+            },
+        }
+        self.assertEqual(source["final_truth"], expected_truth)
+        self.assertEqual((source["verdict"], runner["verdict"]), (
+            "CLOSED", "CLOSED",
+        ))
+        self.assertEqual((source["reason"], runner["reason"]), (
+            source_before["reason"], source_before["reason"],
+        ))
+        self.assertEqual((
+            source["mutation_attempts"], source["legs"],
+            source["governor_release"], runner["governor_release"],
+        ), (0, [], "RELEASED", "RELEASED"))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        rows = self.results()
+        self.assertEqual(
+            [row.get("kind", "RESULT") for row in rows],
+            ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT"],
+        )
+        event = rows[1]
+        self.assertEqual(set(event), jr.REVERSE_ZERO_RECONCILED_FIELDS)
+        self.assertEqual(event, {
+            "kind": "RECONCILED_FROM_EXCHANGE_TRUTH",
+            "job_id": job_id,
+            "op": jr.REVERSE_OP,
+            "symbol": "TSTUSDT",
+            "verdict": "CLOSED",
+            "reason": source_before["reason"],
+            "mutation_attempts": 0,
+            "legs": [],
+            "submitted_ids": [],
+            **expected_truth,
+            "utc": utc(NOW),
+        })
+        result_rows = [
+            row for row in rows if set(row) == jr.RESULT_FIELDS
+        ]
+        self.assertEqual([
+            (row["verdict"], row["exit_code"]) for row in result_rows
+        ], [("UNKNOWN", 4), ("CLOSED", 0)])
+        self.assertEqual(jr._release_result(
+            jr._paths(self.receipt_dir), job_id
+        ), result_rows[-1])
+        self.assertEqual(jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        ), ({job_id}, False, False))
+
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+        self.assert_reverse_reconcile_read_only(job_id, no_reads)
+        no_reads.assert_not_called()
+
+        next_job = "zz-after-reverse-reconcile"
+        self.job(next_job)
+        self.assertEqual(self.tick(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.jobs_dir, "claims", "job-%s.claim" % next_job
+        )))
+
+    def test_reverse_finalized_release_pause_is_completed_by_next_tick(self):
+        job_id = "reverse-finalized-next-tick"
+        artifacts = self.prepare_finalized_reverse_zero(job_id)
+        results_path = jr._paths(self.receipt_dir)["results"]
+        results_before = Path(results_path).read_bytes()
+
+        with mock.patch.object(
+                jr, "_reverse_zero_exchange_truth",
+                side_effect=AssertionError("unexpected exchange read")
+                ) as exchange_truth:
+            self.assertEqual(self.tick(), 0)
+
+        exchange_truth.assert_not_called()
+        self.assertEqual(Path(results_path).read_bytes(), results_before)
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        for path in (artifacts["source_path"], artifacts["runner_path"]):
+            self.assertEqual(
+                json.loads(Path(path).read_text(
+                    encoding="utf-8"
+                ))["governor_release"],
+                "RELEASED",
+            )
+
+    def test_reverse_finalized_reconcile_retry_releases_once(self):
+        job_id = "reverse-finalized-retry"
+        artifacts = self.prepare_finalized_reverse_zero(job_id)
+        results_path = jr._paths(self.receipt_dir)["results"]
+        results_before = Path(results_path).read_bytes()
+        no_reads = mock.Mock(
+            side_effect=AssertionError("unexpected exchange read")
+        )
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, no_reads
+        ), 0)
+
+        no_reads.assert_not_called()
+        self.assertEqual(Path(results_path).read_bytes(), results_before)
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        releases_after_success = list(self.governor_releases)
+
+        self.assert_reverse_reconcile_read_only(job_id, no_reads)
+
+        no_reads.assert_not_called()
+        self.assertEqual(self.governor_releases, releases_after_success)
+
+    def test_reverse_reconcile_short_result_write_stays_unreleased(self):
+        job_id = "reverse-reconcile-short-result"
+        artifacts = self.prepare_unknown_reverse_zero(job_id)
+        results_path = jr._paths(self.receipt_dir)["results"]
+        real_write = os.write
+        real_fsync = os.fsync
+        real_close = os.close
+        short_seen = []
+        fsync_after_short = []
+        short_descriptor = {"value": None, "open": False}
+
+        def short_final_result(descriptor, encoded):
+            if b'"exit_code":0' in encoded:
+                count = max(1, len(encoded) // 2)
+                written = real_write(descriptor, encoded[:count])
+                short_seen.append(written)
+                short_descriptor.update({
+                    "value": descriptor, "open": True,
+                })
+                return written
+            return real_write(descriptor, encoded)
+
+        def observed_fsync(descriptor):
+            if short_descriptor["open"] \
+                    and descriptor == short_descriptor["value"]:
+                fsync_after_short.append(descriptor)
+            return real_fsync(descriptor)
+
+        def observed_close(descriptor):
+            try:
+                return real_close(descriptor)
+            finally:
+                if descriptor == short_descriptor["value"]:
+                    short_descriptor["open"] = False
+
+        with mock.patch.object(
+                jr.os, "write", side_effect=short_final_result), \
+                mock.patch.object(
+                    jr.os, "fsync", side_effect=observed_fsync), \
+                mock.patch.object(
+                    jr.os, "close", side_effect=observed_close):
+            self.assertEqual(jr.reconcile_margin(
+                job_id, True, self.receipt_dir, NOW, ReverseTransport()
+            ), 3)
+
+        self.assertEqual(len(short_seen), 1)
+        self.assertEqual(fsync_after_short, [])
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+        self.assertFalse(Path(results_path).read_bytes().endswith(b"\n"))
+        _ids, bad_results, _unresolved = jr._result_ids(results_path)
+        self.assertTrue(bad_results)
+
+    def test_reconcile_reverse_zero_decimal_equivalent_quote_cap_binds(self):
+        job_id = "reverse-reconcile-decimal-cap"
+        artifacts = self.prepare_unknown_reverse_zero(
+            job_id, quote_cap="8.00"
+        )
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(source["quote_cap"], "8.00")
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, ReverseTransport()
+        ), 0)
+
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+
+    def test_reconcile_margin_missing_source_keeps_durable_evidence(self):
+        job_id = "margin-reconcile-missing-source"
+        artifacts = self.prepare_unknown_margin_reconcile(job_id)
+        os.unlink(artifacts["source_path"])
+        no_reads = mock.Mock(
+            side_effect=AssertionError("unexpected exchange read")
+        )
+
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, no_reads
+        ), 3)
+
+        no_reads.assert_not_called()
+        self.assertEqual(self.results()[-1], {
+            "kind": "RECONCILE_UNCONFIRMED",
+            "job_id": job_id,
+            "reason": "SOURCE_RECEIPT_MISSING",
+            "utc": utc(NOW),
+        })
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_reverse_zero_nonzero_truth_is_read_only(self):
+        job_id = "reverse-reconcile-nonzero"
+        self.prepare_unknown_reverse_zero(job_id)
+
+        cases = (
+            ("borrowed", lambda value: setattr(
+                value, "borrowed", Decimal("0.1")
+            )),
+            ("spot_order", lambda value: value.spot_open_orders.append(
+                {"symbol": "TSTUSDT"}
+            )),
+            ("cross_margin_order", lambda value:
+             value.cross_margin_open_orders.append({"symbol": "TSTUSDT"})),
+            ("futures_order", lambda value: value.futures_open_orders.append(
+                {"symbol": "TSTUSDT"}
+            )),
+            ("futures_position", lambda value: setattr(
+                value, "position", Decimal("0.001")
+            )),
+        )
+        for name, configure in cases:
+            with self.subTest(name=name):
+                truth = ReverseTransport()
+                configure(truth)
+                self.assert_reverse_reconcile_read_only(job_id, truth)
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_reverse_zero_read_failures_are_single_and_read_only(self):
+        job_id = "reverse-reconcile-read"
+        self.prepare_unknown_reverse_zero(job_id)
+        endpoints = (
+            (
+                jr.basis_executor.SPOT.base_url,
+                jr.basis_executor.SPOT_OPEN_ORDERS_PATH,
+            ),
+            (jr.basis_executor.SPOT.base_url, jr.MARGIN_ACCOUNT_PATH),
+            (
+                jr.basis_executor.SPOT.base_url,
+                "/sapi/v1/margin/openOrders",
+            ),
+            (jr.basis_executor.USDM.base_url, "/fapi/v3/positionRisk"),
+            (jr.basis_executor.USDM.base_url, "/fapi/v3/account"),
+            (jr.basis_executor.USDM.base_url, "/fapi/v1/openOrders"),
+        )
+        for base_url, path in endpoints:
+            with self.subTest(path=path):
+                truth = ReverseTransport()
+                truth.read_failures.add((base_url, path))
+                self.assert_reverse_reconcile_read_only(job_id, truth)
+                self.assertEqual(sum(
+                    call[0] == "GET"
+                    and call[1] == base_url and call[2] == path
+                    for call in truth.calls
+                ), 1)
+        self.assertEqual(self.governor_releases, [])
+
+    def test_reconcile_reverse_zero_artifact_refusals_are_read_only(self):
+        job_id = "reverse-reconcile-artifacts"
+        artifacts = self.prepare_unknown_reverse_zero(job_id)
+        original = self.artifact_tree_bytes(self.receipt_dir)
+
+        def restore():
+            root = Path(self.receipt_dir)
+            for path in root.rglob("*"):
+                if path.is_file() and str(path.relative_to(root)) not in original:
+                    path.unlink()
+            for relative, encoded in original.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(encoded)
+
+        def submitted_evidence():
+            source = json.loads(Path(
+                artifacts["source_path"]
+            ).read_text(encoding="utf-8"))
+            source["market"]["submission"] = {"orderId": "71"}
+            Path(artifacts["source_path"]).write_text(
+                json.dumps(source, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def wrong_op():
+            source = json.loads(Path(
+                artifacts["source_path"]
+            ).read_text(encoding="utf-8"))
+            source["op"] = "MARGIN_BORROW"
+            Path(artifacts["source_path"]).write_text(
+                json.dumps(source, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def missing_lock():
+            Path(artifacts["lock_path"]).unlink()
+
+        def token_mismatch():
+            lock = json.loads(Path(
+                artifacts["lock_path"]
+            ).read_text(encoding="utf-8"))
+            lock["token"] = "different-governor-token"
+            Path(artifacts["lock_path"]).write_text(
+                json.dumps(lock, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        for name, change in (
+                ("submitted_evidence", submitted_evidence),
+                ("wrong_op", wrong_op),
+                ("missing_lock", missing_lock),
+                ("token_mismatch", token_mismatch)):
+            with self.subTest(name=name):
+                restore()
+                change()
+                no_reads = mock.Mock(
+                    side_effect=AssertionError("unexpected read")
+                )
+                self.assert_reverse_reconcile_read_only(job_id, no_reads)
+                no_reads.assert_not_called()
+        restore()
+        self.assertEqual(self.governor_releases, [])
 
     def test_reconcile_margin_legacy_receipt_opens_and_releases(self):
         job_id = "mproof-b668c154de2c"

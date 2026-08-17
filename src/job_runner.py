@@ -90,6 +90,24 @@ MARGIN_RECONCILED_FIELDS = {
     "account_liability_before", "account_liability",
     "snapshot_time_note", "utc",
 }
+REVERSE_ZERO_RECONCILED_FIELDS = {
+    "kind", "job_id", "op", "symbol", "verdict", "reason",
+    "mutation_attempts", "legs", "submitted_ids", "spot_open_orders",
+    "cross_margin_open_orders", "futures_position", "futures_open_orders",
+    "margin_liability", "utc",
+}
+REVERSE_ZERO_SOURCE_FIELDS = {
+    "kind", "job_id", "op", "symbol", "borrow_asset", "quote_cap",
+    "intent_id", "client_tag", "sha", "started_utc", "mutation_attempts",
+    "verdict", "reason", "plan", "market", "ladder_actions", "legs",
+    "governor_token", "governor_release", "finished_utc",
+}
+REVERSE_ZERO_RUNNER_FIELDS = {
+    "job_id", "op", "symbol", "verdict", "reason", "utc",
+    "measured_sha", "sha_valid", "source_receipt_path",
+    "authority_digests", "sha", "governor_token", "governor_release",
+    "fills", "fees", "realized",
+}
 MARGIN_LEGACY_RECONCILED_FIELDS = (
     MARGIN_RECONCILED_FIELDS - {
         "history_watermark", "account_liability_before",
@@ -1381,6 +1399,45 @@ def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
         return False
 
 
+def _valid_reverse_zero_reconciled_row(row: Dict[str, Any]) -> bool:
+    try:
+        symbol = row.get("symbol")
+        borrow_asset = symbol[:-4] \
+            if type(symbol) is str and symbol.endswith("USDT") else ""
+        liability = row.get("margin_liability")
+        canonical_liability = _margin_account_liability({
+            "userAssets": [liability]
+        }, borrow_asset)
+        return set(row) == REVERSE_ZERO_RECONCILED_FIELDS \
+            and row.get("kind") == "RECONCILED_FROM_EXCHANGE_TRUTH" \
+            and type(row.get("job_id")) is str \
+            and JOB_ID_RE.fullmatch(row["job_id"]) is not None \
+            and row.get("op") == REVERSE_OP \
+            and type(symbol) is str \
+            and SYMBOL_RE.fullmatch(symbol) is not None \
+            and margin_ops.ASSET_RE.fullmatch(borrow_asset) is not None \
+            and row.get("verdict") == "CLOSED" \
+            and type(row.get("reason")) is str and bool(row["reason"]) \
+            and type(row.get("mutation_attempts")) is int \
+            and row["mutation_attempts"] == 0 \
+            and row.get("legs") == [] \
+            and row.get("submitted_ids") == [] \
+            and all(type(row.get(name)) is int and row[name] == 0
+                    for name in (
+                        "spot_open_orders", "cross_margin_open_orders",
+                        "futures_open_orders",
+                    )) \
+            and _margin_decimal_text(row.get("futures_position")) == "0" \
+            and canonical_liability == liability \
+            and all(Decimal(liability[name]) == Decimal("0") for name in (
+                "borrowed", "interest", "total_liability",
+            )) \
+            and type(row.get("utc")) is str \
+            and _timestamp(row["utc"]) is not None
+    except Exception:
+        return False
+
+
 def _result_ids(path: str) -> Tuple[set, bool, bool]:
     if not os.path.exists(path):
         return set(), False, False
@@ -1405,6 +1462,13 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                     or job_id in legacy_proofs:
                 return set(), True, False
             legacy_proofs[job_id] = (index, row)
+            continue
+        if set(row) == REVERSE_ZERO_RECONCILED_FIELDS:
+            job_id = row.get("job_id")
+            if not _valid_reverse_zero_reconciled_row(row) \
+                    or job_id in reconciled:
+                return set(), True, False
+            reconciled[job_id] = (index, row)
             continue
         if set(row) not in (
                 MARGIN_RECONCILED_FIELDS,
@@ -1468,7 +1532,8 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
         if fields in (
                 MARGIN_RECONCILED_FIELDS,
                 MARGIN_LEGACY_RECONCILED_FIELDS,
-                MARGIN_LEGACY_REPAY_RECONCILED_FIELDS):
+                MARGIN_LEGACY_REPAY_RECONCILED_FIELDS,
+                REVERSE_ZERO_RECONCILED_FIELDS):
             continue
         if fields == MARGIN_LEGACY_PROOF_FIELDS:
             continue
@@ -1511,6 +1576,11 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
             event_index, event = reconciliation
             proof_entry = legacy_proofs.get(job_id)
             legacy_event = set(event) == MARGIN_LEGACY_RECONCILED_FIELDS
+            event_symbol = event.get("asset") \
+                if legacy_event or set(event) in (
+                    MARGIN_RECONCILED_FIELDS,
+                    MARGIN_LEGACY_REPAY_RECONCILED_FIELDS,
+                ) else event.get("symbol")
             if legacy_event:
                 proof_matches = proof_entry is not None \
                     and event_index < proof_entry[0] < final_index \
@@ -1532,7 +1602,7 @@ def _result_ids(path: str) -> Tuple[set, bool, bool]:
                         "job_id", "op", "symbol", "receipt_path",
                     )) \
                     or current["op"] != event["op"] \
-                    or current["symbol"] != event["asset"]:
+                    or current["symbol"] != event_symbol:
                 return set(), True, False
         receipt_path = current["receipt_path"]
         if not receipt_path or not os.path.isfile(receipt_path):
@@ -1717,6 +1787,7 @@ def _append_results_row(paths: Dict[str, str], row: Dict[str, Any]) -> None:
     except (FileNotFoundError, OSError):
         pass
     line = separator + json.dumps(row, separators=(",", ":")) + "\n"
+    encoded_line = line.encode("utf-8")
     created = False
     try:
         descriptor = os.open(
@@ -1728,7 +1799,9 @@ def _append_results_row(paths: Dict[str, str], row: Dict[str, Any]) -> None:
     except FileExistsError:
         descriptor = os.open(paths["results"], os.O_APPEND | os.O_WRONLY)
     try:
-        os.write(descriptor, line.encode("utf-8"))
+        written = os.write(descriptor, encoded_line)
+        if written != len(encoded_line):
+            raise OSError("RESULTS_SHORT_WRITE")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -6484,8 +6557,13 @@ def _margin_governor_halt_rows(paths: Dict[str, str]) \
                 _validate_known_margin_artifact_fields(
                     row, "RESULT", row_job_id
                 )
-                if row["op"] == margin_ops.MARGIN_BORROW \
-                        and row["verdict"] not in FREEZE_VERDICTS:
+                margin_terminal = row["op"] == margin_ops.MARGIN_BORROW \
+                    and row["verdict"] not in FREEZE_VERDICTS
+                reverse_terminal = row["op"] == REVERSE_OP \
+                    and row["verdict"] == "CLOSED" \
+                    and type(row["exit_code"]) is int \
+                    and row["exit_code"] == 0
+                if margin_terminal or reverse_terminal:
                     final_rows[row["job_id"]] = row
     except FileNotFoundError:
         return {}, {}
@@ -6591,8 +6669,23 @@ def _halt_interrupted_margin_governor(
                 paths["receipts"], "job-%s.json" % job_id
             )
             source_path = os.path.join(
-                paths["receipts"], "margin-%s.json" % job_id
+                paths["receipts"], "%s-%s.json" % (
+                    "reverse" if row["op"] == REVERSE_OP else "margin",
+                    job_id,
+                )
             )
+            if row["op"] == REVERSE_OP:
+                try:
+                    reverse_facts = _load_reverse_zero_reconcile_facts(
+                        paths, receipt_dir, job_id
+                    )
+                except (ArtifactAnomaly, JobRefusal):
+                    reverse_facts = None
+                if reverse_facts is not None \
+                        and reverse_facts[2].get("verdict") == "CLOSED":
+                    return None if _reconcile_reverse_zero(
+                        paths, receipt_dir, job_id, reverse_facts, now, None
+                    ) == 0 else True
             runner_exists, runner_verdict, runner = _margin_receipt_fact(
                 runner_path, "RUNNER_RECEIPT", job_id
             )
@@ -6712,9 +6805,13 @@ def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
         if set(row) in (
                 MARGIN_RECONCILED_FIELDS,
                 MARGIN_LEGACY_RECONCILED_FIELDS,
-                MARGIN_LEGACY_REPAY_RECONCILED_FIELDS) \
+                MARGIN_LEGACY_REPAY_RECONCILED_FIELDS,
+                REVERSE_ZERO_RECONCILED_FIELDS) \
                 and row.get("job_id") == job_id:
-            if not _valid_margin_reconciled_row(row):
+            valid_reconciliation = _valid_reverse_zero_reconciled_row(row) \
+                if set(row) == REVERSE_ZERO_RECONCILED_FIELDS \
+                else _valid_margin_reconciled_row(row)
+            if not valid_reconciliation:
                 raise JobRefusal("RESULT_RECONCILIATION_INVALID")
             reconciliations.append((index, row))
             continue
@@ -6739,6 +6836,9 @@ def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
                 == event["legacy_exclusivity_proof"]
         else:
             proof_matches = not legacy_proofs
+        event_symbol = event.get("symbol") \
+            if set(event) == REVERSE_ZERO_RECONCILED_FIELDS \
+            else event.get("asset")
         if first_index < event_index < final_index \
                 and proof_matches \
                 and (first.get("verdict"), first.get("exit_code")) \
@@ -6749,7 +6849,7 @@ def _release_result(paths: Dict[str, str], job_id: str) -> Dict[str, Any]:
                     "job_id", "op", "symbol", "receipt_path",
                 )) \
                 and final.get("op") == event["op"] \
-                and final.get("symbol") == event["asset"]:
+                and final.get("symbol") == event_symbol:
             return final
         raise JobRefusal("RESULT_RECONCILIATION_INVALID")
     if len(matches) != 1 or reconciliations or legacy_proofs:
@@ -7078,6 +7178,352 @@ def _load_margin_reconcile_facts(
     )
 
 
+def _reverse_zero_has_submission_evidence(value: Any) -> bool:
+    blocked = {
+        "txid", "tranid", "mutationstartedutc", "fills", "executedqty",
+        "cumquote", "exchangestatus",
+        "resolvedbyclientidquery",
+    }
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if type(current) is dict:
+            for name, child in current.items():
+                normalized = re.sub(
+                    r"[^a-z0-9]", "", name.lower()
+                ) if type(name) is str else ""
+                if normalized in blocked or any(
+                        marker in normalized for marker in (
+                            "submission", "submitted", "transaction", "order",
+                        )):
+                    return True
+                stack.append(child)
+        elif type(current) is list:
+            stack.extend(current)
+    return False
+
+
+def _load_reverse_zero_reconcile_facts(
+        paths: Dict[str, str], receipt_dir: str, job_id: str) \
+        -> Tuple[str, str, Dict[str, Any], Dict[str, Any], Job, str]:
+    source_path = os.path.join(
+        paths["receipts"], "reverse-%s.json" % job_id
+    )
+    runner_path = os.path.join(
+        paths["receipts"], "job-%s.json" % job_id
+    )
+    job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
+    source = _release_artifact(source_path, "SOURCE_RECEIPT")[0]
+    runner = _release_artifact(runner_path, "RUNNER_RECEIPT")[0]
+    job_payload, job_encoded = _release_artifact(job_path, "JOB_FILE")
+    _validate_known_margin_artifact_fields(
+        source, "SOURCE_RECEIPT", job_id
+    )
+    _validate_known_margin_artifact_fields(
+        runner, "RUNNER_RECEIPT", job_id
+    )
+    pending = source.get("verdict") == "UNKNOWN" \
+        and runner.get("verdict") == "UNKNOWN"
+    finalized = source.get("verdict") == "CLOSED" \
+        and runner.get("verdict") == "CLOSED"
+    _release_require(pending or finalized, "REVERSE_RECEIPT_NOT_UNKNOWN")
+    _release_require(
+        set(source) == REVERSE_ZERO_SOURCE_FIELDS \
+        | ({"final_truth"} if finalized else set()),
+        "SOURCE_RECEIPT_SHAPE_MISMATCH",
+    )
+    _release_require(
+        set(runner) == REVERSE_ZERO_RUNNER_FIELDS,
+        "RUNNER_RECEIPT_SHAPE_MISMATCH",
+    )
+    try:
+        created = _timestamp(job_payload.get("created_utc"))
+        job = _validate_job(job_payload, job_id, created, receipt_dir)
+    except Exception:
+        raise JobRefusal("JOB_FILE_INVALID") from None
+    _release_require(
+        job.op == REVERSE_OP
+        and source.get("kind") == "reverse_mechanics_roundtrip"
+        and source.get("job_id") == job_id
+        and source.get("op") == job.op
+        and source.get("symbol") == job.symbol
+        and source.get("borrow_asset") == job.borrow_asset
+        and _margin_decimal_text(source.get("quote_cap"))
+        == _canonical_decimal_text(job.effective_notional)
+        and source.get("intent_id") == job.intent_id
+        and source.get("client_tag") == job.client_tag
+        and runner.get("job_id") == job_id
+        and runner.get("op") == job.op
+        and runner.get("symbol") == job.symbol,
+        "REVERSE_RECEIPT_IDENTITY_MISMATCH",
+    )
+    _release_require(
+        type(source.get("reason")) is str and bool(source["reason"])
+        and runner.get("reason") == source["reason"],
+        "REVERSE_RECEIPT_REASON_MISMATCH",
+    )
+    _release_require(
+        type(source.get("mutation_attempts")) is int
+        and source["mutation_attempts"] == 0
+        and source.get("legs") == []
+        and type(source.get("market")) is dict
+        and type(source.get("ladder_actions")) is list
+        and (source.get("plan") is None or type(source["plan"]) is dict)
+        and not _reverse_zero_has_submission_evidence({
+            name: value for name, value in source.items()
+            if name != "final_truth"
+        }),
+        "REVERSE_ZERO_MUTATION_PROOF_MISMATCH",
+    )
+    _release_require(
+        runner.get("fills") == []
+        and runner.get("fees") == []
+        and runner.get("realized") == _momentum_ledger([])["realized"],
+        "RUNNER_ZERO_MUTATION_PROOF_MISMATCH",
+    )
+    job_digest = hashlib.sha256(job_encoded).hexdigest()
+    _release_require(
+        runner.get("authority_digests") == {"job_file": job_digest},
+        "JOB_DIGEST_MISMATCH",
+    )
+    measured_sha = runner.get("measured_sha")
+    _release_require(
+        runner.get("sha_valid") is True
+        and type(measured_sha) is str
+        and SHA_RE.fullmatch(measured_sha.lower()) is not None
+        and runner.get("sha") == measured_sha.lower()
+        and source.get("sha") == runner["sha"],
+        "RUNNER_SHA_MISMATCH",
+    )
+    _release_require(
+        type(runner.get("source_receipt_path")) is str
+        and runner["source_receipt_path"] == source_path,
+        "SOURCE_RECEIPT_PATH_MISMATCH",
+    )
+    token = source.get("governor_token")
+    _release_require(
+        type(token) is str and bool(token)
+        and runner.get("governor_token") == token
+        and source.get("governor_release") == "PENDING"
+        and runner.get("governor_release") == "PENDING",
+        "GOVERNOR_RECEIPT_MISMATCH",
+    )
+    lock_path = os.path.join(
+        receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE
+    )
+    lock = _margin_lock_fact(lock_path, job_id)
+    _release_require(
+        isinstance(lock, dict)
+        and set(lock) == {"version", "token", "op", "symbol", "utc"}
+        and lock.get("version") == 1
+        and lock.get("token") == token
+        and lock.get("op") == REVERSE_OP
+        and lock.get("symbol") == job.symbol,
+        "LOCK_MISMATCH",
+    )
+    try:
+        for value in (
+                source["started_utc"], source["finished_utc"],
+                runner["utc"], lock["utc"]):
+            _timestamp(value)
+    except Exception:
+        raise JobRefusal("REVERSE_RECEIPT_TIMESTAMP_MISMATCH") from None
+    if finalized:
+        final_result = _release_result(paths, job_id)
+        _release_require(
+            type(source.get("final_truth")) is dict
+            and final_result.get("op") == REVERSE_OP
+            and final_result.get("symbol") == job.symbol
+            and final_result.get("verdict") == "CLOSED"
+            and type(final_result.get("exit_code")) is int
+            and final_result["exit_code"] == 0
+            and type(final_result.get("receipt_path")) is str
+            and os.path.abspath(final_result["receipt_path"])
+            == os.path.abspath(runner_path),
+            "RESULT_RECONCILIATION_INVALID",
+        )
+    else:
+        _reconcile_unknown_result(
+            paths, job_id, REVERSE_OP, job.symbol, runner_path
+        )
+    return source_path, runner_path, source, runner, job, token
+
+
+def _reverse_zero_exchange_truth(
+        paths: Dict[str, str], job_id: str, job: Job, source: Dict[str, Any],
+        request: Optional[Callable[..., Tuple[str, Any]]]) -> Dict[str, Any]:
+    try:
+        transport = request or basis_executor.live_request_factory(
+            os.environ.get("BINANCE_API_KEY", ""),
+            os.environ.get("BINANCE_API_SECRET", ""),
+        )
+    except Exception:
+        raise ReverseReadUnknown(
+            "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+        ) from None
+
+    def single_attempt(method: str, base_url: str, path: str,
+                       params: Optional[Dict[str, str]] = None,
+                       signed: bool = False) -> Tuple[str, Any]:
+        try:
+            result = transport(
+                method, base_url, path, dict(params or {}), signed
+            )
+        except Exception:
+            raise ReverseReadUnknown(
+                "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+            ) from None
+        if type(result) is not tuple or len(result) != 2 \
+                or result[0] != "ok":
+            raise ReverseReadUnknown(
+                "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+            )
+        return result
+
+    spot_state = _spot_state(
+        job.symbol, source["sha"], paths["receipts"],
+        "reverse-reconcile-" + job_id, single_attempt,
+    )
+    spot_orders = basis_executor.signed_read(
+        spot_state, basis_executor.SPOT.base_url,
+        basis_executor.SPOT_OPEN_ORDERS_PATH, {"symbol": job.symbol},
+        "Reverse reconcile Spot open-orders read",
+    )
+    account = _reverse_read(
+        single_attempt, basis_executor.SPOT.base_url,
+        MARGIN_ACCOUNT_PATH, {}, True,
+        "REVERSE_RECONCILE_MARGIN_ACCOUNT",
+    )
+    liability = _margin_account_liability(account, job.borrow_asset)
+    cross_margin_orders = _reverse_read(
+        single_attempt, basis_executor.SPOT.base_url,
+        "/sapi/v1/margin/openOrders",
+        {"symbol": job.symbol, "isIsolated": "FALSE"}, True,
+        "REVERSE_RECONCILE_CROSS_MARGIN_OPEN_ORDERS",
+    )
+    if not isinstance(spot_orders, list) or any(
+            not isinstance(row, dict) for row in spot_orders) \
+            or liability is None \
+            or not isinstance(cross_margin_orders, list) \
+            or any(not isinstance(row, dict) for row in cross_margin_orders):
+        raise ReverseReadUnknown(
+            "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+        )
+
+    previous_http = futures_hand.http
+
+    def reverse_http(method: str, path: str,
+                     params: Optional[Dict[str, str]] = None,
+                     signed: bool = False) -> Tuple[str, Any]:
+        return single_attempt(
+            method, basis_executor.USDM.base_url, path, params, signed
+        )
+
+    futures_hand.http = reverse_http
+    try:
+        futures = _momentum_measure(
+            job.symbol, require_target_leverage=False
+        )
+    finally:
+        futures_hand.http = previous_http
+    if type(futures) is not dict \
+            or type(futures.get("qty")) is not Decimal \
+            or type(futures.get("open_orders")) is not int:
+        raise ReverseReadUnknown(
+            "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+        )
+    counts = (
+        len(spot_orders), len(cross_margin_orders), futures["open_orders"],
+    )
+    liability_values = tuple(
+        Decimal(liability[name])
+        for name in ("borrowed", "interest", "total_liability")
+    )
+    if any(value != 0 for value in counts) \
+            or futures["qty"] != Decimal("0") \
+            or any(value != Decimal("0") for value in liability_values):
+        raise JobRefusal("REVERSE_ZERO_TRUTH_NOT_FLAT")
+    return {
+        "spot_open_orders": counts[0],
+        "cross_margin_open_orders": counts[1],
+        "futures_position": _canonical_decimal_text(futures["qty"]),
+        "futures_open_orders": counts[2],
+        "margin_liability": liability,
+    }
+
+
+def _reverse_reconcile_unconfirmed(job_id: str, reason: str) -> int:
+    print("JOB-RUNNER | RECONCILE_UNCONFIRMED | %s | %s" % (
+        job_id, reason
+    ))
+    return 3
+
+
+def _reconcile_reverse_zero(
+        paths: Dict[str, str], receipt_dir: str, job_id: str,
+        facts: Tuple[str, str, Dict[str, Any], Dict[str, Any], Job, str],
+        now: datetime,
+        request: Optional[Callable[..., Tuple[str, Any]]]) -> int:
+    source_path, runner_path, source, runner, job, token = facts
+    if source.get("verdict") == "CLOSED":
+        if not _release_final_outcome_governor(
+                paths, receipt_dir, job_id, REVERSE_OP, source_path,
+                token, now):
+            _touch_stop(paths["stop"])
+            print("JOB-RUNNER | RECONCILED | GOVERNOR_RELEASE_PENDING")
+            return 3
+        print("JOB-RUNNER | RECONCILED | " + job_id)
+        return 0
+    try:
+        final_truth = _reverse_zero_exchange_truth(
+            paths, job_id, job, source, request
+        )
+    except JobRefusal as refusal:
+        return _reverse_reconcile_unconfirmed(job_id, refusal.reason)
+    except Exception:
+        return _reverse_reconcile_unconfirmed(
+            job_id, "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+        )
+
+    source_final = dict(source)
+    source_final.update({"verdict": "CLOSED", "final_truth": final_truth})
+    runner_final = dict(runner)
+    runner_final["verdict"] = "CLOSED"
+    event = {
+        "kind": "RECONCILED_FROM_EXCHANGE_TRUTH",
+        "job_id": job_id,
+        "op": REVERSE_OP,
+        "symbol": job.symbol,
+        "verdict": "CLOSED",
+        "reason": source["reason"],
+        "mutation_attempts": 0,
+        "legs": [],
+        "submitted_ids": [],
+        **final_truth,
+        "utc": _utc_text(now),
+    }
+    try:
+        _persist_margin_source(source_path, source_final)
+        _persist_json_receipt(runner_path, runner_final)
+        _append_results_row(paths, event)
+        _append_result(
+            paths, job_id, REVERSE_OP, job.symbol,
+            Outcome("CLOSED", 0, runner_path), now,
+        )
+    except Exception:
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | RECONCILE REFUSED | PERSISTENCE_FAILED")
+        return 3
+    if not _release_final_outcome_governor(
+            paths, receipt_dir, job_id, REVERSE_OP, source_path,
+            token, now):
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | RECONCILED | GOVERNOR_RELEASE_PENDING")
+        return 3
+    print("JOB-RUNNER | RECONCILED | " + job_id)
+    return 0
+
+
 def reconcile_margin(
         job_id: str, confirm_reconcile: bool,
         receipt_dir: Optional[str] = None,
@@ -7102,6 +7548,30 @@ def reconcile_margin(
             paths, receipt_dir, job_id
         )
     except ArtifactAnomaly as anomaly:
+        if anomaly.reason == "SOURCE_RECEIPT_MISSING":
+            try:
+                reverse_facts = _load_reverse_zero_reconcile_facts(
+                    paths, receipt_dir, job_id
+                )
+            except ArtifactAnomaly as reverse_anomaly:
+                if reverse_anomaly.reason == "SOURCE_RECEIPT_MISSING":
+                    return _margin_reconcile_unconfirmed(
+                        paths, job_id, anomaly.reason, now
+                    )
+                return _reverse_reconcile_unconfirmed(
+                    job_id, reverse_anomaly.reason
+                )
+            except JobRefusal as refusal:
+                return _reverse_reconcile_unconfirmed(
+                    job_id, refusal.reason
+                )
+            except Exception:
+                return _reverse_reconcile_unconfirmed(
+                    job_id, "REVERSE_ZERO_RECEIPT_UNCONFIRMED"
+                )
+            return _reconcile_reverse_zero(
+                paths, receipt_dir, job_id, reverse_facts, now, request
+            )
         return _margin_reconcile_unconfirmed(
             paths, job_id, anomaly.reason, now
         )
@@ -8145,7 +8615,8 @@ def main(argv=None) -> int:
     )
     reconcile = commands.add_parser(
         "reconcile-margin",
-        help="reconcile one UNKNOWN Margin receipt from exchange reads",
+        help=("reconcile one UNKNOWN Margin or zero-attempt reverse receipt "
+              "from exchange reads"),
     )
     reconcile.add_argument("--job-id", required=True)
     reconcile.add_argument(
