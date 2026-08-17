@@ -17,8 +17,14 @@ import reverse_mechanics as mechanics  # noqa: E402
 
 D = Decimal
 SYMBOL = "TESTUSDT"
-SPOT = {"step": D("0.003"), "min_notional": D("2"), "price": D("100")}
-PERP = {"step": D("0.004"), "min_notional": D("2"), "price": D("102")}
+SPOT = {"step": D("0.003"), "min_qty": D("0.003"),
+        "min_notional": D("2"), "price": D("100")}
+PERP = {"step": D("0.004"), "min_qty": D("0.004"),
+        "min_notional": D("2"), "price": D("102")}
+ZRO_SPOT = {"step": D("0.1"), "min_qty": D("0.1"),
+            "min_notional": D("5"), "price": D("2.5")}
+ZRO_PERP = {"step": D("0.1"), "min_qty": D("0.1"),
+            "min_notional": D("5"), "price": D("2.4")}
 
 
 def build(**changes):
@@ -35,6 +41,18 @@ def build(**changes):
     }
     values.update(changes)
     return mechanics.plan_reverse_mechanics(**values)
+
+
+def build_zro(**changes):
+    values = {
+        "symbol": "ZROUSDT",
+        "spot_meta": ZRO_SPOT,
+        "perp_meta": ZRO_PERP,
+        "borrow_asset": "ZRO",
+        "borrowable": D("10.08"),
+    }
+    values.update(changes)
+    return build(**values)
 
 
 def outcome(status, quantity=None, net_base=None):
@@ -98,12 +116,112 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(all(not leg.reduce_only for leg in
                             plan.legs[:3] + plan.legs[4:]))
 
+    def test_principal_ceiling_keeps_one_common_step_of_repay_headroom(self):
+        plan = build_zro()
+
+        self.assertIsInstance(plan, mechanics.ReversePlan)
+        quote_only_qty = min(
+            plan.quote_cap / ZRO_SPOT["price"],
+            plan.quote_cap / ZRO_PERP["price"],
+        )
+        self.assertEqual(quote_only_qty, D("3.2"))
+        self.assertEqual(mechanics.margin_ops.PRINCIPAL_CEILING, D("3"))
+        self.assertEqual(plan.common_step, D("0.1"))
+        self.assertEqual((plan.base_qty, plan.borrow_principal),
+                         (D("2.9"), D("2.9")))
+        self.assertEqual((plan.spot_notional, plan.perp_notional,
+                          plan.quote_notional),
+                         (D("7.25"), D("6.96"), D("7.25")))
+        self.assertLessEqual(plan.quote_notional, plan.quote_cap)
+        self.assertGreaterEqual(plan.spot_notional,
+                                ZRO_SPOT["min_notional"])
+        self.assertGreaterEqual(plan.perp_notional,
+                                ZRO_PERP["min_notional"])
+        self.assertTrue(all(leg.base_qty == D("2.9") for leg in plan.legs))
+
+    def test_borrowable_sizes_the_plan_when_it_is_the_smaller_clamp(self):
+        plan = build_zro(borrowable=D("2.7"))
+
+        self.assertIsInstance(plan, mechanics.ReversePlan)
+        self.assertEqual(plan.base_qty, D("2.7"))
+        self.assertEqual(plan.borrow_principal, D("2.7"))
+        self.assertLess(plan.borrowable,
+                        mechanics.margin_ops.PRINCIPAL_CEILING)
+        self.assertGreaterEqual(plan.spot_notional,
+                                ZRO_SPOT["min_notional"])
+        self.assertGreaterEqual(plan.perp_notional,
+                                ZRO_PERP["min_notional"])
+
+    def test_binding_window_below_a_venue_floor_refuses_without_a_plan(self):
+        cases = (
+            ("ceiling", {
+                "spot_meta": {**ZRO_SPOT, "min_notional": D("7.6")},
+                "perp_meta": {**ZRO_PERP, "min_notional": D("7.6")},
+            }),
+            ("borrowable", {"borrowable": D("1.9")}),
+        )
+        for name, changes in cases:
+            with self.subTest(clamp=name):
+                result = build_zro(**changes)
+                self.assertIsInstance(result, mechanics.ReversePlanRefusal)
+                self.assertEqual(
+                    (result.gate, result.reason),
+                    (mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE,
+                     mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE),
+                )
+                self.assertFalse(hasattr(result, "legs"))
+
+    def test_quantity_below_either_venue_minimum_refuses(self):
+        cases = (
+            ("spot", {"spot_meta": {**SPOT, "min_qty": D("0.073")}}),
+            ("futures", {"perp_meta": {**PERP, "min_qty": D("0.073")}}),
+        )
+        for venue, changes in cases:
+            with self.subTest(venue=venue):
+                result = build(**changes)
+                self.assertIsInstance(result, mechanics.ReversePlanRefusal)
+                self.assertEqual(
+                    (result.gate, result.reason),
+                    (mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE,
+                     mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE),
+                )
+
+    def test_missing_or_invalid_minimum_quantity_fails_closed(self):
+        spot_without_minimum = {
+            name: value for name, value in SPOT.items()
+            if name != "min_qty"
+        }
+        perp_without_minimum = {
+            name: value for name, value in PERP.items()
+            if name != "min_qty"
+        }
+        cases = (
+            ("spot-missing", {"spot_meta": spot_without_minimum}),
+            ("futures-missing", {"perp_meta": perp_without_minimum}),
+            ("spot-invalid", {
+                "spot_meta": {**SPOT, "min_qty": D("NaN")},
+            }),
+            ("futures-zero", {
+                "perp_meta": {**PERP, "min_qty": D("0")},
+            }),
+        )
+        for name, changes in cases:
+            with self.subTest(name=name):
+                result = build(**changes)
+                self.assertIsInstance(result, mechanics.ReversePlanRefusal)
+                self.assertEqual(
+                    result.reason,
+                    mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE,
+                )
+
     def test_plan_refuses_at_each_applicable_ordered_gate(self):
         cases = (
             (build(quote_cap=D("8.01")),
              mechanics.QUOTE_NOTIONAL_CAP_EXCEEDED),
-            (build(borrowable=D("0.01")),
+            (build(borrowable=None),
              mechanics.BORROW_CLAMP_EXCEEDED),
+            (build(borrowable=D("0.01")),
+             mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE),
             (build(spot_meta={**SPOT, "step": None}),
              mechanics.STEP_OR_MIN_NOTIONAL_INFEASIBLE),
         )
@@ -255,10 +373,12 @@ class FailureLadderTests(unittest.TestCase):
     def test_truth_mismatch_blocks_borrow_and_reopens_close_first(self):
         two_plan = build(
             spot_meta={
-                "step": D("0.1"), "min_notional": D("5"), "price": D("3"),
+                "step": D("0.1"), "min_qty": D("0.1"),
+                "min_notional": D("5"), "price": D("3"),
             },
             perp_meta={
-                "step": D("1"), "min_notional": D("5"), "price": D("3.5"),
+                "step": D("1"), "min_qty": D("1"),
+                "min_notional": D("5"), "price": D("3.5"),
             },
             borrowable=D("3"),
         )

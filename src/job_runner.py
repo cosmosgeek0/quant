@@ -5453,6 +5453,27 @@ def _reverse_read(transport: Callable[..., Tuple[str, Any]],
     return result[1]
 
 
+def _reverse_futures_min_quantity(payload: Any, symbol: str) -> Decimal:
+    try:
+        info = basis_executor.one_symbol(
+            payload, symbol, "reverse Futures exchangeInfo")
+        filters = {
+            row["filterType"]: row
+            for row in info.get("filters", []) if isinstance(row, dict)
+        }
+        return max(
+            _momentum_decimal(
+                filters["LOT_SIZE"].get("minQty"),
+                "reverse Futures minimum quantity"),
+            _momentum_decimal(
+                filters["MARKET_LOT_SIZE"].get("minQty"),
+                "reverse Futures market minimum quantity"),
+        )
+    except (basis_executor.Refusal, KeyError, MomentumStateError, TypeError):
+        raise ReverseReadUnknown(
+            "REVERSE_FUTURES_MIN_QUANTITY_UNREADABLE") from None
+
+
 def _reverse_plan_row(plan: reverse_mechanics.ReversePlan) -> Dict[str, Any]:
     return {
         "symbol": plan.symbol,
@@ -5588,9 +5609,17 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
         return finish("UNKNOWN", 4, "REVERSE_TRANSPORT_UNREADABLE")
 
     previous_http = futures_hand.http
+    futures_exchange_info = None
 
     def reverse_http(method, path, params=None, signed=False):
-        return transport(method, basis_executor.USDM.base_url, path, params or {}, signed)
+        nonlocal futures_exchange_info
+        result = transport(
+            method, basis_executor.USDM.base_url, path, params or {}, signed)
+        if method == "GET" and path == basis_executor.USDM.exchange_info_path \
+                and type(result) is tuple and len(result) == 2 \
+                and result[0] == "ok":
+            futures_exchange_info = result[1]
+        return result
 
     futures_hand.http = reverse_http
     try:
@@ -5622,9 +5651,13 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
                 raise ReverseReadUnknown("REVERSE_FUTURES_PREFLIGHT_UNREADABLE") from error
             except futures_hand.PreflightError as error:
                 raise JobRefusal("REVERSE_FUTURES_PREFLIGHT: %s" % error) from None
+            futures_min_qty = _reverse_futures_min_quantity(
+                futures_exchange_info, job.symbol)
             plan_result = plan_reverse_mechanics(job.symbol, job.effective_notional,
-                {"step": spot["step"], "min_notional": spot["min_notional"], "price": spot["ask"]},
-                {"step": hand_plan["step"], "min_notional": hand_plan["min_notional"],
+                {"step": spot["step"], "min_qty": spot["min_qty"],
+                 "min_notional": spot["min_notional"], "price": spot["ask"]},
+                {"step": hand_plan["step"], "min_qty": futures_min_qty,
+                 "min_notional": hand_plan["min_notional"],
                  "price": hand_plan["limit_price"]}, job.borrow_asset, borrowable[0],
                 interest[0], job.intent_id, job.client_tag, limits)
             if not isinstance(plan_result, reverse_mechanics.ReversePlan):
@@ -5646,7 +5679,13 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
         initial_base_free = balances[job.borrow_asset]
         hand_plan = dict(hand_plan)
         hand_plan["quantity"] = plan.base_qty
-        hand_plan["max_fill_notional"] = plan.base_qty * hand_plan["limit_price"]
+        hand_plan["max_fill_notional"] = (
+            hand_plan["quantity"] * hand_plan["limit_price"]
+        )
+        hand_plan["close_notional_floor"] = (
+            hand_plan["quantity"] * hand_plan["mark"]
+            * futures_hand.CLOSE_PRICE_FLOOR
+        )
         receipt["market"] = {"spot_bid": _decimal_text(spot["bid"]),
             "spot_ask": _decimal_text(spot["ask"]), "spot_step": _decimal_text(spot["step"]),
             "spot_min_notional": _decimal_text(spot["min_notional"]),

@@ -182,13 +182,16 @@ def plan_reverse_mechanics(
         return _refusal(symbol, BORROW_CLAMP_EXCEEDED,
                         "borrow or claimed-intent facts are unavailable")
 
-    spot_step, spot_min, spot_price = (_value(spot_meta, "step"),
+    spot_step, spot_min_qty, spot_min, spot_price = (
+        _value(spot_meta, "step"), _value(spot_meta, "min_qty"),
         _value(spot_meta, "min_notional"), _value(spot_meta, "price"))
-    perp_step, perp_min, perp_price = (_value(perp_meta, "step"),
+    perp_step, perp_min_qty, perp_min, perp_price = (
+        _value(perp_meta, "step"), _value(perp_meta, "min_qty"),
         _value(perp_meta, "min_notional"), _value(perp_meta, "price"))
     if type(symbol) is not str or SYMBOL_RE.fullmatch(symbol) is None \
             or not all(_valid_decimal(value, positive=True) for value in (
-                spot_step, spot_price, perp_step, perp_price)) \
+                spot_step, spot_min_qty, spot_price,
+                perp_step, perp_min_qty, perp_price)) \
             or not all(_valid_decimal(value) for value in (spot_min, perp_min)):
         return _refusal(symbol, STEP_OR_MIN_NOTIONAL_INFEASIBLE,
                         "symbol or venue sizing metadata is unavailable")
@@ -197,7 +200,9 @@ def plan_reverse_mechanics(
         with localcontext() as context:
             context.prec = 60
             common_step = _common_step(spot_step, perp_step)
-            raw_qty = min(quote_cap / spot_price, quote_cap / perp_price)
+            raw_qty = min(quote_cap / spot_price, quote_cap / perp_price,
+                          margin_ops.PRINCIPAL_CEILING - common_step,
+                          borrowable)
             base_qty = (raw_qty / common_step).to_integral_value(
                 rounding=ROUND_DOWN) * common_step
             spot_notional = base_qty * spot_price
@@ -209,7 +214,9 @@ def plan_reverse_mechanics(
     if base_qty > margin_ops.PRINCIPAL_CEILING or base_qty > borrowable:
         return _refusal(symbol, BORROW_CLAMP_EXCEEDED,
                         "the common base quantity exceeds the borrow clamp")
-    if base_qty <= ZERO or spot_notional < spot_min or perp_notional < perp_min:
+    if base_qty <= ZERO or base_qty < spot_min_qty \
+            or base_qty < perp_min_qty \
+            or spot_notional < spot_min or perp_notional < perp_min:
         return _refusal(symbol, STEP_OR_MIN_NOTIONAL_INFEASIBLE,
                         "no common floored quantity meets both venue minimums")
 

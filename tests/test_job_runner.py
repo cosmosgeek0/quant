@@ -243,6 +243,10 @@ class ReverseTransport:
         self.current_leverage = 1
         self.leverage_post_applies = True
         self.price = Decimal("100")
+        self.spot_step = Decimal("0.001")
+        self.spot_min_qty = Decimal("0.001")
+        self.futures_step = Decimal("0.001")
+        self.futures_min_qty = Decimal("0.001")
         self.free = Decimal("0.5")
         self.borrowed = Decimal("0")
         self.interest = Decimal("0")
@@ -279,16 +283,22 @@ class ReverseTransport:
             "quoteOrderQtyMarketAllowed": True,
             "baseAssetPrecision": 8, "quoteAssetPrecision": 8,
             "filters": [
-                {"filterType": "LOT_SIZE", "stepSize": "0.001",
-                 "minQty": "0.001", "maxQty": "1000"},
-                {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001",
-                 "minQty": "0.001", "maxQty": "1000"},
+                {"filterType": "LOT_SIZE",
+                 "stepSize": self.text(self.spot_step),
+                 "minQty": self.text(self.spot_min_qty), "maxQty": "1000"},
+                {"filterType": "MARKET_LOT_SIZE",
+                 "stepSize": self.text(self.spot_step),
+                 "minQty": self.text(self.spot_min_qty), "maxQty": "1000"},
                 {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
             ],
         }]}
 
     def futures_exchange(self):
         info = momentum_symbol_info()
+        for row in info["filters"]:
+            if row["filterType"] in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+                row["stepSize"] = self.text(self.futures_step)
+                row["minQty"] = self.text(self.futures_min_qty)
         return {"symbols": [info]}
 
     def account(self):
@@ -6206,10 +6216,101 @@ class JobRunnerTests(unittest.TestCase):
             }),
         ])
         args = plan.call_args.args
+        self.assertEqual(
+            (args[2]["min_qty"], args[3]["min_qty"]),
+            (Decimal("0.001"), Decimal("0.001")),
+        )
         self.assertEqual(args[5:7], (
             Decimal("10.08461683"), Decimal("0.000037")))
         self.assertEqual(self.reverse_source(self.results()[0])["plan"][
             "base_qty"], "0.079")
+
+    def test_reverse_ceiling_headroom_accepts_measured_repay_interest(self):
+        self.reverse_job("reverse-ceiling-headroom")
+        transport = ReverseTransport()
+        transport.price = Decimal("2.5")
+        transport.spot_step = Decimal("0.1")
+        transport.spot_min_qty = Decimal("0.1")
+        transport.futures_step = Decimal("0.1")
+        transport.futures_min_qty = Decimal("0.1")
+
+        self.assertEqual(self.reverse_tick(transport), 0)
+
+        source = self.reverse_source(self.results()[0])
+        repay = source["legs"][-1]
+        self.assertEqual(source["plan"]["base_qty"], "2.9")
+        self.assertEqual(repay["leg"], jr.reverse_mechanics.REPAY)
+        self.assertEqual(repay["params"]["amount"], "2.9005")
+        self.assertEqual(repay["status"], jr.reverse_mechanics.DONE_STATUS)
+        self.assertLessEqual(
+            Decimal(repay["params"]["amount"]),
+            jr.margin_ops.PRINCIPAL_CEILING,
+        )
+
+    def test_reverse_resized_quantity_below_either_venue_minimum_refuses(self):
+        cases = ("spot", "futures")
+        for venue in cases:
+            with self.subTest(venue=venue), \
+                    tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-minimum-" + venue, root)
+                transport = ReverseTransport()
+                transport.max_borrowable_payload = {
+                    "amount": "0.075", "borrowLimit": "11000",
+                }
+                if venue == "spot":
+                    transport.spot_min_qty = Decimal("0.076")
+                else:
+                    transport.futures_min_qty = Decimal("0.076")
+                with mock.patch.object(
+                        jr, "plan_reverse_mechanics",
+                        wraps=jr.plan_reverse_mechanics) as plan:
+                    self.assertEqual(self.reverse_tick(transport, root), 2)
+
+                args = plan.call_args.args
+                expected = (
+                    (Decimal("0.076"), Decimal("0.001"))
+                    if venue == "spot" else
+                    (Decimal("0.001"), Decimal("0.076"))
+                )
+                self.assertEqual(
+                    (args[2]["min_qty"], args[3]["min_qty"]), expected)
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                self.assertEqual(result["verdict"], "REFUSED")
+                self.assertEqual(
+                    self.reason(result), "STEP_OR_MIN_NOTIONAL_INFEASIBLE")
+                self.assertFalse(any(
+                    call[0] == "POST" for call in transport.calls))
+
+    def test_reverse_resize_recomputes_close_floor_for_sized_fill(self):
+        self.reverse_job("reverse-close-floor")
+        transport = ReverseTransport()
+        transport.max_borrowable_payload = {
+            "amount": "0.075", "borrowLimit": "11000",
+        }
+        with mock.patch.object(
+                jr.futures_hand, "open_intent",
+                wraps=jr.futures_hand.open_intent) as open_intent:
+            self.assertEqual(self.reverse_tick(transport), 0)
+
+        resized = open_intent.call_args.args[1]
+        self.assertEqual(resized["quantity"], Decimal("0.075"))
+        self.assertEqual(
+            resized["close_notional_floor"], Decimal("7.425"))
+        close_posts = [
+            call for call in transport.calls
+            if call[0] == "POST"
+            and call[2] == jr.basis_executor.USDM.order_path
+            and str(call[3].get("reduceOnly", "")).lower() == "true"
+        ]
+        self.assertEqual(len(close_posts), 1)
+        close = transport.futures_orders[
+            close_posts[0][3]["newClientOrderId"]]
+        self.assertEqual(Decimal(close["executedQty"]), Decimal("0.075"))
+        self.assertGreaterEqual(
+            Decimal(close["cumQuote"]), resized["close_notional_floor"])
 
     def test_reverse_borrowable_clamp_window_and_floor_refusal(self):
         quote_cap = Decimal("8")
@@ -6268,7 +6369,7 @@ class JobRunnerTests(unittest.TestCase):
         cases = (
             ("bounded", bounded_borrowable, 0, "CLOSED", None),
             ("below-floor", below_floor, 2, "REFUSED",
-             "BORROW_CLAMP_EXCEEDED"),
+             "STEP_OR_MIN_NOTIONAL_INFEASIBLE"),
         )
         for name, borrowable, exit_code, verdict, reason in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
@@ -6809,7 +6910,7 @@ class JobRunnerTests(unittest.TestCase):
             ("reverse-number-cap", {"quote_cap": 8}, "BAD_TYPE", None),
             ("reverse-over-cap", {"quote_cap": "8.01"},
              "QUOTE_NOTIONAL_CAP_EXCEEDED", None),
-            ("reverse-principal", {}, "BORROW_CLAMP_EXCEEDED", Decimal("1")),
+            ("reverse-principal", {}, "STEP_OR_MIN_NOTIONAL_INFEASIBLE", Decimal("1")),
         )
         for job_id, changes, reason, price in cases:
             with self.subTest(job_id=job_id), \
