@@ -29,6 +29,8 @@ files touched | each change in one line | test counts (before/after, green
 or not) | first failure HONESTLY (a passing rerun never erases it) | basis
 per claim: MEASURED (you ran/read it) vs INFERRED | what you did NOT check.
 No stack traces, no raw logs, no secrets, no celebration.
+Give as little output as possible; the report rows are the whole deliverable —
+no interim narration anywhere.
 
 ## Language (owner hard law 2026-08-15)
 Clean words, soft tone, everywhere — reports, code comments, test names,

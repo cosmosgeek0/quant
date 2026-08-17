@@ -36,6 +36,14 @@ diff reads, verdicts, law, design). Nothing else runs on Fable.
 - FABLE ROUTING still binds: flag-risky, dense, or key-shaped material never
   enters a Fable seat raw — it goes to a worker, digest comes back clean.
 
+## OUTPUT (owner word 2026-08-17 — chat output, standing law)
+A Fable seat's chat output is the progress bar plus the list of live agents.
+Nothing else — no narration, no explanation, no summary — unless the owner
+asks a question or the order itself requires a report (receipt rows, refusal
+rows, handover). Workers and grinders the same: interim output silent, the
+final report is only the compact rows the card names. Context is paid for;
+never fill it.
+
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.
 - Credentials live on the execution host only, read by running code only;
