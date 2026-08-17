@@ -108,6 +108,21 @@ REVERSE_ZERO_RUNNER_FIELDS = {
     "authority_digests", "sha", "governor_token", "governor_release",
     "fills", "fees", "realized",
 }
+REVERSE_TRUTH_FIELDS = (
+    "spot_open_orders", "cross_margin_open_orders", "futures_position",
+    "futures_open_orders", "margin_liability",
+)
+# The ladder writes a final_truth row of its own shape, so a receipt closed
+# by the recovery command is told apart by this exact field set.
+REVERSE_RECOVER_TRUTH_FIELDS = set(REVERSE_TRUTH_FIELDS) | {
+    "free_base", "free_base_quote_value",
+}
+# One frozen mid-trip receipt whose position the owner closed with the plain
+# close script finalizes on this reason and no other.
+REVERSE_RECOVER_FLAT_REASON = "EXTERNALLY_CLOSED_CONFIRMED_FLAT"
+# Free base a hand close leaves behind counts as dust below one venue step,
+# or below this quote value at the receipt's own recorded sell price.
+REVERSE_RECOVER_DUST_QUOTE = Decimal("0.05")
 MARGIN_LEGACY_RECONCILED_FIELDS = (
     MARGIN_RECONCILED_FIELDS - {
         "history_watermark", "account_liability_before",
@@ -1405,6 +1420,32 @@ def _valid_margin_reconciled_row(row: Dict[str, Any]) -> bool:
         return False
 
 
+def _valid_reverse_reconciled_actions(row: Dict[str, Any]) -> bool:
+    """Bind one recorded leg history to the submissions that evidence it.
+
+    A reconciliation never mutates the account, so the row carries the frozen
+    receipt's own history: no attempt at all for the zero-mutation close, or
+    the legs the receipt already recorded, each submitted leg naming its own
+    client id.  Nothing outside that history is accepted.
+    """
+    attempts = row.get("mutation_attempts")
+    legs = row.get("legs")
+    submitted = row.get("submitted_ids")
+    if type(attempts) is not int or attempts < 0 \
+            or type(legs) is not list or type(submitted) is not list:
+        return False
+    if attempts == 0:
+        return legs == [] and submitted == []
+    return len(legs) <= attempts \
+        and legs == [name for name in reverse_mechanics.LEG_ORDER
+                     if name in set(legs)] \
+        and len(submitted) <= len(legs) \
+        and len(set(submitted)) == len(submitted) \
+        and all(type(value) is str
+                and REVERSE_ID_RE.fullmatch(value) is not None
+                for value in submitted)
+
+
 def _valid_reverse_zero_reconciled_row(row: Dict[str, Any]) -> bool:
     try:
         symbol = row.get("symbol")
@@ -1424,10 +1465,7 @@ def _valid_reverse_zero_reconciled_row(row: Dict[str, Any]) -> bool:
             and margin_ops.ASSET_RE.fullmatch(borrow_asset) is not None \
             and row.get("verdict") == "CLOSED" \
             and type(row.get("reason")) is str and bool(row["reason"]) \
-            and type(row.get("mutation_attempts")) is int \
-            and row["mutation_attempts"] == 0 \
-            and row.get("legs") == [] \
-            and row.get("submitted_ids") == [] \
+            and _valid_reverse_reconciled_actions(row) \
             and all(type(row.get(name)) is int and row[name] == 0
                     for name in (
                         "spot_open_orders", "cross_margin_open_orders",
@@ -7394,18 +7432,11 @@ def _load_reverse_zero_reconcile_facts(
     return source_path, runner_path, source, runner, job, token
 
 
-def _reverse_zero_exchange_truth(
-        paths: Dict[str, str], job_id: str, job: Job, source: Dict[str, Any],
-        request: Optional[Callable[..., Tuple[str, Any]]]) -> Dict[str, Any]:
-    try:
-        transport = request or basis_executor.live_request_factory(
-            os.environ.get("BINANCE_API_KEY", ""),
-            os.environ.get("BINANCE_API_SECRET", ""),
-        )
-    except Exception:
-        raise ReverseReadUnknown(
-            "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
-        ) from None
+def _reverse_truth_snapshot(
+        paths: Dict[str, str], job_id: str, job: Job, sha: str,
+        transport: Callable[..., Tuple[str, Any]], run_prefix: str,
+        unreadable: str) -> Tuple[Dict[str, Any], Decimal]:
+    """Return one strict venue-wide snapshot and the free borrow-asset base."""
 
     def single_attempt(method: str, base_url: str, path: str,
                        params: Optional[Dict[str, str]] = None,
@@ -7415,19 +7446,15 @@ def _reverse_zero_exchange_truth(
                 method, base_url, path, dict(params or {}), signed
             )
         except Exception:
-            raise ReverseReadUnknown(
-                "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
-            ) from None
+            raise ReverseReadUnknown(unreadable) from None
         if type(result) is not tuple or len(result) != 2 \
                 or result[0] != "ok":
-            raise ReverseReadUnknown(
-                "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
-            )
+            raise ReverseReadUnknown(unreadable)
         return result
 
     spot_state = _spot_state(
-        job.symbol, source["sha"], paths["receipts"],
-        "reverse-reconcile-" + job_id, single_attempt,
+        job.symbol, sha, paths["receipts"], run_prefix + job_id,
+        single_attempt,
     )
     spot_orders = basis_executor.signed_read(
         spot_state, basis_executor.SPOT.base_url,
@@ -7451,9 +7478,11 @@ def _reverse_zero_exchange_truth(
             or liability is None \
             or not isinstance(cross_margin_orders, list) \
             or any(not isinstance(row, dict) for row in cross_margin_orders):
-        raise ReverseReadUnknown(
-            "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
-        )
+        raise ReverseReadUnknown(unreadable)
+    try:
+        free_base = _spot_balances(account, job.borrow_asset)[job.borrow_asset]
+    except MomentumStateError:
+        raise ReverseReadUnknown(unreadable) from None
 
     previous_http = futures_hand.http
 
@@ -7474,27 +7503,49 @@ def _reverse_zero_exchange_truth(
     if type(futures) is not dict \
             or type(futures.get("qty")) is not Decimal \
             or type(futures.get("open_orders")) is not int:
-        raise ReverseReadUnknown(
-            "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
-        )
-    counts = (
-        len(spot_orders), len(cross_margin_orders), futures["open_orders"],
-    )
-    liability_values = tuple(
-        Decimal(liability[name])
-        for name in ("borrowed", "interest", "total_liability")
-    )
-    if any(value != 0 for value in counts) \
-            or futures["qty"] != Decimal("0") \
-            or any(value != Decimal("0") for value in liability_values):
-        raise JobRefusal("REVERSE_ZERO_TRUTH_NOT_FLAT")
+        raise ReverseReadUnknown(unreadable)
     return {
-        "spot_open_orders": counts[0],
-        "cross_margin_open_orders": counts[1],
+        "spot_open_orders": len(spot_orders),
+        "cross_margin_open_orders": len(cross_margin_orders),
         "futures_position": _canonical_decimal_text(futures["qty"]),
-        "futures_open_orders": counts[2],
+        "futures_open_orders": futures["open_orders"],
         "margin_liability": liability,
-    }
+    }, free_base
+
+
+def _reverse_truth_is_flat(row: Any) -> bool:
+    """Report whether one truth row stands at zero on every venue."""
+    try:
+        liability = row["margin_liability"]
+        return not any(row[name] for name in (
+            "spot_open_orders", "cross_margin_open_orders",
+            "futures_open_orders",
+        )) and Decimal(row["futures_position"]) == Decimal("0") \
+            and all(Decimal(liability[name]) == Decimal("0") for name in (
+                "borrowed", "interest", "total_liability",
+            ))
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _reverse_zero_exchange_truth(
+        paths: Dict[str, str], job_id: str, job: Job, source: Dict[str, Any],
+        request: Optional[Callable[..., Tuple[str, Any]]]) -> Dict[str, Any]:
+    unreadable = "REVERSE_ZERO_EXCHANGE_TRUTH_UNREADABLE"
+    try:
+        transport = request or basis_executor.live_request_factory(
+            os.environ.get("BINANCE_API_KEY", ""),
+            os.environ.get("BINANCE_API_SECRET", ""),
+        )
+    except Exception:
+        raise ReverseReadUnknown(unreadable) from None
+    row, _free_base = _reverse_truth_snapshot(
+        paths, job_id, job, source["sha"], transport,
+        "reverse-reconcile-", unreadable,
+    )
+    if not _reverse_truth_is_flat(row):
+        raise JobRefusal("REVERSE_ZERO_TRUTH_NOT_FLAT")
+    return row
 
 
 def _reverse_reconcile_unconfirmed(job_id: str, reason: str) -> int:
@@ -7567,6 +7618,406 @@ def _reconcile_reverse_zero(
         return 3
     print("JOB-RUNNER | RECONCILED | " + job_id)
     return 0
+
+
+def _reverse_recover_unconfirmed(job_id: str, reason: str) -> int:
+    print("JOB-RUNNER | RECOVER_UNCONFIRMED | %s | %s" % (job_id, reason))
+    return 3
+
+
+def _recover_decimal(value: Any) -> Decimal:
+    text = _margin_decimal_text(value)
+    if text is None:
+        raise JobRefusal("REVERSE_RECOVER_RECEIPT_UNREADABLE")
+    return Decimal(text)
+
+
+def _reverse_recover_written(paths: Dict[str, str], job_id: str) -> int:
+    """Count the finalize rows the results file already carries for one job."""
+    try:
+        lines = _read_file_bytes(paths["results"]).splitlines()
+        if any(not line for line in lines):
+            raise JobRefusal("RESULTS_INVALID")
+        rows = [
+            _decode_bounded_plain_object(line, "RESULT", "RESULTS")
+            for line in lines
+        ]
+    except FileNotFoundError:
+        raise JobRefusal("RESULT_MISSING") from None
+    except (ArtifactAnomaly, OSError):
+        raise JobRefusal("RESULTS_INVALID") from None
+    events = [
+        row for row in rows
+        if set(row) == REVERSE_ZERO_RECONCILED_FIELDS
+        and row.get("job_id") == job_id
+    ]
+    finals = [
+        row for row in rows
+        if set(row) == RESULT_FIELDS and row.get("job_id") == job_id
+        and row.get("verdict") == "CLOSED"
+    ]
+    _release_require(
+        len(events) <= 1 and len(finals) <= 1
+        and (bool(events) or not finals),
+        "RESULT_RECONCILIATION_INVALID",
+    )
+    return len(events) + len(finals)
+
+
+def _load_reverse_recover_facts(
+        paths: Dict[str, str], receipt_dir: str, job_id: str) \
+        -> Tuple[str, str, Dict[str, Any], Dict[str, Any], Job, str, int]:
+    """Bind one frozen mid-trip reverse receipt to its job, lock, and result."""
+    source_path = os.path.join(
+        paths["receipts"], "reverse-%s.json" % job_id
+    )
+    runner_path = os.path.join(paths["receipts"], "job-%s.json" % job_id)
+    job_path = os.path.join(paths["jobs"], "job-%s.json" % job_id)
+    source = _release_artifact(source_path, "SOURCE_RECEIPT")[0]
+    runner = _release_artifact(runner_path, "RUNNER_RECEIPT")[0]
+    job_payload, job_encoded = _release_artifact(job_path, "JOB_FILE")
+    _validate_known_margin_artifact_fields(source, "SOURCE_RECEIPT", job_id)
+    _validate_known_margin_artifact_fields(runner, "RUNNER_RECEIPT", job_id)
+    # A frozen mid-trip receipt stands at UNKNOWN, or at OPEN_EXPOSURE once an
+    # earlier run stopped part way; the runner row still carries the UNKNOWN
+    # result the tick halted on.  The four finalize writes land in a fixed
+    # order, so a run that died part way leaves one of the intermediate
+    # shapes: the source closed while the runner has not caught up, or both
+    # closed while the results file is still missing its rows.  The runner
+    # never stands ahead of the source.
+    closed = source.get("verdict") == "CLOSED"
+    _release_require(
+        (closed or source.get("verdict") in {"UNKNOWN", "OPEN_EXPOSURE"})
+        and runner.get("verdict") in (
+            {"UNKNOWN", "CLOSED"} if closed else {"UNKNOWN"}
+        ),
+        "REVERSE_RECEIPT_NOT_RECOVERABLE",
+    )
+    # A receipt that reached a post also carries the authority row its last
+    # leg proved.  ``leverage`` appears once a futures leg was prepared, and
+    # ``final_truth`` once either the ladder or this command has recorded a
+    # terminal truth; a closed receipt always carries one.
+    _release_require(
+        set(source) - {"final_truth", "leverage"}
+        == REVERSE_ZERO_SOURCE_FIELDS | {
+            "authority_checked_utc", "authority_digests",
+            "authority_stop_jobs_present",
+        }
+        and all(type(source[name]) is dict
+                for name in ("final_truth", "leverage") if name in source)
+        and ("final_truth" in source or not closed),
+        "SOURCE_RECEIPT_SHAPE_MISMATCH",
+    )
+    _release_require(
+        set(runner) == REVERSE_ZERO_RUNNER_FIELDS,
+        "RUNNER_RECEIPT_SHAPE_MISMATCH",
+    )
+    try:
+        created = _timestamp(job_payload.get("created_utc"))
+        job = _validate_job(job_payload, job_id, created, receipt_dir)
+    except Exception:
+        raise JobRefusal("JOB_FILE_INVALID") from None
+    _release_require(
+        job.op == REVERSE_OP
+        and source.get("kind") == "reverse_mechanics_roundtrip"
+        and source.get("job_id") == job_id
+        and source.get("op") == job.op
+        and source.get("symbol") == job.symbol
+        and source.get("borrow_asset") == job.borrow_asset
+        and _margin_decimal_text(source.get("quote_cap"))
+        == _canonical_decimal_text(job.effective_notional)
+        and source.get("intent_id") == job.intent_id
+        and source.get("client_tag") == job.client_tag
+        and runner.get("job_id") == job_id
+        and runner.get("op") == job.op
+        and runner.get("symbol") == job.symbol,
+        "REVERSE_RECEIPT_IDENTITY_MISMATCH",
+    )
+    _release_require(
+        type(source.get("reason")) is str and bool(source["reason"])
+        and type(runner.get("reason")) is str and bool(runner["reason"]),
+        "REVERSE_RECEIPT_REASON_MISMATCH",
+    )
+    legs = source.get("legs")
+    _release_require(
+        type(source.get("mutation_attempts")) is int
+        and source["mutation_attempts"] >= 1
+        and type(legs) is list and bool(legs)
+        and type(source.get("plan")) is dict
+        and type(source.get("market")) is dict
+        and type(source.get("ladder_actions")) is list,
+        "REVERSE_MID_TRIP_SHAPE_MISMATCH",
+    )
+    names = []
+    for row in legs:
+        _release_require(
+            type(row) is dict
+            and row.get("leg") in reverse_mechanics.LEG_ORDER
+            and row.get("status") in {reverse_mechanics.DONE_STATUS,
+                                      reverse_mechanics.FAILED}
+            and type(row.get("client_id")) is str
+            and REVERSE_ID_RE.fullmatch(row["client_id"]) is not None
+            and type(row.get("mutation_attempts")) is int
+            and type(row.get("fills")) is list,
+            "REVERSE_MID_TRIP_LEG_MISMATCH",
+        )
+        names.append(row["leg"])
+    _release_require(
+        len(set(names)) == len(names)
+        and len(names) <= source["mutation_attempts"]
+        and names == [name for name in reverse_mechanics.LEG_ORDER
+                      if name in set(names)],
+        "REVERSE_MID_TRIP_LEG_MISMATCH",
+    )
+    _release_require(
+        type(runner.get("fills")) is list
+        and type(runner.get("fees")) is list
+        and type(runner.get("realized")) is dict,
+        "RUNNER_LEDGER_SHAPE_MISMATCH",
+    )
+    # A receipt that posted also carries the leg-level authority digests, so
+    # only the job-file digest binds the artifact pair to these exact bytes.
+    _validate_artifact_string_map(
+        runner, "RUNNER_RECEIPT", "authority_digests", job_id
+    )
+    _validate_artifact_string_map(
+        source, "SOURCE_RECEIPT", "authority_digests", job_id
+    )
+    job_digest = hashlib.sha256(job_encoded).hexdigest()
+    _release_require(
+        runner["authority_digests"].get("job_file") == job_digest
+        and source["authority_digests"].get("job_file") == job_digest,
+        "JOB_DIGEST_MISMATCH",
+    )
+    measured_sha = runner.get("measured_sha")
+    _release_require(
+        runner.get("sha_valid") is True
+        and type(measured_sha) is str
+        and SHA_RE.fullmatch(measured_sha.lower()) is not None
+        and runner.get("sha") == measured_sha.lower()
+        and source.get("sha") == runner["sha"],
+        "RUNNER_SHA_MISMATCH",
+    )
+    _release_require(
+        type(runner.get("source_receipt_path")) is str
+        and runner["source_receipt_path"] == source_path,
+        "SOURCE_RECEIPT_PATH_MISMATCH",
+    )
+    token = source.get("governor_token")
+    _release_require(
+        type(token) is str and bool(token)
+        and runner.get("governor_token") == token
+        and source.get("governor_release") == "PENDING"
+        and runner.get("governor_release") == "PENDING",
+        "GOVERNOR_RECEIPT_MISMATCH",
+    )
+    lock = _margin_lock_fact(
+        os.path.join(receipt_dir, ACCOUNT_GOVERNOR_LOCK_FILE), job_id
+    )
+    _release_require(
+        isinstance(lock, dict)
+        and set(lock) == {"version", "token", "op", "symbol", "utc"}
+        and lock.get("version") == 1
+        and lock.get("token") == token
+        and lock.get("op") == REVERSE_OP
+        and lock.get("symbol") == job.symbol,
+        "LOCK_MISMATCH",
+    )
+    try:
+        for value in (source["started_utc"], source["finished_utc"],
+                      runner["utc"], lock["utc"]):
+            _timestamp(value)
+    except Exception:
+        raise JobRefusal("REVERSE_RECEIPT_TIMESTAMP_MISMATCH") from None
+    written = _reverse_recover_written(paths, job_id)
+    if closed:
+        # The flat truth this command proved is already persisted, so a
+        # resumed run reads it back instead of the exchange.
+        _release_require(
+            source["reason"] == REVERSE_RECOVER_FLAT_REASON
+            and set(source["final_truth"]) == REVERSE_RECOVER_TRUTH_FIELDS
+            and _reverse_truth_is_flat(source["final_truth"]),
+            "REVERSE_RECOVER_FINAL_TRUTH_MISMATCH",
+        )
+    if written == 2:
+        final_result = _release_result(paths, job_id)
+        _release_require(
+            final_result.get("op") == REVERSE_OP
+            and final_result.get("symbol") == job.symbol
+            and final_result.get("verdict") == "CLOSED"
+            and type(final_result.get("exit_code")) is int
+            and final_result["exit_code"] == 0
+            and type(final_result.get("receipt_path")) is str
+            and os.path.abspath(final_result["receipt_path"])
+            == os.path.abspath(runner_path),
+            "RESULT_RECONCILIATION_INVALID",
+        )
+    else:
+        _reconcile_unknown_result(
+            paths, job_id, REVERSE_OP, job.symbol, runner_path
+        )
+    return (source_path, runner_path, source, runner, job, token, written)
+
+
+def _reverse_recover_final_truth(
+        source: Dict[str, Any], truth: Dict[str, Any],
+        free_base: Decimal) -> Dict[str, Any]:
+    """Prove the account is flat and record the dust the close left behind."""
+    step = _recover_decimal(source["plan"].get("dust"))
+    price = _recover_decimal(source["market"].get("spot_bid"))
+    _release_require(
+        step > Decimal("0") and price > Decimal("0"),
+        "REVERSE_RECOVER_PLAN_MISMATCH",
+    )
+    value = free_base * price
+    # Liability, position, and open orders bind at exactly zero.  Free base
+    # is dust when it is below one venue step, or worth less than the quote
+    # bound at the price the receipt's own sell recorded.
+    _release_require(
+        _reverse_truth_is_flat(truth)
+        and (free_base < step or value < REVERSE_RECOVER_DUST_QUOTE),
+        "RECOVER_REQUIRES_FLAT_TRUTH",
+    )
+    final_truth = dict(truth)
+    final_truth.update({
+        "free_base": _canonical_decimal_text(free_base),
+        "free_base_quote_value": _canonical_decimal_text(value),
+    })
+    return final_truth
+
+
+def _reverse_recover_event(
+        job_id: str, job: Job, source: Dict[str, Any],
+        final_truth: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    """Record the receipt's own leg history against the flat truth measured."""
+    return {
+        "kind": "RECONCILED_FROM_EXCHANGE_TRUTH",
+        "job_id": job_id,
+        "op": REVERSE_OP,
+        "symbol": job.symbol,
+        "verdict": "CLOSED",
+        "reason": REVERSE_RECOVER_FLAT_REASON,
+        "mutation_attempts": source["mutation_attempts"],
+        "legs": [row["leg"] for row in source["legs"]],
+        # Every leg that reached a submission names its own client id, so the
+        # evidence for each recorded leg can be read straight off the row.
+        "submitted_ids": [
+            row["client_id"] for row in source["legs"]
+            if row["mutation_attempts"] >= 1
+        ],
+        **{name: final_truth[name] for name in REVERSE_TRUTH_FIELDS},
+        "utc": _utc_text(now),
+    }
+
+
+def _reverse_recover_finalize(
+        paths: Dict[str, str], receipt_dir: str, job_id: str,
+        source_path: str, runner_path: str, source: Dict[str, Any],
+        runner: Dict[str, Any], job: Job, token: str, now: datetime,
+        final_truth: Dict[str, Any], written: int) -> int:
+    """Make only the finalize writes an earlier run never reached."""
+    try:
+        if source.get("verdict") != "CLOSED":
+            source_final = dict(source)
+            source_final.update({
+                "verdict": "CLOSED", "reason": REVERSE_RECOVER_FLAT_REASON,
+                "final_truth": final_truth, "finished_utc": _utc_text(now),
+            })
+            _persist_margin_source(source_path, source_final)
+        if runner.get("verdict") != "CLOSED":
+            runner_final = dict(runner)
+            runner_final.update({
+                "verdict": "CLOSED", "reason": REVERSE_RECOVER_FLAT_REASON,
+                "utc": _utc_text(now),
+            })
+            _persist_json_receipt(runner_path, runner_final)
+        if written < 1:
+            _append_results_row(paths, _reverse_recover_event(
+                job_id, job, source, final_truth, now
+            ))
+        if written < 2:
+            _append_result(
+                paths, job_id, REVERSE_OP, job.symbol,
+                Outcome("CLOSED", 0, runner_path), now,
+            )
+    except Exception:
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | RECOVER REFUSED | PERSISTENCE_FAILED")
+        return 3
+    if not _release_final_outcome_governor(
+            paths, receipt_dir, job_id, REVERSE_OP, source_path, token, now):
+        _touch_stop(paths["stop"])
+        print("JOB-RUNNER | RECOVERED | GOVERNOR_RELEASE_PENDING")
+        return 3
+    print("JOB-RUNNER | RECOVERED | " + job_id)
+    return 0
+
+
+def recover_reverse(
+        job_id: str, confirm_recover: bool,
+        receipt_dir: Optional[str] = None,
+        now: Optional[datetime] = None,
+        request: Optional[Callable[..., Tuple[str, Any]]] = None) -> int:
+    """Finalize one frozen mid-trip reverse receipt closed outside the runner.
+
+    Nothing is executed here.  A standing position is closed by the plain
+    close script first; this command proves the account is flat, records the
+    dust that close left behind, and completes the finalize writes and the
+    governor release from whatever point an earlier run died at.
+    """
+    if confirm_recover is not True:
+        print("JOB-RUNNER | RECOVER REFUSED | CONFIRM_RECOVER_REQUIRED")
+        return 3
+    if type(job_id) is not str or JOB_ID_RE.fullmatch(job_id) is None:
+        print("JOB-RUNNER | RECOVER REFUSED | BAD_JOB_ID")
+        return 3
+    receipt_dir = os.path.abspath(os.path.expanduser(
+        receipt_dir or os.environ.get("RECEIPT_DIR", "~/quant_receipts")
+    ))
+    paths = _paths(receipt_dir)
+    now = now or _utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    try:
+        source_path, runner_path, source, runner, job, token, written = \
+            _load_reverse_recover_facts(paths, receipt_dir, job_id)
+    except (ArtifactAnomaly, JobRefusal) as refusal:
+        return _reverse_recover_unconfirmed(job_id, refusal.reason)
+    except Exception:
+        return _reverse_recover_unconfirmed(
+            job_id, "REVERSE_RECOVER_RECEIPT_UNCONFIRMED"
+        )
+    if source.get("verdict") == "CLOSED":
+        return _reverse_recover_finalize(
+            paths, receipt_dir, job_id, source_path, runner_path, source,
+            runner, job, token, now, source["final_truth"], written,
+        )
+    try:
+        transport = request or basis_executor.live_request_factory(
+            os.environ.get("BINANCE_API_KEY", ""),
+            os.environ.get("BINANCE_API_SECRET", ""),
+        )
+    except Exception:
+        return _reverse_recover_unconfirmed(
+            job_id, "REVERSE_RECOVER_TRANSPORT_UNREADABLE"
+        )
+    try:
+        truth, free_base = _reverse_truth_snapshot(
+            paths, job_id, job, source["sha"], transport,
+            "reverse-recover-", "REVERSE_RECOVER_TRUTH_UNREADABLE",
+        )
+        final_truth = _reverse_recover_final_truth(source, truth, free_base)
+    except JobRefusal as refusal:
+        return _reverse_recover_unconfirmed(job_id, refusal.reason)
+    except Exception:
+        return _reverse_recover_unconfirmed(
+            job_id, "REVERSE_RECOVER_TRUTH_UNREADABLE"
+        )
+    return _reverse_recover_finalize(
+        paths, receipt_dir, job_id, source_path, runner_path, source,
+        runner, job, token, now, final_truth, written,
+    )
 
 
 def reconcile_margin(
@@ -8667,6 +9118,15 @@ def main(argv=None) -> int:
     reconcile.add_argument(
         "--confirm-reconcile", action="store_true", required=True
     )
+    recover = commands.add_parser(
+        "recover-reverse",
+        help=("finish one frozen mid-trip reverse receipt through the "
+              "existing unwind ladder"),
+    )
+    recover.add_argument("--job-id", required=True)
+    recover.add_argument(
+        "--confirm-recover", action="store_true", required=True
+    )
     args = parser.parse_args(argv)
     if args.command == "release-stuck-lock":
         if args.tick:
@@ -8676,10 +9136,15 @@ def main(argv=None) -> int:
         if args.tick:
             parser.error("choose either --tick or reconcile-margin")
         return reconcile_margin(args.job_id, args.confirm_reconcile)
+    if args.command == "recover-reverse":
+        if args.tick:
+            parser.error("choose either --tick or recover-reverse")
+        return recover_reverse(args.job_id, args.confirm_recover)
     if args.tick:
         return tick()
     parser.error(
-        "--tick, release-stuck-lock, or reconcile-margin is required"
+        "--tick, release-stuck-lock, reconcile-margin, or recover-reverse "
+        "is required"
     )
 
 

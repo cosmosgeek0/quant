@@ -544,6 +544,25 @@ class ReverseTransport:
         ))
 
 
+class MidTripTransport(ReverseTransport):
+    """Serve the reverse exchange, then stop answering one truth read."""
+
+    def __init__(self, stop_path="", freeze_at=0):
+        super().__init__(stop_path)
+        self.freeze_at = freeze_at
+        self.cross_margin_reads = 0
+
+    def __call__(self, method, base_url, path, params=None, signed=False):
+        if method == "GET" and path == "/sapi/v1/margin/openOrders":
+            self.cross_margin_reads += 1
+            if self.freeze_at and self.cross_margin_reads >= self.freeze_at:
+                self.calls.append(
+                    (method, base_url, path, dict(params or {}), signed)
+                )
+                return "unclear", {}
+        return super().__call__(method, base_url, path, params, signed)
+
+
 class MomentumReadTransport:
     """Serve complete signed momentum snapshots at the HTTP boundary."""
 
@@ -1125,6 +1144,83 @@ class JobRunnerTests(unittest.TestCase):
             row.get("kind", "RESULT") for row in self.results()
         ], ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT"])
         return artifacts
+
+    def prepare_frozen_mid_trip(self, job_id, **job_overrides):
+        """Freeze one reverse receipt once its borrow and sell legs are DONE."""
+        self.reverse_job(job_id, **job_overrides)
+        transport = MidTripTransport(
+            os.path.join(self.receipt_dir, "STOP-JOBS"), freeze_at=3
+        )
+        transport.price = Decimal("0.79")
+        transport.max_borrowable_payload = {
+            "amount": "10.1", "borrowLimit": "11000",
+        }
+        self.assertEqual(self.reverse_tick(transport), 4)
+        row = self.results()[0]
+        runner_path = row["receipt_path"]
+        runner = json.loads(Path(runner_path).read_text(encoding="utf-8"))
+        source_path = runner["source_receipt_path"]
+        source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(leg["leg"], leg["status"]) for leg in source["legs"]],
+            [("BORROW", "DONE"), ("MARGIN_SELL", "DONE")],
+        )
+        self.assertEqual(source["mutation_attempts"], 2)
+        self.assertEqual(source["plan"]["base_qty"], "10.1")
+        self.assertEqual(source["plan"]["dust"], "0.001")
+        self.assertEqual(source["market"]["spot_bid"], "0.79")
+        self.assertEqual(
+            (source["verdict"], runner["verdict"]), ("UNKNOWN", "UNKNOWN")
+        )
+        self.assertEqual(self.governor_releases, [])
+        lock_path = os.path.join(
+            self.receipt_dir, jr.ACCOUNT_GOVERNOR_LOCK_FILE
+        )
+        Path(lock_path).write_text(json.dumps({
+            "version": 1,
+            "token": runner["governor_token"],
+            "op": jr.REVERSE_OP,
+            "symbol": "TSTUSDT",
+            "utc": utc(NOW),
+        }, separators=(",", ":")) + "\n", encoding="utf-8")
+        return {
+            "row": row,
+            "runner_path": runner_path,
+            "source_path": source_path,
+            "lock_path": lock_path,
+        }
+
+    @staticmethod
+    def standing_reverse_exchange(borrowed="0", interest="0", free="0.0194",
+                                  position="0"):
+        """Serve the exchange as a hand close left it: flat, with dust."""
+        transport = ReverseTransport()
+        transport.price = Decimal("0.79")
+        transport.borrowed = Decimal(borrowed)
+        transport.interest = Decimal(interest)
+        transport.free = Decimal(free)
+        transport.position = Decimal(position)
+        return transport
+
+    def recover(self, job_id, transport, now=None):
+        with mock.patch.object(jr, "_utc_now", return_value=now or NOW), \
+                mock.patch.object(jr.futures_hand, "POLL_SECONDS", 0.01), \
+                mock.patch.object(jr.time, "sleep", return_value=None):
+            return jr.recover_reverse(
+                job_id, True, self.receipt_dir, now or NOW, transport
+            )
+
+    def assert_recover_read_only(self, job_id, transport, now=None):
+        before = self.artifact_tree_bytes(self.receipt_dir)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(self.recover(job_id, transport, now), 3)
+        self.assertEqual(self.artifact_tree_bytes(self.receipt_dir), before)
+        refusals = [
+            str(call.args[0]) for call in output.call_args_list
+            if call.args and "RECOVER_UNCONFIRMED" in str(call.args[0])
+        ]
+        self.assertEqual(len(refusals), 1)
+        return refusals[0].rsplit("|", 1)[-1].strip()
 
     @staticmethod
     def artifact_tree_bytes(root):
@@ -5008,6 +5104,28 @@ class JobRunnerTests(unittest.TestCase):
             ]), 0)
         reconcile.assert_called_once_with(job_id, True)
 
+    def test_recover_reverse_cli_requires_explicit_confirmation(self):
+        job_id = "reverse-recover-cli"
+        with mock.patch("sys.stderr"), \
+                self.assertRaises(SystemExit) as refused:
+            jr.main(["recover-reverse", "--job-id", job_id])
+        self.assertEqual(refused.exception.code, 2)
+
+        with mock.patch("sys.stderr"), \
+                self.assertRaises(SystemExit) as refused:
+            jr.main([
+                "--tick", "recover-reverse", "--job-id", job_id,
+                "--confirm-recover",
+            ])
+        self.assertEqual(refused.exception.code, 2)
+
+        with mock.patch.object(
+                jr, "recover_reverse", return_value=0) as recover:
+            self.assertEqual(jr.main([
+                "recover-reverse", "--job-id", job_id, "--confirm-recover",
+            ]), 0)
+        recover.assert_called_once_with(job_id, True)
+
     def test_exact_margin_artifact_anomalies_halt_tick_and_manual(self):
         job_id = "margin-exact-anomalies"
         paths, originals = self.standing_margin_artifacts(job_id)
@@ -6974,6 +7092,412 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.jobs_dir, "claims", "job-reverse-once.claim"
         )))
+
+    def test_recover_reverse_hand_closed_flat_finalizes_without_mutation(self):
+        job_id = "reverse-hand-closed"
+        artifacts = self.prepare_frozen_mid_trip(job_id)
+        stop_path = os.path.join(self.receipt_dir, "STOP-JOBS")
+        Path(stop_path).touch()
+        os.unlink(os.path.join(self.receipt_dir, "ACCEPT-ONE"))
+        self.assertEqual(self.tick(), 3)
+
+        late = NOW + timedelta(hours=6)
+        transport = self.standing_reverse_exchange()
+        self.assertEqual(self.recover(job_id, transport, late), 0)
+
+        self.assertEqual(
+            [call for call in transport.calls if call[0] == "POST"], []
+        )
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        runner = json.loads(Path(
+            artifacts["runner_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(leg["leg"], leg["status"]) for leg in source["legs"]],
+            [("BORROW", "DONE"), ("MARGIN_SELL", "DONE")],
+        )
+        self.assertEqual(source["mutation_attempts"], 2)
+        self.assertEqual((source["verdict"], runner["verdict"]), (
+            "CLOSED", "CLOSED",
+        ))
+        self.assertEqual(source["reason"], "EXTERNALLY_CLOSED_CONFIRMED_FLAT")
+        self.assertEqual(runner["reason"], source["reason"])
+        # Free base above one venue step, worth well under the quote bound at
+        # the receipt's own recorded sell price: dust, recorded both ways.
+        self.assertEqual(source["final_truth"], {
+            "spot_open_orders": 0,
+            "cross_margin_open_orders": 0,
+            "futures_position": "0",
+            "futures_open_orders": 0,
+            "margin_liability": {
+                "asset": "TST", "borrowed": "0", "interest": "0",
+                "total_liability": "0",
+            },
+            "free_base": "0.0194",
+            "free_base_quote_value": "0.015326",
+        })
+        self.assertEqual((
+            source["governor_release"], runner["governor_release"],
+        ), ("RELEASED", "RELEASED"))
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+
+        rows = self.results()
+        self.assertEqual(
+            [row.get("kind", "RESULT") for row in rows],
+            ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT"],
+        )
+        event = rows[1]
+        self.assertEqual(set(event), jr.REVERSE_ZERO_RECONCILED_FIELDS)
+        self.assertEqual((
+            event["op"], event["symbol"], event["verdict"], event["reason"],
+            event["mutation_attempts"], event["legs"], event["submitted_ids"],
+        ), (
+            jr.REVERSE_OP, "TSTUSDT", "CLOSED",
+            "EXTERNALLY_CLOSED_CONFIRMED_FLAT", 2,
+            ["BORROW", "MARGIN_SELL"],
+            [leg["client_id"] for leg in source["legs"]],
+        ))
+        self.assertEqual(jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        ), ({job_id}, False, False))
+
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads, late),
+            "SOURCE_RECEIPT_SHAPE_MISMATCH",
+        )
+        no_reads.assert_not_called()
+
+        os.unlink(stop_path)
+        self.write_accept_one()
+        next_job = "zz-after-reverse-recover"
+        self.job(next_job)
+        self.assertEqual(self.tick(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.jobs_dir, "claims", "job-%s.claim" % next_job
+        )))
+
+    def test_recover_reverse_event_binds_its_legs_to_submitted_evidence(self):
+        job_id = "reverse-event-binding"
+        self.prepare_frozen_mid_trip(job_id)
+        self.assertEqual(
+            self.recover(job_id, self.standing_reverse_exchange()), 0
+        )
+
+        event = self.results()[1]
+        self.assertTrue(jr._valid_reverse_zero_reconciled_row(event))
+        for name, change in (
+                ("more_ids_than_legs",
+                 {"submitted_ids": event["submitted_ids"] + ["rmo-extra"]}),
+                ("repeated_id",
+                 {"submitted_ids": [event["submitted_ids"][0]] * 2}),
+                ("more_legs_than_attempts",
+                 {"legs": ["BORROW", "MARGIN_SELL", "REPAY"]}),
+                ("legs_out_of_ladder_order",
+                 {"legs": ["MARGIN_SELL", "BORROW"]}),
+                ("unknown_leg", {"legs": ["BORROW", "CASH_OUT"]}),
+                ("attempts_denied_by_the_legs", {"mutation_attempts": 0}),
+                ("standing_liability", {"margin_liability": {
+                    "asset": "TST", "borrowed": "10.1", "interest": "0",
+                    "total_liability": "10.1",
+                }})):
+            with self.subTest(name=name):
+                tampered = dict(event)
+                tampered.update(change)
+                self.assertFalse(
+                    jr._valid_reverse_zero_reconciled_row(tampered)
+                )
+
+    def test_recover_reverse_accepts_free_base_below_one_venue_step(self):
+        job_id = "reverse-sub-step-dust"
+        artifacts = self.prepare_frozen_mid_trip(job_id)
+
+        transport = self.standing_reverse_exchange(free="0.0005")
+        self.assertEqual(self.recover(job_id, transport), 0)
+
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(source["verdict"], "CLOSED")
+        self.assertEqual((
+            source["final_truth"]["free_base"],
+            source["final_truth"]["free_base_quote_value"],
+        ), ("0.0005", "0.000395"))
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+
+    def test_recover_reverse_refuses_every_shape_it_cannot_prove(self):
+        job_id = "reverse-refuse"
+        self.prepare_frozen_mid_trip(job_id)
+        standing_order = self.standing_reverse_exchange()
+        standing_order.cross_margin_open_orders = [{"symbol": "TSTUSDT"}]
+        for name, transport in (
+                ("standing_liability",
+                 self.standing_reverse_exchange(
+                     borrowed="10.1", interest="0.0000729")),
+                ("interest_only_liability",
+                 self.standing_reverse_exchange(interest="0.0000729")),
+                ("live_futures_position",
+                 self.standing_reverse_exchange(position="0.5")),
+                ("cross_margin_order_standing", standing_order),
+                ("free_base_beyond_the_dust_bounds",
+                 self.standing_reverse_exchange(free="0.5"))):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.assert_recover_read_only(job_id, transport),
+                    "RECOVER_REQUIRES_FLAT_TRUTH",
+                )
+                self.assertEqual(
+                    [call for call in transport.calls if call[0] == "POST"],
+                    [],
+                )
+                self.assertEqual(self.governor_releases, [])
+
+    def test_recover_reverse_refuses_artifacts_it_cannot_bind(self):
+        job_id = "reverse-bind"
+        artifacts = self.prepare_frozen_mid_trip(job_id)
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+        lock = Path(artifacts["lock_path"]).read_bytes()
+
+        os.unlink(artifacts["lock_path"])
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads), "LOCK_MISMATCH"
+        )
+        Path(artifacts["lock_path"]).write_bytes(lock)
+
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        unclear = json.loads(json.dumps(source))
+        unclear["legs"][-1]["status"] = "UNKNOWN"
+        Path(artifacts["source_path"]).write_text(
+            json.dumps(unclear, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads),
+            "REVERSE_MID_TRIP_LEG_MISMATCH",
+        )
+
+        self.replace_json_field(artifacts["source_path"], "legs", [])
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads),
+            "REVERSE_MID_TRIP_SHAPE_MISMATCH",
+        )
+
+        self.assertEqual(jr.recover_reverse(
+            job_id, False, self.receipt_dir, NOW, no_reads
+        ), 3)
+        self.assertEqual(jr.recover_reverse(
+            "bad id", True, self.receipt_dir, NOW, no_reads
+        ), 3)
+        no_reads.assert_not_called()
+
+    def test_recover_reverse_refuses_a_margin_receipt(self):
+        job_id = "margin-not-reverse"
+        self.prepare_unknown_margin_reconcile(job_id)
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads),
+            "SOURCE_RECEIPT_MISSING",
+        )
+
+        no_reads.assert_not_called()
+
+    def test_recover_reverse_leaves_the_zero_mutation_shape_to_reconcile(self):
+        job_id = "reverse-zero-shape"
+        self.prepare_unknown_reverse_zero(job_id)
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads),
+            "SOURCE_RECEIPT_SHAPE_MISMATCH",
+        )
+
+        no_reads.assert_not_called()
+        self.assertEqual(jr.reconcile_margin(
+            job_id, True, self.receipt_dir, NOW, ReverseTransport()
+        ), 0)
+
+    def test_recover_reverse_release_pause_is_completed_by_a_rerun(self):
+        job_id = "reverse-recover-release"
+        artifacts = self.prepare_frozen_mid_trip(job_id)
+
+        class ReleasePaused(Exception):
+            pass
+
+        with mock.patch.object(
+                jr, "_release_final_outcome_governor",
+                side_effect=ReleasePaused):
+            with self.assertRaises(ReleasePaused):
+                self.recover(job_id, self.standing_reverse_exchange())
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual((source["verdict"], source["governor_release"]), (
+            "CLOSED", "PENDING",
+        ))
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+        self.assertEqual(self.recover(job_id, no_reads), 0)
+
+        no_reads.assert_not_called()
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        self.assertEqual(jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        ), ({job_id}, False, False))
+
+    def assert_finalize_gap_resumes(self, gap, verdicts, rows):
+        """Kill one finalize before ``gap``; a rerun finishes the rest."""
+        job_id = "reverse-gap"
+        artifacts = self.prepare_frozen_mid_trip(job_id)
+        self.kill_recover_before(job_id, artifacts, gap)
+
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        runner = json.loads(Path(
+            artifacts["runner_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual((source["verdict"], runner["verdict"]), verdicts)
+        self.assertEqual(
+            [row.get("kind", "RESULT") for row in self.results()], rows
+        )
+        self.assertEqual(self.governor_releases, [])
+        self.assertTrue(os.path.isfile(artifacts["lock_path"]))
+        settled = {
+            path: json.loads(Path(path).read_text(encoding="utf-8"))
+            for path in (artifacts["source_path"], artifacts["runner_path"])
+            if json.loads(
+                Path(path).read_text(encoding="utf-8")
+            )["verdict"] == "CLOSED"
+        }
+
+        resumed = self.standing_reverse_exchange() if gap == "source" \
+            else mock.Mock(side_effect=AssertionError("unexpected read"))
+        later = NOW + timedelta(hours=2)
+        self.assertEqual(self.recover(job_id, resumed, later), 0)
+
+        # An artifact already in its final state is left exactly as it was;
+        # only the governor row moves when the lock is handed back.
+        for path, before in settled.items():
+            after = json.loads(Path(path).read_text(encoding="utf-8"))
+            for name in ("governor_release", "governor_released_utc"):
+                before.pop(name, None)
+                after.pop(name, None)
+            self.assertEqual(after, before)
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            (source["verdict"], source["reason"]),
+            ("CLOSED", "EXTERNALLY_CLOSED_CONFIRMED_FLAT"),
+        )
+        self.assertEqual(
+            [row.get("kind", "RESULT") for row in self.results()],
+            ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH", "RESULT"],
+        )
+        self.assertFalse(os.path.exists(artifacts["lock_path"]))
+        self.assertEqual(self.governor_releases, [(
+            "governor-token-1", self.receipt_dir,
+        )])
+        self.assertEqual(jr._result_ids(
+            jr._paths(self.receipt_dir)["results"]
+        ), ({job_id}, False, False))
+
+    def kill_recover_before(self, job_id, artifacts, gap):
+        """Stop one recovery run dead just before the named finalize write."""
+
+        class Killed(BaseException):
+            pass
+
+        write_receipt = jr._persist_json_receipt
+        append_row = jr._append_results_row
+        targets = {
+            "source": artifacts["source_path"],
+            "runner": artifacts["runner_path"],
+        }
+
+        def receipt(path, payload, create=False):
+            if os.path.abspath(path) == os.path.abspath(targets.get(gap, "")):
+                raise Killed
+            return write_receipt(path, payload, create=create)
+
+        def row(paths, value):
+            if gap == ("event" if "kind" in value else "result"):
+                raise Killed
+            return append_row(paths, value)
+
+        with mock.patch.object(jr, "_persist_json_receipt", receipt), \
+                mock.patch.object(jr, "_append_results_row", row):
+            with self.assertRaises(Killed):
+                self.recover(job_id, self.standing_reverse_exchange())
+
+    def test_recover_reverse_resumes_when_the_source_write_never_landed(self):
+        self.assert_finalize_gap_resumes(
+            "source", ("UNKNOWN", "UNKNOWN"), ["RESULT"]
+        )
+
+    def test_recover_reverse_resumes_when_the_runner_write_never_landed(self):
+        self.assert_finalize_gap_resumes(
+            "runner", ("CLOSED", "UNKNOWN"), ["RESULT"]
+        )
+
+    def test_recover_reverse_resumes_when_the_event_row_never_landed(self):
+        self.assert_finalize_gap_resumes(
+            "event", ("CLOSED", "CLOSED"), ["RESULT"]
+        )
+
+    def test_recover_reverse_resumes_when_the_result_row_never_landed(self):
+        self.assert_finalize_gap_resumes(
+            "result", ("CLOSED", "CLOSED"),
+            ["RESULT", "RECONCILED_FROM_EXCHANGE_TRUTH"],
+        )
+
+    def test_recover_reverse_binds_the_final_truth_it_resumes_from(self):
+        job_id = "reverse-ladder-truth"
+        artifacts = self.prepare_frozen_mid_trip(job_id)
+        ladder_truth = {
+            "liability": "10.1", "futures_position": "0",
+            "base_balance_delta": "0", "cross_margin_open_orders": 0,
+            "futures_open_orders": 0, "dust": "0.001",
+        }
+        # The ladder records a terminal truth of its own shape before it
+        # freezes, and recovery still reads a receipt carrying one.
+        self.replace_json_field(
+            artifacts["source_path"], "final_truth", ladder_truth
+        )
+        self.kill_recover_before(job_id, artifacts, "runner")
+
+        source = json.loads(Path(
+            artifacts["source_path"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(source["verdict"], "CLOSED")
+        self.assertEqual(
+            set(source["final_truth"]), jr.REVERSE_RECOVER_TRUTH_FIELDS
+        )
+
+        # A closed receipt is only resumed from when the recorded truth is
+        # this command's own flat row.
+        self.replace_json_field(
+            artifacts["source_path"], "final_truth", ladder_truth
+        )
+        no_reads = mock.Mock(side_effect=AssertionError("unexpected read"))
+        self.assertEqual(
+            self.assert_recover_read_only(job_id, no_reads),
+            "REVERSE_RECOVER_FINAL_TRUTH_MISMATCH",
+        )
+        no_reads.assert_not_called()
+
 
 
 class SpotMomentumJobRunnerTests(unittest.TestCase):
