@@ -102,6 +102,21 @@ either the LIVE FAILURE it fixed (receipt/refusal row) or the LIVE CAPABILITY
 it completed (capability-table row). A block that can name neither is bloat
 and does not land. Reviews check the named justification before anything else.
 
+## ONE OWNER PER NUMBER (owner word 2026-08-17, standing law)
+Every money number — cap, budget, floor, ratio — lives in exactly ONE file
+that owns it; every other site imports it. A second copy anywhere is a
+defect (fifteen copies of the caps ate two presses and an hour). After the
+reverse receipt closes, the standing copies collapse into that one file;
+from then on a size change is one line and one deploy at any repo size.
+
+## TESTS (owner word 2026-08-17, standing law)
+Binance is the real test. Kept tests are exactly two kinds: (a) drills for
+lessons that once cost real money — blind-resend double-buys, silence read
+as not-filled, a frozen lock released wrongly, a wrong release; (b) pins on
+behavior not yet live-proven. A test that duplicates live-proven behavior
+is dead weight and is deleted in the same commit as the seam that replaced
+it. Test counts are never progress and never close a capability.
+
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.
 - Credentials live on the execution host only, read by running code only;
