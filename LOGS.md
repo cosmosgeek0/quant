@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+THE 30-USDT ERA DEPLOYED + FUTURES WALLET FUNDED + PRESS 4 STAGED 2026-08-17 ~11:3xZ (worker 7.0, owner words: size 30 everywhere, daily loss 10, dials lifted, race the models) | machine SEALED + FLAT; ticks clean
+lift | 15 constant sites across 10 src files + composer script + tuner dials moved to the 30/300/10/24 world over four writer passes; surge ratios 3 and 8 kept (market signals, not money); suites 1,519 green Lead-rerun | lane c8f436e | MEASURED
+race | cap-raise review as a timed two-lane race: Opus 5.9 min / 6 findings (incl. THE blocker: futures margin needs ~34.5 at size 30 vs wallet 10.97) vs codex 14.4 min / 9 findings (adds composer cap, tuner restore path, three budget-accounting holes); standing routing now: Opus takes mechanical lanes, money-physics reviews run BOTH lanes in parallel | MEASURED clocks + verdicts
+fund | owner pressed the staged run.md entry: proven receipted transfer moved 32 USDT spot -> USD-M (spot 52.37, USD-M 42.97) — wallet-move-by-press is now standing practice, ~15 s per order | MEASURED balances
+deploy | HOST-DEPLOY OK files=8, RELEASE c8f436e5e8e57524769b0cc73ff81c2a23ab980c; composer + cap-30 launcher re-shipped XFER_VERIFIED; sealed throughout | MEASURED
+press | attempt 4 staged in run.md: ZROUSDT at 30 (plan will honestly clamp to borrow power ~16.6 today); watcher armed, reseal on first terminal row | MEASURED staged
+queued | three budget-accounting repairs from the codex lane (fee double-count at governor, basis/futures closes invisible to the day budget, reverse margin-leg quote result omitted) — next cards after the receipt | MEASURED findings
+note | the preflight PROBE still prints "vs cap 8" in its CAP row — probe display only, machine unaffected; hygiene later | MEASURED
 REVERSE ATTEMPT 3 — SIZING HELD, WINDOW MEASURED EMPTY FOR ZROUSDT 2026-08-17 10:25Z (worker 7.0; owner press 10:24:49Z) | resealed 10:26Z; FLAT; zero mutations
 run | release b295bdf6 live (sha_valid): plan sized into the caps correctly, then refused STEP_OR_MIN_NOTIONAL_INFEASIBLE — ZRO price slid to ~1.65 so ceiling-with-headroom 2.9 x price ~4.8 USDT sits under the 5 USDT venue minimums; the constraint window for ZROUSDT is EMPTY at today's price; arithmetic, not a defect | MEASURED receipt reverse-rproof-c6f742df95f9.json
 receipt | REFUSED exit 2, mutation_attempts 0, legs [], fees [], governor RELEASED 10:25:05Z, watcher resealed on the first terminal row, ticks IDLE exit 0 after | MEASURED
