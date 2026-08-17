@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+FROZEN RECEIPT RECOVERED, MACHINE CLEAN — AND THE JOB HEARTBEAT IS MEASURED ABSENT 2026-08-17 ~13:1xZ (worker 7.0) | account FLAT, SEALED, governor lock RELEASED
+recover | recover-reverse (lane 211ef69, deployed as RELEASE 211ef694) shipped flat-finalize ONLY after both review lanes convicted the unwind branch (13 findings between them; the branch was CUT, net -156 lines): strict binding, dust-tolerant flat truth (0.0194 ZRO free at 0.79 accepted, recorded), restart-safe finalize, zero mutations | ran on host: JOB-RUNNER RECOVERED rproof-1229558b1512, exit 0, account-governor.lock gone | MEASURED
+review | V8 two-lane race on the recovery command: Opus 7 findings / codex 6 (overlap 3); the surviving surface carries nine mutation-probe-proven tests | MEASURED verdicts
+cron | the 1-minute job_tick line is ABSENT from the host crontab (present 2026-08-16, gone by press 3 10:24Z when the fire guard first said so; remaining lines: runtime_tick */2, aliveness */2, knob_tuner hourly :05 — the 10:05 tuner run is the suspect, UNVERIFIED). Consequence: nothing claims job files until re-armed — fail-safe direction; re-arm is the owner's word | MEASURED crontab read
+day close | ten presses, five runner receipts, all four reverse money legs live-proven, the frozen position closed for ~2 cents, the 30-era deployed, the door plan proposed (per-op files + thin spine + receipt-gated proven/); owner words pending: door start, re-arm | MEASURED
+
 POSITION CLOSED FLAT — ALL FOUR REVERSE MONEY LEGS EXECUTED LIVE IN ONE DAY 2026-08-17 ~12:2xZ (worker 7.0; owner pressed the plain close script via run.md) | account FLAT, machine SEALED
 close | scripts/close_reverse_position.py (committed 25d588e, first-script style, ~150 lines from proven primitives, hard 12-USDT spend stop): bought ~10.12 ZRO at ~0.787 (~7.98 USDT), repaid the full 10.1004 liability | MEASURED
 flat | cross-margin after: ZRO borrowed 0 interest 0 free 0.01942646 (headroom dust ~1.5 cents, recorded), USDT free 1.9885, marginLevel 999, 0 orders | MEASURED live read
