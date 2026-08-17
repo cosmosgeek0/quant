@@ -87,6 +87,12 @@ and workers communicate: cards, reports, commits, records. Clean
 engineering words, soft tone; risky-shaped or dense raw material never
 enters a Fable seat — digests come back clean or go back to their worker.
 
+## CODE JUSTIFICATION (owner word 2026-08-17 — standing law)
+Every permanent block of production code must name, in its landing record,
+either the LIVE FAILURE it fixed (receipt/refusal row) or the LIVE CAPABILITY
+it completed (capability-table row). A block that can name neither is bloat
+and does not land. Reviews check the named justification before anything else.
+
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.
 - Credentials live on the execution host only, read by running code only;
