@@ -225,6 +225,7 @@ class ReverseTransport:
 
     def __init__(self, stop_path=""):
         self.calls = []
+        self.get_calls = []
         self.stop_path = stop_path
         self.stop_after = ""
         self.unknown_leg = ""
@@ -252,6 +253,13 @@ class ReverseTransport:
         self.margin_orders = {}
         self.futures_orders = {}
         self.futures_trades = {}
+        self.max_borrowable_kind = "ok"
+        self.max_borrowable_payload = {"amount": "10.08461683",
+                                       "borrowLimit": "11000"}
+        self.interest_rate_kind = "ok"
+        self.interest_rate_payload = [{
+            "asset": "TST", "nextHourlyInterestRate": "0.000037",
+        }]
 
     @staticmethod
     def text(value):
@@ -284,7 +292,6 @@ class ReverseTransport:
             "asset": "TST", "free": self.text(self.free),
             "borrowed": self.text(self.borrowed),
             "interest": self.text(self.interest),
-            "maxBorrowable": "1", "interestRateHourly": "0",
         }]}
 
     def maybe_stop(self, leg):
@@ -392,6 +399,8 @@ class ReverseTransport:
     def __call__(self, method, base_url, path, params=None, signed=False):
         params = dict(params or {})
         self.calls.append((method, base_url, path, params, signed))
+        if method == "GET":
+            self.get_calls.append((path, dict(params)))
         if method == "GET" and path == "/fapi/v1/time":
             return "ok", {"serverTime": 1786708800000}
         if method == "GET" and path == jr.basis_executor.SPOT.exchange_info_path:
@@ -461,6 +470,15 @@ class ReverseTransport:
             }]
         if method == "GET" and path == jr.MARGIN_ACCOUNT_PATH:
             return "ok", self.account()
+        if method == "GET" and path == "/sapi/v1/margin/maxBorrowable":
+            if params != {"asset": "TST"} or not signed:
+                raise AssertionError("unexpected max-borrowable read")
+            return self.max_borrowable_kind, self.max_borrowable_payload
+        if method == "GET" and path == "/sapi/v1/margin/next-hourly-interest-rate":
+            if params != {"assets": "TST", "isIsolated": "FALSE"} \
+                    or not signed:
+                raise AssertionError("unexpected hourly-interest read")
+            return self.interest_rate_kind, self.interest_rate_payload
         if method == "GET" and path == jr.basis_executor.USDM_POSITION_PATH:
             return "ok", [{
                 "symbol": "TSTUSDT", "positionSide": "BOTH",
@@ -5670,6 +5688,227 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(source["legs"][0]["submission"]["transaction_id"])
         self.assertTrue(source["legs"][-1]["submission"]["transaction_id"])
         self.assertEqual(source["governor_release"], "RELEASED")
+
+    def test_reverse_borrow_facts_use_ordered_signed_reads_and_keep_math(self):
+        self.reverse_job("reverse-borrow-facts")
+        transport = ReverseTransport()
+        with mock.patch.object(
+                jr, "plan_reverse_mechanics",
+                wraps=jr.plan_reverse_mechanics) as plan:
+            self.assertEqual(self.reverse_tick(transport), 0)
+
+        fact_calls = [call for call in transport.calls if call[2] in (
+            jr.MARGIN_ACCOUNT_PATH, "/sapi/v1/margin/maxBorrowable",
+            "/sapi/v1/margin/next-hourly-interest-rate",
+        )]
+        self.assertEqual(fact_calls[:3], [
+            ("GET", jr.basis_executor.SPOT.base_url,
+             jr.MARGIN_ACCOUNT_PATH, {}, True),
+            ("GET", jr.basis_executor.SPOT.base_url,
+             "/sapi/v1/margin/maxBorrowable", {"asset": "TST"}, True),
+            ("GET", jr.basis_executor.SPOT.base_url,
+             "/sapi/v1/margin/next-hourly-interest-rate",
+             {"assets": "TST", "isIsolated": "FALSE"}, True),
+        ])
+        self.assertEqual([
+            call for call in transport.get_calls if call[0] in (
+                "/sapi/v1/margin/maxBorrowable",
+                "/sapi/v1/margin/next-hourly-interest-rate",
+            )
+        ], [
+            ("/sapi/v1/margin/maxBorrowable", {"asset": "TST"}),
+            ("/sapi/v1/margin/next-hourly-interest-rate", {
+                "assets": "TST", "isIsolated": "FALSE",
+            }),
+        ])
+        args = plan.call_args.args
+        self.assertEqual(args[5:7], (
+            Decimal("10.08461683"), Decimal("0.000037")))
+        self.assertEqual(self.reverse_source(self.results()[0])["plan"][
+            "base_qty"], "0.079")
+
+    def test_reverse_borrowable_clamp_window_and_floor_refusal(self):
+        quote_cap = Decimal("8")
+        fixture = ReverseTransport()
+        spot = fixture.spot_exchange()["symbols"][0]
+        futures = fixture.futures_exchange()["symbols"][0]
+
+        def filter_decimal(symbol, filter_type, field):
+            return Decimal(next(
+                row[field] for row in symbol["filters"]
+                if row["filterType"] == filter_type
+            ))
+
+        steps = tuple(
+            filter_decimal(symbol, filter_type, "stepSize")
+            for symbol in (spot, futures)
+            for filter_type in ("LOT_SIZE", "MARKET_LOT_SIZE")
+        )
+        common_step = steps[0]
+        for step in steps[1:]:
+            common_step = jr.futures_hand.common_step(common_step, step)
+        spot_minimum = filter_decimal(
+            spot, "MIN_NOTIONAL", "minNotional")
+        futures_minimum = filter_decimal(
+            futures, "MIN_NOTIONAL", "notional")
+        hand_plan = jr.futures_hand.plan_open(
+            futures,
+            {"bidPrice": fixture.text(fixture.price),
+             "askPrice": fixture.text(fixture.price)},
+            {"markPrice": fixture.text(fixture.price)},
+            quote_cap, Decimal("10"), "BUY",
+        )
+        desired_quantity = min(
+            quote_cap / fixture.price,
+            quote_cap / hand_plan["limit_price"],
+        )
+        minimum_quantity = max(
+            jr.futures_hand.ceil_step(
+                spot_minimum / fixture.price, common_step),
+            jr.futures_hand.ceil_step(
+                futures_minimum / hand_plan["limit_price"], common_step),
+        )
+        bounded_borrowable = jr.futures_hand.floor_step(
+            desired_quantity, common_step)
+        below_floor = minimum_quantity - common_step
+        self.assertTrue(
+            minimum_quantity < bounded_borrowable < desired_quantity)
+        self.assertLess(below_floor, minimum_quantity)
+
+        expected_reads = [
+            ("/sapi/v1/margin/maxBorrowable", {"asset": "TST"}),
+            ("/sapi/v1/margin/next-hourly-interest-rate", {
+                "assets": "TST", "isIsolated": "FALSE",
+            }),
+        ]
+        cases = (
+            ("bounded", bounded_borrowable, 0, "CLOSED", None),
+            ("below-floor", below_floor, 2, "REFUSED",
+             "BORROW_CLAMP_EXCEEDED"),
+        )
+        for name, borrowable, exit_code, verdict, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-borrow-" + name, root)
+                transport = ReverseTransport()
+                transport.max_borrowable_payload = {
+                    "amount": format(borrowable, "f"),
+                    "borrowLimit": "11000",
+                }
+                with mock.patch.dict(
+                        os.environ, {"MAX_SLIPPAGE_BPS": "10"}), \
+                        mock.patch.object(
+                            jr, "plan_reverse_mechanics",
+                            wraps=jr.plan_reverse_mechanics) as plan:
+                    self.assertEqual(
+                        self.reverse_tick(transport, root), exit_code)
+
+                self.assertEqual(plan.call_args.args[5], borrowable)
+                self.assertEqual([
+                    call for call in transport.get_calls if call[0] in (
+                        "/sapi/v1/margin/maxBorrowable",
+                        "/sapi/v1/margin/next-hourly-interest-rate",
+                    )
+                ], expected_reads)
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                self.assertEqual(result["verdict"], verdict)
+                self.assertEqual(result["exit_code"], exit_code)
+                if reason is None:
+                    self.assertEqual(
+                        self.reverse_source(result, root)["plan"]["base_qty"],
+                        format(borrowable, "f"),
+                    )
+                else:
+                    self.assertEqual(self.reason(result), reason)
+                    self.assertFalse(any(
+                        call[0] == "POST" for call in transport.calls
+                    ))
+
+    def test_reverse_borrow_fact_transport_failures_are_typed_and_do_not_post(self):
+        max_read = (
+            "/sapi/v1/margin/maxBorrowable", {"asset": "TST"},
+        )
+        interest_read = (
+            "/sapi/v1/margin/next-hourly-interest-rate",
+            {"assets": "TST", "isIsolated": "FALSE"},
+        )
+        cases = (
+            ("max", "max_borrowable_kind",
+             "REVERSE_MAX_BORROWABLE_UNREADABLE", (max_read,)),
+            ("interest", "interest_rate_kind",
+             "REVERSE_NEXT_HOURLY_INTEREST_RATE_UNREADABLE",
+             (max_read, interest_read)),
+        )
+        for name, attribute, reason, expected_reads in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-read-" + name, root)
+                transport = ReverseTransport()
+                setattr(transport, attribute, "api_error")
+
+                self.assertEqual(self.reverse_tick(transport, root), 4)
+
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                self.assertEqual(result["verdict"], "UNKNOWN")
+                self.assertEqual(self.reason(result), reason)
+                self.assertEqual([
+                    call for call in transport.get_calls if call[0] in (
+                        "/sapi/v1/margin/maxBorrowable",
+                        "/sapi/v1/margin/next-hourly-interest-rate",
+                    )
+                ], list(expected_reads))
+                self.assertFalse(any(call[0] == "POST"
+                                     for call in transport.calls))
+
+    def test_reverse_borrow_fact_shapes_fail_closed_without_post(self):
+        cases = (
+            ("max-missing", "max_borrowable_payload", {}),
+            ("max-text", "max_borrowable_payload", {"amount": "plain"}),
+            ("max-zero", "max_borrowable_payload", {"amount": "0"}),
+            ("max-negative", "max_borrowable_payload", {"amount": "-1"}),
+            ("rate-missing", "interest_rate_payload", [{"asset": "TST"}]),
+            ("rate-text", "interest_rate_payload", [{
+                "asset": "TST", "nextHourlyInterestRate": "plain"}]),
+            ("rate-negative", "interest_rate_payload", [{
+                "asset": "TST", "nextHourlyInterestRate": "-0.1"}]),
+            ("rate-no-match", "interest_rate_payload", [{
+                "asset": "ALT", "nextHourlyInterestRate": "0.1"}]),
+            ("rate-two-matches", "interest_rate_payload", [{
+                "asset": "TST", "nextHourlyInterestRate": "0.1"}, {
+                "asset": "TST", "nextHourlyInterestRate": "0.1"}]),
+        )
+        for name, attribute, payload in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jobs"))
+                self.write_reverse_controls(root)
+                self.reverse_job("reverse-shape-" + name, root)
+                transport = ReverseTransport()
+                setattr(transport, attribute, payload)
+
+                self.assertEqual(self.reverse_tick(transport, root), 4)
+
+                result = json.loads(Path(
+                    root, "jobs", "results.jsonl").read_text().splitlines()[0])
+                self.assertEqual(result["verdict"], "UNKNOWN")
+                self.assertEqual(
+                    self.reason(result), "REVERSE_BORROW_FACTS_UNREADABLE")
+                self.assertEqual([
+                    call for call in transport.get_calls if call[0] in (
+                        "/sapi/v1/margin/maxBorrowable",
+                        "/sapi/v1/margin/next-hourly-interest-rate",
+                    )
+                ], [
+                    ("/sapi/v1/margin/maxBorrowable", {"asset": "TST"}),
+                    ("/sapi/v1/margin/next-hourly-interest-rate", {
+                        "assets": "TST", "isIsolated": "FALSE",
+                    }),
+                ])
+                self.assertFalse(any(call[0] == "POST"
+                                     for call in transport.calls))
 
     def test_reverse_leverage_step_uses_final_authority_before_post(self):
         cases = (

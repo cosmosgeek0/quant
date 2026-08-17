@@ -5533,14 +5533,14 @@ def _run_reverse_mechanics(job: Job, paths: Dict[str, str],
             matches = [row for row in rows if isinstance(row, dict) and row.get("asset") == job.borrow_asset]
             if liability is None or len(matches) != 1:
                 raise ReverseReadUnknown("REVERSE_MARGIN_ACCOUNT_UNREADABLE")
-            asset_row = matches[0]
-            borrowable = [_momentum_decimal(asset_row[name], "reverse borrowable")
-                          for name in ("maxBorrowable", "borrowable", "maxBorrowableAmount") if name in asset_row]
-            interest = [_momentum_decimal(asset_row[name], "reverse hourly interest", allow_zero=True)
-                for name in ("interestRateHourly", "hourlyInterestRate", "interestRate") if name in asset_row]
-            if not borrowable or len(set(borrowable)) != 1 \
-                    or not interest or len(set(interest)) != 1:
-                raise ReverseReadUnknown("REVERSE_BORROW_FACTS_UNREADABLE")
+            borrow_fact = _reverse_read(transport, basis_executor.SPOT.base_url,
+                "/sapi/v1/margin/maxBorrowable", {"asset": job.borrow_asset}, True, "REVERSE_MAX_BORROWABLE")
+            interest_facts = _reverse_read(transport, basis_executor.SPOT.base_url,
+                "/sapi/v1/margin/next-hourly-interest-rate", {"assets": job.borrow_asset, "isIsolated": "FALSE"}, True, "REVERSE_NEXT_HOURLY_INTEREST_RATE")
+            interest_matches = [row for row in interest_facts if isinstance(row, dict) and row.get("asset") == job.borrow_asset] if isinstance(interest_facts, list) else []
+            if len(interest_matches) != 1: raise ReverseReadUnknown("REVERSE_BORROW_FACTS_UNREADABLE")
+            try: borrowable = [_momentum_decimal(borrow_fact["amount"], "reverse borrowable")]; interest = [_momentum_decimal(interest_matches[0]["nextHourlyInterestRate"], "reverse hourly interest", allow_zero=True)]
+            except (KeyError, TypeError, MomentumStateError): raise ReverseReadUnknown("REVERSE_BORROW_FACTS_UNREADABLE") from None
             _configure_futures_hand(paths["receipts"])
             try:
                 hand_plan = futures_hand.preflight(job.effective_notional,
