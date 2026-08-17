@@ -7,6 +7,14 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+REVERSE ATTEMPT 4 — FIRST REAL MONEY ON THE LANE: BORROW + SELL FILLED, FROZE BEFORE THE HEDGE 2026-08-17 11:48Z (worker 7.0; owner press 11:47:49Z at size 30) | position LIVE at freeze; watcher resealed 11:48Z
+legs | BORROW DONE: 10.1 ZRO, txn 401747901880, ledger-confirmed principal 10.1 | MARGIN_SELL FILLED: 10.1 ZRO at 0.79, proceeds 7.979 USDT, fee 0.007979 (order 1493431639) | then FREEZE LEDGER_TRUTH_MISMATCH before FUTURES_LONG_OPEN; verdict UNKNOWN exit 4; sha_valid c8f436e5 | MEASURED receipt reverse-rproof-1229558b1512.json
+cause | the truth check compares expected base delta (0) to measured free-ZRO delta with the sell already filled but the account read landing before the exchange settled it — a stale-read race; the interest theory was disproven by replay; the freeze row records no operands (records gap) | MEASURED study + replay, race INFERRED
+exposure at freeze | cross-margin: ZRO borrowed 10.1 + interest 0.0000729 (netAsset -10.1000729), USDT free 9.9709823, marginLevel 1.2487 (inside call territory, watch), 0 open orders anywhere; buyback cost ~8.0 at ask 0.792 — fully funded, ~0.04 USDT total friction to close | MEASURED live reads ~11:5xZ
+trap | NO existing command can exit this state: tick skips resulted jobs, re-claims refuse on the liability, reconcile-margin reverse branch requires zero mutations, release-stuck-lock requires MARGIN_BORROW, and no standalone buy-back op exists — the missing piece is an attested recovery entry point | MEASURED 16-row study
+actions | owner offered the 60-second app close (buy ~10.11, repay all) as fastest risk-kill; R7 building the attested recover-reverse command (rehydrate receipt -> verify truth -> existing UNWIND legs -> CLOSED + release), R6 queued for the stale-read re-check + freeze-row operands | MEASURED state
+history | first borrow and first fill the reverse lane has ever executed; nine presses, four runner receipts, each one deeper | MEASURED
+
 THE 30-USDT ERA DEPLOYED + FUTURES WALLET FUNDED + PRESS 4 STAGED 2026-08-17 ~11:3xZ (worker 7.0, owner words: size 30 everywhere, daily loss 10, dials lifted, race the models) | machine SEALED + FLAT; ticks clean
 lift | 15 constant sites across 10 src files + composer script + tuner dials moved to the 30/300/10/24 world over four writer passes; surge ratios 3 and 8 kept (market signals, not money); suites 1,519 green Lead-rerun | lane c8f436e | MEASURED
 race | cap-raise review as a timed two-lane race: Opus 5.9 min / 6 findings (incl. THE blocker: futures margin needs ~34.5 at size 30 vs wallet 10.97) vs codex 14.4 min / 9 findings (adds composer cap, tuner restore path, three budget-accounting holes); standing routing now: Opus takes mechanical lanes, money-physics reviews run BOTH lanes in parallel | MEASURED clocks + verdicts
