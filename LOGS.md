@@ -7,6 +7,16 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+REVERSE LANE UNBLOCKED — REPAIR DEPLOYED, RECEIPT RECONCILED, PRESS 7 STAGED 2026-08-17 09:4xZ (worker 7.0, owner's autonomous block) | machine SEALED + FLAT end to end; zero mutations
+cause | the deterministic refusal: the preflight hunted borrowable + hourly-interest fields on the margin-account row, which that endpoint never returns (measured live row: free/locked/borrowed/interest/netAsset only) — every press failed identically | MEASURED code trace + host probes
+repair | job_runner reads the real endpoints through the typed single-attempt path (maxBorrowable {asset} -> amount; next-hourly-interest-rate {assets, isIsolated FALSE} -> one matching row), same fail-closed typing, src net 0 lines; fresh-eyes V1/V3 MERGE-SAFE, V2 finding ruled design intent, V4 two test findings repaired; suites 1499 green | lane 4c3af87 | MEASURED
+reconcile | reconcile-margin gained the reverse-zero branch (strict binding, six signed truth reads, close only on all-zero truth, resumable release, full-write check before fsync; single fresh-eyes V5 per the live-cadence law: 2 HIGH + 2 LOW, all repaired; suites 1508 green) | lane 3f655c2 | MEASURED
+deploy | payload w7fix-3f655c23 shipped XFER_VERIFIED (first attempt refused for mac resource-fork files in the tar — rebuilt clean); HOST-DEPLOY OK files=1, RELEASE 3f655c2398b7ad679d154324ea371d3f55fe2808, sealed throughout | MEASURED
+unfreeze | reconcile ran on host under seal: event row + CLOSED/0 result at 09:38:49Z, lock released, receipts CLOSED/RELEASED; next tick consumed the expired second job (REFUSED exit 2) and the tick after ran IDLE exit 0 — halt gone, honest | MEASURED jobs.log
+flat | fresh signed GET-only read after everything: spot USDT 84.3666, USD-M 10.9744, cross-margin 0/0/0 marginLevel 999, zero orders and positions everywhere | VERDICT FLAT | MEASURED
+press | attempt 2 staged in Desktop/run.md PENDING (one line, the proven launcher); worker 7 watcher armed — notices in ~2 min, reseals on the first terminal row, receipt report follows | MEASURED staged
+open | the six press attempts to date produced refusal receipts only; nothing has ever traded on the reverse lane; next receipt decides LIVE_1 vs the next narrow repair | MEASURED
+
 REVERSE PRESS 4 — FIRST RUNNER-CLAIMED ATTEMPT, REFUSED AT ITS FIRST FACT GATE 2026-08-17 07:10Z (worker 7.0 read the receipt; the press was the owner's, ~07:09:30Z) | machine self-resealed, account FLAT, nothing traded
 press | 4th press through the repaired detached launcher: guards ok, signed flat read FLAT, ACCEPT-ONE written (max 8, 15 min), job composed and placed (job …103e, ZROUSDT, cap 8, borrow ZRO, intent …7ab6), ARMED 07:09:30Z — the 2026-08-16 composer repair held | MEASURED fire log
 run | tick claimed the job 07:10:01Z; runner ran 07:10:06.45→07:10:07.66Z (1.2 s); verdict UNKNOWN, reason REVERSE_BORROW_FACTS_UNREADABLE; mutation_attempts 0, legs [], plan null — refused before any borrow, order, or transfer; governor_release PENDING | MEASURED receipt /home/ssm-user/quant_receipts/jobs/receipts/reverse-rproof-051e4f11103e.json, sha 585e0ecd

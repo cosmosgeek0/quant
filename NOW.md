@@ -1,10 +1,10 @@
-# NOW.md — current orders and measured truth (one page, rewritten in place; worker 7.0, 2026-08-17 ~08:0xZ)
+# NOW.md — current orders and measured truth (one page, rewritten in place; worker 7.0, 2026-08-17 ~09:5xZ)
 
 ## Orders in force
 - MACHINE STAYS SEALED (STOP-JOBS present) and FLAT. No lane landing authorizes a deploy, order, transfer, leverage change, or live proof. Each deploy and each live proof runs on ONE owner line. | MEASURED owner word
 - GOVERNING DOC: Downloads/QUANT-FRESH-DIRECTION-2026-08-17.md (owner-adopted audit). Network V1 CLOSED and FROZEN at e5e9893b. Worker 6.0 seat closed (usage limit); worker 7.0 is the sole money Lead. Worker 10 = read-only reviewer unless it declares a unique Git artifact. Shelves (lane/lead5-hand, shelf/*) are donors, never merged wholesale. | MEASURED owner word
-- REVERSE LIVE result 2026-08-17: the 4th owner press RAN — job claimed by the deployed runner, refused at its first fact gate, receipt written, machine self-resealed, account FLAT (see truth). Reconciliation of the UNKNOWN receipt and the borrow-facts read defect are OPEN and need owner words; no repair was performed per the money-only order. | MEASURED
-- NEXT PHASE on the owner's word only: reconciliation/repair card for the receipt gate, then the canonicalization plan from the fresh-direction doc (exact proven release onto one branch, no behavior change, no wholesale merges). | MEASURED owner word
+- REVERSE LIVE state 2026-08-17 ~09:5xZ: the borrow-facts defect is REPAIRED and DEPLOYED (host RELEASE 3f655c2398b7ad679d154324ea371d3f55fe2808, sealed deploy), the frozen UNKNOWN receipt is RECONCILED CLOSED from exchange truth (attested reverse-zero branch, lock released, ticks IDLE exit 0), the expired duplicate job was consumed REFUSED, and ATTEMPT 2's press sits in Desktop/run.md PENDING with the worker 7 watcher armed (reseal on first terminal row is the watcher's). Six presses so far, all refusal receipts, nothing ever traded on this lane. | MEASURED
+- LIVE CADENCE ORDER binds (CLAUDE.md 06d8482): run.md never empty while work exists; one fresh-eyes round at the 8 cap; receipts, not lines, measure the program. | MEASURED owner word
 
 ## Measured truth
 - RECEIPT reverse-rproof-051e4f11103e.json (sha 585e0ecda9a7ef239cf52625fe6d17ead79bc725): op REVERSE_MECHANICS_ROUNDTRIP ZROUSDT cap 8, intent …7ab6, client tag …e5f6; started 07:10:06.45Z finished 07:10:07.66Z (1.2 s); verdict UNKNOWN, reason REVERSE_BORROW_FACTS_UNREADABLE; mutation_attempts 0, legs [], plan null, market {} — refused BEFORE any borrow, order, or transfer; governor_release PENDING. | MEASURED receipt read
@@ -16,8 +16,8 @@
 - Feed/stream state unchanged from 2026-08-16 evening: spot dropped_frames 0, gap rows OK 36/400, book_age floor ~2-3 s (feed 1 s write cadence + snapshot lag). Shadow still evaluates (latest row 06:14Z, would_intent False). | MEASURED earlier proofs, not re-measured today
 
 ## Known limitations
-- The borrow-facts read the runner refused on (REVERSE_BORROW_FACTS_UNREADABLE) is undiagnosed — receipt shows the typed refusal only; the preflight's own maxBorrowable GET read fine minutes later (ZEN 1.99). Diagnosis is a separate card on the owner's word. | MEASURED refusal, UNVERIFIED cause
-- Runner reconciliation path for an UNKNOWN pre-mutation receipt has never been exercised; unfreezing procedure needs its own careful card, not an ad-hoc poke. | INFERRED
+- Diagnosed and cured this seat: the refusal literal came from field hunting on the wrong endpoint (deterministic, never transient); the reconcile path for zero-mutation UNKNOWN receipts now exists, is live-exercised once, and is resumable. | MEASURED
+- Next unknown: what attempt 2 does past the borrow-facts gate — S1-S4 studies mapped the remaining gates (futures preflight, plan/min-notional at the 0.1 ZRO step, leg recovery); a refusal there is a fresh receipt, not a failure of this repair. | INFERRED from code, UNVERIFIED live
 - Sub-second book age remains out of reach by design (feed cadence + snapshot lag); an unchanged quiet book still reads as old age. | MEASURED earlier
 
 ## Source basis
