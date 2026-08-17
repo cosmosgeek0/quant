@@ -109,11 +109,17 @@ deployed runtime under the owner's own activation. STOP (in the receipt dir)
 seals entry unconditionally; exits and reconciliation always run. Entry
 exists only via an immutable, priced, unexpired proposal, revalidated
 against fresh books before the one pre-entry mutation (leverage) runs last.
-RESTRICTED LIVE-TEST JOBS (owner standard 2026-08-14): the owner arms the
-deterministic job runner ONCE; thereafter the Lead queues strictly-validated
-job RECORDS (op whitelist only, notional clamped ≤ 8 USDT, leverage forced
-1x, one job at a time, mandatory expiry, run-at-most-once claims, freeze-on-
-UNKNOWN) and reads the receipts. No per-test human press, no pasted
+RESTRICTED LIVE-TEST JOBS (owner standard 2026-08-14; size raised by owner
+word 2026-08-17): the owner arms the deterministic job runner ONCE;
+thereafter the Lead queues strictly-validated job RECORDS (op whitelist
+only, notional clamped ≤ 30 USDT, leverage forced 1x, one job at a time,
+mandatory expiry, run-at-most-once claims, freeze-on-UNKNOWN) and reads the
+receipts.
+TRADE SIZE LAW (owner word 2026-08-17, standing, hard-coded): the account
+runs near 1,100 USD; the operating trade size is 30 USDT — everywhere, every
+op. The 8-USDT era is closed; no seat proposes, codes, or stages an 8-USDT
+trade again. Small-size arithmetic fights (venue minimums vs tiny caps) are
+the named waste this law removes. No per-test human press, no pasted
 commands, no arbitrary shell near money — job files in, receipts out.
 WORD-TIME FLATNESS (review-lane condition, adopted 2026-08-14): the same
 signed GET-only flat read (positions + open orders both venues + balances,
