@@ -19,7 +19,7 @@ MARGIN_BORROW = "MARGIN_BORROW"
 MARGIN_REPAY = "MARGIN_REPAY"
 MARGIN_OPERATIONS = frozenset((MARGIN_BORROW, MARGIN_REPAY))
 MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
-PRINCIPAL_CEILING = Decimal("3")
+PRINCIPAL_CEILING = Decimal("300")
 MAX_EXPIRY_AHEAD = timedelta(minutes=15)
 MAX_OPERATOR_TOKEN_LENGTH = 256
 MAX_PRINCIPAL_TEXT_LENGTH = 64
@@ -134,7 +134,7 @@ def _principal(value: Any) -> tuple[Decimal, str]:
         raise _Problem("BAD_PRINCIPAL", ["job.principal"])
     if parsed > PRINCIPAL_CEILING:
         raise _Problem("PRINCIPAL_CEILING_EXCEEDED", ["job.principal"],
-                       ["principal_ceiling=3"])
+                       ["principal_ceiling=300"])
     whole, separator, fraction = value.partition(".")
     fraction = fraction.rstrip("0")
     canonical = whole + ((separator + fraction) if fraction else "")
@@ -228,7 +228,7 @@ def _build(job: Any, asset_whitelist: Any, now: Any,
         evidence.append("job.asset")
 
         _amount, principal = _principal(job["principal"])
-        evidence.extend(("job.principal", "principal_ceiling=3"))
+        evidence.extend(("job.principal", "principal_ceiling=300"))
 
         expiry, expires_utc = _timestamp(job["expires_utc"])
         if not isinstance(now, datetime) or now.tzinfo is None \

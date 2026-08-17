@@ -70,6 +70,7 @@ class AccountGovernorTests(unittest.TestCase):
         governor.release_entry_slot(winners[0], self.receipt_dir)
 
     def test_entry_count_limit_rolls_on_the_next_utc_day(self):
+        self.assertEqual(governor.DEFAULT_MAX_ENTRIES_PER_UTC_DAY, 24)
         with mock.patch.object(governor, "_utc_now", return_value=DAY):
             for index in range(governor.DEFAULT_MAX_ENTRIES_PER_UTC_DAY):
                 token = governor.acquire_entry_slot(
@@ -99,6 +100,9 @@ class AccountGovernorTests(unittest.TestCase):
         self.assertEqual(len(self.ledger_rows(tomorrow)), 1)
 
     def test_realized_loss_plus_fees_trips_and_stays_tripped_for_day(self):
+        self.assertEqual(
+            governor.DEFAULT_DAILY_LOSS_PLUS_FEES_USDT, Decimal("10.00")
+        )
         with mock.patch.object(governor, "_utc_now", return_value=DAY):
             loss_cap = governor.DEFAULT_DAILY_LOSS_PLUS_FEES_USDT
             governor.record_realized(

@@ -393,7 +393,7 @@ class AcceptOneReworkTests(unittest.TestCase):
         acceptance = self.valid_acceptance()
         self.momentum_markers()
         self.job("filled", op="MOMENTUM_OPEN", max_notional=32)
-        self.momentum_http.queue_position(Decimal("0.04"))
+        self.momentum_http.queue_position(Decimal("0.15"))
 
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 0)
@@ -431,9 +431,9 @@ class AcceptOneReworkTests(unittest.TestCase):
         _HAS_TICKET_BOUND,
         "ticket-bound ACCEPT-ONE interface has not landed",
     )
-    def test_ticket_bound_refuses_then_preserved_ticket_accepts_eight(self):
+    def test_ticket_bound_refuses_then_preserved_ticket_accepts_thirty(self):
         self.write_operator()
-        acceptance = self.valid_acceptance(max_notional="8")
+        acceptance = self.valid_acceptance(max_notional="30")
         self.job("ticket-overflow", max_notional=32)
 
         self.assertEqual(self.tick(), 2)
@@ -451,13 +451,13 @@ class AcceptOneReworkTests(unittest.TestCase):
             self.claimed_acceptance("ticket-overflow")
         ))
 
-        self.job("ticket-compliant", max_notional=8)
+        self.job("ticket-compliant", max_notional=30)
 
         self.assertEqual(self.tick(), 0)
 
         self.assertEqual(self.results()[-1]["verdict"], "CLOSED")
         self.assertEqual(len(self.hand_calls), 1)
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["max_notional"], "30")
         self.assertFalse(os.path.exists(self.accept_path))
         claim = self.claimed_acceptance("ticket-compliant")
         self.assertTrue(os.path.isfile(claim))
@@ -624,7 +624,7 @@ class AcceptOneReworkTests(unittest.TestCase):
         self.valid_acceptance()
         self.momentum_markers()
         self.job("seal-open", op="MOMENTUM_OPEN")
-        quantity = Decimal("0.04")
+        quantity = Decimal("0.15")
         self.momentum_http.queue_position(quantity)
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 0)
@@ -670,13 +670,13 @@ class AcceptOneReworkTests(unittest.TestCase):
         self.write_operator()
         self.valid_acceptance()
         self.momentum_markers()
-        self.job("reseal-open", op="MOMENTUM_OPEN", max_notional=8)
-        quantity = Decimal("0.04")
+        self.job("reseal-open", op="MOMENTUM_OPEN", max_notional=30)
+        quantity = Decimal("0.15")
         self.momentum_http.queue_position(quantity)
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 0)
 
-        standing = self.valid_acceptance(max_notional="8")
+        standing = self.valid_acceptance(max_notional="30")
         self.job("reseal-exit", op="MOMENTUM_EXIT")
         self.momentum_http.queue_position(quantity, mark_price="200")
         self.momentum_http.queue_position(Decimal("0"), mark_price=None)
@@ -698,7 +698,7 @@ class AcceptOneReworkTests(unittest.TestCase):
 
         before_intents = list(self.momentum_http.intents)
         before_expired = os.stat(expired)
-        self.job("reseal-queued-entry", op="MOMENTUM_OPEN", max_notional=8)
+        self.job("reseal-queued-entry", op="MOMENTUM_OPEN", max_notional=30)
         with self.momentum_runtime():
             self.assertEqual(self.tick(), 2)
 
@@ -718,7 +718,7 @@ class AcceptOneReworkTests(unittest.TestCase):
             [Path(expired)],
         )
 
-    def test_pre_close_marker_entry_is_clamped_to_eight(self):
+    def test_pre_close_marker_entry_is_clamped_to_thirty(self):
         self.write_operator()
         self.valid_acceptance()
         self.job("cap-first", max_notional=32)
@@ -726,9 +726,9 @@ class AcceptOneReworkTests(unittest.TestCase):
         self.assertEqual(self.tick(), 0)
 
         self.assertEqual(len(self.hand_calls), 1)
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
-        self.assertEqual(jr.limits.FIRST_TRADE_CAP_USDT, Decimal("8"))
+        self.assertEqual(self.hand_calls[0]["max_notional"], "30")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "30")
+        self.assertEqual(jr.limits.FIRST_TRADE_CAP_USDT, Decimal("30"))
 
     def test_post_close_marker_entry_is_clamped_to_thirty_two(self):
         self.write_operator()

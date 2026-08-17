@@ -290,8 +290,9 @@ class BasisSupervisorTests(unittest.TestCase):
         job, receipt_dir = self.governor_jobs[0]
         self.assertEqual((job.op, job.symbol, receipt_dir),
                          ("BASIS_ROUNDTRIP", SYMBOL, self.dir))
+        self.assertEqual(job.effective_notional, Decimal("9.91980000"))
         self.assertEqual(job.effective_notional,
-                         bs.FIRST_TRADE_CAP_USDT)
+                         job.requested_max_notional)
         self.assertEqual(self.governor_releases,
                          [("basis-governor-token", self.dir)])
 
@@ -413,7 +414,9 @@ class BasisSupervisorTests(unittest.TestCase):
             self.assertNotIn("governor_token", json.load(handle))
 
     def test_first_trade_clamp_is_an_in_memory_proposal_view(self):
-        proposal_path = self.write_proposal()
+        payload = proposal_payload()
+        payload["quantity"] = "0.399"
+        proposal_path = self.write_proposal(payload)
         with open(proposal_path, "rb") as handle:
             original = handle.read()
         observed = []
@@ -440,6 +443,9 @@ class BasisSupervisorTests(unittest.TestCase):
                          [("basis-governor-token", self.dir)])
 
     def test_first_trade_clamp_is_lifted_after_close_marker(self):
+        payload = proposal_payload()
+        payload["quantity"] = "0.399"
+        self.write_proposal(payload)
         Path(self.dir, bs.FIRST_AUTONOMOUS_CLOSE_MARKER).touch()
         observed = []
 

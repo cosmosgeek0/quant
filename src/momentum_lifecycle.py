@@ -142,7 +142,7 @@ class LifecycleConfig:
     persistence_price_hold_pct: Decimal = Decimal("0")
     max_freshness_ms: Decimal = Decimal("5000")
 
-    initial_notional: Decimal = Decimal("10")
+    initial_notional: Decimal = Decimal("30")
     add_notional: Decimal = Decimal("5")
     max_total_notional: Decimal = Decimal("30")
     max_adds: int = 4
@@ -1377,7 +1377,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persistence-passes", type=int, default=2)
     parser.add_argument("--persistence-price-hold-pct", type=_decimal_argument, default=Decimal("0"))
     parser.add_argument("--max-freshness-ms", type=_decimal_argument, default=Decimal("5000"))
-    parser.add_argument("--initial-notional", type=_decimal_argument, default=Decimal("10"))
+    parser.add_argument("--initial-notional", type=_decimal_argument, default=Decimal("30"))
     parser.add_argument("--add-notional", type=_decimal_argument, default=Decimal("5"))
     parser.add_argument("--max-total-notional", type=_decimal_argument, default=Decimal("30"))
     parser.add_argument("--max-adds", type=int, default=4)

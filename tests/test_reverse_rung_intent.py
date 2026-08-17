@@ -16,6 +16,7 @@ import basis_ladder  # noqa: E402
 import depth_walk as depth  # noqa: E402
 import executable_gap  # noqa: E402
 import funding_ruler  # noqa: E402
+import limits  # noqa: E402
 import margin_ops  # noqa: E402
 import reverse_rung_intent as reverse  # noqa: E402
 
@@ -148,7 +149,6 @@ class ReverseIntentExactnessTests(unittest.TestCase):
         self.assertEqual(result.capture_source, "top_of_book")
         self.assertEqual(result.drag_source, "kernel_default_hold")
         self.assertEqual(result.settlements_crossed, 1)
-        self.assertLessEqual(result.quote_notional, D("8"))
         self.assertRegex(result.intent_id, r"^rri-[0-9a-f]{24}$")
         self.assertRegex(result.sealed_inputs_digest, r"^[0-9a-f]{64}$")
         self.assertEqual(result.assumptions, ())
@@ -173,30 +173,67 @@ class ReverseIntentExactnessTests(unittest.TestCase):
 
     def test_common_grid_without_a_positive_quantity_refuses(self):
         result = build(
-            ladder_input=ladder(size="8"),
+            ladder_input=ladder(size="30"),
             borrow_input=borrow(borrowable_amount=D("0.1")),
-            market_input=market(spot_step=D("0.03"), perp_step=D("0.04")),
+            market_input=market(
+                spot_step=D("0.1125"), perp_step=D("0.15")),
         )
 
         self.assertIsInstance(result, reverse.ReverseRungRefusal)
         self.assertEqual(result.gate,
                          reverse.STEP_OR_MIN_NOTIONAL_INFEASIBLE)
 
+    def test_quote_cap_accepts_a_30_rung_and_refuses_just_over_30(self):
+        accepted = build(
+            ladder_input=ladder(size="30"),
+            borrow_input=borrow(borrowable_amount=D("1")),
+        )
+
+        self.assertEqual(
+            min(limits.PER_LEG_CAP_USDT, limits.FIRST_TRADE_CAP_USDT),
+            D("30"),
+        )
+        self.assertMatchedIntent(accepted)
+        self.assertEqual(accepted.quote_notional, D("30"))
+        self.assertEqual(accepted.borrow_qty, D("0.29"))
+
+        # The same plan refuses under the retired 8 bound, so the accepted
+        # case above cannot pass against the smaller cap.
+        under_old_bound = build(
+            ladder_input=ladder(size="30"),
+            borrow_input=borrow(borrowable_amount=D("1")),
+            caps=reverse.ReverseRungCaps(
+                per_leg_cap_usdt=D("8"), first_trade_cap_usdt=D("8")),
+        )
+
+        self.assertIsInstance(under_old_bound, reverse.ReverseRungRefusal)
+        self.assertEqual(under_old_bound.gate,
+                         reverse.QUOTE_NOTIONAL_CAP_EXCEEDED)
+
+        just_over = build(
+            ladder_input=ladder(size="30.01"),
+            borrow_input=borrow(borrowable_amount=D("1")),
+        )
+
+        self.assertIsInstance(just_over, reverse.ReverseRungRefusal)
+        self.assertEqual(just_over.gate,
+                         reverse.QUOTE_NOTIONAL_CAP_EXCEEDED)
+
     def test_margin_principal_ceiling_boundary_with_cheap_asset_is_accepted(self):
         result = build(
-            gap=directional("2", "1.99"),
-            ladder_input=ladder(size="6"),
+            gap=directional("0.1", "0.099"),
+            ladder_input=ladder(size="30"),
             borrow_input=borrow(
                 borrowable_amount=margin_ops.PRINCIPAL_CEILING),
-            market_input=market("2", "1.99"),
+            market_input=market("0.1", "0.099"),
         )
 
         self.assertMatchedIntent(result)
         self.assertEqual(result.borrow_qty, margin_ops.PRINCIPAL_CEILING)
-        self.assertEqual(result.quote_notional, D("6"))
+        self.assertEqual(result.quote_notional, D("30"))
         self.assertLessEqual(
             result.borrow_qty, margin_ops.PRINCIPAL_CEILING)
-        self.assertLessEqual(result.quote_notional, D("8"))
+        self.assertLessEqual(result.quote_notional, D("30"))
 
     def test_identity_is_stable_and_verified_reading_field_changes_id(self):
         first = build()
@@ -360,7 +397,7 @@ class ReverseIntentExactnessTests(unittest.TestCase):
             "caps.per_leg_cap_usdt": {
                 "caps": replace(caps_input, per_leg_cap_usdt=D("31"))},
             "caps.first_trade_cap_usdt": {
-                "caps": replace(caps_input, first_trade_cap_usdt=D("7"))},
+                "caps": replace(caps_input, first_trade_cap_usdt=D("29"))},
             "caps.roundtrip_fee_pct": {
                 "caps": replace(caps_input, roundtrip_fee_pct=D("0.31"))},
             "caps.expected_hold_ms": {"hold_ms": D("3600001")},
@@ -408,11 +445,11 @@ class ReverseIntentExactnessTests(unittest.TestCase):
             ("identity.schema", reverse,
              "_IDENTITY_SCHEMA", "reverse-rung-intent-v5"),
             ("caps.margin_principal_ceiling", reverse.margin_ops,
-             "PRINCIPAL_CEILING", D("4")),
+             "PRINCIPAL_CEILING", D("301")),
             ("caps.hard_per_leg_cap", reverse.limits,
              "PER_LEG_CAP_USDT", D("31")),
             ("caps.hard_first_trade_cap", reverse.limits,
-             "FIRST_TRADE_CAP_USDT", D("7")),
+             "FIRST_TRADE_CAP_USDT", D("29")),
             ("caps.hard_roundtrip_fee_pct", reverse.limits,
              "MEASURED_ROUNDTRIP_FEE_PCT", D("0.31")),
         )
@@ -530,18 +567,18 @@ class OrderedRefusalTests(unittest.TestCase):
             reverse.LADDER_HEADROOM_UNAVAILABLE,
         )
 
-    def test_quote_above_eight_refuses_before_borrow_clamp(self):
+    def test_quote_above_thirty_refuses_before_borrow_clamp(self):
         self.assertGate(
-            build(ladder_input=ladder(size="9")),
+            build(ladder_input=ladder(size="31")),
             reverse.QUOTE_NOTIONAL_CAP_EXCEEDED,
         )
 
     def test_margin_principal_above_ceiling_refuses(self):
         self.assertGate(
             build(
-                gap=directional("0.50", "0.49"),
-                borrow_input=borrow(borrowable_amount=D("5")),
-                market_input=market("0.50", "0.49"),
+                gap=directional("0.005", "0.0049"),
+                borrow_input=borrow(borrowable_amount=D("500")),
+                market_input=market("0.005", "0.0049"),
             ),
             reverse.BORROW_CLAMP_EXCEEDED,
         )
@@ -628,18 +665,18 @@ class OrderedRefusalTests(unittest.TestCase):
                 replace(executable_reading(), skew_checked=False),
                 "normal")), 2),
             (build(gap=directional(direction="normal"),
-                   ladder_input=ladder(size="9")), 3),
+                   ladder_input=ladder(size="31")), 3),
             (build(ladder_input=ladder(
                 state=basis_ladder.LadderState(
                     basis_ladder.REVERSE,
                     (basis_ladder.Rung(D("2"), D("2.5")),)))), 4),
-            (build(ladder_input=ladder(size="9"),
+            (build(ladder_input=ladder(size="31"),
                    market_input=market(spot_step=None)), 5),
             (build(
-                gap=directional("0.50", "0.49"),
+                gap=directional("0.005", "0.0049"),
                 borrow_input=borrow(
-                    borrowable_amount=D("5"), hourly_interest_rate=None),
-                market_input=market("0.50", "0.49")), 6),
+                    borrowable_amount=D("500"), hourly_interest_rate=None),
+                market_input=market("0.005", "0.0049")), 6),
             (build(market_input=market(
                 spot_step=None, funding_rate=None)), 7),
             (build(depth_value=reverse.ReverseDepthInput({}, {}),

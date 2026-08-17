@@ -5,7 +5,7 @@ from decimal import Decimal
 
 
 PER_LEG_CAP_USDT = Decimal("32")
-FIRST_TRADE_CAP_USDT = Decimal("8")  # first autonomous trade runs at proven size
+FIRST_TRADE_CAP_USDT = Decimal("30")  # owner word 2026-08-17: 30 USDT operating size
 MAX_ADVERSE_PCT = Decimal("2")  # hard per-trade adverse stop, percent from entry
 MEASURED_ROUNDTRIP_FEE_PCT = Decimal("0.30")
 
@@ -36,7 +36,8 @@ MOMENTUM_IGNITION_SURGE_RATIO = min(
     max(_positive_decimal_env("QUANT_IGNITION_SURGE", "3"), Decimal("1")),
     Decimal("100"),
 )
-MAX_ENTRIES_PER_UTC_DAY = min(_positive_int_env("QUANT_MAX_ENTRIES_DAY", "10"), 24)
+# Owner word 2026-08-17: 24 daily entries and a 10 USDT loss-plus-fees budget.
+MAX_ENTRIES_PER_UTC_DAY = min(_positive_int_env("QUANT_MAX_ENTRIES_DAY", "24"), 24)
 DAILY_LOSS_PLUS_FEES_USDT = min(
-    _positive_decimal_env("QUANT_DAILY_LOSS_CAP", "2.00"), Decimal("10.00")
+    _positive_decimal_env("QUANT_DAILY_LOSS_CAP", "10.00"), Decimal("10.00")
 )

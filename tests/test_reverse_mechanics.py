@@ -30,11 +30,11 @@ ZRO_PERP = {"step": D("0.1"), "min_qty": D("0.1"),
 def build(**changes):
     values = {
         "symbol": SYMBOL,
-        "quote_cap": D("8"),
+        "quote_cap": D("30"),
         "spot_meta": SPOT,
         "perp_meta": PERP,
         "borrow_asset": "TEST",
-        "borrowable": D("0.1"),
+        "borrowable": D("0.4"),
         "interest_rate_hourly": D("0.000001"),
         "intent_id": "reverse-intent-a",
         "client_tag": "reverse-client-a",
@@ -62,7 +62,7 @@ def outcome(status, quantity=None, net_base=None):
     return mechanics.LegOutcome(status, fills, executed, net)
 
 
-def leg_outcome(name, status=mechanics.DONE_STATUS, quantity="0.072",
+def leg_outcome(name, status=mechanics.DONE_STATUS, quantity="0.288",
                 net_base=None):
     if name in (mechanics.MARGIN_SELL, mechanics.MARGIN_BUY) \
             and net_base is None and D(quantity) > D("0"):
@@ -77,18 +77,18 @@ def prefix(count):
     }
 
 
-def truth(liability="0.072", base_delta="0", futures="0"):
+def truth(liability="0.288", base_delta="0", futures="0"):
     return mechanics.ExchangeTruth(D(liability), D(base_delta), D(futures))
 
 
 def prefix_truth(count):
     values = (
         ("0", "0", "0"),
-        ("0.072", "0.072", "0"),
-        ("0.072", "0", "0"),
-        ("0.072", "0", "0.072"),
-        ("0.072", "0", "0"),
-        ("0.072", "0.072", "0"),
+        ("0.288", "0.288", "0"),
+        ("0.288", "0", "0"),
+        ("0.288", "0", "0.288"),
+        ("0.288", "0", "0"),
+        ("0.288", "0.288", "0"),
         ("0", "0", "0"),
     )
     return truth(*values[count])
@@ -99,7 +99,7 @@ class PlanTests(unittest.TestCase):
         plan = build()
 
         self.assertIsInstance(plan, mechanics.ReversePlan)
-        self.assertEqual(plan.base_qty, D("0.072"))
+        self.assertEqual(plan.base_qty, D("0.288"))
         self.assertEqual(plan.borrow_principal, plan.base_qty)
         self.assertEqual(plan.base_qty % SPOT["step"], D("0"))
         self.assertEqual(plan.base_qty % PERP["step"], D("0"))
@@ -107,7 +107,7 @@ class PlanTests(unittest.TestCase):
                          (SPOT["step"], SPOT["step"]))
         self.assertGreaterEqual(plan.spot_notional, SPOT["min_notional"])
         self.assertGreaterEqual(plan.perp_notional, PERP["min_notional"])
-        self.assertLessEqual(plan.quote_notional, D("8"))
+        self.assertLessEqual(plan.quote_notional, D("30"))
         self.assertLessEqual(plan.borrow_principal,
                              mechanics.margin_ops.PRINCIPAL_CEILING)
         self.assertEqual(tuple(leg.name for leg in plan.legs),
@@ -116,16 +116,17 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(all(not leg.reduce_only for leg in
                             plan.legs[:3] + plan.legs[4:]))
 
-    def test_principal_ceiling_keeps_one_common_step_of_repay_headroom(self):
-        plan = build_zro()
+    def test_measured_borrowable_sizes_below_the_quote_window(self):
+        plan = build_zro(borrowable=D("2.9"))
 
         self.assertIsInstance(plan, mechanics.ReversePlan)
         quote_only_qty = min(
             plan.quote_cap / ZRO_SPOT["price"],
             plan.quote_cap / ZRO_PERP["price"],
         )
-        self.assertEqual(quote_only_qty, D("3.2"))
-        self.assertEqual(mechanics.margin_ops.PRINCIPAL_CEILING, D("3"))
+        self.assertEqual(quote_only_qty, D("12"))
+        self.assertEqual(mechanics.margin_ops.PRINCIPAL_CEILING, D("300"))
+        self.assertEqual(plan.borrowable, D("2.9"))
         self.assertEqual(plan.common_step, D("0.1"))
         self.assertEqual((plan.base_qty, plan.borrow_principal),
                          (D("2.9"), D("2.9")))
@@ -154,9 +155,10 @@ class PlanTests(unittest.TestCase):
 
     def test_binding_window_below_a_venue_floor_refuses_without_a_plan(self):
         cases = (
-            ("ceiling", {
-                "spot_meta": {**ZRO_SPOT, "min_notional": D("7.6")},
-                "perp_meta": {**ZRO_PERP, "min_notional": D("7.6")},
+            ("quote-cap", {
+                "borrowable": D("20"),
+                "spot_meta": {**ZRO_SPOT, "min_notional": D("30.01")},
+                "perp_meta": {**ZRO_PERP, "min_notional": D("30.01")},
             }),
             ("borrowable", {"borrowable": D("1.9")}),
         )
@@ -173,8 +175,8 @@ class PlanTests(unittest.TestCase):
 
     def test_quantity_below_either_venue_minimum_refuses(self):
         cases = (
-            ("spot", {"spot_meta": {**SPOT, "min_qty": D("0.073")}}),
-            ("futures", {"perp_meta": {**PERP, "min_qty": D("0.073")}}),
+            ("spot", {"spot_meta": {**SPOT, "min_qty": D("0.289")}}),
+            ("futures", {"perp_meta": {**PERP, "min_qty": D("0.289")}}),
         )
         for venue, changes in cases:
             with self.subTest(venue=venue):
@@ -216,7 +218,7 @@ class PlanTests(unittest.TestCase):
 
     def test_plan_refuses_at_each_applicable_ordered_gate(self):
         cases = (
-            (build(quote_cap=D("8.01")),
+            (build(quote_cap=D("30.01")),
              mechanics.QUOTE_NOTIONAL_CAP_EXCEEDED),
             (build(borrowable=None),
              mechanics.BORROW_CLAMP_EXCEEDED),
@@ -234,7 +236,7 @@ class PlanTests(unittest.TestCase):
 
     def test_first_plan_gate_wins_when_inputs_fail_together(self):
         result = build(
-            quote_cap=D("9"), borrowable=None,
+            quote_cap=D("31"), borrowable=None,
             spot_meta={**SPOT, "step": None},
         )
         self.assertEqual(result.gate,
@@ -284,11 +286,11 @@ class FailureLadderTests(unittest.TestCase):
                     mechanics.FUTURES_CLOSE, mechanics.MARGIN_BUY,
                     mechanics.REPAY,
                 ))
-                self.assertEqual(action.leg_sequence[0].quantity, D("0.072"))
+                self.assertEqual(action.leg_sequence[0].quantity, D("0.288"))
             else:
                 self.assertIsInstance(action, mechanics.NEXT_LEG)
                 self.assertEqual(action.leg.name, expected)
-                self.assertEqual(action.leg.quantity, D("0.072"))
+                self.assertEqual(action.leg.quantity, D("0.288"))
 
         final = mechanics.next_action(
             self.plan, prefix(6), truth("0", "0.002", "0"))
@@ -322,13 +324,13 @@ class FailureLadderTests(unittest.TestCase):
                 )
                 current = {
                     mechanics.BORROW: truth("0", "0", "0"),
-                    mechanics.MARGIN_SELL: truth("0.072", "0.072", "0"),
-                    mechanics.FUTURES_LONG_OPEN: truth("0.072", "0", "0"),
+                    mechanics.MARGIN_SELL: truth("0.288", "0.288", "0"),
+                    mechanics.FUTURES_LONG_OPEN: truth("0.288", "0", "0"),
                     mechanics.FUTURES_CLOSE: truth(
-                        "0.072", "0", "0.072",
+                        "0.288", "0", "0.288",
                     ),
-                    mechanics.MARGIN_BUY: truth("0.072", "0", "0"),
-                    mechanics.REPAY: truth("0.072", "0.072", "0"),
+                    mechanics.MARGIN_BUY: truth("0.288", "0", "0"),
+                    mechanics.REPAY: truth("0.288", "0.288", "0"),
                 }[failed_leg]
                 action = mechanics.next_action(self.plan, ledger, current)
                 if terminal is mechanics.DONE:
@@ -346,13 +348,13 @@ class FailureLadderTests(unittest.TestCase):
             mechanics.MARGIN_SELL, mechanics.FAILED, "0.012", "0.011",
         )
         action = mechanics.next_action(
-            self.plan, sell_failed, truth("0.072", "0.060", "0"),
+            self.plan, sell_failed, truth("0.288", "0.276", "0"),
         )
         self.assertEqual(action.sequence,
                          (mechanics.MARGIN_BUY, mechanics.REPAY))
         self.assertEqual(
             tuple(leg.quantity for leg in action.leg_sequence),
-            (D("0.009"), D("0.072")),
+            (D("0.009"), D("0.288")),
         )
 
         long_failed = prefix(2)
@@ -367,7 +369,7 @@ class FailureLadderTests(unittest.TestCase):
         self.assertTrue(action.leg_sequence[0].reduce_only)
         self.assertEqual(
             tuple(leg.quantity for leg in action.leg_sequence),
-            (D("0.012"), D("0.072"), D("0.072")),
+            (D("0.012"), D("0.288"), D("0.288")),
         )
 
     def test_truth_mismatch_blocks_borrow_and_reopens_close_first(self):
@@ -380,26 +382,26 @@ class FailureLadderTests(unittest.TestCase):
                 "step": D("1"), "min_qty": D("1"),
                 "min_notional": D("5"), "price": D("3.5"),
             },
-            borrowable=D("3"),
+            borrowable=D("10"),
         )
-        self.assertEqual(two_plan.base_qty, D("2"))
+        self.assertEqual(two_plan.base_qty, D("8"))
         action = mechanics.next_action(
-            two_plan, {}, truth("2", "0", "0"),
+            two_plan, {}, truth("8", "0", "0"),
         )
         self.assertIsInstance(action, mechanics.FREEZE)
         self.assertEqual(action.reason, "LEDGER_TRUTH_MISMATCH")
 
         ledger = {
-            name: leg_outcome(name, quantity="2")
+            name: leg_outcome(name, quantity="8")
             for name in mechanics.LEG_ORDER[:4]
         }
         action = mechanics.next_action(
-            two_plan, ledger, truth("2", "0", "2"),
+            two_plan, ledger, truth("8", "0", "8"),
         )
         self.assertIsInstance(action, mechanics.UNWIND)
         self.assertEqual(action.leg_sequence[0].name,
                          mechanics.FUTURES_CLOSE)
-        self.assertEqual(action.leg_sequence[0].quantity, D("2"))
+        self.assertEqual(action.leg_sequence[0].quantity, D("8"))
 
     def test_spot_step_dust_is_sale_evidence_and_larger_delta_freezes(self):
         ledger = prefix(2)
@@ -407,14 +409,14 @@ class FailureLadderTests(unittest.TestCase):
             mechanics.FAILED, "0",
         )
         exact_step = mechanics.next_action(
-            self.plan, ledger, truth("0.072", "-0.003", "0"),
+            self.plan, ledger, truth("0.288", "-0.003", "0"),
         )
         self.assertIsInstance(exact_step, mechanics.UNWIND)
         self.assertEqual(exact_step.sequence,
                          (mechanics.MARGIN_BUY, mechanics.REPAY))
 
         outside_step = mechanics.next_action(
-            self.plan, ledger, truth("0.072", "-0.0031", "0"),
+            self.plan, ledger, truth("0.288", "-0.0031", "0"),
         )
         self.assertIsInstance(outside_step, mechanics.FREEZE)
         self.assertEqual(outside_step.reason, "LEDGER_TRUTH_MISMATCH")
@@ -456,9 +458,9 @@ class FailureLadderTests(unittest.TestCase):
                                     mechanics.MARGIN_BUY) else None,
                     )
             for liability, base_delta, futures in product(
-                    (D("0"), D("0.072")),
-                    (D("0"), D("-0.003"), D("0.072")),
-                    (D("0"), D("0.072"))):
+                    (D("0"), D("0.288")),
+                    (D("0"), D("-0.003"), D("0.288")),
+                    (D("0"), D("0.288"))):
                 current = mechanics.ExchangeTruth(
                     liability, base_delta, futures,
                 )

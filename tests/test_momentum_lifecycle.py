@@ -320,6 +320,25 @@ class MomentumLifecycleTests(unittest.TestCase):
             live.default_lifecycle_config().ignition_surge_ratio, expected
         )
 
+    def test_sizing_defaults_are_the_operating_trade_size(self):
+        expected = Decimal("30")
+        tick = ["--tick", str(self.root / "stream.json")]
+
+        self.assertEqual(ml.LifecycleConfig().initial_notional, expected)
+        self.assertEqual(live.DEFAULT_INITIAL_NOTIONAL, expected)
+        self.assertEqual(
+            live.default_lifecycle_config().initial_notional, expected)
+        self.assertEqual(
+            ml.build_parser().parse_args(tick).initial_notional, expected)
+        self.assertEqual(
+            live.build_parser().parse_args(tick).initial_notional, expected)
+        self.assertLessEqual(
+            ml.LifecycleConfig().initial_notional, live.HARD_MAX_NOTIONAL)
+        self.assertLessEqual(
+            ml.LifecycleConfig().initial_notional,
+            ml.LifecycleConfig().max_total_notional,
+        )
+
     def test_live_cli_ignition_surge_override_wins(self):
         parser = live.build_parser()
         default_args = parser.parse_args(["--tick", str(self.root / "stream.json")])

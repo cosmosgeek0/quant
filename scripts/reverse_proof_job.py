@@ -16,7 +16,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 
 OP = "REVERSE_MECHANICS_ROUNDTRIP"
-MAX_QUOTE_CAP = Decimal("8")
+MAX_QUOTE_CAP = Decimal("30")
 MAX_EXPIRY_MINUTES = 15
 JOB_FIELDS = frozenset((
     "job_id", "op", "symbol", "quote_cap", "borrow_asset",

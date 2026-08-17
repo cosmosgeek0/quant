@@ -762,7 +762,7 @@ class JobRunnerTests(unittest.TestCase):
             "job_id": job_id,
             "op": jr.REVERSE_OP,
             "symbol": "TSTUSDT",
-            "quote_cap": "8",
+            "quote_cap": "30",
             "borrow_asset": "TST",
             "intent_id": "reverse-" + digest,
             "client_tag": "reverse-client-" + digest,
@@ -890,7 +890,7 @@ class JobRunnerTests(unittest.TestCase):
                 "operator": "lead",
                 "created_utc": utc(NOW - timedelta(minutes=1)),
                 "expires_utc": utc(NOW + timedelta(minutes=10)),
-                "max_notional": "8",
+                "max_notional": "30",
             }, handle)
 
     def result_events(self, kind):
@@ -1395,7 +1395,7 @@ class JobRunnerTests(unittest.TestCase):
         marker = os.path.join(
             self.receipt_dir, "first_autonomous_close_passed"
         )
-        cap = Decimal("32") if os.path.isfile(marker) else Decimal("8")
+        cap = Decimal("32") if os.path.isfile(marker) else Decimal("30")
         effective = min(Decimal(str(max_notional)), cap)
         self.queue_momentum_measurement(effective / Decimal("200"))
         self.job(
@@ -1412,7 +1412,7 @@ class JobRunnerTests(unittest.TestCase):
         marker = os.path.join(
             self.receipt_dir, "first_autonomous_close_passed"
         )
-        cap = Decimal("32") if os.path.isfile(marker) else Decimal("8")
+        cap = Decimal("32") if os.path.isfile(marker) else Decimal("30")
         effective = min(Decimal(str(max_notional)), cap)
         quantity = effective / Decimal("200")
         self.queue_momentum_measurement(quantity)
@@ -1452,8 +1452,8 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.hand_calls[0]["argv"], [
             "futures_hand.py", "--short", "--execute"
         ])
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["max_notional"], "30")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "30")
         self.assertEqual(self.hand_calls[0]["sha"], SHA)
         self.assertEqual(len(self.leverage.calls), 2)
 
@@ -1870,19 +1870,32 @@ class JobRunnerTests(unittest.TestCase):
         )
 
     def test_margin_runner_clamp_refuses_before_request(self):
-        self.margin_job("margin-cap", principal="3.01")
+        # The clamp reads a principal in the borrowed asset's own units, so it
+        # sits at the unit backstop and mirrors the shared ceiling exactly.
+        self.assertEqual(jr.MARGIN_RUNNER_NOTIONAL_CAP, Decimal("300"))
+        self.assertEqual(
+            jr.MARGIN_RUNNER_NOTIONAL_CAP, jr.margin_ops.PRINCIPAL_CEILING)
+        self.margin_job("margin-cap", principal="300.01")
 
         self.assertEqual(self.margin_tick(), 2)
 
-        self.assertEqual(jr.MARGIN_RUNNER_NOTIONAL_CAP, Decimal("3"))
         self.assertEqual(self.margin.calls, [])
         self.assertEqual(
             self.reason(self.results()[0]),
             "PRINCIPAL_CEILING_EXCEEDED",
         )
 
+        at_cap = self.margin_job("margin-cap-at", principal="300")
+        boundary = jr._validate_job(
+            jr._load_job(at_cap), "margin-cap-at", NOW, self.receipt_dir
+        )
+
+        self.assertEqual(boundary.requested_max_notional, Decimal("300"))
+        self.assertEqual(boundary.effective_notional, Decimal("300"))
+        self.assertEqual(boundary.margin_operation["verdict"], "READY")
+
     def test_margin_runner_clamp_is_independent_of_margin_ops(self):
-        self.margin_job("margin-runner-cap", principal="3.01")
+        self.margin_job("margin-runner-cap", principal="300.01")
 
         def permissive_builder(projection, _whitelist, _now):
             request_type = "BORROW" \
@@ -3786,12 +3799,12 @@ class JobRunnerTests(unittest.TestCase):
     def test_reconcile_reverse_zero_decimal_equivalent_quote_cap_binds(self):
         job_id = "reverse-reconcile-decimal-cap"
         artifacts = self.prepare_unknown_reverse_zero(
-            job_id, quote_cap="8.00"
+            job_id, quote_cap="30.00"
         )
         source = json.loads(Path(
             artifacts["source_path"]
         ).read_text(encoding="utf-8"))
-        self.assertEqual(source["quote_cap"], "8.00")
+        self.assertEqual(source["quote_cap"], "30.00")
 
         self.assertEqual(jr.reconcile_margin(
             job_id, True, self.receipt_dir, NOW, ReverseTransport()
@@ -5441,8 +5454,8 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.tick(), 0)
         self.assertEqual(len(self.basis_calls), 1)
         self.assertEqual(self.basis_calls[0]["argv"], ["--execute"])
-        self.assertEqual(self.basis_calls[0]["executor_cap"], "8")
-        self.assertEqual(self.basis_calls[0]["cycle_cap"], "8")
+        self.assertEqual(self.basis_calls[0]["executor_cap"], "30")
+        self.assertEqual(self.basis_calls[0]["cycle_cap"], "30")
         self.assertTrue(os.path.isfile(os.path.join(
             self.jobs_dir, "basis_proof_passed"
         )))
@@ -5505,8 +5518,8 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.hand_calls[0]["argv"], [
             "futures_hand.py", "--execute"
         ])
-        self.assertEqual(self.hand_calls[0]["max_notional"], "8")
-        self.assertEqual(self.hand_calls[0]["module_max_notional"], "8")
+        self.assertEqual(self.hand_calls[0]["max_notional"], "30")
+        self.assertEqual(self.hand_calls[0]["module_max_notional"], "30")
         self.assertEqual(self.leverage.calls[1], (
             "POST", "/fapi/v1/leverage",
             {"symbol": "TSTUSDT", "leverage": "1"}, True,
@@ -5540,8 +5553,8 @@ class JobRunnerTests(unittest.TestCase):
     def test_momentum_open_is_capped_atomic_and_records_exchange_fill(self):
         quantity = self.open_momentum("position-open", max_notional=800)
 
-        self.assertEqual(self.momentum_plan_caps, [Decimal("8")])
-        self.assertEqual(quantity, Decimal("0.04"))
+        self.assertEqual(self.momentum_plan_caps, [Decimal("30")])
+        self.assertEqual(quantity, Decimal("0.15"))
         self.assertEqual(self.momentum_reads.calls, [
             ("GET", "/fapi/v3/positionRisk",
              {"symbol": "TSTUSDT"}, True),
@@ -5555,12 +5568,12 @@ class JobRunnerTests(unittest.TestCase):
         intent = self.momentum_intents[0]
         self.assertEqual(intent["side"], "BUY")
         self.assertEqual(intent["reduceOnly"], "false")
-        self.assertEqual(intent["quantity"], "0.04")
+        self.assertEqual(intent["quantity"], "0.15")
 
         state = self.momentum_state()
         self.assertEqual(state["state"], "OPEN")
-        self.assertEqual(state["measured_qty"], "0.04")
-        self.assertEqual(state["entry"]["qty"], "0.04")
+        self.assertEqual(state["measured_qty"], "0.15")
+        self.assertEqual(state["entry"]["qty"], "0.15")
         self.assertEqual(state["entry"]["price"], "200")
         self.assertEqual(state["entry"]["order_id"], "1101")
         self.assertEqual(
@@ -5573,7 +5586,7 @@ class JobRunnerTests(unittest.TestCase):
 
         row = self.results()[0]
         self.assertEqual(row["verdict"], "OPEN")
-        self.assertEqual(row["fills"][0]["qty"], "0.04")
+        self.assertEqual(row["fills"][0]["qty"], "0.15")
         self.assertEqual(row["fees"][0]["commission_asset"], "USDT")
         self.assertEqual(row["realized"]["net_usdt"], "UNKNOWN")
 
@@ -6171,9 +6184,9 @@ class JobRunnerTests(unittest.TestCase):
                           source["plan"]["client_tag"]),
                          (source["intent_id"], source["client_tag"]))
         self.assertLessEqual(
-            Decimal(source["plan"]["quote_notional"]), Decimal("8")
+            Decimal(source["plan"]["quote_notional"]), Decimal("30")
         )
-        self.assertEqual(source["legs"][-1]["params"]["amount"], "0.0795")
+        self.assertEqual(source["legs"][-1]["params"]["amount"], "0.2995")
         self.assertTrue(all(
             row["status"] == "DONE" and row["finished_utc"]
             and "fills" in row and "fees_by_asset" in row
@@ -6223,16 +6236,19 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(args[5:7], (
             Decimal("10.08461683"), Decimal("0.000037")))
         self.assertEqual(self.reverse_source(self.results()[0])["plan"][
-            "base_qty"], "0.079")
+            "base_qty"], "0.299")
 
-    def test_reverse_ceiling_headroom_accepts_measured_repay_interest(self):
-        self.reverse_job("reverse-ceiling-headroom")
+    def test_reverse_borrowable_backstop_accepts_measured_repay_interest(self):
+        self.reverse_job("reverse-borrowable-backstop")
         transport = ReverseTransport()
         transport.price = Decimal("2.5")
         transport.spot_step = Decimal("0.1")
         transport.spot_min_qty = Decimal("0.1")
         transport.futures_step = Decimal("0.1")
         transport.futures_min_qty = Decimal("0.1")
+        transport.max_borrowable_payload = {
+            "amount": "2.9", "borrowLimit": "11000",
+        }
 
         self.assertEqual(self.reverse_tick(transport), 0)
 
@@ -6313,7 +6329,7 @@ class JobRunnerTests(unittest.TestCase):
             Decimal(close["cumQuote"]), resized["close_notional_floor"])
 
     def test_reverse_borrowable_clamp_window_and_floor_refusal(self):
-        quote_cap = Decimal("8")
+        quote_cap = Decimal("30")
         fixture = ReverseTransport()
         spot = fixture.spot_exchange()["symbols"][0]
         futures = fixture.futures_exchange()["symbols"][0]
@@ -6904,15 +6920,16 @@ class JobRunnerTests(unittest.TestCase):
             self.receipt_dir, "STOP-JOBS"
         )))
 
-    def test_reverse_job_fields_cap_and_principal_ceiling_are_enforced(self):
+    def test_reverse_job_fields_cap_and_borrowable_floor_are_enforced(self):
         cases = (
-            ("reverse-extra", {"extra": "value"}, "UNKNOWN_FIELD", None),
-            ("reverse-number-cap", {"quote_cap": 8}, "BAD_TYPE", None),
-            ("reverse-over-cap", {"quote_cap": "8.01"},
-             "QUOTE_NOTIONAL_CAP_EXCEEDED", None),
-            ("reverse-principal", {}, "STEP_OR_MIN_NOTIONAL_INFEASIBLE", Decimal("1")),
+            ("reverse-extra", {"extra": "value"}, "UNKNOWN_FIELD", None, None),
+            ("reverse-number-cap", {"quote_cap": 30}, "BAD_TYPE", None, None),
+            ("reverse-over-cap", {"quote_cap": "30.01"},
+             "QUOTE_NOTIONAL_CAP_EXCEEDED", None, None),
+            ("reverse-borrowable-floor", {},
+             "STEP_OR_MIN_NOTIONAL_INFEASIBLE", Decimal("1"), Decimal("1")),
         )
-        for job_id, changes, reason, price in cases:
+        for job_id, changes, reason, price, borrowable in cases:
             with self.subTest(job_id=job_id), \
                     tempfile.TemporaryDirectory() as root:
                 os.makedirs(os.path.join(root, "jobs"))
@@ -6921,6 +6938,11 @@ class JobRunnerTests(unittest.TestCase):
                 transport = ReverseTransport()
                 if price is not None:
                     transport.price = price
+                if borrowable is not None:
+                    transport.max_borrowable_payload = {
+                        "amount": format(borrowable, "f"),
+                        "borrowLimit": "11000",
+                    }
 
                 self.assertEqual(self.reverse_tick(transport, root), 2)
 
@@ -6942,7 +6964,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(self.reverse_tick(transport), 0)
         post_count = sum(call[0] == "POST" for call in transport.calls)
         result_count = len(self.results())
-        self.write_accept_one(max_notional="8")
+        self.write_accept_one(max_notional="30")
         self.assertEqual(self.reverse_tick(transport), 0)
 
         self.assertEqual(
@@ -7029,7 +7051,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def write_accept_one(self, maximum="32"):
+    def write_accept_one(self, maximum="80"):
         path = os.path.join(self.receipt_dir, "ACCEPT-ONE")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({
@@ -7039,7 +7061,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
                 "max_notional": maximum,
             }, handle)
 
-    def job(self, job_id, op="MOMENTUM_OPEN", maximum=20, spot=False):
+    def job(self, job_id, op="MOMENTUM_OPEN", maximum=80, spot=False):
         payload = {
             "job_id": job_id,
             "op": op,
@@ -7196,7 +7218,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
 
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(self.posts[0]["side"], "BUY")
-        self.assertEqual(self.posts[0]["quoteOrderQty"], "8.00000000")
+        self.assertEqual(self.posts[0]["quoteOrderQty"], "30.00000000")
         self.assertEqual(self.governor_acquires, [(
             "MOMENTUM_OPEN", "TSTUSDT", self.receipt_dir,
         )])
@@ -7212,7 +7234,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
         state = self.state()
         self.assertEqual(state["venue"], "spot")
         self.assertEqual(state["state"], "OPEN")
-        self.assertEqual(state["measured_qty"], "0.07900000")
+        self.assertEqual(state["measured_qty"], "0.29900000")
 
     def test_default_momentum_open_remains_on_futures_path(self):
         self.job("futures-default", maximum=6)
@@ -7262,12 +7284,12 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
         self.assertEqual(len(self.posts), 2)
         sell = self.posts[1]
         self.assertEqual(sell["side"], "SELL")
-        self.assertEqual(sell["quantity"], "0.079")
-        self.assertNotEqual(sell["quantity"], "5.079")
+        self.assertEqual(sell["quantity"], "0.299")
+        self.assertNotEqual(sell["quantity"], "5.299")
         self.assertEqual(self.base_free, Decimal("5.000"))
         state = self.state()
         self.assertEqual(state["state"], "CLOSED")
-        self.assertEqual(state["exit"]["submitted_qty"], "0.079")
+        self.assertEqual(state["exit"]["submitted_qty"], "0.299")
 
     def test_spot_adverse_stop_uses_the_same_net_acquired_exit(self):
         self.open_spot("spot-adverse-open")
@@ -7277,7 +7299,7 @@ class SpotMomentumJobRunnerTests(unittest.TestCase):
         self.assertEqual(self.tick(), 0)
 
         self.assertEqual([row["side"] for row in self.posts], ["BUY", "SELL"])
-        self.assertEqual(self.posts[-1]["quantity"], "0.079")
+        self.assertEqual(self.posts[-1]["quantity"], "0.299")
         self.assertEqual(self.state()["state"], "CLOSED")
         self.assertFalse(os.path.exists(os.path.join(
             self.receipt_dir, "first_autonomous_close_passed"

@@ -77,8 +77,8 @@ from job_runner import (
 try:
     from limits import FIRST_TRADE_CAP_USDT
 except ImportError:
-    # TODO: remove this fallback after the sibling limits.py lane merges.
-    FIRST_TRADE_CAP_USDT = Decimal("8")
+    # Owner word 2026-08-17 fallback: 30 USDT operating trade size.
+    FIRST_TRADE_CAP_USDT = Decimal("30")
 
 
 EXIT_ACTED = 0

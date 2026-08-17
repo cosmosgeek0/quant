@@ -59,7 +59,7 @@ FUNNEL_COUNT_FIELDS = (
 FUNNEL_FIELDS = frozenset(("utc", *FUNNEL_COUNT_FIELDS, "starving_stage"))
 DECISION_LEDGER_QUARANTINE_TYPE = "momentum_decision_ledger_quarantine"
 HARD_MAX_NOTIONAL = PER_LEG_CAP_USDT
-DEFAULT_INITIAL_NOTIONAL = Decimal("8")
+DEFAULT_INITIAL_NOTIONAL = Decimal("30")
 DEFAULT_JOB_TTL = timedelta(minutes=10)
 MAX_JOB_TTL = timedelta(minutes=15)
 REQUESTED_BY = "momentum_live"

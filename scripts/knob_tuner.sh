@@ -49,8 +49,8 @@ KNOB_ORDER = (
 )
 DEFAULTS = {
     "QUANT_IGNITION_SURGE": "3",
-    "QUANT_MAX_ENTRIES_DAY": "10",
-    "QUANT_DAILY_LOSS_CAP": "2.00",
+    "QUANT_MAX_ENTRIES_DAY": "24",
+    "QUANT_DAILY_LOSS_CAP": "10.00",
 }
 IGNITION_STAGES = frozenset(("ignited", "ignition"))
 OWNER_TICKET_STAGES = frozenset(("ticket_eligible", "entered"))

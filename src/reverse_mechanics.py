@@ -22,7 +22,7 @@ from reverse_rung_intent import (ASSET_RE, BORROW_CLAMP_EXCEEDED, GATE_ORDER,
     QUOTE_NOTIONAL_CAP_EXCEEDED, STEP_OR_MIN_NOTIONAL_INFEASIBLE)
 
 
-ZERO = Decimal("0"); MAX_QUOTE_CAP = Decimal("8")
+ZERO = Decimal("0"); MAX_QUOTE_CAP = Decimal("30")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,30}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 BORROW = "BORROW"; MARGIN_SELL = "MARGIN_SELL"

@@ -37,7 +37,7 @@ class ReverseProofJobTests(unittest.TestCase):
 
     def build(self, **changes):
         values = {
-            "symbol": "TSTUSDT", "quote_cap": "8",
+            "symbol": "TSTUSDT", "quote_cap": "30",
             "borrow_asset": "TST", "expiry_minutes": 10,
             "operator_token_path": self.operator, "now": NOW,
         }
@@ -67,6 +67,15 @@ class ReverseProofJobTests(unittest.TestCase):
                 composer.JobRefusal, "BAD_EXPIRY_MINUTES"):
             self.build(expiry_minutes=16)
 
+    def test_quote_cap_accepts_thirty_and_refuses_just_above_it(self):
+        at_cap = self.build(quote_cap="30")
+        self.assertEqual(at_cap["quote_cap"], "30")
+        self.assertEqual(composer.validate_job(at_cap, NOW), at_cap)
+
+        with self.assertRaisesRegex(
+                composer.JobRefusal, "QUOTE_CAP_EXCEEDED"):
+            self.build(quote_cap="30.01")
+
     def test_extra_field_is_refused(self):
         job = self.build()
         job["extra"] = "value"
@@ -90,7 +99,7 @@ class ReverseProofJobTests(unittest.TestCase):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = composer.main([
-                "--symbol", "TSTUSDT", "--quote-cap", "8",
+                "--symbol", "TSTUSDT", "--quote-cap", "30",
                 "--borrow-asset", "TST", "--expiry-minutes", "10",
                 "--operator-token-path", str(self.operator),
                 "--output", str(output),

@@ -47,7 +47,7 @@ class LimitsTests(unittest.TestCase):
     def test_money_limits_are_positive_decimals(self):
         expected = {
             "PER_LEG_CAP_USDT": Decimal("32"),
-            "FIRST_TRADE_CAP_USDT": Decimal("8"),
+            "FIRST_TRADE_CAP_USDT": Decimal("30"),
             "MAX_ADVERSE_PCT": Decimal("2"),
         }
         for name, value in expected.items():
@@ -86,9 +86,9 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(
             configured.MOMENTUM_IGNITION_SURGE_RATIO, Decimal("3")
         )
-        self.assertEqual(configured.MAX_ENTRIES_PER_UTC_DAY, 10)
+        self.assertEqual(configured.MAX_ENTRIES_PER_UTC_DAY, 24)
         self.assertEqual(
-            configured.DAILY_LOSS_PLUS_FEES_USDT, Decimal("2.00")
+            configured.DAILY_LOSS_PLUS_FEES_USDT, Decimal("10.00")
         )
 
     def test_governor_defaults_follow_limits_values(self):
@@ -119,7 +119,7 @@ class LimitsTests(unittest.TestCase):
             first = jr._validate_job(
                 job(Decimal("32")), "cap", NOW, receipt_dir
             )
-            self.assertEqual(first.effective_notional, Decimal("8"))
+            self.assertEqual(first.effective_notional, Decimal("30"))
 
             Path(receipt_dir, "first_autonomous_close_passed").touch()
             proven = jr._validate_job(

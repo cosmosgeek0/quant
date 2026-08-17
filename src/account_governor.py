@@ -25,8 +25,9 @@ try:
         MAX_ENTRIES_PER_UTC_DAY as DEFAULT_MAX_ENTRIES_PER_UTC_DAY,
     )
 except ImportError:
-    DEFAULT_MAX_ENTRIES_PER_UTC_DAY = 10
-    DEFAULT_DAILY_LOSS_PLUS_FEES_USDT = Decimal("2.00")
+    # Owner word 2026-08-17 fallback: 24 entries and 10 USDT per UTC day.
+    DEFAULT_MAX_ENTRIES_PER_UTC_DAY = 24
+    DEFAULT_DAILY_LOSS_PLUS_FEES_USDT = Decimal("10.00")
 
 
 ENTRY_LOCK_FILE = "account-governor.lock"

@@ -26,7 +26,7 @@ def job(op=margin_ops.MARGIN_BORROW, **changes):
     row = {
         "op": op,
         "asset": ASSET,
-        "principal": "3",
+        "principal": "300",
         "intent_id": INTENT_ID,
         "expires_utc": EXPIRY,
         "operator_token": "owner-approved-token",
@@ -44,7 +44,7 @@ def job(op=margin_ops.MARGIN_BORROW, **changes):
 
 class MarginOperationTests(unittest.TestCase):
     def test_hard_clamp_constants_are_exact(self):
-        self.assertEqual(margin_ops.PRINCIPAL_CEILING, Decimal("3"))
+        self.assertEqual(margin_ops.PRINCIPAL_CEILING, Decimal("300"))
         self.assertEqual(margin_ops.MAX_EXPIRY_AHEAD,
                          timedelta(minutes=15))
         self.assertEqual(
@@ -55,7 +55,7 @@ class MarginOperationTests(unittest.TestCase):
     def test_borrow_request_and_ledger_shapes_are_exact(self):
         row = margin_ops.build_margin_borrow(job(), {ASSET}, NOW)
         expected_tag = margin_ops.deterministic_client_tag(
-            "MARGIN_BORROW", ASSET, "3", EXPIRY
+            "MARGIN_BORROW", ASSET, "300", EXPIRY
         )
         self.assertEqual(row, {
             "verdict": "READY",
@@ -64,14 +64,14 @@ class MarginOperationTests(unittest.TestCase):
             "intent_id": INTENT_ID,
             "expires_utc": EXPIRY,
             "endpoint_path": "/sapi/v1/margin/borrow-repay",
-            "params": {"asset": ASSET, "amount": "3", "type": "BORROW"},
+            "params": {"asset": ASSET, "amount": "300", "type": "BORROW"},
             "expected_ledger_confirmation": {
-                "asset": ASSET, "principal": "3", "interest": "0",
+                "asset": ASSET, "principal": "300", "interest": "0",
                 "status": "BORROW_CONFIRMED",
             },
             "evidence": [
                 "job.op", "asset_whitelist.single", "job.asset",
-                "job.principal", "principal_ceiling=3", "job.expires_utc",
+                "job.principal", "principal_ceiling=300", "job.expires_utc",
                 "job.operator_token.present", "job.intent_id",
                 "job.client_tag",
             ],
@@ -93,14 +93,14 @@ class MarginOperationTests(unittest.TestCase):
         built = margin_ops.build_margin_borrow(job(), {ASSET}, NOW)
         rows = margin_reconcile.reconcile_margin(
             [{
-                "asset": ASSET, "free": "3", "locked": "0",
-                "borrowed": "3", "interest": "0", "netAsset": "0",
+                "asset": ASSET, "free": "300", "locked": "0",
+                "borrowed": "300", "interest": "0", "netAsset": "0",
             }],
             [],
             [built["expected_ledger_confirmation"]],
         )
         self.assertEqual(rows[0]["verdict"], "LIABILITY_OPEN")
-        self.assertEqual(rows[0]["total_liability"], "3")
+        self.assertEqual(rows[0]["total_liability"], "300")
 
     def test_dispatcher_accepts_only_the_two_named_operations(self):
         for op in (margin_ops.MARGIN_BORROW, margin_ops.MARGIN_REPAY):
@@ -124,14 +124,14 @@ class MarginOperationTests(unittest.TestCase):
         self.assertEqual((row["verdict"], row["reason"]),
                          ("REFUSED", "OP_MISMATCH"))
 
-    def test_principal_ceiling_accepts_three_and_refuses_above_three(self):
+    def test_principal_ceiling_accepts_300_and_refuses_above_300(self):
         self.assertEqual(
-            margin_ops.build_margin_operation(job(principal="3.000"),
+            margin_ops.build_margin_operation(job(principal="300.000"),
                                               {ASSET}, NOW)["verdict"],
             "READY",
         )
         above = job()
-        above["principal"] = "3.0000001"
+        above["principal"] = "300.0000001"
         row = margin_ops.build_margin_operation(above, {ASSET}, NOW)
         self.assertEqual((row["verdict"], row["reason"]),
                          ("REFUSED", "PRINCIPAL_CEILING_EXCEEDED"))
@@ -210,22 +210,22 @@ class MarginOperationTests(unittest.TestCase):
 
     def test_client_tag_is_stable_and_binds_operation_facts(self):
         first = margin_ops.deterministic_client_tag(
-            "MARGIN_BORROW", ASSET, "3.00", EXPIRY
+            "MARGIN_BORROW", ASSET, "300.00", EXPIRY
         )
         second = margin_ops.deterministic_client_tag(
-            "MARGIN_BORROW", ASSET, "3", EXPIRY
+            "MARGIN_BORROW", ASSET, "300", EXPIRY
         )
         changed = margin_ops.deterministic_client_tag(
-            "MARGIN_REPAY", ASSET, "3", EXPIRY
+            "MARGIN_REPAY", ASSET, "300", EXPIRY
         )
         changed_asset = margin_ops.deterministic_client_tag(
-            "MARGIN_BORROW", "BTC", "3", EXPIRY
+            "MARGIN_BORROW", "BTC", "300", EXPIRY
         )
         changed_principal = margin_ops.deterministic_client_tag(
-            "MARGIN_BORROW", ASSET, "2", EXPIRY
+            "MARGIN_BORROW", ASSET, "299", EXPIRY
         )
         changed_expiry = margin_ops.deterministic_client_tag(
-            "MARGIN_BORROW", ASSET, "3", "2026-08-15T10:10:00.000001Z"
+            "MARGIN_BORROW", ASSET, "300", "2026-08-15T10:10:00.000001Z"
         )
         self.assertEqual(first, second)
         for candidate in (
@@ -236,6 +236,29 @@ class MarginOperationTests(unittest.TestCase):
         row = margin_ops.build_margin_operation(value, {ASSET}, NOW)
         self.assertEqual((row["verdict"], row["reason"]),
                          ("REFUSED", "CLIENT_TAG_MISMATCH"))
+
+        # The principals above are tag inputs only, so read the real ceiling
+        # here: just under it builds, just over it refuses.
+        self.assertEqual(margin_ops.PRINCIPAL_CEILING, Decimal("300"))
+        under = margin_ops.build_margin_operation(
+            job(principal="299.5"), {ASSET}, NOW)
+        self.assertEqual(under["verdict"], "READY")
+        self.assertEqual(under["params"]["amount"], "299.5")
+        self.assertEqual(
+            under["client_tag"],
+            margin_ops.deterministic_client_tag(
+                "MARGIN_BORROW", ASSET, "299.5", EXPIRY),
+        )
+        # ``deterministic_client_tag`` refuses an over-ceiling principal
+        # itself, so raise the principal after the tag is computed.
+        above = job()
+        above["principal"] = "300.001"
+        over = margin_ops.build_margin_operation(above, {ASSET}, NOW)
+        self.assertEqual((over["verdict"], over["reason"]),
+                         ("REFUSED", "PRINCIPAL_CEILING_EXCEEDED"))
+        with self.assertRaises(ValueError):
+            margin_ops.deterministic_client_tag(
+                "MARGIN_BORROW", ASSET, "300.001", EXPIRY)
 
     def test_intent_id_shape_is_explicit_and_strict(self):
         ready = margin_ops.build_margin_operation(job(), {ASSET}, NOW)

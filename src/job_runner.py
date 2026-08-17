@@ -174,7 +174,13 @@ ACCEPT_ONE_FORWARD_SKEW = timedelta(seconds=120)
 TICK_INTERVAL_SECONDS = 60.0
 # An owner whose OS identity cannot be confirmed gets three heartbeat intervals.
 TICK_LOCK_HEARTBEAT_INTERVALS = 3
-MARGIN_RUNNER_NOTIONAL_CAP = Decimal("3")
+# The runner's own copy of the borrow-principal backstop.  Both comparisons
+# read a principal denominated in the borrowed asset's own units: USDT for a
+# standalone Margin job, base-asset units on the reverse lane, where the legs
+# carry ``leg.base_qty``.  It mirrors margin_ops.PRINCIPAL_CEILING and raises
+# the same reason.  Operating trade size stays at 30 USDT through the quote-
+# side caps (REVERSE_QUOTE_CAP and the limits authorities), not through this.
+MARGIN_RUNNER_NOTIONAL_CAP = Decimal("300")
 MARGIN_ASSET_WHITELIST = frozenset(("USDT",))
 MARGIN_ENDPOINT_PATH = "/sapi/v1/margin/borrow-repay"
 MARGIN_ACCOUNT_PATH = "/sapi/v1/margin/account"
@@ -206,7 +212,7 @@ MARGIN_IDENTITY_KEY_RE = re.compile(
 MARGIN_TRANSACTION_ID_RE = re.compile(r"^[1-9][0-9]*$")
 REVERSE_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 REVERSE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
-REVERSE_QUOTE_CAP = Decimal("8")
+REVERSE_QUOTE_CAP = Decimal("30")
 REVERSE_ENTRY_LEGS = frozenset((
     reverse_mechanics.BORROW,
     reverse_mechanics.MARGIN_SELL,

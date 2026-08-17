@@ -248,8 +248,8 @@ class ReverseLockinShadowTests(unittest.TestCase):
                 "drag_pct"):
             self.assertIs(type(first_row[field]), str)
         raw = self.output.read_text(encoding="utf-8")
-        self.assertIn('"quote_notional":"3"', raw)
-        self.assertNotIn('"quote_notional":3', raw)
+        self.assertIn('"quote_notional":"30"', raw)
+        self.assertNotIn('"quote_notional":30', raw)
 
     def test_optional_receipt_inputs_drive_both_stamped_sources(self):
         self.write_rows([ok_row("TESTUSDT")])
