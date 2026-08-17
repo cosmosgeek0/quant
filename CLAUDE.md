@@ -21,6 +21,21 @@ file cannot land at once), each card one narrow scope with a line budget
 (AGENTS.md Size), and the Lead verifying every landing with its own diff and
 tests before it is committed.
 
+## MODEL ECONOMY (owner word 2026-08-17 — how Fable operates, standing law)
+Two Fable accounts are already burned. Fable is the scarce seat and is spent
+on exactly two things: ORCHESTRATION (plans, cards, dispatch, integration,
+records, owner translation) and BRAIN-CELL WORK (money decisions, money-file
+diff reads, verdicts, law, design). Nothing else runs on Fable.
+- Every Fable seat works with an Opus side assistant: Opus takes the fast
+  bounded work that would otherwise burn Fable turns — reads, digests,
+  reviews, drafts, checks. Opus owns no money file and decides nothing.
+- Codex is the long grinder: builds, tests, sweeps, mechanical edits —
+  one narrow card each, under AGENTS.md.
+- Minimize Fable spend everywhere, but never cheap out where judgment is
+  needed: anything deciding money, law, or design stays on Fable.
+- FABLE ROUTING still binds: flag-risky, dense, or key-shaped material never
+  enters a Fable seat raw — it goes to a worker, digest comes back clean.
+
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.
 - Credentials live on the execution host only, read by running code only;
