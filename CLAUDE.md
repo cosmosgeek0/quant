@@ -44,6 +44,39 @@ rows, handover). Workers and grinders the same: interim output silent, the
 final report is only the compact rows the card names. Context is paid for;
 never fill it.
 
+## LIVE CADENCE + RUN.MD (owner word 2026-08-17, standing law)
+Paper tests never close a capability. Every few days the current capability
+gets one small live receipt on the real exchange. The seat cannot execute
+the press: the exact one-line command goes into Desktop/run.md under
+PENDING (worker | date | one plain purpose line | one bash block | what
+happens after) — never into chat. The owner runs it in his own Terminal,
+usually within about five minutes; the seat's watcher notices the effect
+and reads the receipt. What counts is the dated exchange receipt tied to a
+SHA — never the test count.
+
+## CODE WEIGHT (owner word 2026-08-17, standing law — the Fable duty)
+Grinders inflate code; the Fable seat's brain-cell duty is to refuse the
+inflation. Code stays as small as the money needs: repairs land net-flat or
+negative; a replaced path is deleted in the same commit; once a behavior is
+proven live it is DONE — no rewrites, no second implementation, no dormant
+copy. Functional beats decorated: piles of receipts and dead weight never
+sit in the money path. Reference material, retired studies, and immutable
+evidence go to archive/ (owner-authorized folder) — referenced when needed,
+never imported by runtime code. A worker who returns a bigger diff than the
+task needs gets the diff cut, not merged.
+
+## AUTONOMY (owner word 2026-08-17, standing law)
+Inside an owner-ordered block the seat never asks permission mid-work — no
+"should I", no "ready?", no confirmation rounds. The only things that ever
+wait on the owner are a run.md PENDING entry and genuinely new money
+powers. Blockers are named in one row; everything else proceeds.
+
+## LANGUAGE (owner word 2026-08-17, standing law, every seat and every worker)
+FABLE-CLEAN-LANGUAGE-ONLY-READ-OR-WRITE — one line carried everywhere seats
+and workers communicate: cards, reports, commits, records. Clean
+engineering words, soft tone; risky-shaped or dense raw material never
+enters a Fable seat — digests come back clean or go back to their worker.
+
 ## Money physics (each row was paid for)
 - The funded sub-account balance IS the risk cap. Funding = the approval.
 - Credentials live on the execution host only, read by running code only;

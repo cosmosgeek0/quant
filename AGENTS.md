@@ -1,6 +1,8 @@
 # AGENTS.md — law for every worker in this repo
 
 You get ONE narrow task from the dispatch. Do exactly it, nothing else.
+FABLE-CLEAN-LANGUAGE-ONLY-READ-OR-WRITE: every card, report row, and commit
+message in clean engineering words, soft tone, compact rows only.
 
 ## Scope
 - Edit ONLY the files your dispatch names. Everything else is read-only.
