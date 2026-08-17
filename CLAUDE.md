@@ -75,6 +75,15 @@ evidence go to archive/ (owner-authorized folder) — referenced when needed,
 never imported by runtime code. A worker who returns a bigger diff than the
 task needs gets the diff cut, not merged.
 
+## SWEEP FIRST (owner word 2026-08-17, standing law — paid for with 44 minutes)
+No writer moves before the full inventory exists. Any change that touches a
+repeated value or pattern starts with ONE exhaustive repo-wide scan (grep
+costs seconds) plus parallel readers to classify every hit (money vs ratio
+vs test pin) — THEN writers fan out on disjoint files, one suite run, one
+deploy. Serial discovery across review rounds is the named waste: each
+straggler a round finds costs a full round. Reviews verify; they are never
+the discovery mechanism.
+
 ## AUTONOMY (owner word 2026-08-17, standing law)
 Inside an owner-ordered block the seat never asks permission mid-work — no
 "should I", no "ready?", no confirmation rounds. The only things that ever
