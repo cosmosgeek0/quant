@@ -44,9 +44,19 @@ rows, handover). Workers and grinders the same: interim output silent, the
 final report is only the compact rows the card names. Context is paid for;
 never fill it.
 
-## LIVE CADENCE + RUN.MD (owner word 2026-08-17, standing law)
-Paper tests never close a capability. Every few days the current capability
-gets one small live receipt on the real exchange. The seat cannot execute
+## LIVE CADENCE + RUN.MD (owner word 2026-08-17, standing law; hardened by
+## the LIVE CADENCE ORDER the same day)
+The measure of this program is live receipts, not lines. Paper tests never
+close a capability. The owner is willing to press every few MINUTES:
+- run.md is NEVER empty while work exists — the moment one press is
+  consumed, the next entry goes in (the press LADDER: attempt N, then
+  reliability repeats, then the next capability; a new press is always
+  ready before the owner returns).
+- At the 8 USDT cap, ONE fresh-eyes check before a live attempt is enough —
+  the runner's own physics (cap, one position, freeze-on-unclear, seals) is
+  the safety and the live receipt is the test. Multi-round review is
+  reserved for cap raises and changes to the physics itself.
+- Every receipt lands in OWNER-CAPABILITIES.md the same day. The seat cannot execute
 the press: the exact one-line command goes into Desktop/run.md under
 PENDING (worker | date | one plain purpose line | one bash block | what
 happens after) — never into chat. The owner runs it in his own Terminal,
