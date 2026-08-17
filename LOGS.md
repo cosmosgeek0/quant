@@ -7,6 +7,12 @@ per task, ≤10 rows. The Lead translates these for the owner in plain words.
 
 ---
 
+REVERSE ATTEMPT 3 — SIZING HELD, WINDOW MEASURED EMPTY FOR ZROUSDT 2026-08-17 10:25Z (worker 7.0; owner press 10:24:49Z) | resealed 10:26Z; FLAT; zero mutations
+run | release b295bdf6 live (sha_valid): plan sized into the caps correctly, then refused STEP_OR_MIN_NOTIONAL_INFEASIBLE — ZRO price slid to ~1.65 so ceiling-with-headroom 2.9 x price ~4.8 USDT sits under the 5 USDT venue minimums; the constraint window for ZROUSDT is EMPTY at today's price; arithmetic, not a defect | MEASURED receipt reverse-rproof-c6f742df95f9.json
+receipt | REFUSED exit 2, mutation_attempts 0, legs [], fees [], governor RELEASED 10:25:05Z, watcher resealed on the first terminal row, ticks IDLE exit 0 after | MEASURED
+decision | owner owns the next word: EITHER name a replacement symbol whose price fits the standing caps (feasibility sweep running — measured candidates land in the worker 7 chat) OR raise the borrow principal ceiling (money law); no press staged until the word — a doomed press is not work | MEASURED state
+note | fire log shows "job tick cron absent" at this press while the tick clearly ran and claimed — the cron guard string in the staging launcher misread once; watch next press, repair only if it recurs | UNVERIFIED cause
+
 SIZING REPAIR DEPLOYED, PRESS 3 STAGED 2026-08-17 10:1xZ (worker 7.0) | machine SEALED + FLAT + ticks clean; zero mutations this entry
 repair | the plan derives base quantity from the binding set min(quote-cap qty per venue, principal ceiling minus one common step for repay-interest headroom, borrowable), floored to step; venue minimum QUANTITIES join the pre-mutation refusals (meta carries measured min_qty, fail-closed); the reduce-only close floor is recomputed from the resized quantity; owner constants untouched | lane b295bdf | MEASURED
 review | single fresh-eyes V6 per the cadence law found 2 HIGH + 1 MEDIUM resize-consistency holes (repay principal+interest over the ceiling at the last leg; min-qty unchecked; stale close floor) — all repaired same hour; suites 17/194/1516 green, Lead-rerun | MEASURED
